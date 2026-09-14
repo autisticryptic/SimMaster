@@ -75,7 +75,11 @@ export function standardDerivedProfileMessage(
 }
 
 export function cellularImsErrorMessage(error?: string | null) {
-  if (!error || isTransientCellularImsRefreshDiagnostic(error)) return null
+  if (!error) return null
+  if (error.includes('volte_runtime_ims_baseband_wedged')) {
+    return '设备后端报告基带状态异常，已停止本轮所有 Profile 和地址族重试。请先核对基带状态与承载归属，再安排受控恢复。'
+  }
+  if (isTransientCellularImsRefreshDiagnostic(error)) return null
 
   const profileNotReady = error.match(PROFILE_NOT_READY)
   if (profileNotReady) {
@@ -124,7 +128,9 @@ export function cellularImsErrorMessage(error?: string | null) {
 }
 
 export function cellularImsErrorStatusLabel(error?: string | null) {
-  if (!error || isTransientCellularImsRefreshDiagnostic(error)) return null
+  if (!error) return null
+  if (error.includes('volte_runtime_ims_baseband_wedged')) return '基带异常，已停止重试'
+  if (isTransientCellularImsRefreshDiagnostic(error)) return null
   if (error.includes('volte_runtime_cellular_network_not_registered')) return '蜂窝网络未注册'
   const networkFailure = networkFailureStatusLabel(error)
   if (networkFailure) return networkFailure

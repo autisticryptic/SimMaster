@@ -157,7 +157,9 @@ impl FailureClass {
     /// Classify a raw ModemManager error/detail string (bearer layer).
     pub fn from_details(details: &str) -> Self {
         let error = details.to_ascii_lowercase();
-        if error.contains("ipv6onlyallowed")
+        if error.contains(code::RUNTIME_IMS_BASEBAND_WEDGED) {
+            FailureClass::BasebandWedged
+        } else if error.contains("ipv6onlyallowed")
             || error.contains("ipv6-only-allowed")
             || error.contains("only ipv6 allowed")
             || error.contains("pdn-ipv4-call-disallowed")
@@ -190,7 +192,9 @@ impl FailureClass {
     /// loop (was `live::should_try_next_family`).
     pub fn from_error(error: &CellularImsError) -> Self {
         match error.code() {
-            code::BEARER_NETDEV_RUNTIME_ERROR => FailureClass::BasebandWedged,
+            code::BEARER_NETDEV_RUNTIME_ERROR | code::RUNTIME_IMS_BASEBAND_WEDGED => {
+                FailureClass::BasebandWedged
+            }
             code::REGISTER_INITIAL_UNEXPECTED_STATUS
                 if error
                     .detail()

@@ -435,16 +435,15 @@ fn forced_native_family(hint: ImsBearerFailureHint) -> Option<u8> {
 
 /// Fold a device-agnostic [`ImsBearerError`] into the stack's [`CellularImsError`],
 /// preserving the exact codes and detail strings used by runtime diagnostics.
-fn cellular_ims_error_from_ims_bearer(error: ImsBearerError) -> CellularImsError {
+pub(crate) fn cellular_ims_error_from_ims_bearer(error: ImsBearerError) -> CellularImsError {
+    if error.hint == ImsBearerFailureHint::BasebandWedged {
+        return CellularImsError::with_detail(code::RUNTIME_IMS_BASEBAND_WEDGED, error.detail);
+    }
     let error_code = match error.kind {
         ImsBearerErrorKind::BasebandUnresolved => code::IP_SETTINGS_MISSING,
         ImsBearerErrorKind::EndpointUnavailable => code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE,
         ImsBearerErrorKind::SessionStartFailed | ImsBearerErrorKind::NetdevUnresolved => {
-            if error.hint == ImsBearerFailureHint::BasebandWedged {
-                code::RUNTIME_MM_BEARER_CONNECT_FAILED
-            } else {
-                code::RUNTIME_IMS_BEARER_START_FAILED
-            }
+            code::RUNTIME_IMS_BEARER_START_FAILED
         }
         ImsBearerErrorKind::SessionLost => code::BEARER_SESSION_LOST,
         ImsBearerErrorKind::SettingsMissing => code::IP_SETTINGS_MISSING,
@@ -599,14 +598,18 @@ mod tests {
     #[test]
     fn a_forced_family_error_keeps_the_wedge_code() {
         // The wedge signature on a start failure must surface as
-        // RUNTIME_MM_BEARER_CONNECT_FAILED, not as a generic start failure, so the
-        // runtime does not hand a dead baseband to ModemManager.
+        // RUNTIME_IMS_BASEBAND_WEDGED, not as a generic start failure, so both
+        // the family loop and the outer profile batch stop on the same hint.
         let error = cellular_ims_error_from_ims_bearer(ImsBearerError {
             kind: ImsBearerErrorKind::SessionStartFailed,
             hint: ImsBearerFailureHint::BasebandWedged,
             detail: "secondary_qmi_start_failed:endpoint hangup".to_string(),
         });
-        assert_eq!(error.code(), code::RUNTIME_MM_BEARER_CONNECT_FAILED);
+        assert_eq!(error.code(), code::RUNTIME_IMS_BASEBAND_WEDGED);
+        assert_eq!(
+            FailureClass::from_error(&error),
+            FailureClass::BasebandWedged
+        );
         let ordinary = cellular_ims_error_from_ims_bearer(ImsBearerError {
             kind: ImsBearerErrorKind::SessionStartFailed,
             hint: ImsBearerFailureHint::None,

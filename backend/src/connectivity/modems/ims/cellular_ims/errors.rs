@@ -67,6 +67,9 @@ pub mod code {
     pub const RUNTIME_IMS_ENDPOINT_UNAVAILABLE: &str = "volte_runtime_ims_endpoint_unavailable";
     /// The device-selected IMS bearer session could not be started.
     pub const RUNTIME_IMS_BEARER_START_FAILED: &str = "volte_runtime_ims_bearer_start_failed";
+    /// The selected provider declared the baseband unsafe for further attempts.
+    /// Preserve this independently of diagnostic wording and netdev faults.
+    pub const RUNTIME_IMS_BASEBAND_WEDGED: &str = "volte_runtime_ims_baseband_wedged";
     pub const RUNTIME_UE_WORKER_UNAVAILABLE: &str = "volte_runtime_ue_worker_unavailable";
     pub const RUNTIME_MM_BEARER_PATH_MISSING: &str = "volte_runtime_mm_bearer_path_missing";
     pub const RUNTIME_MM_MODEM_WAIT_TIMEOUT: &str = "volte_runtime_mm_modem_wait_timeout";

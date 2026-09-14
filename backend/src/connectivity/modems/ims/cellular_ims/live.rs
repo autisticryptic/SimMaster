@@ -6656,43 +6656,44 @@ async fn load_device_identity(
     };
     let sim_imsi = key_value(&sim, "sim.properties.imsi")
         .filter(|value| value.len() >= 5 && value.bytes().all(|byte| byte.is_ascii_digit()));
-    let cimi_argument = "--command=AT+CIMI";
-    let (imsi, imsi_source, ef_ad_mnc_length) = match command_output(
-        "mmcli",
-        &["-m", device.modem_id.as_str(), cimi_argument],
-    )
-    .await
-    {
-        Ok(output) => match identity::parse_cimi_response(&output) {
-            Some(imsi) => (imsi, "at_cimi", None),
-            None => {
-                tracing::warn!(
+    // Resolve the full AID for this slot before a UIM identity fallback needs
+    // to open the USIM application. Never borrow an AID from another slot.
+    let applications = load_uicc_applications(device).await;
+    let aka_aid = identity::resolve_usim_aid(applications.usim_aid.as_deref());
+    let usim_aid = identity::aid_hex(&aka_aid);
+    let isim_aid = applications.isim_aid.as_deref().map(identity::aid_hex);
+    let (imsi, imsi_source, ef_ad_mnc_length) =
+        match crate::hardware::cellular::control::at_command(&device.modem_id, "AT+CIMI").await {
+            Ok(output) => match identity::parse_cimi_response(&output) {
+                Some(imsi) => (imsi, "at_cimi", None),
+                None => {
+                    tracing::warn!(
                     "Native VoLTE AT+CIMI response did not contain an IMSI; using SIM/UIM fallback"
                 );
-                resolve_fallback_imsi(device, sim_imsi.as_deref())
+                    resolve_fallback_imsi(device, sim_imsi.as_deref(), &aka_aid)
+                        .await
+                        .ok_or_else(|| {
+                            CellularImsError::with_detail(
+                                code::MM_IMSI_MISSING,
+                                "at_cimi_modemmanager_and_uim_imsi_invalid",
+                            )
+                        })
+                        .map(|identity| (identity.imsi, identity.source, identity.mnc_length))?
+                }
+            },
+            Err(error) => {
+                tracing::warn!(error = %error, "Native VoLTE ModemManager AT+CIMI failed; using SIM/UIM IMSI fallback");
+                resolve_fallback_imsi(device, sim_imsi.as_deref(), &aka_aid)
                     .await
                     .ok_or_else(|| {
                         CellularImsError::with_detail(
                             code::MM_IMSI_MISSING,
-                            "at_cimi_modemmanager_and_uim_imsi_invalid",
+                            "modemmanager_sim_at_and_uim_identity_unavailable",
                         )
                     })
                     .map(|identity| (identity.imsi, identity.source, identity.mnc_length))?
             }
-        },
-        Err(error) => {
-            tracing::warn!(error = %error, "Native VoLTE ModemManager AT+CIMI failed; using SIM/UIM IMSI fallback");
-            resolve_fallback_imsi(device, sim_imsi.as_deref())
-                .await
-                .ok_or_else(|| {
-                    CellularImsError::with_detail(
-                        code::MM_IMSI_MISSING,
-                        "modemmanager_sim_at_and_uim_identity_unavailable",
-                    )
-                })
-                .map(|identity| (identity.imsi, identity.source, identity.mnc_length))?
-        }
-    };
+        };
     let registered_plmn =
         key_value(&modem, "modem.3gpp.operator-code").filter(|candidate| valid_plmn(candidate));
     let registration_state =
@@ -6718,11 +6719,25 @@ async fn load_device_identity(
     let mut home_plmn = sim_home_plmn.clone();
     let mut ef_ad_mnc_length = ef_ad_mnc_length;
     if home_plmn.is_none() && ef_ad_mnc_length.is_none() {
-        if let Some(uim_identity) = read_uim_identity(device).await {
+        if let Some(uim_identity) = read_uim_identity(device, &aka_aid).await {
             if uim_identity.imsi == imsi {
                 ef_ad_mnc_length = uim_identity.mnc_length;
             }
         }
+    }
+    if home_plmn.is_none() && ef_ad_mnc_length.is_none() {
+        // Some MM/firmware combinations allow CRSM even when a QMI logical
+        // channel cannot be opened. This fallback only reads EF_AD, brackets
+        // it with the same IMSI and has a total deadline; it never guesses MNC.
+        ef_ad_mnc_length = tokio::time::timeout(
+            Duration::from_secs(12),
+            identity::read_mnc_length_via_at(&imsi, |command| {
+                crate::hardware::cellular::control::at_command(&device.modem_id, command)
+            }),
+        )
+        .await
+        .ok()
+        .flatten();
     }
     if home_plmn.is_none() {
         home_plmn = identity::resolve_home_plmn(
@@ -6733,26 +6748,6 @@ async fn load_device_identity(
         .ok()
         .map(|resolved| format!("{}{}", resolved.mcc, resolved.mnc));
     }
-    let applications = match command_output(
-        "qmicli",
-        &[
-            "-d",
-            device.qmi_device.as_str(),
-            "--device-open-proxy",
-            "--uim-get-card-status",
-        ],
-    )
-    .await
-    {
-        Ok(output) => identity::parse_uicc_applications(&output),
-        Err(error) => {
-            tracing::warn!(error = %error, "VoLTE UICC application discovery failed; using USIM AID fallback");
-            identity::UiccApplications::default()
-        }
-    };
-    let aka_aid = identity::resolve_usim_aid(applications.usim_aid.as_deref());
-    let usim_aid = identity::aid_hex(&aka_aid);
-    let isim_aid = applications.isim_aid.as_deref().map(identity::aid_hex);
     let identity_source = match (imsi_source, isim_aid.is_some()) {
         ("at_cimi", true) => "at_cimi_isim_detected",
         ("at_cimi", false) => "at_cimi",
@@ -6853,9 +6848,30 @@ async fn load_device_identity(
     })
 }
 
+async fn load_uicc_applications(device: &CellularImsDeviceBinding) -> identity::UiccApplications {
+    match command_output(
+        "qmicli",
+        &[
+            "-d",
+            device.qmi_device.as_str(),
+            "--device-open-proxy",
+            "--uim-get-card-status",
+        ],
+    )
+    .await
+    {
+        Ok(output) => identity::parse_uicc_applications_for_slot(&output, device.uim_slot),
+        Err(error) => {
+            tracing::warn!(error = %error, "VoLTE UICC application discovery failed; using USIM AID fallback");
+            identity::UiccApplications::default()
+        }
+    }
+}
+
 async fn resolve_fallback_imsi(
     device: &CellularImsDeviceBinding,
     modemmanager_imsi: Option<&str>,
+    aka_aid: &[u8],
 ) -> Option<FallbackImsi> {
     if let Some(imsi) = modemmanager_imsi {
         return Some(FallbackImsi {
@@ -6864,7 +6880,7 @@ async fn resolve_fallback_imsi(
             mnc_length: None,
         });
     }
-    read_uim_identity(device)
+    read_uim_identity(device, aka_aid)
         .await
         .map(|identity| FallbackImsi {
             imsi: identity.imsi,
@@ -6875,15 +6891,17 @@ async fn resolve_fallback_imsi(
 
 async fn read_uim_identity(
     device: &CellularImsDeviceBinding,
+    aka_aid: &[u8],
 ) -> Option<crate::connectivity::modems::ims::vowifi::qmi_uim::UsimIdentity> {
     let qmi_device = device.qmi_device.clone();
     let uim_slot = device.uim_slot;
+    let aka_aid = aka_aid.to_vec();
     tokio::task::spawn_blocking(move || {
         crate::connectivity::modems::ims::vowifi::qmi_uim::read_usim_identity_via_proxy_reason(
             QMI_PROXY_SOCKET,
             &qmi_device,
             uim_slot,
-            crate::connectivity::modems::ims::vowifi::qmi_uim::USIM_AID_PREFIX,
+            &aka_aid,
             Duration::from_secs(3),
         )
         .ok()

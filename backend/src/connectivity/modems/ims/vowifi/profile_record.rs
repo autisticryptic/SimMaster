@@ -957,10 +957,7 @@ impl CarrierProfileRecord {
         if meta.mcc.len() != 3 || !meta.mcc.chars().all(|c| c.is_ascii_digit()) {
             return Err("mcc_must_be_three_digits".to_string());
         }
-        if meta.mnc.is_empty()
-            || meta.mnc.len() > 3
-            || !meta.mnc.chars().all(|c| c.is_ascii_digit())
-        {
+        if !matches!(meta.mnc.len(), 2 | 3) || !meta.mnc.chars().all(|c| c.is_ascii_digit()) {
             return Err("mnc_must_be_two_or_three_digits".to_string());
         }
         if meta.mnc_len as usize != meta.mnc.len() {
@@ -1563,6 +1560,27 @@ mod tests {
             record.validate_ims_only().unwrap_err(),
             "wire_value_contains_control:ims.register.access_network_info"
         );
+    }
+
+    #[test]
+    fn profile_metadata_requires_a_two_or_three_digit_mnc() {
+        for mnc in ["", "3", "3333", "3x"] {
+            let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+            record.meta.mnc = mnc.into();
+            record.meta.mnc_len = mnc.len() as u8;
+            record.meta.plmn = format!("234{mnc}");
+            assert_eq!(
+                record.validate_ims_only().unwrap_err(),
+                "mnc_must_be_two_or_three_digits"
+            );
+        }
+        for mnc in ["03", "003"] {
+            let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+            record.meta.mnc = mnc.into();
+            record.meta.mnc_len = mnc.len() as u8;
+            record.meta.plmn = format!("234{mnc}");
+            assert!(record.validate_ims_only().is_ok());
+        }
     }
 
     #[test]

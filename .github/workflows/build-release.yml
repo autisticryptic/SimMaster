@@ -210,6 +210,7 @@ jobs:
             services::ue_worker::tests \
             services::ue_netcfg::tests \
             connectivity::modems::ims::cellular_ims::identity::tests \
+            connectivity::modems::ims::cellular_ims::plan::tests \
             connectivity::modems::ims::cellular_ims::bearer::tests \
             hardware::devices::qcm410::ims_bearer::tests \
             hardware::devices::qcm410::primary_ims_session::tests \

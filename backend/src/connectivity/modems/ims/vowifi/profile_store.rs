@@ -753,6 +753,42 @@ impl ProfileStore {
         )
     }
 
+    /// Determine the home MNC boundary before automatic source selection.
+    /// Explicit SIM facts win. Without them, validated custom metadata and
+    /// eligible catalog rules must agree; longest-prefix ordering is not
+    /// evidence that a subscription has a three-digit MNC.
+    fn automatic_home_plmn_hint(
+        &self,
+        imsi: &str,
+        home_plmn: Option<&str>,
+        custom: Option<&LoadedCustomProfiles>,
+    ) -> (Option<String>, bool) {
+        if imsi.len() < 5 || !imsi.bytes().all(|byte| byte.is_ascii_digit()) {
+            return (None, true);
+        }
+        if let Some(home) = normalized_home_plmn(imsi, home_plmn) {
+            return (Some(home), false);
+        }
+        let catalog_home = self.catalog.infer_home_plmn(imsi).ok().flatten();
+        if catalog_home.is_none() && self.catalog.imsi_has_ambiguous_plmn(imsi).unwrap_or(false) {
+            return (None, true);
+        }
+        let mut home = catalog_home;
+        if let Some(custom) = custom {
+            for (_, record) in &custom.valid {
+                let plmn = &record.meta.plmn;
+                if !imsi.starts_with(plmn) {
+                    continue;
+                }
+                if home.as_ref().is_some_and(|existing| existing != plmn) {
+                    return (None, true);
+                }
+                home = Some(plmn.clone());
+            }
+        }
+        (home, false)
+    }
+
     /// Shared database/catalog/derived resolver for both IMS access legs.
     ///
     /// Keeping the source ladder here is important: after an ePDG tunnel is
@@ -768,10 +804,9 @@ impl ProfileStore {
         access: CatalogAccessKind,
     ) -> Result<Option<ResolvedProfile>, String> {
         let digits = imsi.trim();
-        let explicit_home_plmn = normalized_home_plmn(digits, home_plmn);
-        let inferred_home_plmn = explicit_home_plmn
-            .clone()
-            .or_else(|| self.catalog.infer_home_plmn(digits).ok().flatten());
+        let loaded_custom = self.custom_records();
+        let (inferred_home_plmn, home_ambiguous) =
+            self.automatic_home_plmn_hint(digits, home_plmn, loaded_custom.as_ref().ok());
         let service = match access {
             CatalogAccessKind::LteEpc => "volte",
             CatalogAccessKind::WifiEpdg => "vowifi",
@@ -788,7 +823,7 @@ impl ProfileStore {
 
         let requested = match source {
             ImsProfileSource::Database => {
-                let records = match self.custom_records() {
+                let records = match loaded_custom {
                     Ok(records) => records,
                     Err(error) => {
                         return Ok(derive_standard_fallback(
@@ -842,26 +877,21 @@ impl ProfileStore {
                         }));
                     }
                 }
+                if home_ambiguous {
+                    return Ok(None);
+                }
                 let mut matches = records
                     .valid
                     .into_iter()
                     .filter(|(_, record)| {
                         custom_profile_ready_for_access(record, access)
-                            && explicit_home_plmn.as_deref().map_or_else(
+                            && inferred_home_plmn.as_deref().map_or_else(
                                 || digits.starts_with(&record.meta.plmn),
                                 |plmn| record.meta.plmn == plmn,
                             )
                     })
                     .collect::<Vec<_>>();
-                matches.sort_by(|left, right| {
-                    right
-                        .1
-                        .meta
-                        .plmn
-                        .len()
-                        .cmp(&left.1.meta.plmn.len())
-                        .then(left.1.meta.profile_id.cmp(&right.1.meta.profile_id))
-                });
+                matches.sort_by(|left, right| left.1.meta.profile_id.cmp(&right.1.meta.profile_id));
                 matches
                     .into_iter()
                     .next()
@@ -912,6 +942,9 @@ impl ProfileStore {
                         }));
                     }
                 }
+                if home_ambiguous {
+                    return Ok(None);
+                }
                 match self.catalog.imsi_has_ambiguous_plmn(digits) {
                     Ok(true) if inferred_home_plmn.is_none() => None,
                     Ok(_) => match self.catalog.resolve_for_imsi(
@@ -944,6 +977,9 @@ impl ProfileStore {
                 }
             }
             ImsProfileSource::Derived => {
+                if home_ambiguous {
+                    return Ok(None);
+                }
                 return Ok(derive_standard_fallback(
                     digits,
                     inferred_home_plmn.as_deref(),
@@ -1039,21 +1075,19 @@ impl ProfileStore {
         }
 
         let digits = imsi.trim();
-        let explicit_home_plmn = home_plmn
-            .map(str::trim)
-            .filter(|plmn| {
-                matches!(plmn.len(), 5 | 6)
-                    && plmn.bytes().all(|byte| byte.is_ascii_digit())
-                    && digits.starts_with(*plmn)
-            })
-            .map(str::to_string);
-        let (custom_records, custom_lookup_error) = match self.custom_records() {
+        let loaded_custom = self.custom_records();
+        let (home_plmn_hint, home_ambiguous) =
+            self.automatic_home_plmn_hint(digits, home_plmn, loaded_custom.as_ref().ok());
+        if home_ambiguous {
+            return Ok(None);
+        }
+        let (custom_records, custom_lookup_error) = match loaded_custom {
             Ok(records) => {
                 let relevant_errors = records
                     .invalid
                     .into_iter()
                     .filter(|invalid| {
-                        explicit_home_plmn.as_deref().map_or_else(
+                        home_plmn_hint.as_deref().map_or_else(
                             || digits.starts_with(&invalid.entry.plmn),
                             |plmn| invalid.entry.plmn == plmn,
                         )
@@ -1078,21 +1112,13 @@ impl ProfileStore {
             .into_iter()
             .filter(|(_, record)| {
                 custom_profile_ready_for_access(record, access)
-                    && explicit_home_plmn.as_deref().map_or_else(
+                    && home_plmn_hint.as_deref().map_or_else(
                         || digits.starts_with(&record.meta.plmn),
                         |plmn| record.meta.plmn == plmn,
                     )
             })
             .collect::<Vec<_>>();
-        custom_matches.sort_by(|left, right| {
-            right
-                .1
-                .meta
-                .plmn
-                .len()
-                .cmp(&left.1.meta.plmn.len())
-                .then(left.1.meta.profile_id.cmp(&right.1.meta.profile_id))
-        });
+        custom_matches.sort_by(|left, right| left.1.meta.profile_id.cmp(&right.1.meta.profile_id));
         if let Some((_, record)) = custom_matches.into_iter().next() {
             return Ok(Some(ResolvedProfile {
                 profile: record.intern(),
@@ -1100,9 +1126,7 @@ impl ProfileStore {
                 fallback_reason: None,
             }));
         }
-        let home_plmn =
-            explicit_home_plmn.or_else(|| self.catalog.infer_home_plmn(digits).ok().flatten());
-        let home_plmn = home_plmn.as_deref();
+        let home_plmn = home_plmn_hint.as_deref();
         let catalog_result = match self.catalog.imsi_has_ambiguous_plmn(digits) {
             Ok(true) if home_plmn.is_none() => Ok(None),
             Ok(_) => self.catalog.resolve_for_imsi(digits, home_plmn, access),
@@ -1876,6 +1900,121 @@ mod tests {
         assert_eq!(resolved.origin, ProfileOrigin::Database);
         assert_eq!(resolved.profile.meta.profile_id, "custom-50212");
         assert!(resolved.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn automatic_sources_refuse_conflicting_custom_and_catalog_home_boundaries() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let (store, path) = store_with_catalog();
+        let mut long = CarrierProfileRecord::from_profile(&profiles::GB_EE_23433);
+        long.meta.profile_id = "custom-234330".into();
+        long.meta.mnc = "330".into();
+        long.meta.mnc_len = 3;
+        long.meta.plmn = "234330".into();
+        store.upsert(long).unwrap();
+        // The catalog infers 23433 while the custom row says 234330. Neither
+        // source gets to settle the MNC boundary by being longer/available.
+        for candidate in ImsProfileSelectionConfig::default().attempts {
+            assert!(store
+                .resolve_cellular_ims_candidate(&candidate, None, "234330123456789", None)
+                .unwrap()
+                .is_none());
+            assert!(store
+                .resolve_vowifi_candidate(&candidate, None, "234330123456789", None)
+                .unwrap()
+                .is_none());
+        }
+        for access in [CatalogAccessKind::LteEpc, CatalogAccessKind::WifiEpdg] {
+            assert!(store
+                .resolve_for_imsi_access(None, "234330123456789", None, access)
+                .unwrap()
+                .is_none());
+        }
+        let resolved = store
+            .resolve_cellular_ims_candidate(
+                &ImsProfileCandidate::automatic(ImsProfileSource::Database),
+                None,
+                "234330123456789",
+                Some("23433"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.origin, ProfileOrigin::Derived);
+        assert_eq!(resolved.profile.meta.plmn, "23433");
+        let pinned = store
+            .resolve_cellular_ims_candidate(
+                &ImsProfileCandidate {
+                    source: ImsProfileSource::Database,
+                    profile_id: Some("custom-234330".into()),
+                },
+                None,
+                "234330123456789",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.profile.meta.profile_id, "custom-234330");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn custom_home_metadata_must_be_unique_and_explicit_sim_facts_override_it() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let catalog =
+            CarrierCatalog::at_path(PathBuf::from("/definitely-missing/carrier-bundles.sqlite3"));
+        let database = Arc::new(Database::new(PathBuf::from(":memory:")).unwrap());
+        let store = ProfileStore::new(Arc::new(catalog), database);
+        for mnc in ["12", "121"] {
+            let mut record = CarrierProfileRecord::from_profile(&profiles::GB_EE_23433);
+            record.meta.profile_id = format!("custom-502{mnc}");
+            record.meta.mcc = "502".into();
+            record.meta.mnc = mnc.into();
+            record.meta.mnc_len = mnc.len() as u8;
+            record.meta.plmn = format!("502{mnc}");
+            store.upsert(record).unwrap();
+        }
+        let candidate = ImsProfileCandidate::automatic(ImsProfileSource::Database);
+        assert!(store
+            .resolve_cellular_ims_candidate(&candidate, None, "502121234567890", None)
+            .unwrap()
+            .is_none());
+        for home in ["50212", "502121"] {
+            let resolved = store
+                .resolve_cellular_ims_candidate(&candidate, None, "502121234567890", Some(home))
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolved.profile.meta.plmn, home);
+            assert_eq!(resolved.origin, ProfileOrigin::Database);
+        }
+    }
+
+    #[test]
+    fn unique_validated_custom_home_metadata_can_support_missing_source_fallbacks() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let catalog =
+            CarrierCatalog::at_path(PathBuf::from("/definitely-missing/carrier-bundles.sqlite3"));
+        let database = Arc::new(Database::new(PathBuf::from(":memory:")).unwrap());
+        let store = ProfileStore::new(Arc::new(catalog), database);
+        let mut record = CarrierProfileRecord::from_profile(&profiles::GB_EE_23433);
+        record.meta.profile_id = "custom-home".into();
+        record.meta.mcc = "502".into();
+        record.meta.mnc = "12".into();
+        record.meta.mnc_len = 2;
+        record.meta.plmn = "50212".into();
+        store.upsert(record).unwrap();
+        for source in [ImsProfileSource::CarrierCatalog, ImsProfileSource::Derived] {
+            let resolved = store
+                .resolve_cellular_ims_candidate(
+                    &ImsProfileCandidate::automatic(source),
+                    None,
+                    "502121234567890",
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolved.origin, ProfileOrigin::Derived);
+            assert_eq!(resolved.profile.meta.profile_id, "derived_3gpp_lte_50212");
+        }
     }
 
     #[test]

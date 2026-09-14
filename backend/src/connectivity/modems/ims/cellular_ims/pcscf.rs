@@ -224,10 +224,11 @@ pub fn configured_ims_cid() -> u8 {
         .unwrap_or(DEFAULT_IMS_CID)
 }
 
-/// Locate the modem's IMS PDP context, rewriting the configured inactive slot
-/// only when no IMS context exists. This function never activates or
-/// deactivates a context; the following bearer remains the sole activation
-/// owner.
+/// Reuse a matching IMS PDP context, or define the configured preferred CID
+/// only when its definition is absent and it is confirmed inactive. Existing
+/// definitions (including empty-APN placeholders) are never overwritten, and
+/// arbitrary unused CIDs are not assumed supported by the device. This never
+/// activates/deactivates a context; the bearer remains the activation owner.
 pub async fn prepare_ims_profile_context(
     modem: &str,
     plan: &ImsConnectionPlan,
@@ -235,10 +236,23 @@ pub async fn prepare_ims_profile_context(
 ) -> Result<ImsProfileContext, CellularImsError> {
     let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
     let contexts = parse_pdp_contexts(&contexts_output);
-    let profile = select_ims_profile_context(&contexts, configured_ims_cid(), apn);
+    // A malformed or duplicate row must not look like a free profile slot.
+    if contexts_output
+        .lines()
+        .filter(|line| line.contains("+CGDCONT:"))
+        .count()
+        != contexts.len()
+    {
+        return Err(CellularImsError::new(
+            "volte_ims_profile_definition_ambiguous",
+        ));
+    }
+    let profile = select_ims_profile_context(&contexts, configured_ims_cid(), apn)?;
     if !profile.created {
         return Ok(profile);
     }
+    let active = run_at(modem, "AT+CGACT?").await?;
+    ensure_profile_inactive(&active, profile.cid)?;
 
     let pdp_type = plan.pdp_types().into_iter().next().unwrap_or("IPV4V6");
     run_at(
@@ -253,19 +267,55 @@ fn select_ims_profile_context(
     contexts: &[PdpContext],
     preferred: u8,
     apn: &str,
-) -> ImsProfileContext {
-    contexts
+) -> Result<ImsProfileContext, CellularImsError> {
+    if let Some(context) = contexts
         .iter()
         .filter(|context| context.apn.eq_ignore_ascii_case(apn))
         .min_by_key(|context| (context.cid != preferred, context.cid))
-        .map(|context| ImsProfileContext {
+    {
+        return Ok(ImsProfileContext {
             cid: context.cid,
             created: false,
-        })
-        .unwrap_or(ImsProfileContext {
-            cid: preferred,
-            created: true,
-        })
+        });
+    }
+    if !(1..=16).contains(&preferred) || contexts.iter().any(|context| context.cid == preferred) {
+        return Err(CellularImsError::new(
+            "volte_ims_preferred_profile_occupied",
+        ));
+    }
+    Ok(ImsProfileContext {
+        cid: preferred,
+        created: true,
+    })
+}
+
+fn ensure_profile_inactive(output: &str, cid: u8) -> Result<(), CellularImsError> {
+    let mut observed = false;
+    for values in output
+        .lines()
+        .filter_map(|line| line.split_once("+CGACT:").map(|(_, rest)| rest))
+    {
+        observed = true;
+        let fields = values
+            .split(',')
+            .map(|field| field.trim().trim_matches('\''))
+            .collect::<Vec<_>>();
+        let parsed = fields.first().and_then(|field| field.parse::<u8>().ok());
+        if fields.len() != 2 || parsed.is_none_or(|id| id == 0) || !matches!(fields[1], "0" | "1") {
+            return Err(CellularImsError::new(
+                "volte_ims_profile_activity_ambiguous",
+            ));
+        }
+        if parsed == Some(cid) && fields[1] == "1" {
+            return Err(CellularImsError::new("volte_ims_preferred_profile_active"));
+        }
+    }
+    if !observed {
+        return Err(CellularImsError::new(
+            "volte_ims_profile_activity_unavailable",
+        ));
+    }
+    Ok(())
 }
 
 /// Enable or disable Qualcomm P-CSCF delivery for one IMS profile.
@@ -1240,17 +1290,59 @@ IPv4 primary DNS: 10.0.0.53";
     }
 
     #[test]
-    fn ims_profile_rewrites_fixed_cid_instead_of_allocating_unsupported_cid() {
+    fn ims_profile_preserves_existing_definitions_instead_of_overwriting_them() {
         let contexts = parse_pdp_contexts(
             "response: '+CGDCONT: 1,\"IPV4V6\",\"\",\"0.0.0.0\",0,0\n+CGDCONT: 2,\"IPV4V6\",\"\",\"0.0.0.0\",0,0'",
         );
+        assert!(select_ims_profile_context(&contexts, 2, "ims").is_err());
+        let occupied = parse_pdp_contexts("+CGDCONT: 2,\"IPV4V6\",\"internet\"");
+        assert!(select_ims_profile_context(&occupied, 2, "ims").is_err());
+        // No arbitrary higher CID is allocated when the preferred one is busy.
+        let all = (1..=16)
+            .map(|cid| PdpContext {
+                cid,
+                pdp_type: "IPV4V6".into(),
+                apn: "internet".into(),
+            })
+            .collect::<Vec<_>>();
+        assert!(select_ims_profile_context(&all, 2, "ims").is_err());
+    }
+
+    #[test]
+    fn ims_profile_reuses_matching_definitions_or_only_the_absent_preferred_cid() {
+        let contexts =
+            parse_pdp_contexts("+CGDCONT: 1,\"IPV4V6\",\"internet\"\n+CGDCONT: 7,\"IPV6\",\"IMS\"");
         assert_eq!(
-            select_ims_profile_context(&contexts, 2, "ims"),
+            select_ims_profile_context(&contexts, 2, "ims").unwrap(),
             ImsProfileContext {
-                cid: 2,
-                created: true,
+                cid: 7,
+                created: false
             }
         );
+        assert_eq!(
+            select_ims_profile_context(&contexts[..1], 2, "ims").unwrap(),
+            ImsProfileContext {
+                cid: 2,
+                created: true
+            }
+        );
+        assert!(select_ims_profile_context(&[], 0, "ims").is_err());
+    }
+
+    #[test]
+    fn ims_profile_definition_requires_an_unambiguous_inactive_observation() {
+        assert!(ensure_profile_inactive("response: '+CGACT: 1,1\n+CGACT: 2,0'", 2).is_ok());
+        assert!(ensure_profile_inactive("+CGACT: 1,1", 2).is_ok());
+        for response in [
+            "+CGACT: 2,1",
+            "+CGACT: 2,2",
+            "+CGACT: 2",
+            "+CGACT: x,0",
+            "ERROR",
+            "",
+        ] {
+            assert!(ensure_profile_inactive(response, 2).is_err(), "{response}");
+        }
     }
 
     #[test]

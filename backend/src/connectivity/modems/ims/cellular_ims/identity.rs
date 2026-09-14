@@ -68,6 +68,56 @@ pub fn parse_ef_ad_mnc_length(output: &str) -> Option<usize> {
     None
 }
 
+/// Decode the fixed READ BINARY EF_AD reply, never a failed/status-only CRSM
+/// response or a partial payload. This is read-only SIM access (TS 27.007).
+pub fn parse_crsm_ef_ad_mnc_length(output: &str) -> Option<u8> {
+    let mut replies = output.lines().filter_map(|line| {
+        let line = line.trim();
+        let line = line
+            .strip_prefix("response:")
+            .unwrap_or(line)
+            .trim()
+            .trim_matches('\'')
+            .trim();
+        line.strip_prefix("+CRSM:")
+    });
+    let reply = replies.next()?;
+    if replies.next().is_some() {
+        return None;
+    }
+    let fields = reply.split(',').map(str::trim).collect::<Vec<_>>();
+    if fields.len() != 3
+        || fields[0].parse::<u8>().ok()? != 0x90
+        || fields[1].parse::<u8>().ok()? != 0
+    {
+        return None;
+    }
+    let hex = fields[2].strip_prefix('"')?.strip_suffix('"')?;
+    if hex.len() != 8 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let length = u8::from_str_radix(&hex[6..8], 16).ok()? & 0x0f;
+    matches!(length, 2 | 3).then_some(length)
+}
+
+/// Recover missing MNC-length metadata without guessing a carrier rule.
+/// Bracket the read with IMSI observations so stale MM metadata or a SIM swap
+/// cannot attach another subscription's EF_AD to the pending IMS identity.
+pub async fn read_mnc_length_via_at<F, Fut>(imsi: &str, mut query: F) -> Option<u8>
+where
+    F: FnMut(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let before = query("AT+CIMI").await.ok()?;
+    if parse_cimi_response(&before).as_deref() != Some(imsi) {
+        return None;
+    }
+    let response = query("AT+CRSM=176,28589,0,0,4").await.ok()?;
+    let length = parse_crsm_ef_ad_mnc_length(&response)?;
+    let after = query("AT+CIMI").await.ok()?;
+    (parse_cimi_response(&after).as_deref() == Some(imsi)).then_some(length)
+}
+
 /// Resolve the IMS home PLMN from authoritative subscription-owned data.
 ///
 /// The serving PLMN is deliberately not accepted here: while roaming it names
@@ -105,6 +155,44 @@ pub fn resolve_home_plmn(
         mnc,
         mnc_length_source: source,
     })
+}
+
+/// Select the requested one-based QMI slot before interpreting any AID.
+/// qmicli 1.28/1.32 use `Slot [n]:`, not an MM modem index or the reference
+/// package's zero-based mock card labels. Missing/duplicate slot sections are
+/// ambiguous and must not borrow an application from another subscription.
+pub fn parse_uicc_applications_for_slot(output: &str, slot: u8) -> UiccApplications {
+    if slot == 0 {
+        return UiccApplications::default();
+    }
+    let mut selected = String::new();
+    let mut active = false;
+    let mut found = false;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("slot ["))
+        {
+            active = trimmed
+                .get(6..)
+                .and_then(|rest| rest.strip_suffix("]:"))
+                .and_then(|number| number.parse::<u8>().ok())
+                == Some(slot);
+            if active {
+                if found {
+                    return UiccApplications::default();
+                }
+                found = true;
+            }
+            continue;
+        }
+        if active {
+            selected.push_str(line);
+            selected.push('\n');
+        }
+    }
+    parse_uicc_applications(&selected)
 }
 
 /// Extract USIM/ISIM application identifiers from `qmicli
@@ -508,6 +596,110 @@ Application ID: 'A0:00:00:00:87:10:04:FF:86:FF'
             parse_uicc_applications("Application ID:\n  Application ID: 'a0000000871004'\n");
         assert!(applications.usim_aid.is_none());
         assert_eq!(applications.isim_aid.as_deref(), Some(ISIM_AID_PREFIX));
+    }
+
+    #[test]
+    fn uicc_applications_are_scoped_to_the_requested_one_based_slot() {
+        let output = concat!(
+            "Provisioning applications:\n  Primary GW: slot '1', application '1'\n",
+            "Slot [1]:\n  Card state: 'present'\n  Application ID:\n    A0:00:00:00:87:10:02:01\n",
+            "Slot [2]:\n  Card state: 'present'\n  Application ID:\n    A0:00:00:00:87:10:02:02:02:02\n",
+            "  Application ID: 'a0000000871004ff'\n",
+        );
+        let first = parse_uicc_applications_for_slot(output, 1);
+        assert_eq!(
+            first.usim_aid.as_deref(),
+            Some(&[0xa0, 0, 0, 0, 0x87, 0x10, 2, 1][..])
+        );
+        assert!(first.isim_aid.is_none());
+        let second = parse_uicc_applications_for_slot(output, 2);
+        assert_eq!(second.usim_aid.as_ref().unwrap().last(), Some(&2));
+        assert!(second.isim_aid.is_some());
+        for slot in [0, 3] {
+            assert_eq!(
+                parse_uicc_applications_for_slot(output, slot),
+                UiccApplications::default()
+            );
+        }
+    }
+
+    #[test]
+    fn uicc_slot_parser_rejects_unscoped_duplicate_and_malformed_sections() {
+        for output in [
+            "Application ID: 'a0000000871002'\n",
+            "Card [0]:\n  Application ID: 'a0000000871002'\n",
+            "Slot [1]:\n  Application ID: 'a0000000871002'\nSlot [1]:\n  Application ID: 'a0000000871002ff'\n",
+            "Slot [1]:\nSlot [invalid]:\n  Application ID: 'a0000000871002'\n",
+        ] {
+            assert_eq!(parse_uicc_applications_for_slot(output, 1), UiccApplications::default(), "{output}");
+        }
+    }
+
+    #[test]
+    fn crsm_ef_ad_requires_success_and_exact_read_binary_payload() {
+        assert_eq!(
+            parse_crsm_ef_ad_mnc_length("+CRSM: 144,0,\"00000182\"\r\nOK"),
+            Some(2)
+        );
+        assert_eq!(
+            parse_crsm_ef_ad_mnc_length("response: '+CRSM: 144,0,\"00000183\"'"),
+            Some(3)
+        );
+        for output in [
+            "+CRSM: 106,130,\"00000183\"",
+            "+CRSM: 144,1,\"00000183\"",
+            "+CRSM: 144,0",
+            "+CRSM: 144,0,00000183",
+            "+CRSM: 144,0,\"000083\"",
+            "+CRSM: 144,0,\"0000018300\"",
+            "+CRSM: 144,0,\"0000018z\"",
+            "+CRSM: 144,0,\"000001ff\"",
+            "unrelated +CRSM: 144,0,\"00000183\"",
+            "+CRSM: 144,0,\"00000182\"\n+CRSM: 144,0,\"00000183\"",
+        ] {
+            assert_eq!(parse_crsm_ef_ad_mnc_length(output), None, "{output}");
+        }
+    }
+
+    #[tokio::test]
+    async fn at_mnc_fallback_is_read_only_and_requires_stable_imsi() {
+        let imsi = "310260123456789";
+        for (before, response, after, expected, queries) in [
+            (imsi, Ok("+CRSM: 144,0,\"00000183\""), imsi, Some(3), 3),
+            (
+                "310260987654321",
+                Ok("+CRSM: 144,0,\"00000183\""),
+                imsi,
+                None,
+                1,
+            ),
+            (
+                imsi,
+                Ok("+CRSM: 144,0,\"00000183\""),
+                "310260987654321",
+                None,
+                3,
+            ),
+            (imsi, Ok("+CRSM: 106,130"), imsi, None, 2),
+            (imsi, Err("unavailable"), imsi, None, 2),
+        ] {
+            let mut replies = std::collections::VecDeque::from([
+                Ok(before.to_string()),
+                response.map(str::to_string).map_err(str::to_string),
+                Ok(after.to_string()),
+            ]);
+            let mut commands = Vec::new();
+            let result = read_mnc_length_via_at(imsi, |command| {
+                commands.push(command);
+                std::future::ready(replies.pop_front().unwrap())
+            })
+            .await;
+            assert_eq!(result, expected);
+            assert_eq!(commands.len(), queries);
+            assert!(commands
+                .iter()
+                .all(|command| matches!(*command, "AT+CIMI" | "AT+CRSM=176,28589,0,0,4")));
+        }
     }
 
     #[test]

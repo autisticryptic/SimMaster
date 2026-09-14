@@ -14674,6 +14674,45 @@ mod tests {
     }
 
     #[test]
+    fn cellular_ims_profile_batch_preserves_provider_wedge_across_error_conversion() {
+        use crate::connectivity::modems::ims::cellular_ims::native_bearer::cellular_ims_error_from_ims_bearer;
+        use crate::hardware::devices::transport::{
+            ImsBearerError, ImsBearerErrorKind, ImsBearerFailureHint,
+        };
+        for kind in [
+            ImsBearerErrorKind::SessionStartFailed,
+            ImsBearerErrorKind::NetdevUnresolved,
+        ] {
+            for detail in ["opaque provider failure", "prefix-unavailable"] {
+                let error = cellular_ims_error_from_ims_bearer(ImsBearerError {
+                    kind,
+                    hint: ImsBearerFailureHint::BasebandWedged,
+                    detail: detail.into(),
+                });
+                let mut attempts = 0;
+                for attempt in 1..=3 {
+                    attempts += 1;
+                    let action = cellular_ims_profile_batch_action(true, attempt, 3, Some(&error));
+                    if action != CellularImsProfileBatchAction::Continue {
+                        assert_eq!(action, CellularImsProfileBatchAction::AbortUnsafe);
+                        break;
+                    }
+                }
+                assert_eq!(attempts, 1);
+                let ordinary = cellular_ims_error_from_ims_bearer(ImsBearerError {
+                    kind,
+                    hint: ImsBearerFailureHint::None,
+                    detail: detail.into(),
+                });
+                assert_eq!(
+                    cellular_ims_profile_batch_action(true, 1, 3, Some(&ordinary)),
+                    CellularImsProfileBatchAction::Continue
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cellular_ims_profile_batch_waits_for_cellular_registration_without_fallback() {
         assert_eq!(
             simulate_cellular_ims_profile_batch(&[
