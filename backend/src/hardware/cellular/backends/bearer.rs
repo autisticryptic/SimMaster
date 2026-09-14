@@ -579,13 +579,19 @@ fn parse_mbim_ip_configuration(text: &str) -> Result<qmi_wds::CurrentSettings, N
     let mut addresses = false;
     let mut dns = false;
     for line in text.lines().map(str::trim) {
-        if line.starts_with("IPv4 configuration") {
+        // mbimcli prefixes family headers with [device-path]. Normalize only
+        // the header candidate, leaving IP/DNS indices and field values intact.
+        let header = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once(']'))
+            .map_or(line, |(_, rest)| rest.trim_start());
+        if header.starts_with("IPv4 configuration available:") {
             family = 4;
             addresses = false;
             dns = false;
             continue;
         }
-        if line.starts_with("IPv6 configuration") {
+        if header.starts_with("IPv6 configuration available:") {
             family = 6;
             addresses = false;
             dns = false;
@@ -978,6 +984,55 @@ impl CellularDataTransport for NativeDataTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mbim_parser_accepts_real_device_prefixed_dual_stack_output() {
+        // mbimcli-helpers.c prints no IP/DNS section headings; only the
+        // per-family summary has a device path in brackets.
+        let settings = parse_mbim_ip_configuration(concat!(
+            "\n[/dev/cdc-wdm0] IPv4 configuration available: 'address, gateway, dns, mtu'\n",
+            "     IP [0]: '192.0.2.9/30'\n",
+            "    Gateway: '192.0.2.10'\n",
+            "    DNS [0]: '192.0.2.53'\n",
+            "        MTU: '1500'\n",
+            "\n[/dev/cdc-wdm0] IPv6 configuration available: 'address, gateway, dns, mtu'\n",
+            "     IP [0]: '2001:db8::9/64'\n",
+            "    Gateway: 'fe80::1'\n",
+            "    DNS [0]: '2001:db8::53'\n",
+            "        MTU: '1500'\n",
+        ))
+        .unwrap();
+        assert_eq!(settings.ipv4_address.as_deref(), Some("192.0.2.9"));
+        assert_eq!(settings.ipv4_prefix, Some(30));
+        assert_eq!(settings.ipv4_gateway.as_deref(), Some("192.0.2.10"));
+        assert_eq!(settings.ipv4_dns, vec!["192.0.2.53"]);
+        assert_eq!(settings.ipv6_address.as_deref(), Some("2001:db8::9"));
+        assert_eq!(settings.ipv6_prefix, Some(64));
+        assert_eq!(settings.ipv6_gateway.as_deref(), Some("fe80::1"));
+        assert_eq!(settings.ipv6_dns, vec!["2001:db8::53"]);
+    }
+
+    #[test]
+    fn mbim_prefixed_headers_preserve_single_family_and_validation() {
+        let settings = parse_mbim_ip_configuration(concat!(
+            "[/dev/cdc-wdm0] IPv4 configuration available: 'none'\n",
+            "[/dev/cdc-wdm0] IPv6 configuration available: 'address'\n",
+            "     IP [0]: '2001:db8::9/64'\n",
+        ))
+        .unwrap();
+        assert!(settings.ipv4_address.is_none());
+        assert_eq!(settings.ipv6_address.as_deref(), Some("2001:db8::9"));
+        assert!(parse_mbim_ip_configuration(concat!(
+            "[/dev/cdc-wdm0] IPv6 configuration available: 'address'\n",
+            "     IP [0]: '192.0.2.9/30'\n",
+        ))
+        .is_err());
+        assert!(parse_mbim_ip_configuration(concat!(
+            "unrelated IPv4 configuration available: 'address'\n",
+            "     IP [0]: '192.0.2.9/30'\n",
+        ))
+        .is_err());
+    }
 
     #[test]
     fn mbim_parser_accepts_explicit_dns_labels_without_section_headers() {

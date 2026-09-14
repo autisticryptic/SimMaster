@@ -113,57 +113,73 @@ pub fn resolve_home_plmn(
 /// is determined by the registered 3GPP RID, not by application order.
 pub fn parse_uicc_applications(output: &str) -> UiccApplications {
     let mut applications = UiccApplications::default();
-    for line in output.lines() {
-        // Filter only the value after the field label. Letters from
-        // "Application ID" itself are valid hex characters and must not be
-        // allowed to contaminate a discovered AID.
+    let mut lines = output.lines().peekable();
+    while let Some(line) = lines.next() {
+        // Match the field, never hex letters from labels or unrelated text.
         let Some((label, value)) = line.split_once(':') else {
             continue;
         };
         if !label.trim().eq_ignore_ascii_case("application id") {
             continue;
         }
-        let value = value.trim();
-        let value = if let Some(quote) = value.chars().next().filter(|c| matches!(c, '\'' | '"')) {
-            let Some(value) = value
-                .strip_prefix(quote)
-                .and_then(|v| v.strip_suffix(quote))
-            else {
+        let decoded = if value.trim().is_empty() {
+            // qmicli-uim prints Application ID on its own line, followed by
+            // one more-indented hex row (the maximum 16-byte AID fits in it).
+            // Do not scan through blank rows or consume the next field.
+            let Some(next) = lines.peek().copied() else {
                 continue;
             };
-            value
-        } else {
-            value
-        };
-        if !value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() || byte == b':' || byte.is_ascii_whitespace())
-        {
-            continue;
-        }
-        let compact = value
-            .bytes()
-            .filter(|byte| byte.is_ascii_hexdigit())
-            .map(|byte| (byte as char).to_ascii_lowercase())
-            .collect::<String>();
-        for (prefix, target) in [
-            ("a0000000871002", &mut applications.usim_aid),
-            ("a0000000871004", &mut applications.isim_aid),
-        ] {
-            if !compact.starts_with(prefix) {
+            let indentation = |text: &str| text.len() - text.trim_start().len();
+            if indentation(next) <= indentation(line) {
                 continue;
             }
-            if let Some(decoded) = decode_hex_aid(&compact) {
-                if target
-                    .as_ref()
-                    .is_none_or(|current| decoded.len() > current.len())
-                {
-                    *target = Some(decoded);
-                }
-            }
+            let Some(decoded) = parse_aid_field(next) else {
+                continue;
+            };
+            lines.next();
+            decoded
+        } else {
+            let Some(decoded) = parse_aid_field(value) else {
+                continue;
+            };
+            decoded
+        };
+        let target = if decoded.starts_with(USIM_AID_PREFIX) {
+            &mut applications.usim_aid
+        } else if decoded.starts_with(ISIM_AID_PREFIX) {
+            &mut applications.isim_aid
+        } else {
+            continue;
+        };
+        if target
+            .as_ref()
+            .is_none_or(|current| decoded.len() > current.len())
+        {
+            *target = Some(decoded);
         }
     }
     applications
+}
+
+fn parse_aid_field(value: &str) -> Option<Vec<u8>> {
+    let value = value.trim();
+    let value = if let Some(quote) = value.chars().next().filter(|c| matches!(c, '\'' | '"')) {
+        value.strip_prefix(quote)?.strip_suffix(quote)?
+    } else {
+        value
+    };
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit() || byte == b':' || byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let compact = value
+        .bytes()
+        .filter(|byte| byte.is_ascii_hexdigit())
+        .map(char::from)
+        .collect::<String>();
+    decode_hex_aid(&compact)
 }
 
 fn decode_hex_aid(value: &str) -> Option<Vec<u8>> {
@@ -446,6 +462,52 @@ Application ID: 'A0:00:00:00:87:10:04:FF:86:FF'
                 .usim_aid
                 .is_some()
         );
+    }
+
+    #[test]
+    fn application_ids_accept_real_qmicli_indented_value_rows() {
+        // qmicli-uim.c emits a separate, more-indented raw-data row.
+        let applications = parse_uicc_applications(concat!(
+            "\tApplication [1]:\n",
+            "\t\tApplication type:  'usim (2)'\n",
+            "\t\tApplication state: 'ready'\n",
+            "\t\tApplication ID:\n",
+            "\t\t\tA0:00:00:00:87:10:02:01:02:03:04:05:06:07:08:09\n",
+            "\tApplication [2]:\n",
+            "\t\tApplication type:  'isim (5)'\n",
+            "\t\tApplication ID:\n",
+            "\t\t\tA0:00:00:00:87:10:04:FF:86:FF\n",
+        ));
+        assert_eq!(
+            applications.usim_aid.as_deref(),
+            Some(&[0xa0, 0, 0, 0, 0x87, 0x10, 2, 1, 2, 3, 4, 5, 6, 7, 8, 9,][..])
+        );
+        assert_eq!(
+            applications.isim_aid.as_deref(),
+            Some(&[0xa0, 0, 0, 0, 0x87, 0x10, 4, 0xff, 0x86, 0xff,][..])
+        );
+    }
+
+    #[test]
+    fn application_id_continuations_cannot_escape_their_field() {
+        for output in [
+            "Application ID:\nA0:00:00:00:87:10:02\n",
+            "Application ID:\n\n  A0:00:00:00:87:10:02\n",
+            "Application ID:\n  Application state: 'ready'\n  A0:00:00:00:87:10:02\n",
+            "Application ID:\n  a0000000871002f\n",
+            "Application ID:\n  a0000000871002ffffffffffffffffffff00\n",
+            "Application ID:\n  'a0000000871002\n",
+        ] {
+            assert_eq!(
+                parse_uicc_applications(output),
+                UiccApplications::default(),
+                "{output}"
+            );
+        }
+        let applications =
+            parse_uicc_applications("Application ID:\n  Application ID: 'a0000000871004'\n");
+        assert!(applications.usim_aid.is_none());
+        assert_eq!(applications.isim_aid.as_deref(), Some(ISIM_AID_PREFIX));
     }
 
     #[test]
