@@ -104,8 +104,13 @@
 混合 owner、自动代次恢复及协议/厂商扩展仍有缺口，不能将 M1/M2 或完整替代勾为完成。
 具体范围、限制、接续入口和 CI 状态见
 [原生后端逻辑候选状态](NATIVE_BACKEND_LOGIC_STATUS.md)。
-`b94c9c2` 已通过两套 Actions 回归/双架构构建，发布 skipped；
-仅表示该逻辑候选已过 CI，不代表上述未完成项或实机验收通过。
+最新代码检查点为 **`f148842`**（2026-09-15 续接）：在 `3d2b363` 的 IMS IPv6/worker
+代次加固基础上，补齐原生接口归还确认、取消清理以及真实 qmicli/mbimcli 输出解析。
+[验证](https://github.com/autisticryptic/SimMaster/actions/runs/34872758400)与
+[双架构构建](https://github.com/autisticryptic/SimMaster/actions/runs/34872758415)均 success，
+发布 skipped；本轮没有部署或设备操作，版本仍为共同基线 `1.1.4-beta3`。
+接口归还失败时保留 receipt 不等于自动恢复完成；仅表示该逻辑候选已过 CI，
+不代表上述未完成项或实机验收通过。
 
 | 版本 | 定位 | ModemManager | 原生后端 | 交付结果 |
 | --- | --- | --- | --- | --- |

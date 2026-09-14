@@ -2,7 +2,9 @@
 
 > **新阶段入口**：用户随后在 2026-09-13 授权自有设备实测。最新过程见
 > [Native 自有设备实测与交接](NATIVE_BACKEND_DEVICE_VALIDATION_2026-09-13.md)。
+> 该实测记录目前为本地未跟踪文件，新 clone 不能假定包含它。
 > 下文保留先前“仅逻辑、延期验收”阶段的范围和结论，不代表新阶段仍禁止测试。
+> 2026-09-15 续接仅完成代码与 CI 收尾，没有重新连接、部署或操作设备。
 
 > 2026-09-13，`dev/1.1.5-modem-backends`。
 > 用户要求先推进非 MM 逻辑；现阶段继续以 MM 为主，等 IMS 多卡基线收敛后再做接管测试。
@@ -51,13 +53,15 @@
 
 ## 3. 仍未完成或未覆盖
 
-### 3.1 本轮离线逻辑强化（2026-09-14）
+### 3.1 离线逻辑强化（2026-09-14，2026-09-15 续接并通过 CI）
 
-- `identity.rs` 修正 EF_AD 低半字节读取、IMSI 长度/MNC 校验，以及只从 `Application ID:` 字段解析 USIM/ISIM AID；异常/越界 AID 不再被截断接受。
+- `identity.rs` 修正 EF_AD 低半字节读取、IMSI 长度/MNC 校验，以及只从 `Application ID:` 字段解析 USIM/ISIM AID；兼容同一行值和 qmicli 真实的紧邻缩进值行，不能跨空行/其他字段扫描。异常/超过 16 字节的 AID 不再被截断接受。
 - UE worker 增加专用 `ImsIpv6AddrReplace` 和 `AddrWaitReady` 操作：只有 IMS IPv6 使用 `nodad noprefixroute`，普通数据、veth、VoWiFi TUN 保留正常 DAD；P-CSCF/DNS 路由前在同一 namespace 验证精确接口地址非 tentative、非 dadfailed 且仍有效。
 - 网络配置批次现在捕获并复核 worker generation；请求不会在代次变化后重放到替换 worker。Native IMS/普通数据路由使用原始 binding，并检查 worker 返回的 `ok/error`，避免路由失败被报告为成功。
-- MBIM IP 配置解析改为严格校验地址族、前缀、网关/DNS，去重并拒绝未标记或跨族值；普通 native 数据网关先建立 host route，再安装对应族默认路由。
-- 这些改动仅完成离线代码/格式层面的强化，尚未经过 Rust 编译、Actions 或设备验证；SIM-04 仍没有 AKA/SIP 注册证据。
+- MBIM IP 配置解析改为严格校验地址族、前缀、网关/DNS，去重并拒绝未标记或跨族值；识别真实 mbimcli 输出中带 `[设备路径]` 的地址族标题和没有分组标题的 IP/DNS 字段。普通 native 数据网关先建立 host route，再安装对应族默认路由。
+- Native 接口归还必须由原 worker binding 串行执行，再由 provider 核对宿主接口/物理 owner 并保存确认。归还失败、取消、旧 generation 或确认写盘失败时保留 namespace receipt 与接口占用；停止 WDS/MBIM 不再被误当成接口已归还。未确认的 Drop 清理仍停止已知会话，但不删除恢复账本。
+- worker 的 net-config/socket 请求采用作用域清理 guard，调用方取消时立即移除 pending 关联项；它不取消已经入队的内核操作，资源仍须显式释放或保留 receipt。
+- 这些改动已在 `f148842` 通过 Rust 编译、回归、前端和双架构 Actions（见第 5 节）；本轮未部署或做设备验证，SIM-04 仍没有 AKA/SIP 注册证据。
 
 不能因为代码能够构建，就将以下项目标记完成：
 
@@ -113,15 +117,38 @@ API 的 `hardware_validated: false`、`native_hardware_validation: deferred` 是
 - 后续收尾增加：拨号调用者取消后的已确认呼叫清理；协议明确拒绝与结果不确定的
   区分；SMS 删除在同一物理门内核对 SIM/内容，保留部分清理进度；
   lpac 超时后等待子进程退出再释放操作门。
-- 安全收尾提交为 `b1caafe`、`b94c9c2`。最新 **`b94c9c2`** 的
+- 该阶段安全收尾提交为 `b1caafe`、`b94c9c2`。当时最终检查点 **`b94c9c2`** 的
   [Validate Beta Refactor](https://github.com/autisticryptic/SimMaster/actions/runs/34740891966)
   与 [Build-Release](https://github.com/autisticryptic/SimMaster/actions/runs/34740891971)
   均 success，包含新增/原有离线回归、私有 D-Bus API 测试、前端和 arm64/amd64 构建；
   `Publish Release` 已核对为 skipped。中间 `b1caafe` 两套 workflow 也均 success。
-- 本地49项 Python检查与 Rust格式/语法、shell语法检查通过；没有本地 Rust 构建，
+- 该阶段本地49项 Python检查与 Rust格式/语法、shell语法检查通过；没有本地 Rust 构建，
   没有部署、发布或 native 硬件测试。
 
-**当前检查点**：本轮逻辑候选已提交并通过 CI，但第 3 节的逻辑缺口仍未完成。
+### 2026-09-15 中断会话续接
+
+- 恢复断点时 `3d2b363` 仅在本地提交；本轮已推送，并补充 `7f38e39`
+  （namespace 归还确认、取消后的 pending 清理）和 `f148842`
+  （真实 qmicli 多行 AID、mbimcli 设备前缀解析）。没有覆盖原 IMS 分支或升版。
+- 最新代码 **`f148842fd8cee2100db6cc43be35b682ed8664ef`** 的
+  [Validate Beta Refactor](https://github.com/autisticryptic/SimMaster/actions/runs/34872758400) 与
+  [Build-Release](https://github.com/autisticryptic/SimMaster/actions/runs/34872758415) 均 success。
+  已逐 job 核对后端回归、私有 D-Bus API、前端和 arm64/amd64 构建成功，
+  `Publish Release` 为 skipped；前一轮 `7f38e39` 的两套 workflow 也通过。
+- 本地 **54 项 Python 边界/发布规则检查**、`cargo fmt --check` 和 `git diff --check`
+  通过。续接新增 **8 个无需硬件的 Rust 用例**，涵盖取消、未确认/失败归还、账本写入失败、
+  Drop 保留归属、真实 CLI 格式及损坏字段；Rust 编译/测试/打包仅由 Actions 执行。
+- 两架构 artifact 的 API 元数据均指向上述完整 SHA，查询时未过期：
+
+| Actions artifact | ID | API ZIP digest（SHA256） |
+| --- | --- | --- |
+| `pkg-amd64` | `10359803807` | `bf0604c5b2a2c5d6d8825df39fe28ee3038173dc96c4d503d263079e8001a4d3` |
+| `pkg-arm64` | `10358864149` | `c25fe45e35b629fc8f2ad4fdead69b8ececba62acf2409e7818e7584f6d3f8dc` |
+
+这些是 Actions artifact ZIP 的摘要，**不是**内部 tar.gz 或二进制摘要；本轮没有下载校验
+或部署。artifact 会过期，未来设备窗口仍须重新查询、下载并校验，不能直接复用历史路径。
+
+**当前检查点（2026-09-15）**：`f148842` 代码候选已推送并通过 CI，但第 3 节的逻辑缺口仍未完成。
 下一名开发 agent 应从混合 owner / 代次恢复等项目继续，不把本轮当作完整替代已完成，
 也不提前在 IMS 验证设备启用 `native`。
 
