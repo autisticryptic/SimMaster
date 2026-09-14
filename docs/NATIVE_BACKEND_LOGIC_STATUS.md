@@ -63,6 +63,15 @@
 - worker 的 net-config/socket 请求采用作用域清理 guard，调用方取消时立即移除 pending 关联项；它不取消已经入队的内核操作，资源仍须显式释放或保留 receipt。
 - 这些改动已在 `f148842` 通过 Rust 编译、回归、前端和双架构 Actions（见第 5 节）；本轮未部署或做设备验证，SIM-04 仍没有 AKA/SIP 注册证据。
 
+### 3.2 1.1.5 身份与 IMS 兜底强化（2026-09-15，6391732）
+
+- qmicli 应用枚举先按实际 one-based `Slot [n]` 筛选，再解析 AID；完整 AID 复用于 UIM 身份读取，不从其他槽位借用应用。
+- IMS 的 CIMI 查询经统一 AT facade；MNC 元数据缺失时增加只读 CRSM/EF_AD 路径，前后核对同一 IMSI并限制总预算为 12 秒，不猜测 MNC 或修改 SIM 配置。
+- 两条自动 profile resolver 共用 home 边界：显式 SIM 事实优先，否则有效自定义元数据与 catalog 规则须无冲突。拒绝两位/三位 MNC 最长前缀猜选、一位 MNC；唯一自定义归属元数据可支撑缺库时的 derived 兜底，显式 pin 语义不变。
+- PDP 准备不覆写已有定义/空 APN 占位项；只复用匹配项，或定义已确认缺失且未活动的 preferred CID。不假定其他空闲 CID 被设备支持；无法确认时不写该定义，保留既有 APN-only 后续路径。
+- provider 的 `BasebandWedged` 信号有独立错误码，贯通 family/profile 两层终止与前端提示；普通失败不被错误升级为永久 netdev 故障。
+- 本轮只完成逻辑与 CI。P-CSCF 来源/override 优先级、DNS RR owner/CNAME/SRV 端口处理、配置预览与 runtime effective 一致性仍待后续完成；硬件/混合 owner 门槛不变。
+
 不能因为代码能够构建，就将以下项目标记完成：
 
 1. **硬件验收全部延期**：BAM-DMUX/data-port 映射、QMI/MBIM 固件差异、SIM/AKA、
@@ -130,7 +139,7 @@ API 的 `hardware_validated: false`、`native_hardware_validation: deferred` 是
 - 恢复断点时 `3d2b363` 仅在本地提交；本轮已推送，并补充 `7f38e39`
   （namespace 归还确认、取消后的 pending 清理）和 `f148842`
   （真实 qmicli 多行 AID、mbimcli 设备前缀解析）。没有覆盖原 IMS 分支或升版。
-- 最新代码 **`f148842fd8cee2100db6cc43be35b682ed8664ef`** 的
+- 该次代码 **`f148842fd8cee2100db6cc43be35b682ed8664ef`** 的
   [Validate Beta Refactor](https://github.com/autisticryptic/SimMaster/actions/runs/34872758400) 与
   [Build-Release](https://github.com/autisticryptic/SimMaster/actions/runs/34872758415) 均 success。
   已逐 job 核对后端回归、私有 D-Bus API、前端和 arm64/amd64 构建成功，
@@ -148,7 +157,24 @@ API 的 `hardware_validated: false`、`native_hardware_validation: deferred` 是
 这些是 Actions artifact ZIP 的摘要，**不是**内部 tar.gz 或二进制摘要；本轮没有下载校验
 或部署。artifact 会过期，未来设备窗口仍须重新查询、下载并校验，不能直接复用历史路径。
 
-**当前检查点（2026-09-15）**：`f148842` 代码候选已推送并通过 CI，但第 3 节的逻辑缺口仍未完成。
+### 2026-09-15 后续开发与候选校验
+
+- 最新代码 **`63917329b0e09a074c6e526997b67e9db4df36c9`** 已推送；
+  [Validate Beta Refactor](https://github.com/autisticryptic/SimMaster/actions/runs/34877802604)、
+  [Frontend Checks](https://github.com/autisticryptic/SimMaster/actions/runs/34877802618) 和
+  [Build-Release](https://github.com/autisticryptic/SimMaster/actions/runs/34877802723) 均 success。
+  已核对 Rust 回归、前端与 arm64/amd64 成功，Publish Release skipped。
+- 本地 58 项 Python 边界/发布规则、6 项前端 unit、rustfmt/diff 通过；Rust 回归净增 11 项，
+  另将既有 PDP 覆写用例改为保护现存定义，并把 plan 回归组接入两套 workflow。
+- arm64 artifact `10361877321` 已下载，ZIP SHA256 与 GitHub API digest 一致：
+  `a7047c322c493bbb9b48d3ef097849f1ae39840d4dcf9f76636b441be95f84dd`。
+  内部包 metadata 的 commit/版本/架构以及 ELF64 AArch64、嵌入短 commit/分支均已核对；
+  二进制 SHA256 为 `bfee39504de0a871192f0a35295bf02cd0a54a91499bd9d4265e31079e51ed5f`。
+  没有执行或部署二进制，也没有任何新设备注册结果。
+- 用户后续实测范围仅 SIM-04 IMS 注册、保持 MM；混合后端实测明确留给其他设备。
+  目前远程入口前置条件未满足，新的实时基线与设备窗口均未开始。
+
+**当前检查点（2026-09-15）**：`6391732` 代码候选已推送并通过 CI，但第 3 节的逻辑缺口仍未完成。
 下一名开发 agent 应从混合 owner / 代次恢复等项目继续，不把本轮当作完整替代已完成，
 也不提前在 IMS 验证设备启用 `native`。
 

@@ -104,11 +104,15 @@
 混合 owner、自动代次恢复及协议/厂商扩展仍有缺口，不能将 M1/M2 或完整替代勾为完成。
 具体范围、限制、接续入口和 CI 状态见
 [原生后端逻辑候选状态](NATIVE_BACKEND_LOGIC_STATUS.md)。
-最新代码检查点为 **`f148842`**（2026-09-15 续接）：在 `3d2b363` 的 IMS IPv6/worker
-代次加固基础上，补齐原生接口归还确认、取消清理以及真实 qmicli/mbimcli 输出解析。
-[验证](https://github.com/autisticryptic/SimMaster/actions/runs/34872758400)与
-[双架构构建](https://github.com/autisticryptic/SimMaster/actions/runs/34872758415)均 success，
-发布 skipped；本轮没有部署或设备操作，版本仍为共同基线 `1.1.4-beta3`。
+最新代码检查点为 **`6391732`**（2026-09-15）：继 `3d2b363`/`7f38e39`/`f148842`
+的 IMS IPv6、worker 代次、归还确认与 CLI 解析之后，继续补齐槽位绑定的 SIM 身份、
+只读 EF_AD 兜底、自动归属 MNC 边界、PDP 防覆写和基带异常的整批重试终止。
+[验证](https://github.com/autisticryptic/SimMaster/actions/runs/34877802604)、
+[前端](https://github.com/autisticryptic/SimMaster/actions/runs/34877802618)与
+[双架构构建](https://github.com/autisticryptic/SimMaster/actions/runs/34877802723)均 success，
+发布 skipped；arm64 候选已下载校验，但未部署或操作设备，版本仍为共同基线 `1.1.4-beta3`。
+下一设备窗口仅允许 SIM-04 IMS 注册、保持 MM；混合后端实机测试留给其他设备。
+当前远程入口前置条件未满足，不把候选准备写成设备测试通过。
 接口归还失败时保留 receipt 不等于自动恢复完成；仅表示该逻辑候选已过 CI，
 不代表上述未完成项或实机验收通过。
 
