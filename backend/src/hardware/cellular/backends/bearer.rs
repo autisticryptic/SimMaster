@@ -155,6 +155,11 @@ impl Session {
                 }
             }
         }
+        // Stopping WDS/MBIM is not proof that a moved interface came home.
+        // Cancellation, a failed move or a stale worker can all leave the
+        // network side unresolved. Only explicit, verified restore clears
+        // this intent; Drop must not erase it after stopping the session.
+        clean &= self.namespace.is_empty();
         if clean {
             clean = self.device.io.clear_receipt(&self.receipt).is_ok();
             if clean {
@@ -164,8 +169,9 @@ impl Session {
                     .unwrap()
                     .remove(self.role.label());
             }
-        } else {
-            tracing::warn!(line_id = %self.device.spec.line_id(), role = self.role.label(), "Native cleanup incomplete; retaining ownership receipt");
+        }
+        if !clean {
+            tracing::warn!(line_id = %self.device.spec.line_id(), role = self.role.label(), namespace_pending = !self.namespace.is_empty(), "Native cleanup incomplete; retaining ownership receipt");
         }
         clean
     }
@@ -703,6 +709,40 @@ impl ImsBearerHandle for NativeHandle {
             .map_err(|e| ims_error(e, ImsBearerErrorKind::SessionLost))?;
         Ok(Box::new(()))
     }
+    fn confirm_namespace_restore<'a>(
+        &'a mut self,
+        namespace: &'a str,
+    ) -> TransportFuture<'a, Result<(), ImsBearerError>> {
+        Box::pin(async move {
+            let session = self.session.as_mut().ok_or_else(|| {
+                ims_error(
+                    NativeError::Unavailable("native_bearer_released".into()),
+                    ImsBearerErrorKind::SessionLost,
+                )
+            })?;
+            if namespace.is_empty() || session.namespace != namespace {
+                return Err(ims_error(
+                    NativeError::OwnerConflict("native_namespace_restore_mismatch".into()),
+                    ImsBearerErrorKind::SessionLost,
+                ));
+            }
+            // move_iface_out is best-effort when an interface is absent.
+            // Require the physical owner and an idle host-side netdev, not
+            // merely a successful command or a same-name namespace lookup.
+            session
+                .device
+                .io
+                .verify_bearer(&session.endpoint)
+                .await
+                .map_err(|error| ims_error(error, ImsBearerErrorKind::SessionLost))?;
+            let previous = std::mem::take(&mut session.namespace);
+            if let Err(error) = session.save(false) {
+                session.namespace = previous;
+                return Err(ims_error(error, ImsBearerErrorKind::SessionLost));
+            }
+            Ok(())
+        })
+    }
     fn release(
         mut self: Box<Self>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
@@ -1098,6 +1138,8 @@ mod tests {
     struct MemoryIo {
         requests: std::sync::Mutex<Vec<CommandRequest>>,
         receipts: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+        interface_available: AtomicBool,
+        reject_receipt_update: AtomicBool,
         failure: Option<&'static str>,
     }
     impl super::super::io::NativeIo for MemoryIo {
@@ -1149,9 +1191,22 @@ mod tests {
             &'a self,
             _endpoint: &'a NativeBearerConfig,
         ) -> TransportFuture<'a, Result<(), NativeError>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                if self.interface_available.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(NativeError::OwnerConflict(
+                        "fixture_interface_not_on_host".into(),
+                    ))
+                }
+            })
         }
         fn save_receipt(&self, key: &str, bytes: &[u8], create: bool) -> Result<(), NativeError> {
+            if !create && self.reject_receipt_update.load(Ordering::Acquire) {
+                return Err(NativeError::OwnerConflict(
+                    "fixture_receipt_update_failed".into(),
+                ));
+            }
             let mut receipts = self.receipts.lock().unwrap();
             if create && receipts.contains_key(key) {
                 return Err(NativeError::OwnerConflict("fixture_receipt_exists".into()));
@@ -1168,6 +1223,8 @@ mod tests {
         let io = Arc::new(MemoryIo {
             requests: Default::default(),
             receipts: Default::default(),
+            interface_available: AtomicBool::new(true),
+            reject_receipt_update: AtomicBool::new(false),
             failure,
         });
         let device = NativeDevice::new(
@@ -1222,6 +1279,120 @@ mod tests {
         assert!(requests
             .iter()
             .all(|r| r.tool == super::super::protocol::Tool::Qmi));
+    }
+
+    #[tokio::test]
+    async fn namespace_receipt_is_cleared_only_after_verified_restore() {
+        for scenario in [
+            "unconfirmed",
+            "missing_interface",
+            "wrong_namespace",
+            "write_failed",
+            "confirmed",
+        ] {
+            let (device, io) = memory_device(None);
+            let (_, mut handle) = begin(
+                device.clone(),
+                Role::Ims,
+                ApnConfig {
+                    apn: "ims".into(),
+                    ..Default::default()
+                },
+                vec![4],
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            let namespace = "sa-ue0123456789ab";
+            drop(handle.prepare_namespace_move(namespace).unwrap());
+            if scenario != "unconfirmed" {
+                io.interface_available
+                    .store(scenario != "missing_interface", Ordering::Release);
+                io.reject_receipt_update
+                    .store(scenario == "write_failed", Ordering::Release);
+                let target = if scenario == "wrong_namespace" {
+                    "sa-ueabcdef012345"
+                } else {
+                    namespace
+                };
+                let restored = handle.confirm_namespace_restore(target).await;
+                assert_eq!(restored.is_ok(), scenario == "confirmed", "{scenario}");
+            }
+            let key = receipt_path(&device, Role::Ims);
+            let saved: serde_json::Value =
+                serde_json::from_slice(io.receipts.lock().unwrap().get(&key).unwrap()).unwrap();
+            assert_eq!(
+                saved["namespace"],
+                if scenario == "confirmed" {
+                    ""
+                } else {
+                    namespace
+                },
+                "{scenario}"
+            );
+            handle.release().await;
+            assert_eq!(
+                io.receipts.lock().unwrap().is_empty(),
+                scenario == "confirmed",
+                "{scenario}"
+            );
+            assert_eq!(
+                device.active_interfaces.lock().unwrap().is_empty(),
+                scenario == "confirmed",
+                "{scenario}"
+            );
+            // Pending network ownership does not suppress safe modem cleanup.
+            assert!(io
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.arguments.iter().any(|arg| arg == "--wds-stop-network=42")));
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_handle_retains_unconfirmed_namespace_ownership() {
+        let (device, io) = memory_device(None);
+        let (_, mut handle) = begin(
+            device.clone(),
+            Role::Ims,
+            ApnConfig {
+                apn: "ims".into(),
+                ..Default::default()
+            },
+            vec![4],
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        drop(handle.prepare_namespace_move("sa-ue0123456789ab").unwrap());
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let released = io.requests.lock().unwrap().iter().any(|request| {
+                    request.arguments.iter().any(|arg| arg == "--wds-noop")
+                        && request.arguments.iter().any(|arg| arg == "--client-cid=17")
+                        && !request
+                            .arguments
+                            .iter()
+                            .any(|arg| arg == "--client-no-release-cid")
+                });
+                if released {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped native handle must finish bounded modem cleanup");
+        // Acquire the same operation gate to wait for the entire cleanup,
+        // not just the final command captured by the fake IO boundary.
+        let _guard = device.operation.lock().await;
+        assert!(!io.receipts.lock().unwrap().is_empty());
+        assert!(!device.active_interfaces.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

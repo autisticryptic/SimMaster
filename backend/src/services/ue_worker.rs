@@ -449,6 +449,24 @@ enum PendingRequest {
     Socket(oneshot::Sender<SocketCreateOutcome>),
 }
 
+/// Cancelling a caller must retire its correlation entry even if the worker
+/// never replies. This does not cancel a batch already executing in the UE;
+/// its resource owner must still drive teardown or retain its receipt.
+struct PendingRequestGuard<'a> {
+    core: &'a WorkerCore,
+    request_id: u64,
+}
+
+impl Drop for PendingRequestGuard<'_> {
+    fn drop(&mut self) {
+        self.core
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.request_id);
+    }
+}
+
 struct WorkerCore {
     line_id: String,
     namespace: NetnsName,
@@ -664,16 +682,18 @@ impl UeWorkerHandle {
             let mut guard = self.core.pending.lock().unwrap();
             guard.insert(request_id, PendingRequest::NetConfig(tx));
         }
+        let _request = PendingRequestGuard {
+            core: &self.core,
+            request_id,
+        };
         let sent = self.send(UeWorkerMessage::NetConfigRequest { request_id, ops });
         if !sent {
-            let mut guard = self.core.pending.lock().unwrap();
-            guard.remove(&request_id);
             return Err(UeWorkerError::Protocol(
                 "worker control channel is not up".to_string(),
             ));
         }
         drop(lifecycle);
-        let result = match tokio::time::timeout(NET_CONFIG_TIMEOUT, rx).await {
+        match tokio::time::timeout(NET_CONFIG_TIMEOUT, rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(UeWorkerError::Protocol(
                 "worker dropped the net-config request".to_string(),
@@ -681,9 +701,7 @@ impl UeWorkerHandle {
             Err(_) => Err(UeWorkerError::Protocol(format!(
                 "net-config request {request_id} timed out"
             ))),
-        };
-        self.core.pending.lock().unwrap().remove(&request_id);
-        result
+        }
     }
 
     /// Install an in-process control responder for unit tests that exercise
@@ -771,13 +789,15 @@ impl UeWorkerHandle {
             let mut guard = self.core.pending.lock().unwrap();
             guard.insert(request_id, PendingRequest::Socket(tx));
         }
+        let _request = PendingRequestGuard {
+            core: &self.core,
+            request_id,
+        };
         let sent = self.send(UeWorkerMessage::SocketCreateRequest {
             request_id,
             spec: spec.clone(),
         });
         if !sent {
-            let mut guard = self.core.pending.lock().unwrap();
-            guard.remove(&request_id);
             return Err(UeWorkerError::Protocol(
                 "worker control channel is not up".to_string(),
             ));
@@ -790,7 +810,6 @@ impl UeWorkerHandle {
                 ));
             }
             Err(_) => {
-                self.core.pending.lock().unwrap().remove(&request_id);
                 return Err(UeWorkerError::Protocol(format!(
                     "socket-create request {request_id} timed out"
                 )));
@@ -2727,6 +2746,59 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("generation changed"));
+        assert!(worker.core.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_net_config_retires_its_pending_entry_without_a_reply() {
+        let worker = UeWorkerHandle::for_line("test", NetnsName::for_line("sa-ue", "test"));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *worker.core.tx.lock().unwrap() = Some(tx);
+        let binding = worker.bind();
+        let caller = tokio::spawn(async move {
+            binding
+                .apply_net_config(vec![NetConfigOp::LinkSetUp {
+                    ifname: "wwan0".into(),
+                }])
+                .await
+        });
+        let request = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(request, UeWorkerMessage::NetConfigRequest { .. }));
+        assert_eq!(worker.core.pending.lock().unwrap().len(), 1);
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(worker.core.pending.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_socket_create_retires_its_pending_entry_without_a_reply() {
+        let worker = UeWorkerHandle::for_line("test", NetnsName::for_line("sa-ue", "test"));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *worker.core.tx.lock().unwrap() = Some(tx);
+        let requester = worker.clone();
+        let caller = tokio::spawn(async move {
+            requester
+                .create_socket(UeSocketSpec::udp_bound(
+                    "192.0.2.1:5060".parse().unwrap(),
+                    Some("wwan0".into()),
+                ))
+                .await
+        });
+        let request = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            request,
+            UeWorkerMessage::SocketCreateRequest { .. }
+        ));
+        assert_eq!(worker.core.pending.lock().unwrap().len(), 1);
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
         assert!(worker.core.pending.lock().unwrap().is_empty());
     }
 

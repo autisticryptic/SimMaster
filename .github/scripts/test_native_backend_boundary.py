@@ -88,6 +88,24 @@ class NativeBackendBoundaryTests(unittest.TestCase):
         helper = text[text.index("async fn apply_data_routes("):text.index("impl CellularDataTransport for NativeDataTransport")]
         self.assertIn("if !outcome.ok", helper)
 
+    def test_native_namespace_receipt_requires_explicit_verified_restore(self):
+        text = (SRC / "hardware/cellular/backends/bearer.rs").read_text()
+        cleanup = text[text.index("async fn cleanup_locked("):text.index("async fn release(mut self)")]
+        self.assertLess(cleanup.index("clean &= self.namespace.is_empty()"), cleanup.index("clear_receipt("))
+        confirmation = text[text.index("fn confirm_namespace_restore<'a>("):]
+        confirmation = confirmation[:confirmation.index("\n    fn release(")]
+        self.assertLess(confirmation.index("verify_bearer("), confirmation.index("std::mem::take(&mut session.namespace)"))
+        self.assertIn("session.namespace = previous", confirmation)
+        self.assertIn("namespace_receipt_is_cleared_only_after_verified_restore", text)
+        self.assertIn("dropped_handle_retains_unconfirmed_namespace_ownership", text)
+
+    def test_worker_requests_use_cancellation_cleanup_guards(self):
+        text = (SRC / "services/ue_worker.rs").read_text()
+        self.assertIn("impl Drop for PendingRequestGuard<'_>", text)
+        self.assertEqual(text.count("let _request = PendingRequestGuard {"), 2)
+        self.assertIn("cancelled_net_config_retires_its_pending_entry_without_a_reply", text)
+        self.assertIn("cancelled_socket_create_retires_its_pending_entry_without_a_reply", text)
+
     def test_native_qmi_leases_precede_commands_and_do_not_reconnect_old_cids(self):
         text = (SRC / "hardware/cellular/backends/io.rs").read_text()
         claim = text[text.index("pub async fn claim("):text.index("async fn verify(&self")]

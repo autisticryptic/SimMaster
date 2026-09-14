@@ -144,6 +144,17 @@ pub trait ImsBearerHandle: Send {
         Ok(Box::new(()))
     }
 
+    /// A scoped move back to the host has completed. Providers with durable
+    /// namespace receipts must verify the returned interface before clearing
+    /// that intent. Never call this after a cancelled move or for a stale
+    /// worker binding; a failed confirmation must retain recovery ownership.
+    fn confirm_namespace_restore<'a>(
+        &'a mut self,
+        _namespace: &'a str,
+    ) -> TransportFuture<'a, Result<(), ImsBearerError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Stop the provider session and release its endpoint and network state.
     fn release(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 }

@@ -208,17 +208,39 @@ impl NativeImsBearer {
         if !self.moved_to_worker {
             return;
         }
-        if let Some(binding) = self.worker_binding.as_ref() {
-            if let Ok(_generation) = binding.lock_current_generation().await {
-                let _ = netns::move_iface_out(binding.namespace(), &self.interface).await;
-                let _ = binding.worker().refresh_net_status().await;
-            } else {
-                tracing::warn!(
-                    interface = %self.interface,
-                    "Skipping native VoLTE interface restore bound to a stale UE worker generation"
-                );
-            }
+        let Some(binding) = self.worker_binding.as_ref() else {
+            // A missing binding is not evidence that the interface is home.
+            return;
+        };
+        let Ok(_generation) = binding.lock_current_generation().await else {
+            tracing::warn!(
+                interface = %self.interface,
+                "Skipping native VoLTE interface restore bound to a stale UE worker generation"
+            );
+            return;
+        };
+        if let Err(error) = netns::move_iface_out(binding.namespace(), &self.interface).await {
+            tracing::warn!(
+                interface = %self.interface,
+                error = %error,
+                "Native interface restore failed; retaining namespace ownership"
+            );
+            return;
         }
+        if let Err(error) = self
+            .handle
+            .confirm_namespace_restore(binding.namespace().as_str())
+            .await
+        {
+            tracing::warn!(
+                interface = %self.interface,
+                error = %error.detail,
+                "Native interface restore unconfirmed; retaining namespace ownership"
+            );
+            return;
+        }
+        let _ = binding.worker().refresh_net_status().await;
+        drop(_generation);
         self.moved_to_worker = false;
         self.worker = None;
         self.worker_binding = None;
