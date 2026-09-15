@@ -4,7 +4,9 @@
 > [Native 自有设备实测与交接](NATIVE_BACKEND_DEVICE_VALIDATION_2026-09-13.md)。
 > 该实测记录目前为本地未跟踪文件，新 clone 不能假定包含它。
 > 下文保留先前“仅逻辑、延期验收”阶段的范围和结论，不代表新阶段仍禁止测试。
-> 2026-09-15 续接仅完成代码与 CI 收尾，没有重新连接、部署或操作设备。
+> 2026-09-15 前一轮续接仅完成代码与 CI；后续已按新授权测试 SIM-04 的 **MM** IMS，
+> 未注册并已恢复原服务。不是 Native/混合后端验收，见
+> [P-CSCF 实测与 beta8 二进制对照](IMS_PCSCF_BETA8_COMPARISON_2026-09-15.md)。
 
 > 2026-09-13，`dev/1.1.5-modem-backends`。
 > 用户要求先推进非 MM 逻辑；现阶段继续以 MM 为主，等 IMS 多卡基线收敛后再做接管测试。
@@ -70,12 +72,19 @@
 - 两条自动 profile resolver 共用 home 边界：显式 SIM 事实优先，否则有效自定义元数据与 catalog 规则须无冲突。拒绝两位/三位 MNC 最长前缀猜选、一位 MNC；唯一自定义归属元数据可支撑缺库时的 derived 兜底，显式 pin 语义不变。
 - PDP 准备不覆写已有定义/空 APN 占位项；只复用匹配项，或定义已确认缺失且未活动的 preferred CID。不假定其他空闲 CID 被设备支持；无法确认时不写该定义，保留既有 APN-only 后续路径。
 - provider 的 `BasebandWedged` 信号有独立错误码，贯通 family/profile 两层终止与前端提示；普通失败不被错误升级为永久 netdev 故障。
-- 本轮只完成逻辑与 CI。P-CSCF 来源/override 优先级、DNS RR owner/CNAME/SRV 端口处理、配置预览与 runtime effective 一致性仍待后续完成；硬件/混合 owner 门槛不变。
+- 该阶段只完成逻辑与 CI。DNS RR owner/CNAME/SRV 端口后续已在第 3.3 节补强；P-CSCF 来源/override 优先级、配置预览与 runtime effective 一致性仍待完成，硬件/混合 owner 门槛不变。
+
+### 3.3 P-CSCF 只读等待与 DNS 归属（2026-09-15）
+
+- `1cf849f` / `269be65`：对照同哈希 beta8 的实际 IDA XREF/反编译，活动 IMS 上下文最多读 6 轮、轮间 1 秒、包括 IO 的总预算 12 秒。固定已观察的 CID/APN/PDP 定义，拒绝变化和重复/矛盾 CGACT 行，接受地址前再次核对。不激活、不改 PDP，也不借用 MM 内部 WDS CID。
+- DNS 严格验证问题与响应，只接受 Answer 中匹配目标或合法有界 CNAME 链的数据；拒绝无关 glue、异常压缩和跨 RDLENGTH。SRV 端口贯通到 UDP SIP，TCP SRV 不被误用；DNS 仍经 UE worker。
+- 本地 61 项 Python、6 项前端 unit 和格式/diff 检查通过；相对 6391732 增加 20 项硬件无关 Rust 回归。新代码未部署，不构成 SIM-04 注册通过。
+- SIM-04 的 6391732 / MM 窗口已建立 IPv6 bearer，但 AT 可见 DNS/P-CSCF 缺失，三槽均未进入 SIP/AKA。精确 IMS 地址 flags 和清理/恢复有证据；不能等同于网络/WDS 没有 PCO，也不能称旧路由问题完全验收。逐卡记录见项目交接第 12 节。
 
 不能因为代码能够构建，就将以下项目标记完成：
 
-1. **硬件验收全部延期**：BAM-DMUX/data-port 映射、QMI/MBIM 固件差异、SIM/AKA、
-   IMS 注册/续期、IPv6、短信/电话、掉线恢复均无本轮实测。
+1. **Native 硬件验收仍未收敛**：BAM-DMUX/data-port 映射、QMI/MBIM 固件差异、SIM/AKA、
+   IMS 注册/续期、IPv6、短信/电话、掉线恢复须分别验收；SIM-04 的 MM 失败窗口不替代这些项目。
 2. **混合 owner**：尚未实现 MM 在线时对不同 modem 的 inhibition/端口隔离式并行管理。
 3. **自动代次恢复**：控制节点代次变化目前要求重启/重新核验；不确定 receipt 需要受控
    reconciliation，自动孤儿会话恢复器尚未完成。不能盲删 receipt 后重连冒充续期。
@@ -159,7 +168,7 @@ API 的 `hardware_validated: false`、`native_hardware_validation: deferred` 是
 
 ### 2026-09-15 后续开发与候选校验
 
-- 最新代码 **`63917329b0e09a074c6e526997b67e9db4df36c9`** 已推送；
+- 该阶段代码 **`63917329b0e09a074c6e526997b67e9db4df36c9`** 已推送；
   [Validate Beta Refactor](https://github.com/autisticryptic/SimMaster/actions/runs/34877802604)、
   [Frontend Checks](https://github.com/autisticryptic/SimMaster/actions/runs/34877802618) 和
   [Build-Release](https://github.com/autisticryptic/SimMaster/actions/runs/34877802723) 均 success。
@@ -170,11 +179,21 @@ API 的 `hardware_validated: false`、`native_hardware_validation: deferred` 是
   `a7047c322c493bbb9b48d3ef097849f1ae39840d4dcf9f76636b441be95f84dd`。
   内部包 metadata 的 commit/版本/架构以及 ELF64 AArch64、嵌入短 commit/分支均已核对；
   二进制 SHA256 为 `bfee39504de0a871192f0a35295bf02cd0a54a91499bd9d4265e31079e51ed5f`。
-  没有执行或部署二进制，也没有任何新设备注册结果。
-- 用户后续实测范围仅 SIM-04 IMS 注册、保持 MM；混合后端实测明确留给其他设备。
-  目前远程入口前置条件未满足，新的实时基线与设备窗口均未开始。
+  当时没有执行或部署二进制；后续 SIM-04 窗口另见下节，旧阶段记录不回填为注册通过。
+- 用户限定实测范围为 SIM-04 IMS 注册、保持 MM；混合后端实测留给其他设备。
+  过期入口凭据后来已安全更新，只读基线和受控测试已执行。
 
-**当前检查点（2026-09-15）**：`6391732` 代码候选已推送并通过 CI，但第 3 节的逻辑缺口仍未完成。
+### 2026-09-15 SIM-04 窗口与 beta8 对照后续
+
+- 6391732 受控 MM 窗口三槽失败，原服务/配置已恢复；没有电话、短信或混合后端测试。
+- `1cf849f` 的 [Validate](https://github.com/autisticryptic/SimMaster/actions/runs/34925540533) 与
+  [Build](https://github.com/autisticryptic/SimMaster/actions/runs/34925540557) 均 success；Rust、前端和两架构成功，发布 skipped。
+- 最终 `269be65` 补充 CGACT 歧义回归与日志来源说明，已推送；
+  [Validate](https://github.com/autisticryptic/SimMaster/actions/runs/34926823080) 和
+  [Build](https://github.com/autisticryptic/SimMaster/actions/runs/34926823070) 均 success，发布 skipped。
+  候选元数据与二进制对照见 [P-CSCF 专项记录](IMS_PCSCF_BETA8_COMPARISON_2026-09-15.md)。本轮新修补未部署。
+
+**当前检查点（2026-09-15）**：P-CSCF/DNS 修补已推送，但 SIM-04 注册及第 3 节的完整后端缺口仍未完成。
 下一名开发 agent 应从混合 owner / 代次恢复等项目继续，不把本轮当作完整替代已完成，
 也不提前在 IMS 验证设备启用 `native`。
 
@@ -182,7 +201,7 @@ API 的 `hardware_validated: false`、`native_hardware_validation: deferred` 是
 
 1. 检查本节提交/CI 状态，继续使用独立 `SimAdmin-1.1.5` worktree。
 2. 继续第 3 节的逻辑缺口，不能把安全拒绝当作全能力覆盖。
-3. IMS 派生兜底仍在原 `fix/sim02-catalog-aka-baseline` 分支验证。
+3. 原 `fix/sim02-catalog-aka-baseline` 保留 IMS 基线；用户已授权用 1.1.5 分支的 MM 候选复测 SIM-04。
    真实凭据仍仅在本地私密交接文件，不经本文或 Git 分发。
 4. 用户明确安排硬件窗口后，再备份、确认归属、释放已确认资源，分 MM/native 测试；
    不同时控制同一物理 modem。

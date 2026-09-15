@@ -13,6 +13,11 @@
 
 ## 1. 当前结论
 
+**1.1.5 分支续接（2026-09-15）**：SIM-04 在 `6391732` 的受控 MM 窗口完成三槽尝试，
+但均因当前 AT 可见设置没有 P-CSCF 而失败，没有 SIP/AKA；已恢复原 `684e2a7` 服务与配置。
+后续 beta8 二进制对照和 P-CSCF/DNS 修补不构成该次注册通过，见第 12 节及
+[专项对照记录](IMS_PCSCF_BETA8_COMPARISON_2026-09-15.md)。以下“最新结论”保留 9 月 12 日的历史时间边界。
+
 **最新结论（21:04–21:10 验收）：SIM-03 在 `684e2a7` 上的完整认证、初始注册及首次原会话自然续期已通过。19:14:13 初始注册，21:04:14 使用原 UDP socket 发送 CSeq=4 并成功续期，网络重新给出 7200 秒租期，refresh_count 从 0 增到 1，reconnect_count 保持 1。48 次只读样本、journal、程序哈希、进程、MM Bearer/3、归属账本、UE namespace 和 socket inode 均已交叉核对；不是重建后注册。观察器已完成退出，设备连接仍保留。见第 4.11 节。旧卡/IPv6 与 Pixel 呼入问题仍未验收，未合并 master、未升/发布 beta4。**
 
 **下午中断的历史采样（17:49–17:52）：`684e2a7` 的 SIM-03 初始注册、正常关闭/重启和主进程崩溃恢复已通过；但原自然续期观察中断，不能再等待原定 18:29 的会话续期。设备 uptime 表明约 17:42:51 重新开机，原因未确认，助手未执行重启或切卡。随后日志使用 `45400 / 46001` 派生配置，并出现 IPv6 P-CSCF 路由 `Invalid source address`、QMI endpoint hangup 和 modem 消失；当时 API 为 `registered=false / volte_line_not_present`。见第 4.7 节。当前 SIM-03 已再次上线，但这些旧卡/IPv6 待查证据仍保留，不能因新 IPv4 会话成功就发布 beta4。**
@@ -246,6 +251,7 @@
 | SIM-01 | `45400` / `46001` | 正式 beta3 `05de680`，9/9 05:47:22 初始注册，06:37:24 原 UDP 通道自然续期；IPv6、标准派生。此前 `65b8a0e` 亦独立通过 | 四库均最终依赖 derived，不是四套库专属参数都通过；需在最新主 QMI 实现上复测 |
 | SIM-02 | `46000` / `46000` | 正式 beta3，9/9 10:18:45 标准派生注册，11:08:46 自然续期 | Pixel ready 配置曾在 AKA 前被 403 拒绝，提示 `Terminal has used different algorithm from initial register`；缺省 AKA 基线已修，最新候选尚未实测 |
 | SIM-03 | `45403` / `46000` | `684e2a7` 标准派生首槽完成认证和注册，IPv4/UDP；正常关闭/恢复、主进程异常恢复通过；9/12 21:04:14 原 socket 首次自然续期通过 | 真实呼入/呼出、短信、双注册及库专属参数仍独立待验收；不是其它卡回归通过 |
+| SIM-04 | `45507` / `46011` | 9/15 T02 的 `6391732`：MM/UE 内 IPv6 bearer、精确地址 nodad/noprefixroute 和受控清理/恢复有证据 | 三槽均因当前 AT 可见 P-CSCF 缺失而未注册；无 SIP/AKA，后续 DNS/轮询修补未部署；见第 12 节 |
 
 四库来自 `autisticryptic/carrier_Bundles` 的 `v0.3.0-catalog-v7` 发布，使用 sealed v7：
 `ios-ipcc`、`iPhone16ProMax26.6.1`、`Pixel Mustang`、`Xiaomi15Ultra Xuanyuan`。
@@ -617,6 +623,42 @@ SIM-01～SIM-03 的既有历史与验收保留在第 4、5 节，不复制成新
 - 代码修复、CI、后续部署和未覆盖范围见
   [Native 自有设备实测与交接](NATIVE_BACKEND_DEVICE_VALIDATION_2026-09-13.md)。
 - 不将以上结果覆盖朋友设备先前成功的 MM IMS 记录，也不扩大为所有后端验收通过。
+
+### SIM-04 / 2026-09-15 / T01 — 候选切换前置检查中止
+
+- 目标：基于 1.1.5 开发分支 `6391732`，仅测试 MM 后端 IMS 注册。
+- 前置只读核对：SIM-04 / home 45507，原程序 684e2a7，wlan0 管理，无活动通话。
+- 独立候选与一致性配置/数据库备份已准备；防残留进程检查将 DATA6 initializer 的同名
+  `simadmin` 进程误判为残留主程序，**候选未启动、没有发起本候选的 IMS 注册**。
+- 回滚已恢复原服务。没有停止 MM/proxy/DATA6；只修改后续检查来识别已知 initializer，
+  不通过杀死依赖进程绕过保护。该次中止不计为 IMS 协议失败。
+
+### SIM-04 / 2026-09-15 / T02 — 6391732 的 MM IMS 注册失败并恢复
+
+- 时间：09:44–10:01（Asia/Shanghai）；11:48 只读复核恢复状态。
+- 卡/网络：SIM-04，home 45507，运行日志 serving 46011，LTE 漫游。
+- 设备：Qualcomm 410、aarch64、内核 5.15.0-handsomekernel+；真实 UIM 槽 1。
+- 程序：`63917329b0e09a074c6e526997b67e9db4df36c9`，共享版本 1.1.4-beta3，非正式 1.1.5；
+  二进制 SHA256 `bfee39504de0a871192f0a35295bf02cd0a54a91499bd9d4265e31079e51ed5f`。
+- 后端：API 确认 modemmanager、automatic_fallback=false、无 native devices。
+  主 QMI / wwan0 为 IMS，DATA6 不用于 IMS；沿用稳定 line_id 与 UE namespace。
+- 隔离：独立候选目录、克隆 DB、回环 API；原主程序暂时停止，25 分钟自动回滚已先设置。
+  MM/proxy/DATA6 未重启；仅临时暂停 modem recovery timer，结束恢复。
+- 09:47 单次启用候选 IMS 后实际顺序：derived→derived；carrier_catalog→
+  `profile-ct-mo-45507-046a9073cd`；database→derived（database source unavailable）。
+  三槽均为 `volte_runtime_all_pcscf_failed`，不是 catalog 专属配置通过。
+- 三次建立 IPv6 bearer。快照见精确 IMS 地址的 nodad/noprefixroute 标志；另一个 RA 地址
+  仍 tentative，不能把两者混同。没有 P-CSCF 候选，尚未验证本次到 P-CSCF 的路由和 SIP。
+- 已持有的 IMS CID 2 活动、APN ims、PDP 类型 IPV4V6，上报开关为 1,1,1；CGCONTRDP
+  只有本地 IPv6/网关，DNS/P-CSCF 为空。一次重发上报请求并等待 5 秒后仍为空；没有新增承载或 SIP retry。
+- 初始注册：**失败**。AKA/SIP：未进入。自然续期、呼入/呼出、音频、短信、双注册：未测。
+  不能将 AT 可见字段为空扩大成网络/WDS 一定没有下发 PCO，也不复用历史 P-CSCF 地址。
+- 清理：显式关闭候选 IMS，receipt 清除、网口归还后停候选并恢复原服务；原 DB 在其主程序
+  停止期间摘要未变，原二进制/配置摘要未变，测试占用释放，管理仍走 wlan0。
+  原配置 IMS 意图仍 true；11:48 原 684e2a7 也为 P-CSCF 缺失、未注册。
+- beta8 的函数/指令证据、后续有界读取与 DNS/SRV 修补，以及未覆盖项统一见
+  [SIM-04 P-CSCF 失败与 beta8 二进制对照](IMS_PCSCF_BETA8_COMPARISON_2026-09-15.md)。
+  新代码没有部署，不能把 CI 结果回填到本次测试。
 
 <!-- SIM_CARD_TESTS_APPEND_BEFORE_NOTE -->
 
