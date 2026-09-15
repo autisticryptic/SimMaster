@@ -500,7 +500,7 @@ where
     Run: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<String, CellularImsError>>,
 {
-    let active = parse_active_context_cids(&query("AT+CGACT?".to_string()).await?);
+    let active = parse_active_context_cids(&query("AT+CGACT?".to_string()).await?)?;
     let output = query("AT+CGDCONT?".to_string()).await?;
     let parsed = parse_pdp_contexts(&output);
     if output
@@ -614,23 +614,40 @@ async fn run_at(modem: &str, command: &str) -> Result<String, CellularImsError> 
         .map_err(|error| CellularImsError::with_detail(code::COMMAND_FAILED, error))
 }
 
-fn parse_active_context_cids(output: &str) -> Vec<u8> {
+fn parse_active_context_cids(output: &str) -> Result<Vec<u8>, CellularImsError> {
     let mut cids = Vec::new();
+    let mut observed = Vec::new();
+    let ambiguous = || {
+        CellularImsError::with_detail(
+            code::RUNTIME_ALL_PCSCF_FAILED,
+            "at_active_ims_context_ambiguous".to_string(),
+        )
+    };
     for line in output.lines() {
         let Some((_, values)) = line.split_once("+CGACT:") else {
             continue;
         };
-        let fields: Vec<&str> = values.split(',').map(|field| field.trim()).collect();
-        if fields.len() < 2 || fields[1].trim_matches('\'') != "1" {
-            continue;
+        let fields = values
+            .split(',')
+            .map(|field| field.trim().trim_matches('\''))
+            .collect::<Vec<_>>();
+        if fields.len() != 2 || !matches!(fields[1], "0" | "1") {
+            return Err(ambiguous());
         }
-        if let Ok(cid) = fields[0].trim_matches('\'').parse::<u8>() {
-            if !cids.contains(&cid) {
-                cids.push(cid);
-            }
+        let cid = fields[0]
+            .parse::<u8>()
+            .ok()
+            .filter(|cid| *cid != 0)
+            .ok_or_else(ambiguous)?;
+        if observed.contains(&cid) {
+            return Err(ambiguous());
+        }
+        observed.push(cid);
+        if fields[1] == "1" {
+            cids.push(cid);
         }
     }
-    cids
+    Ok(cids)
 }
 
 fn parse_ims_context_cids(output: &str, apn: &str) -> Vec<u8> {
@@ -1222,13 +1239,31 @@ IPv4 primary DNS: 10.0.0.53";
         let contexts = "response: '+CGDCONT: 1,\"IPV4V6\",\"ctnet\",\"0.0.0.0\",0,0\n+CGDCONT: 3,\"IPV4V6\",\"ims\",\"0.0.0.0\",0,0\n+CGDCONT: 7,\"IPV6\",\"IMS\",\"0.0.0.0\",0,0'";
         let active = "response: '+CGACT: 1,1\n+CGACT: 3,0\n+CGACT: 7,1'";
         assert_eq!(parse_ims_context_cids(contexts, "ims"), vec![3, 7]);
-        assert_eq!(parse_active_context_cids(active), vec![1, 7]);
-        let active_cids = parse_active_context_cids(active);
+        assert_eq!(parse_active_context_cids(active).unwrap(), vec![1, 7]);
+        let active_cids = parse_active_context_cids(active).unwrap();
         let selected = parse_ims_context_cids(contexts, "ims")
             .into_iter()
             .filter(|cid| active_cids.contains(cid))
             .collect::<Vec<_>>();
         assert_eq!(selected, vec![7]);
+    }
+
+    #[test]
+    fn active_context_observations_reject_conflicts_and_malformed_rows() {
+        for output in [
+            "+CGACT: 2,1\n+CGACT: 2,0",
+            "+CGACT: 2,1\n+CGACT: 2,1",
+            "+CGACT: 0,1",
+            "+CGACT: 256,1",
+            "+CGACT: 2,unknown",
+            "+CGACT: 2,1,extra",
+            "+CGACT: broken",
+        ] {
+            assert!(parse_active_context_cids(output).is_err(), "{output}");
+        }
+        assert!(parse_active_context_cids("response: 'OK'")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

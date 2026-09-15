@@ -2317,7 +2317,7 @@ async fn connect_inner(
     // WDS PCO, the active context, and IMS DNS remain ordered fallbacks when
     // the profile prefetch did not yield an address.
     if bearer.settings.pcscf.is_empty() {
-        tracing::info!("VoLTE bearer delivered no P-CSCF via PCO; reading the active IMS context");
+        tracing::info!("VoLTE bearer settings contain no P-CSCF; reading the active IMS context");
         runtime
             .record_attempt(
                 CellularImsStage::Pcscf,
