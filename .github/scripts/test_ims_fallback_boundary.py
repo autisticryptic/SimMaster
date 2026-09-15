@@ -30,12 +30,43 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         self.assertNotIn("cmp(&left.1.meta.plmn.len())", text)
         self.assertIn("automatic_sources_refuse_conflicting_custom_and_catalog_home_boundaries", text)
 
+    def test_pcscf_dns_validation_remains_on_the_ue_socket_path(self):
+        text = (SRC / "cellular_ims/pcscf.rs").read_text()
+        query = text[text.index("async fn query_dns("):text.index("fn dns_query_id(")]
+        self.assertIn("worker.create_socket(spec)", query)
+        self.assertIn("parse_dns_response(query_id, name, record_type, &response[..read])", query)
+        self.assertNotIn("lookup_host", query)
+        parser = (SRC / "cellular_ims/pcscf_dns.rs").read_text()
+        self.assertIn("section == 0 && class == IN", parser)
+        self.assertIn("answer.owner == terminal", parser)
+        self.assertIn("MAX_CNAME_HOPS", parser)
+
+    def test_active_pcscf_wait_is_read_only_and_has_a_total_budget(self):
+        text = (SRC / "cellular_ims/pcscf.rs").read_text()
+        active = text[text.index("pub async fn discover_pcscf_via_active_at_context("):text.index("/// Read the full IP configuration")]
+        self.assertIn("tokio::time::timeout(", active)
+        self.assertIn("ACTIVE_PCSCF_READ_BUDGET", active)
+        self.assertIn("0..ACTIVE_PCSCF_READ_ROUNDS", active)
+        self.assertIn("at_active_ims_context_changed", active)
+        for command in ("AT+CGACT=", "AT+CGDCONT=", "AT$QCPDPIMSCFGE="):
+            self.assertNotIn(command, active)
+
+    def test_srv_ports_survive_into_the_live_udp_channel(self):
+        text = (SRC / "cellular_ims/live.rs").read_text()
+        family = text[text.index("async fn connect_family("):text.index("async fn", text.index("async fn connect_family(") + 10)]
+        self.assertIn("pcscf: SocketAddr", family)
+        self.assertIn("pcscf_addr: pcscf", family)
+        self.assertNotIn("pcscf_socket(pcscf)", family)
+        discovery = (SRC / "cellular_ims/pcscf.rs").read_text()
+        self.assertIn("target.endpoint(address)", discovery)
+        self.assertNotIn('format!("_sip._tcp.', discovery)
+
     def test_ci_selects_the_fallback_and_end_to_end_batch_regressions(self):
         for name in ("beta-validation.yml", "build-release.yml"):
             text = (ROOT / ".github/workflows" / name).read_text()
             for group in ("cellular_ims::identity::tests", "cellular_ims::plan::tests",
                           "cellular_ims::native_bearer::tests", "cellular_ims::pcscf::tests",
-                          "vowifi::profile_store::tests", "vowifi::profile_record::tests",
+                          "cellular_ims::pcscf_dns::tests", "vowifi::profile_store::tests", "vowifi::profile_record::tests",
                           "api::handlers::tests::cellular_ims_profile_batch"):
                 self.assertIn(group, text)
         package = (ROOT / "frontend/package.json").read_text()

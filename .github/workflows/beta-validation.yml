@@ -88,6 +88,7 @@ jobs:
             connectivity::modems::ims::cellular_ims::data_slot::tests \
             connectivity::modems::ims::cellular_ims::runtime::tests \
             connectivity::modems::ims::cellular_ims::pcscf::tests \
+            connectivity::modems::ims::cellular_ims::pcscf_dns::tests \
             api::handlers::tests::cellular_ims_profile_batch \
             connectivity::modems::ims::profile_override::tests \
             connectivity::modems::ims::effective_profile::tests \

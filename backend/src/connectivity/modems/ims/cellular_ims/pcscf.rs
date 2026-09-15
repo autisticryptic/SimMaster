@@ -26,6 +26,7 @@ use crate::{
 };
 
 use super::errors::{code, CellularImsError};
+use super::pcscf_dns::{build_dns_query, parse_dns_response, DnsRecords};
 use super::plan::{ImsConnectionPlan, IpFamily};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(4);
@@ -37,6 +38,9 @@ const DEFAULT_IMS_CID: u8 = 2;
 const PROFILE_PCSCF_READ_ROUNDS: usize = 4;
 const PROFILE_PCSCF_READ_DELAY: Duration = Duration::from_millis(750);
 const BETA2_PROFILE_CANDIDATES: [u8; 2] = [2, 1];
+const ACTIVE_PCSCF_READ_ROUNDS: usize = 6;
+const ACTIVE_PCSCF_READ_DELAY: Duration = Duration::from_secs(1);
+const ACTIVE_PCSCF_READ_BUDGET: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone)]
 pub struct AtPcscfDiscovery {
@@ -471,47 +475,121 @@ pub async fn discover_pcscf_via_active_at_context(
     _plan: &ImsConnectionPlan,
     apn: &str,
 ) -> Result<AtPcscfDiscovery, CellularImsError> {
-    let active_output = run_at(modem, "AT+CGACT?").await?;
-    let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
-    let mut active_cids = parse_active_context_cids(&active_output);
-    let configured_ims_cids = parse_ims_context_cids(&contexts_output, apn);
-    let preferred_cid = configured_ims_cid();
-    active_cids.sort_by_key(|cid| {
-        (
-            if *cid == preferred_cid { 0 } else { 1 },
-            if configured_ims_cids.contains(cid) {
-                0
-            } else {
-                1
-            },
-        )
-    });
-
-    if active_cids.is_empty() {
-        return Err(CellularImsError::with_detail(
+    // PCO may arrive after the first usable IP address. Retry reads, not PDP
+    // activation/profile writes, and bound the whole operation (including IO).
+    tokio::time::timeout(
+        ACTIVE_PCSCF_READ_BUDGET,
+        discover_active_pcscf_with(apn, ACTIVE_PCSCF_READ_DELAY, |command| async move {
+            run_at(modem, &command).await
+        }),
+    )
+    .await
+    .map_err(|_| {
+        CellularImsError::with_detail(
             code::RUNTIME_ALL_PCSCF_FAILED,
-            format!("at_active_context_missing:ims={configured_ims_cids:?}"),
+            "at_active_pcscf_discovery_timeout".to_string(),
+        )
+    })?
+}
+
+async fn active_ims_contexts<Run, Fut>(
+    apn: &str,
+    query: &mut Run,
+) -> Result<Vec<PdpContext>, CellularImsError>
+where
+    Run: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, CellularImsError>>,
+{
+    let active = parse_active_context_cids(&query("AT+CGACT?".to_string()).await?);
+    let output = query("AT+CGDCONT?".to_string()).await?;
+    let parsed = parse_pdp_contexts(&output);
+    if output
+        .lines()
+        .filter(|line| line.contains("+CGDCONT:"))
+        .count()
+        != parsed.len()
+    {
+        return Err(CellularImsError::new(
+            "volte_ims_profile_definition_ambiguous",
         ));
     }
+    let mut contexts = parsed
+        .into_iter()
+        .filter(|context| {
+            (1..=16).contains(&context.cid)
+                && active.contains(&context.cid)
+                && context.apn.eq_ignore_ascii_case(apn)
+        })
+        .map(|mut context| {
+            context.pdp_type.make_ascii_uppercase();
+            context.apn.make_ascii_lowercase();
+            context
+        })
+        .collect::<Vec<_>>();
+    let preferred = configured_ims_cid();
+    contexts.sort_by_key(|context| (context.cid != preferred, context.cid));
+    Ok(contexts)
+}
 
-    let mut attempted = Vec::with_capacity(active_cids.len());
-    for cid in active_cids {
-        attempted.push(cid);
-        match run_at(modem, &format!("AT+CGCONTRDP={cid}")).await {
-            Ok(settings) => {
-                let candidates = parse_cgcontrdp_pcscf(&settings, cid, apn);
-                if !candidates.is_empty() {
-                    return Ok(AtPcscfDiscovery { candidates, cid });
+async fn discover_active_pcscf_with<Run, Fut>(
+    apn: &str,
+    delay: Duration,
+    mut query: Run,
+) -> Result<AtPcscfDiscovery, CellularImsError>
+where
+    Run: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, CellularImsError>>,
+{
+    let mut pinned: Option<Vec<PdpContext>> = None;
+    let changed = || {
+        CellularImsError::with_detail(
+            code::RUNTIME_ALL_PCSCF_FAILED,
+            "at_active_ims_context_changed".to_string(),
+        )
+    };
+    for round in 0..ACTIVE_PCSCF_READ_ROUNDS {
+        if round > 0 {
+            sleep(delay).await;
+        }
+        let contexts = active_ims_contexts(apn, &mut query).await?;
+        if pinned
+            .as_ref()
+            .is_some_and(|previous| previous != &contexts)
+        {
+            return Err(changed());
+        }
+        if contexts.is_empty() {
+            continue;
+        }
+        pinned.get_or_insert_with(|| contexts.clone());
+        for context in &contexts {
+            let cid = context.cid;
+            match query(format!("AT+CGCONTRDP={cid}")).await {
+                Ok(settings) => {
+                    let candidates = parse_cgcontrdp_pcscf(&settings, cid, apn);
+                    if !candidates.is_empty() {
+                        // A redefined/deactivated context must not lend its
+                        // addresses to the previous bearer after an await.
+                        if active_ims_contexts(apn, &mut query).await? != contexts {
+                            return Err(changed());
+                        }
+                        return Ok(AtPcscfDiscovery { candidates, cid });
+                    }
                 }
-            }
-            Err(error) => {
-                tracing::debug!(cid, error = %error, "VoLTE active-context CGCONTRDP query failed");
+                Err(error) => {
+                    tracing::debug!(cid, round, error = %error, "VoLTE active-context CGCONTRDP query failed")
+                }
             }
         }
     }
+    let cids = pinned
+        .unwrap_or_default()
+        .into_iter()
+        .map(|context| context.cid)
+        .collect::<Vec<_>>();
     Err(CellularImsError::with_detail(
         code::RUNTIME_ALL_PCSCF_FAILED,
-        format!("at_active_ims_context_no_pcscf:cids={attempted:?}:ims={configured_ims_cids:?}"),
+        format!("at_active_ims_context_no_pcscf:cids={cids:?}:rounds={ACTIVE_PCSCF_READ_ROUNDS}"),
     ))
 }
 
@@ -633,7 +711,7 @@ pub async fn discover_pcscf_in_worker(
     local: IpAddr,
     interface: &str,
     worker: &UeWorkerHandle,
-) -> Result<IpAddr, CellularImsError> {
+) -> Result<SocketAddr, CellularImsError> {
     discover_pcscf_on_path(
         settings,
         home_domain,
@@ -656,16 +734,16 @@ pub async fn discover_pcscf_candidates_in_worker(
     local: IpAddr,
     interface: &str,
     worker: &UeWorkerHandle,
-) -> Result<Vec<IpAddr>, CellularImsError> {
+) -> Result<Vec<SocketAddr>, CellularImsError> {
     if let Ok(explicit) = std::env::var(ENV_PCSCF) {
         let candidates = pcscf_candidates_for_family(&parse_pcscf_override(&explicit), local);
         if !candidates.is_empty() {
-            return Ok(candidates);
+            return Ok(candidates.into_iter().map(pcscf_socket).collect());
         }
     }
     let candidates = settings.pcscf_candidates_for(local);
     if !candidates.is_empty() {
-        return Ok(candidates);
+        return Ok(candidates.into_iter().map(pcscf_socket).collect());
     }
     if let Some(configured) = configured_pcscf
         .map(str::trim)
@@ -673,7 +751,7 @@ pub async fn discover_pcscf_candidates_in_worker(
     {
         let candidates = pcscf_candidates_for_family(&parse_pcscf_override(configured), local);
         if !candidates.is_empty() {
-            return Ok(candidates);
+            return Ok(candidates.into_iter().map(pcscf_socket).collect());
         }
     }
     discover_pcscf_on_path(
@@ -695,17 +773,21 @@ async fn discover_pcscf_on_path(
     local: IpAddr,
     interface: &str,
     worker: &UeWorkerHandle,
-) -> Result<IpAddr, CellularImsError> {
+) -> Result<SocketAddr, CellularImsError> {
     if let Ok(explicit) = std::env::var(ENV_PCSCF) {
         if let Some(address) = parse_pcscf_override(&explicit)
             .into_iter()
             .find(|candidate| same_family(local, *candidate))
         {
-            return settings.ensure_family_match(local, address);
+            return settings
+                .ensure_family_match(local, address)
+                .map(pcscf_socket);
         }
     }
     if let Ok(address) = settings.resolve_pcscf_for(local) {
-        return settings.ensure_family_match(local, address);
+        return settings
+            .ensure_family_match(local, address)
+            .map(pcscf_socket);
     }
 
     let dns_servers = if local.is_ipv6() {
@@ -721,7 +803,9 @@ async fn discover_pcscf_on_path(
             .into_iter()
             .find(|candidate| same_family(local, *candidate))
         {
-            return settings.ensure_family_match(local, address);
+            return settings
+                .ensure_family_match(local, address)
+                .map(pcscf_socket);
         }
         let configured_host = configured
             .trim_start_matches("sip:")
@@ -748,7 +832,7 @@ async fn discover_pcscf_on_path(
                         .into_iter()
                         .find(|item| item.is_ipv4() == local.is_ipv4())
                     {
-                        return Ok(address);
+                        return Ok(pcscf_socket(address));
                     }
                 }
             }
@@ -770,7 +854,7 @@ async fn discover_pcscf_on_path(
                     .find(|item| item.is_ipv4() == local.is_ipv4())
                 {
                     tracing::info!(dns_server = %server, name = %pcscf_name, %address, "VoLTE P-CSCF discovered by DNS address query");
-                    return Ok(address);
+                    return Ok(pcscf_socket(address));
                 }
                 tracing::debug!(dns_server = %server, name = %pcscf_name, record_type = address_type, "VoLTE P-CSCF DNS address query returned no matching address");
             }
@@ -788,16 +872,23 @@ async fn discover_pcscf_on_path(
                 }
             };
             for target in records.srv_targets {
-                if let Ok(target_records) =
-                    query_dns(local, *server, &target, address_type, interface, worker).await
+                if let Ok(target_records) = query_dns(
+                    local,
+                    *server,
+                    &target.target,
+                    address_type,
+                    interface,
+                    worker,
+                )
+                .await
                 {
                     if let Some(address) = target_records
                         .addresses
                         .into_iter()
                         .find(|item| item.is_ipv4() == local.is_ipv4())
                     {
-                        tracing::info!(dns_server = %server, name = %srv_name, target = %target, %address, "VoLTE P-CSCF discovered by DNS SRV query");
-                        return Ok(address);
+                        tracing::info!(dns_server = %server, name = %srv_name, target = %target.target, port = target.port, %address, "VoLTE P-CSCF discovered by DNS SRV query");
+                        return Ok(target.endpoint(address));
                     }
                 }
             }
@@ -807,22 +898,16 @@ async fn discover_pcscf_on_path(
 }
 
 fn pcscf_srv_names(home_domain: &str) -> Vec<String> {
+    // The current worker SIP channel is UDP. A TCP SRV target must never be
+    // used as a UDP endpoint merely because it resolves to an IP address.
     vec![
         format!("_sip._udp.pcscf.{home_domain}"),
-        format!("_sip._tcp.pcscf.{home_domain}"),
         format!("_sip._udp.{home_domain}"),
-        format!("_sip._tcp.{home_domain}"),
     ]
 }
 
 pub fn pcscf_socket(address: IpAddr) -> SocketAddr {
     SocketAddr::new(address, SIP_PORT)
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct DnsRecords {
-    addresses: Vec<IpAddr>,
-    srv_targets: Vec<String>,
 }
 
 async fn query_dns(
@@ -854,7 +939,7 @@ async fn query_dns(
         .await
         .map_err(|_| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
         .map_err(|_| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-    parse_dns_response(query_id, &response[..read])
+    parse_dns_response(query_id, name, record_type, &response[..read])
 }
 
 fn dns_query_id(name: &str, record_type: u16) -> u16 {
@@ -863,123 +948,6 @@ fn dns_query_id(name: &str, record_type: u16) -> u16 {
         hash = hash.rotate_left(5) ^ u16::from(byte);
     }
     hash
-}
-
-fn build_dns_query(id: u16, name: &str, record_type: u16) -> Result<Vec<u8>, CellularImsError> {
-    let mut query = Vec::with_capacity(64 + name.len());
-    query.extend_from_slice(&id.to_be_bytes());
-    query.extend_from_slice(&0x0100u16.to_be_bytes());
-    query.extend_from_slice(&1u16.to_be_bytes());
-    query.extend_from_slice(&0u16.to_be_bytes());
-    query.extend_from_slice(&0u16.to_be_bytes());
-    query.extend_from_slice(&0u16.to_be_bytes());
-    for label in name.trim_end_matches('.').split('.') {
-        if label.is_empty() || label.len() > 63 {
-            return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED));
-        }
-        query.push(label.len() as u8);
-        query.extend_from_slice(label.as_bytes());
-    }
-    query.push(0);
-    query.extend_from_slice(&record_type.to_be_bytes());
-    query.extend_from_slice(&1u16.to_be_bytes());
-    Ok(query)
-}
-
-fn parse_dns_response(id: u16, packet: &[u8]) -> Result<DnsRecords, CellularImsError> {
-    if packet.len() < 12 || u16::from_be_bytes([packet[0], packet[1]]) != id {
-        return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED));
-    }
-    let flags = u16::from_be_bytes([packet[2], packet[3]]);
-    if flags & 0x000f != 0 {
-        return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED));
-    }
-    let questions = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
-    let answers = usize::from(u16::from_be_bytes([packet[6], packet[7]]));
-    let authorities = usize::from(u16::from_be_bytes([packet[8], packet[9]]));
-    let additional = usize::from(u16::from_be_bytes([packet[10], packet[11]]));
-    let mut offset = 12usize;
-    for _ in 0..questions {
-        offset = read_dns_name(packet, offset)?.1;
-        offset = offset
-            .checked_add(4)
-            .filter(|end| *end <= packet.len())
-            .ok_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-    }
-
-    let mut records = DnsRecords::default();
-    for _ in 0..answers + authorities + additional {
-        offset = read_dns_name(packet, offset)?.1;
-        if offset + 10 > packet.len() {
-            return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED));
-        }
-        let record_type = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
-        let length = usize::from(u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]));
-        let data_offset = offset + 10;
-        let data_end = data_offset
-            .checked_add(length)
-            .filter(|end| *end <= packet.len())
-            .ok_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-        match (record_type, length) {
-            (1, 4) => records.addresses.push(IpAddr::V4(Ipv4Addr::new(
-                packet[data_offset],
-                packet[data_offset + 1],
-                packet[data_offset + 2],
-                packet[data_offset + 3],
-            ))),
-            (28, 16) => {
-                let octets: [u8; 16] = packet[data_offset..data_end]
-                    .try_into()
-                    .map_err(|_| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-                records.addresses.push(IpAddr::V6(Ipv6Addr::from(octets)));
-            }
-            (33, 6..) => {
-                let (target, _) = read_dns_name(packet, data_offset + 6)?;
-                if !target.is_empty() && !records.srv_targets.contains(&target) {
-                    records.srv_targets.push(target);
-                }
-            }
-            _ => {}
-        }
-        offset = data_end;
-    }
-    Ok(records)
-}
-
-fn read_dns_name(packet: &[u8], start: usize) -> Result<(String, usize), CellularImsError> {
-    let mut labels = Vec::new();
-    let mut offset = start;
-    let mut end = None;
-    for _ in 0..128 {
-        let length = *packet
-            .get(offset)
-            .ok_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-        if length == 0 {
-            return Ok((labels.join("."), end.unwrap_or(offset + 1)));
-        }
-        if length & 0xc0 == 0xc0 {
-            let low = *packet
-                .get(offset + 1)
-                .ok_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-            end.get_or_insert(offset + 2);
-            offset = (usize::from(length & 0x3f) << 8) | usize::from(low);
-            continue;
-        }
-        if length & 0xc0 != 0 {
-            return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED));
-        }
-        let label_start = offset + 1;
-        let label_end = label_start + usize::from(length);
-        let label = std::str::from_utf8(
-            packet
-                .get(label_start..label_end)
-                .ok_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?,
-        )
-        .map_err(|_| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-        labels.push(label.to_string());
-        offset = label_end;
-    }
-    Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))
 }
 
 /// Strip a possible prefix length / netmask suffix and parse an IP.
@@ -1369,15 +1337,179 @@ IPv4 primary DNS: 10.0.0.53";
         assert_eq!(candidates, vec![2, 1, 3]);
     }
 
+    const ACTIVE_IMS: &str = "+CGACT: 1,1\n+CGACT: 2,1";
+    const IMS_DEFINITIONS: &str = "+CGDCONT: 1,\"IP\",\"internet\"\n+CGDCONT: 2,\"IPV6\",\"ims\"";
+    const EMPTY_PCSCF: &str = "+CGCONTRDP: 2,5,ims,2001:db8::2,2001:db8::1,,";
+    const READY_PCSCF: &str = "+CGCONTRDP: 2,5,ims,2001:db8::2,2001:db8::1,,,2001:db8::10";
+
+    #[tokio::test]
+    async fn active_pcscf_waits_for_late_delivery_without_mutating_a_context() {
+        let mut replies = std::collections::VecDeque::from([
+            ACTIVE_IMS,
+            IMS_DEFINITIONS,
+            EMPTY_PCSCF,
+            ACTIVE_IMS,
+            IMS_DEFINITIONS,
+            READY_PCSCF,
+            ACTIVE_IMS,
+            IMS_DEFINITIONS,
+        ]);
+        let mut commands = Vec::new();
+        let result = discover_active_pcscf_with("ims", Duration::ZERO, |command| {
+            commands.push(command);
+            std::future::ready(Ok(replies
+                .pop_front()
+                .expect("bounded query sequence")
+                .to_string()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.cid, 2);
+        assert_eq!(
+            result.candidates,
+            vec!["2001:db8::10".parse::<IpAddr>().unwrap()]
+        );
+        assert!(replies.is_empty());
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| *command == "AT+CGCONTRDP=2")
+                .count(),
+            2
+        );
+        assert!(commands.iter().all(|command| matches!(
+            command.as_str(),
+            "AT+CGACT?" | "AT+CGDCONT?" | "AT+CGCONTRDP=2"
+        )));
+    }
+
+    #[tokio::test]
+    async fn active_pcscf_empty_delivery_stops_after_six_reads() {
+        let mut reads = 0;
+        let result = discover_active_pcscf_with("ims", Duration::ZERO, |command| {
+            let reply = match command.as_str() {
+                "AT+CGACT?" => ACTIVE_IMS,
+                "AT+CGDCONT?" => IMS_DEFINITIONS,
+                "AT+CGCONTRDP=2" => {
+                    reads += 1;
+                    EMPTY_PCSCF
+                }
+                _ => panic!("unexpected mutating or unrelated AT command"),
+            };
+            std::future::ready(Ok(reply.to_string()))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(reads, 6);
+        assert!(result
+            .to_string()
+            .contains("at_active_ims_context_no_pcscf"));
+    }
+
+    #[tokio::test]
+    async fn active_pcscf_never_probes_an_unrelated_active_apn() {
+        let mut reads = 0;
+        let result = discover_active_pcscf_with("ims", Duration::ZERO, |command| {
+            reads += 1;
+            let reply = match command.as_str() {
+                "AT+CGACT?" => "+CGACT: 1,1\n+CGACT: 2,0",
+                "AT+CGDCONT?" => IMS_DEFINITIONS,
+                _ => panic!("no IMS context was active"),
+            };
+            std::future::ready(Ok(reply.to_string()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(reads, 2 * ACTIVE_PCSCF_READ_ROUNDS);
+    }
+
+    #[tokio::test]
+    async fn active_pcscf_does_not_follow_a_replacement_cid() {
+        let mut replies = std::collections::VecDeque::from([
+            ACTIVE_IMS,
+            IMS_DEFINITIONS,
+            EMPTY_PCSCF,
+            "+CGACT: 3,1",
+            "+CGDCONT: 3,\"IPV6\",\"ims\"",
+        ]);
+        let result = discover_active_pcscf_with("ims", Duration::ZERO, |command| {
+            assert_ne!(command, "AT+CGCONTRDP=3");
+            std::future::ready(Ok(replies
+                .pop_front()
+                .expect("must stop on context change")
+                .to_string()))
+        })
+        .await
+        .unwrap_err();
+        assert!(result.to_string().contains("at_active_ims_context_changed"));
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_pcscf_rechecks_ownership_before_accepting_addresses() {
+        let mut replies = std::collections::VecDeque::from([
+            ACTIVE_IMS,
+            IMS_DEFINITIONS,
+            READY_PCSCF,
+            ACTIVE_IMS,
+            "+CGDCONT: 2,\"IPV6\",\"internet\"",
+        ]);
+        let result = discover_active_pcscf_with("ims", Duration::ZERO, |_| {
+            std::future::ready(Ok(replies
+                .pop_front()
+                .expect("recheck must terminate")
+                .to_string()))
+        })
+        .await
+        .unwrap_err();
+        assert!(result.to_string().contains("at_active_ims_context_changed"));
+    }
+
+    #[tokio::test]
+    async fn active_pcscf_can_observe_a_context_that_becomes_active_late() {
+        let mut replies = std::collections::VecDeque::from([
+            "+CGACT: 2,0",
+            IMS_DEFINITIONS,
+            ACTIVE_IMS,
+            IMS_DEFINITIONS,
+            READY_PCSCF,
+            ACTIVE_IMS,
+            IMS_DEFINITIONS,
+        ]);
+        let result = discover_active_pcscf_with("ims", Duration::ZERO, |_| {
+            std::future::ready(Ok(replies
+                .pop_front()
+                .expect("bounded readiness reads")
+                .to_string()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.cid, 2);
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_pcscf_deadline_cancels_a_stalled_read_without_more_commands() {
+        let mut commands = 0;
+        let result = tokio::time::timeout(
+            Duration::from_millis(1),
+            discover_active_pcscf_with("ims", Duration::ZERO, |_| {
+                commands += 1;
+                std::future::pending::<Result<String, CellularImsError>>()
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(commands, 1);
+    }
+
     #[test]
     fn pcscf_dns_srv_names_try_3gpp_pcscf_domain_first() {
         assert_eq!(
             pcscf_srv_names("ims.mnc001.mcc001.3gppnetwork.org"),
             vec![
                 "_sip._udp.pcscf.ims.mnc001.mcc001.3gppnetwork.org",
-                "_sip._tcp.pcscf.ims.mnc001.mcc001.3gppnetwork.org",
                 "_sip._udp.ims.mnc001.mcc001.3gppnetwork.org",
-                "_sip._tcp.ims.mnc001.mcc001.3gppnetwork.org",
             ]
         );
     }
@@ -1409,7 +1541,7 @@ IPv4 primary DNS: 10.0.0.53";
         packet.extend_from_slice(&16u16.to_be_bytes());
         packet.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
 
-        let records = parse_dns_response(id, &packet).unwrap();
+        let records = parse_dns_response(id, name, 28, &packet).unwrap();
         assert_eq!(records.addresses, vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]);
     }
 

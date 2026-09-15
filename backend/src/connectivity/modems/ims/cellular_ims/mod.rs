@@ -38,6 +38,7 @@ pub mod ipsec;
 pub mod live;
 pub mod native_bearer;
 pub mod pcscf;
+mod pcscf_dns;
 pub mod plan;
 pub mod readiness;
 pub mod rtp_relay;

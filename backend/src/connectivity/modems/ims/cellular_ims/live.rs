@@ -2617,7 +2617,7 @@ async fn connect_family(
     bearer: &BearerConnection,
     device_identity: &DeviceIdentity,
     local_addr: IpAddr,
-    pcscf: IpAddr,
+    pcscf: SocketAddr,
     has_alternate_pcscf: bool,
     device: &CellularImsDeviceBinding,
     video_capability_enabled: bool,
@@ -2633,9 +2633,11 @@ async fn connect_family(
         .await;
     ensure_worker_binding_current(worker_binding)?;
     let worker = worker_binding.worker().clone();
-    let pcscf = bearer.settings.ensure_family_match(local_addr, pcscf)?;
+    bearer
+        .settings
+        .ensure_family_match(local_addr, pcscf.ip())?;
     ensure_worker_binding_current(worker_binding)?;
-    route_pcscf_in_worker(bearer, pcscf, worker_binding).await?;
+    route_pcscf_in_worker(bearer, pcscf.ip(), worker_binding).await?;
     ensure_worker_binding_current(worker_binding)?;
     // The policy rule that steers SIP onto this bearer is keyed on the source
     // address captured when the bearer settings were read. Maxis hands out a
@@ -2670,7 +2672,7 @@ async fn connect_family(
 
     let route = ImsRoute {
         local_addr: SocketAddr::new(local_addr, CELLULAR_IMS_SIP_PORT),
-        pcscf_addr: pcscf_socket(pcscf),
+        pcscf_addr: pcscf,
         transport: SipTransport::Udp,
     };
     let profile = device_identity.profile;
@@ -3057,7 +3059,7 @@ async fn connect_family(
             identity: registered_identity,
             registration: registered,
             bearer: bearer.clone(),
-            pcscf: pcscf_socket(pcscf),
+            pcscf,
             ip_family: ip_family_name(local_addr),
             xfrm_plan: authenticator.xfrm_plan,
             retired_xfrm_plan: None,
