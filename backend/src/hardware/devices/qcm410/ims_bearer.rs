@@ -12,12 +12,13 @@
 //! namespace by the native bearer strategy, so SIP and IPsec remain isolated
 //! per line.
 
-use std::{future::Future, net::IpAddr, pin::Pin, time::Duration};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use crate::hardware::cellular::cgcontrdp::CgcontrdpSettings;
 use crate::hardware::devices::qcm410::{
     netdev::{self as qmi_netdev, NetdevConfig},
     primary_ims_session::{PrimaryImsRequest, PrimaryImsSession},
+    primary_ims_settings::MmIpFamily,
     secondary_qmi,
 };
 use crate::hardware::devices::transport::{
@@ -155,16 +156,17 @@ async fn establish_bearer(
     families: &[u8],
     allow_roaming: bool,
 ) -> Result<Established, ImsBearerError> {
-    let Some(first_family) = families.first().copied() else {
-        return Err(session_start_error("native_ims_no_address_family"));
-    };
+    // A two-family request is MM's distinct IPV4V6 flag, not two independent
+    // owners and not an instruction to silently start only the first family.
+    let requested_family =
+        MmIpFamily::from_requested(families).map_err(|detail| session_start_error(&detail))?;
     let mut session = match PrimaryImsSession::start(PrimaryImsRequest {
         device,
         modem: modem_id,
         interface: primary_netdev,
         apn,
         profile_id,
-        family: first_family,
+        family: requested_family,
         allow_roaming,
     })
     .await
@@ -198,8 +200,12 @@ async fn establish_bearer(
             detail,
         });
     }
-    let settings = match settings_for_started_family(settings, first_family) {
-        Ok(settings) => settings,
+    let GrantedSettings {
+        settings,
+        networks,
+        family: granted_family,
+    } = match prepare_granted_settings(settings, families) {
+        Ok(granted) => granted,
         Err(error) => {
             stop_primary_session(&mut session).await;
             return Err(error);
@@ -207,19 +213,18 @@ async fn establish_bearer(
     };
     tracing::info!(
         bearer = session.path(),
-        family = first_family,
+        requested_ip_type = requested_family.as_str(),
+        granted_ip_type = granted_family.as_str(),
         settings_source = "modemmanager_bearer_ip_config",
-        dns_count = settings.ipv4_dns.len() + settings.ipv6_dns.len(),
-        has_gateway = settings.ipv4_gateway.is_some() || settings.ipv6_gateway.is_some(),
+        ipv4_dns_count = settings.ipv4_dns.len(),
+        ipv6_dns_count = settings.ipv6_dns.len(),
+        has_ipv4_gateway = settings.ipv4_gateway.is_some(),
+        has_ipv6_gateway = settings.ipv6_gateway.is_some(),
         "Read primary IMS IP configuration from the owned ModemManager bearer"
     );
-    let Some(config) = netdev_config_for(&settings, first_family) else {
-        stop_primary_session(&mut session).await;
-        return Err(settings_missing(
-            "qca410_primary_ims_session_has_no_address".to_string(),
-        ));
-    };
-    let network_guard = match session.network_will_be_configured(&config) {
+    // Persist every granted address before either family can change the kernel.
+    // A failed/cancelled second step must not leave the first family untracked.
+    let network_guard = match session.network_will_be_configured(&networks) {
         Ok(guard) => guard,
         Err(error) => {
             stop_primary_session(&mut session).await;
@@ -229,10 +234,19 @@ async fn establish_bearer(
 
     // The control port is primary qmi0, but the WDS data interface is moved into
     // the line worker. DATA6 remains exclusively owned by secondary_qmi_data.
-    let resolution = match qmi_netdev::resolve_exact(baseband, &config, primary_netdev).await {
+    // Both families configure this same verified interface; no candidate probe
+    // or independent WDS start is introduced for the second family.
+    let baseband = baseband.to_string();
+    let interface = primary_netdev.to_string();
+    let resolution = match configure_primary_networks(networks, network_guard, move |config| {
+        let baseband = baseband.clone();
+        let interface = interface.clone();
+        async move { qmi_netdev::resolve_exact(&baseband, &config, &interface).await }
+    })
+    .await
+    {
         Ok(resolution) => resolution,
         Err(error) => {
-            drop(network_guard);
             stop_primary_session(&mut session).await;
             return Err(ImsBearerError {
                 kind: ImsBearerErrorKind::NetdevUnresolved,
@@ -245,7 +259,6 @@ async fn establish_bearer(
             });
         }
     };
-    drop(network_guard);
     if let Err(detail) = session.check_liveness() {
         stop_primary_session(&mut session).await;
         return Err(ImsBearerError {
@@ -258,7 +271,8 @@ async fn establish_bearer(
     let info = ImsBearerInfo {
         interface: resolution.interface.clone(),
         netdev_method: resolution.method.as_str(),
-        ip_type: ip_type_for(first_family).to_string(),
+        // This is the actual grant, not an echo of the requested MM flag.
+        ip_type: granted_family.as_str().to_string(),
         path_device: device.to_string(),
         path_handle: format!("mm:{}", session.path()),
         ipv4_address: settings.ipv4_address,
@@ -304,43 +318,100 @@ async fn stop_primary_session(session: &mut PrimaryImsSession) {
     session.stop().await;
 }
 
-fn ip_type_for(family: u8) -> &'static str {
-    if family == 6 {
-        "ipv6"
-    } else {
-        "ipv4"
-    }
+/// Hold the durable lease's activity guard inside a shielded task. Cancelling
+/// the caller must not release the guard while an `ip` mutation can still land;
+/// session cleanup waits for this entire recorded batch before tearing it down.
+async fn configure_primary_networks<F, R, G>(
+    networks: Vec<NetdevConfig>,
+    guard: G,
+    mut configure: F,
+) -> Result<qmi_netdev::ResolvedNetdev, qmi_netdev::NetdevError>
+where
+    F: FnMut(NetdevConfig) -> R + Send + 'static,
+    R: Future<Output = Result<qmi_netdev::ResolvedNetdev, qmi_netdev::NetdevError>>
+        + Send
+        + 'static,
+    G: Send + 'static,
+{
+    tokio::spawn(async move {
+        let _guard = guard;
+        let mut resolution = None;
+        for network in networks {
+            resolution = Some(configure(network).await?);
+        }
+        resolution.ok_or_else(|| {
+            qmi_netdev::NetdevError::ConfigureFailed(
+                "qca410_primary_ims_network_plan_empty".to_string(),
+            )
+        })
+    })
+    .await
+    .map_err(|_| {
+        qmi_netdev::NetdevError::ConfigureFailed(
+            "qca410_primary_ims_network_task_failed".to_string(),
+        )
+    })?
 }
 
-fn settings_for_started_family(
+struct GrantedSettings {
+    settings: CgcontrdpSettings,
+    networks: Vec<NetdevConfig>,
+    family: MmIpFamily,
+}
+
+/// MM may grant just one family for IPV4V6. Configure and report only granted
+/// addresses, in the caller's preference order, without manufacturing a second
+/// grant or discarding a valid one. Explicit single-family requests stay single.
+fn prepare_granted_settings(
     mut settings: CgcontrdpSettings,
-    family: u8,
-) -> Result<CgcontrdpSettings, ImsBearerError> {
-    let address = match family {
-        4 => settings.ipv4_address.filter(|address| address.is_ipv4()),
-        6 => settings.ipv6_address.filter(|address| address.is_ipv6()),
-        _ => None,
-    };
-    if address.is_none() {
-        return Err(settings_missing(format!(
-            "native_ims_started_family_address_missing:ipv{family}"
-        )));
-    }
-    if family == 4 {
-        settings.ipv6_address = None;
-        settings.ipv6_gateway = None;
-        settings.ipv6_dns.clear();
-        settings.ipv6_prefix = None;
-    } else {
+    families: &[u8],
+) -> Result<GrantedSettings, ImsBearerError> {
+    let requested = MmIpFamily::from_requested(families).map_err(settings_missing)?;
+    if requested == MmIpFamily::Ipv6 || settings.ipv4_address.is_none() {
         settings.ipv4_address = None;
         settings.ipv4_gateway = None;
         settings.ipv4_dns.clear();
         settings.ipv4_prefix = None;
     }
-    settings
-        .pcscf
-        .retain(|address| address.is_ipv4() == (family == 4));
-    Ok(settings)
+    if requested == MmIpFamily::Ipv4 || settings.ipv6_address.is_none() {
+        settings.ipv6_address = None;
+        settings.ipv6_gateway = None;
+        settings.ipv6_dns.clear();
+        settings.ipv6_prefix = None;
+    }
+    let has_ipv4 = settings.ipv4_address.is_some();
+    let has_ipv6 = settings.ipv6_address.is_some();
+    let granted = match (has_ipv4, has_ipv6) {
+        (true, true) => MmIpFamily::Ipv4v6,
+        (true, false) => MmIpFamily::Ipv4,
+        (false, true) => MmIpFamily::Ipv6,
+        (false, false) => {
+            return Err(settings_missing(
+                "qca410_primary_ims_session_has_no_address".to_string(),
+            ));
+        }
+    };
+    let networks: Vec<_> = families
+        .iter()
+        .filter_map(|family| netdev_config_for(&settings, *family))
+        .collect();
+    if networks.len() != usize::from(has_ipv4) + usize::from(has_ipv6) {
+        return Err(settings_missing(
+            "qca410_primary_ims_granted_network_invalid".to_string(),
+        ));
+    }
+    settings.pcscf.retain(|address| {
+        if address.is_ipv4() {
+            has_ipv4
+        } else {
+            has_ipv6
+        }
+    });
+    Ok(GrantedSettings {
+        settings,
+        networks,
+        family: granted,
+    })
 }
 
 fn netdev_config_for(settings: &CgcontrdpSettings, family: u8) -> Option<NetdevConfig> {
@@ -359,8 +430,20 @@ fn netdev_config_for(settings: &CgcontrdpSettings, family: u8) -> Option<NetdevC
             settings.ipv4_prefix,
         )
     };
+    let address = address?;
+    let prefix = prefix?;
+    if !matches!(family, 4 | 6)
+        || address.is_ipv4() != (family == 4)
+        || prefix > if family == 4 { 32 } else { 128 }
+    {
+        return None;
+    }
     Some(NetdevConfig::from_session(
-        address?, prefix, None, dns, gateway,
+        address,
+        Some(prefix),
+        None,
+        dns,
+        gateway,
     ))
 }
 
@@ -408,7 +491,10 @@ fn settings_missing(detail: String) -> ImsBearerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        sync::{Arc, Mutex},
+    };
 
     fn reference_settings() -> CgcontrdpSettings {
         CgcontrdpSettings {
@@ -419,6 +505,191 @@ mod tests {
             pcscf: vec![IpAddr::V4(Ipv4Addr::new(10, 11, 12, 13))],
             ..Default::default()
         }
+    }
+
+    fn dual_settings() -> CgcontrdpSettings {
+        let mut settings = reference_settings();
+        settings.ipv6_address = Some("2001:db8::2".parse().unwrap());
+        settings.ipv6_gateway = Some("2001:db8::1".parse().unwrap());
+        settings.ipv6_prefix = Some(64);
+        settings.ipv6_dns = vec!["2001:db8::53".parse().unwrap()];
+        settings.pcscf.push("2001:db8::3".parse().unwrap());
+        settings
+    }
+
+    fn resolved() -> qmi_netdev::ResolvedNetdev {
+        qmi_netdev::ResolvedNetdev {
+            interface: "wwan0".to_string(),
+            rx_packets: 0,
+            method: qmi_netdev::ResolutionMethod::SoleCandidate,
+        }
+    }
+
+    #[test]
+    fn dual_grant_preserves_both_families_in_the_requested_order() {
+        for families in [[4, 6], [6, 4]] {
+            let grant = prepare_granted_settings(dual_settings(), &families).unwrap();
+            assert_eq!(grant.family, MmIpFamily::Ipv4v6);
+            assert_eq!(grant.networks.len(), 2);
+            assert_eq!(grant.networks[0].address.is_ipv4(), families[0] == 4);
+            assert_eq!(grant.networks[1].address.is_ipv4(), families[1] == 4);
+            assert_eq!(grant.settings.ipv4_prefix, Some(27));
+            assert_eq!(grant.settings.ipv6_prefix, Some(64));
+            assert_eq!(grant.settings.ipv4_dns.len(), 1);
+            assert_eq!(grant.settings.ipv6_dns.len(), 1);
+            assert_eq!(grant.settings.pcscf.len(), 2);
+        }
+    }
+
+    #[test]
+    fn partial_dual_grant_reports_the_granted_family_not_the_first_request() {
+        for available in [4, 6] {
+            let mut settings = dual_settings();
+            if available == 4 {
+                settings.ipv6_address = None;
+            } else {
+                settings.ipv4_address = None;
+            }
+            let grant = prepare_granted_settings(settings, &[6, 4]).unwrap();
+            assert_eq!(
+                grant.family.as_str(),
+                if available == 4 { "ipv4" } else { "ipv6" }
+            );
+            assert_eq!(grant.networks.len(), 1);
+            assert_eq!(grant.networks[0].address.is_ipv4(), available == 4);
+            assert_eq!(grant.settings.ipv4_dns.is_empty(), available != 4);
+            assert_eq!(grant.settings.ipv6_dns.is_empty(), available != 6);
+            assert_eq!(grant.settings.pcscf.len(), 1);
+            assert_eq!(grant.settings.pcscf[0].is_ipv4(), available == 4);
+        }
+    }
+
+    #[test]
+    fn explicit_single_family_does_not_consume_an_unrequested_grant() {
+        for family in [4, 6] {
+            let grant = prepare_granted_settings(dual_settings(), &[family]).unwrap();
+            assert_eq!(grant.networks.len(), 1);
+            assert_eq!(grant.networks[0].address.is_ipv4(), family == 4);
+            assert_eq!(grant.settings.ipv4_address.is_some(), family == 4);
+            assert_eq!(grant.settings.ipv6_address.is_some(), family == 6);
+        }
+        assert!(prepare_granted_settings(reference_settings(), &[6]).is_err());
+    }
+
+    #[test]
+    fn incomplete_or_wrong_family_grants_cannot_become_a_network_plan() {
+        assert!(prepare_granted_settings(CgcontrdpSettings::default(), &[4, 6]).is_err());
+        for families in [&[][..], &[0][..], &[4, 4][..], &[6, 4, 6][..]] {
+            assert!(prepare_granted_settings(dual_settings(), families).is_err());
+        }
+        let mut missing_prefix = dual_settings();
+        missing_prefix.ipv6_prefix = None;
+        assert!(prepare_granted_settings(missing_prefix, &[4, 6]).is_err());
+        let mut invalid_prefix = dual_settings();
+        invalid_prefix.ipv4_prefix = Some(33);
+        assert!(prepare_granted_settings(invalid_prefix, &[4, 6]).is_err());
+        let mut wrong_family = dual_settings();
+        wrong_family.ipv6_address = Some("192.0.2.2".parse().unwrap());
+        assert!(prepare_granted_settings(wrong_family, &[4, 6]).is_err());
+    }
+
+    #[tokio::test]
+    async fn network_batch_configures_both_addresses_in_order() {
+        let networks = prepare_granted_settings(dual_settings(), &[6, 4])
+            .unwrap()
+            .networks;
+        let expected = networks.clone();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::clone(&observed);
+        let result = configure_primary_networks(networks, (), move |network| {
+            calls.lock().unwrap().push(network);
+            std::future::ready(Ok(resolved()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.interface, "wwan0");
+        assert_eq!(*observed.lock().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn network_batch_propagates_each_family_failure_without_continuing() {
+        for fail_at in [0, 1] {
+            let networks = prepare_granted_settings(dual_settings(), &[6, 4])
+                .unwrap()
+                .networks;
+            let calls = Arc::new(Mutex::new(0));
+            let count = Arc::clone(&calls);
+            let error = configure_primary_networks(networks, (), move |_| {
+                let mut count = count.lock().unwrap();
+                let fail = *count == fail_at;
+                *count += 1;
+                std::future::ready(if fail {
+                    Err(qmi_netdev::NetdevError::ConfigureFailed(
+                        "injected".to_string(),
+                    ))
+                } else {
+                    Ok(resolved())
+                })
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error,
+                qmi_netdev::NetdevError::ConfigureFailed("injected".to_string())
+            );
+            assert_eq!(*calls.lock().unwrap(), fail_at + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_second_family_keeps_the_lease_guard_until_io_finishes() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let (dropped, mut observe_drop) = tokio::sync::oneshot::channel();
+        let (entered, observe_entry) = tokio::sync::oneshot::channel();
+        let (resume, wait_for_resume) = tokio::sync::oneshot::channel();
+        let networks = prepare_granted_settings(dual_settings(), &[4, 6])
+            .unwrap()
+            .networks;
+        let mut entered = Some(entered);
+        let mut wait_for_resume = Some(wait_for_resume);
+        let waiter = tokio::spawn(configure_primary_networks(
+            networks,
+            DropSignal(Some(dropped)),
+            move |network| {
+                let blocked = if network.address.is_ipv6() {
+                    Some((entered.take().unwrap(), wait_for_resume.take().unwrap()))
+                } else {
+                    None
+                };
+                async move {
+                    if let Some((entered, wait)) = blocked {
+                        let _ = entered.send(());
+                        wait.await.unwrap();
+                    }
+                    Ok(resolved())
+                }
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(2), observe_entry)
+            .await
+            .unwrap()
+            .unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            observe_drop.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        resume.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), observe_drop)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
@@ -450,7 +721,7 @@ mod tests {
         settings.ipv6_prefix = Some(64);
         settings.ipv6_dns = vec!["2001:4860:4860::8888".parse().unwrap()];
         settings.pcscf.push("2001:db8::3".parse().unwrap());
-        let settings = settings_for_started_family(settings, 4).unwrap();
+        let settings = prepare_granted_settings(settings, &[4]).unwrap().settings;
         assert_eq!(
             settings.ipv4_address,
             Some("10.129.39.207".parse().unwrap())
@@ -474,7 +745,7 @@ mod tests {
         dual.ipv6_gateway = Some("2001:db8::1".parse().unwrap());
         dual.ipv6_prefix = Some(64);
         dual.pcscf.push("2001:db8::3".parse().unwrap());
-        let v4 = settings_for_started_family(dual, 4).unwrap();
+        let v4 = prepare_granted_settings(dual, &[4]).unwrap().settings;
         assert!(v4.ipv6_address.is_none());
         assert!(v4.pcscf.iter().all(IpAddr::is_ipv4));
     }

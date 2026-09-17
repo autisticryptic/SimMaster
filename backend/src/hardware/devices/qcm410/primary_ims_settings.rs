@@ -13,6 +13,42 @@ use crate::hardware::cellular::cgcontrdp::CgcontrdpSettings;
 
 pub(super) type Properties = HashMap<String, OwnedValue>;
 
+/// MMBearerIpFamily is a flags enum, not QMI's numeric 4/6 family selector.
+/// In particular IPV4V6 is flag 4, not the first member of a [4, 6] request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MmIpFamily {
+    Ipv4,
+    Ipv6,
+    Ipv4v6,
+}
+
+impl MmIpFamily {
+    pub fn from_requested(families: &[u8]) -> Result<Self, String> {
+        match families {
+            [4] => Ok(Self::Ipv4),
+            [6] => Ok(Self::Ipv6),
+            [4, 6] | [6, 4] => Ok(Self::Ipv4v6),
+            _ => Err("qca410_primary_mm_ip_families_invalid".to_string()),
+        }
+    }
+
+    pub fn flags(self) -> u32 {
+        match self {
+            Self::Ipv4 => 1,
+            Self::Ipv6 => 2,
+            Self::Ipv4v6 => 4,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+            Self::Ipv4v6 => "ipv4v6",
+        }
+    }
+}
+
 fn invalid(field: &str) -> String {
     // The field is a code constant, never an untrusted value or credential.
     format!("qca410_primary_mm_ip_config_invalid:{field}")
@@ -95,19 +131,17 @@ fn address(
     Ok(Some(address))
 }
 
-/// Parse a single GetAll(Bearer) response, selecting only the family actually
-/// started. None is a not-yet-published IP configuration; malformed properties
-/// and unsupported assignment methods are errors, never a reason to guess AT
-/// addressing or silently start DHCP/PPP in the host namespace.
+/// Parse one GetAll response for the requested MM family. A dual request may
+/// receive only one family from MM; report only what was actually granted.
+/// None is a not-yet-published configuration; malformed properties and
+/// unsupported methods never justify guessing AT addressing or starting host
+/// DHCP/PPP. Both dictionaries come from the same owned bearer snapshot.
 pub(super) fn parse(
     properties: &Properties,
     expected_interface: &str,
     expected_apn: &str,
-    family: u8,
+    family: MmIpFamily,
 ) -> Result<Option<CgcontrdpSettings>, String> {
-    if !matches!(family, 4 | 6) {
-        return Err("qca410_primary_mm_requires_explicit_ip_family".to_string());
-    }
     let connected = properties
         .get("Connected")
         .ok_or_else(|| invalid("Connected"))
@@ -117,6 +151,31 @@ pub(super) fn parse(
     let apn = string(&bearer_properties, "apn")?.ok_or_else(|| invalid("apn"))?;
     validate_binding(connected, interface, apn, expected_interface, expected_apn)?;
 
+    match family {
+        MmIpFamily::Ipv4 => parse_ip_config(properties, 4),
+        MmIpFamily::Ipv6 => parse_ip_config(properties, 6),
+        MmIpFamily::Ipv4v6 => {
+            let ipv4 = parse_ip_config(properties, 4)?;
+            let ipv6 = parse_ip_config(properties, 6)?;
+            match (ipv4, ipv6) {
+                (None, None) => Ok(None),
+                (Some(settings), None) | (None, Some(settings)) => Ok(Some(settings)),
+                (Some(mut ipv4), Some(ipv6)) => {
+                    ipv4.ipv6_address = ipv6.ipv6_address;
+                    ipv4.ipv6_prefix = ipv6.ipv6_prefix;
+                    ipv4.ipv6_gateway = ipv6.ipv6_gateway;
+                    ipv4.ipv6_dns = ipv6.ipv6_dns;
+                    Ok(Some(ipv4))
+                }
+            }
+        }
+    }
+}
+
+fn parse_ip_config(
+    properties: &Properties,
+    family: u8,
+) -> Result<Option<CgcontrdpSettings>, String> {
     let key = if family == 4 {
         "Ip4Config"
     } else {
@@ -211,8 +270,134 @@ mod tests {
         ])
     }
 
+    // Single-family fixtures keep their numeric 4/6 notation; the production
+    // boundary only accepts the validated enum above.
+    fn parse(
+        properties: &Properties,
+        interface: &str,
+        apn: &str,
+        family: u8,
+    ) -> Result<Option<CgcontrdpSettings>, String> {
+        super::parse(
+            properties,
+            interface,
+            apn,
+            MmIpFamily::from_requested(&[family])?,
+        )
+    }
+
     fn parse_config(family: u8, config: Properties) -> Result<Option<CgcontrdpSettings>, String> {
         parse(&snapshot_with(family, config), "wwan0", "ims", family)
+    }
+
+    #[test]
+    fn mm_dual_is_a_distinct_flag_and_rejects_ambiguous_family_lists() {
+        for families in [&[4, 6][..], &[6, 4][..]] {
+            assert_eq!(
+                MmIpFamily::from_requested(families).unwrap(),
+                MmIpFamily::Ipv4v6
+            );
+            assert_eq!(MmIpFamily::from_requested(families).unwrap().flags(), 4);
+        }
+        assert_eq!(MmIpFamily::from_requested(&[4]).unwrap().flags(), 1);
+        assert_eq!(MmIpFamily::from_requested(&[6]).unwrap().flags(), 2);
+        for bad in [&[][..], &[0][..], &[4, 4][..], &[6, 6][..], &[4, 6, 4][..]] {
+            assert!(MmIpFamily::from_requested(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn dual_config_keeps_both_granted_addresses_prefixes_and_dns() {
+        let mut snapshot = snapshot_with(4, config(4));
+        snapshot.insert("Ip6Config".into(), OwnedValue::from(config(6)));
+        let dual = super::parse(&snapshot, "wwan0", "ims", MmIpFamily::Ipv4v6)
+            .unwrap()
+            .unwrap();
+        assert_eq!(dual.ipv4_address, Some("192.0.2.2".parse().unwrap()));
+        assert_eq!(dual.ipv6_address, Some("2001:db8::2".parse().unwrap()));
+        assert_eq!(dual.ipv4_gateway, Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(dual.ipv6_gateway, Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(dual.ipv4_prefix, Some(30));
+        assert_eq!(dual.ipv6_prefix, Some(64));
+        assert_eq!(dual.ipv4_dns, vec!["192.0.2.53".parse::<IpAddr>().unwrap()]);
+        assert_eq!(
+            dual.ipv6_dns,
+            vec!["2001:db8::53".parse::<IpAddr>().unwrap()]
+        );
+        assert!(dual.pcscf.is_empty());
+    }
+
+    #[test]
+    fn partial_dual_grant_reports_only_the_available_family() {
+        for available in [4, 6] {
+            let mut snapshot = snapshot_with(available, config(available));
+            let missing = if available == 4 {
+                "Ip6Config"
+            } else {
+                "Ip4Config"
+            };
+            snapshot.insert(
+                missing.into(),
+                OwnedValue::from(Properties::from([(
+                    "method".into(),
+                    OwnedValue::from(0_u32),
+                )])),
+            );
+            let partial = super::parse(&snapshot, "wwan0", "ims", MmIpFamily::Ipv4v6)
+                .unwrap()
+                .unwrap();
+            assert_eq!(partial.ipv4_address.is_some(), available == 4);
+            assert_eq!(partial.ipv6_address.is_some(), available == 6);
+        }
+    }
+
+    #[test]
+    fn malformed_requested_dual_family_is_not_hidden_by_the_other_family() {
+        let mut snapshot = snapshot_with(4, config(4));
+        let mut bad = config(6);
+        bad.insert("prefix".into(), OwnedValue::from(129_u32));
+        snapshot.insert("Ip6Config".into(), OwnedValue::from(bad));
+        assert!(super::parse(&snapshot, "wwan0", "ims", MmIpFamily::Ipv4v6).is_err());
+    }
+
+    #[test]
+    fn dual_without_either_published_family_is_pending() {
+        for config in [
+            Properties::new(),
+            Properties::from([("method".into(), OwnedValue::from(0_u32))]),
+        ] {
+            let mut snapshot = snapshot_with(4, config);
+            snapshot.insert("Ip6Config".into(), OwnedValue::from(Properties::new()));
+            assert!(super::parse(&snapshot, "wwan0", "ims", MmIpFamily::Ipv4v6)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn dual_does_not_hide_unsupported_or_untyped_companion_configuration() {
+        for available in [4, 6] {
+            let key = if available == 4 {
+                "Ip6Config"
+            } else {
+                "Ip4Config"
+            };
+            for value in [
+                text("not an IP dictionary"),
+                OwnedValue::from(Properties::from([(
+                    "method".into(),
+                    OwnedValue::from(1_u32),
+                )])),
+                OwnedValue::from(Properties::from([(
+                    "method".into(),
+                    OwnedValue::from(3_u32),
+                )])),
+            ] {
+                let mut snapshot = snapshot_with(available, config(available));
+                snapshot.insert(key.into(), value);
+                assert!(super::parse(&snapshot, "wwan0", "ims", MmIpFamily::Ipv4v6).is_err());
+            }
+        }
     }
 
     #[test]

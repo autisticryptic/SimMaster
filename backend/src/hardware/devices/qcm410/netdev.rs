@@ -30,13 +30,15 @@
 use std::{
     io,
     net::{IpAddr, SocketAddr},
+    process::Stdio,
     time::Duration,
 };
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
+    io::AsyncReadExt,
     net::UdpSocket,
-    process::Command,
+    process::{Child, Command},
     time::{sleep, timeout},
 };
 
@@ -659,6 +661,124 @@ pub async fn teardown(interface: &str, config: &NetdevConfig) {
     deconfigure(interface, config).await;
 }
 
+/// MM IMS has a durable recovery receipt. Best-effort deletion alone is not
+/// permission to discard it: confirm that the exact address and private family
+/// table/rule are gone. Ordinary DATA6 callers retain their existing teardown
+/// API and routing policy. Missing/unsupported observations fail closed.
+pub(super) async fn teardown_verified(
+    interface: &str,
+    config: &NetdevConfig,
+) -> Result<(), String> {
+    deconfigure(interface, config).await;
+    timeout(Duration::from_secs(10), async {
+        let family = if config.address.is_ipv4() { "-4" } else { "-6" };
+        // Do not family-filter this query: `ip -4 address show dev IF` can
+        // return [] after deleting its last IPv4 address even while IF exists.
+        // The unfiltered query proves the interface is back in this namespace.
+        let addresses = read_ip_json(&["-j", "-N", "address", "show", "dev", interface]).await?;
+        // `table all` succeeds even when our now-empty FIB table no longer
+        // exists. Never mistake an arbitrary failed table lookup for absence.
+        let routes = read_ip_json(&["-j", "-N", family, "route", "show", "table", "all"]).await?;
+        let rules = read_ip_json(&["-j", "-N", family, "rule", "show"]).await?;
+        verify_teardown(interface, config, &addresses, &routes, &rules)
+    })
+    .await
+    .map_err(|_| "qca410_primary_ims_cleanup_verification_timeout".to_string())?
+}
+
+async fn read_ip_json(args: &[&str]) -> Result<serde_json::Value, String> {
+    let output = Command::new("ip")
+        .args(args)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|_| "qca410_primary_ims_cleanup_observation_failed".to_string())?;
+    if !output.status.success() || output.stdout.len() > 256 * 1024 {
+        return Err("qca410_primary_ims_cleanup_observation_failed".to_string());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|_| "qca410_primary_ims_cleanup_observation_invalid".to_string())
+}
+
+fn verify_teardown(
+    interface: &str,
+    config: &NetdevConfig,
+    addresses: &serde_json::Value,
+    routes: &serde_json::Value,
+    rules: &serde_json::Value,
+) -> Result<(), String> {
+    let invalid = || "qca410_primary_ims_cleanup_observation_invalid".to_string();
+    let links = addresses.as_array().ok_or_else(invalid)?;
+    let [link] = links.as_slice() else {
+        return Err(invalid());
+    };
+    if link.get("ifname").and_then(serde_json::Value::as_str) != Some(interface) {
+        return Err(invalid());
+    }
+    let addresses = link
+        .get("addr_info")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(invalid)?;
+    for address in addresses {
+        let local: IpAddr = address
+            .get("local")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid)?
+            .parse()
+            .map_err(|_| invalid())?;
+        if local == config.address {
+            return Err("qca410_primary_ims_cleanup_address_remaining".to_string());
+        }
+    }
+    let table = u64::from(route_table(
+        RouteDomain::ModemData,
+        interface,
+        config.address,
+    ));
+    for route in routes.as_array().ok_or_else(invalid)? {
+        if route
+            .get("dst")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            return Err(invalid());
+        }
+        // iproute2 can omit `table` for main even with `table all`.
+        let actual_table = match route.get("table") {
+            None => 254,
+            Some(value) => numeric_ip_id(value).ok_or_else(invalid)?,
+        };
+        if actual_table == table {
+            return Err("qca410_primary_ims_cleanup_routes_remaining".to_string());
+        }
+    }
+    let priority = u64::from(rule_priority(
+        RouteDomain::ModemData,
+        interface,
+        config.address,
+    ));
+    for rule in rules.as_array().ok_or_else(invalid)? {
+        let actual = rule
+            .get("priority")
+            .and_then(numeric_ip_id)
+            .ok_or_else(invalid)?;
+        if actual == priority {
+            return Err("qca410_primary_ims_cleanup_rule_remaining".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn numeric_ip_id(value: &serde_json::Value) -> Option<u64> {
+    value.as_u64().or_else(|| match value.as_str()? {
+        "unspec" => Some(0),
+        "default" => Some(253),
+        "main" => Some(254),
+        "local" => Some(255),
+        text => text.parse().ok(),
+    })
+}
+
 /// Send one packet the network should answer, from the session address.
 ///
 /// A DNS query is used because it is a plain UDP datagram that needs no
@@ -745,24 +865,189 @@ fn probe_observed(socket_replied: bool, before: LinkCounters, after: LinkCounter
 }
 
 async fn run_ip(args: &[&str]) -> Result<(), String> {
-    let output = Command::new("ip")
+    let child = Command::new("ip")
         .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .output()
-        .await
+        .spawn()
         .map_err(|error| format!("spawn ip: {error}"))?;
-    if output.status.success() {
+    run_ip_child(child, Duration::from_secs(10)).await
+}
+
+/// Bound a mutating command without abandoning its process on deadline. The
+/// shielded MM network batch retains its lease guard until kill+wait finishes;
+/// a detached, hung `ip` must not hold that guard indefinitely or mutate later.
+async fn run_ip_child(mut child: Child, deadline: Duration) -> Result<(), String> {
+    let stderr = child.stderr.take();
+    let errors = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        if let Some(stderr) = stderr {
+            let _ = stderr.take(16 * 1024).read_to_end(&mut bytes).await;
+        }
+        bytes
+    });
+    let status = match timeout(deadline, child.wait()).await {
+        Ok(status) => status.map_err(|error| format!("wait for ip: {error}")),
+        Err(_) => {
+            // Tokio Child::kill waits for the child to exit, unlike start_kill
+            // or simply dropping a wait_with_output future.
+            let terminated = match child.kill().await {
+                Ok(()) => true,
+                // A concurrent exit may make kill fail. Still reap the child;
+                // never equate failure to send a signal with completed IO.
+                Err(_) => child.wait().await.is_ok(),
+            };
+            let _ = errors.await;
+            return Err(if terminated {
+                "ip command timed out; child terminated".to_string()
+            } else {
+                "ip command timed out; child termination unconfirmed".to_string()
+            });
+        }
+    };
+    let stderr = errors.await.unwrap_or_default();
+    if status?.success() {
         return Ok(());
     }
-    Err(String::from_utf8_lossy(&output.stderr)
-        .trim()
-        .replace('\n', " "))
+    Err(String::from_utf8_lossy(&stderr).trim().replace('\n', " "))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_ip_command_is_killed_and_reaped_before_returning() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let error = timeout(
+            Duration::from_secs(2),
+            run_ip_child(child, Duration::from_millis(30)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error, "ip command timed out; child terminated");
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_ip_runner_preserves_normal_exit_and_error_details() {
+        for (script, success) in [
+            ("exit 0", true),
+            ("printf 'injected failure' >&2; exit 1", false),
+        ] {
+            let child = Command::new("sh")
+                .args(["-c", script])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let result = run_ip_child(child, Duration::from_secs(2)).await;
+            if success {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err(), "injected failure");
+            }
+        }
+    }
+
+    #[test]
+    fn verified_cleanup_accepts_only_absent_owned_address_routes_and_rules() {
+        for address in ["192.0.2.2", "2001:db8::2"] {
+            let config =
+                NetdevConfig::from_session(address.parse().unwrap(), None, None, &[], None);
+            let links = serde_json::json!([{"ifname":"wwan0", "addr_info":[]}]);
+            let routes = serde_json::json!([
+                {"dst":"default", "dev":"wlan0", "table":"main"},
+                {"dst":"default", "dev":"wwan1", "table":12002}
+            ]);
+            let rules = serde_json::json!([{"priority":0}, {"priority":32766}]);
+            verify_teardown("wwan0", &config, &links, &routes, &rules).unwrap();
+            let leftover_address =
+                serde_json::json!([{"ifname":"wwan0", "addr_info":[{"local":address}]}]);
+            assert!(
+                verify_teardown("wwan0", &config, &leftover_address, &routes, &rules)
+                    .unwrap_err()
+                    .ends_with("address_remaining")
+            );
+            let table = route_table(RouteDomain::ModemData, "wwan0", config.address);
+            for table in [
+                serde_json::json!(table),
+                serde_json::json!(table.to_string()),
+            ] {
+                let leftover_routes = serde_json::json!([{"dst":"default", "table":table}]);
+                assert!(
+                    verify_teardown("wwan0", &config, &links, &leftover_routes, &rules)
+                        .unwrap_err()
+                        .ends_with("routes_remaining")
+                );
+            }
+            let priority = rule_priority(RouteDomain::ModemData, "wwan0", config.address);
+            let leftover_rules = serde_json::json!([{"priority":priority}]);
+            assert!(
+                verify_teardown("wwan0", &config, &links, &routes, &leftover_rules)
+                    .unwrap_err()
+                    .ends_with("rule_remaining")
+            );
+        }
+    }
+
+    #[test]
+    fn unfiltered_cleanup_snapshot_can_contain_only_the_other_family() {
+        // An unfiltered `ip -j address show dev wwan0` still reports this link
+        // after the target family is gone; a family-filtered query may be [].
+        for (removed, remaining) in [("192.0.2.2", "fe80::1"), ("2001:db8::2", "192.0.2.9")] {
+            let config =
+                NetdevConfig::from_session(removed.parse().unwrap(), None, None, &[], None);
+            let links = serde_json::json!([{"ifindex":7,"ifname":"wwan0","flags":["UP"],
+                "addr_info":[{"local":remaining}]}]);
+            let empty = serde_json::json!([]);
+            verify_teardown("wwan0", &config, &links, &empty, &empty).unwrap();
+        }
+    }
+
+    #[test]
+    fn cleanup_verification_does_not_treat_missing_or_malformed_observations_as_success() {
+        let config =
+            NetdevConfig::from_session("192.0.2.2".parse().unwrap(), None, None, &[], None);
+        let links = serde_json::json!([{"ifname":"wwan0", "addr_info":[]}]);
+        let empty = serde_json::json!([]);
+        for bad_links in [
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!([{"ifname":"wwan1", "addr_info":[]}]),
+            serde_json::json!([{"ifname":"wwan0"}]),
+            serde_json::json!([{"ifname":"wwan0", "addr_info":[{}]}]),
+        ] {
+            assert!(verify_teardown("wwan0", &config, &bad_links, &empty, &empty).is_err());
+        }
+        for bad_routes in [
+            serde_json::json!({}),
+            serde_json::json!([{}]),
+            serde_json::json!([{"dst":"default", "table":"unknown_alias"}]),
+        ] {
+            assert!(verify_teardown("wwan0", &config, &links, &bad_routes, &empty).is_err());
+        }
+        for bad_rules in [
+            serde_json::json!({}),
+            serde_json::json!([{}]),
+            serde_json::json!([{"priority":-1}]),
+        ] {
+            assert!(verify_teardown("wwan0", &config, &links, &empty, &bad_rules).is_err());
+        }
+    }
 
     #[test]
     fn only_receive_counts_as_an_answer() {

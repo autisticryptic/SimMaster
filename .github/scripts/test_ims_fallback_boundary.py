@@ -91,6 +91,58 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
             private_bus = text[text.index("dbus-run-session"):]
             self.assertIn("primary_ims_lifecycle::ip_config_dbus_tests", private_bus)
 
+    def test_mm_dual_request_and_actual_grant_are_not_reduced_to_the_first_family(self):
+        device = ROOT / "backend/src/hardware/devices/qcm410"
+        driver = (device / "ims_bearer.rs").read_text()
+        self.assertIn("MmIpFamily::from_requested(families)", driver)
+        self.assertNotIn("families.first()", driver)
+        self.assertIn("family: requested_family", driver)
+        self.assertIn("ip_type: granted_family.as_str().to_string()", driver)
+        self.assertIn("requested_ip_type = requested_family.as_str()", driver)
+        self.assertIn("granted_ip_type = granted_family.as_str()", driver)
+        lifecycle = (device / "primary_ims_lifecycle.rs").read_text()
+        self.assertIn("let family = request.family.flags()", lifecycle)
+        parser = (device / "primary_ims_settings.rs").read_text()
+        self.assertIn("Self::Ipv4v6 => 4", parser)
+        self.assertIn("dual_does_not_hide_unsupported_or_untyped_companion_configuration", parser)
+
+    def test_mm_network_batch_is_fully_recorded_before_configuration_and_shielded(self):
+        device = ROOT / "backend/src/hardware/devices/qcm410"
+        driver = (device / "ims_bearer.rs").read_text()
+        self.assertLess(driver.index("session.network_will_be_configured(&networks)"),
+                        driver.index("configure_primary_networks(networks, network_guard,"))
+        configure = driver[driver.index("async fn configure_primary_networks<"):driver.index("struct GrantedSettings")]
+        self.assertIn("tokio::spawn(async move", configure)
+        self.assertIn("let _guard = guard", configure)
+        self.assertIn("for network in networks", configure)
+        self.assertIn("cancelling_second_family_keeps_the_lease_guard_until_io_finishes", driver)
+
+    def test_mm_dual_receipts_reject_plan_shrink_and_verify_every_cleanup(self):
+        device = ROOT / "backend/src/hardware/devices/qcm410"
+        lifecycle = (device / "primary_ims_lifecycle.rs").read_text()
+        self.assertIn("qca410_primary_mm_lease_network_change_refused", lifecycle)
+        self.assertIn("legacy_v1_json_without_additional_networks_remains_readable", lifecycle)
+        self.assertIn("netdev::teardown_verified(&interface, &network).await", lifecycle)
+        cleanup = lifecycle[lifecycle.index("async fn cleanup_networks_with<"):lifecycle.index("pub(super) fn cleanup_in_background")]
+        self.assertIn("for network in record.networks()", cleanup)
+        self.assertIn("first_error.get_or_insert(error)", cleanup)
+        netdev = (device / "netdev.rs").read_text()
+        for failure in ("address_remaining", "routes_remaining", "rule_remaining"):
+            self.assertIn("qca410_primary_ims_cleanup_" + failure, netdev)
+
+    def test_mm_cleanup_observes_the_link_without_an_address_family_filter(self):
+        netdev = (ROOT / "backend/src/hardware/devices/qcm410/netdev.rs").read_text()
+        self.assertIn('read_ip_json(&["-j", "-N", "address", "show", "dev", interface])', netdev)
+        self.assertNotIn('family, "address", "show", "dev", interface', netdev)
+        self.assertIn("unfiltered_cleanup_snapshot_can_contain_only_the_other_family", netdev)
+        self.assertIn("timed_out_ip_command_is_killed_and_reaped_before_returning", netdev)
+
+    def test_dual_cleanup_regressions_are_selected_in_both_workflows(self):
+        for name in ("beta-validation.yml", "build-release.yml"):
+            text = (ROOT / ".github/workflows" / name).read_text()
+            for module in ("ims_bearer", "netdev", "primary_ims_session", "primary_ims_lifecycle", "primary_ims_settings"):
+                self.assertIn("hardware::devices::qcm410::" + module + "::tests", text)
+
     def test_srv_ports_survive_into_the_live_udp_channel(self):
         text = (SRC / "cellular_ims/live.rs").read_text()
         family = text[text.index("async fn connect_family("):text.index("async fn", text.index("async fn connect_family(") + 10)]

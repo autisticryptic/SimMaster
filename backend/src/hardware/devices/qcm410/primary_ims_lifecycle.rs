@@ -33,7 +33,7 @@ use crate::{
 use super::{
     netdev::{self, NetdevConfig},
     primary_ims_session::{safe_error, PrimaryImsRequest, OWNER_MISSING},
-    primary_ims_settings,
+    primary_ims_settings::{self, MmIpFamily},
 };
 
 const SERVICE: &str = "org.freedesktop.ModemManager1";
@@ -278,7 +278,7 @@ impl MmBus {
         &self,
         bearer: &str,
         apn: &str,
-        family: u8,
+        family: MmIpFamily,
     ) -> Result<Option<CgcontrdpSettings>, String> {
         timed(10, async {
             if !self.owner_is_current().await? {
@@ -362,17 +362,16 @@ impl MmBus {
 fn create_properties<'a>(
     request: &'a PrimaryImsRequest<'_>,
 ) -> Result<HashMap<&'static str, Value<'a>>, String> {
-    let family = match request.family {
-        4 => 1_u32, // MMBearerIpFamily flags, not the QMI 4/6 enum.
-        6 => 2_u32,
-        _ => return Err("qca410_primary_mm_requires_explicit_ip_family".to_string()),
-    };
+    let family = request.family.flags();
     let mut properties = HashMap::from([
         ("apn", Value::from(request.apn)),
         ("ip-type", Value::from(family)),
         ("allow-roaming", Value::from(request.allow_roaming)),
     ]);
     if let Some(profile) = request.profile_id {
+        // Preserve the caller's profile pin. MM 1.18 QMI loads that profile's
+        // IP type and may ignore the separate ip-type property; never mutate
+        // or drop the pin to force a different PDN. Consume the actual grant.
         let profile = i32::try_from(profile)
             .map_err(|_| "qca410_primary_mm_profile_id_invalid".to_string())?;
         properties.insert("profile-id", Value::from(profile));
@@ -393,11 +392,42 @@ struct LeaseRecord {
     process_start: u64,
     namespace: Option<String>,
     network: Option<NetdevConfig>,
+    /// Version 2 retains the second address so crash recovery cannot leave a
+    /// dual-stack address behind. Older binaries reject v2 instead of silently
+    /// recovering only the first family. Existing v1 records remain readable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    additional_networks: Vec<NetdevConfig>,
 }
 
 impl LeaseRecord {
     fn key(&self) -> LeaseKey {
         (self.bus_id.clone(), self.owner.clone(), self.bearer.clone())
+    }
+
+    fn networks(&self) -> impl Iterator<Item = &NetdevConfig> {
+        self.network.iter().chain(self.additional_networks.iter())
+    }
+
+    fn set_networks(&mut self, networks: &[NetdevConfig]) -> Result<(), String> {
+        let Some(first) = networks.first() else {
+            return Err("qca410_primary_mm_lease_network_missing".to_string());
+        };
+        if self.network.is_some() && !self.networks().eq(networks.iter()) {
+            // The complete plan is written once, before either family starts.
+            // Replacing/shrinking it could forget an already installed address.
+            return Err("qca410_primary_mm_lease_network_change_refused".to_string());
+        }
+        let mut next = self.clone();
+        next.network = Some(first.clone());
+        next.additional_networks = networks[1..].to_vec();
+        next.version = if next.additional_networks.is_empty() {
+            1
+        } else {
+            2
+        };
+        next.validate()?;
+        *self = next;
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -408,7 +438,18 @@ impl LeaseRecord {
                     && id.parse::<u32>().is_ok()
             })
         };
-        if self.version != 1
+        let valid_network_schema = match (
+            self.version,
+            self.network.as_ref(),
+            self.additional_networks.as_slice(),
+        ) {
+            (1, _, []) => true,
+            (2, Some(primary), [secondary]) => {
+                primary.address.is_ipv4() != secondary.address.is_ipv4()
+            }
+            _ => false,
+        };
+        if !valid_network_schema
             || self.bus_id.len() != 32
             || !self.bus_id.bytes().all(|byte| byte.is_ascii_hexdigit())
             || zbus::names::UniqueName::try_from(self.owner.as_str()).is_err()
@@ -432,7 +473,7 @@ impl LeaseRecord {
                 return Err("qca410_primary_mm_lease_namespace_invalid".to_string());
             }
         }
-        if self.network.as_ref().is_some_and(|network| {
+        if self.networks().any(|network| {
             network.prefix > if network.address.is_ipv4() { 32 } else { 128 }
                 || network
                     .probe_target
@@ -471,6 +512,7 @@ impl OwnedLease {
                 .ok_or_else(|| "qca410_primary_mm_process_identity_missing".to_string())?,
             namespace: None,
             network: None,
+            additional_networks: Vec::new(),
         };
         record.validate()?;
         let directory = Path::new(STATE_DIR);
@@ -503,11 +545,14 @@ impl OwnedLease {
         self.record.lock().unwrap().bearer.clone()
     }
 
-    fn update(&self, change: impl FnOnce(&mut LeaseRecord)) -> Result<NetworkGuard, String> {
+    fn update(
+        &self,
+        change: impl FnOnce(&mut LeaseRecord) -> Result<(), String>,
+    ) -> Result<NetworkGuard, String> {
         let guard = self.network_activity.enter()?;
         let mut stored = self.record.lock().unwrap();
         let mut next = stored.clone();
-        change(&mut next);
+        change(&mut next)?;
         next.validate()?;
         write_record(&self.file, &next)?;
         *stored = next;
@@ -516,9 +561,9 @@ impl OwnedLease {
 
     pub fn network_will_be_configured(
         &self,
-        network: &NetdevConfig,
+        networks: &[NetdevConfig],
     ) -> Result<NetworkGuard, String> {
-        self.update(|record| record.network = Some(network.clone()))
+        self.update(|record| record.set_networks(networks))
     }
 
     pub fn connection_will_start(&self) -> Result<NetworkGuard, String> {
@@ -526,7 +571,10 @@ impl OwnedLease {
     }
 
     pub fn namespace_will_change(&self, namespace: &str) -> Result<NetworkGuard, String> {
-        self.update(|record| record.namespace = Some(namespace.to_string()))
+        self.update(|record| {
+            record.namespace = Some(namespace.to_string());
+            Ok(())
+        })
     }
 
     pub fn is_done(&self) -> bool {
@@ -568,9 +616,12 @@ impl OwnedLease {
                     }
                 }
                 if network_error.is_none() {
-                    if let Some(network) = &record.network {
-                        netdev::teardown(&record.interface, network).await;
-                    }
+                    network_error =
+                        cleanup_networks_with(&record, |interface, network| async move {
+                            netdev::teardown_verified(&interface, &network).await
+                        })
+                        .await
+                        .err();
                 }
             }
             Ok(false) => {
@@ -599,6 +650,22 @@ impl OwnedLease {
         leases().lock().unwrap().remove(&record.key());
         Ok(())
     }
+}
+
+/// Attempt every recorded family even if one cleanup fails. Returning an
+/// error prevents `forget`, so a later recovery can retry the complete plan.
+async fn cleanup_networks_with<F, R>(record: &LeaseRecord, mut cleanup: F) -> Result<(), String>
+where
+    F: FnMut(String, NetdevConfig) -> R,
+    R: Future<Output = Result<(), String>>,
+{
+    let mut first_error = None;
+    for network in record.networks() {
+        if let Err(error) = cleanup(record.interface.clone(), network.clone()).await {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 pub(super) fn cleanup_in_background(lease: Arc<OwnedLease>) {
@@ -950,7 +1017,11 @@ mod ip_config_dbus_tests {
     async fn typed_get_all_reads_bearer_dns_without_at_or_hardware() {
         let _server = server(false).await;
         let bus = bus().await;
-        let ipv6 = bus.ip_settings(PATH, "ims", 6).await.unwrap().unwrap();
+        let ipv6 = bus
+            .ip_settings(PATH, "ims", MmIpFamily::Ipv6)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(ipv6.ipv6_address, Some("2001:db8::2".parse().unwrap()));
         assert_eq!(
             ipv6.ipv6_dns,
@@ -958,9 +1029,24 @@ mod ip_config_dbus_tests {
         );
         assert!(ipv6.ipv4_address.is_none());
         assert!(ipv6.pcscf.is_empty());
-        let ipv4 = bus.ip_settings(PATH, "ims", 4).await.unwrap().unwrap();
+        let ipv4 = bus
+            .ip_settings(PATH, "ims", MmIpFamily::Ipv4)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(ipv4.ipv4_prefix, Some(30));
-        assert!(bus.ip_settings(PATH, "internet", 6).await.is_err());
+        let dual = bus
+            .ip_settings(PATH, "ims", MmIpFamily::Ipv4v6)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(dual.ipv4_address.is_some() && dual.ipv6_address.is_some());
+        assert_eq!(dual.ipv4_dns.len(), 1);
+        assert_eq!(dual.ipv6_dns.len(), 1);
+        assert!(bus
+            .ip_settings(PATH, "internet", MmIpFamily::Ipv6)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -968,7 +1054,9 @@ mod ip_config_dbus_tests {
         let _server = server(true).await;
         let bus = bus().await;
         assert_eq!(
-            bus.ip_settings(PATH, "ims", 6).await.unwrap_err(),
+            bus.ip_settings(PATH, "ims", MmIpFamily::Ipv4v6)
+                .await
+                .unwrap_err(),
             "qca410_primary_mm_bearer_not_connected"
         );
     }
@@ -983,7 +1071,9 @@ mod ip_config_dbus_tests {
         // the replacement daemon, even when the latter reuses the same path.
         let _replacement = server(false).await;
         assert_eq!(
-            bus.ip_settings(PATH, "ims", 6).await.unwrap_err(),
+            bus.ip_settings(PATH, "ims", MmIpFamily::Ipv4v6)
+                .await
+                .unwrap_err(),
             OWNER_MISSING
         );
     }
@@ -1006,6 +1096,7 @@ mod tests {
             process_start: 456,
             namespace: Some("sa-ue0123456789ab".to_string()),
             network: None,
+            additional_networks: Vec::new(),
         }
     }
 
@@ -1067,25 +1158,178 @@ mod tests {
 
     #[test]
     fn dbus_ip_family_and_profile_types_match_modemmanager() {
-        let request = PrimaryImsRequest {
-            device: "/dev/wwan0qmi0",
-            modem: "/org/freedesktop/ModemManager1/Modem/0",
-            interface: "wwan0",
-            apn: "ims",
-            profile_id: Some(2),
-            family: 4,
-            allow_roaming: false,
-        };
-        let properties = create_properties(&request).unwrap();
-        assert_eq!(
-            u32::try_from(properties.get("ip-type").unwrap()).unwrap(),
-            1
+        for (family, flags) in [
+            (MmIpFamily::Ipv4, 1_u32),
+            (MmIpFamily::Ipv6, 2_u32),
+            (MmIpFamily::Ipv4v6, 4_u32),
+        ] {
+            let request = PrimaryImsRequest {
+                device: "/dev/wwan0qmi0",
+                modem: "/org/freedesktop/ModemManager1/Modem/0",
+                interface: "wwan0",
+                apn: "ims",
+                profile_id: Some(2),
+                family,
+                allow_roaming: false,
+            };
+            let properties = create_properties(&request).unwrap();
+            assert_eq!(
+                u32::try_from(properties.get("ip-type").unwrap()).unwrap(),
+                flags
+            );
+            assert_eq!(
+                i32::try_from(properties.get("profile-id").unwrap()).unwrap(),
+                2
+            );
+            assert_eq!(
+                <&str>::try_from(properties.get("apn").unwrap()).unwrap(),
+                "ims"
+            );
+            assert!(!bool::try_from(properties.get("allow-roaming").unwrap()).unwrap());
+        }
+    }
+
+    fn network(ipv6: bool) -> NetdevConfig {
+        NetdevConfig {
+            address: if ipv6 { "2001:db8::2" } else { "192.0.2.2" }
+                .parse()
+                .unwrap(),
+            prefix: if ipv6 { 64 } else { 30 },
+            mtu: None,
+            probe_target: Some(
+                if ipv6 { "2001:db8::53" } else { "192.0.2.53" }
+                    .parse()
+                    .unwrap(),
+            ),
+        }
+    }
+
+    #[test]
+    fn legacy_v1_json_without_additional_networks_remains_readable() {
+        let legacy = r#"{
+            "version":1,"bus_id":"0123456789abcdef0123456789abcdef",
+            "owner":":1.42","modem":"/org/freedesktop/ModemManager1/Modem/0",
+            "bearer":"/org/freedesktop/ModemManager1/Bearer/9",
+            "device":"/dev/wwan0qmi0","interface":"wwan0",
+            "process_id":123,"process_start":456,"namespace":null,
+            "network":{"address":"192.0.2.2","prefix":30,"mtu":null,"probe_target":null}
+        }"#;
+        let record: LeaseRecord = serde_json::from_str(legacy).unwrap();
+        record.validate().unwrap();
+        assert_eq!(record.networks().count(), 1);
+        assert!(record.additional_networks.is_empty());
+        assert!(!serde_json::to_string(&record)
+            .unwrap()
+            .contains("additional_networks"));
+    }
+
+    #[test]
+    fn dual_receipts_round_trip_every_address_in_both_preference_orders() {
+        for ipv6_first in [false, true] {
+            let mut original = record();
+            let networks = [network(ipv6_first), network(!ipv6_first)];
+            original.set_networks(&networks).unwrap();
+            assert_eq!(
+                original.version, 2,
+                "old readers must refuse a dual receipt"
+            );
+            let encoded = serde_json::to_vec(&original).unwrap();
+            let decoded: LeaseRecord = serde_json::from_slice(&encoded).unwrap();
+            decoded.validate().unwrap();
+            assert!(decoded.networks().eq(networks.iter()));
+        }
+    }
+
+    #[test]
+    fn malformed_receipt_network_versions_are_rejected() {
+        let mut dual = record();
+        dual.set_networks(&[network(false), network(true)]).unwrap();
+        let mut cases = Vec::new();
+        let mut bad = dual.clone();
+        bad.version = 1;
+        cases.push(bad);
+        let mut bad = dual.clone();
+        bad.version = 3;
+        cases.push(bad);
+        let mut bad = dual.clone();
+        bad.network = None;
+        cases.push(bad);
+        let mut bad = dual.clone();
+        bad.additional_networks.clear();
+        cases.push(bad);
+        let mut bad = dual.clone();
+        bad.additional_networks = vec![network(false)];
+        cases.push(bad);
+        let mut bad = dual.clone();
+        bad.additional_networks.push(network(false));
+        cases.push(bad);
+        let mut bad = dual.clone();
+        bad.additional_networks[0].prefix = 129;
+        cases.push(bad);
+        let mut bad = dual;
+        bad.additional_networks[0].probe_target = Some("192.0.2.53".parse().unwrap());
+        cases.push(bad);
+        for bad in cases {
+            assert!(bad.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn recorded_network_plan_cannot_be_replaced_or_shrunk() {
+        let mut stored = record();
+        let networks = [network(false), network(true)];
+        stored.set_networks(&networks).unwrap();
+        stored.set_networks(&networks).unwrap(); // Idempotent repeat is harmless.
+        let original = serde_json::to_vec(&stored).unwrap();
+        for changed in [
+            vec![],
+            vec![network(false)],
+            vec![network(true), network(false)],
+        ] {
+            assert!(stored.set_networks(&changed).is_err());
+            assert_eq!(serde_json::to_vec(&stored).unwrap(), original);
+        }
+        let mut fresh = record();
+        assert!(fresh
+            .set_networks(&[network(false), network(false)])
+            .is_err());
+        assert!(
+            fresh.network.is_none(),
+            "invalid plans must not mutate even in memory"
         );
-        assert_eq!(
-            i32::try_from(properties.get("profile-id").unwrap()).unwrap(),
-            2
-        );
-        assert!(!bool::try_from(properties.get("allow-roaming").unwrap()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_still_attempts_both_families_and_keeps_the_plan_for_retry() {
+        let mut stored = record();
+        let networks = [network(true), network(false)];
+        stored.set_networks(&networks).unwrap();
+        let original = serde_json::to_vec(&stored).unwrap();
+        for failed_family in [4, 6] {
+            let mut attempted = Vec::new();
+            let result = cleanup_networks_with(&stored, |interface, network| {
+                assert_eq!(interface, "wwan0");
+                let fail = network.address.is_ipv4() == (failed_family == 4);
+                attempted.push(network);
+                std::future::ready(if fail {
+                    Err("injected_cleanup_failure".to_string())
+                } else {
+                    Ok(())
+                })
+            })
+            .await;
+            assert_eq!(result.unwrap_err(), "injected_cleanup_failure");
+            assert_eq!(attempted, networks);
+            assert_eq!(serde_json::to_vec(&stored).unwrap(), original);
+        }
+        let mut retried = Vec::new();
+        cleanup_networks_with(&stored, |_, network| {
+            retried.push(network);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(retried, networks);
     }
 
     #[test]
@@ -1111,6 +1355,12 @@ mod tests {
         });
         write_record(&path, &expected).unwrap();
         assert_eq!(read_record(&path).unwrap().network, expected.network);
+        let mut dual = record();
+        dual.set_networks(&[network(true), network(false)]).unwrap();
+        write_record(&path, &dual).unwrap();
+        let restored = read_record(&path).unwrap();
+        assert_eq!(restored.version, 2);
+        assert!(restored.networks().eq(dual.networks()));
         let text = fs::read_to_string(&path).unwrap();
         for forbidden in ["imsi", "iccid", "password", "cookie", "nonce"] {
             assert!(!text.contains(forbidden));

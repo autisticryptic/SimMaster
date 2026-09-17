@@ -213,6 +213,7 @@ jobs:
             connectivity::modems::ims::cellular_ims::plan::tests \
             connectivity::modems::ims::cellular_ims::bearer::tests \
             hardware::devices::qcm410::ims_bearer::tests \
+            hardware::devices::qcm410::netdev::tests \
             hardware::devices::qcm410::primary_ims_session::tests \
             hardware::devices::qcm410::primary_ims_lifecycle::tests \
             hardware::devices::qcm410::primary_ims_settings::tests \

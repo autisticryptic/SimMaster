@@ -29,6 +29,7 @@ use crate::hardware::cellular::cgcontrdp::CgcontrdpSettings;
 use super::{
     netdev::{self, NetdevConfig},
     primary_ims_lifecycle::{self as lifecycle, MmBus, OwnedLease},
+    primary_ims_settings::MmIpFamily,
 };
 
 const BEARER_PREFIX: &str = "/org/freedesktop/ModemManager1/Bearer/";
@@ -41,7 +42,7 @@ pub(super) struct PrimaryImsRequest<'a> {
     pub interface: &'a str,
     pub apn: &'a str,
     pub profile_id: Option<u32>,
-    pub family: u8,
+    pub family: MmIpFamily,
     pub allow_roaming: bool,
 }
 
@@ -193,11 +194,11 @@ impl PrimaryImsSession {
 
     pub fn network_will_be_configured(
         &self,
-        config: &NetdevConfig,
+        configs: &[NetdevConfig],
     ) -> Result<lifecycle::NetworkGuard, String> {
         self.controller
             .owned(&self.bearer)?
-            .network_will_be_configured(config)
+            .network_will_be_configured(configs)
     }
 
     pub fn namespace_will_change(
@@ -262,7 +263,7 @@ struct OwnedRequest {
     interface: String,
     apn: String,
     profile_id: Option<u32>,
-    family: u8,
+    family: MmIpFamily,
     allow_roaming: bool,
 }
 
@@ -454,11 +455,7 @@ fn modem_bearer_paths(output: &str) -> Vec<String> {
 }
 
 fn create_args(request: &PrimaryImsRequest<'_>) -> Result<Vec<String>, String> {
-    let family = match request.family {
-        4 => "ipv4",
-        6 => "ipv6",
-        _ => return Err("qca410_primary_mm_requires_explicit_ip_family".to_string()),
-    };
+    let family = request.family.as_str();
     let mut properties = format!(
         "apn={},ip-type={family},allow-roaming={}",
         request.apn,
@@ -672,7 +669,7 @@ mod tests {
             interface: "wwan0",
             apn: "ims",
             profile_id: Some(2),
-            family: 4,
+            family: MmIpFamily::Ipv4,
             allow_roaming: true,
         }
     }
@@ -776,7 +773,11 @@ mod tests {
 
     #[test]
     fn create_keeps_explicit_family_profile_apn_and_roaming_policy() {
-        for (family, label) in [(4, "ipv4"), (6, "ipv6")] {
+        for (family, label) in [
+            (MmIpFamily::Ipv4, "ipv4"),
+            (MmIpFamily::Ipv6, "ipv6"),
+            (MmIpFamily::Ipv4v6, "ipv4v6"),
+        ] {
             for allowed in [false, true] {
                 let mut request = request();
                 request.family = family;
@@ -796,9 +797,7 @@ mod tests {
                 assert!(!args.iter().any(|arg| arg.contains("bind-mux")));
             }
         }
-        let mut invalid = request();
-        invalid.family = 0;
-        assert!(create_args(&invalid).is_err());
+        assert!(MmIpFamily::from_requested(&[0]).is_err());
     }
 
     #[tokio::test]
