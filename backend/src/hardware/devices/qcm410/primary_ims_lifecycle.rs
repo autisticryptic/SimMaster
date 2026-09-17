@@ -25,11 +25,15 @@ use zbus::{
     Connection, Proxy,
 };
 
-use crate::platform::netns::{self, NetnsName};
+use crate::{
+    hardware::cellular::cgcontrdp::CgcontrdpSettings,
+    platform::netns::{self, NetnsName},
+};
 
 use super::{
     netdev::{self, NetdevConfig},
     primary_ims_session::{safe_error, PrimaryImsRequest, OWNER_MISSING},
+    primary_ims_settings,
 };
 
 const SERVICE: &str = "org.freedesktop.ModemManager1";
@@ -263,6 +267,42 @@ impl MmBus {
                 interface,
                 apn,
             })
+        })
+        .await
+    }
+
+    /// Read only this unique-owner bearer, not a modem-wide context or another
+    /// application's WDS client. GetAll keeps status and IP dictionaries in one
+    /// response; owner/status are checked again before consuming the result.
+    pub async fn ip_settings(
+        &self,
+        bearer: &str,
+        apn: &str,
+        family: u8,
+    ) -> Result<Option<CgcontrdpSettings>, String> {
+        timed(10, async {
+            if !self.owner_is_current().await? {
+                return Err(OWNER_MISSING.to_string());
+            }
+            let properties: primary_ims_settings::Properties = self
+                .proxy(bearer, "org.freedesktop.DBus.Properties")
+                .await?
+                .call("GetAll", &(BEARER,))
+                .await
+                .map_err(bus_error)?;
+            let settings = primary_ims_settings::parse(&properties, &self.interface, apn, family)?;
+            let status = self.status(bearer).await?;
+            primary_ims_settings::validate_binding(
+                status.connected,
+                &status.interface,
+                &status.apn,
+                &self.interface,
+                apn,
+            )?;
+            if !self.owner_is_current().await? {
+                return Err(OWNER_MISSING.to_string());
+            }
+            Ok(settings)
         })
         .await
     }
@@ -799,6 +839,152 @@ pub(super) async fn shutdown_owned() {
     if result.is_err() {
         tracing::warn!(
             "IMS shutdown exceeded its budget; durable ownership records retained for recovery"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ip_config_dbus_tests {
+    use super::*;
+
+    const PATH: &str = "/org/freedesktop/ModemManager1/Bearer/91";
+
+    struct FakeBearer {
+        connected: Arc<AtomicBool>,
+        disconnect_during_read: bool,
+    }
+
+    fn text(value: &str) -> OwnedValue {
+        OwnedValue::try_from(Value::from(value)).unwrap()
+    }
+
+    fn ip_config(ipv6: bool) -> HashMap<String, OwnedValue> {
+        HashMap::from([
+            ("method".into(), OwnedValue::from(2_u32)),
+            (
+                "address".into(),
+                text(if ipv6 { "2001:db8::2" } else { "192.0.2.2" }),
+            ),
+            (
+                "prefix".into(),
+                OwnedValue::from(if ipv6 { 64_u32 } else { 30_u32 }),
+            ),
+            (
+                "gateway".into(),
+                text(if ipv6 { "2001:db8::1" } else { "192.0.2.1" }),
+            ),
+            (
+                "dns1".into(),
+                text(if ipv6 { "2001:db8::53" } else { "192.0.2.53" }),
+            ),
+        ])
+    }
+
+    #[zbus::interface(name = "org.freedesktop.ModemManager1.Bearer")]
+    impl FakeBearer {
+        #[zbus(property)]
+        fn connected(&self) -> bool {
+            self.connected.load(Ordering::Acquire)
+        }
+        #[zbus(property)]
+        fn interface(&self) -> String {
+            "wwan0".to_string()
+        }
+        #[zbus(property)]
+        fn properties(&self) -> HashMap<String, OwnedValue> {
+            HashMap::from([("apn".into(), text("ims"))])
+        }
+        #[zbus(property)]
+        fn ip4_config(&self) -> HashMap<String, OwnedValue> {
+            if self.disconnect_during_read {
+                self.connected.store(false, Ordering::Release);
+            }
+            ip_config(false)
+        }
+        #[zbus(property)]
+        fn ip6_config(&self) -> HashMap<String, OwnedValue> {
+            if self.disconnect_during_read {
+                self.connected.store(false, Ordering::Release);
+            }
+            ip_config(true)
+        }
+    }
+
+    async fn server(disconnect_during_read: bool) -> Connection {
+        // This filter is executed explicitly inside dbus-run-session on CI.
+        // Never register a fake MM daemon on a real machine's system bus.
+        let session = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+            .expect("run this test filter under dbus-run-session");
+        assert_eq!(
+            std::env::var("DBUS_SYSTEM_BUS_ADDRESS").ok().as_deref(),
+            Some(session.as_str())
+        );
+        zbus::connection::Builder::system()
+            .unwrap()
+            .name(SERVICE)
+            .unwrap()
+            .serve_at(
+                PATH,
+                FakeBearer {
+                    connected: Arc::new(AtomicBool::new(true)),
+                    disconnect_during_read,
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+    }
+
+    async fn bus() -> Arc<MmBus> {
+        MmBus::new(
+            "/dev/wwan0qmi0",
+            "/org/freedesktop/ModemManager1/Modem/0",
+            "wwan0",
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn typed_get_all_reads_bearer_dns_without_at_or_hardware() {
+        let _server = server(false).await;
+        let bus = bus().await;
+        let ipv6 = bus.ip_settings(PATH, "ims", 6).await.unwrap().unwrap();
+        assert_eq!(ipv6.ipv6_address, Some("2001:db8::2".parse().unwrap()));
+        assert_eq!(
+            ipv6.ipv6_dns,
+            vec!["2001:db8::53".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert!(ipv6.ipv4_address.is_none());
+        assert!(ipv6.pcscf.is_empty());
+        let ipv4 = bus.ip_settings(PATH, "ims", 4).await.unwrap().unwrap();
+        assert_eq!(ipv4.ipv4_prefix, Some(30));
+        assert!(bus.ip_settings(PATH, "internet", 6).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn disconnected_during_get_all_does_not_publish_stale_addressing() {
+        let _server = server(true).await;
+        let bus = bus().await;
+        assert_eq!(
+            bus.ip_settings(PATH, "ims", 6).await.unwrap_err(),
+            "qca410_primary_mm_bearer_not_connected"
+        );
+    }
+
+    #[tokio::test]
+    async fn replaced_mm_owner_cannot_supply_an_old_sessions_ip_config() {
+        let first = server(false).await;
+        let bus = bus().await;
+        first.release_name(SERVICE).await.unwrap();
+        // The old unique connection still exists and can answer its old path,
+        // but it is no longer the MM owner. Do not consume it or redirect to
+        // the replacement daemon, even when the latter reuses the same path.
+        let _replacement = server(false).await;
+        assert_eq!(
+            bus.ip_settings(PATH, "ims", 6).await.unwrap_err(),
+            OWNER_MISSING
         );
     }
 }

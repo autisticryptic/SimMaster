@@ -472,16 +472,19 @@ async fn cleanup_profile_context(modem: &str, cid: u8, restore_command: &str) {
 /// than one active IMS context exists; it never causes a context to be changed.
 pub async fn discover_pcscf_via_active_at_context(
     modem: &str,
-    _plan: &ImsConnectionPlan,
     apn: &str,
+    bearer_local_addresses: &[IpAddr],
 ) -> Result<AtPcscfDiscovery, CellularImsError> {
     // PCO may arrive after the first usable IP address. Retry reads, not PDP
     // activation/profile writes, and bound the whole operation (including IO).
     tokio::time::timeout(
         ACTIVE_PCSCF_READ_BUDGET,
-        discover_active_pcscf_with(apn, ACTIVE_PCSCF_READ_DELAY, |command| async move {
-            run_at(modem, &command).await
-        }),
+        discover_active_pcscf_with(
+            apn,
+            bearer_local_addresses,
+            ACTIVE_PCSCF_READ_DELAY,
+            |command| async move { run_at(modem, &command).await },
+        ),
     )
     .await
     .map_err(|_| {
@@ -533,6 +536,7 @@ where
 
 async fn discover_active_pcscf_with<Run, Fut>(
     apn: &str,
+    bearer_local_addresses: &[IpAddr],
     delay: Duration,
     mut query: Run,
 ) -> Result<AtPcscfDiscovery, CellularImsError>
@@ -540,6 +544,16 @@ where
     Run: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<String, CellularImsError>>,
 {
+    if bearer_local_addresses.is_empty()
+        || bearer_local_addresses.iter().any(|address| {
+            address.is_unspecified() || address.is_loopback() || address.is_multicast()
+        })
+    {
+        return Err(CellularImsError::with_detail(
+            code::RUNTIME_ALL_PCSCF_FAILED,
+            "at_active_ims_bearer_address_missing".to_string(),
+        ));
+    }
     let mut pinned: Option<Vec<PdpContext>> = None;
     let changed = || {
         CellularImsError::with_detail(
@@ -566,7 +580,26 @@ where
             let cid = context.cid;
             match query(format!("AT+CGCONTRDP={cid}")).await {
                 Ok(settings) => {
-                    let candidates = parse_cgcontrdp_pcscf(&settings, cid, apn);
+                    let observed = parse_cgcontrdp_settings(&settings, cid, apn);
+                    let candidates = observed
+                        .pcscf
+                        .iter()
+                        .copied()
+                        .filter(|candidate| {
+                            let local = if candidate.is_ipv4() {
+                                observed.ipv4_address
+                            } else {
+                                observed.ipv6_address
+                            };
+                            local.is_some_and(|local| bearer_local_addresses.contains(&local))
+                                && !candidate.is_unspecified()
+                                && !candidate.is_multicast()
+                                && !candidate.is_loopback()
+                        })
+                        .collect::<Vec<_>>();
+                    if !observed.pcscf.is_empty() && candidates.is_empty() {
+                        tracing::debug!(cid, "Ignoring AT P-CSCF candidates not associated with the owned IMS bearer address");
+                    }
                     if !candidates.is_empty() {
                         // A redefined/deactivated context must not lend its
                         // addresses to the previous bearer after an await.
@@ -593,17 +626,10 @@ where
     ))
 }
 
-/// Read the full IP configuration (address, gateway, DNS, prefix, P-CSCF) of one
-/// IMS context via `AT+CGCONTRDP`.
-///
-/// This is beta2's IMS source of truth: after the WDS session is up, the modem
-/// describes the context here (`Native VoLTE P-CSCF candidates discovered from
-/// active IMS bearer`, `volte.rs:3671`), so the native bearer reads its addresses
-/// and P-CSCF from this rather than from `--wds-get-current-settings`.
-///
-/// The reader lives with the other device-agnostic settings parsing under
-/// `crate::hardware::cellular::cgcontrdp`; it is shared with the device IMS
-/// bearer drivers.
+/// Shared AT context reader/parser for providers that expose settings this way.
+/// MM-backed QCA410 IP/DNS comes from its owned D-Bus bearer instead; active AT
+/// P-CSCF supplementation above must match that bearer source address.
+/// Parsing a CID/APN alone never proves which MM bearer owns the observation.
 pub use crate::hardware::cellular::cgcontrdp::{
     parse_cgcontrdp_addresses, parse_cgcontrdp_settings, read_cgcontrdp_settings, CgcontrdpSettings,
 };
@@ -1372,6 +1398,7 @@ IPv4 primary DNS: 10.0.0.53";
         assert_eq!(candidates, vec![2, 1, 3]);
     }
 
+    const BEARER_LOCAL: &[IpAddr] = &[IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2))];
     const ACTIVE_IMS: &str = "+CGACT: 1,1\n+CGACT: 2,1";
     const IMS_DEFINITIONS: &str = "+CGDCONT: 1,\"IP\",\"internet\"\n+CGDCONT: 2,\"IPV6\",\"ims\"";
     const EMPTY_PCSCF: &str = "+CGCONTRDP: 2,5,ims,2001:db8::2,2001:db8::1,,";
@@ -1390,7 +1417,7 @@ IPv4 primary DNS: 10.0.0.53";
             IMS_DEFINITIONS,
         ]);
         let mut commands = Vec::new();
-        let result = discover_active_pcscf_with("ims", Duration::ZERO, |command| {
+        let result = discover_active_pcscf_with("ims", BEARER_LOCAL, Duration::ZERO, |command| {
             commands.push(command);
             std::future::ready(Ok(replies
                 .pop_front()
@@ -1421,7 +1448,7 @@ IPv4 primary DNS: 10.0.0.53";
     #[tokio::test]
     async fn active_pcscf_empty_delivery_stops_after_six_reads() {
         let mut reads = 0;
-        let result = discover_active_pcscf_with("ims", Duration::ZERO, |command| {
+        let result = discover_active_pcscf_with("ims", BEARER_LOCAL, Duration::ZERO, |command| {
             let reply = match command.as_str() {
                 "AT+CGACT?" => ACTIVE_IMS,
                 "AT+CGDCONT?" => IMS_DEFINITIONS,
@@ -1444,7 +1471,7 @@ IPv4 primary DNS: 10.0.0.53";
     #[tokio::test]
     async fn active_pcscf_never_probes_an_unrelated_active_apn() {
         let mut reads = 0;
-        let result = discover_active_pcscf_with("ims", Duration::ZERO, |command| {
+        let result = discover_active_pcscf_with("ims", BEARER_LOCAL, Duration::ZERO, |command| {
             reads += 1;
             let reply = match command.as_str() {
                 "AT+CGACT?" => "+CGACT: 1,1\n+CGACT: 2,0",
@@ -1467,7 +1494,7 @@ IPv4 primary DNS: 10.0.0.53";
             "+CGACT: 3,1",
             "+CGDCONT: 3,\"IPV6\",\"ims\"",
         ]);
-        let result = discover_active_pcscf_with("ims", Duration::ZERO, |command| {
+        let result = discover_active_pcscf_with("ims", BEARER_LOCAL, Duration::ZERO, |command| {
             assert_ne!(command, "AT+CGCONTRDP=3");
             std::future::ready(Ok(replies
                 .pop_front()
@@ -1489,7 +1516,7 @@ IPv4 primary DNS: 10.0.0.53";
             ACTIVE_IMS,
             "+CGDCONT: 2,\"IPV6\",\"internet\"",
         ]);
-        let result = discover_active_pcscf_with("ims", Duration::ZERO, |_| {
+        let result = discover_active_pcscf_with("ims", BEARER_LOCAL, Duration::ZERO, |_| {
             std::future::ready(Ok(replies
                 .pop_front()
                 .expect("recheck must terminate")
@@ -1511,7 +1538,7 @@ IPv4 primary DNS: 10.0.0.53";
             ACTIVE_IMS,
             IMS_DEFINITIONS,
         ]);
-        let result = discover_active_pcscf_with("ims", Duration::ZERO, |_| {
+        let result = discover_active_pcscf_with("ims", BEARER_LOCAL, Duration::ZERO, |_| {
             std::future::ready(Ok(replies
                 .pop_front()
                 .expect("bounded readiness reads")
@@ -1528,7 +1555,7 @@ IPv4 primary DNS: 10.0.0.53";
         let mut commands = 0;
         let result = tokio::time::timeout(
             Duration::from_millis(1),
-            discover_active_pcscf_with("ims", Duration::ZERO, |_| {
+            discover_active_pcscf_with("ims", BEARER_LOCAL, Duration::ZERO, |_| {
                 commands += 1;
                 std::future::pending::<Result<String, CellularImsError>>()
             }),
@@ -1536,6 +1563,80 @@ IPv4 primary DNS: 10.0.0.53";
         .await;
         assert!(result.is_err());
         assert_eq!(commands, 1);
+    }
+
+    #[tokio::test]
+    async fn active_pcscf_does_not_borrow_another_same_apn_bearer_address() {
+        let mut context_reads = 0;
+        let error = discover_active_pcscf_with("ims", BEARER_LOCAL, Duration::ZERO, |command| {
+            let response = match command.as_str() {
+                "AT+CGACT?" => ACTIVE_IMS,
+                "AT+CGDCONT?" => IMS_DEFINITIONS,
+                "AT+CGCONTRDP=2" => {
+                    context_reads += 1;
+                    "+CGCONTRDP: 2,5,ims,2001:db8::99,2001:db8::1,,,2001:db8::10"
+                }
+                _ => panic!("only scoped reads are allowed"),
+            };
+            std::future::ready(Ok(response.to_string()))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(context_reads, ACTIVE_PCSCF_READ_ROUNDS);
+        assert!(error.to_string().contains("at_active_ims_context_no_pcscf"));
+    }
+
+    #[tokio::test]
+    async fn active_pcscf_selects_the_context_matching_the_owned_bearer() {
+        let result = discover_active_pcscf_with("ims", BEARER_LOCAL, Duration::ZERO, |command| {
+            let response = match command.as_str() {
+                "AT+CGACT?" => "+CGACT: 2,1\n+CGACT: 3,1",
+                "AT+CGDCONT?" => "+CGDCONT: 2,\"IPV6\",\"ims\"\n+CGDCONT: 3,\"IPV6\",\"ims\"",
+                "AT+CGCONTRDP=2" => "+CGCONTRDP: 2,5,ims,2001:db8::99,2001:db8::1,,,2001:db8::99",
+                "AT+CGCONTRDP=3" => "+CGCONTRDP: 3,6,ims,2001:db8::2,2001:db8::1,,,2001:db8::10",
+                _ => panic!("only scoped reads are allowed"),
+            };
+            std::future::ready(Ok(response.to_string()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.cid, 3);
+        assert_eq!(
+            result.candidates,
+            vec!["2001:db8::10".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn pcscf_cannot_use_a_different_familys_local_address_as_proof() {
+        let expected = ["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()];
+        let result = discover_active_pcscf_with("ims", &expected, Duration::ZERO, |command| {
+            let response = match command.as_str() {
+                "AT+CGACT?" => "+CGACT: 2,1",
+                "AT+CGDCONT?" => "+CGDCONT: 2,\"IPV4V6\",\"ims\"",
+                "AT+CGCONTRDP=2" => "+CGCONTRDP: 2,5,ims,192.0.2.2,192.0.2.1,,,192.0.2.10\n+CGCONTRDP: 2,5,ims,2001:db8::99,2001:db8::1,,,2001:db8::10",
+                _ => panic!("only scoped reads are allowed"),
+            };
+            std::future::ready(Ok(response.to_string()))
+        }).await.unwrap();
+        assert_eq!(
+            result.candidates,
+            vec!["192.0.2.10".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn active_pcscf_without_bearer_address_does_not_query_the_modem() {
+        let error = discover_active_pcscf_with("ims", &[], Duration::ZERO, |_| {
+            panic!("no address means no association can be proved");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok(String::new()))
+        })
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("at_active_ims_bearer_address_missing"));
     }
 
     #[test]

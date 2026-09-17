@@ -1,11 +1,11 @@
 //! IMS PDP context settings read over `AT+CGCONTRDP`.
 //!
-//! This is the device-agnostic source of truth for an IMS bearer's IP
-//! configuration and P-CSCF: address + mask, gateway, DNS and P-CSCF, all on the
-//! active IMS context (3GPP TS 27.007). It is shared by the ModemManager path
-//! (P-CSCF discovery) and by the device IMS bearer drivers (e.g. the Qualcomm 410
-//! native WDS bearer), which is why it lives here rather than under a protocol
-//! layer.
+//! Device-agnostic parsing of IMS context observations (3GPP TS 27.007).
+//! MM-backed QCA410 bearers obtain their authoritative IP/DNS configuration
+//! from the owned D-Bus bearer; AT is a supplementary P-CSCF observation which
+//! must match that bearer's local address. Native providers may use this reader
+//! as their device-specific settings source. The plain settings container is
+//! shared; its name alone does not identify where a snapshot was obtained.
 //!
 //! The 3GPP field layout for one line is:
 //! `<cid>,<bearer_id>,<apn>,<local_addr_and_mask>,<gw>,<dns1>,<dns2>,<pcscf1>,<pcscf2>,...`
@@ -45,8 +45,9 @@ impl fmt::Display for CgcontrdpError {
 }
 
 /// Read the full IP configuration (address, gateway, DNS, P-CSCF) for one CID
-/// from `AT+CGCONTRDP`. This is the primary IMS source, so it reads every field,
-/// not just the P-CSCF columns.
+/// from `AT+CGCONTRDP`. This reads every field of the observation, not just the
+/// P-CSCF columns. Callers must establish its association with their bearer;
+/// this function does not prove ownership merely from a matching CID/APN.
 pub async fn read_cgcontrdp_settings(
     modem: &str,
     cid: u8,

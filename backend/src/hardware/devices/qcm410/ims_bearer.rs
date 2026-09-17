@@ -14,7 +14,7 @@
 
 use std::{future::Future, net::IpAddr, pin::Pin, time::Duration};
 
-use crate::hardware::cellular::cgcontrdp::{self, CgcontrdpSettings};
+use crate::hardware::cellular::cgcontrdp::CgcontrdpSettings;
 use crate::hardware::devices::qcm410::{
     netdev::{self as qmi_netdev, NetdevConfig},
     primary_ims_session::{PrimaryImsRequest, PrimaryImsSession},
@@ -151,7 +151,7 @@ async fn establish_bearer(
     modem_id: &str,
     apn: &str,
     profile_id: Option<u32>,
-    context_cid: u8,
+    _context_cid: u8,
     families: &[u8],
     allow_roaming: bool,
 ) -> Result<Established, ImsBearerError> {
@@ -179,9 +179,11 @@ async fn establish_bearer(
         }
     };
 
-    // ModemManager holds this exact IMS WDS client for its whole lifetime.
-    // AT reads the corresponding active context without taking over the CID.
-    let settings = match wait_for_current_settings(modem_id, context_cid, apn, first_family).await {
+    // MM reads IP/DNS on its retained WDS client and publishes the result on
+    // the exact owned bearer. AT can omit DNS or refer to a different PDP CID;
+    // it must not replace this object's addressing. The upper IMS layer may
+    // supplement P-CSCF only after matching the observed bearer source address.
+    let settings = match wait_for_current_settings(&session).await {
         Ok(settings) => settings,
         Err(error) => {
             stop_primary_session(&mut session).await;
@@ -203,6 +205,14 @@ async fn establish_bearer(
             return Err(error);
         }
     };
+    tracing::info!(
+        bearer = session.path(),
+        family = first_family,
+        settings_source = "modemmanager_bearer_ip_config",
+        dns_count = settings.ipv4_dns.len() + settings.ipv6_dns.len(),
+        has_gateway = settings.ipv4_gateway.is_some() || settings.ipv6_gateway.is_some(),
+        "Read primary IMS IP configuration from the owned ModemManager bearer"
+    );
     let Some(config) = netdev_config_for(&settings, first_family) else {
         stop_primary_session(&mut session).await;
         return Err(settings_missing(
@@ -272,36 +282,22 @@ async fn establish_bearer(
 }
 
 async fn wait_for_current_settings(
-    modem_id: &str,
-    cid: u8,
-    apn: &str,
-    family: u8,
+    session: &PrimaryImsSession,
 ) -> Result<CgcontrdpSettings, ImsBearerError> {
-    let mut last = String::new();
-    for _ in 0..CURRENT_SETTINGS_RETRIES {
-        match cgcontrdp::read_cgcontrdp_settings(modem_id, cid, apn).await {
-            Ok(settings) if has_started_family(&settings, family) => return Ok(settings),
-            Ok(_) => last = format!("active IMS context has no ipv{family} address"),
-            Err(error) => last = error.to_string(),
+    tokio::time::timeout(Duration::from_secs(20), async {
+        for _ in 0..CURRENT_SETTINGS_RETRIES {
+            // A missing publication can settle; malformed data, owner loss or
+            // unsupported DHCP/PPP must not be hidden by a CLI/AT fallback.
+            if let Some(settings) = session.read_ip_settings().await? {
+                return Ok(settings);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    Err(settings_missing(format!(
-        "qca410_primary_qmi_current_settings_unavailable:{}",
-        compact(&last)
-    )))
-}
-
-fn has_started_family(settings: &CgcontrdpSettings, family: u8) -> bool {
-    match family {
-        4 => settings
-            .ipv4_address
-            .is_some_and(|address| address.is_ipv4()),
-        6 => settings
-            .ipv6_address
-            .is_some_and(|address| address.is_ipv6()),
-        _ => false,
-    }
+        Err("qca410_primary_mm_ip_config_not_ready".to_string())
+    })
+    .await
+    .map_err(|_| settings_missing("qca410_primary_mm_ip_config_timeout".to_string()))?
+    .map_err(settings_missing)
 }
 
 async fn stop_primary_session(session: &mut PrimaryImsSession) {
@@ -407,10 +403,6 @@ fn settings_missing(detail: String) -> ImsBearerError {
         hint: ImsBearerFailureHint::None,
         detail,
     }
-}
-
-fn compact(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]

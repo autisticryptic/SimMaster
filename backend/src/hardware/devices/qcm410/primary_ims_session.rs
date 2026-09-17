@@ -24,6 +24,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::hardware::cellular::cgcontrdp::CgcontrdpSettings;
+
 use super::{
     netdev::{self, NetdevConfig},
     primary_ims_lifecycle::{self as lifecycle, MmBus, OwnedLease},
@@ -159,6 +161,25 @@ impl PrimaryImsSession {
             return Err("qca410_primary_mm_status_monitor_stopped".to_string());
         }
         Ok(())
+    }
+
+    /// IP configuration from the same MM object this session owns. This is a
+    /// read-only RPC: cancelling it cannot leave an unrecorded modem mutation.
+    pub async fn read_ip_settings(&self) -> Result<Option<CgcontrdpSettings>, String> {
+        self.check_liveness()?;
+        let lease = self.controller.owned(&self.bearer)?;
+        let _guard = lease.connection_will_start()?;
+        let settings = self
+            .controller
+            .bus
+            .ip_settings(
+                &self.bearer,
+                &self.controller.request.apn,
+                self.controller.request.family,
+            )
+            .await?;
+        self.check_liveness()?;
+        Ok(settings)
     }
 
     pub async fn stop(&mut self) {

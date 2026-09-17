@@ -43,13 +43,53 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
 
     def test_active_pcscf_wait_is_read_only_and_has_a_total_budget(self):
         text = (SRC / "cellular_ims/pcscf.rs").read_text()
-        active = text[text.index("pub async fn discover_pcscf_via_active_at_context("):text.index("/// Read the full IP configuration")]
+        active = text[text.index("pub async fn discover_pcscf_via_active_at_context("):text.index("async fn run_at(")]
         self.assertIn("tokio::time::timeout(", active)
         self.assertIn("ACTIVE_PCSCF_READ_BUDGET", active)
         self.assertIn("0..ACTIVE_PCSCF_READ_ROUNDS", active)
         self.assertIn("at_active_ims_context_changed", active)
         for command in ("AT+CGACT=", "AT+CGDCONT=", "AT$QCPDPIMSCFGE="):
             self.assertNotIn(command, active)
+
+    def test_mm_bearer_ip_config_uses_typed_get_all_and_unique_owner_checks(self):
+        device = ROOT / "backend/src/hardware/devices/qcm410"
+        lifecycle = (device / "primary_ims_lifecycle.rs").read_text()
+        read = lifecycle[lifecycle.index("pub async fn ip_settings("):lifecycle.index("pub async fn connect(")]
+        self.assertIn('.call("GetAll", &(BEARER,))', read)
+        self.assertEqual(read.count("owner_is_current().await?"), 2)
+        self.assertIn("primary_ims_settings::validate_binding(", read)
+        self.assertIn("CacheProperties::No", lifecycle)
+        session = (device / "primary_ims_session.rs").read_text()
+        read = session[session.index("pub async fn read_ip_settings("):session.index("pub async fn stop(")]
+        self.assertEqual(read.count("self.check_liveness()?"), 2)
+        self.assertIn("owned(&self.bearer)", read)
+
+    def test_qca410_ip_and_dns_do_not_fall_back_to_guessed_at_addressing(self):
+        device = ROOT / "backend/src/hardware/devices/qcm410"
+        driver = (device / "ims_bearer.rs").read_text()
+        self.assertIn("session.read_ip_settings().await?", driver)
+        self.assertNotIn("read_cgcontrdp_settings(", driver)
+        self.assertIn('settings_source = "modemmanager_bearer_ip_config"', driver)
+        parser = (device / "primary_ims_settings.rs").read_text()
+        for field in ('"Ip4Config"', '"Ip6Config"', '"dns1"', '"dns2"', '"dns3"'):
+            self.assertIn(field, parser)
+        self.assertIn("qca410_primary_mm_ip_method_unsupported", parser)
+
+    def test_active_at_pcscf_is_bound_to_the_bearer_source_address(self):
+        text = (SRC / "cellular_ims/pcscf.rs").read_text()
+        active = text[text.index("async fn discover_active_pcscf_with<"):text.index("async fn run_at(")]
+        self.assertIn("bearer_local_addresses.contains(&local)", active)
+        self.assertIn("observed.ipv4_address", active)
+        self.assertIn("observed.ipv6_address", active)
+        self.assertIn("at_active_ims_bearer_address_missing", active)
+        self.assertIn("active_pcscf_does_not_borrow_another_same_apn_bearer_address", text)
+
+    def test_mm_property_regressions_are_executed_on_actions(self):
+        for name in ("beta-validation.yml", "build-release.yml"):
+            text = (ROOT / ".github/workflows" / name).read_text()
+            self.assertIn("primary_ims_settings::tests", text)
+            private_bus = text[text.index("dbus-run-session"):]
+            self.assertIn("primary_ims_lifecycle::ip_config_dbus_tests", private_bus)
 
     def test_srv_ports_survive_into_the_live_udp_channel(self):
         text = (SRC / "cellular_ims/live.rs").read_text()

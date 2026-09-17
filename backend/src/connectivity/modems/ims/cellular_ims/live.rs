@@ -2327,7 +2327,17 @@ async fn connect_inner(
                 Some("at_cgcontrdp_fallback".to_string()),
             )
             .await;
-        match discover_pcscf_via_active_at_context(&device.modem_id, &plan, ims_apn).await {
+        let bearer_local_addresses = [bearer.settings.ipv4_address, bearer.settings.ipv6_address]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        match discover_pcscf_via_active_at_context(
+            &device.modem_id,
+            ims_apn,
+            &bearer_local_addresses,
+        )
+        .await
+        {
             Ok(discovery) => {
                 runtime
                     .record_attempt(
