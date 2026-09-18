@@ -13,6 +13,19 @@
 
 ## 1. 当前结论
 
+**SIM-04/MM 最新续接（2026-09-18）**：功能提交 `e8bff12` 已补完真实 MM 双栈请求、实际单/双族 IP/DNS 投影、双地址 receipt 与取消/清理验证；两套 Actions、前端、arm64/amd64 全部通过，发布 skipped。
+T02 三槽均请求 flag4/profile2，但只获 IPv6、DNS/Pco 空，仍无 SIP/AKA；T03 经 MM 严格新建临时 IPv4 profile3，承载及保留该 pin 的 forced IPv6 复试均被 `pdn-ipv4-call-disallowed` 拒绝。
+两轮均已关闭并恢复；T03 新 profile 已删、原列表逐字恢复，08:28–08:29 独立核对原 `684e2a7`/配置/DB、MM/proxy、管理路由、无 receipt/无通话、IMS关闭。
+用户补充 SIM-04 可在 beta8 注册；同哈希 IDA 及 MM 1.18 源码确认应比较 profile 本身的 family，而不能只看请求 ip-type。当前不改初始 EPS/不重新附着，后续维护需明确授权。
+详情、CI/包摘要及剩余限制见 [9/18 MM 双栈与精确 IPv4 对照](IMS_SIM04_MM_DUAL_STACK_2026-09-18.md)。以下条目保留各自历史时间边界。
+
+**SIM-04/MM 9/17 续接**：继续使用 `SimAdmin-1.1.5` / `dev/1.1.5-modem-backends`。
+`272aa9b` 增加自有 MM bearer 的 typed IP/DNS 读取与 AT 地址关联，两套 CI、双架构构建通过，未发布。
+T02/T03 仍无 P-CSCF、无 SIP/AKA；T03 经 MM 新建的临时 IPv6 profile 已删除，原 profile 列表/程序/配置/DB恢复。
+新增观察是初始 EPS 附着本身为 `ims` / profile 2；MM请求profile3与AT CID视图不等同，且两边IPv6同/64但不同IID。
+不能据此断言根因或直接改初始附着；具体证据与下一步维护门槛见
+[9/17 MM 修复与 profile 对照](IMS_SIM04_MM_REPAIR_2026-09-17.md)。以下9/15及9/12结论保留各自时间边界。
+
 **1.1.5 分支续接（2026-09-15）**：SIM-04 在 `6391732` 的受控 MM 窗口完成三槽尝试，
 但均因当前 AT 可见设置没有 P-CSCF 而失败，没有 SIP/AKA；已恢复原 `684e2a7` 服务与配置。
 后续 beta8 二进制对照和 P-CSCF/DNS 修补不构成该次注册通过，见第 12 节及
@@ -659,6 +672,59 @@ SIM-01～SIM-03 的既有历史与验收保留在第 4、5 节，不复制成新
 - beta8 的函数/指令证据、后续有界读取与 DNS/SRV 修补，以及未覆盖项统一见
   [SIM-04 P-CSCF 失败与 beta8 二进制对照](IMS_PCSCF_BETA8_COMPARISON_2026-09-15.md)。
   新代码没有部署，不能把 CI 结果回填到本次测试。
+
+### SIM-04 / 2026-09-17 / T01 — 272aa9b 前置门禁中止
+
+- 当前修补 `272aa9b` 的 Rust/私有D-Bus/前端及双架构 CI 已通过；候选独立目录与克隆配置已校验。
+- 约09:37–09:39，恢复服务是 active/exited、MainPID/ControlPID=0，脚本误将其视为仍在运行而退出74。
+- 原应用未停止、候选未启动、IMS未开启；已恢复timer/释放标记，原程序与MM PID未变。这不是注册失败。
+- 门禁已改为验证无运行进程、静止子状态及无恢复中标记；没有放行 active/running。
+
+### SIM-04 / 2026-09-17 / T02 — 272aa9b 已读 MM IP 配置，注册仍失败
+
+- 约09:46–09:52，仅IMS/MM，独立候选/DB/回环API，25分钟回滚预先建立；普通数据/VoWiFi/Trunk保持关闭。
+- 三槽 derived→derived、catalog→CT-MO、database→derived 均取得IPv6；新日志来源为 modemmanager_bearer_ip_config，DNS=0。
+- 读取候选PID私有receipt所对应的MM bearer：Ip6Config为method=2，有address/prefix/gateway/mtu，无DNS；Pco为空。
+- 仍无P-CSCF、无SIP/AKA，不能宣称注册通过，也不能把MM Pco为空当成网络未发PCO。
+- 关闭/清理/回滚后原程序、配置、DB和资源校验通过；MM/proxy未重启，09:53 Web/无通话/无receipt复核通过。
+
+### SIM-04 / 2026-09-17 / T03 — MM 临时 IPv6 profile 对照仍失败并恢复
+
+- 16:55左右，通过MM公开ProfileManager严格新建，不提交既有profile-id；返回新ID3，旧profile1/2未变。
+- 16:56候选启动，16:58仅开启IMS；三槽仍停P-CSCF。MM Properties请求profile3/IPv6，但DNS=0、Pco空。
+- AT定义3为IPV6/ims，却只报告CID2活动；上报标志3=1,1,1、2=0,0,0；CGCONTRDP=3无可用行，CID2仅7列、无DNS/P-CSCF。
+- 交叉采样的MM/AT IPv6全地址不同但同/64，不能简单将其等同或认定完全无关。未证明“新profile”即全新独立IMS PDN。
+- 恢复后只读MM：InitialEpsBearerSettings为profile2/ims/IPv4v6，初始EPS实际为ims/IPv6。此为新线索，不是已证明的错误配置/根因。
+- 17:08左右候选关闭，临时profile3删除，原MM profile列表逐字核对恢复；原程序/配置/DB/设备资源校验通过。
+- MM/proxy和Wi-Fi管理保持，测试标记/IMS receipt清空，Web与无通话复核通过；未修改初始EPS、未强制断开CID2。
+- 下一步重新附着/初始EPS配置涉及新的维护边界，需明确授权；本轮未做短信/电话/自然续期或native接管。
+- 代码、CI/包摘要、详细安全边界及证据入口见 [9/17专项记录](IMS_SIM04_MM_REPAIR_2026-09-17.md)。
+
+### SIM-04 / 2026-09-18 / T01 — e8bff12 上传中止，未切换应用
+
+- `e8bff12` 的两套 CI/双架构及候选摘要已验证。独立准备完成备份后，SFTP 上传 EOF，远端包仅 131072 字节。
+- 原应用未停止、候选未启动、IMS 未开启，切换回滚 timer 未创建；这不是 IMS 注册失败。
+- 08:02 重连确认原应用/MM PID、原程序/配置、管理路由和无 receipt，保留中止记录并只释放本轮 marker。
+- 后续 T02 使用新目录/新备份；改为目标白名单的 SSH 分块上传，校验远端摘要后才使用文件。
+
+### SIM-04 / 2026-09-18 / T02 — MM 请求双栈，实际 IPv6，P-CSCF 仍失败
+
+- 08:11–08:15，独立 MM/IMS 候选 `e8bff12`，25 分钟自动回滚先于停止原应用建立；MM/proxy保持，普通业务关闭。
+- 三槽：derived→derived、catalog→CT-MO、database→derived（source unavailable）。每槽日志 requested=ipv4v6、granted=ipv6，DNS=0。
+- 当前候选自有 bearer 的 D-Bus 复核：Connected=true/wwan0，Properties为ims/profile2/ip-type4；Ip4Config method0，Ip6Config method2、/64、有网关无DNS，Pco空。
+- 三槽均 `volte_runtime_all_pcscf_failed`，无 SIP/AKA/自然续期；本次实际单族使用v1 receipt，不能当双族v2硬件验收。
+- 关闭候选后 receipt 清空、接口归还，原 DB 在停机期间摘要不变，程序/配置/资源校验通过；08:16:50原服务/IMS关闭/无通话/Wi-Fi管理复核通过。
+
+### SIM-04 / 2026-09-18 / T03 — 临时精确 IPv4 profile 被拒绝并已恢复
+
+- 08:23，经MM公开ProfileManager严格新建IPv4/ims profile，返回新ID3；旧1/2条目、owner和列表均核对。未传已有ID给Set，未改初始EPS。
+- 08:24启用独立候选；3次计划承载及3次保留该pin的forced IPv6复试均报内部 `pdn-ipv4-call-disallowed`，无成功IP配置、无SIP/AKA。
+- MM 1.18指定profile-id后读取profile本身的族；更换请求ip-type不等于有效切族。此错误不扩张为SIM-04在所有设备上均无IPv4/IMS能力。
+- 首槽derived曾被API捕获；最终失败状态清空profile-attempt结果，不用预设顺序编造完整逐槽effective元数据。
+- 08:27左右关闭/回滚，MM仅删除已确认的新profile3，原列表逐字恢复；原DB/配置/资源校验通过。
+- 08:28–08:29独立核对原684e2a7、MM/proxy、wlan0、无receipt/测试marker、无通话及IMS关闭；InitialEpsBearerSettings仍ims/profile2/flag4。DATA6 initializer保持原有inactive状态。
+- **注册修复仍未通过**；所有初始EPS重新协商/重新附着须另行明确维护许可，不偷偷启native或强断CID2。
+- 完整实现、同哈希beta8/IDA补证、23项新增Rust回归与两架构产物见 [9/18专项记录](IMS_SIM04_MM_DUAL_STACK_2026-09-18.md)。
 
 <!-- SIM_CARD_TESTS_APPEND_BEFORE_NOTE -->
 
