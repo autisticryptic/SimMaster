@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 static RESOURCE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
@@ -24,6 +24,17 @@ async fn lock_for(resource_key: &str) -> Arc<Mutex<()>> {
     )
 }
 
+/// Acquire the same per-modem permit used by `with_serial_for`.
+///
+/// An owned permit allows a retained RPC task to finish even if its caller is
+/// cancelled. Bound the acquisition separately from an already-dispatched RPC;
+/// cancelling a D-Bus future does not cancel the command inside ModemManager.
+pub(crate) async fn acquire_for(resource_key: &str) -> OwnedMutexGuard<()> {
+    let key = resource_key.trim();
+    assert!(!key.is_empty(), "serial resource key must not be empty");
+    lock_for(key).await.lock_owned().await
+}
+
 /// Execute a future while holding the lock for one modem/QMI resource.
 ///
 /// `resource_key` should normally be the selected ModemManager object path. A
@@ -33,10 +44,7 @@ pub async fn with_serial_for<T, F>(resource_key: &str, f: F) -> T
 where
     F: Future<Output = T>,
 {
-    let key = resource_key.trim();
-    assert!(!key.is_empty(), "serial resource key must not be empty");
-    let lock = lock_for(key).await;
-    let _guard = lock.lock().await;
+    let _guard = acquire_for(resource_key).await;
     f.await
 }
 

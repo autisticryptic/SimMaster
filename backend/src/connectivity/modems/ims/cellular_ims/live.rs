@@ -49,7 +49,10 @@ use crate::{
         profile_store::{ProfileOrigin, ProfileStore},
         profiles::CarrierProfile,
     },
-    hardware::{cellular::bindings::ModemBinding, devices::transport::ImsBearerTransport},
+    hardware::{
+        cellular::bindings::ModemBinding,
+        devices::transport::{ImsBearerTransport, ImsPcscfDiscovery},
+    },
     platform::config::{CellularImsIpFamily, ImsProfileCandidate, TrunkIpConnectMode},
     platform::db::{Database, SmsMessage},
     services::trunk::{
@@ -2317,27 +2320,53 @@ async fn connect_inner(
     // WDS PCO, the active context, and IMS DNS remain ordered fallbacks when
     // the profile prefetch did not yield an address.
     if bearer.settings.pcscf.is_empty() {
-        tracing::info!("VoLTE bearer settings contain no P-CSCF; reading the active IMS context");
+        tracing::info!("VoLTE bearer settings contain no P-CSCF; querying retained-provider or exact-address AT observation");
         runtime
             .record_attempt(
                 CellularImsStage::Pcscf,
                 None,
                 "started",
                 None,
-                Some("at_cgcontrdp_fallback".to_string()),
+                Some("retained_provider_or_exact_at_fallback".to_string()),
             )
             .await;
         let bearer_local_addresses = [bearer.settings.ipv4_address, bearer.settings.ipv6_address]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        match discover_pcscf_via_active_at_context(
-            &device.modem_id,
-            ims_apn,
-            &bearer_local_addresses,
-        )
-        .await
-        {
+        let discovery = native_bearer
+            .as_mut()
+            .expect("native bearer was established")
+            .discover_pcscf(|| async {
+                discover_pcscf_via_active_at_context(
+                    &device.modem_id,
+                    ims_apn,
+                    &bearer_local_addresses,
+                )
+                .await
+                .map(|discovery| ImsPcscfDiscovery {
+                    candidates: discovery.candidates,
+                    context_id: Some(discovery.cid),
+                    source: "at_cgcontrdp_exact_address",
+                })
+            })
+            .await;
+        let binding = ensure_generation(runtime, generation).and_then(|_| {
+            if !network_worker_binding.is_current() {
+                return Err(CellularImsError::new(
+                    code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+                ));
+            }
+            native_bearer
+                .as_mut()
+                .expect("native bearer was established")
+                .check_liveness()
+        });
+        if let Err(error) = binding {
+            cleanup_unverified_native_bearer(&mut native_bearer).await;
+            return Err(error);
+        }
+        match discovery {
             Ok(discovery) => {
                 runtime
                     .record_attempt(
@@ -2345,17 +2374,30 @@ async fn connect_inner(
                         None,
                         "succeeded",
                         None,
-                        Some(format!("at_cgcontrdp_fallback:cid={}", discovery.cid)),
+                        Some(format!(
+                            "{}:cid={:?}",
+                            discovery.source, discovery.context_id
+                        )),
                     )
                     .await;
+                tracing::info!(
+                    source = discovery.source,
+                    cid = ?discovery.context_id,
+                    pcscf_count = discovery.candidates.len(),
+                    "Associated P-CSCF candidates with the retained IMS bearer"
+                );
                 runtime
-                    .update(|state| state.at_cid = Some(discovery.cid))
+                    .update(|state| state.at_cid = discovery.context_id)
                     .await;
                 for candidate in discovery.candidates {
                     if !bearer.settings.pcscf.contains(&candidate) {
                         bearer.settings.pcscf.push(candidate);
                     }
                 }
+            }
+            Err(error) if !pcscf_observation_allows_fallback(&error) => {
+                cleanup_unverified_native_bearer(&mut native_bearer).await;
+                return Err(error);
             }
             Err(error) => {
                 runtime
@@ -2364,12 +2406,12 @@ async fn connect_inner(
                         None,
                         "failed",
                         Some(&error),
-                        Some("at_cgcontrdp_fallback".to_string()),
+                        Some("retained_provider_or_exact_at_fallback".to_string()),
                     )
                     .await;
                 tracing::warn!(
                     error = %error,
-                    "VoLTE active-context P-CSCF fallback failed; the SIP loop will still try DNS discovery"
+                    "VoLTE P-CSCF observation failed; explicit configuration and bearer DNS remain available"
                 );
             }
         }
@@ -4253,14 +4295,29 @@ async fn cleanup_ims_profile_lease(lease: Option<ImsProfileLease>) {
     }
 }
 
-/// Release a native bearer while connection setup is still in progress.
-///
-/// Once a provider bearer has been established, every early-return path must
-/// release its device handle as well as the optional P-CSCF/profile state.  In
-/// particular, `move_into_worker` can return after a worker-generation change;
-/// dropping the bearer there would leave the provider session alive on the
-/// modem.  The native release routine already guards namespace cleanup against
-/// stale generations, so it is safe to call for both moved and unmoved bearers.
+/// Only missing/unsupported/ambiguous P-CSCF on a still-verified bearer may
+/// continue to configured proxies or IMS DNS. Other provider errors are fatal.
+fn pcscf_observation_allows_fallback(error: &CellularImsError) -> bool {
+    error.code() == code::RUNTIME_ALL_PCSCF_FAILED
+}
+
+/// A discovered owner/profile/worker change invalidates modem-wide AT cleanup.
+/// Release only through the retained provider handle: a reusable modem/CID
+/// selector could now refer to a replacement device or somebody else's profile.
+/// The caller must leave legacy reporting/profile state untouched for explicit
+/// reconciliation; the current owned-bearer path creates no temporary AT lease.
+async fn cleanup_unverified_native_bearer(native_bearer: &mut Option<NativeImsBearer>) {
+    tracing::warn!(
+        "IMS binding is unverified; skipping modem-wide P-CSCF reporting/profile restoration"
+    );
+    if let Some(native) = native_bearer.take() {
+        native_bearer::release_unverified_native_ims_bearer(native).await;
+    }
+}
+
+/// Release an established handle on ordinary setup failure, then restore the
+/// legacy context state. Known-invalid bindings must instead use the retained
+/// provider-only cleanup above, without re-resolving a modem/CID selector.
 async fn cleanup_pending_native_bearer(
     native_bearer: &mut Option<NativeImsBearer>,
     modem_id: &str,
@@ -7841,6 +7898,67 @@ mod tests {
     use super::*;
     use crate::connectivity::core::voice::MediaDirection;
     use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+
+    #[test]
+    fn pcscf_binding_and_provider_failures_cannot_fall_through_to_dns_or_sip() {
+        assert!(pcscf_observation_allows_fallback(&CellularImsError::new(
+            code::RUNTIME_ALL_PCSCF_FAILED,
+        )));
+        for code in [
+            code::BEARER_SESSION_LOST,
+            code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+            code::RUNTIME_IMS_BASEBAND_WEDGED,
+            code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE,
+            code::IP_SETTINGS_MISSING,
+            code::COMMAND_FAILED,
+        ] {
+            assert!(!pcscf_observation_allows_fallback(&CellularImsError::new(
+                code
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_pcscf_binding_releases_only_the_retained_handle_once() {
+        use crate::hardware::devices::transport::{
+            ImsBearerError, ImsBearerErrorKind, ImsBearerFailureHint, ImsBearerHandle,
+            ImsBearerInfo,
+        };
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        struct RetainedHandle(Arc<AtomicUsize>);
+        impl ImsBearerHandle for RetainedHandle {
+            fn check_liveness(&mut self) -> Result<(), ImsBearerError> {
+                Err(ImsBearerError {
+                    kind: ImsBearerErrorKind::SessionLost,
+                    hint: ImsBearerFailureHint::None,
+                    detail: "test_owner_changed".into(),
+                })
+            }
+            fn release(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::AcqRel);
+                })
+            }
+        }
+        let releases = Arc::new(AtomicUsize::new(0));
+        let info = ImsBearerInfo {
+            ipv6_address: Some("2001:db8::2".parse().unwrap()),
+            ..Default::default()
+        };
+        let mut bearer = Some(
+            native_bearer::adopt_bearer(info, Box::new(RetainedHandle(Arc::clone(&releases))))
+                .await
+                .unwrap(),
+        );
+        cleanup_unverified_native_bearer(&mut bearer).await;
+        cleanup_unverified_native_bearer(&mut bearer).await;
+        assert!(bearer.is_none());
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+    }
 
     #[test]
     fn protected_refresh_uses_the_standard_lease_schedule() {

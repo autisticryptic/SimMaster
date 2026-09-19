@@ -188,6 +188,7 @@ jobs:
             platform::network_routing::tests \
             hardware::cellular::cgcontrdp::tests \
             hardware::cellular::bindings::tests \
+            hardware::cellular::serial::tests \
             hardware::cellular::observations::tests \
             hardware::cellular::mm_observations::tests \
             hardware::cellular::radio::tests \
@@ -217,6 +218,7 @@ jobs:
             hardware::devices::qcm410::primary_ims_session::tests \
             hardware::devices::qcm410::primary_ims_lifecycle::tests \
             hardware::devices::qcm410::primary_ims_settings::tests \
+            hardware::devices::qcm410::primary_ims_pcscf::tests \
             hardware::devices::qcm410::secondary_qmi::tests \
             connectivity::modems::ims::cellular_ims::native_bearer::tests \
             connectivity::modems::ims::cellular_ims::data_slot::tests \

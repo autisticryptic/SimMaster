@@ -23,7 +23,7 @@ use crate::hardware::devices::qcm410::{
 };
 use crate::hardware::devices::transport::{
     BearerInterfaceOwnership, ImsBearerError, ImsBearerErrorKind, ImsBearerFailureHint,
-    ImsBearerHandle, ImsBearerInfo, ImsBearerTransport, TransportFuture,
+    ImsBearerHandle, ImsBearerInfo, ImsBearerTransport, ImsPcscfDiscovery, TransportFuture,
 };
 
 const PRIMARY_QMI_DEVICE: &str = "/dev/wwan0qmi0";
@@ -48,6 +48,7 @@ fn primary_netdev_for_qmi(device: &str) -> Option<String> {
 /// Everything needed to tear down one primary-QMI IMS bearer.
 pub struct Qcm410ImsBearerHandle {
     session: PrimaryImsSession,
+    expected_settings: CgcontrdpSettings,
 }
 
 impl ImsBearerHandle for Qcm410ImsBearerHandle {
@@ -61,9 +62,20 @@ impl ImsBearerHandle for Qcm410ImsBearerHandle {
             })
     }
 
+    fn discover_pcscf(
+        &mut self,
+    ) -> TransportFuture<'_, Result<Option<ImsPcscfDiscovery>, ImsBearerError>> {
+        Box::pin(async move {
+            self.session
+                .discover_pcscf(&self.expected_settings)
+                .await
+                .map(Some)
+        })
+    }
+
     fn release(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         Box::pin(async move {
-            let Qcm410ImsBearerHandle { mut session } = *self;
+            let Qcm410ImsBearerHandle { mut session, .. } = *self;
             stop_primary_session(&mut session).await;
         })
     }
@@ -183,8 +195,8 @@ async fn establish_bearer(
 
     // MM reads IP/DNS on its retained WDS client and publishes the result on
     // the exact owned bearer. AT can omit DNS or refer to a different PDP CID;
-    // it must not replace this object's addressing. The upper IMS layer may
-    // supplement P-CSCF only after matching the observed bearer source address.
+    // it must not replace this object's addressing. Supplementary P-CSCF is
+    // read later through this retained session's unique-owner MM adapter.
     let settings = match wait_for_current_settings(&session).await {
         Ok(settings) => settings,
         Err(error) => {
@@ -268,6 +280,7 @@ async fn establish_bearer(
         });
     }
 
+    let expected_settings = settings.clone();
     let info = ImsBearerInfo {
         interface: resolution.interface.clone(),
         netdev_method: resolution.method.as_str(),
@@ -291,7 +304,10 @@ async fn establish_bearer(
     };
     Ok(Established {
         info,
-        handle: Qcm410ImsBearerHandle { session },
+        handle: Qcm410ImsBearerHandle {
+            session,
+            expected_settings,
+        },
     })
 }
 

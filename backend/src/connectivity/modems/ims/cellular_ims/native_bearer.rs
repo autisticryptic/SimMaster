@@ -8,10 +8,10 @@
 //! moved into the line's UE namespace before SIP or media sockets are created.
 //! The provider retains any device-native session state needed for settings
 //! and teardown.
-//! The IMS path also reads its authoritative IP configuration and P-CSCF from
-//! **`AT+CGCONTRDP`** on the active IMS context
-//! (`Native VoLTE P-CSCF candidates discovered from active IMS bearer`,
-//! `volte.rs:3671`).
+//! Provider-owned IP settings remain authoritative (the QCA410/MM provider
+//! reads its retained D-Bus bearer). Supplementary P-CSCF observation can also
+//! be delegated to that retained provider; unsupported providers keep the
+//! exact-address AT fallback. Never substitute AT addressing for the MM grant.
 //!
 //! The native session mechanism is the *device driver's* job, hidden behind
 //! the [`ImsBearerTransport`] trait. This module only orchestrates: it walks the
@@ -27,7 +27,7 @@ use std::net::IpAddr;
 
 use crate::hardware::devices::transport::{
     BearerInterfaceOwnership, ImsBearerError, ImsBearerErrorKind, ImsBearerFailureHint,
-    ImsBearerHandle, ImsBearerInfo, ImsBearerTransport,
+    ImsBearerHandle, ImsBearerInfo, ImsBearerTransport, ImsPcscfDiscovery,
 };
 use crate::{
     platform::netns,
@@ -99,6 +99,43 @@ impl NativeImsBearer {
         self.handle
             .check_liveness()
             .map_err(cellular_ims_error_from_ims_bearer)
+    }
+
+    /// Use the retained provider's association if supported. Only an explicit
+    /// unsupported result permits the legacy exact-address observation.
+    pub async fn discover_pcscf<F, Fut>(
+        &mut self,
+        exact_at_fallback: F,
+    ) -> Result<ImsPcscfDiscovery, CellularImsError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<ImsPcscfDiscovery, CellularImsError>>,
+    {
+        self.check_liveness()?;
+        if !self.worker_binding_is_current() {
+            return Err(CellularImsError::new(
+                code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+            ));
+        }
+        let provider = self.handle.discover_pcscf().await;
+        self.check_liveness()?;
+        if !self.worker_binding_is_current() {
+            return Err(CellularImsError::new(
+                code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+            ));
+        }
+        let result = match provider {
+            Ok(Some(discovery)) => Ok(discovery),
+            Ok(None) => exact_at_fallback().await,
+            Err(error) => Err(cellular_ims_error_from_ims_bearer(error)),
+        };
+        self.check_liveness()?;
+        if !self.worker_binding_is_current() {
+            return Err(CellularImsError::new(
+                code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+            ));
+        }
+        result
     }
 
     /// Move the dedicated native netdev into this line's UE namespace. The
@@ -382,6 +419,14 @@ pub async fn establish_native_ims_bearer(
     }))
 }
 
+/// Release a handle whose device binding became unverified. Do not first
+/// touch an interface merely because the worker generation still matches:
+/// only the provider can revalidate MM ownership/exclusivity or retain a
+/// recovery receipt. In particular, do not move a replacement owner's link.
+pub(super) async fn release_unverified_native_ims_bearer(bearer: NativeImsBearer) {
+    bearer.handle.release().await;
+}
+
 /// Tear down a native bearer's WDS session(s) and release its endpoint.
 pub async fn release_native_ims_bearer(mut bearer: NativeImsBearer) {
     if bearer.worker_binding_is_current() {
@@ -447,6 +492,7 @@ pub(crate) fn cellular_ims_error_from_ims_bearer(error: ImsBearerError) -> Cellu
         }
         ImsBearerErrorKind::SessionLost => code::BEARER_SESSION_LOST,
         ImsBearerErrorKind::SettingsMissing => code::IP_SETTINGS_MISSING,
+        ImsBearerErrorKind::PcscfUnavailable => code::RUNTIME_ALL_PCSCF_FAILED,
     };
     CellularImsError::with_detail(error_code, error.detail)
 }
@@ -485,7 +531,201 @@ pub fn to_bearer_connection(info: &ImsBearerInfo) -> Result<BearerConnection, Ce
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hardware::devices::transport::TransportFuture;
     use crate::platform::config::CellularImsIpFamilyPreference;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct PcscfHandle {
+        result: Option<Result<Option<ImsPcscfDiscovery>, ImsBearerError>>,
+        alive: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+        lose_during_read: bool,
+    }
+
+    fn lost_pcscf_session() -> ImsBearerError {
+        ImsBearerError {
+            kind: ImsBearerErrorKind::SessionLost,
+            hint: ImsBearerFailureHint::None,
+            detail: "test_session_lost".to_string(),
+        }
+    }
+
+    impl ImsBearerHandle for PcscfHandle {
+        fn check_liveness(&mut self) -> Result<(), ImsBearerError> {
+            self.alive
+                .load(Ordering::Acquire)
+                .then_some(())
+                .ok_or_else(lost_pcscf_session)
+        }
+
+        fn discover_pcscf(
+            &mut self,
+        ) -> TransportFuture<'_, Result<Option<ImsPcscfDiscovery>, ImsBearerError>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                if self.lose_during_read {
+                    self.alive.store(false, Ordering::Release);
+                }
+                self.result.take().expect("one provider observation")
+            })
+        }
+
+        fn release(
+            self: Box<Self>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+            Box::pin(async {})
+        }
+    }
+
+    fn discovered(source: &'static str) -> ImsPcscfDiscovery {
+        ImsPcscfDiscovery {
+            candidates: vec!["192.0.2.20".parse().unwrap()],
+            context_id: Some(2),
+            source,
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_success_missing_and_lost_results_never_retry_legacy_at() {
+        let missing = ImsBearerError {
+            kind: ImsBearerErrorKind::PcscfUnavailable,
+            hint: ImsBearerFailureHint::None,
+            detail: "test_pcscf_missing".to_string(),
+        };
+        for (reply, expected_code) in [
+            (Ok(Some(discovered("provider"))), None),
+            (Err(missing), Some(code::RUNTIME_ALL_PCSCF_FAILED)),
+            (Err(lost_pcscf_session()), Some(code::BEARER_SESSION_LOST)),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handle = PcscfHandle {
+                result: Some(reply),
+                alive: Arc::new(AtomicBool::new(true)),
+                calls: Arc::clone(&calls),
+                lose_during_read: false,
+            };
+            let mut bearer = adopt_bearer(reference_info(), Box::new(handle))
+                .await
+                .unwrap();
+            let before = bearer.connection.settings.clone();
+            let result = bearer
+                .discover_pcscf(|| async {
+                    panic!("a supported provider must not retry modem-wide AT")
+                })
+                .await;
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            if let Some(code) = expected_code {
+                assert_eq!(result.unwrap_err().code(), code);
+            } else {
+                assert_eq!(result.unwrap().source, "provider");
+            }
+            assert_eq!(bearer.connection.settings, before);
+            release_native_ims_bearer(bearer).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_provider_runs_the_exact_address_fallback_once() {
+        struct Unsupported;
+        impl ImsBearerHandle for Unsupported {
+            fn check_liveness(&mut self) -> Result<(), ImsBearerError> {
+                Ok(())
+            }
+            fn release(
+                self: Box<Self>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+            {
+                Box::pin(async {})
+            }
+        }
+        let mut bearer = adopt_bearer(reference_info(), Box::new(Unsupported))
+            .await
+            .unwrap();
+        let calls = AtomicUsize::new(0);
+        let result = bearer
+            .discover_pcscf(|| async {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(discovered("legacy_exact"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(result.source, "legacy_exact");
+        release_native_ims_bearer(bearer).await;
+    }
+
+    #[tokio::test]
+    async fn provider_or_fallback_liveness_loss_discards_the_observation() {
+        for lose_during_read in [true, false] {
+            let alive = Arc::new(AtomicBool::new(true));
+            let handle = PcscfHandle {
+                result: Some(Ok(None)),
+                alive: Arc::clone(&alive),
+                calls: Arc::new(AtomicUsize::new(0)),
+                lose_during_read,
+            };
+            let mut bearer = adopt_bearer(reference_info(), Box::new(handle))
+                .await
+                .unwrap();
+            let fallbacks = AtomicUsize::new(0);
+            let error = bearer
+                .discover_pcscf(|| async {
+                    fallbacks.fetch_add(1, Ordering::AcqRel);
+                    alive.store(false, Ordering::Release);
+                    Ok(discovered("stale"))
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), code::BEARER_SESSION_LOST);
+            assert_eq!(
+                fallbacks.load(Ordering::Acquire),
+                usize::from(!lose_during_read)
+            );
+            release_native_ims_bearer(bearer).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unverified_provider_release_never_sends_generic_worker_cleanup() {
+        struct ReleaseProbe(Arc<AtomicUsize>);
+        impl ImsBearerHandle for ReleaseProbe {
+            fn check_liveness(&mut self) -> Result<(), ImsBearerError> {
+                Err(lost_pcscf_session())
+            }
+            fn release(
+                self: Box<Self>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+            {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::AcqRel);
+                })
+            }
+        }
+        let line = "pcscf-unverified-cleanup";
+        let worker = UeWorkerHandle::for_line(
+            line,
+            netns::NetnsName::for_line(netns::DEFAULT_NAMESPACE_PREFIX, line),
+        );
+        worker
+            .enable_test_net_config_outcome(Some("unexpected_generic_cleanup".into()))
+            .await;
+        let releases = Arc::new(AtomicUsize::new(0));
+        let mut info = reference_info();
+        info.interface = "pcscf-test0".into();
+        let mut bearer = adopt_bearer(info, Box::new(ReleaseProbe(Arc::clone(&releases))))
+            .await
+            .unwrap();
+        bearer.worker_binding = Some(worker.bind());
+        bearer.worker = Some(worker.clone());
+        assert!(bearer.worker_binding_is_current());
+        release_unverified_native_ims_bearer(bearer).await;
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+        assert!(worker.status().await.last_net_config_error.is_none());
+        assert!(!worker.status().await.last_net_config_ok);
+    }
 
     /// The reference IMS context as `+CGCONTRDP` reports it: address+mask,
     /// gateway, DNS and a P-CSCF, all on the same line, projected onto the

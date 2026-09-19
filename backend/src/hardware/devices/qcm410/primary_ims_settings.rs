@@ -76,6 +76,20 @@ fn number(properties: &Properties, key: &str) -> Result<Option<u32>, String> {
         .transpose()
 }
 
+/// A profile pin is a signed integer in MM's bearer Properties dictionary.
+/// Missing/-1 means unspecified; a wrong type must not authorize CID matching.
+pub(super) fn profile_id(properties: &Properties) -> Result<Option<u32>, String> {
+    let properties = dictionary(properties, "Properties")?;
+    match properties.get("profile-id") {
+        None => Ok(None),
+        Some(value) => match i32::try_from(value).map_err(|_| invalid("profile-id"))? {
+            -1 => Ok(None),
+            value if value >= 0 => Ok(Some(value as u32)),
+            _ => Err(invalid("profile-id")),
+        },
+    }
+}
+
 /// Revalidate status both in the GetAll snapshot and after the asynchronous
 /// read. A matching APN alone does not identify an owned, connected interface.
 pub(super) fn validate_binding(
@@ -492,6 +506,29 @@ mod tests {
         assert!(settings.ipv6_gateway.is_none());
         assert!(settings.ipv6_dns.is_empty());
         assert!(settings.pcscf.is_empty());
+    }
+
+    #[test]
+    fn mm_profile_pin_requires_the_typed_actual_property() {
+        let mut snapshot = snapshot_with(6, config(6));
+        assert_eq!(profile_id(&snapshot).unwrap(), None);
+        for (value, expected) in [(2_i32, Some(2)), (-1, None), (0, Some(0))] {
+            snapshot.insert(
+                "Properties".into(),
+                OwnedValue::from(Properties::from([(
+                    "profile-id".into(),
+                    OwnedValue::from(value),
+                )])),
+            );
+            assert_eq!(profile_id(&snapshot).unwrap(), expected);
+        }
+        for value in [OwnedValue::from(2_u32), OwnedValue::from(-2_i32), text("2")] {
+            snapshot.insert(
+                "Properties".into(),
+                OwnedValue::from(Properties::from([("profile-id".into(), value)])),
+            );
+            assert!(profile_id(&snapshot).is_err());
+        }
     }
 
     #[test]

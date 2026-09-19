@@ -120,6 +120,16 @@ pub struct ImsBearerInfo {
     pub qos_flows: Vec<QosFlowInfo>,
 }
 
+/// P-CSCF candidates associated with a retained provider session.
+///
+/// `source` describes the observation, not a registration or reachability result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImsPcscfDiscovery {
+    pub candidates: Vec<IpAddr>,
+    pub context_id: Option<u8>,
+    pub source: &'static str,
+}
+
 /// Opaque teardown handle for an established IMS bearer.
 ///
 /// Dropping it without calling [`Self::release`] would leak the native session
@@ -132,6 +142,15 @@ pub trait ImsBearerHandle: Send {
     /// Report confirmed loss of the retained provider session without opening
     /// another control connection or sending network probes.
     fn check_liveness(&mut self) -> Result<(), ImsBearerError>;
+
+    /// Read supplementary P-CSCF on this retained session's own control path.
+    /// None means the provider does not implement this observation. An error
+    /// must not be retried through a weaker, modem-wide AT association path.
+    fn discover_pcscf(
+        &mut self,
+    ) -> TransportFuture<'_, Result<Option<ImsPcscfDiscovery>, ImsBearerError>> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// Record namespace ownership before the move can happen. Controllers
     /// that survive application exit use it for bounded shutdown/recovery.
@@ -173,6 +192,9 @@ pub enum ImsBearerErrorKind {
     SessionLost,
     /// The IMS context reported no usable IP configuration / P-CSCF.
     SettingsMissing,
+    /// Supplementary P-CSCF was absent, unsupported or ambiguous. The retained
+    /// bearer may still use an explicit configured proxy or its own IMS DNS.
+    PcscfUnavailable,
     /// The data interface for the session could not be resolved.
     NetdevUnresolved,
 }

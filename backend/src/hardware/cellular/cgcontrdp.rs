@@ -3,7 +3,9 @@
 //! Device-agnostic parsing of IMS context observations (3GPP TS 27.007).
 //! MM-backed QCA410 bearers obtain their authoritative IP/DNS configuration
 //! from the owned D-Bus bearer; AT is a supplementary P-CSCF observation which
-//! must match that bearer's local address. Native providers may use this reader
+//! is associated with that bearer by its provider (exact address by default;
+//! QCA410/MM additionally verifies the unique pinned IPv6 PDN). Native providers
+//! may use this reader
 //! as their device-specific settings source. The plain settings container is
 //! shared; its name alone does not identify where a snapshot was obtained.
 //!
@@ -208,13 +210,14 @@ fn parse_cgcontrdp_settings_with_local_addresses(
 /// prefix length. IPv4 arrives as 8 octets (4 address + 4 mask), IPv6 as 32
 /// octets (16 address + 16 mask); a bare address with no mask yields `None` for
 /// the prefix.
-fn parse_cgcontrdp_addr_and_mask(field: &str) -> Option<(IpAddr, Option<u8>)> {
+pub(crate) fn parse_cgcontrdp_addr_and_mask(field: &str) -> Option<(IpAddr, Option<u8>)> {
     let cleaned = field.trim_matches(|c| c == '\'' || c == '"').trim();
     // A pre-formatted address (with or without an inline /prefix) short-circuits.
     if let Some((addr, prefix)) = cleaned.split_once('/') {
-        if let Ok(address) = addr.trim().parse::<IpAddr>() {
-            return Some((address, prefix.trim().parse::<u8>().ok()));
-        }
+        let address = addr.trim().parse::<IpAddr>().ok()?;
+        let prefix = prefix.trim().parse::<u8>().ok()?;
+        return (prefix <= if address.is_ipv4() { 32 } else { 128 })
+            .then_some((address, Some(prefix)));
     }
     if let Ok(address) = cleaned.parse::<IpAddr>() {
         return Some((address, None));
@@ -232,7 +235,7 @@ fn parse_cgcontrdp_addr_and_mask(field: &str) -> Option<(IpAddr, Option<u8>)> {
         8 => {
             let address = IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]));
             let mask = u32::from_be_bytes([octets[4], octets[5], octets[6], octets[7]]);
-            Some((address, prefix_from_mask_bits(mask)))
+            Some((address, Some(prefix_from_mask_bits(mask)?)))
         }
         16 => {
             let bytes: [u8; 16] = octets.try_into().ok()?;
@@ -243,10 +246,7 @@ fn parse_cgcontrdp_addr_and_mask(field: &str) -> Option<(IpAddr, Option<u8>)> {
             let mask_bytes: [u8; 16] = octets[16..].try_into().ok()?;
             let ones: u32 = mask_bytes.iter().map(|b| b.count_ones()).sum();
             let contiguous = u128::from_be_bytes(mask_bytes).leading_ones() == ones;
-            Some((
-                IpAddr::V6(Ipv6Addr::from(addr_bytes)),
-                contiguous.then_some(ones as u8),
-            ))
+            contiguous.then_some((IpAddr::V6(Ipv6Addr::from(addr_bytes)), Some(ones as u8)))
         }
         _ => None,
     }
@@ -346,6 +346,27 @@ mod tests {
             2,
             "internet"
         ));
+    }
+
+    #[test]
+    fn malformed_masks_are_not_relabelled_as_bare_addresses() {
+        for field in [
+            "192.0.2.10/33",
+            "2001:db8::10/129",
+            "2001:db8::10/invalid",
+            "192.0.2.10.255.0.255.0",
+            "32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.10.255.255.0.255.0.0.0.0.0.0.0.0.0.0.0.0",
+        ] {
+            assert!(parse_cgcontrdp_addr_and_mask(field).is_none(), "{field}");
+        }
+        assert_eq!(
+            parse_cgcontrdp_addr_and_mask("2001:db8::10/64"),
+            Some(("2001:db8::10".parse().unwrap(), Some(64)))
+        );
+        assert_eq!(
+            parse_cgcontrdp_addr_and_mask("2001:db8::10"),
+            Some(("2001:db8::10".parse().unwrap(), None))
+        );
     }
 
     #[test]

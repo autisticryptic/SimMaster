@@ -17,6 +17,7 @@ pub mod baseband_faults;
 pub mod ims_bearer;
 pub mod netdev;
 mod primary_ims_lifecycle;
+mod primary_ims_pcscf;
 mod primary_ims_session;
 mod primary_ims_settings;
 pub mod resources;

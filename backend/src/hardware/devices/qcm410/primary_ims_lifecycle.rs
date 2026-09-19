@@ -18,6 +18,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
 use zbus::{
     fdo::DBusProxy,
     proxy::CacheProperties,
@@ -26,12 +27,16 @@ use zbus::{
 };
 
 use crate::{
-    hardware::cellular::cgcontrdp::CgcontrdpSettings,
+    hardware::{
+        cellular::{cgcontrdp::CgcontrdpSettings, serial},
+        devices::transport::{ImsBearerError, ImsBearerErrorKind, ImsPcscfDiscovery},
+    },
     platform::netns::{self, NetnsName},
 };
 
 use super::{
     netdev::{self, NetdevConfig},
+    primary_ims_pcscf::{self, session_changed, unavailable},
     primary_ims_session::{safe_error, PrimaryImsRequest, OWNER_MISSING},
     primary_ims_settings::{self, MmIpFamily},
 };
@@ -307,6 +312,156 @@ impl MmBus {
         .await
     }
 
+    /// Supplementary AT observations are bound to the session's original
+    /// unique owner, never to a later lookup of a reusable modem selector.
+    pub async fn discover_pcscf(
+        self: &Arc<Self>,
+        bearer: &str,
+        apn: &str,
+        family: MmIpFamily,
+        profile_id: Option<u32>,
+        expected: &CgcontrdpSettings,
+        guard: &NetworkGuard,
+    ) -> Result<ImsPcscfDiscovery, ImsBearerError> {
+        let deadline = Instant::now() + primary_ims_pcscf::BUDGET;
+        tokio::time::timeout_at(deadline, async {
+            let result = primary_ims_pcscf::discover_with(
+                expected,
+                profile_id,
+                apn,
+                primary_ims_pcscf::READ_DELAY,
+                || self.pcscf_binding_snapshot(bearer, apn, family, profile_id),
+                |command| async move { self.pcscf_at_read(&command, guard, deadline).await },
+            )
+            .await;
+            // Every recoverable exit (including AT/parse/context errors)
+            // must prove the bearer is still the same before DNS/config
+            // fallback can use its old addressing. Cached liveness alone
+            // cannot detect profile, grant or exclusive-interface changes.
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind == ImsBearerErrorKind::PcscfUnavailable)
+                && self
+                    .pcscf_binding_snapshot(bearer, apn, family, profile_id)
+                    .await?
+                    != *expected
+            {
+                return Err(session_changed("ip_config_changed"));
+            }
+            result
+        })
+        .await
+        .map_err(|_| session_changed("read_timeout_unverified"))?
+    }
+
+    async fn pcscf_owner_check(&self) -> Result<(), ImsBearerError> {
+        if !self
+            .owner_is_current()
+            .await
+            .map_err(|_| session_changed("owner_unavailable"))?
+        {
+            return Err(session_changed("owner_changed"));
+        }
+        let port = self
+            .primary_port()
+            .await
+            .map_err(|_| session_changed("endpoint_unavailable"))?;
+        if self.device.strip_prefix("/dev/") != Some(port.as_str()) {
+            return Err(session_changed("endpoint_changed"));
+        }
+        Ok(())
+    }
+
+    async fn pcscf_binding_snapshot(
+        &self,
+        bearer: &str,
+        apn: &str,
+        family: MmIpFamily,
+        profile_id: Option<u32>,
+    ) -> Result<CgcontrdpSettings, ImsBearerError> {
+        self.pcscf_owner_check().await?;
+        let result = timed(10, async {
+            if !self.bearers().await?.iter().any(|path| path == bearer)
+                || !self.may_clean_interface(bearer).await?
+            {
+                return Err("bearer_not_exclusive".to_string());
+            }
+            let properties: primary_ims_settings::Properties = self
+                .proxy(bearer, "org.freedesktop.DBus.Properties")
+                .await?
+                .call("GetAll", &(BEARER,))
+                .await
+                .map_err(bus_error)?;
+            let actual_profile = primary_ims_settings::profile_id(&properties)?;
+            if profile_id.is_some() && actual_profile != profile_id {
+                return Err("profile_pin_changed".to_string());
+            }
+            let settings = primary_ims_settings::parse(&properties, &self.interface, apn, family)?
+                .ok_or_else(|| "ip_config_unavailable".to_string())?;
+            let status = self.status(bearer).await?;
+            primary_ims_settings::validate_binding(
+                status.connected,
+                &status.interface,
+                &status.apn,
+                &self.interface,
+                apn,
+            )?;
+            Ok(settings)
+        })
+        .await
+        // Do not export raw properties or a possibly sensitive D-Bus error.
+        .map_err(|_| session_changed("bearer_snapshot_invalid"))?;
+        self.pcscf_owner_check().await?;
+        Ok(result)
+    }
+
+    async fn pcscf_at_read(
+        self: &Arc<Self>,
+        command: &str,
+        guard: &NetworkGuard,
+        deadline: Instant,
+    ) -> Result<String, ImsBearerError> {
+        let context_read = command.strip_prefix("AT+CGCONTRDP=").is_some_and(|value| {
+            value
+                .parse::<u8>()
+                .ok()
+                .is_some_and(|cid| (1..=16).contains(&cid) && cid.to_string() == value)
+        });
+        if !matches!(command, "AT+CGACT?" | "AT+CGDCONT?") && !context_read {
+            return Err(unavailable("command_not_read_only"));
+        }
+        let guard = guard
+            .0
+            .enter()
+            .map_err(|_| session_changed("lease_closing"))?;
+        let bus = Arc::clone(self);
+        let command = command.to_string();
+        retained_serial_read(self.modem.clone(), guard, deadline, async move {
+            bus.pcscf_owner_check().await?;
+            if Instant::now() >= deadline {
+                return Err(session_changed("read_timeout_unverified"));
+            }
+            let result = timed(5, async {
+                bus.proxy(&bus.modem, MODEM)
+                    .await?
+                    .call::<_, _, String>("Command", &(command.as_str(), 4_u32))
+                    .await
+                    .map_err(bus_error)
+            })
+            .await;
+            // Even a failed AT reply must not conceal handover during the call.
+            bus.pcscf_owner_check().await?;
+            result.map_err(|error| {
+                if error == "qca410_primary_mm_command_timeout" {
+                    session_changed("at_read_timeout_unverified")
+                } else {
+                    unavailable("at_read_failed")
+                }
+            })
+        })
+        .await
+    }
+
     pub async fn connect(&self, bearer: &str) -> Result<(), String> {
         timed(65, async {
             self.proxy(bearer, BEARER)
@@ -357,6 +512,36 @@ impl MmBus {
         }
         Ok(true)
     }
+}
+
+/// Keep both permits with an already-dispatched read, not with its waiter.
+/// The observation deadline bounds lock acquisition and result publication;
+/// cancellation/timeout may leave one read draining under its own RPC timeout.
+/// No writes are made here, and a late reply is never published as fresh PCO.
+async fn retained_serial_read<F>(
+    modem: String,
+    guard: NetworkGuard,
+    deadline: Instant,
+    read: F,
+) -> Result<String, ImsBearerError>
+where
+    F: Future<Output = Result<String, ImsBearerError>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _lease = guard;
+        let _serial = tokio::time::timeout_at(deadline, serial::acquire_for(&modem))
+            .await
+            .map_err(|_| session_changed("serial_wait_timeout"))?;
+        if Instant::now() >= deadline {
+            return Err(session_changed("read_timeout_unverified"));
+        }
+        if _lease.0.closing.load(Ordering::Acquire) || is_shutting_down() {
+            return Err(session_changed("lease_closing"));
+        }
+        read.await
+    })
+    .await
+    .map_err(|_| session_changed("at_read_task_failed"))?
 }
 
 fn create_properties<'a>(
@@ -919,6 +1104,61 @@ mod ip_config_dbus_tests {
     struct FakeBearer {
         connected: Arc<AtomicBool>,
         disconnect_during_read: bool,
+        profile_id: Arc<std::sync::atomic::AtomicI32>,
+        changed_ip: Arc<AtomicBool>,
+    }
+
+    struct FakeModem {
+        connected: Arc<AtomicBool>,
+        profile_id: Arc<std::sync::atomic::AtomicI32>,
+        changed_ip: Arc<AtomicBool>,
+        commands: Arc<Mutex<Vec<String>>>,
+        action: &'static str,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.ModemManager1.Modem")]
+    impl FakeModem {
+        #[zbus(property)]
+        fn primary_port(&self) -> String {
+            "wwan0qmi0".to_string()
+        }
+        #[zbus(property)]
+        fn bearers(&self) -> Vec<OwnedObjectPath> {
+            vec![OwnedObjectPath::try_from(PATH).unwrap()]
+        }
+        fn command(&self, command: &str, _timeout: u32) -> String {
+            self.commands.lock().unwrap().push(command.to_string());
+            match command {
+                "AT+CGACT?" => "+CGACT: 1,0\n+CGACT: 2,1".into(),
+                "AT+CGDCONT?" => {
+                    "+CGDCONT: 1,\"IPV4V6\",\"internet\"\n+CGDCONT: 2,\"IPV4V6\",\"ims\"".into()
+                }
+                "AT+CGCONTRDP=2" => {
+                    match self.action {
+                        "disconnect" => self.connected.store(false, Ordering::Release),
+                        "profile" => self.profile_id.store(3, Ordering::Release),
+                        "ip" => self.changed_ip.store(true, Ordering::Release),
+                        "error" => return "ERROR".into(),
+                        "error_profile" => {
+                            self.profile_id.store(3, Ordering::Release);
+                            return "ERROR".into();
+                        }
+                        "error_ip" => {
+                            self.changed_ip.store(true, Ordering::Release);
+                            return "ERROR".into();
+                        }
+                        "error_disconnect" => {
+                            self.connected.store(false, Ordering::Release);
+                            return "ERROR".into();
+                        }
+                        _ => {}
+                    }
+                    "+CGCONTRDP: 2,5,ims,2001:db8::a,2001:db8::b,,,2001:db8:2::10,2001:db8:2::11"
+                        .into()
+                }
+                _ => "ERROR".into(),
+            }
+        }
     }
 
     fn text(value: &str) -> OwnedValue {
@@ -959,7 +1199,13 @@ mod ip_config_dbus_tests {
         }
         #[zbus(property)]
         fn properties(&self) -> HashMap<String, OwnedValue> {
-            HashMap::from([("apn".into(), text("ims"))])
+            HashMap::from([
+                ("apn".into(), text("ims")),
+                (
+                    "profile-id".into(),
+                    OwnedValue::from(self.profile_id.load(Ordering::Acquire)),
+                ),
+            ])
         }
         #[zbus(property)]
         fn ip4_config(&self) -> HashMap<String, OwnedValue> {
@@ -973,11 +1219,22 @@ mod ip_config_dbus_tests {
             if self.disconnect_during_read {
                 self.connected.store(false, Ordering::Release);
             }
-            ip_config(true)
+            let mut config = ip_config(true);
+            if self.changed_ip.load(Ordering::Acquire) {
+                config.insert("address".into(), text("2001:db8::3"));
+            }
+            config
         }
     }
 
     async fn server(disconnect_during_read: bool) -> Connection {
+        probe_server(disconnect_during_read, "").await.0
+    }
+
+    async fn probe_server(
+        disconnect_during_read: bool,
+        action: &'static str,
+    ) -> (Connection, Arc<Mutex<Vec<String>>>) {
         // This filter is executed explicitly inside dbus-run-session on CI.
         // Never register a fake MM daemon on a real machine's system bus.
         let session = std::env::var("DBUS_SESSION_BUS_ADDRESS")
@@ -986,21 +1243,39 @@ mod ip_config_dbus_tests {
             std::env::var("DBUS_SYSTEM_BUS_ADDRESS").ok().as_deref(),
             Some(session.as_str())
         );
-        zbus::connection::Builder::system()
+        let connected = Arc::new(AtomicBool::new(true));
+        let profile_id = Arc::new(std::sync::atomic::AtomicI32::new(2));
+        let changed_ip = Arc::new(AtomicBool::new(false));
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let connection = zbus::connection::Builder::system()
             .unwrap()
             .name(SERVICE)
             .unwrap()
             .serve_at(
+                "/org/freedesktop/ModemManager1/Modem/0",
+                FakeModem {
+                    connected: Arc::clone(&connected),
+                    profile_id: Arc::clone(&profile_id),
+                    changed_ip: Arc::clone(&changed_ip),
+                    commands: Arc::clone(&commands),
+                    action,
+                },
+            )
+            .unwrap()
+            .serve_at(
                 PATH,
                 FakeBearer {
-                    connected: Arc::new(AtomicBool::new(true)),
+                    connected,
                     disconnect_during_read,
+                    profile_id,
+                    changed_ip,
                 },
             )
             .unwrap()
             .build()
             .await
-            .unwrap()
+            .unwrap();
+        (connection, commands)
     }
 
     async fn bus() -> Arc<MmBus> {
@@ -1011,6 +1286,211 @@ mod ip_config_dbus_tests {
         )
         .await
         .unwrap()
+    }
+
+    fn observation_guard() -> NetworkGuard {
+        Arc::new(NetworkActivity::default()).enter().unwrap()
+    }
+
+    #[tokio::test]
+    async fn owned_pcscf_uses_only_the_original_mm_read_only_command_path() {
+        let (_server, commands) = probe_server(false, "").await;
+        let bus = bus().await;
+        let expected = bus
+            .ip_settings(PATH, "ims", MmIpFamily::Ipv6)
+            .await
+            .unwrap()
+            .unwrap();
+        let discovery = bus
+            .discover_pcscf(
+                PATH,
+                "ims",
+                MmIpFamily::Ipv6,
+                Some(2),
+                &expected,
+                &observation_guard(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(discovery.source, "mm_owned_at_sole_pinned_ipv6_prefix");
+        assert_eq!(discovery.candidates.len(), 2);
+        assert_eq!(
+            commands.lock().unwrap().as_slice(),
+            [
+                "AT+CGACT?",
+                "AT+CGDCONT?",
+                "AT+CGCONTRDP=2",
+                "AT+CGACT?",
+                "AT+CGDCONT?",
+                "AT+CGCONTRDP=2",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_profile_pin_mismatch_blocks_at_before_the_first_command() {
+        let (_server, commands) = probe_server(false, "").await;
+        let bus = bus().await;
+        let expected = bus
+            .ip_settings(PATH, "ims", MmIpFamily::Ipv6)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = bus
+            .discover_pcscf(
+                PATH,
+                "ims",
+                MmIpFamily::Ipv6,
+                Some(3),
+                &expected,
+                &observation_guard(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            crate::hardware::devices::transport::ImsBearerErrorKind::SessionLost
+        );
+        assert!(commands.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pcscf_is_not_published_after_live_bearer_profile_or_ip_changes() {
+        for action in [
+            "disconnect",
+            "profile",
+            "ip",
+            "error_profile",
+            "error_ip",
+            "error_disconnect",
+        ] {
+            let (server, _) = probe_server(false, action).await;
+            let bus = bus().await;
+            let expected = bus
+                .ip_settings(PATH, "ims", MmIpFamily::Ipv6)
+                .await
+                .unwrap()
+                .unwrap();
+            let error = bus
+                .discover_pcscf(
+                    PATH,
+                    "ims",
+                    MmIpFamily::Ipv6,
+                    Some(2),
+                    &expected,
+                    &observation_guard(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind,
+                crate::hardware::devices::transport::ImsBearerErrorKind::SessionLost,
+                "{action}"
+            );
+            server.release_name(SERVICE).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pcscf_adapter_rejects_mutating_commands_and_replaced_owners() {
+        let (first, old_commands) = probe_server(false, "").await;
+        let bus = bus().await;
+        for command in [
+            "AT+CGACT=0,2",
+            "AT+CGDCONT=2,IPV6,ims",
+            "AT+CFUN=0",
+            "AT+CGCONTRDP=2;AT+CFUN=0",
+            "AT+CGCONTRDP=02",
+        ] {
+            assert!(bus
+                .pcscf_at_read(
+                    command,
+                    &observation_guard(),
+                    Instant::now() + primary_ims_pcscf::BUDGET
+                )
+                .await
+                .unwrap_err()
+                .detail
+                .ends_with("command_not_read_only"));
+        }
+        assert!(old_commands.lock().unwrap().is_empty());
+        first.release_name(SERVICE).await.unwrap();
+        let (_replacement, new_commands) = probe_server(false, "").await;
+        let error = bus
+            .pcscf_at_read(
+                "AT+CGACT?",
+                &observation_guard(),
+                Instant::now() + primary_ims_pcscf::BUDGET,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            crate::hardware::devices::transport::ImsBearerErrorKind::SessionLost
+        );
+        assert!(old_commands.lock().unwrap().is_empty());
+        assert!(new_commands.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsupported_at_is_a_pcscf_failure_not_an_ip_config_replacement() {
+        let (_server, _) = probe_server(false, "error").await;
+        let bus = bus().await;
+        let expected = bus
+            .ip_settings(PATH, "ims", MmIpFamily::Ipv6)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = bus
+            .discover_pcscf(
+                PATH,
+                "ims",
+                MmIpFamily::Ipv6,
+                Some(2),
+                &expected,
+                &observation_guard(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            crate::hardware::devices::transport::ImsBearerErrorKind::PcscfUnavailable
+        );
+        assert_eq!(
+            bus.ip_settings(PATH, "ims", MmIpFamily::Ipv6)
+                .await
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn pcscf_commands_share_the_existing_modem_serial_permit() {
+        let (_server, commands) = probe_server(false, "").await;
+        let bus = bus().await;
+        let permit = serial::acquire_for(&bus.modem).await;
+        let reader = Arc::clone(&bus);
+        let task = tokio::spawn(async move {
+            reader
+                .pcscf_at_read(
+                    "AT+CGACT?",
+                    &observation_guard(),
+                    Instant::now() + primary_ims_pcscf::BUDGET,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(commands.lock().unwrap().is_empty());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            serial::with_serial_for("other-pcscf-modem", async {}),
+        )
+        .await
+        .unwrap();
+        drop(permit);
+        assert!(task.await.unwrap().unwrap().contains("+CGACT:"));
+        assert_eq!(commands.lock().unwrap().as_slice(), ["AT+CGACT?"]);
     }
 
     #[tokio::test]
@@ -1082,6 +1562,107 @@ mod ip_config_dbus_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn cancelled_read_keeps_permits(until_deadline: bool) {
+        let activity = Arc::new(NetworkActivity::default());
+        let guard = activity.enter().unwrap();
+        let modem = format!("pcscf-cancel-{until_deadline}");
+        let key = modem.clone();
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let read = retained_serial_read(
+                modem,
+                guard,
+                Instant::now() + Duration::from_secs(2),
+                async move {
+                    let _ = started.send(());
+                    let _ = finished.await;
+                    Ok("late read result".to_string())
+                },
+            );
+            if until_deadline {
+                assert!(tokio::time::timeout(Duration::from_millis(40), read)
+                    .await
+                    .is_err());
+            } else {
+                let _ = read.await;
+            }
+        });
+        start.await.unwrap();
+        if until_deadline {
+            task.await.unwrap();
+        } else {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(activity.active.load(Ordering::Acquire), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), serial::acquire_for(&key))
+                .await
+                .is_err()
+        );
+        // Cleanup may close admission, but it must still wait for this read.
+        activity.closing.store(true, Ordering::Release);
+        assert!(activity.enter().is_err());
+        finish.send(()).unwrap();
+        let _permit = tokio::time::timeout(Duration::from_secs(1), serial::acquire_for(&key))
+            .await
+            .unwrap();
+        assert_eq!(activity.active.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_pcscf_caller_cannot_release_a_dispatched_reads_permits() {
+        cancelled_read_keeps_permits(false).await;
+    }
+
+    #[tokio::test]
+    async fn pcscf_publication_timeout_drains_one_dispatched_read_without_publishing_it() {
+        cancelled_read_keeps_permits(true).await;
+    }
+
+    #[tokio::test]
+    async fn expired_serial_wait_does_not_start_a_late_at_command() {
+        let key = "pcscf-expired-lock";
+        let _permit = serial::acquire_for(key).await;
+        let activity = Arc::new(NetworkActivity::default());
+        let started = Arc::new(AtomicBool::new(false));
+        let started_read = Arc::clone(&started);
+        let error = retained_serial_read(
+            key.to_string(),
+            activity.enter().unwrap(),
+            Instant::now() + Duration::from_millis(20),
+            async move {
+                started_read.store(true, Ordering::Release);
+                Ok(String::new())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ImsBearerErrorKind::SessionLost);
+        assert!(!started.load(Ordering::Acquire));
+        assert_eq!(activity.active.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn closing_a_lease_prevents_queued_reads_after_the_serial_wait() {
+        let key = "pcscf-closing-lock";
+        let permit = serial::acquire_for(key).await;
+        let activity = Arc::new(NetworkActivity::default());
+        let guard = activity.enter().unwrap();
+        let task = tokio::spawn(retained_serial_read(
+            key.to_string(),
+            guard,
+            Instant::now() + Duration::from_secs(2),
+            async { panic!("a closing lease must not dispatch a queued read") },
+        ));
+        activity.closing.store(true, Ordering::Release);
+        drop(permit);
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.detail.ends_with("lease_closing"));
+        assert_eq!(activity.active.load(Ordering::Acquire), 0);
+    }
 
     fn record() -> LeaseRecord {
         LeaseRecord {

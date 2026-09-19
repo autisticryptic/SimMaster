@@ -24,11 +24,15 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::hardware::cellular::cgcontrdp::CgcontrdpSettings;
+use crate::hardware::{
+    cellular::cgcontrdp::CgcontrdpSettings,
+    devices::transport::{ImsBearerError, ImsPcscfDiscovery},
+};
 
 use super::{
     netdev::{self, NetdevConfig},
     primary_ims_lifecycle::{self as lifecycle, MmBus, OwnedLease},
+    primary_ims_pcscf::session_changed,
     primary_ims_settings::MmIpFamily,
 };
 
@@ -181,6 +185,40 @@ impl PrimaryImsSession {
             .await?;
         self.check_liveness()?;
         Ok(settings)
+    }
+
+    /// Keep the lease alive throughout the bounded, read-only observation.
+    /// Each dispatched AT read also owns a child guard and the modem's serial
+    /// permit until it replies or reaches its own RPC timeout, even if this
+    /// caller is cancelled. The adapter rechecks the actual bearer/profile/IP.
+    pub async fn discover_pcscf(
+        &self,
+        expected: &CgcontrdpSettings,
+    ) -> Result<ImsPcscfDiscovery, ImsBearerError> {
+        self.check_liveness()
+            .map_err(|_| session_changed("session_not_live"))?;
+        let lease = self
+            .controller
+            .owned(&self.bearer)
+            .map_err(|_| session_changed("lease_missing"))?;
+        let _guard = lease
+            .connection_will_start()
+            .map_err(|_| session_changed("lease_closing"))?;
+        let result = self
+            .controller
+            .bus
+            .discover_pcscf(
+                &self.bearer,
+                &self.controller.request.apn,
+                self.controller.request.family,
+                self.controller.request.profile_id,
+                expected,
+                &_guard,
+            )
+            .await;
+        self.check_liveness()
+            .map_err(|_| session_changed("session_not_live"))?;
+        result
     }
 
     pub async fn stop(&mut self) {

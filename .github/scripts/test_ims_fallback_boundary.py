@@ -91,6 +91,67 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
             private_bus = text[text.index("dbus-run-session"):]
             self.assertIn("primary_ims_lifecycle::ip_config_dbus_tests", private_bus)
 
+    def test_retained_pcscf_parser_and_serial_regressions_are_executed_on_actions(self):
+        for name in ("beta-validation.yml", "build-release.yml"):
+            text = (ROOT / ".github/workflows" / name).read_text()
+            self.assertIn("hardware::devices::qcm410::primary_ims_pcscf::tests", text)
+            self.assertIn("hardware::cellular::serial::tests", text)
+            self.assertIn("primary_ims_lifecycle::ip_config_dbus_tests", text)
+
+    def test_mm_pcscf_prefix_association_remains_provider_scoped_and_pinned(self):
+        device = ROOT / "backend/src/hardware/devices/qcm410"
+        text = (device / "primary_ims_pcscf.rs").read_text()
+        association = text[text.index("fn association("):text.index("pub(super) async fn discover_with<")]
+        for gate in ("profile_id != Some(u32::from(cid))", "state.active.as_slice() != [cid]",
+                     "expected.ipv6_prefix != Some(64)", "at[..8] == mm[..8]"):
+            self.assertIn(gate, association)
+        self.assertIn("if read().await? != *expected", text)
+        self.assertIn("context_rows(&at(command).await?, cid, apn)? != rows", text)
+        for write in ("AT+CGACT=", "AT+CGDCONT=", "AT$QCPDPIMSCFGE=", "qmicli"):
+            self.assertNotIn(write, text)
+        driver = (device / "ims_bearer.rs").read_text()
+        self.assertIn(".discover_pcscf(&self.expected_settings)", driver)
+        self.assertIn("let expected_settings = settings.clone()", driver)
+
+    def test_pcscf_rpc_cancellation_keeps_shared_serial_and_lease_guards(self):
+        device = ROOT / "backend/src/hardware/devices/qcm410"
+        lifecycle = (device / "primary_ims_lifecycle.rs").read_text()
+        task = lifecycle[lifecycle.index("async fn retained_serial_read<"):lifecycle.index("fn create_properties<")]
+        self.assertIn("tokio::spawn(async move", task)
+        self.assertIn("let _lease = guard", task)
+        self.assertIn("serial::acquire_for(&modem)", task)
+        self.assertIn("timeout_at(deadline", task)
+        self.assertIn("read.await", task)
+        self.assertIn("at_read_timeout_unverified", lifecycle)
+        self.assertIn("pcscf_publication_timeout_drains_one_dispatched_read_without_publishing_it", lifecycle)
+        serial = (ROOT / "backend/src/hardware/cellular/serial.rs").read_text()
+        self.assertIn("let _guard = acquire_for(resource_key).await", serial)
+
+    def test_provider_failure_does_not_reenter_legacy_at_and_checks_after_each_await(self):
+        text = (SRC / "cellular_ims/native_bearer.rs").read_text()
+        method = text[text.index("pub async fn discover_pcscf<"):text.index("pub async fn move_into_worker(")]
+        self.assertIn("Ok(None) => exact_at_fallback().await", method)
+        self.assertIn("Err(error) => Err(cellular_ims_error_from_ims_bearer(error))", method)
+        self.assertEqual(method.count("self.check_liveness()?"), 3)
+        self.assertEqual(method.count("self.worker_binding_is_current()"), 3)
+        self.assertIn("provider_success_missing_and_lost_results_never_retry_legacy_at", text)
+
+    def test_known_invalid_pcscf_binding_never_uses_reusable_selector_cleanup(self):
+        text = (SRC / "cellular_ims/live.rs").read_text()
+        cleanup = text[text.index("async fn cleanup_unverified_native_bearer("):text.index("async fn cleanup_pending_native_bearer(")]
+        self.assertIn("release_unverified_native_ims_bearer(native).await", cleanup)
+        strategy = (SRC / "cellular_ims/native_bearer.rs").read_text()
+        provider_only = strategy[strategy.index("async fn release_unverified_native_ims_bearer("):strategy.index("pub async fn release_native_ims_bearer(")]
+        self.assertIn("bearer.handle.release().await", provider_only)
+        self.assertNotIn("teardown_bearer_network_in_worker(", provider_only)
+        self.assertNotIn("restore_from_worker(", provider_only)
+        self.assertNotIn("disable_pcscf_reporting(", cleanup)
+        self.assertNotIn("cleanup_ims_profile_lease(", cleanup)
+        self.assertEqual(text.count("cleanup_unverified_native_bearer(&mut native_bearer).await"), 2)
+        self.assertIn("Err(error) if !pcscf_observation_allows_fallback(&error)", text)
+        policy = text[text.index("fn pcscf_observation_allows_fallback("):text.index("async fn cleanup_unverified_native_bearer(")]
+        self.assertIn("error.code() == code::RUNTIME_ALL_PCSCF_FAILED", policy)
+
     def test_mm_dual_request_and_actual_grant_are_not_reduced_to_the_first_family(self):
         device = ROOT / "backend/src/hardware/devices/qcm410"
         driver = (device / "ims_bearer.rs").read_text()
