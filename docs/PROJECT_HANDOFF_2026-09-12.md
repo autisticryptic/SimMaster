@@ -16,6 +16,7 @@
 **SIM-04/MM 9/19 5094ac1 候选结果**：新提交 `5094ac1` 完成 MM retained-bearer P-CSCF 关联、IPv6 同 `/64` 不同 IID 的窄匹配、owner/profile/IP 前后复核、共享 AT 串行和失效清理保护；Validate `35420547441`、Build `35420547370` 均 success，35 项新增 Rust 回归实际执行，arm64/amd64 包已核验，发布 skipped。
 9/19 T01 使用独立克隆配置/数据库和 MM 默认后端完成候选窗口；未重新附着、未改 APN/Initial EPS、未启用 native。三槽仍未注册：首/末槽 `context_pcscf_absent`，中间槽 `at_response_invalid`；当前 `CGCONTRDP=2` 仍为 7 字段、无 P-CSCF，未进入 SIP/AKA。候选已回滚，原服务/MM/proxy/Wi-Fi/配置/DB/receipt均复核恢复。
 随后对 beta8 做了同哈希 IDA 深度补证：高成功率来自身份、CID lease、profile/family准备、多来源P-CSCF、REGISTER/AKA和运行时fallback的组合；direct WDS、宽泛 plain fallback、XFRM flush及临时 `CGACT=1` helper不能未经完整lease/恢复验证移植。详见 [beta8综合深度对照](../../SimAdmin/docs/IMS_DERIVATION_BETA8_COMPARISON_2026-09-17.md)。
+9/19 后续提交 **`0feaa40`** 仅收敛 pinned MM profile 的 forced-family 重试：profile pin 存在时不再用同一 pin 重复另一地址族请求，返回明确 `profile_pin_family_conflict`，等待独立 exact-family lease；Validate `35508165800`、Build `35508165813` success，发布 skipped。
 
 **SIM-04/MM 最新续接（2026-09-18）**：功能提交 `e8bff12` 已补完真实 MM 双栈请求、实际单/双族 IP/DNS 投影、双地址 receipt 与取消/清理验证；两套 Actions、前端、arm64/amd64 全部通过，发布 skipped。
 T02 三槽均请求 flag4/profile2，但只获 IPv6、DNS/Pco 空，仍无 SIP/AKA；T03 经 MM 严格新建临时 IPv4 profile3，承载及保留该 pin 的 forced IPv6 复试均被 `pdn-ipv4-call-disallowed` 拒绝。

@@ -150,3 +150,5 @@ profile 重写、宿主 namespace 发送 IMS、默认三位 MNC 猜测、把 DAT
 当前 SIM-04 实测仍停在 P-CSCF；没有 SIP/AKA 或注册成功证据。9/18 重新附着后曾短暂观察到 P-CSCF 候选，说明 attach/reporting 时序是独立变量，但尚未形成 beta8/current 同条件 A-B 证明。
 
 本节是静态分析和边界记录，不构成 beta8 实机验收或当前项目注册通过。
+
+`0feaa40` 后续仅阻止有效 MM `profile-id` 下无意义的 forced-family 重试，保留 profile pin 并返回 `profile_pin_family_conflict`；这没有改变 9/19 设备仍缺 P-CSCF、未进入 SIP/AKA 的事实。
