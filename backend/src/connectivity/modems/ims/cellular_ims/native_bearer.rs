@@ -382,7 +382,18 @@ pub async fn establish_native_ims_bearer(
                 let forced = forced_native_family(hint);
                 last_error = Some(error);
                 if let Some(forced) = forced {
-                    forced_single = Some(forced);
+                    if let Some(error) = pinned_profile_forced_family_error(request, forced) {
+                        // MM 1.18 resolves a pinned profile's PDP family before
+                        // considering the request flag. Retrying the forced label
+                        // with the same pin repeats the same PDN attempt (the
+                        // IPv4-profile/IPv6 retry seen in SIM-04 T03). Do not
+                        // silently drop or overwrite the pin; an exact-family
+                        // lease must be established by a separate maintenance
+                        // path before another family can be requested.
+                        last_error = Some(error);
+                    } else {
+                        forced_single = Some(forced);
+                    }
                     break;
                 }
             }
@@ -417,6 +428,18 @@ pub async fn establish_native_ims_bearer(
             "native_ims_no_family_attempted".to_string(),
         )
     }))
+}
+
+fn pinned_profile_forced_family_error(
+    request: &BearerRequest,
+    forced: u8,
+) -> Option<CellularImsError> {
+    request.profile_id.map(|profile| {
+        CellularImsError::with_detail(
+            code::RUNTIME_IMS_FAMILY_UNSUPPORTED,
+            format!("profile_pin_family_conflict:profile_id={profile}:forced_family={forced}"),
+        )
+    })
 }
 
 /// Release a handle whose device binding became unverified. Do not first
@@ -773,6 +796,19 @@ mod tests {
         assert!(!bearer.path.starts_with("/org/freedesktop/"));
         assert!(!super::super::bearer::is_valid_bearer_path(&bearer.path));
         assert!(!is_native_bearer("/org/freedesktop/ModemManager1/Bearer/4"));
+    }
+
+    #[test]
+    fn pinned_profile_does_not_repeat_a_forced_family_with_the_same_mm_profile() {
+        let mut request = BearerRequest::ims(false);
+        request.profile_id = Some(3);
+        let error = pinned_profile_forced_family_error(&request, 6).unwrap();
+        assert_eq!(error.code(), code::RUNTIME_IMS_FAMILY_UNSUPPORTED);
+        assert!(error
+            .detail()
+            .is_some_and(|detail| detail.contains("profile_id=3")));
+        request.profile_id = None;
+        assert!(pinned_profile_forced_family_error(&request, 6).is_none());
     }
 
     #[test]

@@ -120,3 +120,33 @@ profile 重写、宿主 namespace 发送 IMS、默认三位 MNC 猜测、把 DAT
 - 混合 owner、Native IMS 实机闭环、SIM-01/02 新版本回归、自然续期与业务验收没有因此完成。
 
 本机原始证据、认证材料、备份和候选脚本保持私密，不随本文提交。
+
+## 6. 2026-09-19 深度 beta8 补证与实现边界
+
+本节补充同一 SHA256=`210c35b11f54dd240a83e90dd08d5e8a8f4f2cea227ce3a0503a9ced4140f9b7` 的 IDA MCP 复核。结论与综合对照文档一致：beta8 的跨运营商成功率来自多层 fallback 和承载路径覆盖，不是单一派生域名。
+
+### 6.1 已确认的优点
+
+- `sub_19014C`：MM/CIMI、SIM/EF_AD、home PLMN/MNC 长度、IMS 域和身份派生。
+- `sub_19A008`：读取 PDP 定义/活动状态，维护 CID 占用并按尝试租用 context。
+- `sub_1A0A80`：profile 准备格式至少包含 `CGACT=0`、按 family 的 `CGDCONT` 和 `QCPDPIMSCFGE=1,1,1`。
+- `sub_196634`：MM 路径携带 `profile-id`、`apn=ims`、`ip-type`、`allow-roaming`。
+- `sub_19D6DC`：独立 WDS 路径、自有 client、按 family 建立 IMS WDS，以及 IPv4 WDS P-CSCF 查询。
+- `sub_19B9F4`：活动 P-CSCF 有界读取，随后进入路由和注册 runtime。
+- `sub_18D548` / `sub_197CC8`：空 AKA、423/401/407、UIM AKA/AUTS、IPsec/plain 注册分支。
+
+### 6.2 不应直接移植的路径
+
+当前证据没有证明 beta8 的所有 MM路径都执行临时 `CGACT=1` 预取；仓库中旧 beta2 helper 的临时激活又存在 QCA410 firmware/DHCP context 释放竞态、完整 profile 恢复不精确、reporting 原值未保存和取消时无补偿清理等问题。因此 `prefetch_pcscf_from_ims_profile` 未接入 5094ac1 的生产 live 路径。
+
+同样没有移植 beta8 的 direct WDS owner、宽泛 IPsec→plain fallback、XFRM flush 或宿主网络 fallback。当前 MM 主线继续保持一个 bearer owner 和 UE namespace 隔离。
+
+### 6.3 当前实现与下一项
+
+5094ac1 已覆盖：MM typed IP4/IP6、实际授予 family、profile pin 保留、retained owner/profile/IP 前后复核、IPv6 同 `/64` 不同 IID 的窄关联、DNS/SRV 严格校验以及取消/清理保护。
+
+剩余真正的代码缺口是 MM 内可恢复的 exact-family profile lease：必须保存完整 `CGDCONT`/profile 定义、CID 存在性、原始 P-CSCF reporting 状态、MM owner/bearer、取消/崩溃恢复和清理后的再读验证。它不能通过普通 IMS retry 自动执行，也不能用 beta8 的自有 WDS 查询替代。
+
+当前 SIM-04 实测仍停在 P-CSCF；没有 SIP/AKA 或注册成功证据。9/18 重新附着后曾短暂观察到 P-CSCF 候选，说明 attach/reporting 时序是独立变量，但尚未形成 beta8/current 同条件 A-B 证明。
+
+本节是静态分析和边界记录，不构成 beta8 实机验收或当前项目注册通过。

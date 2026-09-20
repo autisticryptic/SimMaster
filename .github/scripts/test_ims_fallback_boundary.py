@@ -84,6 +84,13 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         self.assertIn("at_active_ims_bearer_address_missing", active)
         self.assertIn("active_pcscf_does_not_borrow_another_same_apn_bearer_address", text)
 
+    def test_pinned_mm_profile_stops_meaningless_forced_family_retry(self):
+        text = (SRC / "cellular_ims/native_bearer.rs").read_text()
+        self.assertIn("pinned_profile_forced_family_error(request, forced)", text)
+        self.assertIn("profile_pin_family_conflict", text)
+        self.assertIn("RUNTIME_IMS_FAMILY_UNSUPPORTED", text)
+        self.assertIn("exact-family", text)
+
     def test_mm_property_regressions_are_executed_on_actions(self):
         for name in ("beta-validation.yml", "build-release.yml"):
             text = (ROOT / ".github/workflows" / name).read_text()

@@ -13,6 +13,10 @@
 
 ## 1. 当前结论
 
+**SIM-04/MM 9/19 5094ac1 候选结果**：新提交 `5094ac1` 完成 MM retained-bearer P-CSCF 关联、IPv6 同 `/64` 不同 IID 的窄匹配、owner/profile/IP 前后复核、共享 AT 串行和失效清理保护；Validate `35420547441`、Build `35420547370` 均 success，35 项新增 Rust 回归实际执行，arm64/amd64 包已核验，发布 skipped。
+9/19 T01 使用独立克隆配置/数据库和 MM 默认后端完成候选窗口；未重新附着、未改 APN/Initial EPS、未启用 native。三槽仍未注册：首/末槽 `context_pcscf_absent`，中间槽 `at_response_invalid`；当前 `CGCONTRDP=2` 仍为 7 字段、无 P-CSCF，未进入 SIP/AKA。候选已回滚，原服务/MM/proxy/Wi-Fi/配置/DB/receipt均复核恢复。
+随后对 beta8 做了同哈希 IDA 深度补证：高成功率来自身份、CID lease、profile/family准备、多来源P-CSCF、REGISTER/AKA和运行时fallback的组合；direct WDS、宽泛 plain fallback、XFRM flush及临时 `CGACT=1` helper不能未经完整lease/恢复验证移植。详见 [beta8综合深度对照](../../SimAdmin/docs/IMS_DERIVATION_BETA8_COMPARISON_2026-09-17.md)。
+
 **SIM-04/MM 最新续接（2026-09-18）**：功能提交 `e8bff12` 已补完真实 MM 双栈请求、实际单/双族 IP/DNS 投影、双地址 receipt 与取消/清理验证；两套 Actions、前端、arm64/amd64 全部通过，发布 skipped。
 T02 三槽均请求 flag4/profile2，但只获 IPv6、DNS/Pco 空，仍无 SIP/AKA；T03 经 MM 严格新建临时 IPv4 profile3，承载及保留该 pin 的 forced IPv6 复试均被 `pdn-ipv4-call-disallowed` 拒绝。
 两轮均已关闭并恢复；T03 新 profile 已删、原列表逐字恢复，08:28–08:29 独立核对原 `684e2a7`/配置/DB、MM/proxy、管理路由、无 receipt/无通话、IMS关闭。
@@ -726,9 +730,21 @@ SIM-01～SIM-03 的既有历史与验收保留在第 4、5 节，不复制成新
 - **注册修复仍未通过**；所有初始EPS重新协商/重新附着须另行明确维护许可，不偷偷启native或强断CID2。
 - 完整实现、同哈希beta8/IDA补证、23项新增Rust回归与两架构产物见 [9/18专项记录](IMS_SIM04_MM_DUAL_STACK_2026-09-18.md)。
 
-<!-- SIM_CARD_TESTS_APPEND_BEFORE_NOTE -->
+### SIM-04 / 2026-09-19 / T01 — 5094ac1 beta8 对照后的 MM 候选注册尝试
 
-## 固定尾注：为什么需要多卡回归，以及后续记录放在哪里
+- 时间与时区：2026-09-19 20:00 左右至 20:13（Asia/Shanghai）窗口；具体脱敏证据保存在本机 `.tmp/sim04-mm-20260919-t01/evidence/`。
+- 卡别名 / 归属 PLMN / 访问 PLMN：SIM-04 / home `45507`；访问网沿用当前设备观测，未在本轮扩大身份输出。
+- 设备 / 固件 / 内核：Qualcomm 410；Debian 11/aarch64；`5.15.0-handsomekernel+`；MM 1.18.4。
+- 线路 / 后端：原线路；ModemManager；主 QMI/IMS bearer由MM管理；管理链路为Wi-Fi；DATA6未接管。
+- 程序 / 候选：`5094ac15b4acaa8480455d7b410a1a9828eae4b6`；版本字符串仍为`1.1.4-beta3`；arm64候选包/二进制摘要已独立校验。
+- requested/effective profile：derived→derived、carrier_catalog→carrier_catalog、database→derived；请求实际为`ipv4v6`/profile pin 2，MM实际只授予IPv6。
+- 本轮变量：使用新候选；不重新附着、不改APN/Initial EPS、不启用native；仅启用IMS。
+- 承载 / P-CSCF：三次均取得IPv6 bearer和`wwan0`，MM IPv4/DNS/PCO为空；首、末槽为`context_pcscf_absent`，中间槽为`at_response_invalid`；当前只读`CGCONTRDP=2`为7字段且无P-CSCF。
+- SIP/AKA/自然续期：均未进入；无REGISTER、AKA或refresh证据。
+- 清理：候选关闭并自动回滚；原服务、MM/proxy、Wi-Fi、配置/DB、恢复timer核对通过；无遗留receipt或测试marker。
+- 结论：**代码/CI通过，实机注册失败**。beta8静态分析确认了profile/CID/family/P-CSCF分层机制，但临时AT激活预取尚不能安全移植；下一步需单独设计可恢复的MM exact-family lease，或在明确维护许可后复现重新附着时序。
+
+<!-- SIM_CARD_TESTS_APPEND_BEFORE_NOTE -->：为什么需要多卡回归，以及后续记录放在哪里
 
 > **位置约定：本尾注始终保留在文档最后。所有后续卡片测试记录必须插入上方定位标记之前，不得追加在本尾注之后，也不要在下方模板内直接填写实测结果。**
 >
