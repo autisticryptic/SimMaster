@@ -745,7 +745,9 @@ SIM-01～SIM-03 的既有历史与验收保留在第 4、5 节，不复制成新
 - 清理：候选关闭并自动回滚；原服务、MM/proxy、Wi-Fi、配置/DB、恢复timer核对通过；无遗留receipt或测试marker。
 - 结论：**代码/CI通过，实机注册失败**。beta8静态分析确认了profile/CID/family/P-CSCF分层机制，但临时AT激活预取尚不能安全移植；下一步需单独设计可恢复的MM exact-family lease，或在明确维护许可后复现重新附着时序。
 
-<!-- SIM_CARD_TESTS_APPEND_BEFORE_NOTE -->：为什么需要多卡回归，以及后续记录放在哪里
+<!-- SIM_CARD_TESTS_APPEND_BEFORE_NOTE -->
+
+## 固定尾注：为什么需要多卡回归，以及后续记录放在哪里
 
 > **位置约定：本尾注始终保留在文档最后。所有后续卡片测试记录必须插入上方定位标记之前，不得追加在本尾注之后，也不要在下方模板内直接填写实测结果。**
 >
