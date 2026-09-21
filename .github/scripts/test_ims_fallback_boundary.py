@@ -84,12 +84,21 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         self.assertIn("at_active_ims_bearer_address_missing", active)
         self.assertIn("active_pcscf_does_not_borrow_another_same_apn_bearer_address", text)
 
-    def test_pinned_mm_profile_stops_meaningless_forced_family_retry(self):
+    def test_network_forced_family_retry_survives_and_only_skips_a_repeat(self):
         text = (SRC / "cellular_ims/native_bearer.rs").read_text()
-        self.assertIn("pinned_profile_forced_family_error(request, forced)", text)
-        self.assertIn("profile_pin_family_conflict", text)
-        self.assertIn("RUNTIME_IMS_FAMILY_UNSUPPORTED", text)
-        self.assertIn("exact-family", text)
+        establish = text[text.index("pub async fn establish_native_ims_bearer("):text.index("fn forced_family_needs_another_attempt(")]
+        # The single-family retry is what a v4-only/v6-only network needs and
+        # what the validated IPv4 line registration used. It must remain.
+        self.assertIn("forced_single = Some(forced)", establish)
+        self.assertIn("&[forced],", establish)
+        self.assertIn("if let [single] = attempt_families", establish)
+        self.assertIn("forced_family_needs_another_attempt(&attempted_single, forced)", establish)
+        # A pinned profile alone must not cancel the retry, and the original
+        # bearer error must not be replaced by a synthetic pin-conflict code.
+        self.assertNotIn("pinned_profile_forced_family_error", text)
+        self.assertNotIn("profile_pin_family_conflict", text)
+        self.assertIn("fn forced_family_needs_another_attempt", text)
+        self.assertIn("network_forced_family_keeps_its_retry_unless_already_attempted", text)
 
     def test_mm_property_regressions_are_executed_on_actions(self):
         for name in ("beta-validation.yml", "build-release.yml"):

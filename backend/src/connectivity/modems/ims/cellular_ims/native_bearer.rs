@@ -341,6 +341,10 @@ pub async fn establish_native_ims_bearer(
     // configured order is what runs, not "dual-stack first" hardcoded here.
     let mut last_error = None;
     let mut forced_single: Option<u8> = None;
+    // Single-family attempts already made with this same profile pin. A
+    // network-forced family that is already in here would repeat the identical
+    // PDN request, so it is skipped without discarding its real error.
+    let mut attempted_single: Vec<u8> = Vec::with_capacity(2);
     for attempt in plan.bearer_attempts() {
         let attempt_families: &[u8] = match attempt {
             IpType::Ipv4v6 => {
@@ -353,6 +357,9 @@ pub async fn establish_native_ims_bearer(
             IpType::Ipv4 => &[4],
             IpType::Ipv6 => &[6],
         };
+        if let [single] = attempt_families {
+            attempted_single.push(*single);
+        }
         let result = transport
             .establish_ims_bearer(
                 primary_device,
@@ -382,17 +389,18 @@ pub async fn establish_native_ims_bearer(
                 let forced = forced_native_family(hint);
                 last_error = Some(error);
                 if let Some(forced) = forced {
-                    if let Some(error) = pinned_profile_forced_family_error(request, forced) {
-                        // MM 1.18 resolves a pinned profile's PDP family before
-                        // considering the request flag. Retrying the forced label
-                        // with the same pin repeats the same PDN attempt (the
-                        // IPv4-profile/IPv6 retry seen in SIM-04 T03). Do not
-                        // silently drop or overwrite the pin; an exact-family
-                        // lease must be established by a separate maintenance
-                        // path before another family can be requested.
-                        last_error = Some(error);
-                    } else {
+                    // This single-family retry is the path a v4-only/v6-only
+                    // network needs, and it is what the validated IPv4 line
+                    // registration depends on. Keep it, and only skip a request
+                    // that would literally repeat an attempt already made.
+                    if forced_family_needs_another_attempt(&attempted_single, forced) {
                         forced_single = Some(forced);
+                    } else {
+                        tracing::warn!(
+                            family = forced,
+                            profile_id = ?request.profile_id,
+                            "Network-forced family was already attempted with this profile; keeping its original error"
+                        );
                     }
                     break;
                 }
@@ -430,16 +438,15 @@ pub async fn establish_native_ims_bearer(
     }))
 }
 
-fn pinned_profile_forced_family_error(
-    request: &BearerRequest,
-    forced: u8,
-) -> Option<CellularImsError> {
-    request.profile_id.map(|profile| {
-        CellularImsError::with_detail(
-            code::RUNTIME_IMS_FAMILY_UNSUPPORTED,
-            format!("profile_pin_family_conflict:profile_id={profile}:forced_family={forced}"),
-        )
-    })
+/// Whether a network-forced family still deserves its own bearer attempt.
+///
+/// MM 1.18 resolves a pinned profile's own PDP family before the requested
+/// `ip-type`, so re-requesting a family that was already attempted with the
+/// same pin cannot change the outcome. An exact-family profile lease is the
+/// separate maintenance path for actually switching family; it is not done by
+/// silently dropping or overwriting the caller's profile pin here.
+fn forced_family_needs_another_attempt(attempted_single: &[u8], forced: u8) -> bool {
+    !attempted_single.contains(&forced)
 }
 
 /// Release a handle whose device binding became unverified. Do not first
@@ -799,16 +806,15 @@ mod tests {
     }
 
     #[test]
-    fn pinned_profile_does_not_repeat_a_forced_family_with_the_same_mm_profile() {
-        let mut request = BearerRequest::ims(false);
-        request.profile_id = Some(3);
-        let error = pinned_profile_forced_family_error(&request, 6).unwrap();
-        assert_eq!(error.code(), code::RUNTIME_IMS_FAMILY_UNSUPPORTED);
-        assert!(error
-            .detail()
-            .is_some_and(|detail| detail.contains("profile_id=3")));
-        request.profile_id = None;
-        assert!(pinned_profile_forced_family_error(&request, 6).is_none());
+    fn network_forced_family_keeps_its_retry_unless_already_attempted() {
+        // A v4-only/v6-only network must still get its single-family retry:
+        // this is the path the validated IPv4 line registration depends on.
+        assert!(forced_family_needs_another_attempt(&[], 4));
+        assert!(forced_family_needs_another_attempt(&[6], 4));
+        assert!(forced_family_needs_another_attempt(&[4], 6));
+        // Only a literal repeat of an attempt already made is skipped.
+        assert!(!forced_family_needs_another_attempt(&[4], 4));
+        assert!(!forced_family_needs_another_attempt(&[6, 4], 4));
     }
 
     #[test]
