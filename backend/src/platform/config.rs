@@ -196,6 +196,11 @@ pub struct TelegramConfig {
     pub bot_token: String,
     #[serde(default)]
     pub chat_id: String,
+    /// Bot API origin, optionally with a path prefix. Empty keeps the official
+    /// `https://api.telegram.org`; set a reverse-proxy base where Telegram is
+    /// unreachable. HTTPS only, since the bot token travels in the path.
+    #[serde(default)]
+    pub api_base: String,
     #[serde(default)]
     pub parse_mode: String,
     #[serde(default)]
@@ -930,6 +935,7 @@ impl Default for TelegramConfig {
             common: MessageChannelConfig::default(),
             bot_token: String::new(),
             chat_id: String::new(),
+            api_base: String::new(),
             parse_mode: String::new(),
             disable_web_page_preview: true,
         }
@@ -1183,7 +1189,8 @@ fn legacy_channel_migrations(legacy: &LegacyNotificationConfig) -> Vec<LegacyCha
         &legacy.telegram,
         legacy.telegram.common.enabled
             || !legacy.telegram.bot_token.trim().is_empty()
-            || !legacy.telegram.chat_id.trim().is_empty(),
+            || !legacy.telegram.chat_id.trim().is_empty()
+            || !legacy.telegram.api_base.trim().is_empty(),
     );
 
     channels

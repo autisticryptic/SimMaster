@@ -87,7 +87,7 @@ export default function NotificationChannelsTab({
     channel: NotificationChannelInstance,
     key: string,
     label: string,
-    extra?: { password?: boolean; select?: string[]; multiline?: boolean },
+    extra?: { password?: boolean; select?: string[]; multiline?: boolean; placeholder?: string; helperText?: string },
   ) => (
     <TextField
       key={key}
@@ -98,6 +98,8 @@ export default function NotificationChannelsTab({
       onChange={(event: ChangeEvent<HTMLInputElement>) => onPatchChannelConfig(channel.id, { [key]: event.target.value })}
       multiline={extra?.multiline}
       minRows={extra?.multiline ? 3 : undefined}
+      placeholder={extra?.placeholder}
+      helperText={extra?.helperText}
       fullWidth
     >
       {extra?.select?.map((option) => (
@@ -322,6 +324,10 @@ export default function NotificationChannelsTab({
           <Box sx={fieldStackSx}>
             {renderStringField(channel, 'bot_token', 'Bot Token', { password: true })}
             {renderStringField(channel, 'chat_id', 'Chat ID')}
+            {renderStringField(channel, 'api_base', '反代地址（可选）', {
+              placeholder: 'https://api.telegram.org',
+              helperText: '留空直连官方接口。Telegram 无法直连时填入自建反代地址，需为 HTTPS，可带路径前缀，不要带 Bot Token。',
+            })}
             {renderStringField(channel, 'parse_mode', 'Parse Mode', { select: ['', 'MarkdownV2', 'HTML'] })}
             {renderBoolField(channel, 'disable_web_page_preview', '禁用链接预览')}
           </Box>

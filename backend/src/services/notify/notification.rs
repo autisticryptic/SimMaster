@@ -14,6 +14,7 @@ use crate::platform::db::{
     SmsMessage,
 };
 use crate::services::messaging::verification_code::extract_verification_code;
+use crate::services::notify::telegram_endpoint;
 use crate::services::system::device_status::DeviceStatusReport;
 use crate::services::system::system_event::SystemEvent;
 use base64::{engine::general_purpose, Engine as _};
@@ -2285,10 +2286,10 @@ impl NotificationSender {
         if config.bot_token.trim().is_empty() || config.chat_id.trim().is_empty() {
             return Err("Telegram Bot Token 或 Chat ID 未配置".to_string());
         }
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            config.bot_token.trim()
-        );
+        // An empty api_base keeps the official host, so existing installations
+        // are unchanged; a configured reverse proxy only replaces the origin.
+        let url = telegram_endpoint::method_url(&config.api_base, &config.bot_token, "sendMessage")
+            .map_err(|err| format!("Telegram 接口地址无效: {err}"))?;
         let mut payload = Map::new();
         payload.insert("chat_id".to_string(), json!(config.chat_id.trim()));
         payload.insert("text".to_string(), json!(text));
@@ -2298,8 +2299,12 @@ impl NotificationSender {
         );
         insert_non_empty(&mut payload, "parse_mode", &config.parse_mode);
 
+        // The bot token travels in the request path, so transport errors and
+        // proxy response bodies can echo it back.
         self.post_json("Telegram", &url, Value::Object(payload))
             .await
+            .map_err(|err| telegram_endpoint::redact_token(&err, &config.bot_token))
+            .map(|ok| telegram_endpoint::redact_token(&ok, &config.bot_token))
     }
 
     async fn post_json(&self, label: &str, url: &str, payload: Value) -> Result<String, String> {

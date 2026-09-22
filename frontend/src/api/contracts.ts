@@ -1591,6 +1591,8 @@ export interface FeishuRobotConfig extends MessageChannelConfig {
 export interface TelegramConfig extends MessageChannelConfig {
   bot_token: string
   chat_id: string
+  /** Bot API 基址；留空使用官方 https://api.telegram.org，可填反代地址 */
+  api_base: string
   parse_mode: string
   disable_web_page_preview: boolean
 }
