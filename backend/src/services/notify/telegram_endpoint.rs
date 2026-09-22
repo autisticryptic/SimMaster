@@ -65,6 +65,20 @@ impl std::fmt::Display for TelegramEndpointError {
 
 impl std::error::Error for TelegramEndpointError {}
 
+/// Whether the raw operator input contains a `..` path segment.
+///
+/// [`Url::parse`] resolves `..` away (`/a/../b` becomes `/b`), so checking the
+/// parsed path would silently rewrite the configured base instead of rejecting
+/// it. The check therefore runs on the raw value, and percent-encoded dots are
+/// decoded first so `%2e%2e` cannot slip past.
+fn has_traversal_segment(raw: &str) -> bool {
+    let after_scheme = raw.split_once("://").map_or(raw, |(_, rest)| rest);
+    let path = after_scheme.split_once('/').map_or("", |(_, rest)| rest);
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    path.split('/')
+        .any(|segment| segment.to_ascii_lowercase().replace("%2e", ".") == "..")
+}
+
 /// Normalise a configured API base into an origin plus optional path prefix.
 ///
 /// An empty or whitespace-only value resolves to [`OFFICIAL_API_BASE`], which
@@ -100,6 +114,9 @@ pub fn normalize_api_base(raw: &str) -> Result<String, TelegramEndpointError> {
     if url.fragment().is_some() {
         return Err(TelegramEndpointError::BaseHasFragment);
     }
+    if has_traversal_segment(trimmed) {
+        return Err(TelegramEndpointError::BaseTraversal);
+    }
 
     match url.host() {
         None => return Err(TelegramEndpointError::BaseMissingHost),
@@ -122,9 +139,6 @@ pub fn normalize_api_base(raw: &str) -> Result<String, TelegramEndpointError> {
     }
 
     let path = url.path().trim_end_matches('/');
-    if path.split('/').any(|segment| segment == "..") {
-        return Err(TelegramEndpointError::BaseTraversal);
-    }
 
     let mut origin = format!("https://{}", url.host_str().unwrap_or_default());
     if let Some(port) = url.port() {
@@ -240,9 +254,23 @@ mod tests {
             normalize_api_base("https://tg.example.com/#frag"),
             Err(TelegramEndpointError::BaseHasFragment)
         );
+        for base in [
+            "https://tg.example.com/a/../b",
+            "https://tg.example.com/../proxy",
+            "tg.example.com/a/../b",
+            "https://tg.example.com/a/%2e%2e/b",
+            "https://tg.example.com/a/%2E%2E/b",
+        ] {
+            assert_eq!(
+                normalize_api_base(base),
+                Err(TelegramEndpointError::BaseTraversal),
+                "traversal base {base} must be rejected"
+            );
+        }
+        // A host or segment merely containing dots is not traversal.
         assert_eq!(
-            normalize_api_base("https://tg.example.com/a/../b"),
-            Err(TelegramEndpointError::BaseTraversal)
+            normalize_api_base("https://tg.example.com/a..b").unwrap(),
+            "https://tg.example.com/a..b"
         );
     }
 
