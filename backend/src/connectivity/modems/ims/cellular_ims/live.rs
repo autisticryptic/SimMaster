@@ -224,7 +224,7 @@ impl CellularImsDeviceBinding {
         let qmi_device = binding
             .control_device()
             .map(str::to_string)
-            .ok_or_else(|| CellularImsError::new("volte_qmi_device_missing"))?;
+            .ok_or_else(|| CellularImsError::new(code::QMI_DEVICE_MISSING))?;
         Ok(Self {
             line_id: binding.line_id.clone(),
             modem_id: binding.modem_id.clone(),
@@ -690,7 +690,7 @@ impl CellularImsRefreshAuthorization {
         let nonce_count = self
             .nonce_count
             .checked_add(1)
-            .ok_or_else(|| CellularImsError::new("volte_register_nonce_count_exhausted"))?;
+            .ok_or_else(|| CellularImsError::new(code::REGISTER_NONCE_COUNT_EXHAUSTED))?;
         let nc = format!("{nonce_count:08x}");
         let response = digest_aka::compute_aka_response(
             &identity.private_user,
@@ -1713,7 +1713,7 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         let mut prepared = self
             .pending
             .clone()
-            .ok_or(ImsError::new("volte_register_auth_not_prepared"))?;
+            .ok_or(ImsError::new(code::REGISTER_AUTH_NOT_PREPARED))?;
         let mut ids = self.ids.clone();
         ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
         self.last_cseq = ids.cseq;
@@ -1797,7 +1797,7 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
             let mut refresh_authorization = self
                 .refresh_authorization
                 .clone()
-                .ok_or(ImsError::new("volte_register_auth_not_prepared"))?;
+                .ok_or(ImsError::new(code::REGISTER_AUTH_NOT_PREPARED))?;
             let authorization = refresh_authorization
                 .authorization_for(&self.identity, &request_uri)
                 .map_err(to_ims_error)?;
@@ -2756,9 +2756,9 @@ async fn connect_family(
         && profile.ims.register.cni_identity_policy == AccessIdentityPolicy::RequiredDynamic;
     if access_network.is_none() && (requires_dynamic_pani || requires_dynamic_cni) {
         return Err(CellularImsError::new(if requires_dynamic_pani {
-            "volte_pani_required_dynamic_unavailable"
+            code::PANI_REQUIRED_DYNAMIC_UNAVAILABLE
         } else {
-            "volte_cni_required_dynamic_unavailable"
+            code::CNI_REQUIRED_DYNAMIC_UNAVAILABLE
         }));
     }
     let pani_resolution = resolve_access_identity(
@@ -3620,7 +3620,7 @@ async fn live_receive_loop(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
-            LiveLoopInput::Sip(Err(error)) if error.code() == "volte_channel_read_timeout" => {
+            LiveLoopInput::Sip(Err(error)) if error.code() == code::CHANNEL_READ_TIMEOUT => {
                 continue;
             }
             LiveLoopInput::Sip(Err(error)) => {
@@ -4368,7 +4368,7 @@ async fn handle_operator_command(
     if result.is_err() && initial_call {
         if result
             .as_ref()
-            .is_err_and(|error| error.code() == "volte_concurrent_call_limit")
+            .is_err_and(|error| error.code() == code::CONCURRENT_CALL_LIMIT)
         {
             live.operator.send_event(OperatorEvent::Rejected {
                 call_id: call_id.clone(),
@@ -4427,7 +4427,7 @@ async fn handle_operator_command_inner(
     let mut sessions = live.session.lock().await;
     let session = sessions
         .as_mut()
-        .ok_or_else(|| CellularImsError::new("volte_runtime_not_registered"))?;
+        .ok_or_else(|| CellularImsError::new(code::RUNTIME_NOT_REGISTERED))?;
     let frame = match command {
         OperatorCommand::StartCall {
             call_id,
@@ -4437,10 +4437,10 @@ async fn handle_operator_command_inner(
             ..
         } => {
             if session.voice_calls.contains_key(&call_id) {
-                return Err(CellularImsError::new("volte_voice_call_duplicate"));
+                return Err(CellularImsError::new(code::VOICE_CALL_DUPLICATE));
             }
             if session.voice_calls.len() >= MAX_CONCURRENT_CALLS {
-                return Err(CellularImsError::new("volte_concurrent_call_limit"));
+                return Err(CellularImsError::new(code::CONCURRENT_CALL_LIMIT));
             }
             if offer.video.is_some() && !live.operator.video_enabled() {
                 return Err(CellularImsError::new("vilte_feature_disabled"));
@@ -4454,13 +4454,13 @@ async fn handle_operator_command_inner(
             )
             .await
             .map_err(|error| {
-                CellularImsError::with_detail("volte_rtp_bind_failed", error.to_string())
+                CellularImsError::with_detail(code::RTP_BIND_FAILED, error.to_string())
             })?;
             let operator_local = relay.operator_local_addr().map_err(|error| {
-                CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+                CellularImsError::with_detail(code::RTP_LOCAL_ADDR_FAILED, error.to_string())
             })?;
             let internal_local = relay.internal_local_addr().map_err(|error| {
-                CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+                CellularImsError::with_detail(code::RTP_LOCAL_ADDR_FAILED, error.to_string())
             })?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
@@ -4496,7 +4496,7 @@ async fn handle_operator_command_inner(
                 session.channel.security_verify(),
             );
             let invite_branch = top_via_branch(&frame)
-                .ok_or_else(|| CellularImsError::new("volte_voice_invite_branch_missing"))?;
+                .ok_or_else(|| CellularImsError::new(code::VOICE_INVITE_BRANCH_MISSING))?;
             session.voice_calls.insert(
                 call_id,
                 LiveVoiceCall {
@@ -4533,7 +4533,7 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .remove(&call_id)
-                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
             sip::build_cancel(
                 &session.identity,
                 &session.channel.route(),
@@ -4547,7 +4547,7 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .remove(&call_id)
-                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
             if call.dialog.remote_tag.is_some() {
                 sip::build_bye(
                     &session.identity,
@@ -4572,7 +4572,7 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .get_mut(&call_id)
-                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
             let cseq = call.next_cseq;
             call.next_cseq = call.next_cseq.saturating_add(1);
             sip::build_dtmf_info(
@@ -4592,16 +4592,16 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .get_mut(&call_id)
-                .ok_or_else(|| CellularImsError::new("volte_transfer_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new(code::TRANSFER_CALL_UNKNOWN))?;
             if !call.operator_answered || call.dialog.remote_tag.is_none() {
-                return Err(CellularImsError::new("volte_transfer_call_not_confirmed"));
+                return Err(CellularImsError::new(code::TRANSFER_CALL_NOT_CONFIRMED));
             }
             if call
                 .transfer
                 .as_ref()
                 .is_some_and(|transfer| !transfer.state().is_terminal())
             {
-                return Err(CellularImsError::new("volte_transfer_pending"));
+                return Err(CellularImsError::new(code::TRANSFER_PENDING));
             }
             let cseq = call.next_cseq;
             call.next_cseq = call.next_cseq.saturating_add(1);
@@ -4636,7 +4636,7 @@ async fn handle_operator_command_inner(
                 &access_headers,
             )
             .map_err(|error| {
-                CellularImsError::with_detail("volte_transfer_request_invalid", error.to_string())
+                CellularImsError::with_detail(code::TRANSFER_REQUEST_INVALID, error.to_string())
             })?;
             call.transfer = Some(DialogTransfer::for_refer_cseq(cseq));
             call.transfer_deadline = Some(Instant::now() + REFER_RESPONSE_TIMEOUT);
@@ -4659,13 +4659,13 @@ async fn handle_operator_command_inner(
             )
             .await
             .map_err(|error| {
-                CellularImsError::with_detail("volte_rtp_bind_failed", error.to_string())
+                CellularImsError::with_detail(code::RTP_BIND_FAILED, error.to_string())
             })?;
             let operator_local = pending.operator_local_addr().map_err(|error| {
-                CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+                CellularImsError::with_detail(code::RTP_LOCAL_ADDR_FAILED, error.to_string())
             })?;
             let internal_local = pending.internal_local_addr().map_err(|error| {
-                CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+                CellularImsError::with_detail(code::RTP_LOCAL_ADDR_FAILED, error.to_string())
             })?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
@@ -4692,9 +4692,9 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .get_mut(&call_id)
-                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
             if call.pending_operator_reinvite.is_some() || call.pending_asterisk_reinvite {
-                return Err(CellularImsError::new("volte_voice_reinvite_pending"));
+                return Err(CellularImsError::new(code::VOICE_REINVITE_PENDING));
             }
             call.dialog.cseq = call.next_cseq;
             call.next_cseq = call.next_cseq.saturating_add(1);
@@ -4724,12 +4724,12 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .get_mut(&call_id)
-                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
             let answer = prepare_incoming_media(call, &body)?;
             let request = call
                 .pending_operator_reinvite
                 .take()
-                .ok_or_else(|| CellularImsError::new("volte_voice_reinvite_not_pending"))?;
+                .ok_or_else(|| CellularImsError::new(code::VOICE_REINVITE_NOT_PENDING))?;
             call.commit_media_update();
             call.renegotiation_deadline = None;
             let contact = ims_contact(&session.identity, &session.channel.route());
@@ -4746,11 +4746,11 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .get_mut(&call_id)
-                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
             let request = call
                 .pending_operator_reinvite
                 .take()
-                .ok_or_else(|| CellularImsError::new("volte_voice_reinvite_not_pending"))?;
+                .ok_or_else(|| CellularImsError::new(code::VOICE_REINVITE_NOT_PENDING))?;
             call.rollback_media_update();
             call.renegotiation_deadline = None;
             sip::build_response(
@@ -4771,9 +4771,9 @@ async fn handle_operator_command_inner(
                 let call = session
                     .voice_calls
                     .get_mut(&call_id)
-                    .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                    .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
                 if call.direction != LiveVoiceDirection::MobileTerminated {
-                    return Err(CellularImsError::new("volte_voice_direction_mismatch"));
+                    return Err(CellularImsError::new(code::VOICE_DIRECTION_MISMATCH));
                 }
                 if call.operator_answered {
                     return Ok(());
@@ -4781,7 +4781,7 @@ async fn handle_operator_command_inner(
                 let request = call
                     .initial_invite
                     .clone()
-                    .ok_or_else(|| CellularImsError::new("volte_voice_initial_invite_missing"))?;
+                    .ok_or_else(|| CellularImsError::new(code::VOICE_INITIAL_INVITE_MISSING))?;
                 let local_tag = call.dialog.local_tag.clone();
                 let answer = body
                     .as_deref()
@@ -4821,14 +4821,14 @@ async fn handle_operator_command_inner(
                 let call = session
                     .voice_calls
                     .get_mut(&call_id)
-                    .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                    .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
                 if call.direction != LiveVoiceDirection::MobileTerminated {
-                    return Err(CellularImsError::new("volte_voice_direction_mismatch"));
+                    return Err(CellularImsError::new(code::VOICE_DIRECTION_MISMATCH));
                 }
                 let request = call
                     .initial_invite
                     .clone()
-                    .ok_or_else(|| CellularImsError::new("volte_voice_initial_invite_missing"))?;
+                    .ok_or_else(|| CellularImsError::new(code::VOICE_INITIAL_INVITE_MISSING))?;
                 let local_tag = call.dialog.local_tag.clone();
                 let operator_answered = call.operator_answered;
                 let answer = prepare_incoming_media(call, &body);
@@ -4852,7 +4852,7 @@ async fn handle_operator_command_inner(
                     tracing::warn!(error = %error, "Rejected unusable Asterisk answer");
                     if operator_answered {
                         let call =
-                            call.ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                            call.ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
                         sip::build_bye(
                             &session.identity,
                             &session.channel.route(),
@@ -4878,9 +4878,9 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .remove(&call_id)
-                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
             if call.direction != LiveVoiceDirection::MobileTerminated {
-                return Err(CellularImsError::new("volte_voice_direction_mismatch"));
+                return Err(CellularImsError::new(code::VOICE_DIRECTION_MISMATCH));
             }
             if call.operator_answered {
                 sip::build_bye(
@@ -4895,7 +4895,7 @@ async fn handle_operator_command_inner(
                 let request = call
                     .initial_invite
                     .as_deref()
-                    .ok_or_else(|| CellularImsError::new("volte_voice_initial_invite_missing"))?;
+                    .ok_or_else(|| CellularImsError::new(code::VOICE_INITIAL_INVITE_MISSING))?;
                 sip::build_response(
                     request,
                     status,
@@ -4934,7 +4934,7 @@ fn operator_command_call_id(command: &OperatorCommand) -> &str {
 
 fn normalize_operator_callee(callee: &str, home_domain: &str) -> Result<String, CellularImsError> {
     let user = crate::connectivity::core::voice::normalize_ims_dial_user(callee)
-        .map_err(|_| CellularImsError::new("volte_voice_callee_invalid"))?;
+        .map_err(|_| CellularImsError::new(code::VOICE_CALLEE_INVALID))?;
     Ok(format!("sip:{user}@{home_domain};user=phone"))
 }
 
@@ -5117,7 +5117,7 @@ async fn handle_operator_sip_frame(
             return Ok(true);
         }
         let operator_audio = parse_audio_sdp(sip::sip_body(frame)).map_err(|error| {
-            CellularImsError::with_detail("volte_voice_sdp_invalid", error.to_string())
+            CellularImsError::with_detail(code::VOICE_SDP_INVALID, error.to_string())
         })?;
         let operator_remote = media_socket_addr(&operator_audio)?;
         ensure_operator_sdp_routes(
@@ -5147,14 +5147,12 @@ async fn handle_operator_sip_frame(
             session.media_operator_creator.clone(),
         )
         .await
-        .map_err(|error| {
-            CellularImsError::with_detail("volte_rtp_bind_failed", error.to_string())
-        })?;
+        .map_err(|error| CellularImsError::with_detail(code::RTP_BIND_FAILED, error.to_string()))?;
         let operator_local = pending.operator_local_addr().map_err(|error| {
-            CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+            CellularImsError::with_detail(code::RTP_LOCAL_ADDR_FAILED, error.to_string())
         })?;
         let internal_local = pending.internal_local_addr().map_err(|error| {
-            CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+            CellularImsError::with_detail(code::RTP_LOCAL_ADDR_FAILED, error.to_string())
         })?;
         let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some()
         {
@@ -5197,7 +5195,7 @@ async fn handle_operator_sip_frame(
         let call = session
             .voice_calls
             .get_mut(&trunk_call_id)
-            .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+            .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
         call.pending_operator_reinvite = Some(frame.to_vec());
         call.stage_media_update(
             offer,
@@ -5255,7 +5253,7 @@ async fn handle_operator_sip_frame(
         let call = session
             .voice_calls
             .remove(&trunk_call_id)
-            .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+            .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
         if call.direction != LiveVoiceDirection::MobileTerminated {
             return Ok(false);
         }
@@ -5336,13 +5334,13 @@ async fn handle_operator_sip_frame(
             let call = session
                 .voice_calls
                 .get_mut(&trunk_call_id)
-                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
             let transfer = call
                 .transfer
                 .as_mut()
-                .ok_or_else(|| CellularImsError::new("volte_transfer_not_pending"))?;
+                .ok_or_else(|| CellularImsError::new(code::TRANSFER_NOT_PENDING))?;
             transfer.on_refer_response(status).map_err(|error| {
-                CellularImsError::with_detail("volte_transfer_response_invalid", error.to_string())
+                CellularImsError::with_detail(code::TRANSFER_RESPONSE_INVALID, error.to_string())
             })?;
             if status >= 200 {
                 call.transfer_deadline = None;
@@ -5385,7 +5383,7 @@ async fn handle_operator_sip_frame(
                 let call = session
                     .voice_calls
                     .get_mut(&trunk_call_id)
-                    .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                    .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
                 if let Some(tag) = response_to_tag(frame) {
                     call.dialog.set_remote_tag(tag);
                 }
@@ -5406,7 +5404,7 @@ async fn handle_operator_sip_frame(
                 let prack = if reliable {
                     let rseq = sip::header_value(frame, "RSeq")
                         .and_then(|value| value.trim().parse::<u32>().ok())
-                        .ok_or_else(|| CellularImsError::new("volte_voice_rseq_missing"))?;
+                        .ok_or_else(|| CellularImsError::new(code::VOICE_RSEQ_MISSING))?;
                     let cseq = call.next_cseq;
                     call.next_cseq = call.next_cseq.saturating_add(1);
                     Some(sip::build_prack(
@@ -5464,9 +5462,9 @@ async fn handle_operator_sip_frame(
                 let call = session
                     .voice_calls
                     .get_mut(&trunk_call_id)
-                    .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
+                    .ok_or_else(|| CellularImsError::new(code::VOICE_CALL_UNKNOWN))?;
                 let tag = response_to_tag(frame)
-                    .ok_or_else(|| CellularImsError::new("volte_voice_remote_tag_missing"))?;
+                    .ok_or_else(|| CellularImsError::new(code::VOICE_REMOTE_TAG_MISSING))?;
                 call.dialog.set_remote_tag(tag);
                 let answer = prepare_final_operator_media(call, sip::sip_body(frame));
                 let first_operator_rtp =
@@ -5661,10 +5659,10 @@ async fn begin_incoming_operator_call(
         }
     };
     let operator_local = relay.operator_local_addr().map_err(|error| {
-        CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+        CellularImsError::with_detail(code::RTP_LOCAL_ADDR_FAILED, error.to_string())
     })?;
     let internal_local = relay.internal_local_addr().map_err(|error| {
-        CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+        CellularImsError::with_detail(code::RTP_LOCAL_ADDR_FAILED, error.to_string())
     })?;
     let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some() {
         let relay = bind_cellular_ims_operator_relay(
@@ -5828,7 +5826,7 @@ fn prepare_operator_media(
     body: &[u8],
 ) -> Result<String, CellularImsError> {
     let operator_audio = parse_audio_sdp(body).map_err(|error| {
-        CellularImsError::with_detail("volte_voice_sdp_invalid", error.to_string())
+        CellularImsError::with_detail(code::VOICE_SDP_INVALID, error.to_string())
     })?;
     let operator_remote = media_socket_addr(&operator_audio)?;
     let mut internal_answer = operator_audio.clone();
@@ -5844,7 +5842,7 @@ fn prepare_operator_media(
         })
         .collect();
     if internal_answer.codecs.is_empty() {
-        return Err(CellularImsError::new("volte_voice_no_common_codec"));
+        return Err(CellularImsError::new(code::VOICE_NO_COMMON_CODEC));
     }
     let operator_dtmf = parse_rtp_telephone_event(body);
     let internal_dtmf = call.internal_offer.dtmf.rtp_event.as_ref();
@@ -5874,7 +5872,7 @@ fn prepare_operator_media(
         let pending = call
             .pending_relay
             .take()
-            .ok_or_else(|| CellularImsError::new("volte_rtp_relay_missing"))?;
+            .ok_or_else(|| CellularImsError::new(code::RTP_RELAY_MISSING))?;
         let policy = MediaRelayPolicy::from_directions(
             operator_audio.direction,
             call.internal_offer.audio.direction,
@@ -5948,7 +5946,7 @@ fn prepare_final_operator_media(
 ) -> Result<String, CellularImsError> {
     if body.is_empty() {
         return call.early_answer.clone().ok_or_else(|| {
-            CellularImsError::with_detail("volte_voice_sdp_invalid", "voice_sdp_empty".to_string())
+            CellularImsError::with_detail(code::VOICE_SDP_INVALID, "voice_sdp_empty".to_string())
         });
     }
     prepare_operator_media(call, body)
@@ -5960,7 +5958,7 @@ async fn ensure_operator_sdp_routes(
     body: &[u8],
 ) -> Result<(), CellularImsError> {
     let audio = parse_audio_sdp(body).map_err(|error| {
-        CellularImsError::with_detail("volte_voice_sdp_invalid", error.to_string())
+        CellularImsError::with_detail(code::VOICE_SDP_INVALID, error.to_string())
     })?;
     let audio_remote = media_socket_addr(&audio)?;
     let video = parse_video_sdp(body).ok().and_then(|description| {
@@ -6018,7 +6016,7 @@ fn prepare_incoming_media(
     body: &[u8],
 ) -> Result<String, CellularImsError> {
     let internal_audio = parse_audio_sdp(body).map_err(|error| {
-        CellularImsError::with_detail("volte_voice_sdp_invalid", error.to_string())
+        CellularImsError::with_detail(code::VOICE_SDP_INVALID, error.to_string())
     })?;
     let internal_remote = media_socket_addr(&internal_audio)?;
     let mut operator_answer = call.internal_offer.audio.clone();
@@ -6032,7 +6030,7 @@ fn prepare_incoming_media(
         .cloned()
         .collect();
     if operator_answer.codecs.is_empty() {
-        return Err(CellularImsError::new("volte_voice_no_common_codec"));
+        return Err(CellularImsError::new(code::VOICE_NO_COMMON_CODEC));
     }
     let operator_dtmf = call.internal_offer.dtmf.rtp_event.as_ref();
     let internal_dtmf = parse_rtp_telephone_event(body);
@@ -6059,7 +6057,7 @@ fn prepare_incoming_media(
         let pending = call
             .pending_relay
             .take()
-            .ok_or_else(|| CellularImsError::new("volte_rtp_relay_missing"))?;
+            .ok_or_else(|| CellularImsError::new(code::RTP_RELAY_MISSING))?;
         let policy = MediaRelayPolicy::from_directions(
             call.internal_offer.audio.direction,
             internal_audio.direction,
@@ -6178,9 +6176,9 @@ fn media_socket_addr(audio: &SdpAudioDescription) -> Result<SocketAddr, Cellular
     let ip = audio
         .connection_addr
         .parse::<IpAddr>()
-        .map_err(|_| CellularImsError::new("volte_voice_media_address_invalid"))?;
+        .map_err(|_| CellularImsError::new(code::VOICE_MEDIA_ADDRESS_INVALID))?;
     if audio.media_port == 0 {
-        return Err(CellularImsError::new("volte_voice_media_port_invalid"));
+        return Err(CellularImsError::new(code::VOICE_MEDIA_PORT_INVALID));
     }
     Ok(SocketAddr::new(ip, audio.media_port))
 }
@@ -6230,14 +6228,14 @@ async fn handle_live_frame(
     send_live_frame(live, runtime, &response).await?;
 
     let deliver = crate::connectivity::core::sms_codec::parse_mt_rp_data(sip::sip_body(frame))
-        .map_err(|_| CellularImsError::new("volte_mt_rp_data_invalid"))?;
+        .map_err(|_| CellularImsError::new(code::MT_RP_DATA_INVALID))?;
     let rp_ack_body =
         crate::connectivity::core::sms_codec::build_network_rp_ack(deliver.rp_message_reference);
     let rp_ack = {
         let sessions = live.session.lock().await;
         let session = sessions
             .as_ref()
-            .ok_or_else(|| CellularImsError::new("volte_runtime_not_registered"))?;
+            .ok_or_else(|| CellularImsError::new(code::RUNTIME_NOT_REGISTERED))?;
         sip::build_rp_ack(
             &session.identity,
             &session.channel.route(),
@@ -6271,7 +6269,7 @@ async fn handle_live_frame(
                 let claimed = database
                     .claim_sms_dedup(line_id, &fingerprint, TRANSPORT_TAG)
                     .map_err(|error| {
-                        CellularImsError::with_detail("volte_sms_db_failed", error.to_string())
+                        CellularImsError::with_detail(code::SMS_DB_FAILED, error.to_string())
                     })?;
                 if !claimed {
                     runtime.update(|state| state.duplicate_count += 1).await;
@@ -6281,7 +6279,7 @@ async fn handle_live_frame(
             if database
                 .sms_exists_by_pdu_for_line(line_id, &message.dedup_marker)
                 .map_err(|error| {
-                    CellularImsError::with_detail("volte_sms_db_failed", error.to_string())
+                    CellularImsError::with_detail(code::SMS_DB_FAILED, error.to_string())
                 })?
             {
                 runtime.update(|state| state.duplicate_count += 1).await;
@@ -6304,7 +6302,7 @@ async fn handle_live_frame(
                     Some(line_id),
                 )
                 .map_err(|error| {
-                    CellularImsError::with_detail("volte_sms_db_failed", error.to_string())
+                    CellularImsError::with_detail(code::SMS_DB_FAILED, error.to_string())
                 })?;
             runtime.update(|state| state.received_count += 1).await;
             let sms = SmsMessage {
@@ -6337,7 +6335,7 @@ async fn handle_live_frame(
                 "Buffered VoLTE MT multipart segment"
             );
         }
-        MtIngest::ParseError => return Err(CellularImsError::new("volte_mt_rp_data_invalid")),
+        MtIngest::ParseError => return Err(CellularImsError::new(code::MT_RP_DATA_INVALID)),
     }
     Ok(())
 }
@@ -6557,7 +6555,7 @@ async fn send_live_frame(
     let mut sessions = live.session.lock().await;
     let session = sessions
         .as_mut()
-        .ok_or_else(|| CellularImsError::new("volte_runtime_not_registered"))?;
+        .ok_or_else(|| CellularImsError::new(code::RUNTIME_NOT_REGISTERED))?;
     session
         .channel
         .send_sip(frame)
@@ -6575,20 +6573,20 @@ pub async fn send_live_sms_for_line(
     service_center: &str,
 ) -> Result<CellularImsSmsSendResult, CellularImsError> {
     if !runtime.status().await.registered {
-        return Err(CellularImsError::new("volte_runtime_not_registered"));
+        return Err(CellularImsError::new(code::RUNTIME_NOT_REGISTERED));
     }
     if service_center.trim().is_empty() {
-        return Err(CellularImsError::new("volte_smsc_missing"));
+        return Err(CellularImsError::new(code::SMSC_MISSING));
     }
     let submissions = crate::connectivity::modems::ims::cellular_ims::sms::build_mo_submissions(
         recipient,
         text,
         service_center,
     )
-    .map_err(|error| CellularImsError::with_detail("volte_sms_encode_failed", error.to_string()))?;
+    .map_err(|error| CellularImsError::with_detail(code::SMS_ENCODE_FAILED, error.to_string()))?;
     let first = submissions
         .first()
-        .ok_or_else(|| CellularImsError::new("volte_sms_encode_failed"))?;
+        .ok_or_else(|| CellularImsError::new(code::SMS_ENCODE_FAILED))?;
     let message_id = first.message_id.clone();
     let trace_id = first.trace_id.clone();
     let part_count = submissions.len();
@@ -6598,7 +6596,7 @@ pub async fn send_live_sms_for_line(
         let mut sessions = live.session.lock().await;
         let session = sessions
             .as_mut()
-            .ok_or_else(|| CellularImsError::new("volte_runtime_not_registered"))?;
+            .ok_or_else(|| CellularImsError::new(code::RUNTIME_NOT_REGISTERED))?;
         let (service_center_uri, recipient_uri) =
             mo_sms_uris(recipient, service_center, &session.identity.home_domain)?;
         let frame = sip::build_sms_message(
@@ -6632,7 +6630,7 @@ pub async fn send_live_sms_for_line(
                 "VoLTE MO SMS SIP MESSAGE rejected"
             );
             return Err(CellularImsError::with_detail(
-                "volte_sms_message_rejected",
+                code::SMS_MESSAGE_REJECTED,
                 sip_status.to_string(),
             ));
         }
@@ -6678,7 +6676,7 @@ fn phone_uri(number: &str, domain: &str) -> Result<String, CellularImsError> {
             character.is_ascii_digit() || (index == 0 && character == '+')
         })
     {
-        return Err(CellularImsError::new("volte_phone_uri_invalid"));
+        return Err(CellularImsError::new(code::PHONE_URI_INVALID));
     }
     Ok(format!("sip:{number}@{domain};user=phone"))
 }

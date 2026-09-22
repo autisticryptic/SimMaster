@@ -709,12 +709,12 @@ fn worker_host_route_op(
         .settings
         .local_addr_for_family(host)
         .filter(|source| source.is_ipv6() == host.is_ipv6() && !source.is_unspecified())
-        .ok_or_else(|| CellularImsError::new("volte_route_family_mismatch"))?;
+        .ok_or_else(|| CellularImsError::new(code::ROUTE_FAMILY_MISMATCH))?;
     let gateway = bearer.settings.gateway_for_family(host);
     if gateway
         .is_some_and(|gateway| gateway.is_ipv6() != host.is_ipv6() || gateway.is_unspecified())
     {
-        return Err(CellularImsError::new("volte_route_gateway_family_mismatch"));
+        return Err(CellularImsError::new(code::ROUTE_GATEWAY_FAMILY_MISMATCH));
     }
     let via = gateway.map(|gateway| gateway.to_string());
     Ok(NetConfigOp::RouteReplace {
@@ -963,9 +963,9 @@ async fn route_host_on_bearer(
     let local = bearer
         .settings
         .local_addr_for_family(host)
-        .ok_or_else(|| CellularImsError::new("volte_route_family_mismatch"))?;
+        .ok_or_else(|| CellularImsError::new(code::ROUTE_FAMILY_MISMATCH))?;
     if local.is_ipv4() != host.is_ipv4() {
-        return Err(CellularImsError::new("volte_route_family_mismatch"));
+        return Err(CellularImsError::new(code::ROUTE_FAMILY_MISMATCH));
     }
     let table = route_table(RouteDomain::CellularIms, &bearer.interface, host);
     let destination = host_selector(host);

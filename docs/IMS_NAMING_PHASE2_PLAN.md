@@ -50,8 +50,32 @@
 
 ### 3.1 错误码
 
-- 168 个不同的 `volte_*` 错误码；含配置键共 170 个不同字面量；总计 305 处出现。
-- 后端分布：
+重新逐行判定 `#[cfg(test)]` 归属后的准确数字（此前按“首个 `#[cfg(test)]`
+之后即测试”统计是错的，`live.rs` 有 4 处 `#[cfg(test)]`，`channel.rs` 有内联用法）：
+
+- 生产字面量点 **270** 处，测试专用 **56** 处。
+- `errors.rs` 已有 **70** 个 `code::*` 常量与 `verr!` 宏，**步骤 1 的“散落字面量”
+  前提对该文件不成立**；真正缺口是调用方绕过常量。
+- 去掉非错误码项后，生产代码中 **86 个码值需要新建常量**，仅 5 个已有常量可复用。
+- 另有 8 处 `format!` 前缀式码（如 `volte_register_refresh_retry:{}`），
+  需拆成常量 + 后缀。
+
+- 后端分布（按文件，生产/测试）：
+
+| 文件 | 生产 | 测试 |
+|---|---|---|
+| `cellular_ims/live.rs` | 84 | 2 |
+| `cellular_ims/errors.rs` | 70 | 5 |
+| `cellular_ims/channel.rs` | 61 | 1 |
+| `api/handlers.rs` | 25 | 6 |
+| `cellular_ims/pcscf.rs` | 6 | 0 |
+| `cellular_ims/sip.rs` / `cellular_ims/bearer.rs` | 各 4 | 0 |
+| `platform/config.rs` | 0 | 23 |
+
+`channel.rs` 完全没有引用常量模块，61 处全是裸字面量，是本步最大单点。
+`config.rs` 的 23 处全在测试内（键迁移断言表），属预期，不改。
+
+- 旧分布表（首次统计，保留以说明修正过程）：
 
 | 文件 | 处数 |
 |---|---|
@@ -96,7 +120,24 @@
 | `pages/sim/CarrierProfilesPanel.tsx` | 3 |
 | `pages/SMS.tsx` / `pages/SimCard.tsx` / `pages/phone/VoiceRoutingPanel.tsx` | 各 1 |
 
-### 3.4 其他消费者
+### 3.4 必须排除的持久化值（新增约束）
+
+`volte_ims` **不是错误码，而是短信 transport 值**，会写入 `sms_messages.transport`
+列（另有 `vowifi_ims` / `modem` / `trunk`）。前端 `pages/SMS.tsx:97` 与
+`pages/sim/LineRuntimeDetails.tsx:127,179` 按精确值匹配。
+
+改名会让历史短信显示错误来源，因此 **`volte_ims` 排除在本阶段之外**，
+与数据库列一并留待数据库联动。
+
+同类需排除的还有断连原因串（经 `disconnect_live_for_line` 传入，非错误码）：
+
+- `volte_ip_families_changed`（`handlers.rs:8766`）
+- `volte_profile_selection_changed`（`handlers.rs:8583`）
+- `volte_line_connection_disabled`（`handlers.rs:8694,8805`）
+
+这些可改，但属于独立语义类别，需与错误码分开处理，避免混入同一张映射表。
+
+### 3.5 其他消费者
 
 - `bruno-api/`：9 个文件引用 volte（含 `test_volte_status.bru`、`get_volte_line.bru` 等）。
 - `.github/scripts/test_ims_fallback_boundary.py`：2 处。
@@ -134,10 +175,43 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 
 ### 步骤 1 — 后端错误码收敛为常量
 
-- [ ] 在 `cellular_ims/errors.rs` 建立集中的码常量（现为散落字面量）
-- [ ] `live.rs` / `channel.rs` / `pcscf.rs` / `sip.rs` / `bearer.rs` 等改引用常量
-- [ ] 保留字面量值不变，本步**不改名**，只让编译器接管引用正确性
-- [ ] 导出一份全量码清单供守卫读取
+前提更正：`errors.rs` **已有** `pub mod code` 常量模块（70 个常量）与 `verr!` 宏，
+并非“散落字面量”。真实缺口是生产代码大量绕过常量直接写字面量：
+`channel.rs` 完全未使用常量，`live.rs` 也大量直写。
+
+生产字面量共 189 处、91 个不同值；其中 5 个已有常量，**86 个需新增常量**。
+用量最高的几个：`volte_voice_call_unknown`(15)、`volte_channel_local_addr_failed`(14)、
+`volte_channel_read_timeout`(10)、`volte_rtp_local_addr_failed`(8)。
+
+- [x] 在 `errors.rs` 的 `code` 模块补齐缺失常量（值保持不变）：70 → **158** 个
+- [x] 改引用常量：`channel.rs`(62) / `live.rs`(81) / `handlers.rs`(17) /
+      `pcscf.rs`(6) / `sip.rs`(4) / `bearer.rs`(4) / `config.rs`(5)
+- [x] 本步**不改名**，只让编译器接管引用正确性
+- [x] 导出全量码清单 `code::ALL`（158 项）供守卫读取
+- [x] `errors.rs` 内新增两项自检：`ALL` 无重复、无码互为子串
+
+本步完成情况与原计划的差异：
+
+- `format!` 前缀点（8 处）**未**改为常量拼接。这些模板形如
+  `volte_baseband_wedged:{error}`，其前缀本身不是 `code` 表中的码；
+  强行拆成常量拼接会引入一批只被单点使用的常量，反而降低可读性。
+  它们已在守卫中显式排除，改名时按前缀单独处理。
+- `connectivity/core/register.rs` 保留 2 处字面量
+  （`volte_channel_read_timeout` / `volte_channel_read_retryable`）。
+  `connectivity/core` 是 `cellular_ims` 的**下层**，让它引用上层常量会倒置
+  分层依赖。已确认 `core` 目前不依赖 `cellular_ims`，故维持字面量并在守卫中排除。
+- `config.rs` 的 5 处生产校验码已转换；该文件另有 16 处字面量全在测试模块内
+  （serde 迁移断言表），属预期保留。
+
+额外产出（原计划未列，实施中发现必要）：
+
+- [x] 新增 `.github/scripts/test_ims_error_code_table.py`（7 项），断言
+      `code::ALL` 与声明集合**完全一致**、无重复值、无子串关系，
+      并禁止调用点重新写回字面量
+- [x] 该守卫已做负向验证：漏加 `ALL`、引入子串、重复码值、调用点写回字面量
+      四种情形均如期失败
+- [x] 修正 `test_ims_fallback_boundary.py`：原先断言 `pcscf.rs` 含码字面量，
+      改为断言调用点引用常量 **且** 中心表持有该值（约束更强）
 
 ### 步骤 2 — 前端改为精确查表
 
@@ -162,6 +236,9 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 
 ### 步骤 5 — JSON 字段与 serde 别名
 
+注意：`volte_ims` 同时是短信 transport 的**持久化值**（见 §6 排除项），
+本步只改 `api/models.rs:1246` 的 serde 字段名，不动 transport 值。
+
 - [ ] 为 `volte_profiles` / `volte_ims` / `volte_ready` 补 `cellular_ims_*` alias
 - [ ] 6 个已有 alias 的键交换 `rename` 与 `alias`，改为写出新名、读入兼容旧名
 - [ ] `frontend/src/api/contracts.ts` 同步
@@ -175,6 +252,28 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 - [ ] CI 全绿，`Publish Release` 保持 `skipped`
 
 ## 6. 边界
+
+### 6.1 排除项：持久化值不得改名
+
+以下字面量会写入数据库，改名会让**历史数据显示错误**，本阶段一律不动：
+
+| 值 | 落盘位置 | 消费方 |
+|---|---|---|
+| `volte_ims` | `sms_messages.transport`（7 处写入） | `pages/SMS.tsx`、`LineRuntimeDetails.tsx` 精确匹配 |
+
+这是清点阶段新发现的约束，写计划时未识别。与「错误码不落盘」的结论不冲突：
+`volte_ims` 是 transport 取值，不是错误码。
+
+### 6.2 排除项：非错误码字面量
+
+以下虽形如 `volte_*`，但属于其他语义，不纳入错误码改名：
+
+- 断连原因串：`volte_ip_families_changed`、`volte_profile_selection_changed`、
+  `volte_line_connection_disabled`（传入 `disconnect_live_for_line`）
+- 状态串：`volte_degraded`
+- serde 字段名：`volte_profiles`、`volte_ready`、`volte_ims`（步骤 5 单独处理）
+
+### 6.3 通用边界
 
 - 不做 schema 变更；`volte_enabled` 列与 `volte_refresh_stats` 表名留待数据库联动。
 - `/volte/*` 路由别名不删除。

@@ -2832,14 +2832,14 @@ mod tests {
         };
         assert_eq!(
             validate_cellular_ims_profile_selection(&mut too_short),
-            Err("volte_profile_attempt_count_invalid".to_string())
+            Err(crate::connectivity::modems::ims::cellular_ims::errors::code::PROFILE_ATTEMPT_COUNT_INVALID.to_string())
         );
 
         let mut invalid = ImsProfileSelectionConfig::default();
         invalid.attempts[2].profile_id = Some("not-allowed".to_string());
         assert_eq!(
             validate_cellular_ims_profile_selection(&mut invalid),
-            Err("volte_derived_profile_id_not_allowed".to_string())
+            Err(crate::connectivity::modems::ims::cellular_ims::errors::code::DERIVED_PROFILE_ID_NOT_ALLOWED.to_string())
         );
     }
 
@@ -4882,7 +4882,7 @@ fn validate_cellular_ims_profile_selection(
     selection: &mut ImsProfileSelectionConfig,
 ) -> Result<(), String> {
     if selection.attempts.len() != 3 {
-        return Err("volte_profile_attempt_count_invalid".to_string());
+        return Err(crate::connectivity::modems::ims::cellular_ims::errors::code::PROFILE_ATTEMPT_COUNT_INVALID.to_string());
     }
     for candidate in &mut selection.attempts {
         candidate.profile_id = candidate
@@ -4891,14 +4891,17 @@ fn validate_cellular_ims_profile_selection(
             .map(|profile_id| profile_id.trim().to_string())
             .filter(|profile_id| !profile_id.is_empty());
         if candidate.source == ImsProfileSource::Derived && candidate.profile_id.is_some() {
-            return Err("volte_derived_profile_id_not_allowed".to_string());
+            return Err(crate::connectivity::modems::ims::cellular_ims::errors::code::DERIVED_PROFILE_ID_NOT_ALLOWED.to_string());
         }
         if candidate
             .profile_id
             .as_deref()
             .is_some_and(|profile_id| profile_id.len() > 160)
         {
-            return Err("volte_profile_id_too_long".to_string());
+            return Err(
+                crate::connectivity::modems::ims::cellular_ims::errors::code::PROFILE_ID_TOO_LONG
+                    .to_string(),
+            );
         }
     }
     Ok(())
@@ -6406,12 +6409,15 @@ impl ConfigManager {
             return Err("invalid_line_id".to_string());
         }
         if families.is_empty() {
-            return Err("volte_ip_families_empty".to_string());
+            return Err(
+                crate::connectivity::modems::ims::cellular_ims::errors::code::IP_FAMILIES_EMPTY
+                    .to_string(),
+            );
         }
         let mut seen = Vec::new();
         for family in &families {
             if seen.contains(family) {
-                return Err("volte_ip_families_duplicate".to_string());
+                return Err(crate::connectivity::modems::ims::cellular_ims::errors::code::IP_FAMILIES_DUPLICATE.to_string());
             }
             seen.push(*family);
         }

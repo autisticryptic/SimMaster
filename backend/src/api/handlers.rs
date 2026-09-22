@@ -3599,7 +3599,7 @@ pub(crate) async fn suspend_line_runtime_for_hotplug(
         crate::connectivity::modems::ims::cellular_ims::live::disconnect_live_for_line(
             &line.cellular_ims_live,
             &line.cellular_ims,
-            "volte_line_not_present",
+            code::LINE_NOT_PRESENT,
         )
         .await;
     }
@@ -4784,11 +4784,11 @@ async fn send_sms_over_cellular_ims_path(
     }
     let profile = app.config_manager.get_line_profile(line_id);
     if !profile.enabled || !profile.cellular_ims_connection_enabled {
-        return Err("line_volte_connection_disabled".to_string());
+        return Err(code::LINE_VOLTE_CONNECTION_DISABLED.to_string());
     }
     if !line.cellular_ims.status().await.registered {
         if !line.begin_cellular_ims_retry() {
-            return Err("volte_profile_restore_in_progress".to_string());
+            return Err(code::PROFILE_RESTORE_IN_PROGRESS.to_string());
         }
         let retry_max = profile.cellular_ims_profile_selection.attempts.len() as u32;
         line.cellular_ims
@@ -4809,7 +4809,7 @@ async fn send_sms_over_cellular_ims_path(
         if !status.registered {
             return Err(status
                 .last_error
-                .unwrap_or_else(|| "volte_profile_attempts_exhausted".to_string()));
+                .unwrap_or_else(|| code::PROFILE_ATTEMPTS_EXHAUSTED.to_string()));
         }
     }
     let sim =
@@ -6602,7 +6602,7 @@ pub async fn get_line_ims_status_handler(
                 cellular_ims
                     .last_error
                     .clone()
-                    .unwrap_or_else(|| "volte_degraded".to_string())
+                    .unwrap_or_else(|| code::DEGRADED.to_string())
             }),
         media_gateway_ready: line
             .voice_access
@@ -8340,7 +8340,7 @@ impl TryFrom<CellularImsProfileSelectionRequest> for ImsProfileSelectionConfig {
                     "database" => ImsProfileSource::Database,
                     "carrier_catalog" => ImsProfileSource::CarrierCatalog,
                     "derived" => ImsProfileSource::Derived,
-                    _ => return Err("volte_profile_source_unsupported".to_string()),
+                    _ => return Err(code::PROFILE_SOURCE_UNSUPPORTED.to_string()),
                 };
                 Ok(ImsProfileCandidate {
                     source,
@@ -8580,7 +8580,7 @@ pub async fn set_cellular_ims_profile_selection_handler(
                 crate::connectivity::modems::ims::cellular_ims::live::disconnect_live_for_line(
                     &line.cellular_ims_live,
                     &line.cellular_ims,
-                    "volte_profile_selection_changed",
+                    code::PROFILE_SELECTION_CHANGED,
                 )
                 .await;
                 line.cellular_ims.generation()
@@ -8691,7 +8691,7 @@ pub async fn set_cellular_ims_line_connection_handler(
             crate::connectivity::modems::ims::cellular_ims::live::disconnect_live_for_line(
                 &line.cellular_ims_live,
                 &line.cellular_ims,
-                "volte_line_connection_disabled",
+                code::LINE_CONNECTION_DISABLED,
             )
             .await,
         )
@@ -8763,7 +8763,7 @@ pub async fn set_cellular_ims_line_ip_families_handler(
             crate::connectivity::modems::ims::cellular_ims::live::disconnect_live_for_line(
                 &line.cellular_ims_live,
                 &line.cellular_ims,
-                "volte_ip_families_changed",
+                code::IP_FAMILIES_CHANGED,
             )
             .await;
         }
@@ -8802,19 +8802,19 @@ pub async fn retry_cellular_ims_line_handler(
     if !profile.enabled || !profile.cellular_ims_connection_enabled {
         return (
             StatusCode::CONFLICT,
-            Json(ApiResponse::error("volte_line_connection_disabled")),
+            Json(ApiResponse::error(code::LINE_CONNECTION_DISABLED)),
         );
     }
     if line.cellular_ims.status().await.registered {
         return (
             StatusCode::CONFLICT,
-            Json(ApiResponse::error("volte_line_already_registered")),
+            Json(ApiResponse::error(code::LINE_ALREADY_REGISTERED)),
         );
     }
     if !start_line_cellular_ims_restore(app.clone(), Arc::clone(&line), "manual").await {
         return (
             StatusCode::CONFLICT,
-            Json(ApiResponse::error("volte_retry_already_running")),
+            Json(ApiResponse::error(code::RETRY_ALREADY_RUNNING)),
         );
     }
     (
@@ -10560,7 +10560,7 @@ async fn wait_for_line_modem(
                 crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::WaitingModem;
             state.manual_retry_available = false;
             state.next_retry_at = None;
-            state.last_error = Some("volte_line_not_present".to_string());
+            state.last_error = Some(code::LINE_NOT_PRESENT.to_string());
         })
         .await;
     LineModemWait::Deferred
@@ -10679,7 +10679,7 @@ async fn run_line_cellular_ims_restore_batch(
         if let Err(error) = refreshed {
             let attempt_error =
                 crate::connectivity::modems::ims::cellular_ims::CellularImsError::with_detail(
-                    "volte_modem_refresh_failed",
+                    code::MODEM_REFRESH_FAILED,
                     error.to_string(),
                 );
             line.cellular_ims
@@ -10762,7 +10762,7 @@ async fn run_line_cellular_ims_restore_batch(
                 Ok(data_slot_mode) => match ims_override_for_line(app, &binding.line_id).await {
                     Err(error) => Err(
                         crate::connectivity::modems::ims::cellular_ims::CellularImsError::with_detail(
-                            "volte_sim_override_not_ready",
+                            code::SIM_OVERRIDE_NOT_READY,
                             error,
                         ),
                     ),
@@ -10952,7 +10952,7 @@ async fn run_line_cellular_ims_restore_batch(
             state.manual_retry_available = true;
             state.next_retry_at = None;
             if state.last_error.is_none() {
-                state.last_error = Some("volte_profile_attempts_exhausted".to_string());
+                state.last_error = Some(code::PROFILE_ATTEMPTS_EXHAUSTED.to_string());
             }
         })
         .await;
@@ -12768,7 +12768,7 @@ fn build_effective_response(
         .and_then(|o| o.ims_vowifi.profile_id.as_deref());
     let cellular_ims_catalog =
         resolve_ims_catalog(app, imsi, cellular_ims_pinned, CatalogAccessKind::LteEpc)
-            .ok_or_else(|| "volte_carrier_profile_not_resolved".to_string())?;
+            .ok_or_else(|| code::CARRIER_PROFILE_NOT_RESOLVED.to_string())?;
     let vowifi_catalog = resolve_ims_catalog(app, imsi, vowifi_pinned, CatalogAccessKind::WifiEpdg)
         .ok_or_else(|| "vowifi_carrier_profile_not_resolved".to_string())?;
 

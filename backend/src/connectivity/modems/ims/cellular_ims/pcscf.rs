@@ -248,7 +248,7 @@ pub async fn prepare_ims_profile_context(
         != contexts.len()
     {
         return Err(CellularImsError::new(
-            "volte_ims_profile_definition_ambiguous",
+            code::IMS_PROFILE_DEFINITION_AMBIGUOUS,
         ));
     }
     let profile = select_ims_profile_context(&contexts, configured_ims_cid(), apn)?;
@@ -283,9 +283,7 @@ fn select_ims_profile_context(
         });
     }
     if !(1..=16).contains(&preferred) || contexts.iter().any(|context| context.cid == preferred) {
-        return Err(CellularImsError::new(
-            "volte_ims_preferred_profile_occupied",
-        ));
+        return Err(CellularImsError::new(code::IMS_PREFERRED_PROFILE_OCCUPIED));
     }
     Ok(ImsProfileContext {
         cid: preferred,
@@ -306,17 +304,15 @@ fn ensure_profile_inactive(output: &str, cid: u8) -> Result<(), CellularImsError
             .collect::<Vec<_>>();
         let parsed = fields.first().and_then(|field| field.parse::<u8>().ok());
         if fields.len() != 2 || parsed.is_none_or(|id| id == 0) || !matches!(fields[1], "0" | "1") {
-            return Err(CellularImsError::new(
-                "volte_ims_profile_activity_ambiguous",
-            ));
+            return Err(CellularImsError::new(code::IMS_PROFILE_ACTIVITY_AMBIGUOUS));
         }
         if parsed == Some(cid) && fields[1] == "1" {
-            return Err(CellularImsError::new("volte_ims_preferred_profile_active"));
+            return Err(CellularImsError::new(code::IMS_PREFERRED_PROFILE_ACTIVE));
         }
     }
     if !observed {
         return Err(CellularImsError::new(
-            "volte_ims_profile_activity_unavailable",
+            code::IMS_PROFILE_ACTIVITY_UNAVAILABLE,
         ));
     }
     Ok(())
@@ -513,7 +509,7 @@ where
         != parsed.len()
     {
         return Err(CellularImsError::new(
-            "volte_ims_profile_definition_ambiguous",
+            code::IMS_PROFILE_DEFINITION_AMBIGUOUS,
         ));
     }
     let mut contexts = parsed

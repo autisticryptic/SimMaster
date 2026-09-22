@@ -117,6 +117,7 @@ jobs:
             connectivity::core::ims_registration_coordinator::tests \
             connectivity::modems::ims::vowifi::live::coexistence_lease_tests \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \
+            connectivity::modems::ims::cellular_ims::errors::tests \
             services::notify::telegram_endpoint::tests; do
             cargo test --locked "$filter" -- --list > beta-test-list.txt
             if ! grep -q ': test$' beta-test-list.txt; then

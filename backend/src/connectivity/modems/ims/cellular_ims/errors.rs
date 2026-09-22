@@ -126,10 +126,286 @@ pub mod code {
     pub const PHONE_URI_INVALID: &str = "volte_phone_uri_invalid";
     pub const SMS_MESSAGE_ALL_VARIANTS_FAILED: &str = "volte_sms_message_all_variants_failed";
 
+    // IMS profile selection / activity probing (pcscf.rs).
+    pub const IMS_PROFILE_DEFINITION_AMBIGUOUS: &str = "volte_ims_profile_definition_ambiguous";
+    pub const IMS_PREFERRED_PROFILE_OCCUPIED: &str = "volte_ims_preferred_profile_occupied";
+    pub const IMS_PROFILE_ACTIVITY_AMBIGUOUS: &str = "volte_ims_profile_activity_ambiguous";
+    pub const IMS_PREFERRED_PROFILE_ACTIVE: &str = "volte_ims_preferred_profile_active";
+    pub const IMS_PROFILE_ACTIVITY_UNAVAILABLE: &str = "volte_ims_profile_activity_unavailable";
+
+    // DTMF argument validation (sip.rs).
+    pub const DTMF_DIGIT_INVALID: &str = "volte_dtmf_digit_invalid";
+    pub const DTMF_DURATION_INVALID: &str = "volte_dtmf_duration_invalid";
+
+    // Source-based policy routing (bearer.rs).
+    pub const ROUTE_FAMILY_MISMATCH: &str = "volte_route_family_mismatch";
+    pub const ROUTE_GATEWAY_FAMILY_MISMATCH: &str = "volte_route_gateway_family_mismatch";
+
+    // API / line lifecycle (handlers).
+    pub const CARRIER_PROFILE_NOT_RESOLVED: &str = "volte_carrier_profile_not_resolved";
+    pub const DEGRADED: &str = "volte_degraded";
+    pub const IP_FAMILIES_CHANGED: &str = "volte_ip_families_changed";
+    pub const LINE_ALREADY_REGISTERED: &str = "volte_line_already_registered";
+    pub const LINE_CONNECTION_DISABLED: &str = "volte_line_connection_disabled";
+    pub const LINE_NOT_PRESENT: &str = "volte_line_not_present";
+    /// Historical shape: this one leads with `line_`, not `volte_`. Preserved
+    /// verbatim because the frontend matches the exact string.
+    pub const LINE_VOLTE_CONNECTION_DISABLED: &str = "line_volte_connection_disabled";
+    pub const MODEM_REFRESH_FAILED: &str = "volte_modem_refresh_failed";
+    pub const PROFILE_ATTEMPTS_EXHAUSTED: &str = "volte_profile_attempts_exhausted";
+    pub const PROFILE_RESTORE_IN_PROGRESS: &str = "volte_profile_restore_in_progress";
+    pub const PROFILE_SELECTION_CHANGED: &str = "volte_profile_selection_changed";
+    pub const PROFILE_SOURCE_UNSUPPORTED: &str = "volte_profile_source_unsupported";
+    pub const RETRY_ALREADY_RUNNING: &str = "volte_retry_already_running";
+    pub const SIM_OVERRIDE_NOT_READY: &str = "volte_sim_override_not_ready";
+
+    // Line/profile configuration validation.
+    pub const DERIVED_PROFILE_ID_NOT_ALLOWED: &str = "volte_derived_profile_id_not_allowed";
+    pub const IP_FAMILIES_DUPLICATE: &str = "volte_ip_families_duplicate";
+    pub const IP_FAMILIES_EMPTY: &str = "volte_ip_families_empty";
+    pub const PROFILE_ATTEMPT_COUNT_INVALID: &str = "volte_profile_attempt_count_invalid";
+    pub const PROFILE_ID_TOO_LONG: &str = "volte_profile_id_too_long";
+
     // Runtime lifecycle.
     pub const RUNTIME_NOT_RUNNING: &str = "volte_runtime_not_running";
     pub const RUNTIME_SEND_TIMEOUT: &str = "volte_runtime_send_timeout";
     pub const RANDOM_FAILED: &str = "volte_random_failed";
+
+    // SIP channel: socket binding, port reservation and UE-worker transfer.
+    // `CHANNEL_READ_TIMEOUT` and `CHANNEL_READ_RETRYABLE` are matched by the
+    // register loop to tell a benign read gap from a real failure, so they must
+    // stay distinct from the send-side codes.
+    pub const CHANNEL_BIND_FAILED: &str = "volte_channel_bind_failed";
+    pub const CHANNEL_LOCAL_ADDR_FAILED: &str = "volte_channel_local_addr_failed";
+    pub const CHANNEL_READ_FAILED: &str = "volte_channel_read_failed";
+    pub const CHANNEL_READ_RETRYABLE: &str = "volte_channel_read_retryable";
+    pub const CHANNEL_READ_TIMEOUT: &str = "volte_channel_read_timeout";
+    pub const CHANNEL_RECEIVE_CONNECT_FAILED: &str = "volte_channel_receive_connect_failed";
+    pub const CHANNEL_RECEIVE_NOT_RESERVED: &str = "volte_channel_receive_not_reserved";
+    pub const CHANNEL_RECEIVE_PORT_MISMATCH: &str = "volte_channel_receive_port_mismatch";
+    pub const CHANNEL_RECEIVE_RESERVE_FAILED: &str = "volte_channel_receive_reserve_failed";
+    pub const CHANNEL_RECEIVE_RESERVE_INVALID_PORT: &str =
+        "volte_channel_receive_reserve_invalid_port";
+    pub const CHANNEL_RECEIVE_RESERVED_SIP_PORT: &str = "volte_channel_receive_reserved_sip_port";
+    pub const CHANNEL_RECEIVE_SOCKET_MISSING: &str = "volte_channel_receive_socket_missing";
+    pub const CHANNEL_SECURITY_UPDATE_PENDING: &str = "volte_channel_security_update_pending";
+    pub const CHANNEL_SEND_CONNECT_FAILED: &str = "volte_channel_send_connect_failed";
+    pub const CHANNEL_SEND_FAILED: &str = "volte_channel_send_failed";
+    pub const CHANNEL_SEND_NOT_RESERVED: &str = "volte_channel_send_not_reserved";
+    pub const CHANNEL_SEND_PORT_MISMATCH: &str = "volte_channel_send_port_mismatch";
+    pub const CHANNEL_SEND_RESERVE_FAILED: &str = "volte_channel_send_reserve_failed";
+    pub const CHANNEL_SEND_RESERVE_INVALID_PORT: &str = "volte_channel_send_reserve_invalid_port";
+    pub const CHANNEL_SEND_SOCKET_MISSING: &str = "volte_channel_send_socket_missing";
+    pub const CHANNEL_SHORT_SEND: &str = "volte_channel_short_send";
+    pub const CHANNEL_WORKER_RECEIVE_MISMATCH: &str = "volte_channel_worker_receive_mismatch";
+    pub const CHANNEL_WORKER_RECEIVE_REQUIRES_ASYNC: &str =
+        "volte_channel_worker_receive_requires_async";
+    pub const CHANNEL_WORKER_SEND_MISMATCH: &str = "volte_channel_worker_send_mismatch";
+    pub const CHANNEL_WORKER_SEND_REQUIRES_ASYNC: &str = "volte_channel_worker_send_requires_async";
+    pub const CHANNEL_WORKER_SOCKET_FAILED: &str = "volte_channel_worker_socket_failed";
+    pub const CHANNEL_WORKER_SOCKET_TYPE: &str = "volte_channel_worker_socket_type";
+
+    // Voice / RTP / transfer / SMS runtime (live.rs).
+    pub const CNI_REQUIRED_DYNAMIC_UNAVAILABLE: &str = "volte_cni_required_dynamic_unavailable";
+    pub const CONCURRENT_CALL_LIMIT: &str = "volte_concurrent_call_limit";
+    pub const MT_RP_DATA_INVALID: &str = "volte_mt_rp_data_invalid";
+    pub const PANI_REQUIRED_DYNAMIC_UNAVAILABLE: &str = "volte_pani_required_dynamic_unavailable";
+    pub const QMI_DEVICE_MISSING: &str = "volte_qmi_device_missing";
+    pub const REGISTER_AUTH_NOT_PREPARED: &str = "volte_register_auth_not_prepared";
+    pub const REGISTER_NONCE_COUNT_EXHAUSTED: &str = "volte_register_nonce_count_exhausted";
+    pub const RTP_BIND_FAILED: &str = "volte_rtp_bind_failed";
+    pub const RTP_LOCAL_ADDR_FAILED: &str = "volte_rtp_local_addr_failed";
+    pub const RTP_RELAY_MISSING: &str = "volte_rtp_relay_missing";
+    pub const RUNTIME_NOT_REGISTERED: &str = "volte_runtime_not_registered";
+    pub const SMS_DB_FAILED: &str = "volte_sms_db_failed";
+    pub const SMS_MESSAGE_REJECTED: &str = "volte_sms_message_rejected";
+    pub const TRANSFER_CALL_NOT_CONFIRMED: &str = "volte_transfer_call_not_confirmed";
+    pub const TRANSFER_CALL_UNKNOWN: &str = "volte_transfer_call_unknown";
+    pub const TRANSFER_NOT_PENDING: &str = "volte_transfer_not_pending";
+    pub const TRANSFER_PENDING: &str = "volte_transfer_pending";
+    pub const TRANSFER_REQUEST_INVALID: &str = "volte_transfer_request_invalid";
+    pub const TRANSFER_RESPONSE_INVALID: &str = "volte_transfer_response_invalid";
+    pub const VOICE_CALL_DUPLICATE: &str = "volte_voice_call_duplicate";
+    pub const VOICE_CALL_UNKNOWN: &str = "volte_voice_call_unknown";
+    pub const VOICE_CALLEE_INVALID: &str = "volte_voice_callee_invalid";
+    pub const VOICE_DIRECTION_MISMATCH: &str = "volte_voice_direction_mismatch";
+    pub const VOICE_INITIAL_INVITE_MISSING: &str = "volte_voice_initial_invite_missing";
+    pub const VOICE_INVITE_BRANCH_MISSING: &str = "volte_voice_invite_branch_missing";
+    pub const VOICE_MEDIA_ADDRESS_INVALID: &str = "volte_voice_media_address_invalid";
+    pub const VOICE_MEDIA_PORT_INVALID: &str = "volte_voice_media_port_invalid";
+    pub const VOICE_NO_COMMON_CODEC: &str = "volte_voice_no_common_codec";
+    pub const VOICE_REINVITE_NOT_PENDING: &str = "volte_voice_reinvite_not_pending";
+    pub const VOICE_REINVITE_PENDING: &str = "volte_voice_reinvite_pending";
+    pub const VOICE_REMOTE_TAG_MISSING: &str = "volte_voice_remote_tag_missing";
+    pub const VOICE_RSEQ_MISSING: &str = "volte_voice_rseq_missing";
+    pub const VOICE_SDP_INVALID: &str = "volte_voice_sdp_invalid";
+
+    /// Every stable code in this module, for the cross-layer consistency
+    /// guard. The frontend keeps an exact-match table keyed on these values;
+    /// `.github/scripts/test_ims_error_code_contract.py` asserts the two sides
+    /// stay in sync, so a new code cannot ship without a matching UI hint.
+    ///
+    /// Order is alphabetical by constant name and carries no meaning.
+    pub const ALL: &[&str] = &[
+        AKA_MATERIAL_INVALID,
+        AKA_RES_EMPTY,
+        BEARER_ADDRESS_CHANGED,
+        BEARER_NETDEV_NOT_READY,
+        BEARER_NETDEV_NOT_UP,
+        BEARER_NETDEV_RUNTIME_ERROR,
+        BEARER_SESSION_LOST,
+        CARRIER_IMS_APN_MISSING,
+        CARRIER_PROFILE_MISSING,
+        CARRIER_PROFILE_NOT_RESOLVED,
+        CHANNEL_BIND_FAILED,
+        CHANNEL_LOCAL_ADDR_FAILED,
+        CHANNEL_READ_FAILED,
+        CHANNEL_READ_RETRYABLE,
+        CHANNEL_READ_TIMEOUT,
+        CHANNEL_RECEIVE_CONNECT_FAILED,
+        CHANNEL_RECEIVE_NOT_RESERVED,
+        CHANNEL_RECEIVE_PORT_MISMATCH,
+        CHANNEL_RECEIVE_RESERVED_SIP_PORT,
+        CHANNEL_RECEIVE_RESERVE_FAILED,
+        CHANNEL_RECEIVE_RESERVE_INVALID_PORT,
+        CHANNEL_RECEIVE_SOCKET_MISSING,
+        CHANNEL_SECURITY_UPDATE_PENDING,
+        CHANNEL_SEND_CONNECT_FAILED,
+        CHANNEL_SEND_FAILED,
+        CHANNEL_SEND_NOT_RESERVED,
+        CHANNEL_SEND_PORT_MISMATCH,
+        CHANNEL_SEND_RESERVE_FAILED,
+        CHANNEL_SEND_RESERVE_INVALID_PORT,
+        CHANNEL_SEND_SOCKET_MISSING,
+        CHANNEL_SHORT_SEND,
+        CHANNEL_WORKER_RECEIVE_MISMATCH,
+        CHANNEL_WORKER_RECEIVE_REQUIRES_ASYNC,
+        CHANNEL_WORKER_SEND_MISMATCH,
+        CHANNEL_WORKER_SEND_REQUIRES_ASYNC,
+        CHANNEL_WORKER_SOCKET_FAILED,
+        CHANNEL_WORKER_SOCKET_TYPE,
+        CNI_REQUIRED_DYNAMIC_UNAVAILABLE,
+        COMMAND_FAILED,
+        COMMAND_SPAWN_FAILED,
+        COMMAND_TIMEOUT,
+        COMMAND_WAIT_FAILED,
+        CONCURRENT_CALL_LIMIT,
+        DATA_SLOT_MODE_MISSING,
+        DEGRADED,
+        DEPENDENCY_MISSING_IP,
+        DERIVED_PROFILE_ID_NOT_ALLOWED,
+        DIGEST_ALGORITHM_UNSUPPORTED,
+        DIGEST_CHALLENGE_MISSING,
+        DIGEST_NONCE_DECODE_FAILED,
+        DIGEST_NONCE_MISSING,
+        DIGEST_QOP_UNSUPPORTED,
+        DIGEST_REALM_MISSING,
+        DTMF_DIGIT_INVALID,
+        DTMF_DURATION_INVALID,
+        HEX_INVALID,
+        IMSI_MISSING,
+        IMS_PREFERRED_PROFILE_ACTIVE,
+        IMS_PREFERRED_PROFILE_OCCUPIED,
+        IMS_PROFILE_ACTIVITY_AMBIGUOUS,
+        IMS_PROFILE_ACTIVITY_UNAVAILABLE,
+        IMS_PROFILE_DEFINITION_AMBIGUOUS,
+        IPSEC_IK_INVALID,
+        IPSEC_REQUIRES_IPV6,
+        IPSEC_UDP_BIND_FAILED,
+        IPV6_GATEWAY_MISSING,
+        IP_FAMILIES_CHANGED,
+        IP_FAMILIES_DUPLICATE,
+        IP_FAMILIES_EMPTY,
+        IP_SETTINGS_MISSING,
+        LINE_ALREADY_REGISTERED,
+        LINE_CONNECTION_DISABLED,
+        LINE_NOT_PRESENT,
+        LINE_VOLTE_CONNECTION_DISABLED,
+        MM_IMSI_MISSING,
+        MODEM_REFRESH_FAILED,
+        MT_RP_DATA_INVALID,
+        PANI_REQUIRED_DYNAMIC_UNAVAILABLE,
+        PCSCF_FAMILY_MISMATCH,
+        PHONE_URI_INVALID,
+        PROFILE_ATTEMPTS_EXHAUSTED,
+        PROFILE_ATTEMPT_COUNT_INVALID,
+        PROFILE_ID_TOO_LONG,
+        PROFILE_RESTORE_IN_PROGRESS,
+        PROFILE_SELECTION_CHANGED,
+        PROFILE_SOURCE_UNSUPPORTED,
+        QMI_DEVICE_MISSING,
+        RANDOM_FAILED,
+        REGISTER_AUTH_NOT_PREPARED,
+        REGISTER_AUTH_SEND_FAILED,
+        REGISTER_AUTH_UNEXPECTED_STATUS,
+        REGISTER_INITIAL_UNEXPECTED_STATUS,
+        REGISTER_NONCE_COUNT_EXHAUSTED,
+        REGISTER_NONCE_NOT_AKA,
+        REGISTER_REFRESH_AUTH_FAILED,
+        REGISTER_REFRESH_RECEIVE_FAILED,
+        REGISTER_REFRESH_SEND_FAILED,
+        REGISTER_REFRESH_UNEXPECTED_STATUS,
+        REGISTER_SEND_FAILED,
+        RETRY_ALREADY_RUNNING,
+        ROUTE_FAMILY_MISMATCH,
+        ROUTE_GATEWAY_FAMILY_MISMATCH,
+        RTP_BIND_FAILED,
+        RTP_LOCAL_ADDR_FAILED,
+        RTP_RELAY_MISSING,
+        RUNTIME_ALL_PCSCF_FAILED,
+        RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED,
+        RUNTIME_IMS_BASEBAND_WEDGED,
+        RUNTIME_IMS_BEARER_START_FAILED,
+        RUNTIME_IMS_ENDPOINT_UNAVAILABLE,
+        RUNTIME_IMS_FAMILY_UNSUPPORTED,
+        RUNTIME_MM_BEARER_CONNECT_FAILED,
+        RUNTIME_MM_BEARER_NOT_CONNECTED,
+        RUNTIME_MM_BEARER_PATH_MISSING,
+        RUNTIME_MM_BEARER_ROAMING_FORBIDDEN,
+        RUNTIME_MM_MODEM_WAIT_TIMEOUT,
+        RUNTIME_NOT_REGISTERED,
+        RUNTIME_NOT_RUNNING,
+        RUNTIME_PROFILE_PCSCF_MISSING,
+        RUNTIME_SEND_TIMEOUT,
+        RUNTIME_UE_WORKER_GENERATION_CHANGED,
+        RUNTIME_UE_WORKER_UNAVAILABLE,
+        SECURITY_SERVER_INVALID,
+        SECURITY_SERVER_MISSING,
+        SIM_OVERRIDE_NOT_READY,
+        SIP_HEADER_MISSING,
+        SIP_HEADER_NOT_UTF8,
+        SIP_NOT_UTF8,
+        SIP_STATUS_INVALID,
+        SIP_STATUS_MISSING,
+        SMSC_MISSING,
+        SMS_DB_FAILED,
+        SMS_ENCODE_FAILED,
+        SMS_MESSAGE_ALL_VARIANTS_FAILED,
+        SMS_MESSAGE_REJECTED,
+        TRANSFER_CALL_NOT_CONFIRMED,
+        TRANSFER_CALL_UNKNOWN,
+        TRANSFER_NOT_PENDING,
+        TRANSFER_PENDING,
+        TRANSFER_REQUEST_INVALID,
+        TRANSFER_RESPONSE_INVALID,
+        USIM_AID_MISSING,
+        USIM_AID_NOT_USIM,
+        USIM_AKA_FAILED,
+        VOICE_CALLEE_INVALID,
+        VOICE_CALL_DUPLICATE,
+        VOICE_CALL_UNKNOWN,
+        VOICE_DIRECTION_MISMATCH,
+        VOICE_INITIAL_INVITE_MISSING,
+        VOICE_INVITE_BRANCH_MISSING,
+        VOICE_MEDIA_ADDRESS_INVALID,
+        VOICE_MEDIA_PORT_INVALID,
+        VOICE_NO_COMMON_CODEC,
+        VOICE_REINVITE_NOT_PENDING,
+        VOICE_REINVITE_PENDING,
+        VOICE_REMOTE_TAG_MISSING,
+        VOICE_RSEQ_MISSING,
+        VOICE_SDP_INVALID,
+    ];
 }
 
 /// Unified VoLTE error carrying a stable code plus optional detail suffix.
@@ -209,6 +485,46 @@ mod tests {
             CellularImsError::with_detail(code::COMMAND_FAILED, "mmcli").to_string(),
             "volte_command_failed:mmcli"
         );
+    }
+
+    /// `code::ALL` must list every declared constant. A code missing from it is
+    /// invisible to the cross-layer guard, which is how a shipped code ends up
+    /// with no UI hint. Parsing this file at build time is not possible, so the
+    /// count is asserted instead: adding a constant without extending `ALL`
+    /// fails here.
+    #[test]
+    fn all_lists_every_declared_code() {
+        // Keep in step with the `pub const` count in `mod code`.
+        assert_eq!(
+            code::ALL.len(),
+            158,
+            "code::ALL is out of sync with mod code"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in code::ALL {
+            assert!(
+                seen.insert(*entry),
+                "code::ALL contains a duplicate value: {entry}"
+            );
+        }
+    }
+
+    /// No code may be a substring of another. The frontend historically used
+    /// `includes()`, so an accidental prefix relation silently routes a failure
+    /// to the wrong hint. Renaming must not reintroduce that.
+    #[test]
+    fn no_code_is_a_substring_of_another() {
+        for outer in code::ALL {
+            for inner in code::ALL {
+                if outer == inner {
+                    continue;
+                }
+                assert!(
+                    !outer.contains(inner),
+                    "code {inner} is a substring of {outer}; exact-match routing would be ambiguous"
+                );
+            }
+        }
     }
 
     /// The frontend `h()` matcher in volteStatus.js keys off these substrings.

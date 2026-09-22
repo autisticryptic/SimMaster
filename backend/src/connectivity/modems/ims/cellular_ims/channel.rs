@@ -14,6 +14,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::net::UdpSocket as StdUdpSocket;
 use tokio::net::UdpSocket;
 
+use super::errors::code;
 use crate::connectivity::core::{
     access::{ImsChannel, ImsRequeue},
     context::ImsRoute,
@@ -85,11 +86,11 @@ impl CellularImsSipChannel {
         security_verify: Option<String>,
     ) -> Result<Self, ImsError> {
         let socket = build_socket(route.local_addr, route.pcscf_addr, interface)
-            .map_err(|_| ImsError::new("volte_channel_bind_failed"))?;
+            .map_err(|_| ImsError::new(code::CHANNEL_BIND_FAILED))?;
         let mut route = route;
         route.local_addr = socket
             .local_addr()
-            .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+            .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))?;
         Ok(Self {
             send_socket: Some(socket),
             receive_socket: None,
@@ -121,12 +122,12 @@ impl CellularImsSipChannel {
                 ReservedReceiveSocket::Worker(socket) => socket
                     .local_addr()
                     .map(|addr| addr.port())
-                    .map_err(|_| ImsError::new("volte_channel_local_addr_failed")),
+                    .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED)),
             };
         }
         let local = SocketAddr::new(self.route.local_addr.ip(), port);
         let socket = build_bound_socket_excluding(local, self.interface.as_deref(), 0)
-            .map_err(|_| ImsError::new("volte_channel_receive_reserve_failed"))?;
+            .map_err(|_| ImsError::new(code::CHANNEL_RECEIVE_RESERVE_FAILED))?;
         let port = socket_port(&socket)?;
         self.reserved_receive_socket = Some(ReservedReceiveSocket::Host(socket));
         Ok(port)
@@ -170,13 +171,13 @@ impl CellularImsSipChannel {
         );
         let socket = match worker.create_socket(spec).await {
             Ok(UeSocket::Udp(socket)) => socket,
-            Ok(_) => return Err(ImsError::new("volte_channel_worker_socket_type")),
-            Err(_) => return Err(ImsError::new("volte_channel_worker_socket_failed")),
+            Ok(_) => return Err(ImsError::new(code::CHANNEL_WORKER_SOCKET_TYPE)),
+            Err(_) => return Err(ImsError::new(code::CHANNEL_WORKER_SOCKET_FAILED)),
         };
         let mut route = route;
         route.local_addr = socket
             .local_addr()
-            .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+            .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))?;
         Ok(Self {
             send_socket: Some(socket),
             receive_socket: None,
@@ -207,12 +208,12 @@ impl CellularImsSipChannel {
                 ReservedSendSocket::Worker(socket) => socket
                     .local_addr()
                     .map(|addr| addr.port())
-                    .map_err(|_| ImsError::new("volte_channel_local_addr_failed")),
+                    .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED)),
             };
         }
         let local = SocketAddr::new(self.route.local_addr.ip(), 0);
         let socket = build_bound_socket_excluding(local, self.interface.as_deref(), avoid_port)
-            .map_err(|_| ImsError::new("volte_channel_send_reserve_failed"))?;
+            .map_err(|_| ImsError::new(code::CHANNEL_SEND_RESERVE_FAILED))?;
         let port = socket_port(&socket)?;
         self.reserved_send_socket = Some(ReservedSendSocket::Host(socket));
         Ok(port)
@@ -244,7 +245,7 @@ impl CellularImsSipChannel {
                 ReservedSendSocket::Worker(socket) => socket
                     .local_addr()
                     .map(|addr| addr.port())
-                    .map_err(|_| ImsError::new("volte_channel_local_addr_failed")),
+                    .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED)),
             };
         }
         let attempts = if requested_port == 0 { 8 } else { 1 };
@@ -253,12 +254,12 @@ impl CellularImsSipChannel {
             let spec = UeSocketSpec::udp_bound(local, self.interface.clone());
             let socket = match worker.create_socket(spec).await {
                 Ok(UeSocket::Udp(socket)) => socket,
-                Ok(_) => return Err(ImsError::new("volte_channel_worker_socket_type")),
-                Err(_) => return Err(ImsError::new("volte_channel_worker_socket_failed")),
+                Ok(_) => return Err(ImsError::new(code::CHANNEL_WORKER_SOCKET_TYPE)),
+                Err(_) => return Err(ImsError::new(code::CHANNEL_WORKER_SOCKET_FAILED)),
             };
             let port = socket
                 .local_addr()
-                .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?
+                .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))?
                 .port();
             if port != 5060
                 && port != 5061
@@ -269,7 +270,7 @@ impl CellularImsSipChannel {
                 return Ok(port);
             }
         }
-        Err(ImsError::new("volte_channel_send_reserve_invalid_port"))
+        Err(ImsError::new(code::CHANNEL_SEND_RESERVE_INVALID_PORT))
     }
 
     /// Reserve the protected receive port using the worker socket factory.
@@ -297,11 +298,11 @@ impl CellularImsSipChannel {
                 ReservedReceiveSocket::Worker(socket) => socket
                     .local_addr()
                     .map(|addr| addr.port())
-                    .map_err(|_| ImsError::new("volte_channel_local_addr_failed")),
+                    .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED)),
             };
         }
         if requested_port != 0 && (requested_port == 5060 || requested_port == 5061) {
-            return Err(ImsError::new("volte_channel_receive_reserved_sip_port"));
+            return Err(ImsError::new(code::CHANNEL_RECEIVE_RESERVED_SIP_PORT));
         }
         let attempts = if requested_port == 0 { 8 } else { 1 };
         for _ in 0..attempts {
@@ -309,19 +310,19 @@ impl CellularImsSipChannel {
             let spec = UeSocketSpec::udp_bound(local, self.interface.clone());
             let socket = match worker.create_socket(spec).await {
                 Ok(UeSocket::Udp(socket)) => socket,
-                Ok(_) => return Err(ImsError::new("volte_channel_worker_socket_type")),
-                Err(_) => return Err(ImsError::new("volte_channel_worker_socket_failed")),
+                Ok(_) => return Err(ImsError::new(code::CHANNEL_WORKER_SOCKET_TYPE)),
+                Err(_) => return Err(ImsError::new(code::CHANNEL_WORKER_SOCKET_FAILED)),
             };
             let port = socket
                 .local_addr()
-                .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?
+                .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))?
                 .port();
             if port != 5060 && port != 5061 {
                 self.reserved_receive_socket = Some(ReservedReceiveSocket::Worker(socket));
                 return Ok(port);
             }
         }
-        Err(ImsError::new("volte_channel_receive_reserve_invalid_port"))
+        Err(ImsError::new(code::CHANNEL_RECEIVE_RESERVE_INVALID_PORT))
     }
 
     #[cfg(test)]
@@ -337,33 +338,33 @@ impl CellularImsSipChannel {
         let reserved_send = self
             .reserved_send_socket
             .take()
-            .ok_or_else(|| ImsError::new("volte_channel_send_not_reserved"))?;
+            .ok_or_else(|| ImsError::new(code::CHANNEL_SEND_NOT_RESERVED))?;
         let send_socket = match reserved_send {
             ReservedSendSocket::Host(socket) => {
                 if socket_addr(&socket)? != send_route.local_addr {
-                    return Err(ImsError::new("volte_channel_send_port_mismatch"));
+                    return Err(ImsError::new(code::CHANNEL_SEND_PORT_MISMATCH));
                 }
                 connect_bound_socket(socket, send_route.pcscf_addr)
-                    .map_err(|_| ImsError::new("volte_channel_send_connect_failed"))?
+                    .map_err(|_| ImsError::new(code::CHANNEL_SEND_CONNECT_FAILED))?
             }
             ReservedSendSocket::Worker(_) => {
-                return Err(ImsError::new("volte_channel_worker_send_requires_async"));
+                return Err(ImsError::new(code::CHANNEL_WORKER_SEND_REQUIRES_ASYNC));
             }
         };
         let reserved_receive = self
             .reserved_receive_socket
             .take()
-            .ok_or_else(|| ImsError::new("volte_channel_receive_not_reserved"))?;
+            .ok_or_else(|| ImsError::new(code::CHANNEL_RECEIVE_NOT_RESERVED))?;
         let receive_socket = match reserved_receive {
             ReservedReceiveSocket::Host(socket) => {
                 if socket_addr(&socket)? != receive_local {
-                    return Err(ImsError::new("volte_channel_receive_port_mismatch"));
+                    return Err(ImsError::new(code::CHANNEL_RECEIVE_PORT_MISMATCH));
                 }
                 connect_bound_socket(socket, receive_remote)
-                    .map_err(|_| ImsError::new("volte_channel_receive_connect_failed"))?
+                    .map_err(|_| ImsError::new(code::CHANNEL_RECEIVE_CONNECT_FAILED))?
             }
             ReservedReceiveSocket::Worker(_) => {
-                return Err(ImsError::new("volte_channel_worker_receive_requires_async"));
+                return Err(ImsError::new(code::CHANNEL_WORKER_RECEIVE_REQUIRES_ASYNC));
             }
         };
 
@@ -390,47 +391,47 @@ impl CellularImsSipChannel {
         let reserved_send = self
             .reserved_send_socket
             .take()
-            .ok_or_else(|| ImsError::new("volte_channel_send_not_reserved"))?;
+            .ok_or_else(|| ImsError::new(code::CHANNEL_SEND_NOT_RESERVED))?;
         let send_socket = match reserved_send {
             ReservedSendSocket::Worker(socket) => {
                 let local = socket
                     .local_addr()
-                    .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+                    .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))?;
                 if local != send_route.local_addr {
-                    return Err(ImsError::new("volte_channel_send_port_mismatch"));
+                    return Err(ImsError::new(code::CHANNEL_SEND_PORT_MISMATCH));
                 }
                 socket
                     .connect(send_route.pcscf_addr)
                     .await
-                    .map_err(|_| ImsError::new("volte_channel_send_connect_failed"))?;
+                    .map_err(|_| ImsError::new(code::CHANNEL_SEND_CONNECT_FAILED))?;
                 socket
             }
             #[cfg(test)]
             ReservedSendSocket::Host(_) => {
-                return Err(ImsError::new("volte_channel_worker_send_mismatch"));
+                return Err(ImsError::new(code::CHANNEL_WORKER_SEND_MISMATCH));
             }
         };
         let reserved_receive = self
             .reserved_receive_socket
             .take()
-            .ok_or_else(|| ImsError::new("volte_channel_receive_not_reserved"))?;
+            .ok_or_else(|| ImsError::new(code::CHANNEL_RECEIVE_NOT_RESERVED))?;
         let receive_socket = match reserved_receive {
             ReservedReceiveSocket::Worker(socket) => {
                 let local = socket
                     .local_addr()
-                    .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+                    .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))?;
                 if local != receive_local {
-                    return Err(ImsError::new("volte_channel_receive_port_mismatch"));
+                    return Err(ImsError::new(code::CHANNEL_RECEIVE_PORT_MISMATCH));
                 }
                 socket
                     .connect(receive_remote)
                     .await
-                    .map_err(|_| ImsError::new("volte_channel_receive_connect_failed"))?;
+                    .map_err(|_| ImsError::new(code::CHANNEL_RECEIVE_CONNECT_FAILED))?;
                 socket
             }
             #[cfg(test)]
             ReservedReceiveSocket::Host(_) => {
-                return Err(ImsError::new("volte_channel_worker_receive_mismatch"));
+                return Err(ImsError::new(code::CHANNEL_WORKER_RECEIVE_MISMATCH));
             }
         };
 
@@ -452,11 +453,11 @@ impl CellularImsSipChannel {
         security_verify: Option<String>,
     ) -> Result<(), ImsError> {
         if self.staged_security.is_some() {
-            return Err(ImsError::new("volte_channel_security_update_pending"));
+            return Err(ImsError::new(code::CHANNEL_SECURITY_UPDATE_PENDING));
         }
         route.local_addr = send_socket
             .local_addr()
-            .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+            .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))?;
         let replacement = self.outbound.replacement();
         self.staged_security = Some(ChannelSecurity {
             outbound: std::mem::replace(&mut self.outbound, replacement),
@@ -548,9 +549,9 @@ impl CellularImsSipChannel {
     pub fn local_addr(&self) -> Result<SocketAddr, ImsError> {
         self.send_socket
             .as_ref()
-            .ok_or_else(|| ImsError::new("volte_channel_send_socket_missing"))?
+            .ok_or_else(|| ImsError::new(code::CHANNEL_SEND_SOCKET_MISSING))?
             .local_addr()
-            .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))
+            .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))
     }
 
     /// Release ports reserved for a standards-compliant protected refresh that
@@ -583,7 +584,7 @@ impl CellularImsSipChannel {
             let result = self
                 .send_socket
                 .as_ref()
-                .ok_or_else(|| ImsError::new("volte_channel_send_socket_missing"))?
+                .ok_or_else(|| ImsError::new(code::CHANNEL_SEND_SOCKET_MISSING))?
                 .send(&packet)
                 .await;
             if !matches!(result, Ok(n) if n == packet.len()) {
@@ -599,7 +600,7 @@ impl CellularImsSipChannel {
             self.maintain_outbound().await?;
             let now = std::time::Instant::now();
             if now >= deadline {
-                return Err(ImsError::new("volte_channel_read_timeout"));
+                return Err(ImsError::new(code::CHANNEL_READ_TIMEOUT));
             }
             let wake = self
                 .outbound
@@ -615,7 +616,7 @@ impl CellularImsSipChannel {
                         return Ok(frame);
                     }
                 }
-                Err(error) if error.code() == "volte_channel_read_timeout" && wake < deadline => {}
+                Err(error) if error.code() == code::CHANNEL_READ_TIMEOUT && wake < deadline => {}
                 Err(error) => return Err(error),
             }
         }
@@ -655,7 +656,7 @@ impl CellularImsSipChannel {
             result = &mut old => match result {
                 Ok(frame) => Ok(frame),
                 Err(_) => tokio::time::timeout_at(deadline, &mut current).await
-                    .map_err(|_| ImsError::new("volte_channel_read_timeout"))?,
+                    .map_err(|_| ImsError::new(code::CHANNEL_READ_TIMEOUT))?,
             },
         }
     }
@@ -665,7 +666,7 @@ async fn recv_one(socket: &UdpSocket, timeout: Duration) -> Result<Vec<u8>, ImsE
     let mut frame = vec![0u8; MAX_SIP_DATAGRAM];
     let read = tokio::time::timeout(timeout, socket.recv(&mut frame))
         .await
-        .map_err(|_| ImsError::new("volte_channel_read_timeout"))?
+        .map_err(|_| ImsError::new(code::CHANNEL_READ_TIMEOUT))?
         .map_err(|error| map_socket_read_error("single", error))?;
     frame.truncate(read);
     Ok(frame)
@@ -697,9 +698,9 @@ fn map_socket_read_error(path: &'static str, error: io::Error) -> ImsError {
         "VoLTE SIP socket read returned an error"
     );
     if transient {
-        ImsError::new("volte_channel_read_retryable")
+        ImsError::new(code::CHANNEL_READ_RETRYABLE)
     } else {
-        ImsError::new("volte_channel_read_failed")
+        ImsError::new(code::CHANNEL_READ_FAILED)
     }
 }
 
@@ -714,7 +715,7 @@ async fn recv_socket_pair(
     match (receive, send) {
         (Some(receive), Some(send)) => recv_protected(receive, send, timeout).await,
         (Some(socket), None) | (None, Some(socket)) => recv_one(socket, timeout).await,
-        (None, None) => Err(ImsError::new("volte_channel_receive_socket_missing")),
+        (None, None) => Err(ImsError::new(code::CHANNEL_RECEIVE_SOCKET_MISSING)),
     }
 }
 
@@ -737,7 +738,7 @@ async fn recv_protected(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(ImsError::new("volte_channel_read_timeout"));
+            return Err(ImsError::new(code::CHANNEL_READ_TIMEOUT));
         }
 
         let read = match (server_path_available, client_path_available) {
@@ -750,22 +751,22 @@ async fn recv_protected(
             .await
             {
                 Ok(read) => read,
-                Err(_) => return Err(ImsError::new("volte_channel_read_timeout")),
+                Err(_) => return Err(ImsError::new(code::CHANNEL_READ_TIMEOUT)),
             },
             (true, false) => {
                 match tokio::time::timeout(remaining, receive_socket.recv(&mut receive_frame)).await
                 {
                     Ok(read) => (read, true),
-                    Err(_) => return Err(ImsError::new("volte_channel_read_timeout")),
+                    Err(_) => return Err(ImsError::new(code::CHANNEL_READ_TIMEOUT)),
                 }
             }
             (false, true) => {
                 match tokio::time::timeout(remaining, send_socket.recv(&mut send_frame)).await {
                     Ok(read) => (read, false),
-                    Err(_) => return Err(ImsError::new("volte_channel_read_timeout")),
+                    Err(_) => return Err(ImsError::new(code::CHANNEL_READ_TIMEOUT)),
                 }
             }
-            (false, false) => return Err(ImsError::new("volte_channel_read_retryable")),
+            (false, false) => return Err(ImsError::new(code::CHANNEL_READ_RETRYABLE)),
         };
 
         let (read, from_server) = match read {
@@ -777,7 +778,7 @@ async fn recv_protected(
                     "protected_client"
                 };
                 let mapped = map_socket_read_error(path, error);
-                if mapped.code() == "volte_channel_read_retryable" {
+                if mapped.code() == code::CHANNEL_READ_RETRYABLE {
                     if from_server {
                         server_path_available = false;
                     } else {
@@ -867,12 +868,12 @@ impl ImsChannel for CellularImsSipChannel {
         let written = self
             .send_socket
             .as_ref()
-            .ok_or_else(|| ImsError::new("volte_channel_send_socket_missing"))?
+            .ok_or_else(|| ImsError::new(code::CHANNEL_SEND_SOCKET_MISSING))?
             .send(frame)
             .await
-            .map_err(|_| ImsError::new("volte_channel_send_failed"))?;
+            .map_err(|_| ImsError::new(code::CHANNEL_SEND_FAILED))?;
         if written != frame.len() {
-            return Err(ImsError::new("volte_channel_short_send"));
+            return Err(ImsError::new(code::CHANNEL_SHORT_SEND));
         }
         Ok(())
     }
@@ -970,9 +971,9 @@ fn connect_bound_socket(socket: Socket, remote: SocketAddr) -> io::Result<UdpSoc
 fn socket_addr(socket: &Socket) -> Result<SocketAddr, ImsError> {
     socket
         .local_addr()
-        .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?
+        .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))?
         .as_socket()
-        .ok_or_else(|| ImsError::new("volte_channel_local_addr_failed"))
+        .ok_or_else(|| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))
 }
 
 #[cfg(test)]
@@ -1255,6 +1256,6 @@ mod tests {
         let error = CellularImsSipChannel::bind(route, None, None)
             .err()
             .unwrap();
-        assert_eq!(error.code(), "volte_channel_bind_failed");
+        assert_eq!(error.code(), code::CHANNEL_BIND_FAILED);
     }
 }

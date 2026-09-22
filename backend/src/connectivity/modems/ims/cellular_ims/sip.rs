@@ -13,7 +13,7 @@
 
 use std::net::IpAddr;
 
-use super::errors::CellularImsError;
+use super::errors::{code, CellularImsError};
 use crate::connectivity::core::{
     access_network::{
         access_type_token, resolve_access_identity, sanitize_header_value, AccessIdentityPolicy,
@@ -93,7 +93,7 @@ fn random_bytes(len: usize) -> Result<Vec<u8>, CellularImsError> {
     let mut buf = vec![0u8; len];
     SystemRandom::new()
         .fill(&mut buf)
-        .map_err(|_| CellularImsError::new("volte_random_failed"))?;
+        .map_err(|_| CellularImsError::new(code::RANDOM_FAILED))?;
     Ok(buf)
 }
 
@@ -1294,10 +1294,10 @@ pub fn build_dtmf_info_for_access(
 ) -> Result<Vec<u8>, CellularImsError> {
     let digit = digit.to_ascii_uppercase();
     if !matches!(digit, '0'..='9' | '*' | '#' | 'A'..='D') {
-        return Err(CellularImsError::new("volte_dtmf_digit_invalid"));
+        return Err(CellularImsError::new(code::DTMF_DIGIT_INVALID));
     }
     if !(40..=5000).contains(&duration_ms) {
-        return Err(CellularImsError::new("volte_dtmf_duration_invalid"));
+        return Err(CellularImsError::new(code::DTMF_DURATION_INVALID));
     }
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
@@ -1476,7 +1476,7 @@ pub fn build_response_for_access(
 /// Parse the SIP status code (delegates to shared framing; remaps the error).
 pub fn parse_status(frame: &[u8]) -> Result<u16, CellularImsError> {
     crate::connectivity::core::sip_frame::parse_status(frame)
-        .map_err(|_| CellularImsError::new("volte_sip_status_invalid"))
+        .map_err(|_| CellularImsError::new(code::SIP_STATUS_INVALID))
 }
 
 /// Everything after the header terminator (may be empty).

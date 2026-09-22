@@ -21,8 +21,13 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         prepare = text[text.index("pub async fn prepare_ims_profile_context("):text.index("fn select_ims_profile_context(")]
         self.assertLess(prepare.index("select_ims_profile_context("), prepare.index('AT+CGDCONT='))
         self.assertLess(prepare.index("ensure_profile_inactive("), prepare.index('AT+CGDCONT='))
-        self.assertIn("volte_ims_preferred_profile_occupied", text)
-        self.assertIn("volte_ims_profile_definition_ambiguous", text)
+        # The codes themselves live in the central `errors::code` table; the
+        # call site must reference them rather than re-spelling the literal.
+        self.assertIn("code::IMS_PREFERRED_PROFILE_OCCUPIED", text)
+        self.assertIn("code::IMS_PROFILE_DEFINITION_AMBIGUOUS", text)
+        errors = (SRC / "cellular_ims/errors.rs").read_text()
+        self.assertIn('"volte_ims_preferred_profile_occupied"', errors)
+        self.assertIn('"volte_ims_profile_definition_ambiguous"', errors)
 
     def test_both_automatic_resolvers_use_the_same_home_boundary(self):
         text = (SRC / "vowifi/profile_store.rs").read_text()
