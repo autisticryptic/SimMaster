@@ -19,6 +19,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 use zbus::Connection;
 
+// Central IMS error-code table. Handlers must reference these constants rather
+// than re-spelling the code strings; `test_ims_error_code_table.py` enforces it.
+use crate::connectivity::modems::ims::cellular_ims::errors::code;
+
 use crate::{
     api::models::*,
     connectivity::modems::ims::vowifi::diagnostics::{
