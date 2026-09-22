@@ -745,6 +745,34 @@ SIM-01～SIM-03 的既有历史与验收保留在第 4、5 节，不复制成新
 - 清理：候选关闭并自动回滚；原服务、MM/proxy、Wi-Fi、配置/DB、恢复timer核对通过；无遗留receipt或测试marker。
 - 结论：**代码/CI通过，实机注册失败**。beta8静态分析确认了profile/CID/family/P-CSCF分层机制，但临时AT激活预取尚不能安全移植；下一步需单独设计可恢复的MM exact-family lease，或在明确维护许可后复现重新附着时序。
 
+### SIM-04 / 2026-09-20 / T03 — 0feaa40 在受控重新附着后首次取得真实 IMS 注册
+
+- 时间与时区：2026-09-20 窗口（Asia/Shanghai）；脱敏证据保存在本机 `.tmp/sim04-mm-20260920-t03/evidence/`，敏感原文仅留在设备私密目录。
+- 卡别名 / 归属 PLMN / 访问 PLMN：SIM-04 / home `45507` / 访问 `46011`。
+- 设备 / 固件 / 内核：Qualcomm 410；Debian 11/aarch64；`5.15.0-handsomekernel+`；MM 1.18.4。
+- 线路 / 后端：原线路；ModemManager 默认后端；主 QMI/IMS bearer 由 MM 保留；管理链路为 Wi-Fi；DATA6 未接管。
+- 程序 / 候选：`0feaa405f0953c0b6fb474ff3c0f0f5cf9c7fdd3`；版本字符串 `1.1.4-beta3`；arm64 候选包/二进制摘要独立校验通过。
+- requested/effective profile：derived→derived，首槽 `derived_3gpp_lte_45507`，`profile_candidate_index=1`；请求 `ipv4v6`/profile pin 2，MM 实际授予 IPv6。
+- 本轮变量：**在明确授权下先启用 P-CSCF reporting，再执行一次受控 `Disable → Low Power → Enable` 重新附着**；未改 APN、未改 Initial EPS、未启用 native 接管、未借用 MM 内部 WDS、未停 MM/qmi-proxy。
+- 承载 / P-CSCF：重新附着后同一 CID 2 由 7 字段变为 9 字段并给出 2 个 P-CSCF 候选；`source=mm_owned_at_sole_pinned_ipv6_prefix`、`cid=Some(2)`、`pcscf_count=2`；bearer 为 IPv6/`wwan0`，`reconnect_count=1`。
+- SIP/AKA/自然续期：收到 challenge 并生成 authenticated REGISTER（`registration_mode=udp`）；`register_phase=initial`、`register_variant=standard_3gpp_conservative`、`expires_seconds=3600`、`service_route_count=1`、`associated_uri_count=2`、`contact_binding_count=1`、`voice_service=registrar_accepted`。**自然续期未取得**（`register_refresh_count=0`）。
+- 清理：`window.py finish` 完成，`radio_and_reporting_restored=true`、`rollback_complete=true`；原 `simadmin.service`、MM/qmi-proxy、Wi-Fi 默认路由、恢复 timer 核对通过；无遗留 receipt 或测试 marker。
+- 结论：**首次取得 SIM-04 真实初始 IMS 注册**。关键变量是重新附着时序而非 AT 预取：先开 reporting 再受控重新附着，网络才下发 PCO/P-CSCF。未验证自然续期、通话与短信。
+
+### SIM-04 / 2026-09-21 / T04 — 70dfe3d（最终分支）复现真实 IMS 注册
+
+- 时间与时区：2026-09-22 11:00–11:51（Asia/Shanghai）；脱敏证据保存在本机 `.tmp/sim04-mm-20260921-t04/evidence/`。
+- 卡别名 / 归属 PLMN / 访问 PLMN：SIM-04 / home `45507` / 访问 `46011`。
+- 设备 / 固件 / 内核：同上，未更换硬件或内核。
+- 线路 / 后端：原线路；ModemManager 默认后端；bearer 由 MM 保留；管理链路为 Wi-Fi；DATA6 未接管。
+- 程序 / 候选：`70dfe3dc3d74e004c4de97e00dd2852f5c881fb2`；CI Validate `35562473552`、Build `35562473560` 全部成功，Publish Release 为 `skipped`；artifact `f2ceb149…5247b`、package `783d599c…d204`、binary `9b6cddd3…5a1c`、meta `1.1.4-beta3` 均独立校验。
+- requested/effective profile：derived→derived，首槽 `derived_3gpp_lte_45507`，`profile_candidate_index=1`；请求 `ipv4v6`/profile pin 2，MM 实际授予 IPv6（`granted_ip_type=ipv6`，有 IPv6 gateway，DNS 计数为 0）。
+- 本轮变量：复用 T03 的受控重新附着时序验证**最终分支**；T04 维护脚本移除了逐窗口硬编码 case ID（改为单一配置来源 + 正则校验），57 项离线测试通过。
+- 承载 / P-CSCF：重新附着前 CID 2 为 7 字段、0 个 P-CSCF；重新附着后为 9 字段、2 个 P-CSCF；`source=mm_owned_at_sole_pinned_ipv6_prefix`、`cid=Some(2)`、`pcscf_count=2`；bearer IPv6/`wwan0`，`reconnect_count=1`。
+- SIP/AKA/自然续期：收到 challenge，authenticated REGISTER（`registration_mode=udp`）成功；`register_phase=initial`、`register_variant=standard_3gpp_conservative`、`expires_seconds=3600`、`service_route_count=1`、`associated_uri_count=2`、`contact_binding_count=1`、`contact_expiry_ambiguous=false`、`wildcard_contact_present=false`、`voice_service=registrar_accepted`。**自然续期仍未取得**（`register_refresh_count=0`，3600 秒租期需要更长窗口）。
+- 清理：25 分钟自动回滚 timer 先于手动收尾触发并完成，`rollback-complete` 与 `radio-restored` 均落盘；手动 `finish` 因占用 marker 已被 timer 清除而按预期断言中止，未重放任何写操作。复核结果：原二进制 `18408e9b…8167`、配置 `cbb70ae5…394b` 未变，候选服务与回滚 timer 均 inactive，MM/qmi-proxy 未重启，默认路由仍为 `wlan0`，receipt 为 0，marker 已清除；原应用 API 显示 `ims_intent=false`、`registered=false`、`recovery_state=idle`、无通话。
+- 结论：**最终分支 `70dfe3d` 复现了真实初始 IMS 注册**，确认 T03 的成功不依赖那个已被取代的 `0feaa40` 候选，且已恢复的强制单栈重试路径没有破坏 SIM-04。仍未验证自然续期、通话与短信。
+
 <!-- SIM_CARD_TESTS_APPEND_BEFORE_NOTE -->
 
 ## 固定尾注：为什么需要多卡回归，以及后续记录放在哪里

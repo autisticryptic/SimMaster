@@ -147,8 +147,19 @@ profile 重写、宿主 namespace 发送 IMS、默认三位 MNC 猜测、把 DAT
 
 剩余真正的代码缺口是 MM 内可恢复的 exact-family profile lease：必须保存完整 `CGDCONT`/profile 定义、CID 存在性、原始 P-CSCF reporting 状态、MM owner/bearer、取消/崩溃恢复和清理后的再读验证。它不能通过普通 IMS retry 自动执行，也不能用 beta8 的自有 WDS 查询替代。
 
-当前 SIM-04 实测仍停在 P-CSCF；没有 SIP/AKA 或注册成功证据。9/18 重新附着后曾短暂观察到 P-CSCF 候选，说明 attach/reporting 时序是独立变量，但尚未形成 beta8/current 同条件 A-B 证明。
+## 7 SIM-04 实机结论更新（2026-09-20 / 2026-09-21）
 
-本节是静态分析和边界记录，不构成 beta8 实机验收或当前项目注册通过。
+上文「SIM-04 仍停在 P-CSCF、没有 SIP/AKA 证据」的描述已被后续实机结果取代，保留在此仅作演进记录。
 
-`0feaa40` 后续仅阻止有效 MM `profile-id` 下无意义的 forced-family 重试，保留 profile pin 并返回 `profile_pin_family_conflict`；这没有改变 9/19 设备仍缺 P-CSCF、未进入 SIP/AKA 的事实。
+真正缺失的变量不是 beta8 的临时 AT 预取，而是 **attach/reporting 时序**：先启用 P-CSCF reporting，再执行一次受控 `Disable → Low Power → Enable` 重新附着，网络才在同一 CID 2 上把 `CGCONTRDP` 由 7 字段变为 9 字段并下发 2 个 P-CSCF 候选。在此条件下：
+
+- 2026-09-20 T03（`0feaa40`）首次取得 SIM-04 真实初始 IMS 注册；
+- 2026-09-21 T04（`70dfe3d`，最终分支）在同一时序下复现注册，确认成功不依赖已被取代的候选。
+
+两轮均为 derived 首槽 `derived_3gpp_lte_45507`、`profile_candidate_index=1`、MM 保留 bearer、IPv6/`wwan0`、P-CSCF `source=mm_owned_at_sole_pinned_ipv6_prefix` / `cid=Some(2)` / `pcscf_count=2`；REGISTER 收到 challenge 后以 `registration_mode=udp` 完成 `standard_3gpp_conservative` 初始注册，`expires_seconds=3600`、`service_route_count=1`、`associated_uri_count=2`、`contact_binding_count=1`、`voice_service=registrar_accepted`。
+
+仍未取得的验收项：自然续期（两轮 `register_refresh_count` 均为 0）、通话与短信。
+
+结论修正：beta8 对照的价值在于确认 profile/CID/family/P-CSCF 的分层与有界读取机制，而不是证明需要临时 `CGACT=1` 预取；该预取依旧未接入生产路径。上文关于 `0feaa40` 阻止 forced-family 重试并返回 `profile_pin_family_conflict` 的记述也已作废：`70dfe3d` 判定那是回归风险（几乎所有选中的 IMS profile 都带 `profile_id`，会误关闭已验证的 IPv4 强制单栈路径），已恢复网络强制单栈重试，改为用 `attempted_single` 仅跳过字面重复尝试，并移除 `pinned_profile_forced_family_error` / `profile_pin_family_conflict`。
+
+本节仍不构成 beta8 实机验收；上述是当前项目在 MM 默认后端下的注册结论。
