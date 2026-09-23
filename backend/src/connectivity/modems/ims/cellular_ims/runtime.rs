@@ -1042,7 +1042,7 @@ mod tests {
             s.register_refresh_count = 4;
         })
         .await;
-        let snap = rt.reset_runtime("volte_disabled").await;
+        let snap = rt.reset_runtime("cellular_ims_disabled").await;
         assert_eq!(snap.phase, CellularImsPhase::Disabled);
         assert_eq!(snap.stage, CellularImsStage::Disabled);
         assert_eq!(
@@ -1053,7 +1053,7 @@ mod tests {
             snap.register_refresh_count, 0,
             "refresh count belongs to the ended IMS session"
         );
-        assert_eq!(snap.last_error.as_deref(), Some("volte_disabled"));
+        assert_eq!(snap.last_error.as_deref(), Some("cellular_ims_disabled"));
         assert_eq!(rt.generation(), g0 + 1);
     }
 }

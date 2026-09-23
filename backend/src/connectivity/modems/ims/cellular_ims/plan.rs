@@ -414,7 +414,8 @@ mod tests {
     /// classified as unsafe rather than as a generic failure.
     #[test]
     fn real_device_bearer_internal_error_is_classified_as_wedged() {
-        let detail = "volte_command_failed:mmcli:1:-b /org/freedesktop/ModemManager1/Bearer/4 \
+        let detail =
+            "cellular_ims_command_failed:mmcli:1:-b /org/freedesktop/ModemManager1/Bearer/4 \
              --connect:error: couldn't connect the bearer: \
              'GDBus.Error:org.freedesktop.ModemManager1.Error.MobileEquipment.Unknown: \
              Unknown error: Call failed: internal error: error'";

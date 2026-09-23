@@ -184,7 +184,7 @@ impl DiagnosticRecord {
         }
         if let Some(raw_error) = &self.raw_error {
             // Kept verbatim apart from newline flattening: the nested
-            // `volte_command_failed:...` chain is the whole point of the file.
+            // `cellular_ims_command_failed:...` chain is the whole point of the file.
             let raw_error = if redact {
                 redact_text(raw_error)
             } else {
@@ -754,7 +754,7 @@ mod tests {
     fn keeps_short_numbers_but_masks_subscriber_length_runs() {
         // Exit codes and SIP statuses are what make a raw error useful; only
         // runs long enough to identify a subscriber are masked.
-        let masked = redact_digit_runs("volte_command_failed:mmcli:1:403:460010123456789");
+        let masked = redact_digit_runs("cellular_ims_command_failed:mmcli:1:403:460010123456789");
         assert!(masked.contains(":1:"));
         assert!(masked.contains("403"));
         assert!(!masked.contains("460010123456789"));
@@ -768,7 +768,7 @@ mod tests {
             "bearer.connect.failed",
         )
         .with_line("79139C")
-        .with_raw_error("volte_command_failed:mmcli:1\nerror: couldn't find modem");
+        .with_raw_error("cellular_ims_command_failed:mmcli:1\nerror: couldn't find modem");
         let rendered = record.render(false);
         assert_eq!(
             rendered.matches('\n').count(),
@@ -806,7 +806,7 @@ mod tests {
         // Regression guard: building records in a bus subscriber instead of on
         // the producing task collapsed every line to `main`, which made the
         // scope column useless on a multi-SIM device.
-        let payload = serde_json::json!({ "attempt": { "error": "volte_bearer_failed" } });
+        let payload = serde_json::json!({ "attempt": { "error": "cellular_ims_bearer_failed" } });
 
         let device_wide =
             record_for_app_event("system.service_started", None, Some("system"), &payload);
@@ -825,7 +825,10 @@ mod tests {
         assert_eq!(per_line.subsystem, "VoLTE");
         // An error present anywhere in the payload lifts the record above Info.
         assert_eq!(per_line.severity, DiagnosticLogSeverity::Warn);
-        assert_eq!(per_line.raw_error.as_deref(), Some("volte_bearer_failed"));
+        assert_eq!(
+            per_line.raw_error.as_deref(),
+            Some("cellular_ims_bearer_failed")
+        );
         assert!(per_line.render(true).contains("[ue_worker]"));
     }
 }

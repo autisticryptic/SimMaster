@@ -15,32 +15,32 @@ const COLON_CODES = CELLULAR_IMS_ERROR_CODES.filter((code) => code.includes(':')
 // Diagnostics that are not table codes: `format!` prefixes and the shared
 // connectivity-core code for an unanswered initial REGISTER.
 const TRANSIENT_REFRESH_DIAGNOSTICS = [
-  'volte_register_refresh_retry',
+  'cellular_ims_register_refresh_retry',
   'ims_register_initial_receive_failed',
 ] as const
-const TRANSIENT_REFRESH_CODES: readonly CellularImsErrorCode[] = ['volte_register_refresh_receive_failed']
+const TRANSIENT_REFRESH_CODES: readonly CellularImsErrorCode[] = ['cellular_ims_register_refresh_receive_failed']
 
 // Former `includes()` prefix families, listed member by member so a new code
 // joins a family deliberately instead of by accident of spelling.
 const DIGEST_FAILURES: readonly CellularImsErrorCode[] = [
-  'volte_digest_algorithm_unsupported',
-  'volte_digest_challenge_missing',
-  'volte_digest_nonce_decode_failed',
-  'volte_digest_nonce_missing',
-  'volte_digest_qop_unsupported',
-  'volte_digest_realm_missing',
-  'volte_register_nonce_not_aka',
+  'cellular_ims_digest_algorithm_unsupported',
+  'cellular_ims_digest_challenge_missing',
+  'cellular_ims_digest_nonce_decode_failed',
+  'cellular_ims_digest_nonce_missing',
+  'cellular_ims_digest_qop_unsupported',
+  'cellular_ims_digest_realm_missing',
+  'cellular_ims_register_nonce_not_aka',
 ]
 const IPSEC_FAILURES: readonly CellularImsErrorCode[] = [
-  'volte_security_server_missing',
-  'volte_ipsec_ik_invalid',
-  'volte_ipsec_requires_ipv6',
-  'volte_ipsec_udp_bind_failed',
+  'cellular_ims_security_server_missing',
+  'cellular_ims_ipsec_ik_invalid',
+  'cellular_ims_ipsec_requires_ipv6',
+  'cellular_ims_ipsec_udp_bind_failed',
 ]
 const BEARER_NETDEV_FAILURES: readonly CellularImsErrorCode[] = [
-  'volte_bearer_netdev_not_ready',
-  'volte_bearer_netdev_not_up',
-  'volte_bearer_netdev_runtime_error',
+  'cellular_ims_bearer_netdev_not_ready',
+  'cellular_ims_bearer_netdev_not_up',
+  'cellular_ims_bearer_netdev_runtime_error',
 ]
 
 function escapeRegExp(value: string) {
@@ -77,7 +77,7 @@ export function isTransientCellularImsRefreshDiagnostic(error?: string | null) {
 function networkFailureStatusLabel(error: string, codes: ReadonlySet<CellularImsErrorCode>) {
   if (IMS_SERVICE_NOT_SUBSCRIBED.test(error)) return '未订阅 IMS 服务'
   if (/operator-determined-barring|operator determined barring/i.test(error)) return '运营商禁止 IMS'
-  if (codes.has('volte_runtime_mm_bearer_roaming_forbidden') || /roaming(?:-|\s)*(?:not-allowed|forbidden)|roaming not allowed/i.test(error)) return 'IMS 漫游被禁止'
+  if (codes.has('cellular_ims_runtime_mm_bearer_roaming_forbidden') || /roaming(?:-|\s)*(?:not-allowed|forbidden)|roaming not allowed/i.test(error)) return 'IMS 漫游被禁止'
   if (/missing-(?:or-)?unknown-apn|missing or unknown apn|unknown-apn/i.test(error)) return 'IMS APN 不可用'
   if (/ServiceOptionNotSupported|service-option-not-supported|option-not-supported/i.test(error)) return '运营商不支持 IMS'
   if (/service-option-out-of-order|option-out-of-order/i.test(error)) return 'IMS 服务暂不可用'
@@ -143,7 +143,7 @@ export function standardDerivedProfileMessage(
 export function cellularImsErrorMessage(error?: string | null) {
   if (!error) return null
   const codes = cellularImsErrorCodes(error)
-  if (codes.has('volte_runtime_ims_baseband_wedged')) {
+  if (codes.has('cellular_ims_runtime_ims_baseband_wedged')) {
     return '设备后端报告基带状态异常，已停止本轮所有 Profile 和地址族重试。请先核对基带状态与承载归属，再安排受控恢复。'
   }
   if (isTransientCellularImsRefreshDiagnostic(error)) return null
@@ -164,31 +164,31 @@ export function cellularImsErrorMessage(error?: string | null) {
   if (error.includes('carrier_catalog_schema_') || error.includes('carrier_catalog_config_contract_')) {
     return 'SIM 身份已读取，但运营商配置库版本与当前程序不兼容。请更新 carrier catalog。'
   }
-  if (codes.has('volte_carrier_profile_missing')) {
+  if (codes.has('cellular_ims_carrier_profile_missing')) {
     return 'SIM 身份已读取，但未匹配到可用的运营商 VoLTE profile。请检查线路 Profile 或更新 carrier catalog。'
   }
-  if (codes.has('volte_carrier_ims_apn_missing')) {
+  if (codes.has('cellular_ims_carrier_ims_apn_missing')) {
     return '已匹配运营商 Profile，但其中缺少 IMS APN，无法建立 VoLTE Bearer。'
   }
-  if (codes.has('volte_runtime_cellular_network_not_registered')) {
+  if (codes.has('cellular_ims_runtime_cellular_network_not_registered')) {
     return '蜂窝网络未注册'
   }
   if (IMS_SERVICE_NOT_SUBSCRIBED.test(error)) {
     return '当前 SIM 未订阅 IMS 服务，或当前漫游网络不允许该 SIM 建立 IMS APN。该拒绝发生在运营商网络/套餐侧，尚未进入 P-CSCF、AKA 或 SIP REGISTER。'
   }
-  if (codes.has('volte_mm_imsi_missing') || codes.has('volte_imsi_missing')) {
+  if (codes.has('cellular_ims_mm_imsi_missing') || codes.has('cellular_ims_imsi_missing')) {
     return 'ModemManager SIM 属性与 AT+CIMI 均未返回有效 IMSI。请确认 SIM 已就绪，并检查基带 AT 端口状态。'
   }
-  if (codes.has('volte_usim_aka_failed')) {
+  if (codes.has('cellular_ims_usim_aka_failed')) {
     return 'SIM 身份已读取，但 USIM AKA 鉴权失败。请检查 UIM 通道、卡槽映射和运营商鉴权响应。'
   }
-  if (codes.has('volte_runtime_all_pcscf_failed')) {
+  if (codes.has('cellular_ims_runtime_all_pcscf_failed')) {
     return 'IMS Bearer 已建立，但所有 P-CSCF 候选均连接失败。请检查运营商 Profile、PCO/DNS 返回和 IMS 路由。'
   }
-  if (codes.has('volte_bearer_netdev_runtime_error')) {
+  if (codes.has('cellular_ims_bearer_netdev_runtime_error')) {
     return 'IMS Bearer 已建立，但设备数据通道报告不可恢复错误。系统已停止继续重试；请检查基带日志或重启设备。'
   }
-  if (codes.has('volte_bearer_netdev_not_up') || codes.has('volte_bearer_netdev_not_ready')) {
+  if (codes.has('cellular_ims_bearer_netdev_not_up') || codes.has('cellular_ims_bearer_netdev_not_ready')) {
     return 'IMS Bearer 已建立，但其网卡没有完成 OPEN/UP 握手。系统已停止继续安装路由和重复重试，避免把底层链路故障误报成 P-CSCF 失败。'
   }
   return error
@@ -197,25 +197,25 @@ export function cellularImsErrorMessage(error?: string | null) {
 export function cellularImsErrorStatusLabel(error?: string | null) {
   if (!error) return null
   const codes = cellularImsErrorCodes(error)
-  if (codes.has('volte_runtime_ims_baseband_wedged')) return '基带异常，已停止重试'
+  if (codes.has('cellular_ims_runtime_ims_baseband_wedged')) return '基带异常，已停止重试'
   if (isTransientCellularImsRefreshDiagnostic(error)) return null
-  if (codes.has('volte_runtime_cellular_network_not_registered')) return '蜂窝网络未注册'
+  if (codes.has('cellular_ims_runtime_cellular_network_not_registered')) return '蜂窝网络未注册'
   const networkFailure = networkFailureStatusLabel(error, codes)
   if (networkFailure) return networkFailure
-  if (codes.has('volte_carrier_profile_missing') || PROFILE_NOT_READY.test(error) || PROFILE_PLMN.test(error)) return '缺少运营商配置'
-  if (codes.has('volte_carrier_ims_apn_missing')) return '缺少 IMS APN'
-  if (codes.has('volte_mm_imsi_missing') || codes.has('volte_imsi_missing')) return '无法读取 SIM 身份'
-  if (codes.has('volte_runtime_mm_modem_wait_timeout')) return '等待基带超时'
-  if (codes.has('volte_runtime_ims_endpoint_unavailable')) return 'IMS 数据端口不可用'
-  if (codes.has('volte_runtime_ims_bearer_start_failed')) return 'IMS Bearer 建立失败'
-  if (codes.has('volte_runtime_ims_family_unsupported') || codes.has('volte_pcscf_family_mismatch')) return 'IMS 地址族不兼容'
-  if (codes.has('volte_runtime_all_pcscf_failed')) return 'P-CSCF 不可达'
-  if (codes.has('volte_usim_aka_failed') || codes.has('volte_aka_material_invalid') || codes.has('volte_aka_res_empty')) return 'SIM AKA 鉴权失败'
+  if (codes.has('cellular_ims_carrier_profile_missing') || PROFILE_NOT_READY.test(error) || PROFILE_PLMN.test(error)) return '缺少运营商配置'
+  if (codes.has('cellular_ims_carrier_ims_apn_missing')) return '缺少 IMS APN'
+  if (codes.has('cellular_ims_mm_imsi_missing') || codes.has('cellular_ims_imsi_missing')) return '无法读取 SIM 身份'
+  if (codes.has('cellular_ims_runtime_mm_modem_wait_timeout')) return '等待基带超时'
+  if (codes.has('cellular_ims_runtime_ims_endpoint_unavailable')) return 'IMS 数据端口不可用'
+  if (codes.has('cellular_ims_runtime_ims_bearer_start_failed')) return 'IMS Bearer 建立失败'
+  if (codes.has('cellular_ims_runtime_ims_family_unsupported') || codes.has('cellular_ims_pcscf_family_mismatch')) return 'IMS 地址族不兼容'
+  if (codes.has('cellular_ims_runtime_all_pcscf_failed')) return 'P-CSCF 不可达'
+  if (codes.has('cellular_ims_usim_aka_failed') || codes.has('cellular_ims_aka_material_invalid') || codes.has('cellular_ims_aka_res_empty')) return 'SIM AKA 鉴权失败'
   if (hasAny(codes, DIGEST_FAILURES)) return 'IMS 鉴权响应异常'
   if (hasAny(codes, IPSEC_FAILURES)) return 'IMS IPsec 建立失败'
   if (hasAny(codes, BEARER_NETDEV_FAILURES)) return '基带数据通道异常'
-  if (codes.has('volte_register_initial_unexpected_status')) return 'IMS 注册响应异常'
-  if (codes.has('volte_register_auth_unexpected_status')) return 'IMS 鉴权注册失败'
-  if (codes.has('volte_register_send_failed') || codes.has('volte_register_auth_send_failed')) return 'IMS 请求发送失败'
+  if (codes.has('cellular_ims_register_initial_unexpected_status')) return 'IMS 注册响应异常'
+  if (codes.has('cellular_ims_register_auth_unexpected_status')) return 'IMS 鉴权注册失败'
+  if (codes.has('cellular_ims_register_send_failed') || codes.has('cellular_ims_register_auth_send_failed')) return 'IMS 请求发送失败'
   return null
 }

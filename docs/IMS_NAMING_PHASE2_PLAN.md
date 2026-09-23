@@ -241,10 +241,23 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 
 ### 步骤 4 — 统一改名
 
-- [ ] 后端码 `volte_*` → `cellular_ims_*`
-- [ ] 前端映射表同步
-- [ ] 20 个 Rust 测试文件的断言同步
-- [ ] `test_ims_fallback_boundary.py` 同步
+改名规则：`volte_X` → `cellular_ims_X`；`volte_ims_X` → `cellular_ims_X`（避免
+`cellular_ims_ims_`）；`line_volte_connection_disabled` →
+`line_cellular_ims_connection_disabled`（常量同名改为
+`LINE_CELLULAR_IMS_CONNECTION_DISABLED`）。按标识符边界做 token 精确替换，
+映射表只含码表 158 项 + 7 个 `format!` 前缀 + 3 个测试字面量，配置键、
+`volte_ims` transport 值与 `volte_refresh_stats` 表名因不在表内而不受影响。
+
+- [x] 后端码 `volte_*` → `cellular_ims_*`（`errors.rs` 等 10 个 Rust 文件）
+- [x] 前端码表重新生成、formatter 与单测同步
+- [x] 改名后仍无子串关系（改名脚本自检 + 三处守卫）
+- [x] `test_ims_fallback_boundary.py` 同步
+- [x] `format!` 前缀一并改名：`profile_not_lte_ready`、`profile_not_found_in_source`、
+      `baseband_wedged`、`modem_missing_wait`、`options_ping_timeout`、
+      `register_refresh_retry`、`register_refresh_failed`
+- [x] `connectivity/core/register.rs` 的 2 处跨层字面量同步
+- [x] 新增 Rust 自检 `codes_use_the_cellular_ims_prefix`，禁止 `volte_` 前缀回流
+- 注：引用第三方历史码名的注释（beta2 / 1.7）保留原拼写，那是史实而非本项目的码
 
 ### 步骤 5 — JSON 字段与 serde 别名
 

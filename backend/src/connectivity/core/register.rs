@@ -638,10 +638,10 @@ fn is_register_read_retryable(error: &ImsError) -> bool {
     matches!(
         error.code(),
         "ims_channel_read_timeout"
-            | "volte_channel_read_timeout"
+            | "cellular_ims_channel_read_timeout"
             | "ims_register_read_timeout"
             | "ims_channel_read_failed"
-            | "volte_channel_read_retryable"
+            | "cellular_ims_channel_read_retryable"
     )
 }
 
@@ -814,7 +814,7 @@ mod tests {
         async fn recv_sip_fresh(&mut self, _timeout: Duration) -> Result<Vec<u8>, ImsError> {
             if self.read_attempts == 0 {
                 self.read_attempts = 1;
-                return Err(ImsError::new("volte_channel_read_retryable"));
+                return Err(ImsError::new("cellular_ims_channel_read_retryable"));
             }
             Ok(response_with_header(
                 200,

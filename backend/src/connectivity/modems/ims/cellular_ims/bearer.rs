@@ -958,7 +958,7 @@ async fn route_host_on_bearer(
     // address (currently IPv6-first), which is not necessarily the family
     // selected by the current REGISTER attempt.  Comparing every destination
     // with that preferred address made a valid IPv4 attempt fail with
-    // `volte_route_family_mismatch` whenever the same bearer also had IPv6.
+    // `cellular_ims_route_family_mismatch` whenever the same bearer also had IPv6.
     // Select the local address belonging to the destination family instead.
     let local = bearer
         .settings

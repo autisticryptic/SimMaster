@@ -4788,7 +4788,7 @@ async fn send_sms_over_cellular_ims_path(
     }
     let profile = app.config_manager.get_line_profile(line_id);
     if !profile.enabled || !profile.cellular_ims_connection_enabled {
-        return Err(code::LINE_VOLTE_CONNECTION_DISABLED.to_string());
+        return Err(code::LINE_CELLULAR_IMS_CONNECTION_DISABLED.to_string());
     }
     if !line.cellular_ims.status().await.registered {
         if !line.begin_cellular_ims_retry() {
@@ -8430,7 +8430,7 @@ fn validate_and_save_cellular_ims_profile_selection(
                 return Err((
                     StatusCode::BAD_REQUEST,
                     format!(
-                        "volte_profile_not_lte_ready:{}:{profile_id}",
+                        "cellular_ims_profile_not_lte_ready:{}:{profile_id}",
                         candidate.source.as_str()
                     ),
                 ));
@@ -8441,7 +8441,7 @@ fn validate_and_save_cellular_ims_profile_selection(
                 return Err((
                     StatusCode::BAD_REQUEST,
                     format!(
-                        "volte_profile_not_found_in_source:{}:{profile_id}",
+                        "cellular_ims_profile_not_found_in_source:{}:{profile_id}",
                         candidate.source.as_str()
                     ),
                 ));
@@ -10269,7 +10269,7 @@ async fn start_line_cellular_ims_restore(
                 state.manual_retry_available = false;
                 state.next_retry_at = None;
                 state.last_error = Some(
-                    "volte_baseband_wedged:volte_bearer_netdev_runtime_error:full_system_reboot_required"
+                    "cellular_ims_baseband_wedged:cellular_ims_bearer_netdev_runtime_error:full_system_reboot_required"
                         .to_string(),
                 );
             })
@@ -10318,7 +10318,7 @@ async fn start_line_cellular_ims_restore(
     tokio::spawn(async move {
         // Attributes this line's registration diagnostics to per-line UE work.
         // This is the path that produces the nested
-        // `volte_runtime_mm_bearer_connect_failed:...` chains, so separating it
+        // `cellular_ims_runtime_mm_bearer_connect_failed:...` chains, so separating it
         // from the device-wide schedulers is what makes the log readable when
         // several cards are retrying at once.
         diagnostic_log::with_ue_worker_context(async {
@@ -10533,7 +10533,7 @@ async fn wait_for_line_modem(
                 state.recovery_state =
                     crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::WaitingModem;
                 state.last_error = Some(format!(
-                    "volte_modem_missing_wait:{}/{}",
+                    "cellular_ims_modem_missing_wait:{}/{}",
                     poll + 1,
                     CELLULAR_IMS_MODEM_MISSING_POLLS
                 ));
@@ -10921,7 +10921,7 @@ async fn run_line_cellular_ims_restore_batch(
                                 crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::Exhausted;
                             state.manual_retry_available = !permanent;
                             state.next_retry_at = None;
-                            state.last_error = Some(format!("volte_baseband_wedged:{error}"));
+                            state.last_error = Some(format!("cellular_ims_baseband_wedged:{error}"));
                             state.last_failure_at = Some(chrono::Utc::now().to_rfc3339());
                         })
                         .await;
@@ -14218,7 +14218,7 @@ mod tests {
         failed.manual_retry_available = true;
         failed.retry_attempt = 3;
         failed.retry_max = 3;
-        failed.last_error = Some("volte_profile_attempts_exhausted".to_string());
+        failed.last_error = Some("cellular_ims_profile_attempts_exhausted".to_string());
         let mut parked = CellularImsSnapshot::default();
         preserve_exhausted_cellular_ims_recovery_after_policy_park(&failed, &mut parked);
         assert_eq!(parked.recovery_state, CellularImsRecoveryState::Exhausted);
@@ -14348,7 +14348,7 @@ mod tests {
 
         assert_eq!(
             ImsProfileSelectionConfig::try_from(request),
-            Err("volte_profile_source_unsupported".to_string())
+            Err("cellular_ims_profile_source_unsupported".to_string())
         );
     }
 
@@ -14365,7 +14365,7 @@ mod tests {
             .expect("supported source names");
         assert_eq!(
             derived_with_id.validate(),
-            Err("volte_derived_profile_id_not_allowed".to_string())
+            Err("cellular_ims_derived_profile_id_not_allowed".to_string())
         );
 
         let mut wrong_count =
@@ -14378,7 +14378,7 @@ mod tests {
             .expect("supported source names");
         assert_eq!(
             wrong_count.validate(),
-            Err("volte_profile_attempt_count_invalid".to_string())
+            Err("cellular_ims_profile_attempt_count_invalid".to_string())
         );
     }
 
@@ -14497,7 +14497,7 @@ mod tests {
         assert_eq!(missing_database.0, StatusCode::BAD_REQUEST);
         assert_eq!(
             missing_database.1,
-            "volte_profile_not_found_in_source:database:missing-user-profile"
+            "cellular_ims_profile_not_found_in_source:database:missing-user-profile"
         );
 
         {
@@ -14526,7 +14526,7 @@ mod tests {
         assert_eq!(non_lte_catalog.0, StatusCode::BAD_REQUEST);
         assert_eq!(
             non_lte_catalog.1,
-            "volte_profile_not_lte_ready:carrier_catalog:test-v7-23433"
+            "cellular_ims_profile_not_lte_ready:carrier_catalog:test-v7-23433"
         );
 
         remove_cellular_ims_profile_handler_fixture(config_path, catalog_path);

@@ -3271,7 +3271,7 @@ mod http_router_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(
-            body.contains("volte_profile_attempt_count_invalid"),
+            body.contains("cellular_ims_profile_attempt_count_invalid"),
             "{body}"
         );
 
@@ -3292,7 +3292,7 @@ mod http_router_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(
-            body.contains("volte_derived_profile_id_not_allowed"),
+            body.contains("cellular_ims_derived_profile_id_not_allowed"),
             "{body}"
         );
 
@@ -3313,7 +3313,10 @@ mod http_router_tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("volte_profile_not_found_in_source"), "{body}");
+        assert!(
+            body.contains("cellular_ims_profile_not_found_in_source"),
+            "{body}"
+        );
         assert!(
             body.contains("database"),
             "the error must name the source it searched: {body}"

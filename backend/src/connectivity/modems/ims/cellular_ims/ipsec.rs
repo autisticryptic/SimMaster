@@ -353,7 +353,7 @@ pub fn build_install_plan_with_algs(
     validate_binding(ue_sec)?;
     validate_binding(pcscf_sec)?;
     // IMS IPsec requires IPv6 in most deployments (observed
-    // `volte_ipsec_requires_ipv6`); we allow v4 for lab use but both ends must
+    // `cellular_ims_ipsec_requires_ipv6`); we allow v4 for lab use but both ends must
     // match family.
     if std::mem::discriminant(&ue) != std::mem::discriminant(&pcscf) {
         return Err(CellularImsError::new(code::PCSCF_FAMILY_MISMATCH));
@@ -448,7 +448,7 @@ pub fn xfrm_algs_from_security_server(value: &str) -> Result<XfrmAlgs, CellularI
 // ===================== #[cfg(unix)] execution layer =====================
 
 /// Locate the `ip` binary, or return the dependency-missing error the frontend
-/// recognizes (`volte_dependency_missing:ip`).
+/// recognizes (`cellular_ims_dependency_missing:ip`).
 pub fn locate_ip_binary() -> Result<&'static str, CellularImsError> {
     #[cfg(unix)]
     {

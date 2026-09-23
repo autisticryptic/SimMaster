@@ -3441,7 +3441,8 @@ async fn live_receive_loop(
                 pending_options = None;
                 options_failures = options_failures.saturating_add(1);
                 if options_failures >= OPTIONS_MAX_CONSECUTIVE_FAILURES {
-                    let error = format!("volte_options_ping_timeout:failures={options_failures}");
+                    let error =
+                        format!("cellular_ims_options_ping_timeout:failures={options_failures}");
                     // OPTIONS is only an advisory probe. Some carrier IMS
                     // cores accept protected REGISTER traffic but do not answer
                     // out-of-dialog OPTIONS. REGISTER refresh remains the
@@ -3561,7 +3562,7 @@ async fn live_receive_loop(
                             state.phase = CellularImsPhase::Registered;
                             state.stage = CellularImsStage::Registered;
                             state.last_error =
-                                Some(format!("volte_register_refresh_retry:{}", error));
+                                Some(format!("cellular_ims_register_refresh_retry:{}", error));
                             state.last_failure_at = Some(now());
                         })
                         .await;
@@ -3584,7 +3585,7 @@ async fn live_receive_loop(
                         .update(|state| {
                             state.phase = CellularImsPhase::Degraded;
                             state.last_error = Some(format!(
-                                "volte_register_refresh_failed:{}:{error}",
+                                "cellular_ims_register_refresh_failed:{}:{error}",
                                 loss_reason.as_str()
                             ));
                             state.last_failure_at = Some(now());
@@ -9145,7 +9146,7 @@ mod tests {
         // reordering, since AT no longer runs before the bearer.)
         let prefix = CellularImsError::with_detail(
             code::RUNTIME_MM_BEARER_CONNECT_FAILED,
-            "volte_command_failed:mmcli:prefix-unavailable",
+            "cellular_ims_command_failed:mmcli:prefix-unavailable",
         );
         assert_eq!(
             FailureClass::from_details(prefix.detail().unwrap_or("")),
@@ -9153,7 +9154,7 @@ mod tests {
         );
         let generic = CellularImsError::with_detail(
             code::RUNTIME_MM_BEARER_CONNECT_FAILED,
-            "volte_command_failed:mmcli:operation-failed",
+            "cellular_ims_command_failed:mmcli:operation-failed",
         );
         assert_ne!(
             FailureClass::from_details(generic.detail().unwrap_or("")),

@@ -26,8 +26,8 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         self.assertIn("code::IMS_PREFERRED_PROFILE_OCCUPIED", text)
         self.assertIn("code::IMS_PROFILE_DEFINITION_AMBIGUOUS", text)
         errors = (SRC / "cellular_ims/errors.rs").read_text()
-        self.assertIn('"volte_ims_preferred_profile_occupied"', errors)
-        self.assertIn('"volte_ims_profile_definition_ambiguous"', errors)
+        self.assertIn('"cellular_ims_preferred_profile_occupied"', errors)
+        self.assertIn('"cellular_ims_profile_definition_ambiguous"', errors)
 
     def test_both_automatic_resolvers_use_the_same_home_boundary(self):
         text = (SRC / "vowifi/profile_store.rs").read_text()
