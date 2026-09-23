@@ -36,6 +36,8 @@
 
 ### 2.2 数据库列改名不在本阶段范围
 
+> 2026-09-23 更新：已纳入本阶段，见步骤 7。
+
 `volte_enabled` 列与 `volte_refresh_stats` 表名保留原样，等与数据库项目联动后
 单独处理。本阶段不做任何 schema 变更。
 
@@ -215,17 +217,27 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 
 ### 步骤 2 — 前端改为精确查表
 
-- [ ] `cellularImsErrorFormat.ts` 从 `includes()` 改为精确查表
-- [ ] 前缀族（`digest_` / `ipsec_` / `bearer_netdev_` / `at_`）显式列举成员，不再靠前缀
-- [ ] 建立 `旧码 → 新码` 映射表
-- [ ] 保持对外提示文案不变
+- [x] `cellularImsErrorFormat.ts` 从 `includes()` 改为精确查表：`last_error` 按
+      `[a-z][a-z0-9_]*` 切成 token，与码表逐个相等比较；嵌套在 detail 里的码同样命中，
+      嵌在更长标识符里的码**不**命中
+- [x] 前缀族（`digest_` / `ipsec_` / `bearer_netdev_`）显式列举成员，不再靠前缀；
+      `volte_at_` 族在前端并无消费者，无需列举
+- [x] 码表来源：新增 `frontend/src/pages/sim/cellularImsErrorCodes.ts`，由
+      `.github/scripts/gen_cellular_ims_error_codes.py` 从 `errors.rs` 生成（158 项），
+      并导出 `CellularImsErrorCode` 类型，formatter 里写错码名会在 `tsc` 阶段报错
+- [x] `旧码 → 新码` 映射：不另建运行时映射表。前后端同包发布，前端永远只需认识
+      同版本后端的码；改名由步骤 4 的机械替换一次完成
+- [x] 保持对外提示文案不变
 
 ### 步骤 3 — 建立一致性守卫
 
-- [ ] 新增 Python 守卫：断言后端码集合与前端映射表键集合**完全一致**
-- [ ] 断言无任一码是另一码的子串（防止错位回归）
-- [ ] 接入 `beta-validation.yml` 与 `build-release.yml` 的测试过滤器
-- [ ] 确认守卫在故意引入不一致时会失败（负向验证）
+- [x] 新增 `.github/scripts/test_ims_error_code_contract.py`（5 项）：前端码表与
+      后端码表**完全一致**、生成文件为最新、formatter 只引用真实存在的码、
+      formatter 不得对码做子串匹配、前端码表无子串关系
+- [x] 断言无任一码是另一码的子串（Rust 侧与两个 Python 守卫三处同时约束）
+- [x] 接入：两个工作流均以 `unittest discover -p 'test_*.py'` 自动发现，无需改过滤器
+- [x] 负向验证：多列一个码、漏列一个码、formatter 改回 `includes()`、
+      formatter 引用不存在的码——四种情形均如期失败
 
 ### 步骤 4 — 统一改名
 
@@ -251,9 +263,29 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 - [ ] `docs/CHANGELOG.md` 追加条目
 - [ ] CI 全绿，`Publish Release` 保持 `skipped`
 
+### 步骤 7 — 数据库联动（2026-09-23 纳入范围）
+
+用户确认 `carrier_Bundles` 即“数据库项目”，要求本阶段一并处理原先留待联动的
+持久化名称。§2.2 与 §6.1 的“留待联动”因此改为本步执行。持久化值不能靠文本替换，
+每项都要有迁移，且读取端兼容旧值：
+
+- [ ] 表 `volte_refresh_stats` → `cellular_ims_refresh_stats`：启动迁移在旧表存在、
+      新表不存在时 `ALTER TABLE ... RENAME TO`
+- [ ] `sms_messages.transport` 取值 `volte_ims` → `cellular_ims`：迁移改写历史行；
+      后端解析与前端显示仍接受旧值，防止未迁移的备份导入后显示错误来源
+- [ ] 短信去重指纹前缀 `volte-mt:`：评估是否改名（改名会让窗口期内的重复短信
+      漏过去重，需同时查新旧两种前缀）
+- [ ] `carrier_Bundles`：唯一的 `volte` 标识符是配置文档的 `services.volte`。
+      它镜像运营商自身的 VoLTE 标志（Android `carrier_volte_available_bool`、
+      iOS `SupportsVolteCapability`），与 `services.vonr` / `services.vowifi` 并列，
+      SimAdmin 用它决定是否宣告 MMTEL 语音能力——语义就是 LTE 语音，并非 IMS 注册。
+      schema 列已是中性的 `lte_ims_status` / `nr_ims_status`。改名方向待用户确认后执行
+
 ## 6. 边界
 
 ### 6.1 排除项：持久化值不得改名
+
+> 2026-09-23 更新：改为“不得靠文本替换改名”，按步骤 7 带迁移处理。
 
 以下字面量会写入数据库，改名会让**历史数据显示错误**，本阶段一律不动：
 
