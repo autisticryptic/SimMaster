@@ -80,7 +80,7 @@
 
 ### 线路级蜂窝与通话接口
 - **get_signal_strength.bru** - 获取信号强度详细信息
-- **get_ims_status.bru** - 获取 IMS（VoLTE）状态
+- **get_ims_status.bru** - 获取 IMS 注册状态
 - **get_call_volume.bru** - 获取通话音量设置
 - **set_call_volume.bru** - 设置通话音量
 - **get_operators.bru** - 获取当前运营商
@@ -95,7 +95,7 @@
 ### APN 管理接口（后端已移除，请求文件待清理）
 > `/api/modem/lines/{line_id}/apn` 的 GET/POST 路由已从 `main.rs` 删除——APN 现在只作为
 > 线路内部的数据承载参数维护，不再提供独立编辑接口。下面两个 `.bru` 仍留在目录里但会 404，
-> 应连同 `get_volte_voice_status.bru` / `set_volte_voice.bru` 一起删除。
+> 应删除（原同批待删的 `set_volte_voice.bru` 已随 IMS 命名迁移移除）。
 - ~~**get_apn_list.bru** - 获取 APN 配置列表~~
 - ~~**set_apn.bru** - 设置 APN 配置~~
 
@@ -136,13 +136,12 @@
 - **get_vowifi_sms_delivery.bru** - 获取基于 IPsec 隧道的短信投递记录列表
 - **get_vowifi_esim_restore_status.bru** - 获取 eSIM 切卡与基带状态恢复的同步进度
 
-### VoLTE / ViLTE 接口
-- **get_volte_lines.bru** - 获取所有基带线路的 IMS 状态
-- **get_volte_line.bru** - 获取单条线路的 IMS 状态
-- **set_volte_line_connection.bru** - 开关单条线路的 IMS 连接
-- **retry_volte_line.bru** - 不切换开关，手动启动新的五轮 IMS 恢复批次
-- **get_volte_voice_status.bru** - 获取指定线路的 VoLTE 语音状态
-- **set_volte_voice.bru** - 设置指定线路的 VoLTE 语音能力
+### 蜂窝 IMS / ViLTE 接口
+- **get_cellular_ims_lines.bru** - 获取所有基带线路的 IMS 状态
+- **get_cellular_ims_line.bru** - 获取单条线路的 IMS 状态
+- **set_cellular_ims_line_connection.bru** - 开关单条线路的 IMS 连接
+- **retry_cellular_ims_line.bru** - 不切换开关，手动启动新的五轮 IMS 恢复批次
+- **get_cellular_ims_voice_status.bru** - 获取指定线路的蜂窝 IMS 语音状态
 - **get_vilte_control.bru** - 获取 ViLTE 视频转发开关
 - **set_vilte_feature.bru** - 开关 ViLTE 视频转发
 - **set_vilte_config.bru** - 设置 H.264 payload type 和 fmtp
@@ -166,7 +165,7 @@
 
 3. **修改 IP 地址**
    - 所有请求使用当前 Bruno 环境中的 `base_url`
-   - 线路级请求还需要设置 `line_id`；可先调用 `/api/volte/lines` 或 `/api/modems` 获取
+   - 线路级请求还需要设置 `line_id`；可先调用 `/api/cellular-ims/lines` 或 `/api/modems` 获取
 
 4. **完成认证**
    - 除健康检查和登录相关端点外，业务接口默认需要 `simadmin_session` Cookie
@@ -194,11 +193,11 @@
 | GET | `/api/stats` | 综合系统统计（网速+内存+运行时间+系统信息） |
 | GET | `/api/stats/cpu` | CPU信息 |
 | GET | `/api/modem/lines/{line_id}/location/cell-info` | 指定线路的基站定位参数 |
-| GET | `/api/volte/lines` | VoLTE 线路列表 |
-| GET | `/api/volte/lines/{line_id}` | 指定线路的 VoLTE 配置和注册状态 |
-| POST | `/api/volte/lines/{line_id}/retry` | 手动启动五轮 IMS 恢复 |
-| GET | `/api/modem/lines/{line_id}/volte/call/status` | 指定线路的 VoLTE 语音状态 |
-| ~~POST~~ | ~~`/api/modem/lines/{line_id}/volte/voice`~~ | **已移除**：路由不存在，`set_volte_voice.bru` / `get_volte_voice_status.bru` 会 404 |
+| GET | `/api/cellular-ims/lines` | 蜂窝 IMS 线路列表（旧路径 `/api/volte/*` 仍作为别名保留） |
+| GET | `/api/cellular-ims/lines/{line_id}` | 指定线路的 IMS 配置和注册状态 |
+| POST | `/api/cellular-ims/lines/{line_id}/retry` | 手动启动五轮 IMS 恢复 |
+| GET | `/api/modem/lines/{line_id}/cellular-ims/call/status` | 指定线路的蜂窝 IMS 语音状态 |
+| ~~POST~~ | ~~`/api/modem/lines/{line_id}/volte/voice`~~ | **已移除**：路由不存在，对应的 `set_volte_voice.bru` 已删除 |
 | GET/POST | `/api/modem/lines/{line_id}/voice/path-policy` | 指定线路的语音路径策略 |
 | GET | `/api/trunk/lines` | Trunk 配置和 runtime 诊断 |
 | POST | `/api/trunk/lines/{line_id}` | 保存线路 Trunk 配置 |
@@ -221,7 +220,7 @@
 | GET | `/api/sms/stats` | 获取短信统计 |
 | POST | `/api/sms/clear?channel_id={channel_id}` | 清空指定短信通道 |
 | GET | `/api/modem/lines/{line_id}/network/signal-strength` | 获取指定线路的信号强度详细信息 |
-| GET | `/api/modem/lines/{line_id}/ims/status` | 获取指定线路的 IMS（VoLTE）状态 |
+| GET | `/api/modem/lines/{line_id}/ims/status` | 获取指定线路的 IMS 注册状态 |
 | GET | `/api/modem/lines/{line_id}/calls/volume` | 获取指定线路的通话音量设置 |
 | POST | `/api/modem/lines/{line_id}/calls/volume` | 设置指定线路的通话音量 |
 | GET | `/api/modem/lines/{line_id}/network/operators` | 获取指定线路的当前运营商 |
@@ -351,7 +350,7 @@
 - `410-adb`: `base_url=http://127.0.0.1:3300`
 
 执行线路级请求前，还需在当前 Bruno 环境中设置 `line_id`。先请求
-`GET {{base_url}}/api/volte/lines`，从响应中的 `modem.line_id` 选择目标线路。
+`GET {{base_url}}/api/cellular-ims/lines`，从响应中的 `modem.line_id` 选择目标线路。
 
 ## 响应格式
 

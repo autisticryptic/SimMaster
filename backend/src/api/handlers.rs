@@ -4839,13 +4839,13 @@ async fn send_sms_over_cellular_ims_path(
             &payload.content,
             "sent",
             None,
-            "volte_ims",
+            "cellular_ims",
             Some(line_id),
         )
         .map_err(|error| error.to_string())?;
     Ok(json!({
-            "path": "volte_ims",
-            "transport": "volte_ims",
+            "path": "cellular_ims",
+            "transport": "cellular_ims",
             "line_id": line_id,
             "message_id": result.message_id,
             "trace_id": result.trace_id,
@@ -13270,7 +13270,7 @@ pub async fn get_ims_ut_document_handler(
                     "Success",
                     json!({
                         "access": match access {
-                            crate::connectivity::core::registration::ImsRegistrationAccess::CellularIms => "volte",
+                            crate::connectivity::core::registration::ImsRegistrationAccess::CellularIms => "cellular_ims",
                             crate::connectivity::core::registration::ImsRegistrationAccess::Vowifi => "vowifi",
                         },
                         "document": document,
@@ -13376,7 +13376,7 @@ pub async fn put_ims_ut_document_handler(
                     "Updated and read back",
                     json!({
                         "access": match access {
-                            crate::connectivity::core::registration::ImsRegistrationAccess::CellularIms => "volte",
+                            crate::connectivity::core::registration::ImsRegistrationAccess::CellularIms => "cellular_ims",
                             crate::connectivity::core::registration::ImsRegistrationAccess::Vowifi => "vowifi",
                         },
                         "changed": outcome.changed,

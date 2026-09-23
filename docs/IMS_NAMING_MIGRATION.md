@@ -25,6 +25,10 @@ remain distinct; the latter is not implied by a successful build.
 
 ## Wire/storage compatibility decision
 
+> **Superseded by phase 2 (2026-09-23), see the section at the end.** Output now
+> uses the `cellular_ims*` spellings; the `volte*` spellings below are read-only
+> aliases.
+
 This refactor does **not** require rewriting existing installations or breaking
 old API clients. Rust fields/members use the canonical names, but serde retains
 the old serialized key and accepts the new spelling as an input alias.
@@ -87,6 +91,9 @@ Tests check that contract rather than merely the presence of route aliases.
 - Read old event/SMS transport labels; do not hide pre-upgrade history.
 - Preserve compatibility for persisted error codes; UI helper names can change
   without rewriting every historical error string.
+  *(Correction, phase 2: IMS error codes are not persisted. `last_error` is
+  in-memory runtime state; the four SQLite error-text columns belong to other
+  domains. The codes were renamed with no data migration.)*
 - Never replace `volte` in carrier database blobs, SIP feature tags, AT commands,
   LTE RAT data, arbitrary user strings or prior release history by substring.
 - Keep VoWiFi → cellular IMS → CS ordering, enabled intents, binding ownership,
@@ -119,3 +126,34 @@ Tests check that contract rather than merely the presence of route aliases.
   at 16:23, and its own protected natural refresh at 16:47:58 passed after
   deployment. The current SMS/Trunk VoWiFi-only switches were not silently
   enabled or reset; operational details are in `docs/IMS_REGISTRATION_POLICY.md`.
+
+## Phase 2 (2026-09-23): canonical output names
+
+Tracked step by step in `docs/IMS_NAMING_PHASE2_PLAN.md`. Phase 1 kept every
+`volte*` serialized spelling; phase 2 makes `cellular_ims*` the written form.
+
+- **Error codes** `volte_*` → `cellular_ims_*` (158 table codes, the `format!`
+  diagnostic prefixes; `volte_ims_*` → `cellular_ims_*`). The frontend matches
+  them by exact token against a table generated from `errors.rs`, guarded by
+  `test_ims_error_code_contract.py`. No data migration: codes are not stored.
+- **JSON / config keys** swap `rename` and `alias`: `cellular_ims_connection_enabled`,
+  `cellular_ims_auto_restore`, `cellular_ims_profile_selection`,
+  `cellular_ims_ip_families(_auto)`, `ims_video.cellular_ims_enabled`,
+  `cellular_ims_profiles`, `cellular_ims_ready`, runtime `cellular_ims`,
+  effective-profile `cellular_ims`, overrides `ims_cellular` / `ims.cellular_ims`,
+  and `AccessPathKind` `"cellular_ims"`. The old spellings still load; a stored
+  document is rewritten with the new names the next time it is saved. Releases
+  since phase 1 already accept the new spellings, so a downgrade still reads them.
+- **Persisted values** are migrated at startup, gated on the legacy
+  `volte_refresh_stats` table (created by every earlier release): the table
+  becomes `cellular_ims_refresh_stats`; `sms_messages` / `sms_dedup` /
+  `app_events` transport `volte_ims` → `cellular_ims`; stored MT markers
+  `volte-mt:` → `cellular-ims-mt:`; event types `volte.*` → `cellular_ims.*`.
+  Readers (backend normalisation, notification labels, diagnostic-log tags and
+  the UI) still accept the legacy values.
+- **Environment overrides** `SIMADMIN_CELLULAR_IMS_PCSCF` / `SIMADMIN_CELLULAR_IMS_CID`;
+  the `SIMADMIN_VOLTE_*` names remain a fallback.
+- **Unchanged on purpose**: the `/api/volte/*` route aliases; the carrier catalog's
+  `services.volte` key (the carrier's own VoLTE voice flag, owned by the
+  `carrier_Bundles` contract); VoLTE as the name of the voice service in
+  user-facing text, standards and vendor data.

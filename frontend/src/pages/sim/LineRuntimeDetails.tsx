@@ -27,7 +27,7 @@ export function LineCsDetails({ line }: { line: CellularImsLineControlResponse }
 
 export function LineCellularImsDetails({ line }: { line: CellularImsLineControlResponse }) {
   const displayError = cellularImsErrorMessage(line.runtime.last_error)
-  const imsAttemptInProgress = line.profile.volte_connection_enabled
+  const imsAttemptInProgress = line.profile.cellular_ims_connection_enabled
     && !line.runtime.registered
     && (
       line.runtime.recovery_state !== 'idle'
@@ -124,7 +124,8 @@ function compactMessageContent(content: string) {
 
 function smsTransportLabel(transport?: string) {
   switch (transport) {
-    case 'volte_ims':
+    case 'cellular_ims':
+    case 'volte_ims': // stored before the cellular IMS rename
     case 'ims':
       return '4G/5G'
     case 'vowifi_ims':
@@ -176,7 +177,8 @@ export function LineActivityLog({
       .join(' · ')
     const source = event.transport === 'vowifi_ims' || event.event_type.startsWith('vowifi.')
       ? 'VoWiFi'
-      : event.transport === 'volte_ims' || event.event_type.startsWith('volte.')
+      : event.transport === 'cellular_ims' || event.event_type.startsWith('cellular_ims.')
+        || event.transport === 'volte_ims' || event.event_type.startsWith('volte.')
         ? '4G/5G'
         : event.transport === 'trunk' || event.event_type.startsWith('trunk.')
           ? 'Trunk'

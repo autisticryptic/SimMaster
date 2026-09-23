@@ -479,7 +479,7 @@ pub struct LineRuntimeStatus {
     pub modem: ModemBinding,
     pub ue: UeContext,
     pub ue_worker: UeWorkerStatus,
-    #[serde(rename = "volte")]
+    #[serde(rename = "cellular_ims", alias = "volte")]
     pub cellular_ims: CellularImsRuntimeStatus,
     pub ims_access_network: AccessNetworkRuntimeStatus,
     pub trunk: TrunkRuntimeStatus,

@@ -1239,7 +1239,7 @@ pub struct StoredProfile {
     pub source: String,
     pub updated_at: String,
     pub record: CarrierProfileRecord,
-    #[serde(rename = "volte_ready")]
+    #[serde(rename = "cellular_ims_ready", alias = "volte_ready")]
     pub cellular_ims_ready: bool,
     pub vowifi_ready: bool,
     pub vilte_enabled: bool,
@@ -1258,7 +1258,7 @@ pub struct StoredProfileSummary {
     pub origin: ProfileOrigin,
     pub source: String,
     pub updated_at: String,
-    #[serde(rename = "volte_ready")]
+    #[serde(rename = "cellular_ims_ready", alias = "volte_ready")]
     pub cellular_ims_ready: bool,
     pub vowifi_ready: bool,
     pub vilte_enabled: bool,

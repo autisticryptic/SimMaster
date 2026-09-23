@@ -16,7 +16,7 @@ import {
 
 const pathLabels: Record<VoiceAccessPathKind, string> = {
   vowifi: 'VoWiFi',
-  volte: '4G/5G',
+  cellular_ims: '4G/5G',
 }
 
 type Props = { lineId: string }
@@ -159,7 +159,7 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
             VoLTE 语音：{cellularImsVoice?.ims_connection_enabled ? '随 IMS 连接自动可用' : '请先启用当前线路的 VoLTE IMS 连接'}
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            VoLTE 视频：{vilte.config.volte_enabled ? '已随连接启用' : '等待 VoLTE 连接启用'}；VoWiFi 视频：{vilte.config.vowifi_enabled ? '已随连接启用' : '等待 VoWiFi 连接启用'}
+            VoLTE 视频：{vilte.config.cellular_ims_enabled ? '已随连接启用' : '等待 VoLTE 连接启用'}；VoWiFi 视频：{vilte.config.vowifi_enabled ? '已随连接启用' : '等待 VoWiFi 连接启用'}
           </Typography>
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 1fr' }} gap={2}>
             <FormControl fullWidth>

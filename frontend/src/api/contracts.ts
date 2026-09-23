@@ -151,7 +151,7 @@ export interface CarrierCatalogStatusResponse {
   release_id: string
   generated_at: string
   sealed: boolean
-  volte_profiles: number
+  cellular_ims_profiles: number
   vowifi_profiles: number
   message: string
 }
@@ -182,7 +182,7 @@ export interface CarrierCatalogInstallResponse {
   asset_url: string
   release_id: string
   generated_at: string
-  volte_profiles: number
+  cellular_ims_profiles: number
   vowifi_profiles: number
   message: string
 }
@@ -687,9 +687,9 @@ export interface AutoRestoreConfig {
 export interface LineProfileConfig {
   line_id: string
   enabled: boolean
-  volte_connection_enabled: boolean
-  volte_auto_restore: AutoRestoreConfig
-  volte_profile_selection: ImsProfileSelectionConfig
+  cellular_ims_connection_enabled: boolean
+  cellular_ims_auto_restore: AutoRestoreConfig
+  cellular_ims_profile_selection: ImsProfileSelectionConfig
   vilte: VilteConfig
   vowifi: LineVowifiConfig
   trunk: TrunkProfileConfig
@@ -701,9 +701,9 @@ export interface LineProfileConfig {
    * Ordered IMS address-family attempt list. Order is the attempt/fallback order; a one-element list means
    * "only that family".
    */
-  volte_ip_families: CellularImsIpFamily[]
+  cellular_ims_ip_families: CellularImsIpFamily[]
   /** Whether the carrier catalog may choose the preferred fallback order. */
-  volte_ip_families_auto: boolean
+  cellular_ims_ip_families_auto: boolean
   /**
    * Per-line eSIM management override. `null`/undefined = auto (managed only
    * when the SIM reports a eUICC chip), `true` = force eSIM controls on,
@@ -943,7 +943,7 @@ export interface StoredCarrierProfile {
   source: string
   updated_at: string
   record: CarrierProfileRecord
-  volte_ready: boolean
+  cellular_ims_ready: boolean
   vowifi_ready: boolean
   vilte_enabled: boolean
   smsoip_enabled: boolean
@@ -960,7 +960,7 @@ export interface CarrierProfileSummary {
   origin: ProfileOrigin
   source: string
   updated_at: string
-  volte_ready: boolean
+  cellular_ims_ready: boolean
   vowifi_ready: boolean
   vilte_enabled: boolean
   smsoip_enabled: boolean
@@ -1074,7 +1074,7 @@ export interface SimImsOverride {
     custom_imei?: string | null
     voicemail_number?: string | null
   }
-  ims_volte: ImsAccessOverride
+  ims_cellular: ImsAccessOverride
   ims_vowifi: ImsAccessOverride
   services: {
     call_waiting?: boolean | null
@@ -1118,7 +1118,7 @@ export interface AccessNetworkRuntimeStatus {
 
 export interface LineRuntimeStatus {
   modem: ModemBinding
-  volte: CellularImsRuntimeStatus
+  cellular_ims: CellularImsRuntimeStatus
   ims_access_network: AccessNetworkRuntimeStatus
   trunk: TrunkRuntimeStatus
   supplementary: SupplementarySnapshot
@@ -1258,7 +1258,7 @@ export interface CallSettingsResponse {
   voice_call_waiting: string
 }
 
-export type AccessPathKind = 'vowifi' | 'volte' | 'cs'
+export type AccessPathKind = 'vowifi' | 'cellular_ims' | 'cs'
 
 export type ImsAccessFamily = 'three_gpp' | 'non_three_gpp'
 
@@ -1375,7 +1375,7 @@ export interface SmsPathPolicy {
   message_retention_limit: number
 }
 
-export type VoiceAccessPathKind = 'vowifi' | 'volte'
+export type VoiceAccessPathKind = 'vowifi' | 'cellular_ims'
 
 export interface VoicePathLayerConfig {
   kind: VoiceAccessPathKind
@@ -1405,7 +1405,7 @@ export interface WebCallCapabilitiesResponse {
 }
 
 export interface VilteConfig {
-  volte_enabled: boolean
+  cellular_ims_enabled: boolean
   vowifi_enabled: boolean
   codec: string
   video_payload_type: number

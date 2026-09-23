@@ -133,7 +133,7 @@ export default function CellularImsProfileDialog({ open, lineId, onClose, onSave
 
           {!loading && data && attempts.map((attempt, index) => {
             const options = profilesForSource(data.profiles, attempt.source)
-            const readyOptions = options.filter((profile) => profile.volte_ready)
+            const readyOptions = options.filter((profile) => profile.cellular_ims_ready)
             const explicitProfile = attempt.profile_id
               ? options.find((profile) => profile.profile_id === attempt.profile_id)
               : null
@@ -141,7 +141,7 @@ export default function CellularImsProfileDialog({ open, lineId, onClose, onSave
               ? null
               : attempt.profile_id && !explicitProfile
                 ? `指定的 Profile ${attempt.profile_id} 已不存在，本槽位将使用派生配置兜底。`
-                : explicitProfile && !explicitProfile.volte_ready
+                : explicitProfile && !explicitProfile.cellular_ims_ready
                   ? `指定的 Profile ${attempt.profile_id} 没有 LTE/EPC 投影，本槽位将使用派生配置兜底。`
                   : readyOptions.length === 0
                     ? '该来源当前没有 LTE-ready Profile，本槽位将使用派生配置兜底。'
@@ -192,9 +192,9 @@ export default function CellularImsProfileDialog({ open, lineId, onClose, onSave
                           <MenuItem
                             key={`${profile.origin}:${profile.profile_id}`}
                             value={profile.profile_id}
-                            disabled={!profile.volte_ready}
+                            disabled={!profile.cellular_ims_ready}
                           >
-                            {profile.profile_id}{name ? ` · ${name}` : ''} · PLMN {profile.plmn} · {profile.volte_ready ? 'LTE 可用' : 'LTE 不可用'} · {profile.source}
+                            {profile.profile_id}{name ? ` · ${name}` : ''} · PLMN {profile.plmn} · {profile.cellular_ims_ready ? 'LTE 可用' : 'LTE 不可用'} · {profile.source}
                           </MenuItem>
                         )
                       })}

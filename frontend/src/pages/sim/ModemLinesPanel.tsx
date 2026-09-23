@@ -69,7 +69,7 @@ const cellularImsStageStatusLabels: Record<string, string> = {
 
 function imsConnectionSummary(line: CellularImsLineControlResponse) {
   if (line.runtime.registered) return 'IMS 已注册'
-  if (!line.profile.volte_connection_enabled) return 'IMS 未连接'
+  if (!line.profile.cellular_ims_connection_enabled) return 'IMS 未连接'
   const errorStatus = cellularImsErrorStatusLabel(line.runtime.last_error)
   if (errorStatus) return errorStatus
   const label = cellularImsStageStatusLabels[line.runtime.stage] || '正在连接 IMS'
@@ -114,14 +114,14 @@ function cellularImsStageTimelineState(line: CellularImsLineControlResponse) {
     const failed = Boolean(runtime.last_error && current === stage && runtime.phase !== 'registered')
     const complete = runtime.registered || (!failed && currentIndex > index)
       || attempt?.outcome === 'succeeded' || attempt?.outcome === 'success'
-    const active = !complete && !failed && current === stage && line.profile.volte_connection_enabled
+    const active = !complete && !failed && current === stage && line.profile.cellular_ims_connection_enabled
     return { stage, label, attempt, complete, active, failed }
   })
 }
 
 function CellularImsStageTimeline({ line }: { line: CellularImsLineControlResponse }) {
   const displayError = cellularImsErrorMessage(line.runtime.last_error)
-  if (!line.profile.volte_connection_enabled && !displayError && !line.runtime.connection_attempts?.length) return null
+  if (!line.profile.cellular_ims_connection_enabled && !displayError && !line.runtime.connection_attempts?.length) return null
   const items = cellularImsStageTimelineState(line)
   const currentLabel = items.find((item) => item.active || item.failed)?.label
     || (line.runtime.registered ? 'IMS 已注册' : '等待启动')
@@ -587,7 +587,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
 
   const toggleLine = async (lineId: string, enabled: boolean) => {
     loadVersion.current += 1
-    setSavingKey(`volte:${lineId}`)
+    setSavingKey(`cellular-ims:${lineId}`)
     setError(null)
     setSuccess(null)
     try {
@@ -639,7 +639,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
           ...line,
           profile: {
             ...line.profile,
-            volte_profile_selection: updated.selection,
+            cellular_ims_profile_selection: updated.selection,
           },
           runtime: updated.runtime,
         }
@@ -823,7 +823,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
       ) : (
         <Grid container spacing={2.5}>
           {(workbench ? lines.filter((line) => line.modem.line_id === selectedLineId) : lines).map((line, index) => {
-            const cellularImsBusy = savingKey === `volte:${line.modem.line_id}`
+            const cellularImsBusy = savingKey === `cellular-ims:${line.modem.line_id}`
             const retryBusy = savingKey === `retry:${line.modem.line_id}`
             const vowifiBusy = savingKey === `vowifi:${line.modem.line_id}`
             const trunkBusy = savingKey === `trunk:${line.modem.line_id}`
@@ -1043,7 +1043,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                     {(!workbench || workbenchTab === 'ims') && (
                       <ImsRegistrationSettings key={line.modem.line_id} lineId={line.modem.line_id} disabled={savingKey !== null} />
                     )}
-                    {(!workbench || workbenchTab === 'ims') && line.profile.volte_connection_enabled && !line.runtime.registered && (recovery || displayError) && (
+                    {(!workbench || workbenchTab === 'ims') && line.profile.cellular_ims_connection_enabled && !line.runtime.registered && (recovery || displayError) && (
                       <Alert severity={line.runtime.recovery_state === 'exhausted' ? 'error' : 'warning'} sx={{ mt: 2, py: 0.25 }}>
                         {fallbackMessage && (
                           <Typography variant="body2" fontWeight={600}>
@@ -1074,7 +1074,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         </Box>
                       </Box>
                       <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
-                        <Chip size="small" label={imsConnectionSummary(line)} color={!line.profile.volte_connection_enabled ? 'default' : line.runtime.registered ? 'success' : displayError ? 'error' : 'warning'} variant="outlined" />
+                        <Chip size="small" label={imsConnectionSummary(line)} color={!line.profile.cellular_ims_connection_enabled ? 'default' : line.runtime.registered ? 'success' : displayError ? 'error' : 'warning'} variant="outlined" />
                         <Button
                           size="small"
                           variant="text"
@@ -1082,14 +1082,14 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                           // (data proxy, VoLTE, VoWiFi, trunk). The test id
                           // names this one so a browser test cannot pick the
                           // wrong one and act on it.
-                          data-testid="volte-profile-config"
+                          data-testid="cellular-ims-profile-config"
                           onClick={() => setEditingCellularImsProfileLineId(line.modem.line_id)}
                           disabled={savingKey !== null}
                         >
                           配置
                         </Button>
                         {(cellularImsBusy || retryBusy) && <CircularProgress size={18} />}
-                        {line.profile.volte_connection_enabled && line.runtime.manual_retry_available && (
+                        {line.profile.cellular_ims_connection_enabled && line.runtime.manual_retry_available && (
                           <Tooltip title={recoveryRunning ? '自动恢复正在进行' : `立即开始新的 ${line.runtime.retry_max || 3} 次恢复批次`}>
                             <span>
                               <Button
@@ -1105,7 +1105,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                           </Tooltip>
                         )}
                         <Switch
-                          checked={line.profile.volte_connection_enabled}
+                          checked={line.profile.cellular_ims_connection_enabled}
                           onChange={(_, enabled) => void toggleLine(line.modem.line_id, enabled)}
                           disabled={(line.modem.present && airplaneEnabled) || savingKey !== null}
                         />
@@ -1177,7 +1177,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Box>
                     </Box>
                     )}
-                    {!isReader && workbench && workbenchTab === 'ims' && line.profile.volte_connection_enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider">
+                    {!isReader && workbench && workbenchTab === 'ims' && line.profile.cellular_ims_connection_enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider">
                       <Box display="flex" alignItems="center" gap={0.75} mb={1.5}>
                         <CellTower color="action" fontSize="small" />
                         <Typography variant="subtitle2" fontWeight={700}>4G/5G 详情</Typography>

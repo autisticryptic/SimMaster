@@ -1,11 +1,11 @@
 meta {
-  name: retry_volte_line
+  name: retry_cellular_ims_line
   type: http
   seq: 155
 }
 
 post {
-  url: {{base_url}}/api/volte/lines/{{line_id}}/retry
+  url: {{base_url}}/api/cellular-ims/lines/{{line_id}}/retry
   body: json
   auth: inherit
 }

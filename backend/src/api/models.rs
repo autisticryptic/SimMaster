@@ -139,7 +139,7 @@ pub struct CarrierCatalogStatusResponse {
     pub release_id: String,
     pub generated_at: String,
     pub sealed: bool,
-    #[serde(rename = "volte_profiles")]
+    #[serde(rename = "cellular_ims_profiles", alias = "volte_profiles")]
     pub cellular_ims_profiles: usize,
     pub vowifi_profiles: usize,
     pub message: String,
@@ -181,7 +181,7 @@ pub struct CarrierCatalogInstallResponse {
     pub asset_url: String,
     pub release_id: String,
     pub generated_at: String,
-    #[serde(rename = "volte_profiles")]
+    #[serde(rename = "cellular_ims_profiles", alias = "volte_profiles")]
     pub cellular_ims_profiles: usize,
     pub vowifi_profiles: usize,
     pub message: String,
@@ -1243,7 +1243,7 @@ pub struct EffectiveEmergencyDto {
 pub struct EffectiveImsProfileResponse {
     pub binding: BindingKeyDto,
     pub vowifi: EffectiveVowifiDto,
-    #[serde(rename = "volte_ims")]
+    #[serde(rename = "cellular_ims", alias = "volte_ims")]
     pub cellular_ims: EffectiveImsDto,
     pub vowifi_ims: EffectiveImsDto,
     pub identity: EffectiveDeviceIdentityDto,

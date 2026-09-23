@@ -2591,7 +2591,7 @@ mod tests {
     #[test]
     fn access_path_kind_transport_tags_match_db_contract() {
         assert_eq!(AccessPathKind::Vowifi.transport_tag(), "vowifi_ims");
-        assert_eq!(AccessPathKind::CellularIms.transport_tag(), "volte_ims");
+        assert_eq!(AccessPathKind::CellularIms.transport_tag(), "cellular_ims");
         assert_eq!(AccessPathKind::Cs.transport_tag(), "modem");
         assert!(AccessPathKind::Vowifi.is_ims());
         assert!(AccessPathKind::CellularIms.is_ims());
@@ -3480,35 +3480,38 @@ line_profiles:
         profile.cellular_ims_ip_families = vec![CellularImsIpFamily::Ipv6];
         profile.cellular_ims_ip_families_auto = false;
         profile.ims_video.cellular_ims_enabled = true;
-        let legacy = serde_json::to_value(&profile).unwrap();
-        let mut aliases = legacy.clone();
-        for (old, new) in [
+        // Canonical storage uses the cellular_ims_* names; documents written by
+        // older releases carry volte_* and must load to the same profile.
+        let canonical = serde_json::to_value(&profile).unwrap();
+        let mut legacy = canonical.clone();
+        for (new, old) in [
             (
-                "volte_connection_enabled",
                 "cellular_ims_connection_enabled",
+                "volte_connection_enabled",
             ),
-            ("volte_auto_restore", "cellular_ims_auto_restore"),
-            ("volte_profile_selection", "cellular_ims_profile_selection"),
-            ("volte_ip_families", "cellular_ims_ip_families"),
-            ("volte_ip_families_auto", "cellular_ims_ip_families_auto"),
+            ("cellular_ims_auto_restore", "volte_auto_restore"),
+            ("cellular_ims_profile_selection", "volte_profile_selection"),
+            ("cellular_ims_ip_families", "volte_ip_families"),
+            ("cellular_ims_ip_families_auto", "volte_ip_families_auto"),
         ] {
-            let object = aliases.as_object_mut().unwrap();
-            let value = object.remove(old).expect("legacy wire key remains present");
-            assert!(!object.contains_key(new));
-            object.insert(new.into(), value);
+            let object = legacy.as_object_mut().unwrap();
+            let value = object.remove(new).expect("canonical wire key is written");
+            assert!(!object.contains_key(old));
+            object.insert(old.into(), value);
         }
-        let video = aliases["ims_video"].as_object_mut().unwrap();
-        let enabled = video.remove("volte_enabled").unwrap();
-        video.insert("cellular_ims_enabled".into(), enabled);
+        let video = legacy["ims_video"].as_object_mut().unwrap();
+        let enabled = video.remove("cellular_ims_enabled").unwrap();
+        video.insert("volte_enabled".into(), enabled);
+        let from_canonical: LineProfileConfig = serde_json::from_value(canonical.clone()).unwrap();
         let from_legacy: LineProfileConfig = serde_json::from_value(legacy.clone()).unwrap();
-        let from_aliases: LineProfileConfig = serde_json::from_value(aliases).unwrap();
+        assert_eq!(from_canonical, profile);
         assert_eq!(from_legacy, profile);
-        assert_eq!(from_aliases, profile);
-        assert_eq!(serde_json::to_value(from_aliases).unwrap(), legacy);
+        // A legacy document is rewritten with the canonical names on save.
+        assert_eq!(serde_json::to_value(from_legacy).unwrap(), canonical);
         // Ambiguous mixed spellings fail closed instead of disabling a line.
         for value in [true, false] {
-            let mut mixed = legacy.clone();
-            mixed["cellular_ims_connection_enabled"] = serde_json::json!(value);
+            let mut mixed = canonical.clone();
+            mixed["volte_connection_enabled"] = serde_json::json!(value);
             assert!(serde_json::from_value::<LineProfileConfig>(mixed).is_err());
         }
     }
@@ -3518,11 +3521,11 @@ line_profiles:
         for value in ["volte", "cellular_ims"] {
             let kind: AccessPathKind = serde_json::from_value(serde_json::json!(value)).unwrap();
             assert_eq!(kind, AccessPathKind::CellularIms);
-            assert_eq!(kind.as_str(), "volte");
-            assert_eq!(kind.transport_tag(), "volte_ims");
+            assert_eq!(kind.as_str(), "cellular_ims");
+            assert_eq!(kind.transport_tag(), "cellular_ims");
             assert_eq!(
                 serde_json::to_value(kind).unwrap(),
-                serde_json::json!("volte")
+                serde_json::json!("cellular_ims")
             );
         }
     }
@@ -4636,18 +4639,18 @@ pub struct LineProfileConfig {
     pub enabled: bool,
     #[serde(default)]
     #[serde(
-        rename = "volte_connection_enabled",
-        alias = "cellular_ims_connection_enabled"
+        rename = "cellular_ims_connection_enabled",
+        alias = "volte_connection_enabled"
     )]
     pub cellular_ims_connection_enabled: bool,
     #[serde(default)]
-    #[serde(rename = "volte_auto_restore", alias = "cellular_ims_auto_restore")]
+    #[serde(rename = "cellular_ims_auto_restore", alias = "volte_auto_restore")]
     pub cellular_ims_auto_restore: AutoRestoreConfig,
     /// Ordered outer carrier-profile attempts for this physical line.
     #[serde(default)]
     #[serde(
-        rename = "volte_profile_selection",
-        alias = "cellular_ims_profile_selection"
+        rename = "cellular_ims_profile_selection",
+        alias = "volte_profile_selection"
     )]
     pub cellular_ims_profile_selection: ImsProfileSelectionConfig,
     #[serde(default, alias = "vilte")]
@@ -4691,15 +4694,15 @@ pub struct LineProfileConfig {
     /// enable, in fallback order. The default `[Ipv4v6, Ipv6, Ipv4]` tries dual-stack,
     /// then IPv6, then IPv4; `[Ipv6]` is IPv6-only. An empty list is invalid.
     #[serde(default = "default_line_cellular_ims_ip_families")]
-    #[serde(rename = "volte_ip_families", alias = "cellular_ims_ip_families")]
+    #[serde(rename = "cellular_ims_ip_families", alias = "volte_ip_families")]
     pub cellular_ims_ip_families: Vec<CellularImsIpFamily>,
     /// Whether the family order is still automatic. Automatic lines may use
     /// the carrier catalog's LTE `ip_family` as a hint; saving the order from
     /// the UI turns this off so the user's choice always wins.
     #[serde(default = "default_line_cellular_ims_ip_families_auto")]
     #[serde(
-        rename = "volte_ip_families_auto",
-        alias = "cellular_ims_ip_families_auto"
+        rename = "cellular_ims_ip_families_auto",
+        alias = "volte_ip_families_auto"
     )]
     pub cellular_ims_ip_families_auto: bool,
     /// Per-line APN.
@@ -5014,8 +5017,9 @@ fn default_vilte_h264_fmtp() -> String {
 /// Shared IMS video (ViLTE / VoWiFi video) media configuration.
 ///
 /// Video rides the *same* IMS voice session as the access's voice call (one
-/// INVITE, an audio `m=` line plus a video `m=` line). VoLTE and VoWiFi each
-/// expose their effective state through `volte_enabled` and `vowifi_enabled`.
+/// INVITE, an audio `m=` line plus a video `m=` line). Cellular IMS and VoWiFi
+/// each expose their effective state through `cellular_ims_enabled` (stored by
+/// older releases as `volte_enabled`) and `vowifi_enabled`.
 /// Those fields are maintained by `ConfigManager`: VoLTE video follows the
 /// line's VoLTE connection plus voice gateway, while VoWiFi video follows the
 /// line's VoWiFi connection. They are status mirrors, not independent switches.
@@ -5025,13 +5029,13 @@ fn default_vilte_h264_fmtp() -> String {
 /// are meaningful — `codec` is what we advertise, not something we transcode to.
 ///
 /// Schema migration: the historical field `feature_enabled` (a single gate that
-/// implicitly meant VoLTE) is accepted as an alias for `volte_enabled` on load,
-/// so existing persisted configs migrate in place.
+/// implicitly meant VoLTE) and `volte_enabled` are accepted as aliases for
+/// `cellular_ims_enabled` on load, so existing persisted configs migrate in place.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImsVideoConfig {
     /// Effective configured state for the VoLTE (LTE) access leg.
     #[serde(default, alias = "feature_enabled")]
-    #[serde(rename = "volte_enabled", alias = "cellular_ims_enabled")]
+    #[serde(rename = "cellular_ims_enabled", alias = "volte_enabled")]
     pub cellular_ims_enabled: bool,
     /// Effective configured state for the VoWiFi (WiFi/ePDG) access leg.
     #[serde(default)]
@@ -5071,8 +5075,9 @@ impl Default for ImsVideoConfig {
 pub enum AccessPathKind {
     /// VoWiFi (IMS over WiFi / ePDG).
     Vowifi,
-    /// Cellular IMS; the old transport ID remains a compatibility wire value.
-    #[serde(rename = "volte", alias = "cellular_ims")]
+    /// Cellular IMS. `volte` is the legacy spelling still found in stored
+    /// path policies and automation documents; it is read, never written.
+    #[serde(rename = "cellular_ims", alias = "volte")]
     CellularIms,
     /// Circuit-switched (ModemManager baseband).
     Cs,
@@ -5082,7 +5087,7 @@ impl AccessPathKind {
     pub fn as_str(self) -> &'static str {
         match self {
             AccessPathKind::Vowifi => "vowifi",
-            AccessPathKind::CellularIms => "volte",
+            AccessPathKind::CellularIms => "cellular_ims",
             AccessPathKind::Cs => "cs",
         }
     }
@@ -5091,7 +5096,7 @@ impl AccessPathKind {
     pub fn transport_tag(self) -> &'static str {
         match self {
             AccessPathKind::Vowifi => "vowifi_ims",
-            AccessPathKind::CellularIms => "volte_ims",
+            AccessPathKind::CellularIms => "cellular_ims",
             AccessPathKind::Cs => "modem",
         }
     }

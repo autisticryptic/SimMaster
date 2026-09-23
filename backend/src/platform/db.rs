@@ -798,9 +798,11 @@ mod tests {
             .conn
             .lock()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM volte_refresh_stats", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM cellular_ims_refresh_stats",
+                [],
+                |row| row.get(0),
+            )
             .expect("count refresh stats rows");
         assert_eq!(count, CELLULAR_IMS_REFRESH_STATS_MAX_ROWS);
     }
@@ -1507,10 +1509,10 @@ mod tests {
     #[test]
     fn sms_dedup_claim_is_idempotent_across_transports() {
         let db = test_database();
-        let fp = "volte-mt:single:+123:2026-07-14 10:00:00:abcdef";
+        let fp = "cellular-ims-mt:single:+123:2026-07-14 10:00:00:abcdef";
 
         assert!(db
-            .claim_sms_dedup("line-a", fp, "volte_ims")
+            .claim_sms_dedup("line-a", fp, "cellular_ims")
             .expect("claim line-a"));
         assert!(db
             .sms_dedup_exists("line-a", fp)
@@ -1610,7 +1612,7 @@ mod tests {
             .claim_sms_dedup("line-a", "legacy-fingerprint", "modem")
             .expect("legacy compatibility row must not block line-a"));
         assert!(db
-            .claim_sms_dedup("line-b", "legacy-fingerprint", "volte_ims")
+            .claim_sms_dedup("line-b", "legacy-fingerprint", "cellular_ims")
             .expect("line-a must not block line-b"));
 
         drop(db);
@@ -1935,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn sms_line_identity_round_trips_without_changing_transport_label() {
+    fn sms_line_identity_round_trips_and_normalizes_the_legacy_transport_label() {
         let db = test_database();
         let line_id = "line-0123456789abcdef0123456789abcdef";
         db.insert_sms_with_transport_for_line(
@@ -1950,8 +1952,96 @@ mod tests {
         .expect("insert line sms");
 
         let message = db.get_sms_messages(1, 0, None).expect("list sms").remove(0);
-        assert_eq!(message.transport, "volte_ims");
+        assert_eq!(message.transport, "cellular_ims");
         assert_eq!(message.line_id.as_deref(), Some(line_id));
+    }
+
+    #[test]
+    fn legacy_volte_persisted_names_migrate_to_cellular_ims() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-cellular-ims-rename-{}-{nonce}.db",
+            std::process::id()
+        ));
+        drop(Database::new(path.clone()).expect("create current database"));
+        {
+            // What a pre-rename binary leaves behind when it runs on this file.
+            let conn = Connection::open(&path).expect("reopen as an older release");
+            conn.execute_batch(
+                "CREATE TABLE volte_refresh_stats (
+                    line_id TEXT PRIMARY KEY,
+                    refresh_count INTEGER NOT NULL DEFAULT 0,
+                    last_refresh_at TEXT,
+                    updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO volte_refresh_stats VALUES
+                    ('line-a', 7, '2026-09-22T20:08:18Z', '2026-09-22T20:08:18Z');
+                 INSERT INTO sms_messages (
+                    direction, phone_number, content, timestamp, status, pdu, transport, line_id
+                 ) VALUES (
+                    'incoming', '10086', 'hello', '2026-09-22 20:00:00', 'received',
+                    'volte-mt:single:+10086:2026-09-22:abc', 'volte_ims', 'line-a'
+                 );
+                 INSERT INTO sms_dedup (line_id, fingerprint, transport)
+                    VALUES ('line-a', 'fp-1', 'volte_ims');
+                 INSERT INTO app_events (event_type, line_id, transport, payload_json, created_at)
+                    VALUES ('volte.connection_attempt', 'line-a', 'volte_ims', '{}',
+                            '2026-09-22T20:00:00Z');
+                 INSERT INTO app_events (event_type, line_id, transport, payload_json, created_at)
+                    VALUES ('vowifi.connection_attempt', 'line-a', 'vowifi', '{}',
+                            '2026-09-22T20:00:01Z');",
+            )
+            .expect("seed pre-rename rows");
+        }
+
+        let db = Database::new(path.clone()).expect("migrate pre-rename rows");
+        let stats = db
+            .get_cellular_ims_refresh_stats("line-a")
+            .expect("read migrated refresh stats")
+            .expect("refresh stats survive the rename");
+        assert_eq!(stats.refresh_count, 7);
+        {
+            let conn = db.conn.lock().unwrap();
+            assert!(!sqlite_table_exists(&conn, "volte_refresh_stats").unwrap());
+            let (transport, pdu): (String, String) = conn
+                .query_row("SELECT transport, pdu FROM sms_messages", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(transport, "cellular_ims");
+            assert_eq!(pdu, "cellular-ims-mt:single:+10086:2026-09-22:abc");
+            let dedup: String = conn
+                .query_row("SELECT transport FROM sms_dedup", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(dedup, "cellular_ims");
+            let events: Vec<(String, Option<String>)> = conn
+                .prepare("SELECT event_type, transport FROM app_events ORDER BY id")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_>>()
+                .unwrap();
+            assert_eq!(
+                events,
+                vec![
+                    (
+                        "cellular_ims.connection_attempt".to_string(),
+                        Some("cellular_ims".to_string())
+                    ),
+                    (
+                        "vowifi.connection_attempt".to_string(),
+                        Some("vowifi".to_string())
+                    ),
+                ]
+            );
+        }
+        drop(db);
+        // A second start finds nothing left to migrate.
+        drop(Database::new(path.clone()).expect("reopen migrated database"));
+        std::fs::remove_file(path).expect("remove migration database");
     }
 
     #[test]
@@ -2471,7 +2561,8 @@ fn non_empty_option(value: Option<&str>) -> Option<String> {
 fn normalized_sms_transport(value: &str) -> &'static str {
     match value.trim() {
         "vowifi_ims" => "vowifi_ims",
-        "volte_ims" => "volte_ims",
+        // Stored by releases before the cellular IMS rename.
+        "cellular_ims" | "volte_ims" => "cellular_ims",
         _ => "modem",
     }
 }
@@ -2544,6 +2635,53 @@ fn table_has_unique_index(
     }
 
     Ok(false)
+}
+
+fn sqlite_table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![table_name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Move values persisted under the old `volte` naming to `cellular_ims`.
+///
+/// These rows describe the IMS registration over cellular access, not its
+/// voice service. Every release before the rename creates
+/// `cellular_ims_refresh_stats` at startup, so that table existing is exactly the
+/// signal that pre-rename rows may be present (a fresh database, or one only
+/// ever opened by this release, skips the full-table updates). Running an
+/// older binary again recreates the table, and the next start migrates the
+/// rows it wrote.
+fn migrate_cellular_ims_persisted_names(conn: &Connection) -> Result<()> {
+    if !sqlite_table_exists(conn, "volte_refresh_stats")? {
+        return Ok(());
+    }
+    let migration = conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         INSERT OR IGNORE INTO cellular_ims_refresh_stats (
+             line_id, refresh_count, last_refresh_at, updated_at
+         )
+         SELECT line_id, refresh_count, last_refresh_at, updated_at
+         FROM volte_refresh_stats;
+         DROP TABLE volte_refresh_stats;
+         UPDATE sms_messages SET transport = 'cellular_ims' WHERE transport = 'volte_ims';
+         UPDATE sms_messages
+            SET pdu = 'cellular-ims-mt:' || substr(pdu, length('volte-mt:') + 1)
+          WHERE pdu LIKE 'volte-mt:%';
+         UPDATE sms_dedup SET transport = 'cellular_ims' WHERE transport = 'volte_ims';
+         UPDATE app_events SET transport = 'cellular_ims' WHERE transport = 'volte_ims';
+         UPDATE app_events
+            SET event_type = 'cellular_ims.' || substr(event_type, length('volte.') + 1)
+          WHERE event_type LIKE 'volte.%';
+         COMMIT;",
+    );
+    if migration.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    migration
 }
 
 fn migrate_sms_dedup_for_line_scope(conn: &Connection) -> Result<()> {
@@ -2982,7 +3120,7 @@ impl Database {
         )?;
 
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS volte_refresh_stats (
+            "CREATE TABLE IF NOT EXISTS cellular_ims_refresh_stats (
                 line_id TEXT PRIMARY KEY,
                 refresh_count INTEGER NOT NULL DEFAULT 0,
                 last_refresh_at TEXT,
@@ -3398,6 +3536,7 @@ impl Database {
         // modem/reader slot map, notification and automation records — live in
         // this database rather than the text configuration file. See
         // `platform::config_store` for why.
+        migrate_cellular_ims_persisted_names(&conn)?;
         crate::platform::config_store::initialize_schema(&conn)?;
 
         let (app_event_tx, _) = broadcast::channel(512);
@@ -5751,7 +5890,7 @@ impl Database {
         Ok(deleted)
     }
 
-    // ==================== VoLTE REGISTER refresh stats ====================
+    // ==================== Cellular IMS REGISTER refresh stats ====================
 
     pub fn get_cellular_ims_refresh_stats(
         &self,
@@ -5761,7 +5900,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT refresh_count, last_refresh_at, updated_at
-             FROM volte_refresh_stats
+             FROM cellular_ims_refresh_stats
              WHERE line_id = ?1",
             params![line_id],
             |row| {
@@ -5795,19 +5934,19 @@ impl Database {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO volte_refresh_stats (
+            "INSERT INTO cellular_ims_refresh_stats (
                 line_id, refresh_count, last_refresh_at, updated_at
              ) VALUES (?1, 1, ?2, ?3)
              ON CONFLICT(line_id) DO UPDATE SET
-                refresh_count = MIN(volte_refresh_stats.refresh_count + 1, 9223372036854775807),
+                refresh_count = MIN(cellular_ims_refresh_stats.refresh_count + 1, 9223372036854775807),
                 last_refresh_at = excluded.last_refresh_at,
                 updated_at = excluded.updated_at",
             params![line_id, last_refresh_at, updated_at],
         )?;
         tx.execute(
-            "DELETE FROM volte_refresh_stats
+            "DELETE FROM cellular_ims_refresh_stats
              WHERE line_id NOT IN (
-                SELECT line_id FROM volte_refresh_stats
+                SELECT line_id FROM cellular_ims_refresh_stats
                 ORDER BY updated_at DESC, line_id ASC
                 LIMIT ?1
              )",
@@ -5815,7 +5954,7 @@ impl Database {
         )?;
         let entry = tx.query_row(
             "SELECT refresh_count, last_refresh_at, updated_at
-             FROM volte_refresh_stats
+             FROM cellular_ims_refresh_stats
              WHERE line_id = ?1",
             params![line_id],
             |row| {
@@ -5835,7 +5974,7 @@ impl Database {
         let line_id = required_line_id(line_id)?;
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(
-            "DELETE FROM volte_refresh_stats WHERE line_id = ?1",
+            "DELETE FROM cellular_ims_refresh_stats WHERE line_id = ?1",
             params![line_id],
         )? > 0)
     }

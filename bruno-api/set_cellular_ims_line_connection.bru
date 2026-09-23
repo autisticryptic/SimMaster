@@ -1,11 +1,11 @@
 meta {
-  name: set_volte_line_connection
+  name: set_cellular_ims_line_connection
   type: http
   seq: 154
 }
 
 post {
-  url: {{base_url}}/api/volte/lines/{{line_id}}/connection
+  url: {{base_url}}/api/cellular-ims/lines/{{line_id}}/connection
   body: json
   auth: inherit
 }

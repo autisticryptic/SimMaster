@@ -49,7 +49,7 @@ export type ConnectionAddresses = ConnectionAddressesResponse
 
 export interface DashboardLineInfo {
   modem: LineRuntimeStatus['modem']
-  volte: LineRuntimeStatus['volte']
+  cellular_ims: LineRuntimeStatus['cellular_ims']
   trunk: LineRuntimeStatus['trunk']
   supplementary: LineRuntimeStatus['supplementary']
   ims: ImsSubsystemState | null
@@ -151,7 +151,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         addressesRes,
       ] = await fastPromise
 
-      const lineDetails = await Promise.all((modemLinesRes?.data ?? []).map(async ({ modem, volte, trunk, supplementary }) => {
+      const lineDetails = await Promise.all((modemLinesRes?.data ?? []).map(async ({ modem, cellular_ims, trunk, supplementary }) => {
         const imsRes = await requestOrNull(
           api.getLineImsStatus(modem.line_id),
           `ims:${modem.line_id}`,
@@ -160,7 +160,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         if (!hasCellularModem) {
           return {
             modem,
-            volte,
+            cellular_ims,
             trunk,
             supplementary,
             ims: imsRes?.data ?? null,
@@ -176,7 +176,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         ])
         return {
           modem,
-          volte,
+          cellular_ims,
           trunk,
           supplementary,
           ims: imsRes?.data ?? null,

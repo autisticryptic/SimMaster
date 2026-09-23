@@ -1,11 +1,11 @@
 meta {
-  name: get_volte_line
+  name: get_cellular_ims_line
   type: http
   seq: 153
 }
 
 get {
-  url: {{base_url}}/api/volte/lines/{{line_id}}
+  url: {{base_url}}/api/cellular-ims/lines/{{line_id}}
   body: none
   auth: inherit
 }

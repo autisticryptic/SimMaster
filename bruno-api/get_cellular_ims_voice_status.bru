@@ -1,0 +1,15 @@
+meta {
+  name: get_cellular_ims_voice_status
+  type: http
+  seq: 155
+}
+
+get {
+  url: {{base_url}}/api/modem/lines/{{line_id}}/cellular-ims/call/status
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

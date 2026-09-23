@@ -14,6 +14,15 @@
 > 以下保留早期 v1.1.4 开发阶段的归纳；后续 beta 版本的独立验收范围以
 > `docs/releases/` 中对应版本说明为准。
 
+- **IMS 注册相关命名从 `volte` 统一为 `cellular_ims`。** VoLTE 只是 IMS 之上的语音
+  业务，而这些名称描述的是蜂窝接入的 IMS 注册本身（同时承载短信、语音和补充业务）。
+  错误码改为 `cellular_ims_*`，前端按完整 token 精确匹配，不再做子串匹配；
+  接口 JSON 与线路配置写出新字段名，旧字段名仍可读入；启动时把数据库中的
+  `volte_refresh_stats` 表、短信/事件的 `volte_ims` 传输标记和 `volte.*` 事件类型迁移为
+  新名称，界面对旧值仍能正确显示。`/api/volte/*` 旧路由继续保留为别名；
+  环境变量改为 `SIMADMIN_CELLULAR_IMS_*`，旧名仍生效。界面上的“4G/5G”“VoLTE”文案不变。
+  详见 `docs/IMS_NAMING_MIGRATION.md`。
+
 - **Telegram 通知支持自定义反代地址。** 新增 `api_base` 字段：留空仍直连官方
   `https://api.telegram.org`，不改变现有部署；填入自建反代（如 CF-Workers-TGbot
   这类保持 `/bot<token>/<method>` 路径的代理）即可在直连受限的网络下发送。

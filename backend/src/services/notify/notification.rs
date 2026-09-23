@@ -3109,7 +3109,8 @@ fn render_sms_template(
 fn sms_transport_label(transport: &str) -> &'static str {
     match transport.trim() {
         "vowifi_ims" => "VoWiFi",
-        "volte_ims" => "VoLTE",
+        // `volte_ims` is how rows stored before the cellular IMS rename read.
+        "cellular_ims" | "volte_ims" => "VoLTE",
         _ => "CS",
     }
 }
@@ -3522,6 +3523,7 @@ mod tests {
         let context = SmsTemplateContext::default();
         for (stored, expected) in [
             ("modem", "CS"),
+            ("cellular_ims", "VoLTE"),
             ("volte_ims", "VoLTE"),
             ("vowifi_ims", "VoWiFi"),
         ] {

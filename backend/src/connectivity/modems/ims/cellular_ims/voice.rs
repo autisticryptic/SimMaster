@@ -53,7 +53,7 @@ pub fn cellular_ims_voice_params(voice_enabled: bool) -> VoiceParams {
         vowifi_enabled: voice_enabled,
         carrier_fallback_enabled: false,
         ims_transport: "udp",
-        profile_id: "volte_ims",
+        profile_id: "cellular_ims",
         plmn: "",
     }
 }

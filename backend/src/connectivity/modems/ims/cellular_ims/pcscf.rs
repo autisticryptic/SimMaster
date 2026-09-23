@@ -32,8 +32,15 @@ use super::plan::{ImsConnectionPlan, IpFamily};
 const DNS_TIMEOUT: Duration = Duration::from_secs(4);
 const DNS_PORT: u16 = 53;
 const SIP_PORT: u16 = 5060;
-const ENV_PCSCF: &str = "SIMADMIN_VOLTE_PCSCF";
-const ENV_IMS_CID: &str = "SIMADMIN_VOLTE_IMS_CID";
+const ENV_PCSCF: &str = "SIMADMIN_CELLULAR_IMS_PCSCF";
+const ENV_IMS_CID: &str = "SIMADMIN_CELLULAR_IMS_CID";
+// Names used before the cellular IMS rename; still honoured when the new one is unset.
+const LEGACY_ENV_PCSCF: &str = "SIMADMIN_VOLTE_PCSCF";
+const LEGACY_ENV_IMS_CID: &str = "SIMADMIN_VOLTE_IMS_CID";
+
+fn ims_env_var(name: &str, legacy: &str) -> Result<String, std::env::VarError> {
+    std::env::var(name).or_else(|_| std::env::var(legacy))
+}
 const DEFAULT_IMS_CID: u8 = 2;
 const PROFILE_PCSCF_READ_ROUNDS: usize = 4;
 const PROFILE_PCSCF_READ_DELAY: Duration = Duration::from_millis(750);
@@ -217,11 +224,11 @@ pub fn parse_ip_settings(block: &str) -> ImsIpSettings {
 }
 
 /// The IMS PDP context id used for P-CSCF discovery and the IPv6 WDS preflight.
-/// Honors `SIMADMIN_VOLTE_IMS_CID` (1..=16), else falls back to CID 2. Exposed
+/// Honors `SIMADMIN_CELLULAR_IMS_CID` (legacy `SIMADMIN_VOLTE_IMS_CID`, 1..=16), else falls back to CID 2. Exposed
 /// so callers that skip the AT probe (e.g. when it is non-fatal and returns no
 /// candidates) still have a stable CID hint for the preflight.
 pub fn configured_ims_cid() -> u8 {
-    std::env::var(ENV_IMS_CID)
+    ims_env_var(ENV_IMS_CID, LEGACY_ENV_IMS_CID)
         .ok()
         .and_then(|value| value.trim().parse::<u8>().ok())
         .filter(|value| (1..=16).contains(value))
@@ -464,7 +471,7 @@ async fn cleanup_profile_context(modem: &str, cid: u8, restore_command: &str) {
 ///
 /// This fallback is deliberately read-only. Reconfiguring or toggling a fixed
 /// CID here races ModemManager and can tear down the bearer whose PCO we are
-/// trying to inspect. `SIMADMIN_VOLTE_IMS_CID` is only a preference when more
+/// trying to inspect. `SIMADMIN_CELLULAR_IMS_CID` is only a preference when more
 /// than one active IMS context exists; it never causes a context to be changed.
 pub async fn discover_pcscf_via_active_at_context(
     modem: &str,
@@ -774,7 +781,7 @@ pub async fn discover_pcscf_candidates_in_worker(
     interface: &str,
     worker: &UeWorkerHandle,
 ) -> Result<Vec<SocketAddr>, CellularImsError> {
-    if let Ok(explicit) = std::env::var(ENV_PCSCF) {
+    if let Ok(explicit) = ims_env_var(ENV_PCSCF, LEGACY_ENV_PCSCF) {
         let candidates = pcscf_candidates_for_family(&parse_pcscf_override(&explicit), local);
         if !candidates.is_empty() {
             return Ok(candidates.into_iter().map(pcscf_socket).collect());
@@ -813,7 +820,7 @@ async fn discover_pcscf_on_path(
     interface: &str,
     worker: &UeWorkerHandle,
 ) -> Result<SocketAddr, CellularImsError> {
-    if let Ok(explicit) = std::env::var(ENV_PCSCF) {
+    if let Ok(explicit) = ims_env_var(ENV_PCSCF, LEGACY_ENV_PCSCF) {
         if let Some(address) = parse_pcscf_override(&explicit)
             .into_iter()
             .find(|candidate| same_family(local, *candidate))

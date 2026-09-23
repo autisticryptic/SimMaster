@@ -174,7 +174,7 @@ export default function CarrierProfilesPanel() {
       const response = await api.installCarrierCatalog({ asset_url: catalogAssetUrl })
       const installed = response.data
       setSuccess(installed
-        ? `已覆盖并启用 ${installed.release_id}：VoLTE ${installed.volte_profiles} 条，VoWiFi ${installed.vowifi_profiles} 条`
+        ? `已覆盖并启用 ${installed.release_id}：VoLTE ${installed.cellular_ims_profiles} 条，VoWiFi ${installed.vowifi_profiles} 条`
         : '运营商数据库安装完成')
       setCatalogDialogOpen(false)
       invalidateCarrierProfileSummaryCache()
@@ -394,7 +394,7 @@ export default function CarrierProfilesPanel() {
                         <TableCell sx={{ fontFamily: 'monospace' }}>{profile.plmn}</TableCell>
                         <TableCell>
                           <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
-                            {profile.volte_ready && <Chip size="small" label="VoLTE" color="primary" variant="outlined" />}
+                            {profile.cellular_ims_ready && <Chip size="small" label="VoLTE" color="primary" variant="outlined" />}
                             {profile.vowifi_ready && <Chip size="small" label="VoWiFi" color="success" variant="outlined" />}
                             {profile.vilte_enabled && <Chip size="small" label="ViLTE" color="secondary" variant="outlined" />}
                             {profile.smsoip_enabled && <Chip size="small" label="SMS IMS" variant="outlined" />}
@@ -507,7 +507,7 @@ export default function CarrierProfilesPanel() {
               </Stack>
               <Typography variant="caption" color="text.secondary">
                 {catalogStatus?.usable
-                  ? `${catalogStatus.release_id} · ${catalogStatus.generated_at} · VoLTE ${catalogStatus.volte_profiles} 条 · VoWiFi ${catalogStatus.vowifi_profiles} 条`
+                  ? `${catalogStatus.release_id} · ${catalogStatus.generated_at} · VoLTE ${catalogStatus.cellular_ims_profiles} 条 · VoWiFi ${catalogStatus.vowifi_profiles} 条`
                   : `尚无可用运营商数据库。${catalogStatus?.message || ''}`}
               </Typography>
             </Box>

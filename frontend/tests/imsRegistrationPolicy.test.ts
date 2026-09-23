@@ -40,9 +40,9 @@ await test('cost restrictions produce clear Chinese errors without hiding unrela
 })
 
 await test('voice controls display effective WiFi priority without changing enabled flags or storage order', () => {
-  const stored = [{ kind: 'volte', enabled: true }, { kind: 'vowifi', enabled: false }] as const
+  const stored = [{ kind: 'cellular_ims', enabled: true }, { kind: 'vowifi', enabled: false }] as const
   const displayed = orderedVoicePaths(stored)
-  assert.deepEqual(displayed, [{ kind: 'vowifi', enabled: false }, { kind: 'volte', enabled: true }])
-  assert.equal(stored[0].kind, 'volte')
+  assert.deepEqual(displayed, [{ kind: 'vowifi', enabled: false }, { kind: 'cellular_ims', enabled: true }])
+  assert.equal(stored[0].kind, 'cellular_ims')
   assert.equal(stored[1].enabled, false)
 })

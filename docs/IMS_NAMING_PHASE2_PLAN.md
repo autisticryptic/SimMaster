@@ -261,19 +261,28 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 
 ### 步骤 5 — JSON 字段与 serde 别名
 
-注意：`volte_ims` 同时是短信 transport 的**持久化值**（见 §6 排除项），
-本步只改 `api/models.rs:1246` 的 serde 字段名，不动 transport 值。
+`volte_ims` 的持久化 transport 值由步骤 7 带迁移处理；本步只动 serde 字段名。
 
-- [ ] 为 `volte_profiles` / `volte_ims` / `volte_ready` 补 `cellular_ims_*` alias
-- [ ] 6 个已有 alias 的键交换 `rename` 与 `alias`，改为写出新名、读入兼容旧名
-- [ ] `frontend/src/api/contracts.ts` 同步
-- [ ] 其余 8 个前端文件同步
+- [x] `volte_profiles` / `volte_ims`（effective profile 字段）/ `volte_ready` /
+      运行态 `volte` 改为写出 `cellular_ims_profiles` / `cellular_ims` /
+      `cellular_ims_ready` / `cellular_ims`，旧名保留为 alias
+- [x] 6 个已有 alias 的线路配置键交换 `rename` 与 `alias`：写出新名、读入兼容旧名；
+      混用新旧两种拼写仍按设计 fail closed。已确认 profile 更新走类型化接口，
+      不存在“旧文档 + 新字段”原样合并后反序列化的路径
+- [x] SIM 覆盖配置 `ims_volte` / `ims.volte` → `ims_cellular` / `ims.cellular_ims`；
+      `AccessPathKind` 写出 `"cellular_ims"`；UT 响应 `access` 同步
+- [x] `frontend/src/api/contracts.ts` 同步
+- [x] 其余前端文件同步（含 Dashboard、SMS、线路详情、语音路由、e2e 测试 ID）
+- [x] 环境变量 `SIMADMIN_CELLULAR_IMS_PCSCF` / `SIMADMIN_CELLULAR_IMS_CID`，
+      `SIMADMIN_VOLTE_*` 保留为回退
 
 ### 步骤 6 — 收尾
 
-- [ ] `bruno-api/` 9 个文件更新（文件名与请求体）
-- [ ] 更新 `docs/IMS_NAMING_MIGRATION.md`，修正"stored in the database"的错误记载
-- [ ] `docs/CHANGELOG.md` 追加条目
+- [x] `bruno-api/`：5 个请求改名并指向 `/cellular-ims/` 规范路由，
+      2 个路径策略请求体改为 `cellular_ims`，删除早已 404 的 `set_volte_voice.bru`，README 同步
+- [x] 更新 `docs/IMS_NAMING_MIGRATION.md`：标注第一阶段“保留旧写出名”的决定已被取代，
+      更正“错误码持久化”的错误记载，新增第二阶段小节
+- [x] `docs/CHANGELOG.md` 追加条目
 - [ ] CI 全绿，`Publish Release` 保持 `skipped`
 
 ### 步骤 7 — 数据库联动（2026-09-23 纳入范围）
@@ -282,12 +291,16 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 持久化名称。§2.2 与 §6.1 的“留待联动”因此改为本步执行。持久化值不能靠文本替换，
 每项都要有迁移，且读取端兼容旧值：
 
-- [ ] 表 `volte_refresh_stats` → `cellular_ims_refresh_stats`：启动迁移在旧表存在、
-      新表不存在时 `ALTER TABLE ... RENAME TO`
-- [ ] `sms_messages.transport` 取值 `volte_ims` → `cellular_ims`：迁移改写历史行；
-      后端解析与前端显示仍接受旧值，防止未迁移的备份导入后显示错误来源
-- [ ] 短信去重指纹前缀 `volte-mt:`：评估是否改名（改名会让窗口期内的重复短信
-      漏过去重，需同时查新旧两种前缀）
+- [x] 表 `volte_refresh_stats` → `cellular_ims_refresh_stats`。迁移以旧表存在为触发条件
+      （此前每个版本启动时都会建旧表，旧表存在 ⇔ 可能有旧名数据），把旧行并入新表后删除旧表；
+      降级运行旧版后再升级，同一迁移会再跑一次
+- [x] `sms_messages` / `sms_dedup` / `app_events` 的 transport `volte_ims` → `cellular_ims`，
+      `app_events` 事件类型 `volte.*` → `cellular_ims.*`；后端归一化、通知标签、
+      诊断日志子系统标签与前端显示仍接受旧值
+- [x] 短信 MT 标记前缀 `volte-mt:` → `cellular-ims-mt:`：去重主判据是内容指纹，
+      不含前缀，不受影响；按标记做的逐条查重依赖存量 `pdu`，因此迁移同时改写历史行
+- [x] 新增迁移测试 `legacy_volte_persisted_names_migrate_to_cellular_ims`
+      （模拟旧版在新库上写入，再次启动后逐项核对，并验证二次启动无副作用）
 - [ ] `carrier_Bundles`：唯一的 `volte` 标识符是配置文档的 `services.volte`。
       它镜像运营商自身的 VoLTE 标志（Android `carrier_volte_available_bool`、
       iOS `SupportsVolteCapability`），与 `services.vonr` / `services.vowifi` 并列，
@@ -320,7 +333,8 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 
 ### 6.3 通用边界
 
-- 不做 schema 变更；`volte_enabled` 列与 `volte_refresh_stats` 表名留待数据库联动。
+- ~~不做 schema 变更；`volte_enabled` 列与 `volte_refresh_stats` 表名留待数据库联动。~~
+  已由步骤 7 带迁移完成（`volte_enabled` 实为线路配置 JSON 键，归步骤 5）。
 - `/volte/*` 路由别名不删除。
 - 不改动对外提示文案的中文表述。
 - 不触碰 IMS 注册逻辑本身——本阶段是纯命名与契约变更。
@@ -335,7 +349,12 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 | — | `8cd62e1` | 本计划文档落盘 |
 | 1 | `20d5bda` | 码表补齐至 158 项、194 处调用点改引用常量、新增一致性守卫 |
 | 1 | `27542f0` | 补 `handlers.rs` 的 `code` 导入（修 17 处 E0433） |
+| 2–3 | `afa7112` | 前端按 token 精确匹配、生成式码表、前后端码表一致性守卫；CI 全绿 |
+| 4 | `a4108f3` | 错误码 `volte_*` → `cellular_ims_*`（427 处，14 个文件）；CI 全绿 |
 
 步骤 1 验收：CI `Validate Beta Refactor` / `Build-Release` 全绿，
 arm64 与 amd64 均编译通过，`Publish Release` 保持 `skipped`；
 本地 90 项 Python 结构化测试通过（原 83 + 新守卫 7）。
+
+步骤 2–4 验收：本地 95 项 Python 守卫、前端 8 项单测、`tsc -b` 与
+`eslint --max-warnings 0` 通过；`afa7112` 与 `a4108f3` 的三个工作流均为 success。

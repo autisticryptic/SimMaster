@@ -231,14 +231,15 @@ pub fn record_for_app_event(
 /// edit at every call site.
 fn subsystem_for_event(event_type: &str, transport: Option<&str>) -> &'static str {
     match event_type.split('.').next().unwrap_or(event_type) {
-        "volte" => "VoLTE",
+        // `volte` is how events recorded before the cellular IMS rename are named.
+        "cellular_ims" | "volte" => "CellularIMS",
         "vowifi" => "VoWiFi",
         "trunk" => "Trunk",
         "sms" => "SMS",
         "call" | "calls" => "Call",
         "system" => "System",
         _ => match transport {
-            Some("volte_ims") => "VoLTE",
+            Some("cellular_ims") | Some("volte_ims") => "CellularIMS",
             Some("vowifi") => "VoWiFi",
             Some("trunk") => "Trunk",
             _ => "App",
@@ -814,15 +815,15 @@ mod tests {
 
         let per_line = with_ue_worker_context(async {
             record_for_app_event(
-                "volte.connection_attempt",
+                "cellular_ims.connection_attempt",
                 Some("79139C"),
-                Some("volte_ims"),
+                Some("cellular_ims"),
                 &payload,
             )
         })
         .await;
         assert_eq!(per_line.context, ExecutionContext::UeWorker);
-        assert_eq!(per_line.subsystem, "VoLTE");
+        assert_eq!(per_line.subsystem, "CellularIMS");
         // An error present anywhere in the payload lifts the record above Info.
         assert_eq!(per_line.severity, DiagnosticLogSeverity::Warn);
         assert_eq!(

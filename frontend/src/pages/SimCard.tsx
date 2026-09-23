@@ -273,7 +273,7 @@ function WorkbenchOverview({ line }: { line: CellularImsLineControlResponse }) {
         status: vowifi?.runtime_stage || '等待连接',
       }
     }
-    if (line.runtime.registered || line.profile.volte_connection_enabled) {
+    if (line.runtime.registered || line.profile.cellular_ims_connection_enabled) {
       const stages = ['SIM 身份', '无线接入', 'IMS Bearer', 'P-CSCF', 'IMS 注册', '注册就绪']
       const stageIndex: Record<string, number> = {
         identity: 0, identity_aka: 0, radio: 1, modem: 1,

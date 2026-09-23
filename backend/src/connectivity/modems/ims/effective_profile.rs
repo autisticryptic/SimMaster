@@ -408,7 +408,7 @@ pub fn validate_override(override_: &SimOverride) -> Vec<String> {
     }
     for (access, name) in [
         (&override_.ims_vowifi, "ims_vowifi"),
-        (&override_.ims_cellular, "ims_volte"),
+        (&override_.ims_cellular, "ims_cellular"),
     ] {
         validate_access(access, name, &mut problems);
     }
@@ -484,7 +484,7 @@ pub fn source_map_of(
     for (index, server) in vowifi.dns_servers.iter().enumerate() {
         push_field(&mut map, &format!("vowifi.dns[{index}]"), server);
     }
-    for (prefix, ims) in [("volte_ims", cellular_ims), ("vowifi_ims", vowifi_ims)] {
+    for (prefix, ims) in [("cellular_ims", cellular_ims), ("vowifi_ims", vowifi_ims)] {
         push_field(&mut map, &format!("{prefix}.domain"), &ims.domain);
         push_field(&mut map, &format!("{prefix}.realm"), &ims.realm);
         if let Some(pcscf) = &ims.pcscf {
@@ -772,7 +772,7 @@ mod tests {
         );
         assert!(map.contains(&("vowifi.epdg_host".to_string(), OverrideSource::SimOverride)));
         assert!(map.contains(&("vowifi.epdg_port".to_string(), OverrideSource::Catalog)));
-        assert!(map.contains(&("volte_ims.domain".to_string(), OverrideSource::Catalog)));
+        assert!(map.contains(&("cellular_ims.domain".to_string(), OverrideSource::Catalog)));
         assert!(map.contains(&("vowifi_ims.domain".to_string(), OverrideSource::Catalog)));
         assert!(map.contains(&("identity.imei".to_string(), OverrideSource::Network)));
     }

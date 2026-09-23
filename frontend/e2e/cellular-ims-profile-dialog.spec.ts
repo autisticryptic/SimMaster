@@ -75,7 +75,7 @@ async function openDialog(page: Page) {
   // so matching on the label picks the wrong control and *acts* on it. Doing
   // that once while writing these tests saved a data-proxy config on a live
   // device, which is why the id exists.
-  const configButtons = page.getByTestId('volte-profile-config')
+  const configButtons = page.getByTestId('cellular-ims-profile-config')
   const appeared = await configButtons
     .first()
     .waitFor({ state: 'visible', timeout: 30_000 })

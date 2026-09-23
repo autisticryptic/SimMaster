@@ -29,7 +29,7 @@ function imsStatusLabel(line: DashboardLineInfo) {
 
   const registered = line.ims.registration.registered_over
   const hasVowifi = registered.includes('vowifi')
-  const hasCellularIms = registered.includes('volte')
+  const hasCellularIms = registered.includes('cellular_ims')
   if (hasVowifi && hasCellularIms) return { label: 'VoWiFi + VoLTE', color: 'success' as const }
   if (hasVowifi) return { label: 'VoWiFi', color: 'success' as const }
   if (hasCellularIms) return { label: 'VoLTE', color: 'success' as const }

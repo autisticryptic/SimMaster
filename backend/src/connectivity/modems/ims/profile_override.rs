@@ -238,7 +238,7 @@ pub struct SimOverride {
     #[serde(default)]
     pub ims_common: ImsCommonOverride,
     #[serde(default)]
-    #[serde(rename = "ims_volte", alias = "ims_cellular")]
+    #[serde(rename = "ims_cellular", alias = "ims_volte")]
     pub ims_cellular: ImsAccessOverride,
     #[serde(default)]
     pub ims_vowifi: ImsAccessOverride,
@@ -341,7 +341,7 @@ impl StoredBinding {
 #[serde(default)]
 struct StoredImsOverrides {
     common: ImsCommonOverride,
-    #[serde(rename = "volte", alias = "cellular_ims")]
+    #[serde(rename = "cellular_ims", alias = "volte")]
     cellular_ims: ImsAccessOverride,
     vowifi: ImsAccessOverride,
 }
@@ -866,25 +866,35 @@ mod tests {
         let mut value = SimOverride::default();
         value.ims_cellular.apn = Some("ims.fixture".into());
         value.ims_cellular.pcscf = Some(vec!["192.0.2.1".into()]);
+        // Canonical documents use ims_cellular / ims.cellular_ims; files saved by
+        // older releases carry ims_volte / ims.volte and must decode identically.
         let flat = serde_json::to_value(&value).unwrap();
-        assert!(flat.get("ims_volte").is_some());
-        let mut alias = flat.clone();
-        let cell = alias.as_object_mut().unwrap().remove("ims_volte").unwrap();
-        alias["ims_cellular"] = cell;
-        assert_eq!(serde_json::from_value::<SimOverride>(alias).unwrap(), value);
+        assert!(flat.get("ims_cellular").is_some());
+        assert!(flat.get("ims_volte").is_none());
+        let mut legacy = flat.clone();
+        let cell = legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("ims_cellular")
+            .unwrap();
+        legacy["ims_volte"] = cell;
+        assert_eq!(
+            serde_json::from_value::<SimOverride>(legacy).unwrap(),
+            value
+        );
         let key = SimBindingKey::Plain {
             iccid: "test-sim".into(),
         };
         let stored = serde_json::to_value(OverrideFile::from_override(&key, &value)).unwrap();
-        assert!(stored["ims"].get("volte").is_some());
-        let mut alias = stored.clone();
-        let cell = alias["ims"]
+        assert!(stored["ims"].get("cellular_ims").is_some());
+        let mut legacy = stored.clone();
+        let cell = legacy["ims"]
             .as_object_mut()
             .unwrap()
-            .remove("volte")
+            .remove("cellular_ims")
             .unwrap();
-        alias["ims"]["cellular_ims"] = cell;
-        let decoded: OverrideFile = serde_json::from_value(alias).unwrap();
+        legacy["ims"]["volte"] = cell;
+        let decoded: OverrideFile = serde_json::from_value(legacy).unwrap();
         assert_eq!(decoded.clone().into_override(), value);
         assert_eq!(serde_json::to_value(decoded).unwrap(), stored);
     }
@@ -1119,7 +1129,10 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(store.path_for(&key)).unwrap()).unwrap();
         assert!(value.get("ims").and_then(|ims| ims.get("common")).is_some());
-        assert!(value.get("ims").and_then(|ims| ims.get("volte")).is_some());
+        assert!(value
+            .get("ims")
+            .and_then(|ims| ims.get("cellular_ims"))
+            .is_some());
         assert!(value.get("ims").and_then(|ims| ims.get("vowifi")).is_some());
         assert!(value.get("ims_common").is_none());
     }

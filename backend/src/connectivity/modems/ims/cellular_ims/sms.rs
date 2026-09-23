@@ -9,7 +9,7 @@
 //!
 //! This module adds the VoLTE-specific orchestration: multipart segment
 //! reassembly, cross-frame dedup keys, and the persistence marker/transport tag
-//! (`volte_ims` / `volte-mt:<key>`) so stored MT SMS dedup deterministically.
+//! (`cellular_ims` / `cellular-ims-mt:<key>`) so stored MT SMS dedup deterministically.
 
 use std::collections::HashMap;
 
@@ -17,9 +17,9 @@ use crate::connectivity::core::sms_codec::{parse_mt_rp_data, MtSmsDeliver, SmsEn
 
 /// Transport tag stored on the shared `sms_messages` row (db `transport`
 /// column), distinguishing VoLTE-delivered SMS from modem/vowifi ones.
-pub const TRANSPORT_TAG: &str = "volte_ims";
+pub const TRANSPORT_TAG: &str = "cellular_ims";
 /// Prefix for the synthetic dedup marker stored in the `pdu` column.
-pub const MT_MARKER_PREFIX: &str = "volte-mt:";
+pub const MT_MARKER_PREFIX: &str = "cellular-ims-mt:";
 
 /// Outcome of feeding one inbound MT MESSAGE body into the reassembler.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,7 +264,7 @@ mod tests {
                 assert_eq!(sms.text, "hello");
                 assert_eq!(sms.segment_reference, None);
                 assert_eq!(sms.segment_total, 1);
-                assert!(sms.dedup_marker.starts_with("volte-mt:single:"));
+                assert!(sms.dedup_marker.starts_with("cellular-ims-mt:single:"));
             }
             other => panic!("expected Complete, got {other:?}"),
         }
@@ -293,7 +293,9 @@ mod tests {
                 assert_eq!(sms.text, "Hello World");
                 assert_eq!(sms.segment_reference, Some(0x1234));
                 assert_eq!(sms.segment_total, 2);
-                assert!(sms.dedup_marker.starts_with("volte-mt:segment:1234:2:"));
+                assert!(sms
+                    .dedup_marker
+                    .starts_with("cellular-ims-mt:segment:1234:2:"));
             }
             other => panic!("expected Complete, got {other:?}"),
         }
@@ -345,7 +347,7 @@ mod tests {
 
     #[test]
     fn transport_tag_and_marker_prefix_are_stable() {
-        assert_eq!(TRANSPORT_TAG, "volte_ims");
-        assert_eq!(MT_MARKER_PREFIX, "volte-mt:");
+        assert_eq!(TRANSPORT_TAG, "cellular_ims");
+        assert_eq!(MT_MARKER_PREFIX, "cellular-ims-mt:");
     }
 }

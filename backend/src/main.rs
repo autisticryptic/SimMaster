@@ -110,9 +110,9 @@ fn spawn_runtime_event_bridge(app: AppState) {
                             continue;
                         }
                         if let Err(error) = app.event_bus.publish(
-                            "volte.connection_attempt",
+                            "cellular_ims.connection_attempt",
                             Some(&line_id),
-                            Some("volte_ims"),
+                            Some("cellular_ims"),
                             serde_json::json!({ "attempt": attempt }),
                         ) {
                             tracing::warn!(line_id, error = %error, "Failed to publish VoLTE connection event");
