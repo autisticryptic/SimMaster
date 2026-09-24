@@ -15,9 +15,9 @@
 | 后端选择 | 已完成（代码+CI） | `backends/config.rs`：默认 MM；`mode: native` 需 `allow_unvalidated_native: true`；未知目标不回退 MM |
 | 协议控制器 | 已完成（代码+CI） | QMI DMS/NAS/UIM/WDS、MBIM、AT；按物理设备串行、flock、超时与输出上限（`native.rs`、`io.rs`、`bearer.rs`） |
 | SIM/AKA、承载、UE 数据面 | 已完成（代码+CI） | QMI UIM / AT CCHO-CGLA；QMI/MBIM 会话、receipt、namespace 归还确认 |
-| 短信/电话/USSD | 部分 | AT 命令与 URC 分流、原生短信事件提示触发扫描＋15 秒兜底已补；电话仍主要 `CLCC` 轮询，尚非完整事件驱动业务层 |
+| 短信/电话/USSD | 部分 | AT/URC 分流与有界广播已接通，事件唤醒通话/注册权威核对；短信存储接收保留兜底；直接 PDU/送达报告尚未完整消费 |
 | 设备发现 | 代码/CI及SIM-04只读运行通过 | `discover-native` 只读扫描 sysfs，输出端口/物理锚点建议与不完整配置；不自动启用 native，不猜 IMS/data 映射 |
-| Quectel | 专用驱动仅分类 | `devices/quectel/` 主要提供型号分类；native 已可走通用 AT/QMI 控制，但没有 Quectel MBN/USB composition 专用管理 |
+| Quectel | 诊断及显式维护已接线/通过CI | EC2x/EG25 的型号/IMS/MBN/USB诊断、revision确认及写后回读；真实固件未验收 |
 | 混合 owner | 未实现 | 同机 MM/native 分设备并行未接通；当前全局二选一 |
 | 代次恢复 | 未实现 | 控制节点代次变化需重启；无自动孤儿会话 reconciliation |
 | 实机验收 | **无** | 已实测的 IMS 注册/续期（SIM-03、SIM-04 T03/T04/T05、`71513ea`）全部走 **MM 路径**，不能算 native 证据 |
@@ -86,7 +86,9 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
       `35951689850` success，arm64/amd64 success，Publish Release skipped
 - [x] 通话/注册事件有界订阅与独立广播，唤醒 CLCC/线路权威核对，落后订阅者全量核对；
       native 空闲通话/线路采用低频兜底，活动通话保留结束判定；API事件仅含提示
-- [ ] 新业务事件接线 CI；跨代次断口/孤儿资源自动恢复仍不启用（同代次传输错误可重开，
+- [x] 新业务事件接线 CI：`12daeef`，Validate `35972665477` / Build `35972665685` success，
+      arm64/amd64均成功，Publish skipped；本地118项Python守卫通过
+- [ ] 跨代次断口/孤儿资源自动恢复仍不启用（同代次传输错误可重开，
       控制节点换代仍要求重新核对，不能盲目复用 CID）
 - [ ] 直接 `+CMT` 正文与 `+CDS` delivery-report 的完整业务消费（当前仅隔离并触发核对）；
       配置仍使用存储通知，不因收到一个 hint 就声称短信已入库或发送成功
@@ -143,6 +145,10 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 | — | `71513ea` | 审计基线；该版本 SIM-04 MM 路径已实机注册及自然续期 |
 | N1 | `7a15a7f` | 被动发现、12 项 Rust 回归、4 项 Python 守卫；双架构 CI 通过，无硬件写入 |
 | N2 基础 | `efe6135` | AT/URC 分流、有界读取、经准入的短信事件提示调度；双架构 CI 通过，未做 native 实机业务测试 |
+| N3 | `ed508af` | Quectel诊断与显式维护，两套CI通过（修正首轮未声明依赖） |
+| N5 | `16ee44e` | AT/QMI SIM通道与lpac范围账本、未知结果保护，CI通过 |
+| N4 | `7e255b8` / `32df051` | DJI维护入口；后者修复musl ioctl request参数类型，双架构CI通过 |
+| N2 业务事件 | `12daeef` | 原生通话/注册独立订阅与Lagged核对、Web安全提示，两套CI与双架构通过 |
 
 参考仓库审计快照：VoCat `484cd23`、mdd-sim-gateway `8d9a830`、DJIModeSwitcher
 `6d86b64`、EC25Toolbox `12678de`、DJOneHub `f7f1a0d`。只读发现是本项目自行实现，
