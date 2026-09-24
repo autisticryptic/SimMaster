@@ -55,18 +55,18 @@ pub trait NativeIo: Send + Sync {
     }
 }
 
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PortIdentity {
-    device: String,
-    canonical: std::path::PathBuf,
-    sysfs: std::path::PathBuf,
-    rdev: u64,
-    inode: u64,
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PortIdentity {
+    pub(super) device: String,
+    pub(super) canonical: std::path::PathBuf,
+    pub(super) sysfs: std::path::PathBuf,
+    pub(super) rdev: u64,
+    pub(super) inode: u64,
 }
 
 #[cfg(unix)]
-fn identity(device: &str, anchor: &std::path::Path) -> Result<PortIdentity, NativeError> {
+pub(super) fn identity(device: &str, anchor: &std::path::Path) -> Result<PortIdentity, NativeError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let canonical = std::fs::canonicalize(device)
         .map_err(|_| NativeError::Unavailable("native_control_port_absent".into()))?;
@@ -97,8 +97,17 @@ fn identity(device: &str, anchor: &std::path::Path) -> Result<PortIdentity, Nati
     })
 }
 
+#[cfg(not(unix))]
+pub(super) fn identity(_device: &str, _anchor: &std::path::Path) -> Result<PortIdentity, NativeError> {
+    Err(NativeError::Unsupported("native_backend_requires_linux"))
+}
+
 pub struct SystemNativeIo {
     connection: Arc<Connection>,
+    #[cfg(unix)]
+    spec: NativeDeviceConfig,
+    #[cfg(unix)]
+    owner_instance: super::recovery::OwnerInstance,
     invalidated: std::sync::atomic::AtomicBool,
     #[cfg(unix)]
     anchor: std::path::PathBuf,
@@ -116,7 +125,7 @@ impl SystemNativeIo {
     /// the operator. It never stops it itself and never calls a method that
     /// would D-Bus-activate MM. Coexisting device owners need a separate,
     /// explicit inhibition/port-isolation policy, not a fallback here.
-    async fn verify_manager_absent(connection: &Connection) -> Result<(), NativeError> {
+    pub(super) async fn verify_manager_absent(connection: &Connection) -> Result<(), NativeError> {
         let bus = DBusProxy::new(connection)
             .await
             .map_err(|_| NativeError::OwnerConflict("native_owner_check_unavailable".into()))?;
@@ -197,6 +206,9 @@ impl SystemNativeIo {
             // Opening a new physical channel can invalidate old firmware CIDs.
             // Crash receipts must be reconciled before even a helper bootstrap.
             verify_receipts_clear(directory, &spec.line_id())?;
+            super::recovery::ensure_persistent_clear()?;
+            super::recovery::ensure_directory(std::path::Path::new(super::recovery::RECEIPT_DIRECTORY))?;
+            let owner_instance = super::recovery::OwnerInstance::current()?;
             let mut qmi_proxy_leases = Vec::new();
             if spec.protocol == NativeProtocol::Qmi {
                 let ports = std::iter::once(spec.control_device.clone())
@@ -217,6 +229,8 @@ impl SystemNativeIo {
             }
             Ok(Arc::new(Self {
                 connection,
+                spec: spec.clone(),
+                owner_instance,
                 invalidated: std::sync::atomic::AtomicBool::new(false),
                 anchor,
                 identities,
@@ -260,34 +274,13 @@ impl SystemNativeIo {
     }
 }
 
-fn verify_receipts_clear(directory: &std::path::Path, line: &str) -> Result<(), NativeError> {
-    let names = std::fs::read_dir(directory)
-        .map_err(|_| NativeError::OwnerConflict("native_session_receipt_state_unreadable".into()))?
-        .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| {
-            NativeError::OwnerConflict("native_session_receipt_state_unreadable".into())
-        })?;
-    for role in ["ims", "data", "maintenance", "sim"] {
-        let prefix = format!("session-{line}-{role}.");
-        if names
-            .iter()
-            .any(|name| name.starts_with(&prefix) && name.ends_with(".tmp"))
-        {
-            return Err(NativeError::OwnerConflict(
-                "native_sessions_require_reconciliation_before_native_start".into(),
-            ));
-        }
-        for extension in ["json", "tmp"] {
-            let path = directory.join(format!("session-{line}-{role}.{extension}"));
-            if path.try_exists().map_err(|_| {
-                NativeError::OwnerConflict("native_session_receipt_state_unreadable".into())
-            })? {
-                return Err(NativeError::OwnerConflict(
-                    "native_sessions_require_reconciliation_before_native_start".into(),
-                ));
-            }
-        }
+fn verify_receipts_clear(directory: &std::path::Path, _line: &str) -> Result<(), NativeError> {
+    // Unknown/legacy records cannot be attributed safely after a hardware-key
+    // or slot edit. All lines and DJI/partial receipts block normal startup.
+    if !super::recovery::pending_paths(directory)?.is_empty() {
+        return Err(NativeError::OwnerConflict(
+            "native_sessions_require_reconciliation_before_native_start".into(),
+        ));
     }
     Ok(())
 }
@@ -329,38 +322,18 @@ impl NativeIo for SystemNativeIo {
         Box::pin(self.verify(device))
     }
     fn save_receipt(&self, key: &str, bytes: &[u8], create: bool) -> Result<(), NativeError> {
-        use std::io::Write;
-        let path = ledger_path(key)?;
-        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        #[cfg(unix)] {
+            let record = super::recovery::Receipt::new(key, &self.spec, &self.anchor,
+                self.owner_instance.clone(), self.identities.clone(), bytes)?;
+            super::recovery::save_owned(std::path::Path::new(super::recovery::RECEIPT_DIRECTORY), key, &record, create)
         }
-        let mut file = options
-            .open(if create { &path } else { &temporary })
-            .map_err(|_| {
-                NativeError::OwnerConflict("native_session_receipt_pending_reconciliation".into())
-            })?;
-        file.write_all(bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| {
-                NativeError::OwnerConflict("native_session_receipt_write_failed".into())
-            })?;
-        if !create {
-            std::fs::rename(&temporary, &path).map_err(|_| {
-                NativeError::OwnerConflict("native_session_receipt_commit_failed".into())
-            })?;
-        }
-        Ok(())
+        #[cfg(not(unix))] { let _ = (key, bytes, create); Err(NativeError::Unsupported("native_backend_requires_linux")) }
     }
     fn clear_receipt(&self, key: &str) -> Result<(), NativeError> {
-        std::fs::remove_file(ledger_path(key)?)
-            .map_err(|_| NativeError::OwnerConflict("native_session_receipt_remove_failed".into()))
+        #[cfg(unix)] {
+            super::recovery::clear_owned(std::path::Path::new(super::recovery::RECEIPT_DIRECTORY), key, &self.owner_instance)
+        }
+        #[cfg(not(unix))] { let _ = key; Err(NativeError::Unsupported("native_backend_requires_linux")) }
     }
     fn verify_bearer<'a>(
         &'a self,
@@ -535,18 +508,6 @@ impl NativeIo for SystemNativeIo {
     }
 }
 
-fn ledger_path(key: &str) -> Result<std::path::PathBuf, NativeError> {
-    if key.is_empty()
-        || key.len() > 100
-        || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
-        return Err(NativeError::Protocol(
-            "native_session_ledger_key_invalid".into(),
-        ));
-    }
-    Ok(std::path::Path::new("/run/simadmin/native-control").join(format!("{key}.json")))
-}
-
 pub(crate) async fn run_process(request: &CommandRequest) -> Result<String, NativeError> {
     let program = match request.tool {
         Tool::Qmi => "qmicli",
@@ -691,7 +652,7 @@ mod tests {
                 let path = directory.join(format!("session-fixture-{role}.{extension}"));
                 std::fs::write(&path, "{}").unwrap();
                 assert!(verify_receipts_clear(&directory, "fixture").is_err());
-                assert!(verify_receipts_clear(&directory, "another-line").is_ok());
+                assert!(verify_receipts_clear(&directory, "another-line").is_err());
                 std::fs::remove_file(path).unwrap();
             }
         }

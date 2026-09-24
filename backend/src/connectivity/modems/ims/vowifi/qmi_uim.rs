@@ -1283,12 +1283,16 @@ struct QmiProxyConnection {
     next_service_transaction: u16,
     native_device:
         Option<std::sync::Arc<crate::hardware::cellular::backends::native::NativeDevice>>,
-    native_channel: Option<(
-        u8,
-        u8,
-        u8,
-        crate::hardware::cellular::backends::sim_ledger::ChannelLease,
-    )>,
+    native_channel: Option<NativeUimReceipt>,
+}
+
+#[cfg(unix)]
+struct NativeUimReceipt {
+    client_id: Option<u8>,
+    slot: u8,
+    channel_id: Option<u8>,
+    channel_uncertain: bool,
+    receipt: crate::hardware::cellular::backends::sim_ledger::ChannelLease,
 }
 
 /// Narrow native-management exchange sharing the proven QMUX framing. This is
@@ -1436,23 +1440,59 @@ impl QmiProxyConnection {
     }
 
     fn allocate_uim_cid(&mut self) -> Result<u8, QmiUimError> {
+        if let Some(device) = &self.native_device {
+            if self.native_channel.is_some() { return Err(QmiUimError::InvalidApduResponse); }
+            let receipt = crate::hardware::cellular::backends::sim_ledger::ChannelLease::begin(
+                device.clone(), crate::hardware::cellular::backends::sim_ledger::Purpose::QmiUim, false,
+            ).map_err(|_| QmiUimError::InvalidApduResponse)?;
+            self.native_channel = Some(NativeUimReceipt {
+                client_id: None, slot: device.spec.uim_slot, channel_id: None,
+                channel_uncertain: false, receipt,
+            });
+        }
+        // The allocation intent is durable before CTL can allocate a CID.
         let tx = self.take_ctl_transaction();
         let frame = build_allocate_uim_cid_frame(tx)?;
-        let response = self.send_and_recv(&frame)?;
-        if response.message_id != QMI_CTL_ALLOCATE_CID {
-            return Err(QmiUimError::InvalidFrame);
+        let result = (|| {
+            let response = if self.native_device.is_some() {
+                self.native_exchange_correlated(&decode_qmi_frame(&frame)?)?
+            } else { self.send_and_recv(&frame)? };
+            if response.message_id != QMI_CTL_ALLOCATE_CID { return Err(QmiUimError::InvalidFrame); }
+            parse_allocated_cid(&response)
+        })();
+        match result {
+            Ok(client) => {
+                if let Some(owned) = self.native_channel.as_mut() {
+                    owned.client_id = Some(client);
+                    owned.receipt.client_allocated(client).map_err(|_| QmiUimError::InvalidApduResponse)?;
+                }
+                Ok(client)
+            }
+            Err(error) => {
+                if matches!(error, QmiUimError::ResultFailure(_)) {
+                    if let Some(mut owned) = self.native_channel.take() { let _ = owned.receipt.rejected(); }
+                }
+                Err(error)
+            }
         }
-        parse_allocated_cid(&response)
     }
 
     fn release_uim_cid(&mut self, client_id: u8) -> Result<(), QmiUimError> {
+        if self.native_device.is_some() && !self.native_channel.as_ref().is_some_and(|owned|
+            owned.client_id == Some(client_id) && owned.channel_id.is_none() && !owned.channel_uncertain) {
+            return Err(QmiUimError::InvalidApduResponse);
+        }
         let tx = self.take_ctl_transaction();
         let frame = build_release_uim_cid_frame(client_id, tx)?;
-        let response = self.send_and_recv(&frame)?;
-        if response.message_id != QMI_CTL_RELEASE_CID {
-            return Err(QmiUimError::InvalidFrame);
-        }
+        let response = if self.native_device.is_some() {
+            self.native_exchange_correlated(&decode_qmi_frame(&frame)?)?
+        } else { self.send_and_recv(&frame)? };
+        if response.message_id != QMI_CTL_RELEASE_CID { return Err(QmiUimError::InvalidFrame); }
         ensure_success(&response)?;
+        if let Some(mut owned) = self.native_channel.take() {
+            owned.receipt.client_released().map_err(|_| QmiUimError::InvalidApduResponse)?;
+            owned.receipt.closed().map_err(|_| QmiUimError::InvalidApduResponse)?;
+        }
         Ok(())
     }
 
@@ -1479,21 +1519,17 @@ impl QmiProxyConnection {
         slot: u8,
         aid: &[u8],
     ) -> Result<LogicalChannelOpened, QmiUimError> {
+        if self.native_device.is_some() && !self.native_channel.as_ref().is_some_and(|owned|
+            owned.client_id == Some(client_id) && owned.slot == slot && owned.channel_id.is_none() && !owned.channel_uncertain) {
+            return Err(QmiUimError::InvalidApduResponse);
+        }
         let resolved_aid = self.resolve_application_aid(client_id, aid)?;
         let tx = self.take_service_transaction();
         let frame = build_open_logical_channel_frame(client_id, tx, slot, &resolved_aid)?;
-        let mut receipt = self
-            .native_device
-            .as_ref()
-            .map(|device| {
-                crate::hardware::cellular::backends::sim_ledger::ChannelLease::begin(
-                    device.clone(),
-                    crate::hardware::cellular::backends::sim_ledger::Purpose::QmiUim,
-                    false,
-                )
-            })
-            .transpose()
-            .map_err(|_| QmiUimError::InvalidApduResponse)?;
+        if let Some(owned) = self.native_channel.as_mut() {
+            owned.receipt.channel_open_pending().map_err(|_| QmiUimError::InvalidApduResponse)?;
+            owned.channel_uncertain = true;
+        }
         let exchange = if self.native_device.is_some() {
             self.native_exchange_correlated(&decode_qmi_frame(&frame)?)
         } else {
@@ -1507,20 +1543,22 @@ impl QmiProxyConnection {
         });
         match result {
             Ok(channel) => {
-                if let Some(mut receipt) = receipt.take() {
-                    let persisted = receipt.opened(Some(client_id), u32::from(channel.channel_id));
-                    self.native_channel = Some((client_id, slot, channel.channel_id, receipt));
-                    if persisted.is_err() {
-                        let _ = self.close_logical_channel(client_id, slot, channel.channel_id);
-                        return Err(QmiUimError::InvalidApduResponse);
-                    }
+                let persisted = if let Some(owned) = self.native_channel.as_mut() {
+                    owned.channel_id = Some(channel.channel_id);
+                    owned.channel_uncertain = false;
+                    owned.receipt.opened(Some(client_id), u32::from(channel.channel_id))
+                } else { Ok(()) };
+                if persisted.is_err() {
+                    let _ = self.close_logical_channel(client_id, slot, channel.channel_id);
+                    return Err(QmiUimError::InvalidApduResponse);
                 }
                 Ok(channel)
             }
             Err(error) => {
                 if matches!(error, QmiUimError::ResultFailure(_)) {
-                    if let Some(receipt) = receipt.as_mut() {
-                        let _ = receipt.rejected();
+                    if let Some(owned) = self.native_channel.as_mut() {
+                        owned.channel_uncertain = false;
+                        let _ = owned.receipt.channel_open_rejected();
                     }
                 }
                 Err(error)
@@ -1536,6 +1574,10 @@ impl QmiProxyConnection {
     ) -> Result<(), QmiUimError> {
         let tx = self.take_service_transaction();
         let frame = build_close_logical_channel_frame(client_id, tx, slot, channel_id)?;
+        if self.native_device.is_some() && !self.native_channel.as_ref().is_some_and(|owned|
+            owned.client_id == Some(client_id) && owned.slot == slot && owned.channel_id == Some(channel_id)) {
+            return Err(QmiUimError::InvalidApduResponse);
+        }
         let mut response = if self.native_device.is_some() {
             self.native_exchange_correlated(&decode_qmi_frame(&frame)?)?
         } else {
@@ -1555,18 +1597,10 @@ impl QmiProxyConnection {
             return Err(QmiUimError::InvalidFrame);
         }
         ensure_success(&response)?;
-        if self
-            .native_channel
-            .as_ref()
-            .is_some_and(|(client, owned_slot, channel, _)| {
-                (*client, *owned_slot, *channel) == (client_id, slot, channel_id)
-            })
-        {
-            if let Some((_, _, _, mut receipt)) = self.native_channel.take() {
-                receipt
-                    .closed()
-                    .map_err(|_| QmiUimError::InvalidApduResponse)?;
-            }
+        if let Some(owned) = self.native_channel.as_mut() {
+            owned.channel_id = None;
+            owned.channel_uncertain = false;
+            owned.receipt.channel_closed_retaining_client().map_err(|_| QmiUimError::InvalidApduResponse)?;
         }
         Ok(())
     }
@@ -1857,6 +1891,10 @@ fn find_tlv(message: &QmiMessage, tlv_type: u8) -> Option<&[u8]> {
 fn tlv(tlv_type: u8, value: Vec<u8>) -> QmiTlv {
     QmiTlv { tlv_type, value }
 }
+
+#[cfg(all(test, unix))]
+#[path = "qmi_uim_native_tests.rs"]
+mod native_ledger_tests;
 
 #[cfg(test)]
 mod tests {

@@ -34,8 +34,11 @@ pub struct NativeSnapshot {
     pub pin_state: String,
 }
 
+static NEXT_CONTROLLER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct NativeDevice {
     pub spec: NativeDeviceConfig,
+    pub controller_instance: String,
     pub(crate) io: Arc<dyn NativeIo>,
     pub(crate) operation: Arc<Mutex<()>>,
     maintenance_required: std::sync::atomic::AtomicBool,
@@ -49,8 +52,12 @@ pub struct NativeDevice {
 
 impl NativeDevice {
     pub fn new(spec: NativeDeviceConfig, io: Arc<dyn NativeIo>) -> Arc<Self> {
+        let sequence = NEXT_CONTROLLER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let controller_instance = super::direct_sms::digest(format!("{}:{started}:{sequence}:{}:{}", std::process::id(), spec.hardware_key, spec.sysfs_anchor).as_bytes());
         Arc::new(Self {
             spec,
+            controller_instance,
             io,
             operation: Arc::new(Mutex::new(())),
             maintenance_required: std::sync::atomic::AtomicBool::new(false),
@@ -606,24 +613,13 @@ impl NativeDevice {
         })
     }
 
-    pub async fn reset(self: &Arc<Self>, sim_only: bool) -> Result<(), NativeError> {
-        if sim_only && self.spec.protocol == NativeProtocol::Qmi {
-            self.command(self.request(&format!("--uim-sim-power-off={}", self.spec.uim_slot)))
-                .await?;
-            self.command(self.request(&format!("--uim-sim-power-on={}", self.spec.uim_slot)))
-                .await?;
-            return Ok(());
-        }
-        let action = match self.spec.protocol {
-            NativeProtocol::Qmi => "--dms-set-operating-mode=reset",
-            NativeProtocol::At => "AT+CFUN=1,1",
-            NativeProtocol::Mbim => {
-                return Err(NativeError::Unsupported(
-                    "native_mbim_reset_requires_device_driver",
-                ))
-            }
-        };
-        self.command(self.request(action)).await.map(|_| ())
+    pub async fn reset(self: &Arc<Self>, _sim_only: bool) -> Result<(), NativeError> {
+        // A generic reset would invalidate SIM/packet leases without a
+        // generation-bound maintenance receipt. Use the explicit device plan
+        // (e.g. Quectel Reboot), never two independent SIM power transactions.
+        Err(NativeError::Unsupported(
+            "native_reset_requires_explicit_maintenance_plan",
+        ))
     }
 
     pub(super) async fn verify_primary_slot(self: &Arc<Self>) -> Result<(), NativeError> {
@@ -867,6 +863,16 @@ mod tests {
         let device = at_device(io.clone());
         assert!(device.radio().await.is_err());
         assert_eq!(io.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn generic_reset_never_bypasses_the_explicit_maintenance_receipt() {
+        let io = Arc::new(ScriptedIo { requests: Default::default(), replies: Default::default() });
+        let device = at_device(io.clone());
+        assert!(matches!(device.reset(false).await, Err(NativeError::Unsupported("native_reset_requires_explicit_maintenance_plan"))));
+        assert!(device.reset(true).await.is_err());
+        assert!(io.requests.lock().unwrap().is_empty());
+        assert_ne!(device.controller_instance, at_device(io).controller_instance);
     }
 
     #[tokio::test]

@@ -71,6 +71,7 @@ jobs:
             hardware::cellular::backends::config::tests \
             hardware::cellular::backends::discovery::tests \
             hardware::cellular::backends::io::tests \
+            hardware::cellular::backends::recovery::tests \
             hardware::cellular::backends::qmi_proxy::tests \
             hardware::sim::esim::process_lifecycle_tests \
             hardware::cellular::backends::protocol::tests \
@@ -81,6 +82,7 @@ jobs:
             hardware::cellular::backends::sim::tests \
             hardware::cellular::backends::sim_ledger::tests \
             connectivity::modems::ims::vowifi::qmi_uim::tests \
+            connectivity::modems::ims::vowifi::qmi_uim::native_ledger_tests \
             hardware::cellular::backends::management::tests \
             hardware::devices::quectel::maintenance::tests \
             hardware::devices::dji::tests \

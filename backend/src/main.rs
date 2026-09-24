@@ -372,6 +372,22 @@ enum CliCommand {
         #[arg(long, default_value = "/dev")]
         dev_root: PathBuf,
     },
+    /// Inspect native crash receipts before backend startup; archive only
+    /// previously confirmed cleanup, never replay old hardware resource IDs.
+    NativeRecovery {
+        #[arg(long)]
+        receipt: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, requires_all = ["receipt", "expected_revision", "confirm_line_id", "confirm_physical_key"])]
+        apply: bool,
+        #[arg(long, requires = "apply")]
+        expected_revision: Option<String>,
+        #[arg(long, requires = "apply")]
+        confirm_line_id: Option<String>,
+        #[arg(long, requires = "apply")]
+        confirm_physical_key: Option<String>,
+    },
     /// Inspect or explicitly repair one DJI 2ca3:4006 USB modem; default is a passive plan.
     DjiPrepare {
         #[arg(long)]
@@ -568,6 +584,25 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&modems)?);
         return Ok(());
     }
+    if let Some(CliCommand::NativeRecovery {
+        receipt, config, apply, expected_revision, confirm_line_id, confirm_physical_key,
+    }) = &cli.command {
+        use hardware::cellular::backends::recovery;
+        if let Some(file) = receipt {
+            let backend = read_backend_config(config.clone().unwrap_or_else(get_default_config_path))?;
+            let plan = if *apply {
+                recovery::apply(file, &backend.devices,
+                    expected_revision.as_deref().ok_or_else(|| anyhow::anyhow!("native_recovery_revision_required"))?,
+                    confirm_line_id.as_deref().ok_or_else(|| anyhow::anyhow!("native_recovery_line_confirmation_required"))?,
+                    confirm_physical_key.as_deref().ok_or_else(|| anyhow::anyhow!("native_recovery_physical_confirmation_required"))?,
+                ).await?
+            } else { recovery::plan(file, &backend.devices)? };
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&recovery::inventory()?)?);
+        }
+        return Ok(()); // No backend initialization, worker sweep or service start.
+    }
     if let Some(CliCommand::DjiPrepare {
         usb_device,
         apply,
@@ -752,8 +787,10 @@ async fn main() -> Result<()> {
     // this point, so anything found inside a namespace is a leftover.
     if using_mm {
         hardware::devices::recover_owned_ims_sessions().await;
+        platform::netns::reclaim_all_stranded_hardware_links().await;
     }
-    platform::netns::reclaim_all_stranded_hardware_links().await;
+    // Native ownership receipts require explicit reconciliation. A global
+    // namespace sweep is not proof that an old native resource is ours.
 
     match line_registry.refresh().await {
         Ok(count) => info!(count, "Discovered modem/SIM lines"),

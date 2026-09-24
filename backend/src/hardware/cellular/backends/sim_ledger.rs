@@ -118,12 +118,70 @@ impl ChannelLease {
         )
     }
 
-    /// Only a matching hardware close response permits clearing an owned ID.
+    fn update(&mut self, action: impl FnOnce(&mut Ledger) -> Result<(), NativeError>) -> Result<(), NativeError> {
+        let mut ledger = self.device.sim_ledger.lock().unwrap_or_else(|p| p.into_inner());
+        if ledger.serial != self.serial { return Err(NativeError::OwnerConflict("native_sim_lease_replaced".into())); }
+        action(&mut ledger)?;
+        self.device.io.save_receipt(&self.key, &serde_json::to_vec(&*ledger).expect("SIM ledger"), false)
+    }
+
+    /// QMI CTL allocation is a resource operation too, before logical-channel open.
+    pub fn client_allocated(&mut self, client: u8) -> Result<(), NativeError> {
+        if client == 0 { return Err(NativeError::Protocol("native_sim_client_invalid".into())); }
+        self.update(|ledger| {
+            let owner = ledger.owner.as_mut().ok_or_else(|| NativeError::OwnerConflict("native_sim_lease_missing".into()))?;
+            owner.client_id = Some(client);
+            owner.state = "client_open";
+            Ok(())
+        })
+    }
+    pub fn channel_open_pending(&mut self) -> Result<(), NativeError> {
+        self.update(|ledger| {
+            let owner = ledger.owner.as_mut().ok_or_else(|| NativeError::OwnerConflict("native_sim_lease_missing".into()))?;
+            owner.state = "open_pending";
+            Ok(())
+        })
+    }
+    pub fn channel_open_rejected(&mut self) -> Result<(), NativeError> {
+        self.update(|ledger| {
+            let owner = ledger.owner.as_mut().ok_or_else(|| NativeError::OwnerConflict("native_sim_lease_missing".into()))?;
+            owner.state = "client_open";
+            ledger.rejected_opens = ledger.rejected_opens.saturating_add(1);
+            Ok(())
+        })
+    }
+    pub fn channel_closed_retaining_client(&mut self) -> Result<(), NativeError> {
+        self.update(|ledger| {
+            let owner = ledger.owner.as_mut().ok_or_else(|| NativeError::OwnerConflict("native_sim_lease_missing".into()))?;
+            if owner.client_id.is_none() || owner.channel_id.is_none() { return Err(NativeError::OwnerConflict("native_sim_channel_scope_invalid".into())); }
+            owner.channel_id = None;
+            owner.state = "client_open";
+            ledger.confirmed_closes = ledger.confirmed_closes.saturating_add(1);
+            Ok(())
+        })
+    }
+    pub fn client_released(&mut self) -> Result<(), NativeError> {
+        self.update(|ledger| {
+            let owner = ledger.owner.as_mut().ok_or_else(|| NativeError::OwnerConflict("native_sim_lease_missing".into()))?;
+            if owner.channel_id.is_some() || owner.state != "client_open" { return Err(NativeError::OwnerConflict("native_sim_channel_release_unconfirmed".into())); }
+            owner.client_id = None;
+            owner.state = "closed";
+            Ok(())
+        })
+    }
+
+    /// A logical-channel close alone does not release its QMI client.
     pub fn closed(&mut self) -> Result<(), NativeError> {
+        if self.device.sim_ledger.lock().unwrap_or_else(|p| p.into_inner()).owner.as_ref().is_some_and(|owner| owner.client_id.is_some()) {
+            return Err(NativeError::OwnerConflict("native_sim_client_release_pending".into()));
+        }
         self.finish(false)
     }
     /// Only an explicit protocol rejection proves allocation never happened.
     pub fn rejected(&mut self) -> Result<(), NativeError> {
+        if self.device.sim_ledger.lock().unwrap_or_else(|p| p.into_inner()).owner.as_ref().is_some_and(|owner| owner.client_id.is_some() || owner.channel_id.is_some()) {
+            return Err(NativeError::OwnerConflict("native_sim_allocated_resources_still_owned".into()));
+        }
         self.finish(true)
     }
     /// An external helper exposes no channel IDs; process completion releases
@@ -271,6 +329,35 @@ mod tests {
             assert!(ChannelLease::begin(d, Purpose::Identity, false).is_err());
         }
     }
+    #[test]
+    fn qmi_client_survives_logical_channel_close_until_ctl_release_is_confirmed() {
+        let (d, io) = fixture();
+        let mut c = ChannelLease::begin(d.clone(), Purpose::QmiUim, false).unwrap();
+        c.client_allocated(7).unwrap();
+        c.channel_open_pending().unwrap();
+        c.opened(Some(7), 2).unwrap();
+        assert!(c.closed().is_err());
+        c.channel_closed_retaining_client().unwrap();
+        assert!(c.closed().is_err());
+        assert_eq!(io.receipts.lock().unwrap().len(), 1);
+        c.client_released().unwrap();
+        c.closed().unwrap();
+        assert!(io.receipts.lock().unwrap().is_empty());
+        assert_eq!(d.sim_channel_status().confirmed_closes, 1);
+    }
+    #[test]
+    fn qmi_client_only_and_failed_release_are_retained() {
+        let (d, io) = fixture();
+        let mut c = ChannelLease::begin(d.clone(), Purpose::QmiUim, false).unwrap();
+        c.client_allocated(7).unwrap();
+        c.channel_open_pending().unwrap();
+        c.channel_open_rejected().unwrap();
+        assert!(c.rejected().is_err());
+        drop(c);
+        assert_eq!(io.receipts.lock().unwrap().len(), 1);
+        assert!(d.sim_channel_status().reconciliation_required);
+    }
+
     #[test]
     fn explicit_rejection_clears_pending_not_an_unrelated_channel() {
         let (d, io) = fixture();

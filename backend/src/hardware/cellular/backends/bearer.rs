@@ -111,7 +111,9 @@ impl Session {
             monitor.abort();
         }
         let mut clean = true;
-        for client in self.clients.iter().rev() {
+        for index in (0..self.clients.len()).rev() {
+            let client = self.clients[index].clone();
+            let mut released = true;
             if let Some(cid) = client.cid {
                 if let Some(handle) = client.packet_handle {
                     let disconnected = self
@@ -146,14 +148,23 @@ impl Session {
                     .await
                     .is_err()
                 {
-                    clean = false;
+                    released = false;
                 }
             } else if let Some(id) = client.mbim_session {
                 let request = mbim_request(&self.endpoint, &format!("--disconnect={id}"));
                 if self.device.io.execute(&request).await.is_err() {
-                    clean = false;
+                    released = false;
                 }
+            } else {
+                released = false;
             }
+            if released {
+                // Retire this numeric ID in memory BEFORE persisting. A failed
+                // receipt write must never make a later cleanup reuse a CID
+                // which the modem has already returned to its allocator.
+                self.clients.remove(index);
+                if self.save(false).is_err() { clean = false; break; }
+            } else { clean = false; }
         }
         // Stopping WDS/MBIM is not proof that a moved interface came home.
         // Cancellation, a failed move or a stale worker can all leave the
@@ -1448,6 +1459,24 @@ mod tests {
         let _guard = device.operation.lock().await;
         assert!(!io.receipts.lock().unwrap().is_empty());
         assert!(!device.active_interfaces.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_cleanup_does_not_replay_released_cids_while_namespace_is_pending() {
+        let (device, io) = memory_device(None);
+        let mut session = Session {
+            device: device.clone(), endpoint: endpoint(), role: Role::Ims,
+            clients: vec![Client { cid: Some(17), packet_handle: Some(42), mbim_session: None }],
+            receipt: receipt_path(&device, Role::Ims), namespace: "sa-ue0123456789ab".into(),
+            lost: Arc::new(AtomicBool::new(false)), monitor: None,
+        };
+        session.save(true).unwrap();
+        assert!(!session.cleanup_locked().await);
+        assert!(session.clients.is_empty());
+        assert!(!session.cleanup_locked().await);
+        let requests = io.requests.lock().unwrap();
+        assert_eq!(requests.iter().filter(|r| r.arguments.iter().any(|a| a == "--wds-noop")).count(), 1);
+        assert!(!io.receipts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

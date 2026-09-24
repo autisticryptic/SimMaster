@@ -312,7 +312,10 @@ pub async fn apply(
         }
     }
     manager_absent(&connection).await?;
-    let marker = directory.join(format!(
+    let receipt_directory = Path::new(crate::hardware::cellular::backends::recovery::RECEIPT_DIRECTORY);
+    crate::hardware::cellular::backends::recovery::ensure_directory(receipt_directory)
+        .map_err(|_| error("dji_receipt_directory_failed"))?;
+    let marker = receipt_directory.join(format!(
         "session-dji-{}-maintenance.json",
         name.replace('.', "-")
     ));
@@ -328,6 +331,8 @@ pub async fn apply(
         .write_all(&serde_json::to_vec(&plan).map_err(|_| error("dji_plan_encoding_failed"))?)
         .and_then(|_| marker_file.sync_all())
         .map_err(|_| error("dji_receipt_write_failed"))?;
+    fs::File::open(receipt_directory).and_then(|file| file.sync_all())
+        .map_err(|_| error("dji_receipt_directory_sync_failed"))?;
     let mut result = DjiResult {
         status: "unconfirmed",
         completed_steps: Vec::new(),
@@ -438,6 +443,8 @@ pub async fn apply(
     );
     step!("generation_readback", unchanged(&plan));
     fs::remove_file(marker).map_err(|_| error("dji_receipt_cleanup_failed"))?;
+    fs::File::open(receipt_directory).and_then(|file| file.sync_all())
+        .map_err(|_| error("dji_receipt_directory_sync_failed"))?;
     result.status = "bindings_and_dms_verified";
     result.qmi_ready = true;
     Ok(result)

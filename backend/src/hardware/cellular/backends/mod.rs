@@ -16,6 +16,7 @@ pub mod messages;
 pub mod native;
 pub mod protocol;
 pub mod qmi_proxy;
+pub mod recovery;
 pub mod sim;
 pub mod sim_ledger;
 
@@ -72,6 +73,11 @@ pub fn active_native() -> Option<&'static std::sync::Arc<native::NativeFleet>> {
 /// Do not start MM over a live native owner or an unresolved native session.
 /// This check never removes a receipt or stops another process.
 pub fn ensure_mm_handover_clear() -> Result<(), String> {
+    recovery::ensure_persistent_clear().map_err(|error| error.to_string())?;
+    if !recovery::pending_paths(std::path::Path::new(recovery::LOCK_DIRECTORY))
+        .map_err(|error| error.to_string())?.is_empty() {
+        return Err("native_sessions_require_reconciliation_before_mm_start".into());
+    }
     let entries = match std::fs::read_dir("/run/simadmin/native-control") {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),

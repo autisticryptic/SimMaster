@@ -29,6 +29,7 @@ pub struct MbnProfile {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Diagnostics {
+    pub controller_instance: String,
     pub model: String,
     pub ims_mode: Option<u8>,
     pub usb_network_mode: Option<u8>,
@@ -204,6 +205,7 @@ async fn diagnostics_owned(device: &NativeDevice) -> Result<Diagnostics, NativeE
         unavailable.push("mbn_list_invalid");
     }
     Ok(Diagnostics {
+        controller_instance: device.controller_instance.clone(),
         model,
         ims_mode: qcfg_number(&replies[0], "ims", 2),
         usb_network_mode: qcfg_number(&replies[1], "usbnet", 3),
@@ -597,6 +599,7 @@ mod tests {
     #[test]
     fn plans_bind_action_line_and_observed_settings() {
         let mut before = Diagnostics {
+            controller_instance: "fixture-instance-a".into(),
             model: "EC25".into(),
             ims_mode: Some(0),
             usb_network_mode: Some(0),
@@ -612,6 +615,9 @@ mod tests {
             original,
             revision("line-a", &MaintenanceAction::Reboot, &before)
         );
+        before.controller_instance = "fixture-instance-b".into();
+        assert_ne!(original, revision("line-a", &action, &before));
+        before.controller_instance = "fixture-instance-a".into();
         before.ims_mode = Some(2);
         assert_ne!(original, revision("line-a", &action, &before));
         assert!(validate_against(
