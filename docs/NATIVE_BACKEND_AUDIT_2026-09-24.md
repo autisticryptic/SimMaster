@@ -8,18 +8,18 @@
 
 ## 1. 完成情况结论
 
-**默认 MM 与显式 native 选择已接线，但 native 端到端实机验收仍为零；本轮补充只读发现与 AT/URC 基础能力。** 具体：
+**默认 MM 与显式 native 选择已接线，发现、业务事件、专项维护、短信收件箱和受控恢复已有实现；native 端到端实机验收仍为零。** 具体：
 
 | 方面 | 状态 | 依据 |
 |---|---|---|
 | 后端选择 | 已完成（代码+CI） | `backends/config.rs`：默认 MM；`mode: native` 需 `allow_unvalidated_native: true`；未知目标不回退 MM |
 | 协议控制器 | 已完成（代码+CI） | QMI DMS/NAS/UIM/WDS、MBIM、AT；按物理设备串行、flock、超时与输出上限（`native.rs`、`io.rs`、`bearer.rs`） |
 | SIM/AKA、承载、UE 数据面 | 已完成（代码+CI） | QMI UIM / AT CCHO-CGLA；QMI/MBIM 会话、receipt、namespace 归还确认 |
-| 短信/电话/USSD | 部分 | AT/URC 分流与有界广播已接通，事件唤醒通话/注册权威核对；短信存储接收保留兜底；直接 PDU/送达报告尚未完整消费 |
+| 短信/电话/USSD | 代码补强、待实机 | AT/URC 广播唤醒权威核对；直接/存储 PDU 持久化、分片、逐片发送与送达关联已有代码及CI；固件变体和长稳未验收 |
 | 设备发现 | 代码/CI及SIM-04只读运行通过 | `discover-native` 只读扫描 sysfs，输出端口/物理锚点建议与不完整配置；不自动启用 native，不猜 IMS/data 映射 |
 | Quectel | 诊断及显式维护已接线/通过CI | EC2x/EG25 的型号/IMS/MBN/USB诊断、revision确认及写后回读；真实固件未验收 |
 | 混合 owner | 未实现 | 同机 MM/native 分设备并行未接通；当前全局二选一 |
-| 代次恢复 | 未实现 | 控制节点代次变化需重启；无自动孤儿会话 reconciliation |
+| 代次恢复 | 显式受控入口已实现 | 持久化 owner/代次 receipt；只归档已确认完整清理的记录；未知孤儿资源仍不自动恢复/复用CID |
 | 实机验收 | **无** | 已实测的 IMS 注册/续期（SIM-03、SIM-04 T03/T04/T05、`71513ea`）全部走 **MM 路径**，不能算 native 证据 |
 | 路线图 | M0–M5 全部未勾 | `MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md` §5.2/§5.3 |
 
@@ -67,7 +67,7 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
       应用 PID/MM/管理路由未变化。**不等于 native owner 接管或注册验收**，详见
       [9/24 续接记录](SIM04_CONTINUATION_2026-09-24.md)
 
-### N2 URC 感知的 AT 会话（分流与短信调度已实现，完整业务事件层仍待补）
+### N2 URC 感知的 AT 会话与持久化短信
 
 本轮在既有 `at_session.rs` 单读者互斥会话上增强，净室实现标准 AT 分帧/归属，
 不复制参考项目的 transport 代码。使用与限制见 [原生 AT 事件处理](NATIVE_AT_EVENTS.md)。
@@ -88,10 +88,12 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
       native 空闲通话/线路采用低频兜底，活动通话保留结束判定；API事件仅含提示
 - [x] 新业务事件接线 CI：`12daeef`，Validate `35972665477` / Build `35972665685` success，
       arm64/amd64均成功，Publish skipped；本地118项Python守卫通过
-- [ ] 跨代次断口/孤儿资源自动恢复仍不启用（同代次传输错误可重开，
-      控制节点换代仍要求重新核对，不能盲目复用 CID）
-- [ ] 直接 `+CMT` 正文与 `+CDS` delivery-report 的完整业务消费（当前仅隔离并触发核对）；
-      配置仍使用存储通知，不因收到一个 hint 就声称短信已入库或发送成功
+- [x] `a1be268` 直接/存储 PDU 私有 inbox、持久化后 ACK/删除、SIM-scoped 原子去重与事件、
+      分片重放、发送逐片账本和严格送达关联；Validate `35984847888` / Build `35984847830`
+      及前端全绿、双架构成功、Publish skipped；[实现与边界](NATIVE_SMS_INBOX.md)
+- [ ] 跨代次断口/未知孤儿资源**自动**恢复仍不启用；已增加独立显式
+      [恢复 CLI](NATIVE_RESOURCE_RECOVERY.md)，只归档原 owner 已确认清理的记录。
+      换端口/重插/重启不等于释放证明；未确认资源不删、不重放 CID
 - [ ] native 真机短信/电话长稳验收
 
 ### N3 Quectel 设备驱动（EC20/EC25/EG25）
@@ -126,6 +128,8 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 - [x] AT/QMI 通道用途、slot、已确认 client/channel、open/close 计数及未知容量可见；
       写前 receipt、确认关闭才释放、未知结果保留，新增 [SIM 通道账本](NATIVE_SIM_CHANNEL_LEDGER.md)
 - [x] eSIM(lpac) 与 IMS AKA 共用物理门，增加外部操作范围；不虚构 lpac 内部通道 ID
+- [x] 后继代码覆盖 QMI CTL client 分配至释放；channel close 不提前清账，已释放 bearer CID
+      不在 namespace 清理重试时重放；通用 reset 不绕过显式维护
 - [x] 账本新增回归 CI：`16ee44e`，Validate `35963157944` / Build `35963157995` success；
       QMI UIM 基础 codec 回归也补入两套实际执行过滤器
 - [ ] native 真机通道故障/容量验收（不能用已通过的 MM IMS 验收替代）
@@ -149,8 +153,14 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 | N5 | `16ee44e` | AT/QMI SIM通道与lpac范围账本、未知结果保护，CI通过 |
 | N4 | `7e255b8` / `32df051` | DJI维护入口；后者修复musl ioctl request参数类型，双架构CI通过 |
 | N2 业务事件 | `12daeef` | 原生通话/注册独立订阅与Lagged核对、Web安全提示，两套CI与双架构通过 |
+| N2 短信链路 | `a1be268` | inbox、ACK、分片与送达报告，两套CI、前端及双架构通过 |
+| N2/N5 资源恢复 | `a4a83c2` | 持久化代次/owner、显式终态归档、QMI client完整账本与不重放释放ID；CI核对见接续计划 |
 
 参考仓库审计快照：VoCat `484cd23`、mdd-sim-gateway `8d9a830`、DJIModeSwitcher
 `6d86b64`、EC25Toolbox `12678de`、DJOneHub `f7f1a0d`。只读发现是本项目自行实现，
-未复制这些项目的硬件控制实现。N2 的分流/短信提示调度在本轮继续补强；
-N2 剩余业务层与 N3–N5 不能因这些基础工作完成而一并勾选。
+未复制这些项目的硬件控制实现。N2 的直接短信与 N5 生命周期在本次接续继续补强。
+未支持型号、未知孤儿资源自动恢复及 native 实机验收不能因代码/CI通过而一并勾选。
+
+用户已确认 SIM-04 自然续期及 SIM-05 手测完成，不再重复验收。当前原生功能及 CI/文档
+收尾后，下一主线为 **SIM-06 中国电信 IMS 注册失败**；见
+[本次接续计划](NATIVE_SMS_AND_RECOVERY_PLAN_2026-09-24.md)。

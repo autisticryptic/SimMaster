@@ -5,7 +5,8 @@
 ## 接收与确认顺序
 
 1. 线路 present/enabled、`sms_reception_enabled` 及 IMS/CS 接收策略准入。
-2. 在同一物理操作锁下核验 SIM，绑定稳定 SIM 摘要，再初始化 PDU 模式。
+2. 在同一物理操作锁下重新核验 QMI primary slot 与 SIM，绑定稳定 SIM 摘要，再初始化 PDU 模式；
+   不能依赖进入事务前的槽位快照。返回可消费作用域前再核验，变化则保留原 inbox、不跨卡投递。
 3. `+CMT`/`+CDS` 与命令回复分离，校验 SMSC/TPDU 长度与类型；最多保留 16 个私有 PDU。
    公共事件仍只有 boolean 提示，不包含号码、正文、PDU 或 SIM 摘要。
 4. 每个 PDU 先提交 SQLite 私有 inbox，**提交成功后**才允许 CNMA 或移除 modem 存储。
@@ -15,6 +16,8 @@
 
 普通 MT 仍使用 `AT+CNMI=2,1,0,1,0` 的存储模式，保留 15 秒扫描兜底，不主动启用 direct-only。
 存储中的 PDU 也进入同一个 inbox；删除前重新核验 SIM 与索引的精确 PDU 内容。
+`302b70e` 将持久化重放与存储扫尾解耦：CMGL 不支持、删除失败或 inbox 新写入受限，
+不会阻止消费已经提交的安全作用域记录；未提交 token 不 ACK，未确认存储内容不删除。
 
 ### CNMA 限制
 
@@ -61,5 +64,6 @@ native 发送入口在第一片发送前持久化 outgoing pending 记录和预�
 `a1be268`：Validate `35984847888`、Build `35984847830`、Frontend `35984847857` 全部成功；
 amd64-musl/arm64-musl 成功，Publish Release skipped。本地 123 项 Python 守卫通过。
 新增 DB 事务/重启、socket-pair ACK、PDU codec、分片、报告先到/碰撞/多段/失败回归实际运行。
+后继增加存储失败仍可重放、事务内槽位/换卡复核用例；最终 CI 状态见接续计划。
 
 未发送实网短信、未拨号、未在 SIM-04 切 native；native 固件的 CNMI/CSMS/报告格式仍需独立实机验收。

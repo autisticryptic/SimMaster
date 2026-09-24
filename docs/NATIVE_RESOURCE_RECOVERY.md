@@ -69,6 +69,7 @@ simadmin native-recovery \
 - 尚存 namespace/网口归还义务或未确认的固件会话。
 - 外部 helper 仅证明进程结束、不能证明其内部通道清理的遗留记录。
 - 仍在运行的原 owner、占用中的 flock、MM owner 或过时的 revision。
+- 未反映到控制节点/proxy 生命周期的固件内部复位；本记录的控制代次不是所有型号的固件 boot ID。
 
 这些情况需要具体型号支持的资源核对/复位证据与独立授权窗口。本实现不把“不知道”
 升级为“资源已经释放”，也不提供 `--force`/“清空所有 receipt”开关。
@@ -89,5 +90,7 @@ simadmin native-recovery \
 新增硬件无关测试覆盖：完整/部分/旧格式账本、owner/代次变化、陈旧计划、终态归档、
 QMI socket-pair 分配/关闭/释放成功与失败、重复 bearer 清理不重放 ID、禁止通用 reset。
 
-Rust 测试及双架构结果见本轮接续计划及 native 审计记录。**未执行 native 真机故障恢复、
+`a4a83c2` 的 Validate `35989431881` / Build `35989431842` 全部通过，含新增 recovery、
+QMI socket-pair 与原有回归；amd64/arm64 成功、Publish skipped。后继最终检查点见接续计划。
+**未执行 native 真机故障恢复、
 Quectel/DJI 写操作或 SIM-04 native 接管**；已有 SIM-04/SIM-05 验收不能替代这些测试。

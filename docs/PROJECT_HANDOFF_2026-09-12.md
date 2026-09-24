@@ -13,6 +13,19 @@
 
 ## 1. 当前结论
 
+**2026-09-24 JSONL 接续更新**：已恢复 `2026-09-19T.jsonl` 原待办 #26。
+`a1be268` 补齐 native 直接/存储短信 inbox、持久化后确认、SIM 隔离、分片及送达报告；
+两套回归、前端和双架构 CI 已通过，发布 skipped。`a4a83c2` 补强持久化 owner/代次 receipt、
+显式终态归档、UIM client 分配至释放账本与不重放已释放 CID；随后 302b70e 修正持久短信回放与存储清理解耦。
+4a83c2（Validate `35989431881` / Build `35989431842`）与 `302b70e`（Validate `36003900244` /
+Build `36003900240`）均 success，arm64/amd64 构建通过，Publish Release skipped。
+本次未连接设备、未部署、未切 native、未发短信或拨号；默认 MM 不变。
+
+用户已确认 **SIM-04 正常自然续期、SIM-05 手动测试完成**，不再重复验收。
+**下一主线是 SIM-06 中国电信 IMS 注册失败**，在上述功能及 CI/文档收尾之后推进。
+须重新确认其实际设备/版本/配置和失败阶段，不能沿用旧 SIM 的 PID、身份或失败结论。
+native 真机验收、未知资源自动恢复和混合 owner 仍未完成，不能以这些多卡反馈代替。
+
 **2026-09-24 分支整理完成**：GitHub `autisticryptic/SimMaster` 与本地现均只保留 `master`。
 `586985e` 已包含所有旧开发/修复分支的完整历史；master 三工作流、双架构构建通过，
 `Publish Release=skipped`，5 个旧 Release 及 beta3 tag 未被改动。以后在主目录

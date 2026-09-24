@@ -25,11 +25,13 @@
 （EC2x QMI/RMNET / ECM）、`select_mbn` 的 **List 中精确名称**、独立的 `reboot`。
 不按 HPLMN 猜 MBN，不将关闭基带 IMS 当作用户态 IMS 必需步骤。
 
-计划返回读取到的状态和绑定“线路＋动作＋状态”的 `expected_revision`。执行请求必须
+计划返回读取到的状态和绑定“线路＋控制器实例＋动作＋状态”的 `expected_revision`；
+控制器重建后旧计划失效。执行请求必须
 带同一 `action`、该 revision 和 `confirm_line_id`。执行时在同一物理门内重新核对状态，
 拒绝过期计划、有活动 bearer、未确认空闲通话或类型不匹配的设备。
 
-- 写入前保存 `session-<line>-maintenance.json` receipt；HTTP 取消不会中断物理事务。
+- 写入前在 `/var/lib/simadmin/native-control` 保存 `session-<line>-maintenance.json` receipt，
+  带原 owner/控制代次，文件及目录同步；HTTP 取消不会中断物理事务。
 - 模式/MBN 设置写后回读；MBN 必须来自设备清单，先显式关闭 AutoSel，再设置选中项。
 - `verified_setting` 仅表示设置回读一致，**不表示重启、重新枚举、驻网或 IMS 成功**。
   部分固件需重启/激活配置，必须再次明确请求，不自动执行 `CFUN`。
@@ -69,5 +71,9 @@ simadmin dji-prepare --usb-device 1-2 --apply \
 因此拒绝同型号多设备窗口，并显式在计划中披露该副作用。只有本次从未绑定状态新产生的
 串口误绑定 QMI 才会被纠正，既有或陌生驱动状态要求人工处理。
 
-中途出错保留 `session-dji-<usb>-maintenance.json` 和已完成步骤，不自动回滚或重试。
+中途出错在 `/var/lib/simadmin/native-control` 保留 `session-dji-<usb>-maintenance.json`
+和已完成步骤，不自动回滚或重试；旧 `/run` 记录同样阻止接管。
 控制节点/代次改变立即停止。此实现只取得代码/fixture 证据，未在 SIM-04 或真实 DJI 硬件执行。
+
+通用 native reset 不能绕过本页显式维护计划。账本检查/终态归档入口及不支持自动清理的
+情况见 [资源恢复](NATIVE_RESOURCE_RECOVERY.md)；DJI 专用/未知格式仍需人工核对，不套用通用恢复证明。
