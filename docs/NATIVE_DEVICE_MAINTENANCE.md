@@ -41,3 +41,33 @@
 
 代码回归使用注入式 IO，检查计划过期、跨线路确认、活动承载拒绝、写后回读、超时保留
 receipt 与后续 IO 禁止；Rust 仅在 Actions 运行。真实 Quectel 固件行为仍需独立设备验收。
+
+## DJI 一代 USB 模块（2ca3:4006）
+
+独立维护 CLI，默认只输出 sysfs 计划：
+
+```sh
+simadmin dji-prepare --usb-device 1-2
+# 下列值必须来自刚才的计划，不能复制别台设备的拓扑或代次：
+simadmin dji-prepare --usb-device 1-2 --apply \
+  --confirm-usb-device 1-2 --expected-generation <busnum:devnum>
+```
+
+这是维护窗口工具，不是开机自动修复器。执行条件：
+
+- Linux，精确 VID/PID、恰好接口 0–4，且当前仅有一台匹配的 DJI 模块。
+- MM 必须由操作者事先停止，不存在原生 owner 或未解决 receipt；持有与 native 相同的
+  物理锁。其他 AT/读卡/PPP 程序也必须由操作者关闭。
+- QMI 接口 4 必须尚未绑定，不能为修复而自动拆掉活动数据面。
+- `qmi_wwan` 与 `option` 必须已由操作者加载，工具不自动 modprobe、停服务或改 USB 身份。
+
+执行核验 USB 字符设备及 bus/dev 代次，发送接口 4 的 CDC DTR 控制，注册动态 ID，
+绑定接口 4 的 QMI 与 0–3 的串口，逐项回读，最后用有界 `qmicli --dms-get-operating-mode`
+检查可读取的 DMS 模式。它**不会**将模式改为 online，也不把 DMS 就绪称作 IMS 注册成功。
+
+注意 `new_id` 是内核驱动级规则，作用到该 VID/PID，通常直到驱动卸载；并非永久单端口规则。
+因此拒绝同型号多设备窗口，并显式在计划中披露该副作用。只有本次从未绑定状态新产生的
+串口误绑定 QMI 才会被纠正，既有或陌生驱动状态要求人工处理。
+
+中途出错保留 `session-dji-<usb>-maintenance.json` 和已完成步骤，不自动回滚或重试。
+控制节点/代次改变立即停止。此实现只取得代码/fixture 证据，未在 SIM-04 或真实 DJI 硬件执行。

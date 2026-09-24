@@ -534,7 +534,7 @@ fn ledger_path(key: &str) -> Result<std::path::PathBuf, NativeError> {
     Ok(std::path::Path::new("/run/simadmin/native-control").join(format!("{key}.json")))
 }
 
-async fn run_process(request: &CommandRequest) -> Result<String, NativeError> {
+pub(crate) async fn run_process(request: &CommandRequest) -> Result<String, NativeError> {
     let program = match request.tool {
         Tool::Qmi => "qmicli",
         Tool::Mbim => "mbimcli",

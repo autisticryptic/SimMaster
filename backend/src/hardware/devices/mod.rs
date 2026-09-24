@@ -12,6 +12,7 @@ use crate::platform::config::ApnConfig;
 use self::transport::{CellularDataTransport, ImsBearerTransport, TransportFuture};
 
 pub mod baseband_faults;
+pub mod dji;
 pub mod pcsc;
 pub mod qcm410;
 pub mod quectel;

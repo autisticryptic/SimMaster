@@ -107,16 +107,21 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 
 ### N4 DJI 一代 4G 模块（`2ca3:4006`）驱动绑定修复
 
-- [ ] 显式维护命令（不自动执行）：接口 0–3 经 `option` 的 `new_id` 绑定为串口，接口 4 绑定
-      `qmi_wwan`，拉起 DTR，随后 `qmicli --dms-get-operating-mode` 就绪检查；不写 NV、不改 USB 身份
-- [ ] `usbnet` 模式切换沿用 N3 的“写入—重启—等待重枚举—回读验证”流程
+- [x] 显式 `dji-prepare` CLI 已实现：默认被动计划；确认 exact USB port + 代次、单设备、
+      owner/receipt、未绑定 QMI 接口和驱动前置后，DTR、接口 4 QMI、0–3 串口绑定及 DMS 只读检查；
+      动态 ID 驱动级副作用明确披露，不写 NV/USB 身份，不自动停 MM 或回滚
+- [x] 识别为 EC2x 的 DJI 模块可使用 N3 的显式 usbnet 设置与独立重启入口，
+      重枚举后重新检查发现结果/端点，不将旧代次复用当成恢复
+- [ ] DJI 代码 CI 与实际驱动绑定/重枚举验收（分别记录）
 
 ### N5 SIM 逻辑通道与 APDU 仲裁
 
 - [x] AT/QMI 通道用途、slot、已确认 client/channel、open/close 计数及未知容量可见；
       写前 receipt、确认关闭才释放、未知结果保留，新增 [SIM 通道账本](NATIVE_SIM_CHANNEL_LEDGER.md)
 - [x] eSIM(lpac) 与 IMS AKA 共用物理门，增加外部操作范围；不虚构 lpac 内部通道 ID
-- [ ] 账本新增回归 CI 与 native 真机故障/容量验收（分别记录）
+- [x] 账本新增回归 CI：`16ee44e`，Validate `35963157944` / Build `35963157995` success；
+      QMI UIM 基础 codec 回归也补入两套实际执行过滤器
+- [ ] native 真机通道故障/容量验收（不能用已通过的 MM IMS 验收替代）
 
 ## 4. 边界
 

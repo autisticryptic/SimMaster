@@ -78,6 +78,7 @@ jobs:
             connectivity::modems::ims::vowifi::qmi_uim::tests \
             hardware::cellular::backends::management::tests \
             hardware::devices::quectel::maintenance::tests \
+            hardware::devices::dji::tests \
             hardware::cellular::backends::bearer::tests \
             services::messaging::sms_listener::tests \
             hardware::cellular::modem_manager::roaming_observation_tests \

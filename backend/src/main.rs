@@ -372,6 +372,17 @@ enum CliCommand {
         #[arg(long, default_value = "/dev")]
         dev_root: PathBuf,
     },
+    /// Inspect or explicitly repair one DJI 2ca3:4006 USB modem; default is a passive plan.
+    DjiPrepare {
+        #[arg(long)]
+        usb_device: String,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long, requires = "apply")]
+        expected_generation: Option<String>,
+        #[arg(long, requires = "apply")]
+        confirm_usb_device: Option<String>,
+    },
     /// Read backend selection without opening a bus, probing hardware or changing services.
     ModemBackendMode {
         #[arg(long)]
@@ -555,6 +566,34 @@ async fn main() -> Result<()> {
         }
         let modems = hardware::cellular::backends::discovery::discover(sys_root, dev_root);
         println!("{}", serde_json::to_string_pretty(&modems)?);
+        return Ok(());
+    }
+    if let Some(CliCommand::DjiPrepare {
+        usb_device,
+        apply,
+        expected_generation,
+        confirm_usb_device,
+    }) = &cli.command
+    {
+        if *apply {
+            let generation = expected_generation
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("dji_expected_generation_required"))?;
+            let confirm = confirm_usb_device
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("dji_explicit_confirmation_required"))?;
+            let result =
+                hardware::devices::dji::apply(usb_device.clone(), generation, confirm).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            if !result.qmi_ready {
+                anyhow::bail!("dji_maintenance_unconfirmed_review_receipt");
+            }
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&hardware::devices::dji::plan(usb_device)?)?
+            );
+        }
         return Ok(());
     }
     if matches!(&cli.command, Some(CliCommand::InspectModems)) {
