@@ -14,6 +14,11 @@
 > 以下保留早期 v1.1.4 开发阶段的归纳；后续 beta 版本的独立验收范围以
 > `docs/releases/` 中对应版本说明为准。
 
+- **新增只读原生设备发现 `simadmin discover-native`。** 按 USB 驱动与 WWAN/MHI 拓扑
+  列出物理锚点、端口和配置缺口；多控制口不任意选择，AT 角色只作提示，IMS/data 端点留空。
+  不发硬件命令、不改变 MM 默认后端、不自动接管。参见 `docs/NATIVE_MODEM_DISCOVERY.md`；
+  native 注册/短信/通话的实机验收仍独立待办。
+
 - **IMS 注册相关命名从 `volte` 统一为 `cellular_ims`。** VoLTE 只是 IMS 之上的语音
   业务，而这些名称描述的是蜂窝接入的 IMS 注册本身（同时承载短信、语音和补充业务）。
   错误码改为 `cellular_ims_*`，前端按完整 token 精确匹配，不再做子串匹配；

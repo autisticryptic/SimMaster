@@ -362,6 +362,16 @@ enum CliCommand {
     },
     /// Read-only JSON inventory of every ModemManager modem/SIM line.
     InspectModems,
+    /// Read-only sysfs walk proposing native-backend device entries. Opens no
+    /// device node, writes nothing and does not need ModemManager.
+    DiscoverNative {
+        /// sysfs root (tests and chroots).
+        #[arg(long, default_value = "/sys")]
+        sys_root: PathBuf,
+        /// /dev root (tests and chroots).
+        #[arg(long, default_value = "/dev")]
+        dev_root: PathBuf,
+    },
     /// Read backend selection without opening a bus, probing hardware or changing services.
     ModemBackendMode {
         #[arg(long)]
@@ -537,6 +547,14 @@ async fn main() -> Result<()> {
         if *require_mm && mode != "modemmanager" {
             std::process::exit(1);
         }
+        return Ok(());
+    }
+    if let Some(CliCommand::DiscoverNative { sys_root, dev_root }) = &cli.command {
+        if !sys_root.is_dir() || !dev_root.is_dir() {
+            anyhow::bail!("native_discovery_roots_unavailable");
+        }
+        let modems = hardware::cellular::backends::discovery::discover(sys_root, dev_root);
+        println!("{}", serde_json::to_string_pretty(&modems)?);
         return Ok(());
     }
     if matches!(&cli.command, Some(CliCommand::InspectModems)) {

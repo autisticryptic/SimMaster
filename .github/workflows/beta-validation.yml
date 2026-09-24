@@ -62,6 +62,7 @@ jobs:
             hardware::cellular::radio::tests \
             hardware::cellular::mm_radio::tests \
             hardware::cellular::backends::config::tests \
+            hardware::cellular::backends::discovery::tests \
             hardware::cellular::backends::io::tests \
             hardware::cellular::backends::qmi_proxy::tests \
             hardware::sim::esim::process_lifecycle_tests \

@@ -838,7 +838,9 @@ async fn read_usim_identity_fallback(
 
 pub use super::bindings::SimIdentity;
 
-fn physical_device_slot_id(device: &str) -> Option<String> {
+/// Physical key encoding shared with native discovery. A discovered sysfs key
+/// preserves an MM line ID only if MM used that same path (not a custom UID).
+pub(crate) fn physical_device_slot_id(device: &str) -> Option<String> {
     let device = device.trim().trim_end_matches('/');
     if device.is_empty()
         || device == "/"
