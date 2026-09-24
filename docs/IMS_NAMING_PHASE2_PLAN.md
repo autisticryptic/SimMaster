@@ -19,14 +19,14 @@
 ### 2.1 数据库不持久化 IMS 错误码
 
 `IMS_NAMING_MIGRATION.md` 曾记载错误码 "stored in the database"。经逐列核实，
-**该结论不成立**。全库仅四个存错误文本的列，均不属于 IMS 注册：
+**该结论不成立**。不能把其他业务的错误记录或内存态字段当作 IMS 注册错误码列：
 
 | 列 | 所属表 | 实际内容 |
 |---|---|---|
 | `last_error` | `vowifi_soak_runs` | VoWiFi 长稳测试 |
 | `last_error` | `notification_queue` | 通知发送失败原因（如 HTTP 状态） |
 | `failure_code` | 通话记录 | 通话失败码，独立词表 |
-| `last_failure_reason` | `volte_refresh_stats` | 仅写 `vowifi_refresh_rebuild_pending` |
+| `last_failure_reason` | VoWiFi 内存态 refresh 管理器（非数据库列） | `vowifi_refresh_rebuild_pending` 等 |
 
 `volte_refresh_stats` 表名含 volte，但只存 `refresh_count` / `last_refresh_at` /
 `updated_at`。`CellularImsStatus.last_error` 是内存态，经 API 暴露，不落盘。
@@ -34,12 +34,11 @@
 
 **结论：错误码改名不存在历史数据兼容问题，唯一消费者是前端。**
 
-### 2.2 数据库列改名不在本阶段范围
+### 2.2 持久化名称以迁移处理
 
-> 2026-09-23 更新：已纳入本阶段，见步骤 7。
-
-`volte_enabled` 列与 `volte_refresh_stats` 表名保留原样，等与数据库项目联动后
-单独处理。本阶段不做任何 schema 变更。
+2026-09-23 已纳入步骤 7：`volte_refresh_stats` 与 transport/event/MT 标记带迁移更新。
+`volte_enabled` 实为线路配置 JSON 键，不是 SQL 列；由步骤 5 的 serde alias 兼容读取。
+`carrier_Bundles` 的 LTE/NR 注册字段本来就是 `lte_ims_status` / `nr_ims_status`。
 
 ### 2.3 RustRover 不适用于本次重构
 
@@ -128,8 +127,8 @@
 列（另有 `vowifi_ims` / `modem` / `trunk`）。前端 `pages/SMS.tsx:97` 与
 `pages/sim/LineRuntimeDetails.tsx:127,179` 按精确值匹配。
 
-改名会让历史短信显示错误来源，因此 **`volte_ims` 排除在本阶段之外**，
-与数据库列一并留待数据库联动。
+不能仅靠文本替换改名，否则历史短信会显示错误来源；后续授权已由步骤 7 带迁移处理，
+后端与前端仍读取旧值。本节保留其“非错误码”的分类，不再表示延期。
 
 同类需排除的还有断连原因串（经 `disconnect_live_for_line` 传入，非错误码）：
 
@@ -154,12 +153,13 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 
 ### 4.2 前端子串匹配错位（本阶段最高风险）
 
-前端用 `includes()` 和正则做**子串**匹配，不是精确比较。存在 5 组互为子串的码：
+清点阶段曾将 5 组配置键/断连原因误称为“错误码子串”：
 
 - `volte_ip_families` ⊂ `volte_ip_families_auto` / `_changed` / `_duplicate` / `_empty`
 - `volte_profile_selection` ⊂ `volte_profile_selection_changed`
 
-同时前端**有意**依赖前缀族匹配，改名必须保持同族共同前缀：
+它们不是最终 `errors::code` 表的码值；158 项表中无互为子串的码。旧前端仍有意依赖
+前缀族/子串匹配，所以步骤 2–3 改为精确 token 匹配并用守卫防止回归：
 
 | 前缀 | 覆盖后端码数 |
 |---|---|
@@ -283,7 +283,8 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 - [x] 更新 `docs/IMS_NAMING_MIGRATION.md`：标注第一阶段“保留旧写出名”的决定已被取代，
       更正“错误码持久化”的错误记载，新增第二阶段小节
 - [x] `docs/CHANGELOG.md` 追加条目
-- [ ] CI 全绿，`Publish Release` 保持 `skipped`
+- [x] `71513ea` 的 CI 全绿，`Publish Release` 保持 `skipped`；2026-09-24 已重新查询确认。
+      本轮另补迁移测试执行过滤器，验证记录见 §7（此前仅编译该测试）。
 
 ### 步骤 7 — 数据库联动（2026-09-23 纳入范围）
 
@@ -301,26 +302,20 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
       不含前缀，不受影响；按标记做的逐条查重依赖存量 `pdu`，因此迁移同时改写历史行
 - [x] 新增迁移测试 `legacy_volte_persisted_names_migrate_to_cellular_ims`
       （模拟旧版在新库上写入，再次启动后逐项核对，并验证二次启动无副作用）
-- [ ] `carrier_Bundles`：唯一的 `volte` 标识符是配置文档的 `services.volte`。
-      它镜像运营商自身的 VoLTE 标志（Android `carrier_volte_available_bool`、
-      iOS `SupportsVolteCapability`），与 `services.vonr` / `services.vowifi` 并列，
-      SimAdmin 用它决定是否宣告 MMTEL 语音能力——语义就是 LTE 语音，并非 IMS 注册。
-      schema 列已是中性的 `lte_ims_status` / `nr_ims_status`。改名方向待用户确认后执行
+- [x] `carrier_Bundles` 联动审查完成：`services.volte`、`services.vonr` 是真实 LTE/NR
+      语音能力，不改成 IMS 注册开关；上游提取键保持原样。schema 的注册字段已为
+      `lte_ims_status` / `nr_ims_status`。
+- [x] 修正数据库项目的真实语义混用：LTE/NR readiness 不再被 `volte=false` /
+      `vonr=false` 否决；SMS-only IMS 可按完整配置得到 ready，缺配置仍拒绝 ready。
+      新增 Python 测试；SimMaster 增加 SMS-only profile 可解析且不宣告 MMTEL 的 Rust 回归。
+      旧 sealed catalog 不就地改写，新生成 catalog 才采用新判定。
 
 ## 6. 边界
 
-### 6.1 排除项：持久化值不得改名
+### 6.1 持久化值不得仅做文本替换
 
-> 2026-09-23 更新：改为“不得靠文本替换改名”，按步骤 7 带迁移处理。
-
-以下字面量会写入数据库，改名会让**历史数据显示错误**，本阶段一律不动：
-
-| 值 | 落盘位置 | 消费方 |
-|---|---|---|
-| `volte_ims` | `sms_messages.transport`（7 处写入） | `pages/SMS.tsx`、`LineRuntimeDetails.tsx` 精确匹配 |
-
-这是清点阶段新发现的约束，写计划时未识别。与「错误码不落盘」的结论不冲突：
-`volte_ims` 是 transport 取值，不是错误码。
+`volte_ims` 会落盘且有精确匹配消费者。步骤 7 已包含存量迁移与旧值读取兼容，
+不再以“错误码不落盘”为理由忽略 transport 历史数据。
 
 ### 6.2 排除项：非错误码字面量
 
@@ -351,6 +346,8 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 | 1 | `27542f0` | 补 `handlers.rs` 的 `code` 导入（修 17 处 E0433） |
 | 2–3 | `afa7112` | 前端按 token 精确匹配、生成式码表、前后端码表一致性守卫；CI 全绿 |
 | 4 | `a4108f3` | 错误码 `volte_*` → `cellular_ims_*`（427 处，14 个文件）；CI 全绿 |
+| 5–7 | `71513ea` | JSON/配置/持久化名称迁移；CI 全绿、发布 skipped；SIM-04 已部署并自然续期 |
+| 收尾 | 本轮待提交 | 数据库迁移测试加入两个实际执行过滤器；carrier_Bundles readiness 与语音能力解耦 |
 
 步骤 1 验收：CI `Validate Beta Refactor` / `Build-Release` 全绿，
 arm64 与 amd64 均编译通过，`Publish Release` 保持 `skipped`；

@@ -2255,6 +2255,28 @@ mod tests {
     }
 
     #[test]
+    fn sms_only_lte_ims_remains_resolvable_without_advertising_mmtel() {
+        let (catalog, path) = fixture();
+        {
+            let conn = Connection::open(&path).expect("open fixture for mutation");
+            conn.execute(
+                "UPDATE carrier_profiles SET config_json = json_set(config_json,
+                    '$.services.volte', json('false'), '$.services.smsoip', json('true'))
+                 WHERE profile_id = 'test-v7-23433'",
+                [],
+            )
+            .expect("set SMS-only service facts");
+        }
+        let resolved = catalog
+            .resolve_for_imsi("234330123456789", None, CatalogAccessKind::LteEpc)
+            .expect("query")
+            .expect("complete IMS config remains ready independently of voice");
+        assert!(!resolved.record.ims.register.include_mmtel_features);
+        assert_eq!(resolved.record.epdg.apn.as_deref(), Some("lte-ims"));
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
     fn loads_profile_icon_with_carrier_fallback() {
         let (catalog, path) = fixture();
         let icon = catalog

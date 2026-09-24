@@ -52,6 +52,7 @@ jobs:
           for filter in \
             platform::dns::tests \
             platform::config::tests \
+            platform::db::tests::legacy_volte_persisted_names_migrate_to_cellular_ims \
             platform::config_file::tests \
             platform::network_routing::tests \
             hardware::cellular::cgcontrdp::tests \

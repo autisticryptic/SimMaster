@@ -73,6 +73,14 @@ class ImsErrorCodeContractTests(unittest.TestCase):
         offenders += re.findall(rf"/[^/\n]*\b{FAMILY}_[a-z0-9_]+[^/\n]*/[a-z]*\.test\(", text)
         self.assertEqual(offenders, [], "match codes with cellularImsErrorCodes(), not substrings")
 
+    def test_persisted_name_migration_runs_in_both_workflows(self):
+        name = "legacy_volte_persisted_names_migrate_to_cellular_ims"
+        source = (ROOT / "backend/src/platform/db.rs").read_text()
+        self.assertIn(f"fn {name}(", source)
+        for workflow in ("beta-validation.yml", "build-release.yml"):
+            text = (ROOT / ".github/workflows" / workflow).read_text()
+            self.assertIn(f"platform::db::tests::{name}", text)
+
     def test_no_frontend_code_is_a_substring_of_another(self):
         codes = frontend_codes()
         offenders = [(a, b) for a in codes for b in codes if a != b and a in b]

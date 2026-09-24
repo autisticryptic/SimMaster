@@ -26,7 +26,9 @@
   `volte_refresh_stats` 表、短信/事件的 `volte_ims` 传输标记和 `volte.*` 事件类型迁移为
   新名称，界面对旧值仍能正确显示。`/api/volte/*` 旧路由继续保留为别名；
   环境变量改为 `SIMADMIN_CELLULAR_IMS_*`，旧名仍生效。界面上的“4G/5G”“VoLTE”文案不变。
-  详见 `docs/IMS_NAMING_MIGRATION.md`。
+  详见 `docs/IMS_NAMING_MIGRATION.md`。相邻 `carrier_Bundles` 保留真实语音能力
+  `services.volte`，但不再用它否决 LTE IMS 的静态 readiness；新增 SMS-only IMS
+  profile 不宣告 MMTEL 的契约回归。既有 sealed catalog 不就地修改。
 
 - **Telegram 通知支持自定义反代地址。** 新增 `api_base` 字段：留空仍直连官方
   `https://api.telegram.org`，不改变现有部署；填入自建反代（如 CF-Workers-TGbot
