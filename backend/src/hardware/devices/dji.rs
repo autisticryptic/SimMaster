@@ -157,6 +157,11 @@ fn unchanged(plan: &DjiPlan) -> Result<(), NativeError> {
     Ok(())
 }
 
+// Linux ioctl numbers are 32-bit bitfields even where libc accepts c_ulong.
+const fn usb_control_request(control_size: usize) -> u32 {
+    (3u32 << 30) | ((control_size as u32) << 16) | ((b'U' as u32) << 8)
+}
+
 #[cfg(target_os = "linux")]
 fn assert_dtr(plan: &DjiPlan) -> Result<(), NativeError> {
     use std::os::fd::AsRawFd;
@@ -196,9 +201,7 @@ fn assert_dtr(plan: &DjiPlan) -> Result<(), NativeError> {
         return Err(error("dji_usbfs_device_identity_mismatch"));
     }
     // Linux USBDEVFS_CONTROL, sized for the target architecture's pointer.
-    let request = ((3u32 << 30)
-        | ((std::mem::size_of::<Control>() as u32) << 16)
-        | ((b'U' as u32) << 8)) as libc::c_ulong;
+    let request = usb_control_request(std::mem::size_of::<Control>());
     for value in [0, 1] {
         let mut control = Control {
             request_type: 0x21,
@@ -209,7 +212,10 @@ fn assert_dtr(plan: &DjiPlan) -> Result<(), NativeError> {
             timeout: 3000,
             data: std::ptr::null_mut(),
         };
-        if unsafe { libc::ioctl(file.as_raw_fd(), request, &mut control) } < 0 {
+        // libc::ioctl takes c_int on musl and c_ulong on glibc. Infer the
+        // target ABI here, preserving the low 32 bits (including bit 31);
+        // checked u32 -> i32 conversion would wrongly reject this request.
+        if unsafe { libc::ioctl(file.as_raw_fd(), request as _, &mut control) } < 0 {
             return Err(error("dji_dtr_control_failed"));
         }
     }
@@ -492,6 +498,21 @@ mod tests {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
+    #[test]
+    fn ioctl_request_preserves_the_linux_bitfield_for_both_libc_signatures() {
+        for (size, expected) in [(16, 0xc0105500u32), (24, 0xc0185500u32)] {
+            let request = usb_control_request(size);
+            assert_eq!(request, expected);
+            assert_eq!((request as i32) as u32, request, "musl signed argument");
+            assert_eq!(
+                request as u64,
+                u64::from(expected),
+                "glibc unsigned argument"
+            );
+            assert_eq!((request >> 16) & 0x3fff, size as u32);
+        }
+    }
+
     #[test]
     fn only_exact_usb_port_names_are_accepted() {
         for s in ["../1-1", "1-1:1.4", "1-1/driver", "usb1", "1-"] {

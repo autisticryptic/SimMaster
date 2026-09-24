@@ -15,6 +15,12 @@ class DjiMaintenanceBoundaryTests(unittest.TestCase):
         self.assertNotIn('ioctl', passive)
         self.assertNotIn('Command::', passive)
 
+    def test_ioctl_uses_the_target_libc_signature_without_checked_sign_conversion(self):
+        source = (ROOT / 'backend/src/hardware/devices/dji.rs').read_text()
+        self.assertIn('libc::ioctl(file.as_raw_fd(), request as _, &mut control)', source)
+        self.assertNotIn('as libc::c_ulong', source)
+        self.assertNotIn('request.try_into()', source)
+
     def test_apply_is_generation_and_owner_guarded_without_nv_or_service_changes(self):
         source = (ROOT / 'backend/src/hardware/devices/dji.rs').read_text()
         for check in ['dji_plan_stale', 'dji_qmi_interface_must_be_unbound', 'LOCK_EX',
