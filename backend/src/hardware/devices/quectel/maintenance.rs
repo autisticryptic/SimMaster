@@ -1,7 +1,7 @@
 //! Explicit EC2x/EG25 maintenance. No arbitrary AT input, implicit MBN choice,
 //! background modem writes or automatic rollback. Native owns every exchange.
+use ring::digest;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::hardware::cellular::backends::{
@@ -235,7 +235,11 @@ fn validate_against(action: &MaintenanceAction, before: &Diagnostics) -> Result<
 fn revision(line_id: &str, action: &MaintenanceAction, before: &Diagnostics) -> String {
     let bytes =
         serde_json::to_vec(&(line_id, action, before)).expect("serializable maintenance plan");
-    format!("{:x}", Sha256::digest(bytes))
+    digest::digest(&digest::SHA256, &bytes)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 async fn idle_owned(device: &NativeDevice) -> Result<(), NativeError> {
