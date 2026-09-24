@@ -953,6 +953,33 @@ async fn main() -> Result<()> {
     spawn_runtime_event_bridge(app_state.clone());
     spawn_trunk_sms_bridge(app_state.clone());
     spawn_modem_mt_sms_bridge(app_state.clone(), modem_mt_sms_rx);
+    if hardware::cellular::backends::active_native().is_some() {
+        let mut events = hardware::cellular::backends::events::subscribe();
+        let bus = app_state.event_bus.clone();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        let _ = bus.publish(
+                            "modem.native_observation",
+                            Some(&event.line_id),
+                            Some("modem"),
+                            serde_json::json!(event.hints),
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        let _ = bus.publish(
+                            "modem.native_observation_gap",
+                            None,
+                            Some("modem"),
+                            serde_json::json!({"dropped":count}),
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
 
     // Restore only explicitly enabled per-line data and airplane-mode intents.
     {
@@ -980,10 +1007,24 @@ async fn main() -> Result<()> {
                     (binding.line_id, binding.present)
                 })
                 .collect::<HashMap<_, _>>();
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            let native = hardware::cellular::backends::active_native().is_some();
+            let mut events = hardware::cellular::backends::events::subscribe();
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(if native {
+                60
+            } else {
+                10
+            }));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {},
+                    event = events.recv(), if native => match event {
+                        Ok(event) if event.hints.registration_changed || event.hints.vendor => {},
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        _ => continue,
+                    },
+                }
                 if let Err(error) = refresh_app.line_registry.refresh().await {
                     tracing::warn!(error = %error, "Modem/SIM line inventory refresh failed");
                 } else {

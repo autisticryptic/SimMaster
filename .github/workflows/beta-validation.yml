@@ -73,6 +73,7 @@ jobs:
             hardware::cellular::backends::protocol::tests \
             hardware::cellular::backends::native::tests \
             hardware::cellular::backends::messages::tests \
+            hardware::cellular::backends::events::tests \
             hardware::cellular::backends::sim::tests \
             hardware::cellular::backends::sim_ledger::tests \
             connectivity::modems::ims::vowifi::qmi_uim::tests \

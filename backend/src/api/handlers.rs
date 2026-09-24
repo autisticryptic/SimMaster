@@ -5645,11 +5645,37 @@ async fn reconcile_finished_calls(
 
 pub fn spawn_call_monitor(app: AppState) {
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(CALL_MONITOR_INTERVAL_SECS));
+        let native = crate::hardware::cellular::backends::active_native().is_some();
+        let mut events = crate::hardware::cellular::backends::events::subscribe();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(if native {
+            15
+        } else {
+            CALL_MONITOR_INTERVAL_SECS
+        }));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut active_poll =
+            tokio::time::interval(std::time::Duration::from_secs(CALL_MONITOR_INTERVAL_SECS));
+        active_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
+            // Retain the established disappearance grace while a native call
+            // is active; idle devices no longer need frequent CLCC queries.
+            let active_native_call = native
+                && app
+                    .active_calls
+                    .lock()
+                    .await
+                    .keys()
+                    .any(|path| path.starts_with("native:"));
+            tokio::select! {
+                _ = interval.tick() => {},
+                _ = active_poll.tick(), if active_native_call => {},
+                event = events.recv(), if native => match event {
+                    Ok(event) if event.hints.call_changed => {},
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    _ => continue,
+                },
+            }
             let mut reconciled_lines = HashSet::new();
             let mut observed_paths = HashSet::new();
             for line in app.line_registry.all().await {

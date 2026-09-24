@@ -84,7 +84,10 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
       两套 CI 新增实际执行过滤器；本地仅格式与 Python 守卫
 - [x] 该轮新 Rust 测试与构建 CI 通过：`efe6135`；Validate `35951689917` / Build
       `35951689850` success，arm64/amd64 success，Publish Release skipped
-- [ ] 电话/注册事件的完整订阅与广播、用事件替换 `CLCC` 轮询、断口自动重连
+- [x] 通话/注册事件有界订阅与独立广播，唤醒 CLCC/线路权威核对，落后订阅者全量核对；
+      native 空闲通话/线路采用低频兜底，活动通话保留结束判定；API事件仅含提示
+- [ ] 新业务事件接线 CI；跨代次断口/孤儿资源自动恢复仍不启用（同代次传输错误可重开，
+      控制节点换代仍要求重新核对，不能盲目复用 CID）
 - [ ] 直接 `+CMT` 正文与 `+CDS` delivery-report 的完整业务消费（当前仅隔离并触发核对）；
       配置仍使用存储通知，不因收到一个 hint 就声称短信已入库或发送成功
 - [ ] native 真机短信/电话长稳验收
@@ -112,7 +115,9 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
       动态 ID 驱动级副作用明确披露，不写 NV/USB 身份，不自动停 MM 或回滚
 - [x] 识别为 EC2x 的 DJI 模块可使用 N3 的显式 usbnet 设置与独立重启入口，
       重枚举后重新检查发现结果/端点，不将旧代次复用当成恢复
-- [ ] DJI 代码 CI 与实际驱动绑定/重枚举验收（分别记录）
+- [x] DJI 代码 CI：`32df051` 修复 musl/glibc ioctl 参数 ABI 后，Validate `35968312013` / Build
+      `35968312015` success，amd64-musl/arm64-musl成功，发布 skipped
+- [ ] 实际 DJI 驱动绑定/DTR/重枚举验收（未在SIM-04执行）
 
 ### N5 SIM 逻辑通道与 APDU 仲裁
 

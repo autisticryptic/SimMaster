@@ -570,29 +570,28 @@ async fn native_sms_events_pending(
     config_manager: &ConfigManager,
     line_registry: &LineRuntimeRegistry,
 ) -> bool {
-    if !device.spec.sms_reception_enabled {
-        return false;
-    }
     let selector = device.spec.selector();
     let Some(line) = line_registry.for_modem_path(&selector).await else {
         return false;
     };
     let binding = line.binding();
     let profile = config_manager.get_line_profile(&binding.line_id);
-    if !modem_sms_scan_allowed(
-        &profile,
-        binding.present,
-        modem_sms_paused_for_ims(config_manager, line_registry, &selector).await,
-    ) {
+    if !profile.enabled || !binding.present || device.at_request("AT").is_err() {
         return false;
     }
-    // No new reader/thread and no modem writes: native IO verifies the port
-    // generation before and after a bounded read under the physical gate.
-    // A hint only requests the existing durable-ingest/content-checked scan.
-    match device.poll_sms_events().await {
-        Ok(events) => events.needs_sms_scan(),
-        Err(_) => false, // Periodic reconciliation remains the loss/error fallback.
-    }
+    // One admitted pump also broadcasts call/registration hints. Reading a
+    // voice indication is not permission to consume SMS storage or its PDU.
+    let events = match device.poll_events().await {
+        Ok(events) => events,
+        Err(_) => return false, // Periodic reconciliation is the loss/error fallback.
+    };
+    device.spec.sms_reception_enabled
+        && events.needs_sms_scan()
+        && modem_sms_scan_allowed(
+            &profile,
+            binding.present,
+            modem_sms_paused_for_ims(config_manager, line_registry, &selector).await,
+        )
 }
 
 async fn scan_all_modems_or_rebind(
@@ -672,12 +671,12 @@ pub async fn start_sms_listener(
                 },
             };
             for device in fleet.all() {
+                let pending =
+                    native_sms_events_pending(&device, &config_manager, &line_registry).await;
                 if !device.spec.sms_reception_enabled {
                     continue;
                 }
-                if reason == "native_urc"
-                    && !native_sms_events_pending(&device, &config_manager, &line_registry).await
-                {
+                if reason == "native_urc" && !pending {
                     continue;
                 }
                 maybe_scan_sms_paths(

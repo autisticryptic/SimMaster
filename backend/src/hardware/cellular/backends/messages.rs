@@ -80,12 +80,22 @@ impl NativeDevice {
         self: &Arc<Self>,
     ) -> Result<crate::hardware::cellular::at_urc::UrcEvents, NativeError> {
         self.require_sms_reception()?;
+        self.poll_events().await
+    }
+
+    /// Shared observation pump for enabled native lines. SMS consumers still
+    /// need their separate reception/IMS admission before ingesting anything.
+    pub async fn poll_events(
+        self: &Arc<Self>,
+    ) -> Result<crate::hardware::cellular::at_urc::UrcEvents, NativeError> {
         let mut request = self.at_request("AT")?;
         request.tool = Tool::AtPoll;
         request.arguments = vec!["poll-urcs".into()];
         let output = self.command(request).await?;
-        serde_json::from_str(&output)
-            .map_err(|_| NativeError::Protocol("native_at_events_invalid".into()))
+        let events: crate::hardware::cellular::at_urc::UrcEvents = serde_json::from_str(&output)
+            .map_err(|_| NativeError::Protocol("native_at_events_invalid".into()))?;
+        super::events::publish(self.spec.line_id(), events.clone());
+        Ok(events)
     }
 
     pub async fn initialize_sms(self: &Arc<Self>) -> Result<(), NativeError> {
