@@ -36,8 +36,9 @@ pub struct NativeSnapshot {
 
 pub struct NativeDevice {
     pub spec: NativeDeviceConfig,
-    pub(super) io: Arc<dyn NativeIo>,
-    pub(super) operation: Arc<Mutex<()>>,
+    pub(crate) io: Arc<dyn NativeIo>,
+    pub(crate) operation: Arc<Mutex<()>>,
+    maintenance_required: std::sync::atomic::AtomicBool,
     pub(crate) active_interfaces: std::sync::Mutex<BTreeMap<String, String>>,
     pub(super) sms_cache: Mutex<BTreeMap<String, super::messages::NativeSms>>,
     refresh: Mutex<()>,
@@ -51,12 +52,33 @@ impl NativeDevice {
             spec,
             io,
             operation: Arc::new(Mutex::new(())),
+            maintenance_required: std::sync::atomic::AtomicBool::new(false),
             active_interfaces: Default::default(),
             sms_cache: Default::default(),
             refresh: Mutex::new(()),
             voice_operation: Mutex::new(()),
             snapshot: Mutex::new(None),
         })
+    }
+
+    pub fn ensure_available(&self) -> Result<(), NativeError> {
+        if super::is_shutting_down()
+            || self
+                .maintenance_required
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Err(NativeError::Unavailable(
+                "native_maintenance_or_shutdown_pending".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn mark_maintenance_required(&self) {
+        self.maintenance_required
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.io.invalidate();
     }
 
     /// Shield the bounded protocol transaction from HTTP/task cancellation.
@@ -71,6 +93,7 @@ impl NativeDevice {
             let _guard = this.operation.lock().await;
             let mut responses = Vec::with_capacity(requests.len());
             for request in requests {
+                this.ensure_available()?;
                 if super::is_shutting_down() {
                     return Err(NativeError::Unavailable(
                         "native_backend_shutting_down".into(),
@@ -88,6 +111,7 @@ impl NativeDevice {
         self: &Arc<Self>,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>, NativeError> {
         let guard = self.operation.clone().lock_owned().await;
+        self.ensure_available()?;
         if super::is_shutting_down() {
             return Err(NativeError::Unavailable(
                 "native_backend_shutting_down".into(),

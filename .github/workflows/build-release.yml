@@ -204,6 +204,7 @@ jobs:
             hardware::cellular::backends::messages::tests \
             hardware::cellular::backends::sim::tests \
             hardware::cellular::backends::management::tests \
+            hardware::devices::quectel::maintenance::tests \
             hardware::cellular::backends::bearer::tests \
             services::messaging::sms_listener::tests \
             hardware::cellular::modem_manager::roaming_observation_tests \

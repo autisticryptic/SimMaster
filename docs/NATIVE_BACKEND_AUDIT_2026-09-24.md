@@ -93,10 +93,12 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 
 先只读诊断，再做受确认保护的写入：
 
-- [ ] 只读：`AT+QCFG="ims"`（MBN 默认/强制开/强制关 + 基带 VoLTE 可用位）、
-      `AT+QMBNCFG="List"` / `"AutoSel"`、`AT+QCFG="usbnet"`、`AT+QCFG="usbcfg"`
-- [ ] 写入需显式确认、写后回读、必要时 `AT+CFUN=1,1` 并按代次作废既有 QMI 会话：
-      IMS 模式、按 HPLMN 选择 MBN（关闭 AutoSel 以免被拉回其他运营商 MBN）
+- [x] 只读诊断实现：CGMM 型号核验、QCFG ims/usbnet/usbcfg、QMBNCFG List/AutoSel；
+      未确认字段与不支持型号不猜测，见 [专项维护](NATIVE_DEVICE_MAINTENANCE.md)
+- [x] 受确认写入实现：精确线路＋状态 revision 的 plan/apply，空闲/资源检查、写前 receipt、
+      IMS/USB 模式与显式 MBN 选择（先关闭 AutoSel）写后回读；独立显式 reboot，
+      不自动按 HPLMN 选 MBN、不自动重启或逆向回写；不确定结果 fence IO 并保留 receipt
+- [ ] 新实现 CI 与真实 Quectel 固件验收（分别记录，不能互相替代）
 - [ ] 设计问题待实机确认：用户态 IMS 注册时，基带自带 IMS 客户端是否会与本项目争用同一
       IMS PDN/注册（EC20 CEFA 固件差异正是这一类问题）。候选做法是由本项目注册时
       强制关闭基带 IMS（`QCFG ims=2`），但必须在实机上先验证不影响承载与 P-CSCF 下发

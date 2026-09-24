@@ -1531,6 +1531,18 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
             get(get_line_network_controls_handler).options(options_handler),
         )
         .route(
+            "/api/modem/lines/{line_id}/native/quectel/diagnostics",
+            get(api::native_controls::quectel_diagnostics).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/native/quectel/plan",
+            post(api::native_controls::quectel_plan).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/native/quectel/apply",
+            post(api::native_controls::quectel_apply).options(options_handler),
+        )
+        .route(
             "/api/modem/backend",
             get(get_modem_backend_status_handler).options(options_handler),
         )

@@ -15,6 +15,9 @@ use super::{
 use crate::hardware::devices::transport::TransportFuture;
 
 pub trait NativeIo: Send + Sync {
+    /// Fence an uncertain reset/write outcome. Existing receipts remain owned.
+    fn invalidate(&self) {}
+
     fn execute<'a>(
         &'a self,
         request: &'a CommandRequest,
@@ -96,6 +99,7 @@ fn identity(device: &str, anchor: &std::path::Path) -> Result<PortIdentity, Nati
 
 pub struct SystemNativeIo {
     connection: Arc<Connection>,
+    invalidated: std::sync::atomic::AtomicBool,
     #[cfg(unix)]
     anchor: std::path::PathBuf,
     #[cfg(unix)]
@@ -213,6 +217,7 @@ impl SystemNativeIo {
             }
             Ok(Arc::new(Self {
                 connection,
+                invalidated: std::sync::atomic::AtomicBool::new(false),
                 anchor,
                 identities,
                 qmi_proxy_leases,
@@ -227,6 +232,11 @@ impl SystemNativeIo {
     }
 
     async fn verify(&self, device: &str) -> Result<(), NativeError> {
+        if self.invalidated.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(NativeError::OwnerConflict(
+                "native_maintenance_reconciliation_required".into(),
+            ));
+        }
         Self::verify_manager_absent(&self.connection).await?;
         #[cfg(unix)]
         {
@@ -251,7 +261,7 @@ impl SystemNativeIo {
 }
 
 fn verify_receipts_clear(directory: &std::path::Path, line: &str) -> Result<(), NativeError> {
-    for role in ["ims", "data"] {
+    for role in ["ims", "data", "maintenance", "sim"] {
         for extension in ["json", "tmp"] {
             let path = directory.join(format!("session-{line}-{role}.{extension}"));
             if path.try_exists().map_err(|_| {
@@ -295,6 +305,10 @@ async fn open_qmi_proxy_lease(
 }
 
 impl NativeIo for SystemNativeIo {
+    fn invalidate(&self) {
+        self.invalidated
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
     fn verify_owner<'a>(&'a self, device: &'a str) -> TransportFuture<'a, Result<(), NativeError>> {
         Box::pin(self.verify(device))
     }

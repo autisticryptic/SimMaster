@@ -1,11 +1,11 @@
 //! Quectel modem-family classification.
 //!
-//! Generic Quectel control remains owned by ModemManager. This module only
-//! turns the manufacturer/model strings already reported by ModemManager into
-//! stable capability metadata for diagnostics and UI decisions.
+//! Classification is backend-neutral. Explicit native EC2x maintenance is
+//! separated from MM control and never invoked by discovery or an IMS retry.
 
 mod ec2x;
 mod eg600;
+pub mod maintenance;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuectelFamily {
