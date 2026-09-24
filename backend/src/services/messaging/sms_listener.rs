@@ -580,6 +580,12 @@ async fn maybe_scan_sms_paths(
             debug!(line_id, dropped = captured.dropped, unconfirmed_acks = captured.unconfirmed_acks,
                 "Native SMS transport uncertainty; no raw PDU published");
         }
+        if captured.capture_deferred || captured.storage_scan_deferred || captured.stored_deletes_deferred > 0 {
+            warn!(line_id, capture_deferred = captured.capture_deferred,
+                storage_scan_deferred = captured.storage_scan_deferred,
+                stored_deletes_deferred = captured.stored_deletes_deferred,
+                "Native SMS input/cleanup deferred; replaying already durable inbox rows");
+        }
         match super::native_sms::consume_pending(context.db, &line_id, &captured.sim_key, profile.sms_path.dedupe_enabled) {
             Ok(messages) => for sms in messages {
                 let _ = context.mt_sms.send(sms.clone());

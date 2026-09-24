@@ -622,6 +622,20 @@ impl NativeDevice {
         ))
     }
 
+    /// Caller already owns `operation`; do not reacquire the gate. In
+    /// particular, a preflight slot query cannot cover a later SMS transaction
+    /// if an eSIM operation acquired the gate between those two steps.
+    pub(super) async fn verify_primary_slot_locked(&self) -> Result<(), NativeError> {
+        if self.spec.protocol != NativeProtocol::Qmi { return Ok(()); }
+        let text = self.io.execute(&self.request("--uim-get-card-status")).await?;
+        let slot = text.lines().find_map(|line| {
+            let value = line.trim().strip_prefix("Primary GW:")?.trim().strip_prefix("slot '")?;
+            value.split('\'').next()?.parse::<u8>().ok()
+        });
+        if slot == Some(self.spec.uim_slot) { Ok(()) }
+        else { Err(NativeError::OwnerConflict("native_primary_sim_slot_unconfirmed_or_mismatched".into())) }
+    }
+
     pub(super) async fn verify_primary_slot(self: &Arc<Self>) -> Result<(), NativeError> {
         if self.spec.protocol != NativeProtocol::Qmi {
             return Ok(());

@@ -11,12 +11,17 @@ class NativeSmsInboxBoundaryTests(unittest.TestCase):
         source = (BACKEND / "hardware/cellular/backends/direct_sms.rs").read_text()
         capture = source.split("pub async fn capture_sms(", 1)[1].split("pub async fn send_sms_persisted(", 1)[0]
         self.assertLess(capture.index("operation.lock().await"), capture.index("bind_current_sim"))
-        self.assertLess(capture.index("db.stage_native_pdu"), capture.index("Tool::AtDirectCommit"))
-        self.assertLess(capture.index("db.stage_native_pdu"), capture.index("AT+CMGD="))
+        compact = ''.join(capture.split())
+        self.assertLess(compact.index("db.stage_native_pdu"), compact.index("Tool::AtDirectCommit"))
+        self.assertLess(compact.index("db.stage_native_pdu"), compact.index("AT+CMGD="))
         self.assertIn("current.get(&index) == Some(&pdu)", capture)
         self.assertIn("pdu.sim_key != key", capture)
         self.assertIn("AT+CSMS?", capture)
         self.assertNotIn("AT+CSMS=", source)
+        bind = source.split('async fn bind_current_sim(', 1)[1].split('fn ack_service(', 1)[0]
+        self.assertLess(bind.index('verify_primary_slot_locked'), bind.index('AT+CIMI'))
+        self.assertIn('stored_scan.unwrap_or_default()', capture)
+        self.assertIn('capture_deferred', capture)
 
     def test_new_inbox_is_initialized_and_native_listener_uses_it(self):
         db = (BACKEND / "platform/db.rs").read_text()
