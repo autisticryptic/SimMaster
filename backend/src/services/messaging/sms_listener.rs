@@ -565,6 +565,36 @@ async fn maybe_scan_sms_paths(
     scan_sms_paths(context, modem_path, reason, forward_new_sms, &line_id).await;
 }
 
+async fn native_sms_events_pending(
+    device: &Arc<crate::hardware::cellular::backends::native::NativeDevice>,
+    config_manager: &ConfigManager,
+    line_registry: &LineRuntimeRegistry,
+) -> bool {
+    if !device.spec.sms_reception_enabled {
+        return false;
+    }
+    let selector = device.spec.selector();
+    let Some(line) = line_registry.for_modem_path(&selector).await else {
+        return false;
+    };
+    let binding = line.binding();
+    let profile = config_manager.get_line_profile(&binding.line_id);
+    if !modem_sms_scan_allowed(
+        &profile,
+        binding.present,
+        modem_sms_paused_for_ims(config_manager, line_registry, &selector).await,
+    ) {
+        return false;
+    }
+    // No new reader/thread and no modem writes: native IO verifies the port
+    // generation before and after a bounded read under the physical gate.
+    // A hint only requests the existing durable-ingest/content-checked scan.
+    match device.poll_sms_events().await {
+        Ok(events) => events.needs_sms_scan(),
+        Err(_) => false, // Periodic reconciliation remains the loss/error fallback.
+    }
+}
+
 async fn scan_all_modems_or_rebind(
     context: SmsScanContext<'_>,
     modem_paths: &[String],
@@ -623,11 +653,19 @@ pub async fn start_sms_listener(
     mut resync_receiver: SmsResyncReceiver,
 ) -> zbus::Result<()> {
     if let Some(fleet) = crate::hardware::cellular::backends::active_native() {
-        let mut interval = tokio::time::interval(Duration::from_secs(SMS_POLL_INTERVAL_SECS));
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut next_full_scan = tokio::time::Instant::now();
         loop {
             let reason = tokio::select! {
-                _ = interval.tick() => "native_poll".to_string(),
+                _ = interval.tick() => {
+                    if tokio::time::Instant::now() >= next_full_scan {
+                        next_full_scan = tokio::time::Instant::now() + Duration::from_secs(SMS_POLL_INTERVAL_SECS);
+                        "native_poll".to_string()
+                    } else {
+                        "native_urc".to_string()
+                    }
+                },
                 message = resync_receiver.recv() => match message {
                     Some(message) => message.reason,
                     None => return Ok(()),
@@ -635,6 +673,11 @@ pub async fn start_sms_listener(
             };
             for device in fleet.all() {
                 if !device.spec.sms_reception_enabled {
+                    continue;
+                }
+                if reason == "native_urc"
+                    && !native_sms_events_pending(&device, &config_manager, &line_registry).await
+                {
                     continue;
                 }
                 maybe_scan_sms_paths(

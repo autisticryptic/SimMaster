@@ -409,11 +409,17 @@ impl NativeIo for SystemNativeIo {
             for argument in &request.arguments {
                 single_line(argument)?;
             }
-            let result = if matches!(request.tool, Tool::At | Tool::AtUssd | Tool::AtSms) {
+            let result = if matches!(
+                request.tool,
+                Tool::At | Tool::AtPoll | Tool::AtUssd | Tool::AtSms
+            ) {
                 if request.arguments.len() != if request.tool == Tool::AtSms { 2 } else { 1 } {
                     return Err(NativeError::Protocol(
                         "native_at_transaction_invalid".into(),
                     ));
+                }
+                if request.tool == Tool::AtPoll && request.arguments[0] != "poll-urcs" {
+                    return Err(NativeError::Protocol("native_at_poll_invalid".into()));
                 }
                 let device = request.device.clone();
                 let command = request.arguments[0].clone();
@@ -423,6 +429,11 @@ impl NativeIo for SystemNativeIo {
                 // The serial implementation has its own deadline. Do not drop
                 // a blocking transaction and release the owner gate early.
                 tokio::task::spawn_blocking(move || match tool {
+                    Tool::AtPoll => {
+                        let events = crate::hardware::cellular::at_session::poll_events(&device)?;
+                        serde_json::to_string(&events)
+                            .map_err(|_| "AT event encoding failed".into())
+                    }
                     Tool::AtUssd => {
                         crate::hardware::cellular::at_session::execute_ussd(&device, &command)
                     }
@@ -497,7 +508,7 @@ async fn run_process(request: &CommandRequest) -> Result<String, NativeError> {
     let program = match request.tool {
         Tool::Qmi => "qmicli",
         Tool::Mbim => "mbimcli",
-        Tool::At | Tool::AtSms | Tool::AtUssd | Tool::QmiControl => {
+        Tool::At | Tool::AtPoll | Tool::AtSms | Tool::AtUssd | Tool::QmiControl => {
             return Err(NativeError::Protocol("native_at_not_a_process".into()))
         }
     };

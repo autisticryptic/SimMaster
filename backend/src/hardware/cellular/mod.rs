@@ -16,6 +16,7 @@
 //! lives under [`crate::hardware::devices`], keyed by device name.
 
 pub mod at_session;
+pub mod at_urc;
 pub mod backends;
 pub mod bindings;
 pub mod cell_lock_store;

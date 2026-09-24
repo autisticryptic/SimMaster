@@ -14,7 +14,7 @@
 | 后端选择 | 已完成（代码+CI） | `backends/config.rs`：默认 MM；`mode: native` 需 `allow_unvalidated_native: true`；未知目标不回退 MM |
 | 协议控制器 | 已完成（代码+CI） | QMI DMS/NAS/UIM/WDS、MBIM、AT；按物理设备串行、flock、超时与输出上限（`native.rs` 853 行、`io.rs` 623 行、`bearer.rs` 1438 行） |
 | SIM/AKA、承载、UE 数据面 | 已完成（代码+CI） | QMI UIM / AT CCHO-CGLA；QMI/MBIM 会话、receipt、namespace 归还确认 |
-| 短信/电话/USSD | 部分 | 仅 AT **轮询**（存储、`CLCC`）；只有 `+CUSD` 走 URC（`at_session.rs`），无统一 URC 事件源 |
+| 短信/电话/USSD | 部分 | AT 命令与 URC 分流、原生短信事件提示触发扫描＋15 秒兜底已补；电话仍主要 `CLCC` 轮询，尚非完整事件驱动业务层 |
 | 设备发现 | 本轮新增（待 CI） | `discover-native` 只读扫描 sysfs，输出端口/物理锚点建议与不完整配置；不自动启用 native，不猜 IMS/data 映射 |
 | Quectel | 专用驱动仅分类 | `devices/quectel/` 主要提供型号分类；native 已可走通用 AT/QMI 控制，但没有 Quectel MBN/USB composition 专用管理 |
 | 混合 owner | 未实现 | 同机 MM/native 分设备并行未接通；当前全局二选一 |
@@ -59,16 +59,33 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 - [x] JSON 输出可审阅的 `candidate`，只在协议/控制口唯一时生成；`ims`、`data`、`at_device`
       留空，`sms_reception_enabled=false`，不打开端点，不写配置
 - [x] 12 项 fake-sysfs Rust 回归接入两套 CI；4 项 Python 被动边界守卫
-- [ ] CI 与两架构构建通过（不得将本地格式检查当成 Rust 测试）
-- [ ] 实机只读发现验证（不等于 native owner 接管或注册验收）
+- [x] CI 与两架构构建通过：`7a15a7f`，Validate `35946394878` / Build `35946394856`，
+      发布 skipped；本轮收尾 `2129282` 的两套 CI 也通过
+- [x] 实机只读发现验证：`2129282` 在 SIM-04 的 MM 正式服务运行期间成功；
+      1 个物理 modem / 1 个 QMI / 2 个 AT、7 个宿主可见网口，AT 歧义和键/slot 待确认明确报告；
+      应用 PID/MM/管理路由未变化。**不等于 native owner 接管或注册验收**，详见
+      [9/24 续接记录](SIM04_CONTINUATION_2026-09-24.md)
 
-### N2 URC 驱动的 AT 会话（后续路线图，本轮不切换业务事件源）
+### N2 URC 感知的 AT 会话（分流与短信调度已实现，完整业务事件层仍待补）
 
-- [ ] 每个 AT 口单一读者：行分帧、`>` 提示、终结码（`OK`/`ERROR`/`+CME ERROR`/`+CMS ERROR`）归属当前事务
-- [ ] URC 分类并广播：`+CMTI`/`+CMT`/`+CDS`、`RING`/`+CLIP`/`+CRING`、`NO CARRIER`、`+CUSD`、
-      `+CREG`/`+CEREG`/`+C5GREG`、`+QIND`
-- [ ] 以事件替换原生短信存储轮询和 `CLCC` 轮询（保留低频轮询兜底以防 URC 丢失）
-- 对应状态文档 §3 缺口 5
+本轮在既有 `at_session.rs` 单读者互斥会话上增强，净室实现标准 AT 分帧/归属，
+不复制参考项目的 transport 代码。使用与限制见 [原生 AT 事件处理](NATIVE_AT_EVENTS.md)。
+
+- [x] 保持同一 AT 口单读者；命令响应与已知 URC 分离，查询同名前缀保留给查询；
+      `NO CARRIER`/`BUSY` 等只终止拨号/接听事务，不误伤信号/SIM/短信查询
+- [x] `>` 仅在帧起始识别为短信提示，不把 USSD 文本中的 `>` 当提示；
+      输入帧、总响应及排空读取均设上限
+- [x] 分类 `+CMTI`/`+CMT`/`+CDS`/`+CDSI`、来电、USSD、注册和 `+QIND`；
+      只保留固定大小、无号码/正文的合并事件提示，不广播敏感原文
+- [x] 原生短信在准入后每秒被动读取提示，通过同一物理门及端口代次前后核验；
+      事件触发既有持久化接收/索引内容校验流程，15 秒完整扫描保留作丢事件兜底
+- [x] 命令/提示交错、分片、URC 排空保留、SMS 提示与 reference、帧上限等离线测试已编写，
+      两套 CI 新增实际执行过滤器；本地仅格式与 Python 守卫
+- [ ] 该轮新 Rust 测试与构建 CI 通过
+- [ ] 电话/注册事件的完整订阅与广播、用事件替换 `CLCC` 轮询、断口自动重连
+- [ ] 直接 `+CMT` 正文与 `+CDS` delivery-report 的完整业务消费（当前仅隔离并触发核对）；
+      配置仍使用存储通知，不因收到一个 hint 就声称短信已入库或发送成功
+- [ ] native 真机短信/电话长稳验收
 
 ### N3 Quectel 设备驱动（EC20/EC25/EG25）
 
@@ -106,4 +123,9 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 | 条目 | 提交 | 说明 |
 |---|---|---|
 | — | `71513ea` | 审计基线；该版本 SIM-04 MM 路径已实机注册及自然续期 |
-| N1 | 本轮待提交 | 被动发现、12 项 Rust 回归、4 项 Python 守卫；无硬件写入 |
+| N1 | `7a15a7f` | 被动发现、12 项 Rust 回归、4 项 Python 守卫；双架构 CI 通过，无硬件写入 |
+
+参考仓库审计快照：VoCat `484cd23`、mdd-sim-gateway `8d9a830`、DJIModeSwitcher
+`6d86b64`、EC25Toolbox `12678de`、DJOneHub `f7f1a0d`。只读发现是本项目自行实现，
+未复制这些项目的硬件控制实现。N2 的分流/短信提示调度在本轮继续补强；
+N2 剩余业务层与 N3–N5 不能因这些基础工作完成而一并勾选。

@@ -190,6 +190,8 @@ jobs:
             hardware::cellular::cgcontrdp::tests \
             hardware::cellular::bindings::tests \
             hardware::cellular::serial::tests \
+            hardware::cellular::at_session::tests \
+            hardware::cellular::at_urc::tests \
             hardware::cellular::observations::tests \
             hardware::cellular::mm_observations::tests \
             hardware::cellular::radio::tests \

@@ -31,12 +31,19 @@ const USSD_CANCEL_TIMEOUT: Duration = Duration::from_secs(3);
 const READ_POLL: Duration = Duration::from_millis(20);
 #[cfg(unix)]
 const DRAIN_GRACE: Duration = Duration::from_millis(120);
+#[cfg(unix)]
+const MAX_BUFFER_BYTES: usize = 32 * 1024;
+#[cfg(unix)]
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+#[cfg(unix)]
+const MAX_DRAIN_READS: usize = 64;
 
 #[cfg(unix)]
 struct AtSession {
     device: String,
     port: Option<File>,
     read_buf: Vec<u8>,
+    urcs: super::at_urc::UrcRouter,
 }
 
 #[cfg(unix)]
@@ -46,12 +53,14 @@ impl AtSession {
             device: device.to_string(),
             port: None,
             read_buf: Vec::new(),
+            urcs: super::at_urc::UrcRouter::default(),
         }
     }
 
     fn reset(&mut self) {
         self.port = None;
         self.read_buf.clear();
+        self.urcs.reset_frame();
     }
 
     fn ensure_open(&mut self) -> Result<(), String> {
@@ -82,6 +91,7 @@ impl AtSession {
 
         let deadline = Instant::now() + timeout;
         let mut lines = Vec::new();
+        let mut response_bytes = 0usize;
         loop {
             let Some(line) = self.next_line(deadline).map_err(|err| {
                 self.reset();
@@ -94,6 +104,14 @@ impl AtSession {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed == command {
                 continue;
+            }
+            if self.urcs.route(trimmed, Some(command)) {
+                continue;
+            }
+            response_bytes = response_bytes.saturating_add(line.len());
+            if response_bytes > MAX_RESPONSE_BYTES {
+                self.reset();
+                return Err("AT response exceeds size limit".into());
             }
             let is_final = is_final_line(trimmed);
             lines.push(line);
@@ -128,6 +146,7 @@ impl AtSession {
         let mut lines = Vec::new();
         let mut saw_cusd = false;
         let mut saw_final = false;
+        let mut response_bytes = 0usize;
         loop {
             let Some(line) = self.next_line(deadline).map_err(|err| {
                 self.reset();
@@ -139,6 +158,14 @@ impl AtSession {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed == command {
                 continue;
+            }
+            if self.urcs.route(trimmed, Some(command)) {
+                continue;
+            }
+            response_bytes = response_bytes.saturating_add(line.len());
+            if response_bytes > MAX_RESPONSE_BYTES {
+                self.reset();
+                return Err("AT response exceeds size limit".into());
             }
             if trimmed.to_ascii_uppercase().starts_with("+CUSD:") {
                 saw_cusd = true;
@@ -202,13 +229,29 @@ impl AtSession {
         self.execute_command("AT+CMGF=0", COMMAND_TIMEOUT)?;
         self.write_command(&format!("AT+CMGS={tpdu_length}"))?;
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
+        'prompt: loop {
             self.read_available()?;
-            if let Some(prompt) = self.read_buf.iter().position(|b| *b == b'>') {
-                self.read_buf.drain(..=prompt);
+            // A '>' inside a USSD/vendor line is not the CMGS prompt. Frame
+            // complete lines first; recognize a prompt only at a frame start.
+            if self.take_sms_prompt() {
                 break;
             }
-            if Instant::now() >= deadline || self.read_buf.windows(5).any(|w| w == b"ERROR") {
+            while let Some(line) = self.pop_line() {
+                if line.trim() == ">" {
+                    break 'prompt;
+                }
+                if self.urcs.route(&line, Some("AT+CMGS")) {
+                    continue;
+                }
+                if is_error_line(line.trim()) {
+                    self.reset();
+                    return Err("modem SMS prompt rejected".into());
+                }
+            }
+            if self.take_sms_prompt() {
+                break;
+            }
+            if Instant::now() >= deadline {
                 if let Some(port) = self.port.as_mut() {
                     let _ = port.write_all(&[0x1b]);
                 }
@@ -238,6 +281,9 @@ impl AtSession {
                     return Err("SMS submission result unconfirmed".into());
                 }
             };
+            if self.urcs.route(line.trim(), Some("AT+CMGS")) {
+                continue;
+            }
             if let Some(value) = line.trim().strip_prefix("+CMGS:") {
                 reference = value.trim().parse::<u32>().ok();
             }
@@ -273,15 +319,64 @@ impl AtSession {
     }
 
     fn discard_pending(&mut self) -> Result<(), String> {
-        self.read_buf.clear();
-        loop {
-            match self.read_available()? {
-                0 => break,
-                _ => continue,
+        // Preserve complete URCs before discarding stale command replies.
+        // A continuous URC stream must not hold the physical gate forever.
+        let deadline = Instant::now() + DRAIN_GRACE;
+        for _ in 0..MAX_DRAIN_READS {
+            while let Some(line) = self.pop_line() {
+                self.urcs.route(&line, None);
+            }
+            if Instant::now() >= deadline || self.read_available()? == 0 {
+                break;
             }
         }
+        while let Some(line) = self.pop_line() {
+            self.urcs.route(&line, None);
+        }
         self.read_buf.clear();
+        self.urcs.reset_frame();
         Ok(())
+    }
+
+    fn poll_events(&mut self) -> Result<super::at_urc::UrcEvents, String> {
+        self.ensure_open()?;
+        // Same session mutex / reader as commands; no AT query or competing
+        // background reader. Preserve fragmented URCs for the next poll.
+        for _ in 0..MAX_DRAIN_READS {
+            while let Some(line) = self.pop_line() {
+                self.urcs.route(&line, None);
+            }
+            if self.read_available()? == 0 {
+                break;
+            }
+        }
+        while let Some(line) = self.pop_line() {
+            self.urcs.route(&line, None);
+        }
+        Ok(self.urcs.take())
+    }
+
+    fn pop_line(&mut self) -> Option<String> {
+        let index = self.read_buf.iter().position(|byte| *byte == b'\n')?;
+        let bytes: Vec<u8> = self.read_buf.drain(..=index).collect();
+        Some(
+            String::from_utf8_lossy(&bytes)
+                .trim_matches(['\r', '\n'])
+                .to_string(),
+        )
+    }
+
+    fn take_sms_prompt(&mut self) -> bool {
+        let start = self
+            .read_buf
+            .iter()
+            .position(|b| !matches!(b, b'\r' | b'\n' | b' '));
+        if let Some(start) = start.filter(|&n| self.read_buf[n] == b'>') {
+            self.read_buf.drain(..=start);
+            true
+        } else {
+            false
+        }
     }
 
     fn read_available(&mut self) -> Result<usize, String> {
@@ -292,6 +387,9 @@ impl AtSession {
         match port.read(&mut buffer) {
             Ok(n) => {
                 if n > 0 {
+                    if self.read_buf.len().saturating_add(n) > MAX_BUFFER_BYTES {
+                        return Err("AT frame exceeds size limit".into());
+                    }
                     self.read_buf.extend_from_slice(&buffer[..n]);
                 }
                 Ok(n)
@@ -303,13 +401,8 @@ impl AtSession {
 
     fn next_line(&mut self, deadline: Instant) -> Result<Option<String>, String> {
         loop {
-            if let Some(index) = self.read_buf.iter().position(|byte| *byte == b'\n') {
-                let bytes: Vec<u8> = self.read_buf.drain(..=index).collect();
-                return Ok(Some(
-                    String::from_utf8_lossy(&bytes)
-                        .trim_matches(['\r', '\n'])
-                        .to_string(),
-                ));
+            if let Some(line) = self.pop_line() {
+                return Ok(Some(line));
             }
             if Instant::now() >= deadline {
                 return Ok(None);
@@ -333,6 +426,10 @@ fn lines_with(lines: &[String], extra: &str) -> String {
 fn is_error_line(line: &str) -> bool {
     line.eq_ignore_ascii_case("ERROR")
         || line.eq_ignore_ascii_case("NO CARRIER")
+        || line.eq_ignore_ascii_case("BUSY")
+        || line.eq_ignore_ascii_case("NO ANSWER")
+        || line.eq_ignore_ascii_case("NO DIALTONE")
+        || line.eq_ignore_ascii_case("NO DIAL TONE")
         || line.to_ascii_uppercase().starts_with("+CME ERROR")
         || line.to_ascii_uppercase().starts_with("+CMS ERROR")
 }
@@ -479,8 +576,151 @@ pub fn send_sms_pdu(_device: &str, _pdu: &str, _tpdu_length: usize) -> Result<St
     Err("SMS AT port access is only supported on Unix devices".into())
 }
 
+/// Poll coalesced indications under the persistent port's single-reader lock.
+/// Callers must already hold the native physical lease and verify port ownership.
+#[cfg(unix)]
+pub fn poll_events(device: &str) -> Result<super::at_urc::UrcEvents, String> {
+    let session = session_for(device);
+    let mut session = session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = session.poll_events();
+    if result.is_err() {
+        session.reset();
+    }
+    result
+}
+
+#[cfg(not(unix))]
+pub fn poll_events(_device: &str) -> Result<super::at_urc::UrcEvents, String> {
+    Err("AT port access is only supported on Unix devices".into())
+}
+
 #[cfg(all(test, unix))]
 mod tests {
+    use super::*;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    fn pair() -> (AtSession, UnixStream) {
+        let (port, peer) = UnixStream::pair().unwrap();
+        port.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let fd: OwnedFd = port.into();
+        let mut session = AtSession::new("fixture");
+        session.port = Some(File::from(fd));
+        (session, peer)
+    }
+
+    fn read_until(peer: &mut UnixStream, end: u8) -> Vec<u8> {
+        let mut value = Vec::new();
+        loop {
+            let mut byte = [0];
+            peer.read_exact(&mut byte).unwrap();
+            if byte[0] == end {
+                return value;
+            }
+            value.push(byte[0]);
+            assert!(value.len() < 2048);
+        }
+    }
+
+    #[test]
+    fn unrelated_urcs_do_not_pollute_a_command_or_steal_its_final() {
+        let (mut session, mut peer) = pair();
+        let server = std::thread::spawn(move || {
+            assert_eq!(read_until(&mut peer, b'\r'), b"AT+CSQ");
+            peer.write_all(b"\r\n+CMTI: \"SM\",7\r\nNO CARRIER\r\n+CSQ: 20,99\r\nOK\r\n")
+                .unwrap();
+        });
+        let response = session
+            .execute_command("AT+CSQ", Duration::from_secs(1))
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(response, "+CSQ: 20,99\r\nOK");
+        let events = session.urcs.take();
+        assert!(events.sms_stored && events.call_changed);
+    }
+
+    #[test]
+    fn passive_poll_preserves_fragmented_urcs_and_does_not_send_commands() {
+        let (mut session, mut peer) = pair();
+        peer.write_all(b"+CMTI: \"SM\",").unwrap();
+        assert!(!session.poll_events().unwrap().needs_sms_scan());
+        peer.write_all(b"7\r\n+QIND: ignored-data\r\n").unwrap();
+        let events = session.poll_events().unwrap();
+        assert!(events.sms_stored && events.vendor);
+        assert_eq!(
+            session.poll_events().unwrap(),
+            super::super::at_urc::UrcEvents::default()
+        );
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            peer.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn pending_urcs_survive_command_preflight_drain() {
+        let (mut session, mut peer) = pair();
+        peer.write_all(b"+CMTI: \"SM\",1\r\nOK\r\n").unwrap();
+        let server = std::thread::spawn(move || {
+            assert_eq!(read_until(&mut peer, b'\r'), b"AT");
+            peer.write_all(b"OK\r\n").unwrap();
+        });
+        assert_eq!(
+            session
+                .execute_command("AT", Duration::from_secs(1))
+                .unwrap(),
+            "OK"
+        );
+        server.join().unwrap();
+        assert!(session.urcs.take().sms_stored);
+    }
+
+    #[test]
+    fn sms_prompt_is_framed_not_found_inside_unsolicited_text() {
+        let mut session = AtSession::new("fixture");
+        session.read_buf = b"+CUSD: 0,\"amount > 0\",15\r\n".to_vec();
+        assert!(!session.take_sms_prompt());
+        session.pop_line().unwrap();
+        session.read_buf = b"\r\n> ".to_vec();
+        assert!(session.take_sms_prompt());
+        assert!(!session.take_sms_prompt());
+    }
+
+    #[test]
+    fn sms_submit_interleaves_urcs_without_losing_prompt_or_reference() {
+        let (mut session, mut peer) = pair();
+        let server = std::thread::spawn(move || {
+            assert_eq!(read_until(&mut peer, b'\r'), b"AT+CMGF=0");
+            peer.write_all(b"OK\r\n").unwrap();
+            assert_eq!(read_until(&mut peer, b'\r'), b"AT+CMGS=3");
+            peer.write_all(b"+CUSD: 0,\"text > not prompt\",15\r\n> \r\n")
+                .unwrap();
+            assert_eq!(read_until(&mut peer, 0x1a), b"00010203");
+            peer.write_all(b"+CMTI: \"SM\",2\r\n+CMGS: 9\r\nOK\r\n")
+                .unwrap();
+        });
+        assert_eq!(session.send_sms_pdu("00010203", 3).unwrap(), "9");
+        server.join().unwrap();
+        let events = session.urcs.take();
+        assert!(events.ussd && events.sms_stored);
+    }
+
+    #[test]
+    fn unterminated_at_frames_are_bounded() {
+        let (mut session, mut peer) = pair();
+        session.read_buf.resize(MAX_BUFFER_BYTES, b'x');
+        peer.write_all(b"x").unwrap();
+        assert_eq!(
+            session.read_available().unwrap_err(),
+            "AT frame exceeds size limit"
+        );
+    }
+
     #[test]
     fn recognizes_final_lines_case_insensitively() {
         assert!(super::is_final_line("OK"));

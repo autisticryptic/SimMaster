@@ -9,6 +9,8 @@ pub enum Tool {
     QmiControl,
     Mbim,
     At,
+    /// Passive, bounded read of coalesced indications; never sends an AT command.
+    AtPoll,
     AtUssd,
     AtSms,
 }

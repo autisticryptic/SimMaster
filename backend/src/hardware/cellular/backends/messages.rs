@@ -74,6 +74,20 @@ impl NativeDevice {
         ))
     }
 
+    /// Read event hints through the SAME physical command gate and AT reader.
+    /// Reception admission must also be checked by the caller before polling.
+    pub async fn poll_sms_events(
+        self: &Arc<Self>,
+    ) -> Result<crate::hardware::cellular::at_urc::UrcEvents, NativeError> {
+        self.require_sms_reception()?;
+        let mut request = self.at_request("AT")?;
+        request.tool = Tool::AtPoll;
+        request.arguments = vec!["poll-urcs".into()];
+        let output = self.command(request).await?;
+        serde_json::from_str(&output)
+            .map_err(|_| NativeError::Protocol("native_at_events_invalid".into()))
+    }
+
     pub async fn initialize_sms(self: &Arc<Self>) -> Result<(), NativeError> {
         self.require_sms_reception()?;
         self.verify_primary_slot().await?;
@@ -305,6 +319,50 @@ mod tests {
         assert!(unhex("00;AT").is_none());
     }
 
+    struct EventsIo(std::sync::Mutex<Vec<super::super::protocol::CommandRequest>>);
+    impl super::super::io::NativeIo for EventsIo {
+        fn execute<'a>(
+            &'a self,
+            request: &'a super::super::protocol::CommandRequest,
+        ) -> crate::hardware::devices::transport::TransportFuture<'a, Result<String, NativeError>>
+        {
+            Box::pin(async move {
+                self.0.lock().unwrap().push(request.clone());
+                let events = crate::hardware::cellular::at_urc::UrcEvents {
+                    sms_stored: true,
+                    ..Default::default()
+                };
+                Ok(serde_json::to_string(&events).unwrap())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn sms_event_poll_uses_only_the_explicit_at_endpoint_and_passive_tool() {
+        use super::super::config::{NativeDeviceConfig, NativeProtocol};
+        let io = Arc::new(EventsIo(Default::default()));
+        let device = NativeDevice::new(
+            NativeDeviceConfig {
+                hardware_key: "fixture-events".into(),
+                sysfs_anchor: "/sys/devices/fixture".into(),
+                protocol: NativeProtocol::Qmi,
+                control_device: "/dev/fixture-qmi".into(),
+                at_device: Some("/dev/fixture-at".into()),
+                sms_reception_enabled: true,
+                uim_slot: 1,
+                ims: None,
+                data: None,
+            },
+            io.clone(),
+        );
+        assert!(device.poll_sms_events().await.unwrap().sms_stored);
+        let requests = io.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].tool, Tool::AtPoll);
+        assert_eq!(requests[0].device, "/dev/fixture-at");
+        assert_eq!(requests[0].arguments, vec!["poll-urcs"]);
+    }
+
     struct ChangedSimIo(std::sync::Mutex<Vec<String>>);
     impl super::super::io::NativeIo for ChangedSimIo {
         fn execute<'a>(
@@ -377,6 +435,10 @@ mod tests {
         );
         assert!(matches!(
             device.initialize_sms().await,
+            Err(NativeError::Unsupported("native_sms_reception_disabled"))
+        ));
+        assert!(matches!(
+            device.poll_sms_events().await,
             Err(NativeError::Unsupported("native_sms_reception_disabled"))
         ));
         assert!(matches!(
