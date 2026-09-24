@@ -39,14 +39,22 @@
 
 - [x] 核实所有分支祖先关系及唯一历史，保存远端分支/Release/tag 的整理前只读快照
 - [x] 补普通 push 不发布、显式发布拒绝复用 tag/Release 的测试与工作流保护
-- [ ] 开发分支新保护与 native 增强的 CI/双架构通过，发布 skipped
-- [ ] master 快进到包含全部成果及保护的提交，master CI 通过且发布 skipped
-- [ ] 对比旧 Release 资产/元数据与 beta3 tag，确认未被本次整理改写
-- [ ] 删除四个已合并远端分支，并确认 GitHub 只剩 master
-- [ ] 清理本地已合并分支；保留工作区目录及未跟踪文件，不删除用户日志/脚本/证据
+- [x] 开发分支新保护 `586985e` 与 native 增强 `efe6135` 的 CI/双架构通过，发布 skipped
+- [x] master 快进到 `586985e`，master CI 通过且发布 skipped
+- [x] 5 个旧 Release 及其资产元数据、beta3 tag 前后完全相同
+- [x] 四个远端分支已按精确 SHA 租约原子删除，GitHub 只剩 master
+- [x] 本地四个分支也使用安全 `branch -d` 删除；工作区目录及未跟踪文件全部保留
 
-本地工作区计划：主目录 `SimAdmin` 使用 master；保留 `SimAdmin-1.1.5` 为 detached
-快照工作区，避免为删除分支而删除目录。原始会话、私密凭据、下载包不加入提交。
+本地工作区结果：主目录 `SimAdmin` 使用 master，跟踪 `simmaster/master`；
+`SimAdmin-1.1.5` 保留为 `586985e` 的 detached 快照，不删除目录。以后开发从主目录继续，
+不要把 detached 快照的修改误当主分支进度。原始会话、私密凭据、下载包未加入提交。
+
+master 验证：[Build-Release](https://github.com/autisticryptic/SimMaster/actions/runs/35953483420)、
+[Validate](https://github.com/autisticryptic/SimMaster/actions/runs/35953483477)、
+[Frontend](https://github.com/autisticryptic/SimMaster/actions/runs/35953483418) 均 success，
+Build 的 `Publish Release=skipped`。整合共保留原主分支之后 **67** 个提交，没有重写提交历史。
+旧 beta3 tag 仍为 `05de680b50a47d5c98658b5e656f1398d68e1e3d`。
+后续 docs-only 提交不改变这个已验收程序构建的 SHA。
 
 ## 4. 能力与发布不是同一件事
 

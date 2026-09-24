@@ -1,7 +1,8 @@
 # SIM-04 / 1.1.5 续接验收（2026-09-24）
 
 > 本记录区分代码、CI、制品、部署、MM IMS 与 native 验收。
-> 代码 worktree：`SimAdmin-1.1.5`；分支：`dev/1.1.5-modem-backends`。
+> 原开发 worktree：`SimAdmin-1.1.5` / `dev/1.1.5-modem-backends`；后续已将完整历史
+> 整合到主目录 `SimAdmin` / `master`，旧开发分支删除，旧目录保留为 detached 快照。
 > 本文不包含入口凭据、SIP/AKA 原文、订阅者身份或原始设备日志。
 
 ## 1. 本轮完成
@@ -12,7 +13,9 @@
 | 原生后端审计与被动发现 | `7a15a7f`；12 项 fake-sysfs Rust 回归在 CI 执行；两架构通过 |
 | 命名迁移收尾回归 | `2129282`；数据库旧名迁移测试从“仅编译”补为实际执行；SMS-only profile 不误宣告 MMTEL |
 | 数据库项目联动 | `carrier_Bundles:558a505`；LTE/NR IMS readiness 与 VoLTE/VoNR 语音标志解耦；29 单测及 CI 通过 |
-| 本地检查 | 100 项 Python guards、8 项前端单测、cargo fmt 与 diff 检查通过；没有本地 Rust 编译/测试 |
+| 本地检查 | 命名收尾时100项Python guards、8项前端单测通过；AT/URC与发布保护后增至109项guards；没有本地Rust编译/测试 |
+| 原生 AT/URC 基础增强 | `efe6135`，两套CI及双架构通过；未在SIM-04切换native测试 |
+| 主分支收口 | `586985e` 已整合全部历史，四个旧分支删除，master CI全绿、发布skipped；设备尚未重复部署这部分后继代码 |
 
 `2129282` 的 [Validate](https://github.com/autisticryptic/SimMaster/actions/runs/35947763715)
 和 [Build](https://github.com/autisticryptic/SimMaster/actions/runs/35947763717) 均 success；

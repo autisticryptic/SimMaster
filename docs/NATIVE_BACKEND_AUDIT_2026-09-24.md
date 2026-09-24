@@ -2,20 +2,21 @@
 
 > 范围：检查 1.1.4 → 1.1.5 “ModemManager 可选 / 本项目直接操作硬件接口”的完成情况，
 > 并对照用户指定的 5 个参考项目，给出能增强直接硬件接口完备性的具体条目。
-> 分支 `dev/1.1.5-modem-backends`，基线 `71513ea`。
+> 审计基线为原 `dev/1.1.5-modem-backends` 的 `71513ea`；本轮成果已整合到 `master`。
+> 分支收口过程见 [分支整理记录](BRANCH_CONSOLIDATION_2026-09-24.md)。
 > 每项按“代码 / CI / 实机”分别记录，不因编译通过而勾选实机。
 
 ## 1. 完成情况结论
 
-**默认 MM 与显式 native 选择已接线，但 native 端到端实机验收仍为零；本轮补充只读发现。** 具体：
+**默认 MM 与显式 native 选择已接线，但 native 端到端实机验收仍为零；本轮补充只读发现与 AT/URC 基础能力。** 具体：
 
 | 方面 | 状态 | 依据 |
 |---|---|---|
 | 后端选择 | 已完成（代码+CI） | `backends/config.rs`：默认 MM；`mode: native` 需 `allow_unvalidated_native: true`；未知目标不回退 MM |
-| 协议控制器 | 已完成（代码+CI） | QMI DMS/NAS/UIM/WDS、MBIM、AT；按物理设备串行、flock、超时与输出上限（`native.rs` 853 行、`io.rs` 623 行、`bearer.rs` 1438 行） |
+| 协议控制器 | 已完成（代码+CI） | QMI DMS/NAS/UIM/WDS、MBIM、AT；按物理设备串行、flock、超时与输出上限（`native.rs`、`io.rs`、`bearer.rs`） |
 | SIM/AKA、承载、UE 数据面 | 已完成（代码+CI） | QMI UIM / AT CCHO-CGLA；QMI/MBIM 会话、receipt、namespace 归还确认 |
 | 短信/电话/USSD | 部分 | AT 命令与 URC 分流、原生短信事件提示触发扫描＋15 秒兜底已补；电话仍主要 `CLCC` 轮询，尚非完整事件驱动业务层 |
-| 设备发现 | 本轮新增（待 CI） | `discover-native` 只读扫描 sysfs，输出端口/物理锚点建议与不完整配置；不自动启用 native，不猜 IMS/data 映射 |
+| 设备发现 | 代码/CI及SIM-04只读运行通过 | `discover-native` 只读扫描 sysfs，输出端口/物理锚点建议与不完整配置；不自动启用 native，不猜 IMS/data 映射 |
 | Quectel | 专用驱动仅分类 | `devices/quectel/` 主要提供型号分类；native 已可走通用 AT/QMI 控制，但没有 Quectel MBN/USB composition 专用管理 |
 | 混合 owner | 未实现 | 同机 MM/native 分设备并行未接通；当前全局二选一 |
 | 代次恢复 | 未实现 | 控制节点代次变化需重启；无自动孤儿会话 reconciliation |

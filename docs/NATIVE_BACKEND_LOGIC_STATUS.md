@@ -1,7 +1,9 @@
 # 原生后端逻辑候选：默认 MM，硬件验收延期
 
 > **2026-09-24 更新**：当前审计见 [原生硬件接口审计](NATIVE_BACKEND_AUDIT_2026-09-24.md)，
-> 新增 [只读发现命令](NATIVE_MODEM_DISCOVERY.md)。SIM-04 的 MM IMS 已注册并自然续期，
+> 新增 [只读发现命令](NATIVE_MODEM_DISCOVERY.md) 与 [AT/URC 基础增强](NATIVE_AT_EVENTS.md)，
+> 均已通过 CI；所有开发历史已整合到 `master`，从主目录 `SimAdmin` 继续。
+> SIM-04 的 MM IMS 已注册并自然续期，
 > 但 native 接管仍无端到端实机通过记录。下文为对应日期的历史检查点。
 >
 > **新阶段入口**：用户随后在 2026-09-13 授权自有设备实测。最新过程见

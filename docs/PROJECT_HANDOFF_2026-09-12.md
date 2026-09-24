@@ -13,7 +13,14 @@
 
 ## 1. 当前结论
 
-**2026-09-24 最新检查点**：命名迁移已完成；`7a15a7f` 新增原生被动发现，`2129282`
+**2026-09-24 分支整理完成**：GitHub `autisticryptic/SimMaster` 与本地现均只保留 `master`。
+`586985e` 已包含所有旧开发/修复分支的完整历史；master 三工作流、双架构构建通过，
+`Publish Release=skipped`，5 个旧 Release 及 beta3 tag 未被改动。以后在主目录
+`SimAdmin` / `master` 开发；`SimAdmin-1.1.5` 仅保留为 detached 历史快照。
+普通 push 不再自动发布，只有显式授权的 master 手动流程可创建尚不存在的版本。
+详见 [分支整理记录](BRANCH_CONSOLIDATION_2026-09-24.md)。
+
+**2026-09-24 IMS/命名检查点**：命名迁移已完成；`7a15a7f` 新增原生被动发现，`2129282`
 补数据库迁移实际执行与 SMS-only catalog 回归；双架构 CI success，发布 skipped。
 `carrier_Bundles:558a505` 已联动修正把语音标志当 IMS readiness 的误用。
 SIM-04 的 `71513ea` 已确认初始注册和 **9 次自然续期**；T05 原始日志也重新确认了
