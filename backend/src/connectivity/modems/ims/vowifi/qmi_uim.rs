@@ -321,8 +321,15 @@ pub fn parse_open_logical_channel(
     ensure_success(message)?;
     let value =
         find_tlv(message, TLV_UIM_OPEN_CHANNEL_ID).ok_or(QmiUimError::MissingTlv("channel_id"))?;
-    let channel_id = *value.first().ok_or(QmiUimError::InvalidFrame)?;
-    Ok(LogicalChannelOpened { channel_id })
+    let [channel_id] = value else {
+        return Err(QmiUimError::InvalidFrame);
+    };
+    if *channel_id == 0 {
+        return Err(QmiUimError::InvalidFrame);
+    }
+    Ok(LogicalChannelOpened {
+        channel_id: *channel_id,
+    })
 }
 
 /// Extract the complete application identifier for an application prefix from
@@ -1274,6 +1281,14 @@ struct QmiProxyConnection {
     stream: UnixStream,
     next_ctl_transaction: u16,
     next_service_transaction: u16,
+    native_device:
+        Option<std::sync::Arc<crate::hardware::cellular::backends::native::NativeDevice>>,
+    native_channel: Option<(
+        u8,
+        u8,
+        u8,
+        crate::hardware::cellular::backends::sim_ledger::ChannelLease,
+    )>,
 }
 
 /// Narrow native-management exchange sharing the proven QMUX framing. This is
@@ -1402,6 +1417,8 @@ impl QmiProxyConnection {
             stream,
             next_ctl_transaction: 1,
             next_service_transaction: 1,
+            native_device: None,
+            native_channel: None,
         })
     }
 
@@ -1413,6 +1430,8 @@ impl QmiProxyConnection {
             return Err(QmiUimError::InvalidFrame);
         }
         ensure_success(&response)?;
+        self.native_device = crate::hardware::cellular::backends::active_native()
+            .and_then(|fleet| fleet.by_control_device(device_path).ok());
         Ok(())
     }
 
@@ -1463,11 +1482,50 @@ impl QmiProxyConnection {
         let resolved_aid = self.resolve_application_aid(client_id, aid)?;
         let tx = self.take_service_transaction();
         let frame = build_open_logical_channel_frame(client_id, tx, slot, &resolved_aid)?;
-        let response = self.send_and_recv(&frame)?;
-        if response.message_id != QMI_UIM_OPEN_LOGICAL_CHANNEL {
-            return Err(QmiUimError::InvalidFrame);
+        let mut receipt = self
+            .native_device
+            .as_ref()
+            .map(|device| {
+                crate::hardware::cellular::backends::sim_ledger::ChannelLease::begin(
+                    device.clone(),
+                    crate::hardware::cellular::backends::sim_ledger::Purpose::QmiUim,
+                    false,
+                )
+            })
+            .transpose()
+            .map_err(|_| QmiUimError::InvalidApduResponse)?;
+        let exchange = if self.native_device.is_some() {
+            self.native_exchange_correlated(&decode_qmi_frame(&frame)?)
+        } else {
+            self.send_and_recv(&frame)
+        };
+        let result = exchange.and_then(|response| {
+            if response.message_id != QMI_UIM_OPEN_LOGICAL_CHANNEL {
+                return Err(QmiUimError::InvalidFrame);
+            }
+            parse_open_logical_channel(&response)
+        });
+        match result {
+            Ok(channel) => {
+                if let Some(mut receipt) = receipt.take() {
+                    let persisted = receipt.opened(Some(client_id), u32::from(channel.channel_id));
+                    self.native_channel = Some((client_id, slot, channel.channel_id, receipt));
+                    if persisted.is_err() {
+                        let _ = self.close_logical_channel(client_id, slot, channel.channel_id);
+                        return Err(QmiUimError::InvalidApduResponse);
+                    }
+                }
+                Ok(channel)
+            }
+            Err(error) => {
+                if matches!(error, QmiUimError::ResultFailure(_)) {
+                    if let Some(receipt) = receipt.as_mut() {
+                        let _ = receipt.rejected();
+                    }
+                }
+                Err(error)
+            }
         }
-        parse_open_logical_channel(&response)
     }
 
     fn close_logical_channel(
@@ -1478,7 +1536,11 @@ impl QmiProxyConnection {
     ) -> Result<(), QmiUimError> {
         let tx = self.take_service_transaction();
         let frame = build_close_logical_channel_frame(client_id, tx, slot, channel_id)?;
-        let mut response = self.send_and_recv(&frame)?;
+        let mut response = if self.native_device.is_some() {
+            self.native_exchange_correlated(&decode_qmi_frame(&frame)?)?
+        } else {
+            self.send_and_recv(&frame)?
+        };
         // The 410 modem emits a Logical Channel indication (0x0043) before
         // the close response. qmicli consumes that indication and keeps
         // waiting for 0x003F; do the same so the following CTL release does
@@ -1493,6 +1555,19 @@ impl QmiProxyConnection {
             return Err(QmiUimError::InvalidFrame);
         }
         ensure_success(&response)?;
+        if self
+            .native_channel
+            .as_ref()
+            .is_some_and(|(client, owned_slot, channel, _)| {
+                (*client, *owned_slot, *channel) == (client_id, slot, channel_id)
+            })
+        {
+            if let Some((_, _, _, mut receipt)) = self.native_channel.take() {
+                receipt
+                    .closed()
+                    .map_err(|_| QmiUimError::InvalidApduResponse)?;
+            }
+        }
         Ok(())
     }
 

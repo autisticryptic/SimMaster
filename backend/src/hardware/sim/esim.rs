@@ -267,15 +267,28 @@ impl EsimSupervisor {
                     .external_sim_operation()
                     .await
                     .map_err(|e| EsimApiError::Unavailable(e.to_string()))?;
+                let mut receipt =
+                    crate::hardware::cellular::backends::sim_ledger::ChannelLease::begin(
+                        device.clone(),
+                        crate::hardware::cellular::backends::sim_ledger::Purpose::Esim,
+                        true,
+                    )
+                    .map_err(|e| EsimApiError::Unavailable(e.to_string()))?;
                 let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-                run_lpac_command(
+                let result = run_lpac_command(
                     &device_config.lpac_path,
                     &action,
                     &args,
                     timeout_seconds,
                     &target,
                 )
-                .await
+                .await;
+                if result.as_ref().is_ok_and(command_succeeded) {
+                    receipt
+                        .external_completed()
+                        .map_err(|e| EsimApiError::Unavailable(e.to_string()))?;
+                }
+                result
             })
             .await
             .map_err(|_| EsimApiError::Command("native_esim_operation_task_failed".into()))?;

@@ -40,6 +40,7 @@ pub struct NativeDevice {
     pub(crate) operation: Arc<Mutex<()>>,
     maintenance_required: std::sync::atomic::AtomicBool,
     pub(crate) active_interfaces: std::sync::Mutex<BTreeMap<String, String>>,
+    pub(crate) sim_ledger: std::sync::Mutex<super::sim_ledger::Ledger>,
     pub(super) sms_cache: Mutex<BTreeMap<String, super::messages::NativeSms>>,
     refresh: Mutex<()>,
     voice_operation: Mutex<()>,
@@ -54,6 +55,7 @@ impl NativeDevice {
             operation: Arc::new(Mutex::new(())),
             maintenance_required: std::sync::atomic::AtomicBool::new(false),
             active_interfaces: Default::default(),
+            sim_ledger: Default::default(),
             sms_cache: Default::default(),
             refresh: Mutex::new(()),
             voice_operation: Mutex::new(()),
@@ -69,6 +71,25 @@ impl NativeDevice {
         {
             Err(NativeError::Unavailable(
                 "native_maintenance_or_shutdown_pending".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn sim_channel_status(&self) -> super::sim_ledger::Ledger {
+        self.sim_ledger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub fn ensure_sim_available(&self) -> Result<(), NativeError> {
+        self.ensure_available()?;
+        let state = self.sim_ledger.lock().unwrap_or_else(|p| p.into_inner());
+        if state.owner.is_some() || state.reconciliation_required {
+            Err(NativeError::OwnerConflict(
+                "native_sim_channels_pending_reconciliation".into(),
             ))
         } else {
             Ok(())
@@ -111,7 +132,7 @@ impl NativeDevice {
         self: &Arc<Self>,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>, NativeError> {
         let guard = self.operation.clone().lock_owned().await;
-        self.ensure_available()?;
+        self.ensure_sim_available()?;
         if super::is_shutting_down() {
             return Err(NativeError::Unavailable(
                 "native_backend_shutting_down".into(),

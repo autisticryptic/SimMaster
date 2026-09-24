@@ -261,7 +261,23 @@ impl SystemNativeIo {
 }
 
 fn verify_receipts_clear(directory: &std::path::Path, line: &str) -> Result<(), NativeError> {
+    let names = std::fs::read_dir(directory)
+        .map_err(|_| NativeError::OwnerConflict("native_session_receipt_state_unreadable".into()))?
+        .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            NativeError::OwnerConflict("native_session_receipt_state_unreadable".into())
+        })?;
     for role in ["ims", "data", "maintenance", "sim"] {
+        let prefix = format!("session-{line}-{role}.");
+        if names
+            .iter()
+            .any(|name| name.starts_with(&prefix) && name.ends_with(".tmp"))
+        {
+            return Err(NativeError::OwnerConflict(
+                "native_sessions_require_reconciliation_before_native_start".into(),
+            ));
+        }
         for extension in ["json", "tmp"] {
             let path = directory.join(format!("session-{line}-{role}.{extension}"));
             if path.try_exists().map_err(|_| {
@@ -657,12 +673,14 @@ mod tests {
         ));
         std::fs::create_dir(&directory).unwrap();
         verify_receipts_clear(&directory, "fixture").unwrap();
-        for extension in ["json", "tmp"] {
-            let path = directory.join(format!("session-fixture-ims.{extension}"));
-            std::fs::write(&path, "{}").unwrap();
-            assert!(verify_receipts_clear(&directory, "fixture").is_err());
-            assert!(verify_receipts_clear(&directory, "another-line").is_ok());
-            std::fs::remove_file(path).unwrap();
+        for role in ["ims", "data", "maintenance", "sim"] {
+            for extension in ["json", "tmp", "123.tmp"] {
+                let path = directory.join(format!("session-fixture-{role}.{extension}"));
+                std::fs::write(&path, "{}").unwrap();
+                assert!(verify_receipts_clear(&directory, "fixture").is_err());
+                assert!(verify_receipts_clear(&directory, "another-line").is_ok());
+                std::fs::remove_file(path).unwrap();
+            }
         }
         std::fs::remove_dir(directory).unwrap();
     }

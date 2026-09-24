@@ -98,7 +98,9 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 - [x] 受确认写入实现：精确线路＋状态 revision 的 plan/apply，空闲/资源检查、写前 receipt、
       IMS/USB 模式与显式 MBN 选择（先关闭 AutoSel）写后回读；独立显式 reboot，
       不自动按 HPLMN 选 MBN、不自动重启或逆向回写；不确定结果 fence IO 并保留 receipt
-- [ ] 新实现 CI 与真实 Quectel 固件验收（分别记录，不能互相替代）
+- [x] 专项维护 CI：`ed508af`，Validate `35960810685` / Build `35960810703` success；
+      首轮未声明 sha2 的编译问题已改用既有 ring 修正
+- [ ] 真实 Quectel 固件验收（不能由注入式 IO 测试替代）
 - [ ] 设计问题待实机确认：用户态 IMS 注册时，基带自带 IMS 客户端是否会与本项目争用同一
       IMS PDN/注册（EC20 CEFA 固件差异正是这一类问题）。候选做法是由本项目注册时
       强制关闭基带 IMS（`QCFG ims=2`），但必须在实机上先验证不影响承载与 P-CSCF 下发
@@ -111,8 +113,10 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 
 ### N5 SIM 逻辑通道与 APDU 仲裁
 
-- [ ] 逻辑通道容量/已分配/用途可见；部分分配失败时主动释放已打开通道
-- [ ] eSIM(lpac)、IMS AKA、短信读卡共用的 APDU 仲裁已有物理操作门，补齐按通道的归属账本
+- [x] AT/QMI 通道用途、slot、已确认 client/channel、open/close 计数及未知容量可见；
+      写前 receipt、确认关闭才释放、未知结果保留，新增 [SIM 通道账本](NATIVE_SIM_CHANNEL_LEDGER.md)
+- [x] eSIM(lpac) 与 IMS AKA 共用物理门，增加外部操作范围；不虚构 lpac 内部通道 ID
+- [ ] 账本新增回归 CI 与 native 真机故障/容量验收（分别记录）
 
 ## 4. 边界
 

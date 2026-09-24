@@ -37,6 +37,9 @@ impl SimLease {
         // These APIs were already blocking QMI transactions before native
         // routing. They must remain on spawn_blocking, never a Tokio worker.
         let guard = device.operation.clone().blocking_lock_owned();
+        device
+            .ensure_sim_available()
+            .map_err(|_| "native_sim_channels_pending_reconciliation")?;
         if super::is_shutting_down() {
             return Err("native_backend_shutting_down");
         }
@@ -68,11 +71,14 @@ impl SimLease {
     fn with_channel<T>(
         &self,
         aid: &[u8],
+        purpose: super::sim_ledger::Purpose,
         run: impl FnOnce(&mut AtChannel<'_>) -> Result<T, &'static str>,
     ) -> Result<T, &'static str> {
-        if aid.is_empty() || aid.len() > 32 {
+        if aid.is_empty() || aid.len() > 16 {
             return Err("native_sim_aid_invalid");
         }
+        let receipt = super::sim_ledger::ChannelLease::begin(self.device.clone(), purpose, false)
+            .map_err(|_| "native_sim_receipt_create_failed")?;
         let output = self.at(&format!("AT+CCHO=\"{}\"", hex(aid)))?;
         let channel = at_payload(&output, "+CCHO:")
             .or_else(|| {
@@ -88,7 +94,14 @@ impl SimLease {
             lease: self,
             channel,
             closed: false,
+            receipt,
         };
+        // Create the close guard before persisting the known channel ID: if
+        // persistence fails, the confirmed ID is still closed exactly once.
+        channel
+            .receipt
+            .opened(None, channel.channel)
+            .map_err(|_| "native_sim_receipt_update_failed")?;
         let result = run(&mut channel);
         let close = channel.close();
         match result {
@@ -101,7 +114,7 @@ impl SimLease {
     }
 
     pub fn verify(&self, aid: &[u8]) -> Result<(), &'static str> {
-        self.with_channel(aid, |_| Ok(()))
+        self.with_channel(aid, super::sim_ledger::Purpose::Probe, |_| Ok(()))
     }
 
     pub fn authenticate(
@@ -112,14 +125,14 @@ impl SimLease {
     ) -> Result<UsimAkaApduResult, &'static str> {
         let apdu = qmi_uim::build_usim_authenticate_apdu(rand, autn)
             .map_err(|_| "native_sim_aka_input_invalid")?;
-        self.with_channel(aid, |channel| {
+        self.with_channel(aid, super::sim_ledger::Purpose::Authentication, |channel| {
             let response = channel.exchange(&apdu)?;
             qmi_uim::parse_usim_authenticate_response_reason(&response)
         })
     }
 
     pub fn identity(&self, aid: &[u8]) -> Result<UsimIdentity, &'static str> {
-        self.with_channel(aid, |channel| {
+        self.with_channel(aid, super::sim_ledger::Purpose::Identity, |channel| {
             channel.select(0x6f07)?;
             let imsi = channel.exchange(&[0, 0xb0, 0, 0, 9])?;
             if (imsi.sw1, imsi.sw2) != (0x90, 0) {
@@ -138,7 +151,7 @@ impl SimLease {
     }
 
     pub fn epdg(&self, aid: &[u8]) -> Result<UsimEpdgConfig, &'static str> {
-        self.with_channel(aid, |channel| {
+        self.with_channel(aid, super::sim_ledger::Purpose::Epdg, |channel| {
             let home_identifiers = channel
                 .read_file(qmi_uim::EF_EPDG_ID)
                 .ok()
@@ -163,13 +176,15 @@ struct AtChannel<'a> {
     lease: &'a SimLease,
     channel: u32,
     closed: bool,
+    receipt: super::sim_ledger::ChannelLease,
 }
 impl AtChannel<'_> {
     fn close(&mut self) -> Result<(), &'static str> {
         self.closed = true; // No automatic duplicate close on an ambiguous result.
-        self.lease
-            .at(&format!("AT+CCHC={}", self.channel))
-            .map(|_| ())
+        self.lease.at(&format!("AT+CCHC={}", self.channel))?;
+        self.receipt
+            .closed()
+            .map_err(|_| "native_sim_receipt_cleanup_failed")
     }
 
     fn exchange(&mut self, apdu: &[u8]) -> Result<UimApduResponse, &'static str> {

@@ -15,6 +15,7 @@ pub mod native;
 pub mod protocol;
 pub mod qmi_proxy;
 pub mod sim;
+pub mod sim_ledger;
 
 static ACTIVE_NATIVE: std::sync::OnceLock<std::sync::Arc<native::NativeFleet>> =
     std::sync::OnceLock::new();

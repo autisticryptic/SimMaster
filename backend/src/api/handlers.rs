@@ -3177,6 +3177,7 @@ pub async fn get_modem_backend_status_handler(State(app): State<AppState>) -> im
             "sim_auth_logic": at || device.spec.protocol == crate::hardware::cellular::backends::config::NativeProtocol::Qmi,
             "sms_voice_ussd_logic": at,
             "sms_reception_enabled": device.spec.sms_reception_enabled,
+            "sim_channels": device.sim_channel_status(),
             "ims_endpoint_configured": device.spec.ims.is_some(),
             "data_endpoint_configured": device.spec.data.is_some(),
             "band_lock_logic": device.spec.protocol == crate::hardware::cellular::backends::config::NativeProtocol::Qmi,

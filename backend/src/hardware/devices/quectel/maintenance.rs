@@ -243,7 +243,7 @@ fn revision(line_id: &str, action: &MaintenanceAction, before: &Diagnostics) -> 
 }
 
 async fn idle_owned(device: &NativeDevice) -> Result<(), NativeError> {
-    device.ensure_available()?;
+    device.ensure_sim_available()?;
     if !device
         .active_interfaces
         .lock()

@@ -74,6 +74,8 @@ jobs:
             hardware::cellular::backends::native::tests \
             hardware::cellular::backends::messages::tests \
             hardware::cellular::backends::sim::tests \
+            hardware::cellular::backends::sim_ledger::tests \
+            connectivity::modems::ims::vowifi::qmi_uim::tests \
             hardware::cellular::backends::management::tests \
             hardware::devices::quectel::maintenance::tests \
             hardware::cellular::backends::bearer::tests \
