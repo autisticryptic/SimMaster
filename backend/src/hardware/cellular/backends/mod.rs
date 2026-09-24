@@ -8,6 +8,7 @@ use std::{error::Error, fmt};
 pub mod bearer;
 pub mod config;
 pub mod discovery;
+pub mod direct_sms;
 pub mod events;
 pub mod io;
 pub mod management;

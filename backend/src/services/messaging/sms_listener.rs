@@ -553,7 +553,7 @@ async fn maybe_scan_sms_paths(
         let Ok(device) = crate::hardware::cellular::backends::native_device(modem_path) else {
             return;
         };
-        if !device.spec.sms_reception_enabled {
+        if !device.spec.sms_reception_enabled || device.spec.line_id() != line_id {
             return;
         }
         // Initialize only AFTER line/reception admission, also after SIM changes.
@@ -561,6 +561,36 @@ async fn maybe_scan_sms_paths(
             warn!(line_id, %error, "Native SMS initialization deferred");
             return;
         }
+        let captured = match device.capture_sms(context.db.clone()).await {
+            Ok(captured) => captured,
+            Err(error) => {
+                warn!(line_id, %error, "Native SMS capture deferred; uncommitted input was not acknowledged");
+                return;
+            }
+        };
+        let profile = config_manager.get_line_profile(&line_id);
+        if !modem_sms_scan_allowed(
+            &profile,
+            line.binding().present,
+            modem_sms_paused_for_ims(config_manager, line_registry, modem_path).await,
+        ) {
+            return; // Durable bytes remain scoped and replayable after re-admission.
+        }
+        if captured.dropped > 0 || captured.unconfirmed_acks > 0 {
+            debug!(line_id, dropped = captured.dropped, unconfirmed_acks = captured.unconfirmed_acks,
+                "Native SMS transport uncertainty; no raw PDU published");
+        }
+        match super::native_sms::consume_pending(context.db, &line_id, &captured.sim_key, profile.sms_path.dedupe_enabled) {
+            Ok(messages) => for sms in messages {
+                let _ = context.mt_sms.send(sms.clone());
+                if forward_new_sms {
+                    let sender = Arc::clone(context.notification_sender);
+                    tokio::spawn(async move { let _ = sender.forward_sms(&sms).await; });
+                }
+            },
+            Err(_) => warn!(line_id, "Native inbox promotion deferred; durable PDU retained"),
+        }
+        return; // Native storage and direct PDUs share the atomic inbox path.
     }
     scan_sms_paths(context, modem_path, reason, forward_new_sms, &line_id).await;
 }

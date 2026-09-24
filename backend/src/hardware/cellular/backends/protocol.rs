@@ -11,6 +11,9 @@ pub enum Tool {
     At,
     /// Passive, bounded read of coalesced indications; never sends an AT command.
     AtPoll,
+    AtDirectPoll,
+    AtDirectBind,
+    AtDirectCommit,
     AtUssd,
     AtSms,
 }

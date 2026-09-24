@@ -623,13 +623,119 @@ pub fn parse_mt_rp_data(body: &[u8]) -> Result<MtSmsDeliver, SmsEncodingError> {
 
 /// TS 27.005 modem PDU wrapper around the shared TS 23.040 codec. No modem IO.
 pub fn parse_modem_deliver_pdu(pdu: &[u8]) -> Result<MtSmsDeliver, SmsEncodingError> {
+    parse_modem_deliver(pdu).map(|value| value.message)
+}
+
+pub struct ModemDeliver {
+    pub message: MtSmsDeliver,
+    /// PID/DCS/address type plus UDH with only the concat sequence removed.
+    /// Distinguishes 8/16-bit references and port-addressed/binary messages.
+    pub assembly_key: String,
+}
+
+pub fn parse_modem_deliver(pdu: &[u8]) -> Result<ModemDeliver, SmsEncodingError> {
     let start = 1 + usize::from(*pdu.first().ok_or(SmsEncodingError::BodyTooLong)?);
     let tpdu = pdu.get(start..).ok_or(SmsEncodingError::BodyTooLong)?;
-    if tpdu.first().is_none_or(|b| b & 0x03 != 0) {
+    if tpdu.len() < 3 || tpdu[0] & 3 != 0 || tpdu[1] == 0 || tpdu[1] > 40 {
         return Err(SmsEncodingError::BodyTooLong);
     }
-    parse_sms_deliver_tpdu(0, tpdu)
+    let offset = 3 + address_value_octets(usize::from(tpdu[1]));
+    let fixed = tpdu.get(offset..offset+10).ok_or(SmsEncodingError::BodyTooLong)?;
+    decode_service_center_timestamp(&fixed[2..9]).ok_or(SmsEncodingError::BodyTooLong)?;
+    let dcs = fixed[1];
+    let udl = usize::from(fixed[9]);
+    let data = &tpdu[offset+10..];
+    let expected = match sms_alphabet_for_dcs(dcs) {
+        SmsAlphabet::Gsm7 if udl <= 160 => (udl*7).div_ceil(8),
+        SmsAlphabet::Binary | SmsAlphabet::Ucs2 if udl <= 140 => udl,
+        _ => return Err(SmsEncodingError::BodyTooLong),
+    };
+    if data.len() != expected { return Err(SmsEncodingError::BodyTooLong); }
+    let mut metadata = vec![tpdu[2], fixed[0], dcs];
+    if tpdu[0] & 0x40 != 0 {
+        let end = 1 + usize::from(*data.first().ok_or(SmsEncodingError::BodyTooLong)?);
+        let header = data.get(1..end).ok_or(SmsEncodingError::BodyTooLong)?;
+        if matches!(sms_alphabet_for_dcs(dcs), SmsAlphabet::Gsm7) && (end*8).div_ceil(7) > udl {
+            return Err(SmsEncodingError::BodyTooLong);
+        }
+        let mut offset = 0;
+        let mut concat = false;
+        while offset < header.len() {
+            let pair = header.get(offset..offset+2).ok_or(SmsEncodingError::BodyTooLong)?;
+            let iei = pair[0];
+            let len = usize::from(pair[1]);
+            let value = header.get(offset+2..offset+2+len).ok_or(SmsEncodingError::BodyTooLong)?;
+            metadata.extend_from_slice(pair);
+            if matches!(iei, 0 | 8) {
+                if concat || len != if iei == 0 {3} else {4} {
+                    return Err(SmsEncodingError::BodyTooLong);
+                }
+                let total = value[len-2];
+                let sequence = value[len-1];
+                if total == 0 || sequence == 0 || sequence > total { return Err(SmsEncodingError::BodyTooLong); }
+                metadata.extend_from_slice(&value[..len-1]);
+                metadata.push(0);
+                concat = true;
+            } else { metadata.extend_from_slice(value); }
+            offset += 2 + len;
+        }
+    }
+    Ok(ModemDeliver { message:parse_sms_deliver_tpdu(0,tpdu)?, assembly_key:hex_lower(&metadata) })
 }
+
+#[derive(Debug, Clone)]
+pub struct ModemStatusReport {
+    pub reference: u8,
+    pub recipient: String,
+    pub service_center_timestamp: String,
+    pub discharge_timestamp: String,
+    pub status: u8,
+}
+
+/// TS 23.040 SMS-STATUS-REPORT, including the TS 27.005 SMSC envelope.
+/// Only TP-ST=0 is affirmative delivery; other completed/temporary statuses
+/// must not be promoted to delivered by a broad numeric-range comparison.
+pub fn parse_modem_status_report(pdu: &[u8]) -> Result<ModemStatusReport, SmsEncodingError> {
+    let start = 1 + usize::from(*pdu.first().ok_or(SmsEncodingError::BodyTooLong)?);
+    let tpdu = pdu.get(start..).ok_or(SmsEncodingError::BodyTooLong)?;
+    if tpdu.len() < 4 || tpdu[0] & 3 != 2 { return Err(SmsEncodingError::BodyTooLong); }
+    let digits = usize::from(tpdu[2]);
+    // TP-SRQ=1 reports SMS-COMMAND, not SMS-SUBMIT. Do not correlate it to
+    // an outgoing message. Keep unknown address types out of numeric matching.
+    if tpdu[0] & 0x20 != 0 || digits == 0 || digits > 20 || !matches!(tpdu[3], 0x81 | 0x91) {
+        return Err(SmsEncodingError::BodyTooLong);
+    }
+    let address_end = 4 + address_value_octets(digits);
+    let address = tpdu.get(4..address_end).ok_or(SmsEncodingError::BodyTooLong)?;
+    for (index,nibble) in address.iter().flat_map(|b| [b&15,b>>4]).enumerate() {
+        if (index < digits && nibble > 9) || (index == digits && nibble != 15) {
+            return Err(SmsEncodingError::InvalidAddress);
+        }
+    }
+    let scts = tpdu.get(address_end..address_end+7).and_then(decode_service_center_timestamp).ok_or(SmsEncodingError::BodyTooLong)?;
+    let discharge = tpdu.get(address_end+7..address_end+14).and_then(decode_service_center_timestamp).ok_or(SmsEncodingError::BodyTooLong)?;
+    let status = *tpdu.get(address_end+14).ok_or(SmsEncodingError::BodyTooLong)?;
+    if discharge < scts { return Err(SmsEncodingError::BodyTooLong); }
+    // Validate the optional PI/PID/DCS/UDL tail rather than accepting a
+    // truncated report. Extended/reserved PI forms stay diagnostic-only.
+    if let Some((&pi, tail)) = tpdu.get(address_end+15..).and_then(|v|v.split_first()) {
+        if pi & 0xf8 != 0 { return Err(SmsEncodingError::BodyTooLong); }
+        let mut offset = 0;
+        if pi & 1 != 0 { tail.get(offset).ok_or(SmsEncodingError::BodyTooLong)?; offset += 1; }
+        let dcs = if pi & 2 != 0 { let v=*tail.get(offset).ok_or(SmsEncodingError::BodyTooLong)?;offset+=1;v } else {0};
+        if pi & 4 != 0 {
+            let udl=usize::from(*tail.get(offset).ok_or(SmsEncodingError::BodyTooLong)?);offset+=1;
+            let bytes=if matches!(sms_alphabet_for_dcs(dcs),SmsAlphabet::Gsm7){(udl*7).div_ceil(8)}else{udl};
+            if bytes>140 || tail.len()!=offset+bytes {return Err(SmsEncodingError::BodyTooLong);}
+        } else if tail.len()!=offset {return Err(SmsEncodingError::BodyTooLong);}
+    }
+    Ok(ModemStatusReport { reference:tpdu[1], recipient:decode_address_value(tpdu[3],address,digits),
+        service_center_timestamp:scts, discharge_timestamp:discharge, status })
+}
+
+#[cfg(test)]
+#[path = "sms_codec_modem_tests.rs"]
+mod modem_tests;
 
 pub fn build_modem_submit_pdus(
     recipient: &str,
@@ -656,6 +762,9 @@ pub fn build_modem_submit_pdus(
             pdu.push(sc_length as u8);
             pdu.extend_from_slice(sc);
             pdu.extend_from_slice(tpdu);
+            // Request status reports on the native modem leg only. The IMS
+            // RP-DATA/SUBMIT builder and its established wire format stay intact.
+            pdu[1 + sc_length] |= 0x20;
             Ok(pdu)
         })
         .collect()

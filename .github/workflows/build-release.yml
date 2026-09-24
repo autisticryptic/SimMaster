@@ -183,6 +183,9 @@ jobs:
             platform::dns::tests \
             platform::config::tests \
             platform::db::tests::legacy_volte_persisted_names_migrate_to_cellular_ims \
+            platform::db::native_sms_inbox::tests \
+            connectivity::core::sms_codec::tests \
+            connectivity::core::sms_codec::modem_tests \
             platform::config_file::tests \
             platform::network_routing::tests \
             hardware::cellular::cgcontrdp::tests \
@@ -202,6 +205,7 @@ jobs:
             hardware::cellular::backends::protocol::tests \
             hardware::cellular::backends::native::tests \
             hardware::cellular::backends::messages::tests \
+            hardware::cellular::backends::direct_sms::tests \
             hardware::cellular::backends::events::tests \
             hardware::cellular::backends::sim::tests \
             hardware::cellular::backends::sim_ledger::tests \
@@ -211,6 +215,7 @@ jobs:
             hardware::devices::dji::tests \
             hardware::cellular::backends::bearer::tests \
             services::messaging::sms_listener::tests \
+            services::messaging::native_sms::tests \
             hardware::cellular::modem_manager::roaming_observation_tests \
             services::orchestrator::radio_intent::tests \
             services::automation::tasks::consume_data::tests \

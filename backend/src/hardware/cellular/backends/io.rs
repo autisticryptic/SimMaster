@@ -441,14 +441,17 @@ impl NativeIo for SystemNativeIo {
             }
             let result = if matches!(
                 request.tool,
-                Tool::At | Tool::AtPoll | Tool::AtUssd | Tool::AtSms
+                Tool::At | Tool::AtPoll | Tool::AtDirectPoll | Tool::AtDirectBind | Tool::AtDirectCommit | Tool::AtUssd | Tool::AtSms
             ) {
-                if request.arguments.len() != if request.tool == Tool::AtSms { 2 } else { 1 } {
+                if request.arguments.len() != if matches!(request.tool, Tool::AtSms | Tool::AtDirectCommit) { 2 } else { 1 } {
                     return Err(NativeError::Protocol(
                         "native_at_transaction_invalid".into(),
                     ));
                 }
                 if request.tool == Tool::AtPoll && request.arguments[0] != "poll-urcs" {
+                    return Err(NativeError::Protocol("native_at_poll_invalid".into()));
+                }
+                if request.tool == Tool::AtDirectPoll && request.arguments[0] != "direct-pdus" {
                     return Err(NativeError::Protocol("native_at_poll_invalid".into()));
                 }
                 let device = request.device.clone();
@@ -463,6 +466,16 @@ impl NativeIo for SystemNativeIo {
                         let events = crate::hardware::cellular::at_session::poll_events(&device)?;
                         serde_json::to_string(&events)
                             .map_err(|_| "AT event encoding failed".into())
+                    }
+                    Tool::AtDirectPoll => {
+                        serde_json::to_string(&crate::hardware::cellular::at_session::direct_pdus(&device)?)
+                            .map_err(|_| "AT direct queue encoding failed".into())
+                    }
+                    Tool::AtDirectBind => crate::hardware::cellular::at_session::bind_direct_sim(&device, &command),
+                    Tool::AtDirectCommit => {
+                        let token = arguments[0].parse::<u64>().map_err(|_| "AT direct token invalid".to_string())?;
+                        let ack = match arguments[1].as_str() { "0"=>Some(false), "1"=>Some(true), "unknown"=>None, _=>return Err("AT direct ack invalid".into()) };
+                        crate::hardware::cellular::at_session::complete_direct(&device, token, ack)
                     }
                     Tool::AtUssd => {
                         crate::hardware::cellular::at_session::execute_ussd(&device, &command)
@@ -538,7 +551,7 @@ pub(crate) async fn run_process(request: &CommandRequest) -> Result<String, Nati
     let program = match request.tool {
         Tool::Qmi => "qmicli",
         Tool::Mbim => "mbimcli",
-        Tool::At | Tool::AtPoll | Tool::AtSms | Tool::AtUssd | Tool::QmiControl => {
+        Tool::At | Tool::AtPoll | Tool::AtDirectPoll | Tool::AtDirectBind | Tool::AtDirectCommit | Tool::AtSms | Tool::AtUssd | Tool::QmiControl => {
             return Err(NativeError::Protocol("native_at_not_a_process".into()))
         }
     };

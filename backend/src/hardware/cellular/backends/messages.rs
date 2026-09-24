@@ -22,7 +22,7 @@ pub struct NativeSms {
 }
 
 impl NativeDevice {
-    fn require_sms_reception(&self) -> Result<(), NativeError> {
+    pub(super) fn require_sms_reception(&self) -> Result<(), NativeError> {
         if self.spec.sms_reception_enabled {
             Ok(())
         } else {
@@ -99,15 +99,7 @@ impl NativeDevice {
     }
 
     pub async fn initialize_sms(self: &Arc<Self>) -> Result<(), NativeError> {
-        self.require_sms_reception()?;
-        self.verify_primary_slot().await?;
-        self.commands(vec![
-            self.at_request("AT+CMGF=0")?,
-            // Store MT messages; a missed URC must be recoverable by polling.
-            self.at_request("AT+CNMI=2,1,0,1,0")?,
-        ])
-        .await
-        .map(|_| ())
+        self.initialize_durable_sms().await
     }
 
     async fn raw_messages(self: &Arc<Self>) -> Result<(String, Vec<(u32, String)>), NativeError> {

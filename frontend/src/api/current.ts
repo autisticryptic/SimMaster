@@ -807,7 +807,7 @@ class SimAdminCurrentAPI {
   }
 
   async sendSms(lineId: string, phoneNumber: string, content: string) {
-    return request<ApiResponse<{ path: string; transport?: string; line_id: string }>>(modemLinePath(lineId, '/sms/send'), {
+    return request<ApiResponse<{ path: string; transport?: string; line_id: string; submission_state?: 'sent' | 'unconfirmed'; sms_id?: number; part_count?: number; submitted_parts?: number }>>(modemLinePath(lineId, '/sms/send'), {
       method: 'POST',
       body: JSON.stringify({ phone_number: phoneNumber, content }),
     })

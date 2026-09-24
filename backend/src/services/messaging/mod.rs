@@ -3,5 +3,6 @@
 //!   - `sms_listener`: watches ModemManager for new SMS and forwards them
 //!   - `verification_code`: extracts one-time codes from SMS bodies
 
+pub mod native_sms;
 pub mod sms_listener;
 pub mod verification_code;

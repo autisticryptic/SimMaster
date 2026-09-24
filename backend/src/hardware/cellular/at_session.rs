@@ -60,7 +60,7 @@ impl AtSession {
     fn reset(&mut self) {
         self.port = None;
         self.read_buf.clear();
-        self.urcs.reset_frame();
+        self.urcs.transport_reset();
     }
 
     fn ensure_open(&mut self) -> Result<(), String> {
@@ -84,11 +84,14 @@ impl AtSession {
             self.reset();
             return Err(err);
         }
+        self.exchange_ready(command, timeout)
+    }
+
+    fn exchange_ready(&mut self, command: &str, timeout: Duration) -> Result<String, String> {
         if let Err(err) = self.write_command(command) {
             self.reset();
             return Err(err);
         }
-
         let deadline = Instant::now() + timeout;
         let mut lines = Vec::new();
         let mut response_bytes = 0usize;
@@ -105,7 +108,7 @@ impl AtSession {
             if trimmed.is_empty() || trimmed == command {
                 continue;
             }
-            if self.urcs.route(trimmed, Some(command)) {
+            if self.route_command(trimmed, command)? {
                 continue;
             }
             response_bytes = response_bytes.saturating_add(line.len());
@@ -159,7 +162,7 @@ impl AtSession {
             if trimmed.is_empty() || trimmed == command {
                 continue;
             }
-            if self.urcs.route(trimmed, Some(command)) {
+            if self.route_command(trimmed, command)? {
                 continue;
             }
             response_bytes = response_bytes.saturating_add(line.len());
@@ -240,7 +243,7 @@ impl AtSession {
                 if line.trim() == ">" {
                     break 'prompt;
                 }
-                if self.urcs.route(&line, Some("AT+CMGS")) {
+                if self.route_command(&line, "AT+CMGS")? {
                     continue;
                 }
                 if is_error_line(line.trim()) {
@@ -281,11 +284,11 @@ impl AtSession {
                     return Err("SMS submission result unconfirmed".into());
                 }
             };
-            if self.urcs.route(line.trim(), Some("AT+CMGS")) {
+            if self.route_command(line.trim(), "AT+CMGS")? {
                 continue;
             }
             if let Some(value) = line.trim().strip_prefix("+CMGS:") {
-                reference = value.trim().parse::<u32>().ok();
+                reference = value.split(',').next().and_then(|v| v.trim().parse::<u8>().ok());
             }
             if is_error_line(line.trim()) {
                 self.reset();
@@ -333,12 +336,32 @@ impl AtSession {
         while let Some(line) = self.pop_line() {
             self.urcs.route(&line, None);
         }
-        self.read_buf.clear();
-        self.urcs.reset_frame();
+        // Do not erase a partial +CMT/+CDS header/body before a command.
+        // Finish a partial line within the drain budget, or refuse the write.
+        while !self.read_buf.is_empty() && Instant::now() < deadline {
+            if self.read_available()? == 0 { std::thread::sleep(READ_POLL); }
+            while let Some(line) = self.pop_line() { self.urcs.route(&line, None); }
+        }
+        if !self.read_buf.is_empty() {
+            return Err("AT partial frame before command".into());
+        }
         Ok(())
     }
 
     fn poll_events(&mut self) -> Result<super::at_urc::UrcEvents, String> {
+        self.pump_events()?;
+        Ok(self.urcs.take())
+    }
+
+    fn route_command(&mut self, line: &str, command: &str) -> Result<bool, String> {
+        let routed = self.urcs.route(line, Some(command));
+        if self.urcs.framing_fault() {
+            self.reset();
+            Err("AT unsolicited PDU framing lost".into())
+        } else { Ok(routed) }
+    }
+
+    fn pump_events(&mut self) -> Result<(), String> {
         self.ensure_open()?;
         // Same session mutex / reader as commands; no AT query or competing
         // background reader. Preserve fragmented URCs for the next poll.
@@ -353,7 +376,29 @@ impl AtSession {
         while let Some(line) = self.pop_line() {
             self.urcs.route(&line, None);
         }
-        Ok(self.urcs.take())
+        Ok(())
+    }
+
+    fn complete_direct(&mut self, token: u64, ack: Option<bool>) -> Result<&'static str, String> {
+        self.pump_events()?;
+        if ack != Some(true) {
+            if ack.is_none() { self.urcs.block_ack(); }
+            return self.urcs.take_direct(token, false).map(|_| if ack == Some(false) {"not_required"} else {"service_unconfirmed"})
+                .ok_or_else(|| "AT direct PDU token expired".into());
+        }
+        // Do not consume a new partial frame or run a second input drain
+        // after deciding which sole network delivery CNMA will acknowledge.
+        if self.read_buf.iter().any(|b| !b.is_ascii_whitespace()) || self.urcs.take_direct(token, true).is_none() {
+            self.urcs.block_ack();
+            let _ = self.urcs.take_direct(token, false);
+            return Ok("ambiguous");
+        }
+        // Remove the live token BEFORE writing. A timeout cannot cause a
+        // blind second CNMA against a later, unrelated network message.
+        match self.exchange_ready("AT+CNMA=1", COMMAND_TIMEOUT) {
+            Ok(_) => Ok("confirmed"),
+            Err(_) => Ok("unconfirmed"),
+        }
     }
 
     fn pop_line(&mut self) -> Option<String> {
@@ -596,6 +641,55 @@ pub fn poll_events(_device: &str) -> Result<super::at_urc::UrcEvents, String> {
     Err("AT port access is only supported on Unix devices".into())
 }
 
+#[cfg(unix)]
+pub fn direct_pdus(device: &str) -> Result<super::at_urc::DirectBatch, String> {
+    let session = session_for(device);
+    let mut session = session.lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(error) = session.pump_events() {
+        session.reset();
+        return Err(error);
+    }
+    Ok(session.urcs.direct_batch())
+}
+#[cfg(not(unix))]
+pub fn direct_pdus(_device: &str) -> Result<super::at_urc::DirectBatch, String> {
+    Err("AT port access requires Unix".into())
+}
+#[cfg(unix)]
+pub fn bind_direct_sim(device: &str, sim_key: &str) -> Result<String, String> {
+    let session = session_for(device);
+    let mut session = session.lock().unwrap_or_else(|p| p.into_inner());
+    session.pump_events()?;
+    if !session.read_buf.is_empty() || session.urcs.has_pending_frame() {
+        return Err("AT SIM scope deferred until complete PDU frame".into());
+    }
+    session.urcs.bind_sim(sim_key)?;
+    Ok("bound".into())
+}
+#[cfg(not(unix))]
+pub fn bind_direct_sim(_device: &str, _sim_key: &str) -> Result<String, String> {
+    Err("AT port access requires Unix".into())
+}
+#[cfg(unix)]
+pub fn complete_direct(device: &str, token: u64, ack: Option<bool>) -> Result<String, String> {
+    let session = session_for(device);
+    let mut session = session.lock().unwrap_or_else(|p| p.into_inner());
+    let result = session.complete_direct(token, ack).map(str::to_string);
+    if result.is_err() { session.reset(); }
+    result
+}
+#[cfg(not(unix))]
+pub fn complete_direct(_device: &str, _token: u64, _ack: Option<bool>) -> Result<String, String> {
+    Err("AT port access requires Unix".into())
+}
+#[cfg(unix)]
+pub fn discard_direct(device: &str) {
+    let session = session_for(device);
+    session.lock().unwrap_or_else(|p| p.into_inner()).urcs.clear_private_data();
+}
+#[cfg(not(unix))]
+pub fn discard_direct(_device: &str) {}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -701,7 +795,7 @@ mod tests {
             peer.write_all(b"+CUSD: 0,\"text > not prompt\",15\r\n> \r\n")
                 .unwrap();
             assert_eq!(read_until(&mut peer, 0x1a), b"00010203");
-            peer.write_all(b"+CMTI: \"SM\",2\r\n+CMGS: 9\r\nOK\r\n")
+            peer.write_all(b"+CMTI: \"SM\",2\r\n+CMGS: 9,\"0000\"\r\nOK\r\n")
                 .unwrap();
         });
         assert_eq!(session.send_sms_pdu("00010203", 3).unwrap(), "9");
@@ -719,6 +813,53 @@ mod tests {
             session.read_available().unwrap_err(),
             "AT frame exceeds size limit"
         );
+    }
+
+    #[test]
+    fn cnma_is_sent_once_only_for_a_sole_committed_live_token() {
+        let (mut session, mut peer) = pair();
+        session.urcs.bind_sim(&"a".repeat(64)).unwrap();
+        peer.write_all(b"+CMT: ,4\r\n0000112233\r\n").unwrap();
+        session.pump_events().unwrap();
+        let token = session.urcs.direct_batch().pdus[0].token;
+        let server = std::thread::spawn(move || {
+            assert_eq!(read_until(&mut peer, b'\r'), b"AT+CNMA=1");
+            peer.write_all(b"OK\r\n").unwrap();
+        });
+        assert_eq!(session.complete_direct(token, Some(true)).unwrap(), "confirmed");
+        server.join().unwrap();
+        assert!(session.urcs.direct_batch().pdus.is_empty());
+        assert!(session.urcs.take_direct(token, true).is_none());
+    }
+
+    #[test]
+    fn ambiguous_or_unconfirmed_service_never_writes_cnma() {
+        let (mut session, mut peer) = pair();
+        session.urcs.bind_sim(&"a".repeat(64)).unwrap();
+        peer.write_all(b"+CMT: ,4\r\n0000112233\r\n+CMT: ,4\r\n0000112233\r\n").unwrap();
+        session.pump_events().unwrap();
+        let batch = session.urcs.direct_batch();
+        assert_eq!(session.complete_direct(batch.pdus[0].token, Some(true)).unwrap(), "ambiguous");
+        assert_eq!(session.complete_direct(batch.pdus[1].token, None).unwrap(), "service_unconfirmed");
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn pending_direct_body_survives_the_command_preflight() {
+        let (mut session, mut peer) = pair();
+        session.urcs.bind_sim(&"a".repeat(64)).unwrap();
+        peer.write_all(b"+CMT: ,4\r\n").unwrap();
+        session.pump_events().unwrap();
+        let server = std::thread::spawn(move || {
+            assert_eq!(read_until(&mut peer, b'\r'), b"AT+CMGL=4");
+            peer.write_all(b"0000112233\r\n+CMGL: 1,0,,4\r\n0000556677\r\nOK\r\n").unwrap();
+        });
+        let response = session.execute_command("AT+CMGL=4", Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
+        assert!(!response.contains("00112233"));
+        assert_eq!(session.urcs.direct_batch().pdus.len(), 1);
     }
 
     #[test]

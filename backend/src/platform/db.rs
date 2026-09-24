@@ -16,6 +16,9 @@ use tokio::sync::broadcast;
 
 use crate::connectivity::core::ims_failure::ImsFailureDiagnostic;
 
+#[path = "native_sms_inbox.rs"]
+pub mod native_sms_inbox;
+
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const SMS_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 const ESIM_DETECTION_CACHE_MAX_ROWS: i64 = 64;
@@ -512,6 +515,7 @@ pub struct VowifiSoakRunsResponse {
     pub read_only: bool,
 }
 
+#[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
     app_event_tx: broadcast::Sender<AppEventEntry>,
@@ -2948,6 +2952,7 @@ impl Database {
             [],
         )?;
         migrate_sms_dedup_for_line_scope(&conn)?;
+        native_sms_inbox::init(&conn)?;
         conn.execute("DROP INDEX IF EXISTS idx_sms_dedup_created_at", [])?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sms_dedup_line_created_at

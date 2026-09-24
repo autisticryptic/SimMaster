@@ -4874,6 +4874,25 @@ async fn send_sms_over_cs_path(
         return Err("line_has_no_baseband".to_string());
     }
     check_sms_send_cost_guard(app, line_id, AccessPathKind::Cs, guard)?;
+    if crate::hardware::cellular::backends::is_native_selector(&binding.modem_path) {
+        if !app.config_manager.get_line_profile(line_id).enabled {
+            return Err("line_disabled".into());
+        }
+        let device = crate::hardware::cellular::backends::native_device(&binding.modem_path)
+            .map_err(|error| error.to_string())?;
+        if device.spec.line_id() != line_id { return Err("native_sms_line_scope_mismatch".into()); }
+        let result = device.send_sms_persisted(
+            app.database.as_ref().clone(), &payload.phone_number, &payload.content,
+        ).await.map_err(|error| error.to_string())?;
+        // An uncertain multipart send is not an invitation to resend/fallback.
+        // Its pending DB row and submitted prefix remain available for diagnosis.
+        return Ok(json!({
+            "path": result.path, "transport": "modem", "line_id": line_id,
+            "sms_id": result.sms_id, "part_count": result.part_count,
+            "submitted_parts": result.submitted_parts,
+            "submission_state": if result.confirmed { "sent" } else { "unconfirmed" },
+        }));
+    }
     let path = send_sms_via_modem(
         &app.dbus_conn,
         &binding.modem_path,

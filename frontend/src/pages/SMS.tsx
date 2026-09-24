@@ -586,7 +586,11 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
       const response = await api.sendSms(selectedLineId, phoneNumber, content)
       if (response.status === 'ok') {
         const path = smsTransportInfo(response.data?.transport ?? response.data?.path).label
-        setSuccess(`短信已通过 ${path} 发送到 ${phoneNumber}`)
+        if (response.data?.submission_state === 'unconfirmed') {
+          setError('发送结果尚未确认，可能已有部分短信提交。记录已保留，请勿直接重发。')
+        } else {
+          setSuccess(`短信已通过 ${path} 发送到 ${phoneNumber}`)
+        }
         setContent('')
         setTimeout(() => {
           void fetchMessages()
@@ -1240,8 +1244,10 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
                       }}
                     />
                     {msg.direction === 'outgoing' && (
-                      msg.status === 'sent' ? (
-                        <Chip label="已发送" size="small" sx={{ height: 16, fontSize: '0.65rem', bgcolor: 'rgba(255,255,255,0.2)', color: '#ffffff' }} />
+                      msg.status === 'sent' || msg.status === 'delivered' ? (
+                        <Chip label={msg.status === 'delivered' ? '已送达' : '已发送'} size="small" sx={{ height: 16, fontSize: '0.65rem', bgcolor: 'rgba(255,255,255,0.2)', color: '#ffffff' }} />
+                      ) : msg.status === 'pending' ? (
+                        <Chip label="待确认" size="small" color="warning" sx={{ height: 16, fontSize: '0.65rem' }} />
                       ) : msg.status === 'failed' ? (
                         <Chip label="失败" size="small" color="error" sx={{ height: 16, fontSize: '0.65rem' }} />
                       ) : null
