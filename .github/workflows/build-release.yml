@@ -1,6 +1,7 @@
 name: Build-Release
 
-# 多架构发布构建：编译前端 + 后端，按架构分别打包为 .tar.gz 并发布到 GitHub Release。
+# 多架构构建：普通 push 只生成 Actions artifacts；仅 master 上显式手动授权发布。
+# 整合开发分支不得覆盖旧版本 Release 或标签。
 #
 # 产物结构与既有 OTA 包保持一致（meta.json + simadmin + www/），
 # 符合 deploy/install.sh 的安装约定，可直接被现有 OTA 流程消费。
@@ -15,11 +16,7 @@ on:
   push:
     branches:
       - master
-      # Device candidates are built as Actions artifacts only. The release job
-      # below must never publish/retag an existing beta from this branch.
-      - fix/1.1.4-beta3-cellular-ims
-      - fix/sim02-catalog-aka-baseline
-      - dev/1.1.5-modem-backends
+      - 'dev/**'
   workflow_dispatch:
     inputs:
       version:
@@ -33,7 +30,7 @@ on:
         type: boolean
         default: true
       publish_release:
-        description: '仅 master 可发布；开发分支始终只生成候选 artifact'
+        description: '仅 master 显式手动授权可发布新版本；所有 push 均只生成 artifact'
         required: false
         type: boolean
         default: false
@@ -126,6 +123,7 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm run build
           pnpm run type-check
+          pnpm run lint
           pnpm run test:unit
           echo "✅ 前端构建完成！"
           ls -lh dist/
@@ -505,12 +503,24 @@ jobs:
   # ==================== 3. 汇总所有架构并发布 Release ====================
   release:
     name: Publish Release
-    if: github.ref == 'refs/heads/master' && needs.prepare.outputs.publish_release == 'true'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && needs.prepare.outputs.publish_release == 'true'
     needs: [prepare, build, check-tests]
     runs-on: ubuntu-24.04
+    concurrency:
+      group: publish-${{ needs.prepare.outputs.version }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
+      - name: Checkout publication guard
+        uses: actions/checkout@v4
+
+      - name: Refuse an existing tag or release
+        env:
+          RELEASE_TAG: v${{ needs.prepare.outputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/release_target.py
+
       - name: Download all packages
         uses: actions/download-artifact@v4
         with:
@@ -540,7 +550,7 @@ jobs:
           files: |
             release/*.tar.gz
             release/SHA256SUMS.txt
-          overwrite_files: true
+          overwrite_files: false
           generate_release_notes: true
           body: |
             ## SimAdmin 多架构发布包

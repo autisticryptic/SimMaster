@@ -2,6 +2,12 @@
 
 本文档是前端、后端和整包构建的唯一开发入口。子目录不再分别维护容易失真的 README。
 
+主线为 `master`。普通 push（包括 master）只生成 Actions artifacts，不自动发布；
+发布必须在 master 手动选择 `publish_release=true`，且目标 tag/Release 必须尚不存在。
+分支整理不等于版本发布，默认 MM 与 native 实验性 opt-in 边界不变。参见
+[分支整理与发布保护](BRANCH_CONSOLIDATION_2026-09-24.md)、
+[原生后端审计](NATIVE_BACKEND_AUDIT_2026-09-24.md)。
+
 ## 项目结构
 
 ```text
@@ -33,8 +39,8 @@ backend/src/
 ├── api/                       HTTP handler、DTO、密码与会话认证
 ├── connectivity/
 │   ├── core/                  共享 IMS/SIP/AKA/短信/语音核心
-│   └── modems/softstack/
-│       ├── volte/             IMS bearer、ip xfrm、SIP、RTP 与语音
+│   └── modems/ims/
+│       ├── cellular_ims/      蜂窝 IMS bearer、ip xfrm、SIP、RTP 与语音
 │       └── vowifi/            IKEv2/ESP、ePDG、TUN、SIP 与运营商 Profile
 ├── hardware/
 │   ├── cellular/              ModemManager、QMI、AT、数据代理和线路控制
@@ -53,7 +59,7 @@ backend/src/
 
 架构约束：
 
-- `connectivity/core` 不依赖具体接入腿；VoLTE 和 VoWiFi 复用相同的 SIP、AKA 和业务模型。
+- `connectivity/core` 不依赖具体接入腿；蜂窝 IMS 和 VoWiFi 复用相同的 SIP、AKA 和业务模型。
 - `hardware` 只封装设备与固件操作，跨接入的策略放在 `services/orchestrator`。
 - 所有会影响线路状态的 API 都应显式解析 `line_id`，不要重新引入“取第一个 modem”的全局接口。
 - 同一物理 modem 的 D-Bus、QMI 和 AT 修改操作使用

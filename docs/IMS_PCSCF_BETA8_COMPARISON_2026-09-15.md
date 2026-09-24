@@ -3,6 +3,9 @@
 > 这是有时间边界的开发/实测记录，不是 1.1.5 发布验收。
 > 本次仅测试 MM 后端的 SIM-04 IMS 注册；没有混合后端、短信或电话测试。
 > **6391732 实测未注册；后续 P-CSCF/DNS 修补不能被回填为该次实测成功。**
+> 2026-09-24 更新：T03/T04 的初始成功见 §7；后续 T05 原始日志已核实 7 次自然续期，
+> `71513ea` 正式服务已核实 9 次。详见 [续接验收](SIM04_CONTINUATION_2026-09-24.md)，
+> 不再把旧短窗口“尚无续期”当作当前故障。
 
 ## 1. 参考文件身份
 
@@ -158,7 +161,8 @@ profile 重写、宿主 namespace 发送 IMS、默认三位 MNC 猜测、把 DAT
 
 两轮均为 derived 首槽 `derived_3gpp_lte_45507`、`profile_candidate_index=1`、MM 保留 bearer、IPv6/`wwan0`、P-CSCF `source=mm_owned_at_sole_pinned_ipv6_prefix` / `cid=Some(2)` / `pcscf_count=2`；REGISTER 收到 challenge 后以 `registration_mode=udp` 完成 `standard_3gpp_conservative` 初始注册，`expires_seconds=3600`、`service_route_count=1`、`associated_uri_count=2`、`contact_binding_count=1`、`voice_service=registrar_accepted`。
 
-仍未取得的验收项：自然续期（两轮 `register_refresh_count` 均为 0）、通话与短信。
+当时尚未取得的验收项：自然续期（两轮 `register_refresh_count` 均为 0）、通话与短信。
+自然续期后来已在 T05 / `71513ea` 取得，见本文顶部的后续记录；通话和短信仍单独待测。
 
 结论修正：beta8 对照的价值在于确认 profile/CID/family/P-CSCF 的分层与有界读取机制，而不是证明需要临时 `CGACT=1` 预取；该预取依旧未接入生产路径。上文关于 `0feaa40` 阻止 forced-family 重试并返回 `profile_pin_family_conflict` 的记述也已作废：`70dfe3d` 判定那是回归风险（几乎所有选中的 IMS profile 都带 `profile_id`，会误关闭已验证的 IPv4 强制单栈路径），已恢复网络强制单栈重试，改为用 `attempted_single` 仅跳过字面重复尝试，并移除 `pinned_profile_forced_family_error` / `profile_pin_family_conflict`。
 

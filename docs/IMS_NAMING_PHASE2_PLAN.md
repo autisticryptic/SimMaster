@@ -347,7 +347,8 @@ JSON 字段改名必须前后端同步发布，否则页面读不到字段而静
 | 2–3 | `afa7112` | 前端按 token 精确匹配、生成式码表、前后端码表一致性守卫；CI 全绿 |
 | 4 | `a4108f3` | 错误码 `volte_*` → `cellular_ims_*`（427 处，14 个文件）；CI 全绿 |
 | 5–7 | `71513ea` | JSON/配置/持久化名称迁移；CI 全绿、发布 skipped；SIM-04 已部署并自然续期 |
-| 收尾 | 本轮待提交 | 数据库迁移测试加入两个实际执行过滤器；carrier_Bundles readiness 与语音能力解耦 |
+| 收尾 | `2129282` | 数据库迁移测试加入两个实际执行过滤器并通过；SMS-only catalog 回归通过 |
+| 数据库项目 | `carrier_Bundles:558a505` | readiness 与语音能力解耦，29 项 Python 单测及其 CI 通过 |
 
 步骤 1 验收：CI `Validate Beta Refactor` / `Build-Release` 全绿，
 arm64 与 amd64 均编译通过，`Publish Release` 保持 `skipped`；
@@ -355,3 +356,10 @@ arm64 与 amd64 均编译通过，`Publish Release` 保持 `skipped`；
 
 步骤 2–4 验收：本地 95 项 Python 守卫、前端 8 项单测、`tsc -b` 与
 `eslint --max-warnings 0` 通过；`afa7112` 与 `a4108f3` 的三个工作流均为 success。
+
+2026-09-24 收尾验收：本地 **100** 项 Python 守卫、**8** 项前端单测通过；
+`2129282` 的 [Validate](https://github.com/autisticryptic/SimMaster/actions/runs/35947763715)
+和 [Build](https://github.com/autisticryptic/SimMaster/actions/runs/35947763717) 均 success，
+数据库旧名迁移测试已实际运行，arm64/amd64 成功，`Publish Release=skipped`。
+`carrier_Bundles:558a505` 的 [CI](https://github.com/autisticryptic/carrier_Bundles/actions/runs/35947740501)
+通过。固件 catalog 的重新提取/封存/发布是另一条构建流程，不等同于这次代码和单测验收。

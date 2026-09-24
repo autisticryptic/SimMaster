@@ -4,10 +4,11 @@ name: Validate Beta Refactor
 on:
   push:
     branches:
-      - refactor/1.1.4-beta2
-      - fix/1.1.4-beta3-cellular-ims
-      - fix/sim02-catalog-aka-baseline
-      - dev/1.1.5-modem-backends
+      - master
+      - 'dev/**'
+  pull_request:
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:

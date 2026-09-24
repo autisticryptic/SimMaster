@@ -81,7 +81,8 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
       事件触发既有持久化接收/索引内容校验流程，15 秒完整扫描保留作丢事件兜底
 - [x] 命令/提示交错、分片、URC 排空保留、SMS 提示与 reference、帧上限等离线测试已编写，
       两套 CI 新增实际执行过滤器；本地仅格式与 Python 守卫
-- [ ] 该轮新 Rust 测试与构建 CI 通过
+- [x] 该轮新 Rust 测试与构建 CI 通过：`efe6135`；Validate `35951689917` / Build
+      `35951689850` success，arm64/amd64 success，Publish Release skipped
 - [ ] 电话/注册事件的完整订阅与广播、用事件替换 `CLCC` 轮询、断口自动重连
 - [ ] 直接 `+CMT` 正文与 `+CDS` delivery-report 的完整业务消费（当前仅隔离并触发核对）；
       配置仍使用存储通知，不因收到一个 hint 就声称短信已入库或发送成功
@@ -124,6 +125,7 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 |---|---|---|
 | — | `71513ea` | 审计基线；该版本 SIM-04 MM 路径已实机注册及自然续期 |
 | N1 | `7a15a7f` | 被动发现、12 项 Rust 回归、4 项 Python 守卫；双架构 CI 通过，无硬件写入 |
+| N2 基础 | `efe6135` | AT/URC 分流、有界读取、经准入的短信事件提示调度；双架构 CI 通过，未做 native 实机业务测试 |
 
 参考仓库审计快照：VoCat `484cd23`、mdd-sim-gateway `8d9a830`、DJIModeSwitcher
 `6d86b64`、EC25Toolbox `12678de`、DJOneHub `f7f1a0d`。只读发现是本项目自行实现，

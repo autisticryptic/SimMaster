@@ -13,6 +13,17 @@
 
 ## 1. 当前结论
 
+**2026-09-24 最新检查点**：命名迁移已完成；`7a15a7f` 新增原生被动发现，`2129282`
+补数据库迁移实际执行与 SMS-only catalog 回归；双架构 CI success，发布 skipped。
+`carrier_Bundles:558a505` 已联动修正把语音标志当 IMS readiness 的误用。
+SIM-04 的 `71513ea` 已确认初始注册和 **9 次自然续期**；T05 原始日志也重新确认了
+**7 次** refresh，旧“零续期”判断无效。用户已取消测试窗口自动回滚，以后原位部署最新构建，
+保持 MM 默认。下载镜像故障已恢复；`2129282` 于 10:57:57 启动、10:58:47 初始注册成功，
+只读发现实机验证通过；随后按用户要求停止本地续期轮询，保留设备正常运行，
+继续 native 接口增强与主分支整理。`efe6135` 的 AT/URC 基础增强已通过双架构 CI。
+详见 [9/24 续接验收](SIM04_CONTINUATION_2026-09-24.md) 与
+[分支整理记录](BRANCH_CONSOLIDATION_2026-09-24.md)。以下为各历史日期快照。
+
 **SIM-04/MM 9/19 5094ac1 候选结果**：新提交 `5094ac1` 完成 MM retained-bearer P-CSCF 关联、IPv6 同 `/64` 不同 IID 的窄匹配、owner/profile/IP 前后复核、共享 AT 串行和失效清理保护；Validate `35420547441`、Build `35420547370` 均 success，35 项新增 Rust 回归实际执行，arm64/amd64 包已核验，发布 skipped。
 9/19 T01 使用独立克隆配置/数据库和 MM 默认后端完成候选窗口；未重新附着、未改 APN/Initial EPS、未启用 native。三槽仍未注册：首/末槽 `context_pcscf_absent`，中间槽 `at_response_invalid`；当前 `CGCONTRDP=2` 仍为 7 字段、无 P-CSCF，未进入 SIP/AKA。候选已回滚，原服务/MM/proxy/Wi-Fi/配置/DB/receipt均复核恢复。
 随后对 beta8 做了同哈希 IDA 深度补证：高成功率来自身份、CID lease、profile/family准备、多来源P-CSCF、REGISTER/AKA和运行时fallback的组合；direct WDS、宽泛 plain fallback、XFRM flush及临时 `CGACT=1` helper不能未经完整lease/恢复验证移植。详见 [beta8综合深度对照](../../SimAdmin/docs/IMS_DERIVATION_BETA8_COMPARISON_2026-09-17.md)。

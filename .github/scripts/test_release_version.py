@@ -80,7 +80,7 @@ class ReleaseVersionTests(unittest.TestCase):
         before_release, release = text.split("\n  release:\n", 1)
         self.assertNotIn("uses: softprops/action-gh-release@", before_release)
         self.assertIn(
-            "if: github.ref == 'refs/heads/master' && needs.prepare.outputs.publish_release == 'true'",
+            "if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && needs.prepare.outputs.publish_release == 'true'",
             release.split("    steps:", 1)[0],
         )
         self.assertIn("needs: [prepare, build, check-tests]", release)

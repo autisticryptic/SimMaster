@@ -1,4 +1,4 @@
-"""Decide whether a build may publish; development refs are artifacts-only."""
+"""Publish only through an explicit master dispatch; all pushes are artifacts-only."""
 import os
 from pathlib import Path
 
@@ -7,11 +7,11 @@ MASTER_REF = "refs/heads/master"
 
 
 def resolve_publication(event, ref, requested=False):
-    """Fail closed except master pushes or explicitly authorized master dispatches."""
+    """Fail closed except explicitly authorized master workflow dispatches."""
     if ref != MASTER_REF:
         return {"publish_release": "false", "publication_reason": "non_release_ref"}
     if event == "push":
-        return {"publish_release": "true", "publication_reason": "master_push"}
+        return {"publish_release": "false", "publication_reason": "push_artifacts_only"}
     if event != "workflow_dispatch":
         return {"publish_release": "false", "publication_reason": "unsupported_event"}
     explicit = requested is True or (

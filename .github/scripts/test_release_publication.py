@@ -9,11 +9,12 @@ from release_publication import resolve_publication
 
 
 class ReleasePublicationTests(unittest.TestCase):
-    def test_master_push_preserves_existing_release_flow(self):
-        self.assertEqual(
-            resolve_publication("push", "refs/heads/master")["publish_release"],
-            "true",
-        )
+    def test_master_push_never_publishes_even_if_requested(self):
+        for requested in (False, True, "true"):
+            self.assertEqual(
+                resolve_publication("push", "refs/heads/master", requested),
+                {"publish_release": "false", "publication_reason": "push_artifacts_only"},
+            )
 
     def test_development_pushes_never_publish(self):
         for ref in (
@@ -125,20 +126,26 @@ class ReleasePublicationTests(unittest.TestCase):
             build,
         )
         self.assertIn(
-            "if: github.ref == 'refs/heads/master' && needs.prepare.outputs.publish_release == 'true'",
+            "if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && needs.prepare.outputs.publish_release == 'true'",
             release.split("    steps:", 1)[0],
         )
         self.assertIn("    permissions:\n      contents: write\n", release)
         self.assertNotIn("uses: softprops/action-gh-release@", before_release)
         self.assertIn("needs: [prepare, build, check-tests]", release)
         for workflow in (build, validation):
-            self.assertIn(
-                "      - dev/1.1.5-modem-backends\n",
-                workflow.split("  workflow_dispatch:", 1)[0],
-            )
+            triggers = workflow.split("  workflow_dispatch:", 1)[0]
+            self.assertIn("      - master\n", triggers)
+            self.assertIn("      - 'dev/**'\n", triggers)
+        self.assertIn("  pull_request:\n", validation)
+        self.assertIn("pnpm run lint", before_release)
+        self.assertIn("run: python3 .github/scripts/release_target.py", release)
+        self.assertIn("overwrite_files: false", release)
+        self.assertNotIn("overwrite_files: true", release)
+        self.assertIn("group: publish-${{ needs.prepare.outputs.version }}", release)
+        self.assertLess(release.index("release_target.py"), release.index("uses: softprops/action-gh-release@"))
         self.assertIn(
             "      publish_release:\n"
-            "        description: '仅 master 可发布；开发分支始终只生成候选 artifact'\n"
+            "        description: '仅 master 显式手动授权可发布新版本；所有 push 均只生成 artifact'\n"
             "        required: false\n"
             "        type: boolean\n"
             "        default: false",
