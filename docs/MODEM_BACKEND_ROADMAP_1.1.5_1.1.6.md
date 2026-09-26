@@ -4,6 +4,10 @@
 > 状态：用户已确认版本方向；本文是待实施规划，不是实现完成、实机通过或发布记录。
 > 本文是 [开发总计划](DEVELOPMENT_PLAN.md) 的版本分项，后端迁移的详细任务与发布门槛以本文为准。
 > 写入规划不修改当前 `VERSION`，不触发部署、卸载 ModemManager 或停止设备服务。
+>
+> **2026-09-26 接续提示**：唯一工作区已统一为 `SimAdmin/master`。本文件保留版本目标及历史阶段过程，
+> 最新已实现/未验收范围见 [native 状态](NATIVE_BACKEND_STATUS.md)，当前工作和版本修正见
+> [HANDOFF](HANDOFF.md)。调整发布版本号不等于 M0–M5 或硬件矩阵已经验收。
 
 ### 当前启动进度（2026-09-13，M0）
 
@@ -103,7 +107,7 @@
 启动/安装/恢复入口开始按后端分开；默认仍为 MM，不自动尝试 native。
 混合 owner、自动代次恢复及协议/厂商扩展仍有缺口，不能将 M1/M2 或完整替代勾为完成。
 具体范围、限制、接续入口和 CI 状态见
-[原生后端逻辑候选状态](NATIVE_BACKEND_LOGIC_STATUS.md)。
+[原生后端逻辑候选状态](NATIVE_BACKEND_STATUS.md)。
 最新代码检查点为 **`269be65`**（2026-09-15）：保留此前 IPv6、代次/归还、身份/EF_AD、
 MNC 边界、PDP 防覆写与整批终止修补；进一步加入活动 P-CSCF 有界只读等待、DNS 问题与
 Answer/CNAME 归属校验、UDP SRV 端口贯通及活动 CID 歧义拒绝。
@@ -113,7 +117,7 @@ Answer/CNAME 归属校验、UDP SRV 端口贯通及活动 CID 歧义拒绝。
 此前 `6391732` 已在 SIM-04 做受控 MM IMS 实测：IPv6 bearer 和 UE 地址配置有证据，但
 三槽均因 AT 可见 P-CSCF 缺失而未注册，原服务/配置已恢复。
 仅 IMS/MM 的测试边界不变；混合后端实机测试留给其他设备。beta8 的实际指令对照、
-本轮已移植/未移植差异及失败层级见 [P-CSCF 专项记录](IMS_PCSCF_BETA8_COMPARISON_2026-09-15.md)。
+本轮已移植/未移植差异及失败层级见 [P-CSCF 专项记录](archive/2026-09/IMS_PCSCF_BETA8_COMPARISON_2026-09-15.md)。
 接口归还失败时保留 receipt 不等于自动恢复完成；仅表示该逻辑候选已过 CI，
 不代表上述未完成项或实机验收通过。
 

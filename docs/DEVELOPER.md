@@ -5,8 +5,8 @@
 主线为 `master`。普通 push（包括 master）只生成 Actions artifacts，不自动发布；
 发布必须在 master 手动选择 `publish_release=true`，且目标 tag/Release 必须尚不存在。
 分支整理不等于版本发布，默认 MM 与 native 实验性 opt-in 边界不变。参见
-[分支整理与发布保护](BRANCH_CONSOLIDATION_2026-09-24.md)、
-[原生后端审计](NATIVE_BACKEND_AUDIT_2026-09-24.md)。
+[分支整理与发布保护](archive/2026-09/BRANCH_CONSOLIDATION_2026-09-24.md)、
+[原生后端审计](NATIVE_BACKEND_STATUS.md)。
 
 ## 项目结构
 

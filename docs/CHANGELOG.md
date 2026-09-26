@@ -18,7 +18,7 @@
   确认的维护 API、默认只输出计划的 DJI `dji-prepare`；未知写入/关闭结果保留 receipt，不自动
   停 MM、切 owner、写 NV 或回滚。SIM/APDU 账本覆盖 AT/QMI 与 lpac 外部操作范围；
   通话/驻网事件可唤醒权威核对，保留低频兜底。已通过双架构 CI，**未做对应 native 硬件验收**；
-  直接短信 PDU/送达报告完整消费仍待完成。详见 `docs/NATIVE_BACKEND_AUDIT_2026-09-24.md`。
+  直接短信 PDU/送达报告完整消费仍待完成。详见 `docs/NATIVE_BACKEND_STATUS.md`。
 
 - **原生 AT 事务与 URC 分流。** 增加有界、无敏感正文的事件提示；修复异步呼叫结束
   误伤无关查询、USSD 文本内 `>` 被误判短信提示等情况。启用原生短信接收后，事件可触发

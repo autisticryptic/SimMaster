@@ -1,5 +1,8 @@
 # SIM-04：MM 配置读取修复与临时 profile 对照（2026-09-17）
 
+> 历史档案：本文件保留对应日期的事实，旧版本、worktree 和操作步骤不代表当前状态。
+> 当前接手请读 [HANDOFF](../../HANDOFF.md)，不要重放旧部署、回滚或设备命令。
+
 > **后续续接（2026-09-18）**：`e8bff12` 已补完 MM 双栈请求与实际授予处理并通过 CI；新双栈/临时 IPv4 窗口仍未注册，均已恢复。最新证据见 [9/18 专项记录](IMS_SIM04_MM_DUAL_STACK_2026-09-18.md)。以下保留 9/17 的时间边界，不代表双栈代码仍未完成。
 
 > **当前结论：代码与 CI 已推进，SIM-04 仍未注册。** 三轮窗口分别记录；中止、失败、恢复均不回填为成功。
@@ -160,7 +163,7 @@ MM QMI源码从 LTE attach PDN list 的首项加载 default_attach_pdn；这里�
 ## 9. 可复核位置
 
 - 产品源码与CI：本文件第2节；逐卡记录见 [项目交接第12节](PROJECT_HANDOFF_2026-09-12.md#12-后续多卡测试记录持续追加)。
-- beta8静态对照：[相邻IMS树的综合文档](../../SimAdmin/docs/IMS_DERIVATION_BETA8_COMPARISON_2026-09-17.md)。它冻结于此前源码基线，272aa9b的变化以本文为准。
+- beta8静态对照：[相邻IMS树的综合文档](IMS_DERIVATION_BETA8_COMPARISON_2026-09-17.md)。它冻结于此前源码基线，272aa9b的变化以本文为准。
 - 本地候选校验：`SimAdmin/.codex-cf-candidates/272aa9b/verification.json`。
 - 本地安全事件摘要/脚本：`SimAdmin/.tmp/sim04-mm-20260917/`，含T01～T03分离记录；不是新clone必备文件。
 - 完整配置、MM profile快照、原始journal与AT结果保留在仓库外受限私密目录，不随本文提交。不记录完整IMSI/ICCID、Cookie、密码或AKA材料。

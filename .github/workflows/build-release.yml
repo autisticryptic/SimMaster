@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（例如：1.1.4-beta1，auto=读取 VERSION；不会自动递增）'
+        description: '版本号（例如：1.1.5，auto=读取 VERSION；不会自动递增）'
         required: false
         type: string
         default: 'auto'
@@ -87,11 +87,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: python3 .github/scripts/release_version.py
 
-      - name: Sync version (frontend)
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" frontend/package.json
-          echo "✅ frontend/package.json 版本号同步为 $VERSION"
+      - name: Sync release version (all manifests)
+        run: python3 .github/scripts/sync_release_version.py "${{ steps.version.outputs.version }}"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -141,11 +138,15 @@ jobs:
   # A release must not ship if a challenged refresh loses its active SA.
   check-tests:
     name: IMS registration and dual-flow regression tests
+    needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Sync release version (tests)
+        run: python3 .github/scripts/sync_release_version.py "${{ needs.prepare.outputs.version }}"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -336,13 +337,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Sync version (backend)
-        run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
-          # 更新根目录 VERSION，确保 build.rs 注入的 APP_VERSION 与本次包一致
-          printf "%s\n" "$VERSION" > VERSION
-          sed -i "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" backend/Cargo.toml
-          echo "✅ 版本号同步为 $VERSION"
+      - name: Sync release version (backend and lockfile)
+        run: python3 .github/scripts/sync_release_version.py "${{ needs.prepare.outputs.version }}"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -393,7 +389,7 @@ jobs:
           export SQLITE3_STATIC=1
           export LIBSQLITE3_SYS_USE_PKG_CONFIG=0
 
-          cargo build --release --target "$TARGET"
+          cargo build --locked --release --target "$TARGET"
 
           BINARY_PATH="target/$TARGET/release/simadmin"
           echo "✅ 后端构建完成！"
@@ -575,7 +571,7 @@ jobs:
             - **UPX 压缩**: ${{ github.event_name == 'workflow_dispatch' && inputs.use_upx || false }}
 
             ### 验证范围
-            - 阶段验收记录：本 commit 的 `plan.md`。
+            - 当前状态与验收边界：本 commit 的 `docs/HANDOFF.md`。
             - 本版本变更与限制：`docs/releases/${{ needs.prepare.outputs.version }}.md`（如有）。
             - Beta 是预发布验证包，不代表尚未取得实机证据的功能已经通过验收。
 
@@ -589,14 +585,10 @@ jobs:
             校验值见 `SHA256SUMS.txt`。
 
             ### 安装 / 更新
-            ```bash
-            # 安装脚本会按 uname -m 自动选择 ARM64 或 AMD64 包
-            curl -fsSL https://raw.githubusercontent.com/autisticryptic/SimMaster/master/install_latest.sh | sudo sh
-
-            # 或手动指定架构包进行 OTA
-            curl -X POST http://IP:3000/api/ota/upload -F "file=@simadmin-linux-amd64.tar.gz"
-            curl -X POST http://IP:3000/api/ota/apply
-            ```
+            请按本 commit 的 `docs/INSTALL.md` 手动安装，并先校验 `SHA256SUMS.txt`、
+            包内版本/commit/架构及设备实际运行版本。旧一键安装/OTA 流程仍在重构，
+            不因发布版本号变化而视为已验收。保持原配置/数据库及后端选择，
+            不自动切换 native 或执行设备重启。
           draft: false
           prerelease: ${{ fromJSON(needs.prepare.outputs.prerelease) }}
           make_latest: ${{ needs.prepare.outputs.make_latest }}

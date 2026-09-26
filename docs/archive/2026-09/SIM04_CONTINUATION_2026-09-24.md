@@ -1,5 +1,8 @@
 # SIM-04 / 1.1.5 续接验收（2026-09-24）
 
+> 历史档案：本文件保留对应日期的事实，旧版本、worktree 和操作步骤不代表当前状态。
+> 当前接手请读 [HANDOFF](../../HANDOFF.md)，不要重放旧部署、回滚或设备命令。
+
 > 本记录区分代码、CI、制品、部署、MM IMS 与 native 验收。
 > 原开发 worktree：`SimAdmin-1.1.5` / `dev/1.1.5-modem-backends`；后续已将完整历史
 > 整合到主目录 `SimAdmin` / `master`，旧开发分支删除，旧目录保留为 detached 快照。
@@ -107,4 +110,4 @@ arm64/amd64 成功，`Publish Release` 为 skipped。没有合并 master、升�
 - 本次 agent 未执行实网短信、通话、重启或 native 接管；用户手动测试与 agent 证据分开记录。
 
 详见 [原生审计](NATIVE_BACKEND_AUDIT_2026-09-24.md)、
-[被动发现说明](NATIVE_MODEM_DISCOVERY.md) 和 [命名迁移计划](IMS_NAMING_PHASE2_PLAN.md)。
+[被动发现说明](../../NATIVE_MODEM_DISCOVERY.md) 和 [命名迁移计划](IMS_NAMING_PHASE2_PLAN.md)。

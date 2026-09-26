@@ -85,7 +85,7 @@ The temporary metadata capture was stopped without restarting the service.
 
 This verifies the deployed HTTP/system DNS path and the current single WLAN
 registration, not live dual registration, an unconfigured Trunk, or every
-carrier/proxy DNS path. Detailed evidence and untested cases remain in `plan.md`.
+carrier/proxy DNS path. Detailed evidence and untested cases remain in `docs/archive/2026-09/LEGACY_BETA_PLAN.md`.
 
 The later policy/cost-guard candidate `48e37fc` passed final workflow
 `34197531701` and was deployed at 15:57. Its application HTTP DNS check passed

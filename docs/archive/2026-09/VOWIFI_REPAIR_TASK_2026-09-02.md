@@ -1,5 +1,8 @@
 # VoWiFi/VoLTE 修复任务跟踪
 
+> 历史档案：本文件保留对应日期的事实，旧版本、worktree 和操作步骤不代表当前状态。
+> 当前接手请读 [HANDOFF](../../HANDOFF.md)，不要重放旧部署、回滚或设备命令。
+
 更新时间：2026-09-02 17:55（北京时间）
 适用设备：QCM410 `192.168.100.13`  相关线路：Vodafone Germany（PLMN `26202`）
 
@@ -218,7 +221,7 @@ IMS bearer，导致 modem 78→79→80 重枚举，并连带中断仍然正常�
   当前线路会话内保存的不可变 Profile，数据库条目删除只影响下一次新连接。
 - [x] 会话 Profile 继续随线路 live runtime 清理，不写数据库、不建立无限增长
   的持久化映射。
-- [x] 在项目根目录新增 `DNS_RESOLVER_HICKORY_MIGRATION_TASK.md`，记录后续
+- [x] 在项目根目录新增 `docs/archive/2026-09/DNS_RESOLVER_HICKORY_MIGRATION_TASK.md`，记录后续
   使用 Hickory 统一 DNS 层的方案 A；本轮仅实施低风险方案 C。
 - [x] GitHub Actions 执行新增 hosts 与会话 Profile 回归测试并完成双架构构建。
   证据：commit `28a11d3`；GitHub Actions run `33612255723` 的测试代码编译、

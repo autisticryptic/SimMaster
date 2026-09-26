@@ -1,10 +1,13 @@
 # SimAdmin DNS 解析层 Hickory 重构任务
 
+> 历史档案：本文件保留对应日期的事实，旧版本、worktree 和操作步骤不代表当前状态。
+> 当前接手请读 [HANDOFF](../../HANDOFF.md)，不要重放旧部署、回滚或设备命令。
+
 创建日期：2026-09-02
 状态：DNS 排序修正 0b97b4f 和后续 beta2/48e37fc 均通过各自最终 CI、部署、应用 HTTP DNS 及 VoWiFi 原通道自然续期实测；48e37fc 当前在设备运行。双注册及未启用的专用业务不标为通过
 本轮范围：替换 libc 系统解析、HTTP 和代理端点隐式解析，启用 system-config；专用 DNS 传输维持原行为
 
-> 2026-09-08 更新：详见 `docs/DNS_HICKORY.md` 和 `plan.md`。
+> 2026-09-08 更新：详见 `docs/DNS_HICKORY.md` 和 `docs/archive/2026-09/LEGACY_BETA_PLAN.md`。
 > 用户本轮要求的普通系统解析已使用 hickory-resolver 0.25.2。
 > 下列原始“统一所有专用 DNS 报文/传输”项目保留为后续设计清单；
 > 原有运营商 DNS、P-CSCF、NAPTR 和 SOCKS5 UDP DNS 已是 Rust 实现，

@@ -61,7 +61,7 @@ MBIM、PC/SC 或厂商 API 的设备时，应分别增加 SIM 鉴权与基带恢
 ## 1.1.5 第一阶段：设备观察接口
 
 后续原生逻辑候选的接线、默认 MM 策略及尚未完成项，集中记录于
-[原生后端逻辑候选状态](NATIVE_BACKEND_LOGIC_STATUS.md)；没有因此增加任何实机通过记录。
+[原生后端逻辑候选状态](NATIVE_BACKEND_STATUS.md)；没有因此增加任何实机通过记录。
 
 `hardware/cellular/observations.rs` 的 `ModemObservationProvider` 提供设备列表与驻网
 snapshot，`LineRuntimeRegistry` 在构造时注入它。注册表及其 API 调用者不再为刷新传入

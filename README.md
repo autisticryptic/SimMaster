@@ -64,10 +64,10 @@ SimAdmin 是面向 Debian 蜂窝 CPE、随身 WiFi 和软路由设备的 Web 管
 “基带 + 卡槽”建模为独立线路，在同一服务中管理 SIM/eSIM、蜂窝数据、短信、通话、
 VoLTE、VoWiFi、SIP Trunk、设备网络、通知和自动化。
 
-项目由 Rust + Axum 后端与 React + TypeScript 前端组成。后端主要通过 ModemManager
-D-Bus 管理 modem，并按场景使用 QMI、AT、`mmcli`、`qmicli`、NetworkManager 和 Linux
-网络栈；生产环境由同一个后端进程托管前端 SPA，默认安装到 `/opt/simadmin` 并通过
-systemd 运行。
+项目由 Rust + Axum 后端与 React + TypeScript 前端组成。后端默认通过 ModemManager
+D-Bus 管理 modem，也提供需显式启用的实验性 native QMI/MBIM/AT 后端；具体完成边界见
+[原生后端状态](./docs/NATIVE_BACKEND_STATUS.md)。生产环境由同一个后端进程托管前端 SPA，
+默认安装到 `/opt/simadmin` 并通过 systemd 运行。
 
 > 当前 IMS、多基带和 eSIM 能力与 modem 固件、内核驱动、运营商配置及 SIM 权限高度相关。
 > “代码中提供能力”不等于所有设备均可直接使用，请在目标硬件上按真机清单验收。
@@ -111,7 +111,7 @@ SimAdmin/
 后端依赖方向为 `api/services -> connectivity/hardware -> platform`：
 
 - `connectivity/core`：与传输无关的 IMS、SIP、AKA、短信与语音核心。
-- `connectivity/modems/softstack/{volte,vowifi}`：VoLTE 与 VoWiFi 接入实现。
+- `connectivity/modems/ims/{cellular_ims,vowifi}`：蜂窝 IMS 与 VoWiFi 接入实现。
 - `hardware/{cellular,sim}`：ModemManager、QMI、AT、数据代理与 eSIM 设备操作。
 - `services/{orchestrator,trunk,...}`：跨接入选路、Trunk、短信、通知、自动化、网络和 OTA。
 - `platform`：配置、SQLite 与通用系统能力。
@@ -143,20 +143,21 @@ systemctl enable --now simadmin.service
 
 ## 文档导航
 
-| 文档 | 用途 | 是否应独立维护 |
-|------|------|----------------|
-| [手动安装与部署](./docs/INSTALL.md) | 构建产物、手动安装、升级和登录恢复 | 是，面向最终用户 |
-| [运行环境与系统管理](./docs/ENVIRONMENT.md) | 依赖、路径、systemd、数据与硬件约束 | 是，面向设备运维 |
-| [架构说明](./docs/ARCHITECTURE.md) | 线路模型、前端信息架构、路由隔离、profile 选择 | 是，读代码前先看这份 |
-| [开发者指南](./docs/DEVELOPER.md) | 架构、前后端开发、构建、测试、ADB 调试 | 是，前后端子 README 已归并于此 |
-| [Bruno API 集合](./bruno-api/README.md) | API 调试方法、环境变量和线路级请求说明 | 是，可执行请求以 `.bru` 文件为准 |
-| [未完成开发计划](./docs/DEVELOPMENT_PLAN.md) | 未完成功能、真实硬件验收和发布前门槛 | 是，后续开发总入口 |
-| [1.1.5 / 1.1.6 设备后端规划](./docs/MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md) | 1.1.5 双后端过渡、1.1.6 完全移除 ModemManager | 是，总计划的版本分项；M1 查询接口已接入，完整后端仍待完成 |
-| [版本更新记录](./docs/CHANGELOG.md) | 已发布版本的用户可见变化 | 是，不与开发计划混写 |
-| [运营商 Profile 来源说明](./docs/CARRIER_PROFILES.md) | catalog、AOSP/IPCC 来源、限制与维护边界 | 是，保留为专题背景 |
+**新对话/开发接手先读 [当前接手与项目状态](./docs/HANDOFF.md)**；唯一开发目录为
+`SimAdmin/master`，旧 `SimAdmin-1.1.5` 已在确认无独有源码后移除，不是较新的版本。
+完整分类入口见 **[文档导航](./docs/README.md)**。
 
-已完成的 VoLTE / VoWiFi 逆向、重构和阶段性开发记录已移至同级归档仓库
-`SimAdmin-Enhance`；它们不再作为本仓库的现行使用说明。
+| 入口 | 用途 |
+|---|---|
+| [当前接手](./docs/HANDOFF.md) | 当前版本、CI、下一主线、未验收边界及新对话提示 |
+| [安装](./docs/INSTALL.md) / [运行环境](./docs/ENVIRONMENT.md) | 部署、依赖、systemd、数据与硬件约束 |
+| [架构](./docs/ARCHITECTURE.md) / [开发者指南](./docs/DEVELOPER.md) | 模块与开发测试流程 |
+| [开发总计划](./docs/DEVELOPMENT_PLAN.md) / [后端路线图](./docs/MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md) | 实现和真实硬件/发布门槛 |
+| [Bruno API](./bruno-api/README.md) / [版本记录](./docs/CHANGELOG.md) | 可执行接口与用户可见变更 |
+| [历史档案](./docs/archive/README.md) | 旧排查、接手、分支及阶段记录，不直接重放旧操作 |
+
+本机临时脚本、原始会话、下载和私有证据集中在 `.local/`，不随 Git 分发；
+其中可能含凭据和数据库，不作为普通发布附件或可全部删除的缓存。
 
 ---
 

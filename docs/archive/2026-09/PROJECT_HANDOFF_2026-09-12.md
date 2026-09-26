@@ -1,5 +1,8 @@
 # SimAdmin 项目进度与续接交接文档
 
+> 历史档案：本文件保留对应日期的事实，旧版本、worktree 和操作步骤不代表当前状态。
+> 当前接手请读 [HANDOFF](../../HANDOFF.md)，不要重放旧部署、回滚或设备命令。
+
 > 整理日期：2026-09-12，时间均为 Asia/Shanghai，另有注明除外。
 > 本轮于 2026-09-12 上午重新读取两份完整会话的结构化记录，并核对已有交接草稿。
 > 原会话最后有效设备快照约为 00:40，最新 CI/下载结果为 00:46:40；中止不等于候选已部署。
@@ -7,7 +10,7 @@
 > 本文可独立用于新对话。所有设备状态都有采样时间，不代表阅读本文时仍然如此。
 
 **快速阅读：**第 1–3 节看结论和硬约束，第 7–9 节直接接续操作，第 11 节可复制到新对话。后续多卡测试明细统一追加到第 12 节，始终放在文末固定尾注之前。
-只做 IMS 派生/兜底分析或恢复测试，可读取本地 `IMS_DERIVED_FALLBACK_HANDOFF.md` 或其私密完整版；两者按用户要求均不随 Git 分发，新环境需由用户安全提供。
+只做 IMS 派生/兜底分析或恢复测试，可读取本地 `.local/archive/legacy-docs/IMS_DERIVED_FALLBACK_HANDOFF.md` 或其私密完整版；两者按用户要求均不随 Git 分发，新环境需由用户安全提供。
 用户已确定由一个开发 agent 统一修改，其他 agent 只读汇总问题；1.1.5 与 IMS 修复采用独立分支/worktree，不共用可写工作区或争抢设备操作窗口。用户要求的全套接入凭据仅存仓库外私密版，不随 Git 同步。
 用户已要求将本文、版本规划及文档索引一并提交 GitHub；异地续接应确认克隆的是包含这些文件的修复分支，不能只取旧 master。`.codex-*` 辅助脚本和原始会话不随文档提交。本文是交接快照，不代替全项目长期开发计划。
 
@@ -17,13 +20,23 @@
 `a1be268` 补齐 native 直接/存储短信 inbox、持久化后确认、SIM 隔离、分片及送达报告；
 两套回归、前端和双架构 CI 已通过，发布 skipped。`a4a83c2` 补强持久化 owner/代次 receipt、
 显式终态归档、UIM client 分配至释放账本与不重放已释放 CID；随后 302b70e 修正持久短信回放与存储清理解耦。
-4a83c2（Validate `35989431881` / Build `35989431842`）与 `302b70e`（Validate `36003900244` /
+`a4a83c2`（Validate `35989431881` / Build `35989431842`）与 `302b70e`（Validate `36003900244` /
 Build `36003900240`）均 success，arm64/amd64 构建通过，Publish Release skipped。
 本次未连接设备、未部署、未切 native、未发短信或拨号；默认 MM 不变。
 
 用户已确认 **SIM-04 正常自然续期、SIM-05 手动测试完成**，不再重复验收。
 **下一主线是 SIM-06 中国电信 IMS 注册失败**，在上述功能及 CI/文档收尾之后推进。
 须重新确认其实际设备/版本/配置和失败阶段，不能沿用旧 SIM 的 PID、身份或失败结论。
+2026-09-25T02:30:39Z、2026-09-26T02:06:17Z 与本轮 2026-09-26T02:20:30Z、02:44:53Z
+四次只读连接均失败于 Cloudflare WebSocket：HTTP 530 / Cloudflare 1033、无 Access 登录跳转，请求未到 SSH。
+这既不构成 SIM-06 注册失败证据，也不能据以认定 Cookie 过期；需先恢复设备侧隧道入口。
+本轮离线补齐采证脚本的初始注册/AKA/终止响应覆盖和运行程序哈希核验，28 项新回归、
+全套 157 项 Python 守卫通过；未改变注册算法、未部署，SIM-06 仍未定位/修复。
+采证入口及解除阻塞所需动作见 [SIM-06 排查接续](../../IMS_DIAGNOSTICS.md)，
+顺序与禁止项见 [接续计划](NATIVE_SMS_AND_RECOVERY_PLAN_2026-09-24.md)。
+用户已确认设备当前离线，停止现场重连/轮询，待设备上线后在新对话继续。
+本机最新接手入口为根目录 `LOCAL_HANDOFF_2026-09-26.md`，短提示为
+`NEXT_SESSION_PROMPT_2026-09-26.md`；这两份及无凭据的本地改动快照不随 Git 分发。
 native 真机验收、未知资源自动恢复和混合 owner 仍未完成，不能以这些多卡反馈代替。
 
 **2026-09-24 分支整理完成**：GitHub `autisticryptic/SimMaster` 与本地现均只保留 `master`。
@@ -46,7 +59,7 @@ SIM-04 的 `71513ea` 已确认初始注册和 **9 次自然续期**；T05 原始
 
 **SIM-04/MM 9/19 5094ac1 候选结果**：新提交 `5094ac1` 完成 MM retained-bearer P-CSCF 关联、IPv6 同 `/64` 不同 IID 的窄匹配、owner/profile/IP 前后复核、共享 AT 串行和失效清理保护；Validate `35420547441`、Build `35420547370` 均 success，35 项新增 Rust 回归实际执行，arm64/amd64 包已核验，发布 skipped。
 9/19 T01 使用独立克隆配置/数据库和 MM 默认后端完成候选窗口；未重新附着、未改 APN/Initial EPS、未启用 native。三槽仍未注册：首/末槽 `context_pcscf_absent`，中间槽 `at_response_invalid`；当前 `CGCONTRDP=2` 仍为 7 字段、无 P-CSCF，未进入 SIP/AKA。候选已回滚，原服务/MM/proxy/Wi-Fi/配置/DB/receipt均复核恢复。
-随后对 beta8 做了同哈希 IDA 深度补证：高成功率来自身份、CID lease、profile/family准备、多来源P-CSCF、REGISTER/AKA和运行时fallback的组合；direct WDS、宽泛 plain fallback、XFRM flush及临时 `CGACT=1` helper不能未经完整lease/恢复验证移植。详见 [beta8综合深度对照](../../SimAdmin/docs/IMS_DERIVATION_BETA8_COMPARISON_2026-09-17.md)。
+随后对 beta8 做了同哈希 IDA 深度补证：高成功率来自身份、CID lease、profile/family准备、多来源P-CSCF、REGISTER/AKA和运行时fallback的组合；direct WDS、宽泛 plain fallback、XFRM flush及临时 `CGACT=1` helper不能未经完整lease/恢复验证移植。详见 [beta8综合深度对照](IMS_DERIVATION_BETA8_COMPARISON_2026-09-17.md)。
 9/19 后续提交 **`0feaa40`** 仅收敛 pinned MM profile 的 forced-family 重试：profile pin 存在时不再用同一 pin 重复另一地址族请求，返回明确 `profile_pin_family_conflict`，等待独立 exact-family lease；Validate `35508165800`、Build `35508165813` success，发布 skipped。
 
 **SIM-04/MM 最新续接（2026-09-18）**：功能提交 `e8bff12` 已补完真实 MM 双栈请求、实际单/双族 IP/DNS 投影、双地址 receipt 与取消/清理验证；两套 Actions、前端、arm64/amd64 全部通过，发布 skipped。
@@ -121,7 +134,7 @@ T02/T03 仍无 P-CSCF、无 SIP/AKA；T03 经 MM 新建的临时 IPv6 profile �
 
 ### 4.1 9 月 9 日会话及其延续
 
-下面第 1–4 项是该会话承接的较早基线，证据来自其读取的实机台账及 `plan.md`；该会话开始时已经在测试第三张卡。不是本次重新执行了 SIM-01/02 验收。
+下面第 1–4 项是该会话承接的较早基线，证据来自其读取的实机台账及 `docs/archive/2026-09/LEGACY_BETA_PLAN.md`；该会话开始时已经在测试第三张卡。不是本次重新执行了 SIM-01/02 验收。
 
 1. 在已备份、使用本仓库干净配置/数据库的远程 QCA410 上，修复原生端点准备、AT 紧凑双地址解析、WDS/SIP 地址族不一致问题。
 2. 按 TS 24.229 §5.1.1.2.2 修正标准派生 LTE 初始 Authorization 的 AKA 身份。候选 `65b8a0e` 注册并自然续期成功，四库对照完成。
@@ -310,7 +323,7 @@ SIM-03 的历史静态库核对：Pixel 的 `profile-h3-hk-45403-84c6302cf9`、X
 
 设备最后激活的是 Pixel 库，SHA256 为 `10b603c2b29c6fbb08a8f2e796c3db878671051eae97ff734004310fb8709efc`。用户提供的[旧版 `1.1.7-beta8` 对照包](https://github.com/lilith-rong/SimAdmin-Enhance/blob/Backup-Vowifi-and-VoLTE/Volte/simadmin_1.1.7-beta8.tar.gz)属于另一条历史版本线，其“可注册、可接短信”是用户反馈；可用于架构差异分析，不能算当前代码复测通过，也不要直接覆盖现有安装。
 
-历史 beta1/beta2 已完成命名/DNS 重构、自动双注册/仅单注册设置、资费门禁以及另一台设备的 VoWiFi 原通道续期，详见 [plan.md](../plan.md)。这些不是本台远程 QCA410 或最新候选的实测证据。现有网络未确认 Outbound 多注册，不等于运营商永久不支持，也不能宣布双注册目标完成。本轮候选的真实电话、短信、账单和完整浏览器交互仍没有验收结论。
+历史 beta1/beta2 已完成命名/DNS 重构、自动双注册/仅单注册设置、资费门禁以及另一台设备的 VoWiFi 原通道续期，详见 [plan.md](LEGACY_BETA_PLAN.md)。这些不是本台远程 QCA410 或最新候选的实测证据。现有网络未确认 Outbound 多注册，不等于运营商永久不支持，也不能宣布双注册目标完成。本轮候选的真实电话、短信、账单和完整浏览器交互仍没有验收结论。
 
 ## 6. 关键修复与归因边界
 
@@ -411,7 +424,7 @@ QMI `network_disconnected`、进程退出或 `AT+CEER` 空结果都不能直接�
 
 ### 6.6 用户确认的 1.1.5 / 1.1.6 版本规划
 
-- 新增独立文档：[设备后端版本规划](MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md)，并接入 `DEVELOPMENT_PLAN.md` 总入口、README 文档导航及架构/driver 说明。跨环境继续本任务时携带该文件，不只携带本文。
+- 新增独立文档：[设备后端版本规划](../../MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md)，并接入 `DEVELOPMENT_PLAN.md` 总入口、README 文档导航及架构/driver 说明。跨环境继续本任务时携带该文件，不只携带本文。
 - **1.1.5**：统一设备能力接口，同时支持 MM provider 与原生 QMI/MBIM/AT；MM 变为可选依赖。双后端可以服务不同设备，不能共同管理同一物理 modem。
 - **1.1.6**：移除 MM provider、运行调用、必装依赖及专属恢复逻辑，原生接管所有明确承诺支持的设备能力；不保留环境开关、自动安装或隐藏 MM 回退。
 - 规划包含能力范围、M0–M5/N0–N5 阶段、具体源码边界、设备矩阵、同卡对照、自然续期/长稳、多 UE、迁移和包级回滚。硬件/能力未达标会阻止发布，不能静默缩小支持范围。
@@ -553,25 +566,25 @@ Rust 内部已采用 `CellularIms*` / `ImsProfile*` 命名，旧 HTTP 别名和�
 
 | 位置 | 重点 |
 | --- | --- |
-| [QCA410 IMS bearer](../backend/src/hardware/devices/qcm410/ims_bearer.rs) | 已部署 `684e2a7` 的 `PrimaryImsRequest` 接入、地址族过滤、netdev 所有权；旧 qmicli flags/pipe 实现应从 `aabe4e5` 查看 |
-| [MM 主 IMS session](../backend/src/hardware/devices/qcm410/primary_ims_session.rs) | 私有 bearer 创建、数字 selector 规范化、主口/接口/占用检查、取消和状态观察 |
-| [MM 生命周期与归属](../backend/src/hardware/devices/qcm410/primary_ims_lifecycle.rs) | unique-owner D-Bus 调用、原子归属账本、namespace/config guard、shutdown 和重启恢复 |
-| [netdev](../backend/src/hardware/devices/qcm410/netdev.rs)、[secondary_qmi](../backend/src/hardware/devices/qcm410/secondary_qmi.rs)、[secondary_qmi_data](../backend/src/hardware/devices/qcm410/secondary_qmi_data.rs) | 主/次端点、数据网卡解析和普通数据归属 |
-| [transport](../backend/src/hardware/devices/transport.rs) | 多设备承载接口、所有权和存活检查边界 |
-| [cellular_ims](../backend/src/connectivity/modems/ims/cellular_ims/) | `live.rs`、`pcscf.rs`、`native_bearer.rs`、`data_slot.rs`、`errors.rs`；注册/续期/轮询/承载失效 |
-| [catalog v7](../backend/src/connectivity/modems/ims/vowifi/carrier_catalog_v7.rs)、[profile_store](../backend/src/connectivity/modems/ims/vowifi/profile_store.rs) | 初始认证默认值、可选库和 source-bound 引用 |
-| [config](../backend/src/platform/config.rs)、[API handlers](../backend/src/api/handlers.rs) | 连接开关兼容字段、video 镜像与已有 API |
-| [HTTP 路由](../backend/src/main.rs) | canonical / legacy API 对照；诊断前核对真实路径、方法和返回结构 |
-| [DATA6 service](../deploy/devices/qcm410/system/simadmin-secondary-qmi.service) | 项目创建 DATA6 的职责说明 |
-| [beta validation](../.github/workflows/beta-validation.yml)、[build release](../.github/workflows/build-release.yml) | Actions 编译、回归、构建与发布门禁 |
-| [release policy](../.github/scripts/release_version.py) | beta 预发布和 latest 判定 |
-| [DNS 迁移](DNS_HICKORY.md)、[IMS 命名迁移](IMS_NAMING_MIGRATION.md)、[接入共存](IMS_ACCESS_COEXISTENCE.md) | 前期重构和兼容约束；不是本次最新候选的业务验收 |
+| [QCA410 IMS bearer](../../../backend/src/hardware/devices/qcm410/ims_bearer.rs) | 已部署 `684e2a7` 的 `PrimaryImsRequest` 接入、地址族过滤、netdev 所有权；旧 qmicli flags/pipe 实现应从 `aabe4e5` 查看 |
+| [MM 主 IMS session](../../../backend/src/hardware/devices/qcm410/primary_ims_session.rs) | 私有 bearer 创建、数字 selector 规范化、主口/接口/占用检查、取消和状态观察 |
+| [MM 生命周期与归属](../../../backend/src/hardware/devices/qcm410/primary_ims_lifecycle.rs) | unique-owner D-Bus 调用、原子归属账本、namespace/config guard、shutdown 和重启恢复 |
+| [netdev](../../../backend/src/hardware/devices/qcm410/netdev.rs)、[secondary_qmi](../../../backend/src/hardware/devices/qcm410/secondary_qmi.rs)、[secondary_qmi_data](../../../backend/src/hardware/devices/qcm410/secondary_qmi_data.rs) | 主/次端点、数据网卡解析和普通数据归属 |
+| [transport](../../../backend/src/hardware/devices/transport.rs) | 多设备承载接口、所有权和存活检查边界 |
+| [cellular_ims](../../../backend/src/connectivity/modems/ims/cellular_ims) | `live.rs`、`pcscf.rs`、`native_bearer.rs`、`data_slot.rs`、`errors.rs`；注册/续期/轮询/承载失效 |
+| [catalog v7](../../../backend/src/connectivity/modems/ims/vowifi/carrier_catalog_v7.rs)、[profile_store](../../../backend/src/connectivity/modems/ims/vowifi/profile_store.rs) | 初始认证默认值、可选库和 source-bound 引用 |
+| [config](../../../backend/src/platform/config.rs)、[API handlers](../../../backend/src/api/handlers.rs) | 连接开关兼容字段、video 镜像与已有 API |
+| [HTTP 路由](../../../backend/src/main.rs) | canonical / legacy API 对照；诊断前核对真实路径、方法和返回结构 |
+| [DATA6 service](../../../deploy/devices/qcm410/system/simadmin-secondary-qmi.service) | 项目创建 DATA6 的职责说明 |
+| [beta validation](../../../.github/workflows/beta-validation.yml)、[build release](../../../.github/workflows/build-release.yml) | Actions 编译、回归、构建与发布门禁 |
+| [release policy](../../../.github/scripts/release_version.py) | beta 预发布和 latest 判定 |
+| [DNS 迁移](../../DNS_HICKORY.md)、[IMS 命名迁移](../../IMS_NAMING_MIGRATION.md)、[接入共存](../../IMS_ACCESS_COEXISTENCE.md) | 前期重构和兼容约束；不是本次最新候选的业务验收 |
 
 **旧文档要按时间和设备解释：**
 
-- [plan.md](../plan.md) 保留历史阶段和 beta3 发布验收，但开头“当前 beta2”的摘要已过期。
-- [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) 是长期待办入口，现已补充 1.1.5/1.1.6 路线并修正 QCM410 主 IMS / DATA6 普通数据描述。其余沿用 8/30 的测试数量、其它设备通话结果及“完全没有实现”的判断，仍需核对后才能当作新版本状态。
-- [ENVIRONMENT.md](ENVIRONMENT.md) 和 [QCM410_BAM_DMUX_MODEM_CRASH.md](QCM410_BAM_DMUX_MODEM_CRASH.md) 的历史设备/secondary IMS 描述不能覆盖当前主 QMI 设备契约；后者也不能证明这台远程设备发生了相同内核故障。
+- [plan.md](LEGACY_BETA_PLAN.md) 保留历史阶段和 beta3 发布验收，但开头“当前 beta2”的摘要已过期。
+- [DEVELOPMENT_PLAN.md](../../DEVELOPMENT_PLAN.md) 是长期待办入口，现已补充 1.1.5/1.1.6 路线并修正 QCM410 主 IMS / DATA6 普通数据描述。其余沿用 8/30 的测试数量、其它设备通话结果及“完全没有实现”的判断，仍需核对后才能当作新版本状态。
+- [ENVIRONMENT.md](../../ENVIRONMENT.md) 和 [QCM410_BAM_DMUX_MODEM_CRASH.md](../../QCM410_BAM_DMUX_MODEM_CRASH.md) 的历史设备/secondary IMS 描述不能覆盖当前主 QMI 设备契约；后者也不能证明这台远程设备发生了相同内核故障。
 - 旧 README/笔记里的 `connectivity/modems/softstack/...` 不再是本轮源码定位入口；当前相关实现见 `connectivity/modems/ims/{cellular_ims,vowifi}`。
 - 双注册及各自续期、多线路/多硬件矩阵、真实短信语音/视频、Ut/MWI/E911、VoNR 等仍要分别验收，不能以这次 QCA410 注册修复代替整个项目完成。本轮不批量重写旧文档或扩大产品改动。
 

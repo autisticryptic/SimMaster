@@ -62,4 +62,4 @@
 另有 native inbox/逐片发送/报告/重组回归，全部仅在 GitHub Actions 编译执行；
 `a1be268` 两套回归及双架构通过，Python 守卫保证准入与过滤器不会退化。
 
-参考思路与许可证边界见 [原生后端审计](NATIVE_BACKEND_AUDIT_2026-09-24.md)。
+参考思路与许可证边界见 [原生后端审计](NATIVE_BACKEND_STATUS.md)。

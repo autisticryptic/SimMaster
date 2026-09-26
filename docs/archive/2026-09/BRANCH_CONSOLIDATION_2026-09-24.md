@@ -1,5 +1,8 @@
 # SimMaster 单主分支整理（2026-09-24）
 
+> 历史档案：本文件保留对应日期的事实，旧版本、worktree 和操作步骤不代表当前状态。
+> 当前接手请读 [HANDOFF](../../HANDOFF.md)，不要重放旧部署、回滚或设备命令。
+
 用户要求检查多余分支，在不丢失有用改动的前提下只保留主分支。
 真实远端是 `autisticryptic/SimMaster`（本地名 `simmaster`），默认分支为 **master**；
 本地 `origin` 指向旧工作区，不是此次 GitHub 清理目标。

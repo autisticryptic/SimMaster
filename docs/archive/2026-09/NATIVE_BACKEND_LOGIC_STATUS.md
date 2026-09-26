@@ -1,9 +1,12 @@
 # 原生后端逻辑候选：默认 MM，硬件验收延期
 
+> 历史档案：本文件保留对应日期的事实，旧版本、worktree 和操作步骤不代表当前状态。
+> 当前接手请读 [HANDOFF](../../HANDOFF.md)，不要重放旧部署、回滚或设备命令。
+
 > **2026-09-24 更新**：当前审计见 [原生硬件接口审计](NATIVE_BACKEND_AUDIT_2026-09-24.md)，
-> 已有 [只读发现](NATIVE_MODEM_DISCOVERY.md)、[AT/URC 事件](NATIVE_AT_EVENTS.md)、
-> [短信持久化与送达报告](NATIVE_SMS_INBOX.md)，并补充
-> [显式资源恢复](NATIVE_RESOURCE_RECOVERY.md)；最新代码/CI状态见
+> 已有 [只读发现](../../NATIVE_MODEM_DISCOVERY.md)、[AT/URC 事件](../../NATIVE_AT_EVENTS.md)、
+> [短信持久化与送达报告](../../NATIVE_SMS_INBOX.md)，并补充
+> [显式资源恢复](../../NATIVE_RESOURCE_RECOVERY.md)；最新代码/CI状态见
 > [本次接续计划](NATIVE_SMS_AND_RECOVERY_PLAN_2026-09-24.md)。开发统一在 `SimAdmin/master`。
 > 用户确认 SIM-04 自然续期、SIM-05 手测完成；下一主线是 SIM-06 中国电信注册失败。
 > native 接管仍无端到端实机通过记录；未知资源不因控制代次改变就自动释放。

@@ -1,11 +1,17 @@
 //! Build script for injecting version and Git information at compile time
 
 fn main() {
-    // Read version from VERSION file (default: 3.0.0)
+    // Never inject a made-up version when metadata is missing or drifted.
     let version = std::fs::read_to_string("../VERSION")
-        .unwrap_or_else(|_| "3.0.0".to_string())
+        .expect("VERSION is required for a reproducible build")
         .trim()
         .to_string();
+    let package_version = std::env::var("CARGO_PKG_VERSION")
+        .expect("Cargo must provide the package version to build.rs");
+    assert_eq!(
+        version, package_version,
+        "VERSION and backend/Cargo.toml must be synchronized before building"
+    );
 
     // Get Git branch name
     let branch = std::process::Command::new("git")

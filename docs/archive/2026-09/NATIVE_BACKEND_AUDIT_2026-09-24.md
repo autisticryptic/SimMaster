@@ -1,5 +1,8 @@
 # 原生硬件接口审计与增强计划（2026-09-24）
 
+> 历史档案：本文件保留对应日期的事实，旧版本、worktree 和操作步骤不代表当前状态。
+> 当前接手请读 [HANDOFF](../../HANDOFF.md)，不要重放旧部署、回滚或设备命令。
+
 > 范围：检查 1.1.4 → 1.1.5 “ModemManager 可选 / 本项目直接操作硬件接口”的完成情况，
 > 并对照用户指定的 5 个参考项目，给出能增强直接硬件接口完备性的具体条目。
 > 审计基线为原 `dev/1.1.5-modem-backends` 的 `71513ea`；本轮成果已整合到 `master`。
@@ -46,7 +49,7 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 ### N1 只读原生设备发现 `simadmin discover-native` — 最高优先
 
 原因：手写设备表是启用 native 的主要障碍；本命令只读文件系统，不打开设备节点或改变 owner。
-实现与使用说明见 [原生设备只读发现](NATIVE_MODEM_DISCOVERY.md)。
+实现与使用说明见 [原生设备只读发现](../../NATIVE_MODEM_DISCOVERY.md)。
 
 - [x] USB 按 `qmi_wwan` / `cdc_mbim` / `option` / `qcserial` 驱动发现；
       `cdc_acm` 只在同设备另有 modem 证据或已知厂商身份时纳入，避免把 Arduino 当基带
@@ -70,7 +73,7 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 ### N2 URC 感知的 AT 会话与持久化短信
 
 本轮在既有 `at_session.rs` 单读者互斥会话上增强，净室实现标准 AT 分帧/归属，
-不复制参考项目的 transport 代码。使用与限制见 [原生 AT 事件处理](NATIVE_AT_EVENTS.md)。
+不复制参考项目的 transport 代码。使用与限制见 [原生 AT 事件处理](../../NATIVE_AT_EVENTS.md)。
 
 - [x] 保持同一 AT 口单读者；命令响应与已知 URC 分离，查询同名前缀保留给查询；
       `NO CARRIER`/`BUSY` 等只终止拨号/接听事务，不误伤信号/SIM/短信查询
@@ -90,9 +93,9 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
       arm64/amd64均成功，Publish skipped；本地118项Python守卫通过
 - [x] `a1be268` 直接/存储 PDU 私有 inbox、持久化后 ACK/删除、SIM-scoped 原子去重与事件、
       分片重放、发送逐片账本和严格送达关联；Validate `35984847888` / Build `35984847830`
-      及前端全绿、双架构成功、Publish skipped；[实现与边界](NATIVE_SMS_INBOX.md)
+      及前端全绿、双架构成功、Publish skipped；[实现与边界](../../NATIVE_SMS_INBOX.md)
 - [ ] 跨代次断口/未知孤儿资源**自动**恢复仍不启用；已增加独立显式
-      [恢复 CLI](NATIVE_RESOURCE_RECOVERY.md)，只归档原 owner 已确认清理的记录。
+      [恢复 CLI](../../NATIVE_RESOURCE_RECOVERY.md)，只归档原 owner 已确认清理的记录。
       换端口/重插/重启不等于释放证明；未确认资源不删、不重放 CID
 - [ ] native 真机短信/电话长稳验收
 
@@ -101,7 +104,7 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 先只读诊断，再做受确认保护的写入：
 
 - [x] 只读诊断实现：CGMM 型号核验、QCFG ims/usbnet/usbcfg、QMBNCFG List/AutoSel；
-      未确认字段与不支持型号不猜测，见 [专项维护](NATIVE_DEVICE_MAINTENANCE.md)
+      未确认字段与不支持型号不猜测，见 [专项维护](../../NATIVE_DEVICE_MAINTENANCE.md)
 - [x] 受确认写入实现：精确线路＋状态 revision 的 plan/apply，空闲/资源检查、写前 receipt、
       IMS/USB 模式与显式 MBN 选择（先关闭 AutoSel）写后回读；独立显式 reboot，
       不自动按 HPLMN 选 MBN、不自动重启或逆向回写；不确定结果 fence IO 并保留 receipt
@@ -126,7 +129,7 @@ macOS/libusb transport、模块 PCM 语音（`AT+QPCMV`）、MaVo/ADB 注入与�
 ### N5 SIM 逻辑通道与 APDU 仲裁
 
 - [x] AT/QMI 通道用途、slot、已确认 client/channel、open/close 计数及未知容量可见；
-      写前 receipt、确认关闭才释放、未知结果保留，新增 [SIM 通道账本](NATIVE_SIM_CHANNEL_LEDGER.md)
+      写前 receipt、确认关闭才释放、未知结果保留，新增 [SIM 通道账本](../../NATIVE_SIM_CHANNEL_LEDGER.md)
 - [x] eSIM(lpac) 与 IMS AKA 共用物理门，增加外部操作范围；不虚构 lpac 内部通道 ID
 - [x] 后继代码覆盖 QMI CTL client 分配至释放；channel close 不提前清账，已释放 bearer CID
       不在 namespace 清理重试时重放；通用 reset 不绕过显式维护

@@ -1,5 +1,8 @@
 # beta8 与当前项目：IMS 派生配置及注册链路对照
 
+> 历史档案：本文件保留对应日期的事实，旧版本、worktree 和操作步骤不代表当前状态。
+> 当前接手请读 [HANDOFF](../../HANDOFF.md)，不要重放旧部署、回滚或设备命令。
+
 > 整理日期：2026-09-17。续接材料：本目录 `2026-09-15.jsonl`，实际记录包含 2026-09-16 的后续分析。
 >
 > **范围**：以蜂窝 IMS/VoLTE 为主，从身份、配置、承载、P-CSCF，到 REGISTER、AKA/IPsec、注册成功和续期完整串联；VoWiFi 仅用于说明不同接入的默认值，本文不是 beta8 的完整 VoWiFi 逆向报告。
@@ -631,10 +634,10 @@ WDS 常量对照资料：[libqmi 1.28.6 WDS消息定义](https://github.com/linu
 
 ## 11. 相关文档与可复核材料
 
-- [原 IMS 派生专项交接](IMS_DERIVED_FALLBACK_HANDOFF.md)：本地操作约束、历史 SIM-03 验收、单写入者与费用边界；不应强制加入公开版本管理。
-- [此前 SIM-04 P-CSCF / beta8 对照](../../SimAdmin-1.1.5/docs/IMS_PCSCF_BETA8_COMPARISON_2026-09-15.md)：详细 T02、WDS指令及后续修补记录。
-- [当前主要项目逐卡交接](../../SimAdmin-1.1.5/docs/PROJECT_HANDOFF_2026-09-12.md)：历史测试按卡/版本/轮次记录，不用新结论覆盖旧失败。
-- [REGISTER 三态字段](../../SimAdmin-1.1.5/docs/IMS_REGISTER_TRISTATE_SCHEMA.md)：显式disabled与缺省不同，兼容fallback不能复活明确禁止项。
+- [原 IMS 派生专项交接](../../../.local/archive/legacy-docs/IMS_DERIVED_FALLBACK_HANDOFF.md)：本地操作约束、历史 SIM-03 验收、单写入者与费用边界；不应强制加入公开版本管理。
+- [此前 SIM-04 P-CSCF / beta8 对照](IMS_PCSCF_BETA8_COMPARISON_2026-09-15.md)：详细 T02、WDS指令及后续修补记录。
+- [当前主要项目逐卡交接](PROJECT_HANDOFF_2026-09-12.md)：历史测试按卡/版本/轮次记录，不用新结论覆盖旧失败。
+- [REGISTER 三态字段](../../IMS_REGISTER_TRISTATE_SCHEMA.md)：显式disabled与缺省不同，兼容fallback不能复活明确禁止项。
 
 相邻工作树链接用于本机阅读；其他环境应按第2节分支/commit获取对应文件，不假设该目录布局存在。
 

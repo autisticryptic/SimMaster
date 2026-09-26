@@ -19,8 +19,16 @@ class ReleaseVersionTests(unittest.TestCase):
                 self.assertEqual(result["release_type"], "pre-release")
 
     def test_stable_version_is_not_incremented(self):
-        result = resolve_version("1.1.4")
-        self.assertEqual(result["version"], "1.1.4")
+        for version in ("1.1.4", "1.1.5"):
+            with self.subTest(version=version):
+                result = resolve_version(version)
+                self.assertEqual(result["version"], version)
+                self.assertEqual(result["prerelease"], "false")
+                self.assertEqual(result["make_latest"], "true")
+
+    def test_explicit_correction_to_lower_version_can_be_latest(self):
+        result = resolve_version("1.1.8", "1.1.5", "workflow_dispatch", "最新正式版（latest release）")
+        self.assertEqual(result["version"], "1.1.5")
         self.assertEqual(result["prerelease"], "false")
         self.assertEqual(result["make_latest"], "true")
 

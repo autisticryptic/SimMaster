@@ -44,4 +44,4 @@
 3. SIM-04 只读运行可以验证该设备的拓扑扫描；**不能**作为 native IMS/短信/电话的实机通过。
 4. EC20/EC25 等设备的 native 接管仍需独立授权窗口与归属、SIM/AKA、承载、注册/续期验收。
 
-审计与后续项目见 [原生硬件接口审计](NATIVE_BACKEND_AUDIT_2026-09-24.md)。
+审计与后续项目见 [原生硬件接口审计](NATIVE_BACKEND_STATUS.md)。

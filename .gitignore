@@ -38,10 +38,16 @@ release/*
 userdata/home/root/simadmin
 userdata/home/root/www/
 
-# 临时目录
+# 临时目录与本地接手/诊断归档（不随 Git 分发）
+.local/
 temp/
 .tmp
+/.tmp-*
+/20??-??-??*.jsonl
 .device-dump/
+# Python 缓存
+__pycache__/
+*.py[cod]
 # IDE 配置
 .idea/
 backend/.idea/
