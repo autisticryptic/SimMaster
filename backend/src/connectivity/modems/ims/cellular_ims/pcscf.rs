@@ -235,11 +235,15 @@ pub fn configured_ims_cid() -> u8 {
         .unwrap_or(DEFAULT_IMS_CID)
 }
 
-/// Reuse a matching IMS PDP context, or define the configured preferred CID
-/// only when its definition is absent and it is confirmed inactive. Existing
-/// definitions (including empty-APN placeholders) are never overwritten, and
-/// arbitrary unused CIDs are not assumed supported by the device. This never
-/// activates/deactivates a context; the bearer remains the activation owner.
+/// Reuse a matching IMS PDP context, or define a new one in an absent CID that
+/// is confirmed inactive. The configured preferred CID is used when free;
+/// otherwise the lowest absent CID in 1..=16 is used (the Qualcomm
+/// `$QCPDPIMSCFGE` table covers the same range). Existing definitions
+/// (including empty-APN placeholders and the default-attach/Internet/WAP
+/// profiles) are never overwritten. Without a pinned IMS profile the P-CSCF
+/// reporting flag cannot be armed and carriers such as 46011 never deliver a
+/// P-CSCF in PCO. This never activates/deactivates a context; the bearer
+/// remains the activation owner.
 pub async fn prepare_ims_profile_context(
     modem: &str,
     plan: &ImsConnectionPlan,
@@ -289,13 +293,19 @@ fn select_ims_profile_context(
             created: false,
         });
     }
-    if !(1..=16).contains(&preferred) || contexts.iter().any(|context| context.cid == preferred) {
+    if !(1..=16).contains(&preferred) {
         return Err(CellularImsError::new(code::IMS_PREFERRED_PROFILE_OCCUPIED));
     }
-    Ok(ImsProfileContext {
-        cid: preferred,
-        created: true,
-    })
+    let absent = |cid: u8| !contexts.iter().any(|context| context.cid == cid);
+    // CID 1 is the default LTE attach profile on Qualcomm firmware even when
+    // AT does not list it; defining an IMS APN there could change attach.
+    // Search above the preferred CID first, then below it, never CID 1.
+    let cid = std::iter::once(preferred)
+        .chain(preferred.saturating_add(1)..=16)
+        .chain(2..preferred)
+        .find(|cid| *cid != 1 && absent(*cid))
+        .ok_or_else(|| CellularImsError::new(code::IMS_PREFERRED_PROFILE_OCCUPIED))?;
+    Ok(ImsProfileContext { cid, created: true })
 }
 
 fn ensure_profile_inactive(output: &str, cid: u8) -> Result<(), CellularImsError> {
@@ -1326,10 +1336,40 @@ IPv4 primary DNS: 10.0.0.53";
         let contexts = parse_pdp_contexts(
             "response: '+CGDCONT: 1,\"IPV4V6\",\"\",\"0.0.0.0\",0,0\n+CGDCONT: 2,\"IPV4V6\",\"\",\"0.0.0.0\",0,0'",
         );
-        assert!(select_ims_profile_context(&contexts, 2, "ims").is_err());
+        // Empty-APN placeholders are occupied definitions, never rewritten.
+        assert_eq!(
+            select_ims_profile_context(&contexts, 2, "ims").unwrap(),
+            ImsProfileContext {
+                cid: 3,
+                created: true
+            }
+        );
+        // An unlisted CID 1 is still never chosen: it is the attach profile.
         let occupied = parse_pdp_contexts("+CGDCONT: 2,\"IPV4V6\",\"internet\"");
-        assert!(select_ims_profile_context(&occupied, 2, "ims").is_err());
-        // No arbitrary higher CID is allocated when the preferred one is busy.
+        assert_eq!(
+            select_ims_profile_context(&occupied, 2, "ims").unwrap(),
+            ImsProfileContext {
+                cid: 3,
+                created: true
+            }
+        );
+        // Even an explicitly configured CID 1 is never newly defined.
+        assert_eq!(
+            select_ims_profile_context(&occupied, 1, "ims").unwrap().cid,
+            3
+        );
+        // SIM-06 (46011): CID 1 ctlte default attach, CID 2 ctwap.
+        let ctcc = parse_pdp_contexts(
+            "+CGDCONT: 1,\"IPV4V6\",\"ctlte\"\n+CGDCONT: 2,\"IPV4V6\",\"ctwap\"",
+        );
+        assert_eq!(
+            select_ims_profile_context(&ctcc, 2, "ims").unwrap(),
+            ImsProfileContext {
+                cid: 3,
+                created: true
+            }
+        );
+        // Every CID occupied: nothing is overwritten.
         let all = (1..=16)
             .map(|cid| PdpContext {
                 cid,
