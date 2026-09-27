@@ -1172,34 +1172,6 @@ fn register_variants(profile: &CarrierProfile) -> Vec<CellularImsRegisterVariant
     variants
 }
 
-fn security_server_matches_profile(profile: &CarrierProfile, value: &str) -> bool {
-    let mut parameters = HashMap::new();
-    for part in value.split(';').skip(1) {
-        if let Some((name, raw)) = part.split_once('=') {
-            parameters.insert(
-                name.trim().to_ascii_lowercase(),
-                raw.trim().trim_matches('"').to_ascii_lowercase(),
-            );
-        }
-    }
-    profile
-        .ims
-        .register
-        .security_client_mechanisms
-        .iter()
-        .any(|mechanism| {
-            let mut expected = mechanism.split('/');
-            ["alg", "ealg", "prot", "mod"]
-                .into_iter()
-                .zip(&mut expected)
-                .all(|(name, expected)| {
-                    parameters
-                        .get(name)
-                        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
-                })
-        })
-}
-
 struct CellularImsRegisterAuthenticator {
     identity: ImsIdentity,
     ids: RequestIds,
@@ -1349,7 +1321,7 @@ impl CellularImsRegisterAuthenticator {
         &mut self,
         challenge: digest_aka::DigestChallenge,
         aka: crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult,
-        security_server: Option<(SecAgree, String)>,
+        security_server: Option<super::security_agreement::Agreement>,
         channel: &mut CellularImsSipChannel,
     ) -> Result<(), ImsError> {
         if let Some(auts) = aka.auts.as_deref() {
@@ -1424,12 +1396,17 @@ impl CellularImsRegisterAuthenticator {
                 channel.security_verify().map(str::to_string),
                 register_policy,
             )
-        } else if let Some((selected, verify)) = security_server {
+        } else if let Some(agreement) = security_server {
+            let selected = agreement.binding;
+            let verify = agreement.verify;
+            let algs = agreement.algorithms;
             // SM1 already reserved and advertised the replacement tuple.
             // Only the challenge authorizes installing new SAs; SM7 must use
             // exactly that frozen offer, not allocate different parameters.
             if let Some(previous) = channel.security_verify() {
-                let previous = ipsec::parse_security_server(previous).map_err(to_ims_error)?;
+                let previous = select_security_server(self.profile, &[previous.to_string()])?
+                    .ok_or_else(|| ImsError::new(code::SECURITY_SERVER_INVALID))?
+                    .binding;
                 ipsec::validate_server_rollover(&previous, &selected).map_err(to_ims_error)?;
                 if self.offered_security_binding.port_c == channel.send_route().local_addr.port()
                     || self.offered_security_binding.port_s != channel.route().local_addr.port()
@@ -1458,7 +1435,6 @@ impl CellularImsRegisterAuthenticator {
                 .update(|state| state.stage = CellularImsStage::Ipsec)
                 .await;
             let route = channel.route();
-            let algs = ipsec::xfrm_algs_from_security_server(&verify).map_err(to_ims_error)?;
             let plan = ipsec::build_install_plan_with_algs(
                 route.local_addr.ip(),
                 route.pcscf_addr.ip(),
@@ -1583,27 +1559,20 @@ impl CellularImsRegisterAuthenticator {
 fn select_security_server(
     profile: &CarrierProfile,
     values: &[String],
-) -> Result<Option<(SecAgree, String)>, ImsError> {
-    let selected = values.iter().find_map(|value| {
-        if profile.ims.register.strict_security_server_offer
-            && !security_server_matches_profile(profile, value)
-        {
-            return None;
-        }
-        ipsec::parse_security_server(value)
-            .ok()
-            .map(|sec| (sec, value.clone()))
-    });
-    if !values.is_empty() && selected.is_none() {
-        // Do not log the raw challenge (nonce/AKA secrets). In particular SPI=0
-        // is not a usable SA and must never reach Linux XFRM.
+) -> Result<Option<super::security_agreement::Agreement>, ImsError> {
+    let selected = super::security_agreement::select(
+        values,
+        profile.ims.register.security_client_mechanisms,
+        profile.ims.register.strict_security_server_offer,
+    );
+    if selected.is_err() {
+        // Never log the raw list: unknown extensions may contain private data.
         tracing::warn!(
             offer_count = values.len(),
             "VoLTE REGISTER challenge has no usable Security-Server offer"
         );
-        return Err(ImsError::new(code::SECURITY_SERVER_INVALID));
     }
-    Ok(selected)
+    selected.map_err(to_ims_error)
 }
 
 async fn reserve_refresh_security_offer(
@@ -7897,6 +7866,46 @@ mod tests {
     use super::*;
     use crate::connectivity::core::voice::MediaDirection;
     use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+
+    #[test]
+    fn security_server_selection_preserves_all_wire_header_values() {
+        let profile = GB_EE_23433;
+        let offer = "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;prot=esp;mod=trans;spi-c=100;spi-s=101;port-c=5064;port-s=5062;q=0.8";
+        let response = format!(
+            "SIP/2.0 401 Unauthorized\r\nSecurity-Server: tls;q=0.9\r\nSecurity-Server: {offer}\r\nContent-Length: 0\r\n\r\n"
+        );
+        let values = sip::header_values(response.as_bytes(), "Security-Server");
+        let selected = select_security_server(&profile, &values).unwrap().unwrap();
+        assert_eq!(selected.binding.spi_c, 100);
+        assert_eq!(selected.algorithms.auth, "hmac(sha1)");
+        assert_eq!(selected.verify, format!("tls;q=0.9, {offer}"));
+        let stored = select_security_server(&profile, &[selected.verify.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.binding, selected.binding);
+        assert_eq!(stored.algorithms, selected.algorithms);
+    }
+
+    #[test]
+    fn server_list_fix_does_not_expand_or_change_the_client_offer() {
+        let mut profile = GB_EE_23433;
+        profile.ims.register.security_client_mechanisms = &[
+            "hmac-sha-1-96/aes-cbc/esp/trans",
+            "hmac-md5-96/null/esp/trans",
+        ];
+        let binding = SecAgree {
+            spi_c: 100,
+            spi_s: 101,
+            port_c: 5064,
+            port_s: 5062,
+        };
+        let before = CellularImsSecurityClientOffer::Full.build(binding, &profile);
+        profile.ims.register.security_client_mechanisms = &["hmac-sha-1-96/aes-cbc/esp/trans"];
+        let single = CellularImsSecurityClientOffer::Full.build(binding, &profile);
+        assert_eq!(before, single);
+        assert!(!before.contains("hmac-md5-96"));
+        assert!(!before.contains(','));
+    }
 
     #[test]
     fn pcscf_binding_and_provider_failures_cannot_fall_through_to_dns_or_sip() {

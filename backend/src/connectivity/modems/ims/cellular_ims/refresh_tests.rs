@@ -31,6 +31,12 @@ async fn protected_session() -> (
 ) {
     let (live, runtime, server) = super::tests::test_voice_session().await;
     let mut session = live.session.lock().await.take().unwrap();
+    // This fixture installs MD5/null SAs. Give it a matching strict policy
+    // rather than injecting them into the voice fixture's SHA1-only profile.
+    let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+    profile.ims.register.security_client_mechanisms = &["hmac-md5-96/null/esp/trans"];
+    session.profile = Box::leak(Box::new(profile));
+    session.effective_ims = resolve_effective_ims_profile(session.profile, None);
     // Model the real USIM trace: REGISTER uses a temporary IMPU, whereas
     // P-Associated-URI selects an MSISDN identity for originating services.
     session.registration_identity.public_uri = "sip:234330000000001@ims.example".into();
@@ -187,7 +193,7 @@ async fn challenged_refresh_freezes_offer_and_rolls_back_sockets_and_nonce_on_ti
     auth.prepare_aka_result(
         challenge("new-nonce"),
         aka(),
-        Some((selected, selected.security_client_value())),
+        select_security_server(session.profile, &[selected.security_client_value()]).unwrap(),
         &mut session.channel,
     )
     .await
@@ -287,15 +293,23 @@ async fn successful_rollover_keeps_old_inbound_path_until_next_procedure() {
         port_c: new_client.local_addr().unwrap().port(),
         port_s: server.local_addr().unwrap().port(),
     };
+    let server_values = vec![
+        "tls;q=0.9".to_string(),
+        format!("{};q=0.8", selected.security_client_value()),
+    ];
     auth.prepare_aka_result(
         challenge("new-nonce"),
         aka(),
-        Some((selected, selected.security_client_value())),
+        select_security_server(session.profile, &server_values).unwrap(),
         &mut session.channel,
     )
     .await
     .unwrap();
-    auth.authenticated_request(b"", 2).await.unwrap();
+    let authenticated = auth.authenticated_request(b"", 2).await.unwrap();
+    assert_eq!(
+        sip::header_value(&authenticated, "Security-Verify"),
+        Some(server_values.join(", "))
+    );
     let incoming = session.channel.route().local_addr;
     new_client
         .send_to(b"SIP/2.0 200 OK\r\n\r\n", incoming)
@@ -360,7 +374,7 @@ async fn invalid_zero_spi_challenge_is_rejected_before_aka_without_mutating_chan
     );
     // Captured failure shape: syntactically present but unusable Security-Server.
     let error = auth.prepare_authenticated_channel(
-        b"SIP/2.0 401 Unauthorized\r\nSecurity-Server: ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=1;spi-s=0;port-c=33174;port-s=6000\r\n\r\n",
+        b"SIP/2.0 401 Unauthorized\r\nSecurity-Server: ipsec-3gpp;alg=hmac-md5-96;ealg=null;prot=esp;mod=trans;spi-c=1;spi-s=0;port-c=33174;port-s=6000\r\n\r\n",
         &mut session.channel,
     ).await.unwrap_err();
     assert_eq!(error.code(), code::SECURITY_SERVER_INVALID);

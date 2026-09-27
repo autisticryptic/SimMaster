@@ -274,6 +274,7 @@ jobs:
             connectivity::modems::ims::cellular_ims::ipsec::tests \
             connectivity::modems::ims::cellular_ims::live::tests::refresh \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \
+            connectivity::modems::ims::cellular_ims::security_agreement::tests \
             connectivity::modems::ims::cellular_ims::errors::tests \
             services::notify::telegram_endpoint::tests; do
             cargo test --locked "$filter" -- --list > release-test-list.txt
