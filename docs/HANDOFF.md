@@ -72,13 +72,21 @@ SIM-04 自然续期、SIM-05 手动测试已由用户确认完成，不重复等
 此前对其他提交号、已完成身份错误码补丁或“native 全部验收”的口述不能当证据；
 以 Git、明确的 CI run、实际下载包和当前源码为准。
 
-### 后继安全列表候选（尚未发布/部署）
+### 后继安全列表修补：代码/CI 已完成，尚未发布或部署
 
-发现并补齐多行/逗号 Security-Server 的候选边界与完整 Security-Verify 回传，
-不改变默认客户端算法、MMTEL 或 MM 后端。新增 17 项 Rust 测试及既有 refresh 接线回归；
-本地 172 项 Python 检查通过，Rust CI 待本次提交执行。
+`dfda6cd2ed51e6ee450752a7b565cdb97d4b7906` 补齐多行/逗号 Security-Server 的候选边界与
+完整 Security-Verify 回传，不改变默认客户端算法、MMTEL 或 MM 后端。
+新增 17 项 Rust 测试及既有 refresh 接线回归，两套 Actions 已实际运行通过：
+
+- [Validate `36291639402`](https://github.com/autisticryptic/SimMaster/actions/runs/36291639402)：success。
+- [Build `36291639395`](https://github.com/autisticryptic/SimMaster/actions/runs/36291639395)：前端、
+  Rust 回归、amd64/arm64 musl 编译及打包全部 success，Publish Release 按 push 门禁 skipped。
+- 本地 172 项 Python 检查、定向 Rust 格式和 diff 检查通过；未在本地编译 Rust。
+- 明细证据：`.local/evidence/sim06/security-agreement-ci.json`，对应提交与 job/step 结果已核对。
+
 具体范围及保留的客户端单候选限制见 [IMS 诊断 §8](IMS_DIAGNOSTICS.md#8-后继候选修补security-server-列表2026-09-27)。
-这不是 SIM-06 根因/实机修复结论，已发布 v1.1.5 仍对应 `16998ae`。
+这不是 SIM-06 根因/实机修复结论，**已发布 v1.1.5 仍对应 `16998ae`，不包含此后继修补**。
+不能重新对现有 tag 直接发布覆盖资产；若需发行或部署候选，应另行明确版本及目标。
 
 ## 5. 本地资料布局
 

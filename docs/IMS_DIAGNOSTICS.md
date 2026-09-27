@@ -171,5 +171,11 @@ P 路径前缀：`cellular_ims/` = `backend/src/connectivity/modems/ims/cellular
 
 新增 15 项纯 Rust 解析测试和 2 项 live 接线测试；已有 protected refresh 测试改为使用与其
 MD5/null 测试 SA 一致的严格测试 profile，并验证认证请求完整回传列表、旧通道回滚/保留。
-两套 Actions 已加入独立模块测试过滤器；本地仅格式与 172 项 Python 守卫通过，
-**Rust CI 结果尚待本次提交执行**。未发布覆盖现有 v1.1.5，也未部署设备。
+两套 Actions 已加入独立模块测试过滤器，`dfda6cd` 的新增与既有回归实际执行通过：
+[Validate `36291639402`](https://github.com/autisticryptic/SimMaster/actions/runs/36291639402)、
+[Build `36291639395`](https://github.com/autisticryptic/SimMaster/actions/runs/36291639395) 均 success，
+包含前端、Rust 回归和 amd64/arm64 musl 构建/打包；Publish Release 按 push 门禁 skipped。
+本地定向格式、diff 与 172 项 Python 守卫通过，未进行本地 Rust 编译。
+
+**代码/CI 已完成，但未实机验证，也未覆盖已发布 `v1.1.5 / 16998ae` 的资产。**
+如 SIM-06 实际停在承载或 P-CSCF 阶段，本修补并不能解释它的失败；仍先取得现场分层证据。
