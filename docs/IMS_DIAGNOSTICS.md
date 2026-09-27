@@ -73,3 +73,72 @@ SIM 作用域、backend、runtime 的 `phase/stage/last_error`、尝试记录及
 上限/超长行、journal 失败以及模拟采样期间 PID 变化。
 
 本地只做 Python/语法检查，Rust 编译与回归仍交给 Actions；最新实际执行结果见接手记录。
+
+## 7. SIM-06：两套成功参考的生产链对照（2026-09-27）
+
+### 7.1 证据与关键纠正
+
+用户确认 **beta8** 与 **`simadmin-volte-main.zip` 构建的成品** 都能注册同一张 SIM-06 中国电信卡。
+这是两套成品，不混称为同一个实现；也不以本项目暂时失败推断该卡不支持 IMS。
+本项目设备仍离线，本节是代码/历史静态资料对照，**不是现场根因或修复验收**。
+
+- **P**：本项目已发布 `1.1.5 / 16998ae`，下列 P 行号固定于该源码。
+- **R**：上级目录源码 ZIP，SHA-256 为
+  `7bee591d9f292ba5129114eb4c221aa77b7fac66d04bd553434155fb82d98750`。
+  本地位于 `.local/reference-volte-20260926/simadmin-volte-main/`，关键文件已逐字节与 ZIP 比对。
+- **B**：归档 [beta8 对照](archive/2026-09/IMS_DERIVATION_BETA8_COMPARISON_2026-09-17.md)
+  的样本 `1.1.7-beta8 / 930365d`，二进制 SHA-256
+  `210c35b11f54dd240a83e90dd08d5e8a8f4f2cea227ce3a0503a9ced4140f9b7`。
+  本轮 IDA `get_metadata` 返回连接拒绝（10061），**没有新的 IDA 验证**；B 的结论只引已有 B01–B09/§8.1。
+
+**R 的真正注册路径是 Python daemon，而不是 ZIP 中的 Rust 逆向辅助模块：**
+
+```text
+backend/src/volte_manager.rs:22,388,428–430,538–558
+  -> /opt/simadmin/volte_register.py
+  -> volte_register.py:49–58 启动 ims_runtime.py
+  -> ims_runtime.py:122–174 manager / rebuild
+  -> ims_bearer.py:110–189 建立承载和取得地址/P-CSCF
+  -> ims_protocol.py:133–282 Session / register
+```
+
+R 的 `scripts/pack-ota.sh:13–18,211–216` 与 `install_latest.sh:1202–1207` 也将这些 Python 文件
+放入运行包。Rust `volte/identity.rs` 确有 `460 -> 2 位 MNC` 和长 APN helper，但不能把这些
+辅助实现当成 daemon 的执行证据。旧参考审计把两条路径混在一起的部分以本节为准。
+
+### 7.2 有实际调用依据的差异
+
+| 项目 | R 实际执行 | P / beta8 对照与意义 |
+|---|---|---|
+| 身份 / MNC | `ims_protocol.py:140–148` 直接读 MM **SIM** 的 `operator-code` 并生成 home domain；此链没有 EF_AD 或 MCC 460 猜测调用 | P `cellular_ims/live.rs:6694–6818` 也接受匹配 IMSI 的 SIM operator，额外支持确认 home 的驻网信息及 UIM/AT EF_AD。B 的 B01/B02 确有末级国家猜测；它**不是 R/B 成功共同依赖** |
+| EF_AD / AID | R `ims_protocol.py:148–152` 读 card status 找 USIM AID，缺失即失败；不调用 Rust 的内置 AID fallback。`ims_runtime.py:389` 的 CRSM 是短信相关读取，不是 MNC 的 EF_AD | P `identity.rs:73–118` 有前后 IMSI 核验的 CRSM EF_AD，`live.rs:6796–6810` 有 12 秒边界；QMI UIM 支持同卡 EF_AD。不能因 R 未读 EF_AD 就断言 P 缺来源 |
+| IMS APN / profile | R `ims_bearer.py:30–37,125–146` 查找 **APN=ims 且 IPv6** 的 QMI profile，缺失时新建 IPv6 profile，然后以同一 profile/WDS client 启动 | P `profiles.rs:1148,1180–1250` 标准派生为短 APN `ims`，`live.rs:2099–2183` 使用 effective APN。P `pcscf.rs:243–299` 按 APN/优先 CID 选现存 AT context，并非 R 的 exact IPv6 QMI profile 选择；B §8.1 B/C 强调 family 与 lease 关联 |
+| 承载 / 普通数据副作用 | R `ims_bearer.py:76–97,122–146` 按 data_enabled 选 wwan0/wwan1，直管 WDS、BAM-DMUX 绑定及 family=6；`ims_runtime.py:147–174,205–226` 在数据关闭且判断不活跃时临时 `simple-connect apn=3gnet`，结束时 `simple-disconnect` | P MM 默认路径由 `qcm410/ims_bearer.rs:160–210` 的 `PrimaryImsSession` 管理 MM bearer，保留 UE 隔离和数据意图；没有 R 的硬编码 3gnet 激活。B 有 MM/direct WDS 两条路径，但缺少 SIM-06 成功时走哪条的证据。R helper 存在也不证明成功时分支一定执行 |
+| P-CSCF 时序 | R `ims_bearer.py:138–169` 激活前开 reporting；QMI settings 取 IPv6 地址/网关，P-CSCF 实际取自 CGCONTRDP。为空则**再次写 reporting**、等 5 秒、重读一次 | P `live.rs:2146–2183` **已经在建立承载前开启 reporting**；随后 retained provider/同址 AT 补充。`pcscf.rs:476–630` 已有 6 轮、间隔 1 秒、总预算 12 秒的只读等待，但不在该循环重复写 reporting。B §8.1 E 的六轮读取已被覆盖，不是 P 完全没等 PCO |
+| REGISTER / 安全 | R `ims_protocol.py:176–192,247–275`：IPv6、明文 5060 初始空 AKA，固定声明 Require/Proxy-Require，`hmac-md5-96/null`，401 后 UIM AKA、四向 XFRM、受保护认证 REGISTER；固定端口 42001/42002 | P `live.rs:783–815,2816–2883` 的 offer 取当前 profile 第一项；标准派生 `profiles.rs:1247–1250` 为 `hmac-sha-1-96/aes-cbc`，Require 根据策略/响应升级。P `ipsec.rs:432–437` **已支持 MD5/null**；非 strict profile 可接受合法 server offer（`live.rs:1583–1605`）。因此是**实际声明形状**差异，不是“P 完全不支持 MD5” |
+| Contact / 续期 | R Contact 声明 smsip，不含 P 的 MMTEL/audio/+sip.instance；PANI 是固定接入类型。R `ims_runtime.py:122–170` 到期前调用 rebuild/初始注册，通常可复用存活 WDS，但会更换 SIP/XFRM 会话 | P 标准派生声明 MMTEL/audio/instance、使用已知动态 PANI，并有原会话自然 refresh。B 另有较宽的 plain fallback 和定时重入。成功初始注册不证明参考的语音能力或续期更完整 |
+
+P 路径前缀：`cellular_ims/` = `backend/src/connectivity/modems/ims/cellular_ims/`；
+`profiles.rs` = `backend/src/connectivity/modems/ims/vowifi/profiles.rs`；
+`qcm410/` = `backend/src/hardware/devices/qcm410/`。R 路径相对 ZIP 顶层目录。
+
+### 7.3 现场只读判别顺序，不按无数据的“概率”硬排根因
+
+1. **先确认是否在 bearer / P-CSCF 之前失败。** 比较真实 backend、当前/请求 profile 的 PDP family、
+   实际授予地址族、MM 与 WDS owner，以及默认数据是否本来活跃；如果尚未发送 REGISTER，
+   不能把安全算法或 Contact 写成根因。不要将 AT CID、MM profile-id、WDS client ID 混为同一编号。
+2. **到 P-CSCF 时**，检查 reporting 是否成功、实际来源与重读次数。P 已有启用和等待，
+   真正未等价的是 R 的再次写 reporting、exact-family profile 和额外数据面激活。
+   需要任何重挂载/写 reporting/临时承载对照时，另开有归属与清理证明的授权窗口；
+   不能在“只读采证”中执行 `simple-connect` 或 `simple-disconnect`。
+3. **确实进入 SIP 后**，先读取安全的算法名、Require/Proxy-Require、MMTEL/instance/PANI 存在标志、
+   auth_rounds 与真实 SIP 状态。不得收集 nonce/密钥。R/B 的 MD5/null 与 P 的默认 offer 不同值得对照，
+   但不因此全局降低安全配置、停掉 MMTEL、固定端口或加入任意错误后的明文回退。
+4. **身份仅在来源真的缺失时检查。** P 有可靠 SIM operator 时不会依赖 MCC 猜测。
+   `identity.rs:147–150` 实际返回 `CARRIER_PROFILE_MISSING` + detail `home_plmn_mnc_length_ambiguous`，
+   `live.rs:2002–2004` 将该类错误映射到 `carrier_profile`；profile store 还可能给出其他 detail。
+   不能沿用此前口述的四个不存在的 `HOME_PLMN_*` 独立码或“必定停在 starting”的结论。
+
+**本次没有改注册算法、没有运行参考程序或访问离线设备。**
+下一轮若启用 IDA，应先复核上面的 beta8 样本哈希，再查看 B04/B08 的具体参数和返回路径；
+不能仅凭旧函数地址、Rust 辅助模块中的说明或“两套参考都能注册”就重放设备写操作。

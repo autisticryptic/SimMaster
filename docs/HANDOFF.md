@@ -1,14 +1,17 @@
 # 当前接手与项目状态
 
-> 更新：2026-09-26。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
+> 更新：2026-09-27。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
 ## 1. 当前优先级
 
-1. **版本修正**：用户确认目标版本为 **1.1.5**，需核对 GitHub 错误的 1.1.8 Release/tag/latest，
-   统一源码与产物版本并通过 Actions。此项目前进行中，不能仅改 Release 标题冒充二进制已修正。
+1. **版本/发布已完成**：源码、tag、发布包统一为 **1.1.5 / `16998ae`**，用户手动触发的
+   Build-Release `36253740079` 已全绿，GitHub `/releases/latest` 已为 `v1.1.5`。
+   两架构包实际下载后确认 SHA-256、包内版本/commit 与 ELF 架构一致，不是只改 Release 标题。
 2. **SIM-06 中国电信 IMS 注册失败**：用户确认设备离线，暂停访问与轮询。
-   待用户确认上线后，先只读取得该卡的实际版本、线路、runtime 和注册失败证据，再修复。
+   用户另确认 beta8 与源码参考构建均可注册此卡；已核对源码参考的真实 Python daemon 入口，
+   首轮机制对照见 [IMS 诊断 §7](IMS_DIAGNOSTICS.md#7-sim-06两套成功参考的生产链对照2026-09-27)。
+   待上线先核实现场 backend/profile/失败阶段；静态差异不等于已定位或修复。
 3. native 真机及其他长期任务按 [开发总计划](DEVELOPMENT_PLAN.md) 和
    [后端路线图](MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md) 单独推进，不并行抢占同一设备。
 
@@ -42,18 +45,31 @@ SIM-04 自然续期、SIM-05 手动测试已由用户确认完成，不重复等
 
 ## 4. 验证与发布证据
 
-### 已有历史验证
+### 1.1.5 已核验发布基线
 
-- `302b70e14e39cfa6ead687b972f92585232b8b7c`：Validate `36003900244`、Build `36003900240`
-  success，amd64/arm64 success，Publish Release skipped。
-- 本轮只读采证工具：新增 28 项、全套 157 项 Python 检查通过；未作为该设备的实测结果。
-- 发布版本修正前源码仍为 `1.1.4-beta3`；用户要求的 1.1.5 版本统一和新 Actions 必须另有对应证明。
+- 真实源码提交：`16998ae3c5172890075b2392ded3ce9c711d72b8`。
+- push 构建 `36252976546`、Validate `36252976632`、Frontend `36252976689` 均 success；
+  push 的 Publish Release skipped 是原门禁行为，不是构建失败。
+- 用户手动 dispatch 构建 **`36253740079`** 全部 success，含前端、Rust 回归、arm64/amd64 及 Publish Release。
+- Release **`397300521 / v1.1.5`** 为非 draft、非 prerelease、latest；tag 指向上述源码 SHA。
+  用户删除了旧 Release；不能继续建议操作不存在的 v1.1.7/v1.1.8 Release，旧 tag 与 Release 分开看。
+- 2026-09-27 实际下载验证：两个 `meta.json` 均为 `1.1.5 / 16998ae`，target 与 ELF 机器类型匹配。
 
-### 本轮整理不代表业务修复
+| 包 | SHA-256（与发布的 SHA256SUMS 一致） |
+|---|---|
+| amd64 | `34920b6d0760bc8b16463a736c8e20513457c01e0c75ada0b39e043747abc92f` |
+| arm64 | `eba1704d6b760142b8a724547781bb4baa40be5df90cd8b822cb0ed555a5d491` |
 
-本轮保存、迁移了先前未提交的采证脚本和测试，合并/归档文档，清理缓存及旧 worktree。
-没有改变 IMS 注册算法，没有连接离线设备或部署。版本修正结果及新 CI 在本节后续记录，
-不能把上述旧 CI 当作新版本已编译通过。
+- 本地检查为 **169 项 Python 测试通过**，含 28 项采证回归；Rust 仅在 Actions 编译/测试。
+- 可核验记录在 `.local/evidence/release-1.1.5/github-verified.json` 与 `artifacts-verified.json`。
+- 后续 docs-only 提交可晚于发布 tag；不要把新的文档 HEAD 当作已发布二进制的 commit。
+
+### 历史与未验收边界
+
+`302b70e` 的旧 CI 和早期接手快照仍保留，但不再代替上述真实 1.1.5 证明。
+本轮只做发布核验和静态对照，未部署设备、未改变 IMS 注册算法、未改 MM 默认。
+此前对其他提交号、已完成身份错误码补丁或“native 全部验收”的口述不能当证据；
+以 Git、明确的 CI run、实际下载包和当前源码为准。
 
 ## 5. 本地资料布局
 
