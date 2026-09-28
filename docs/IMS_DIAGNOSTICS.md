@@ -259,6 +259,43 @@ MM/secondary 的 PID 不变。证据：`.local/evidence/sim06/deploy-02dfdc5/add
 后续不得把固定 IPv6 当作最终修复，也不能据此宣布其他族/配置已验收；继续围绕实际 MM bearer、
 活动 PDP 与 PCO 来源排查，保留并正确实现原地址族策略。
 
+### 2026-09-28 已授权 MM 窗口与首次注册成功
+
+用户后续批准：在核验实际承载 IMS 的上下文后打开 reporting，并经 MM 进行一次重新附着，
+用于验证可推广的兜底机制，不固定 IPv6、不使用 direct WDS/AT 后端。
+
+本次只有一个 MM 自有 IMS bearer，实际 APN=ims/profile-id=3，只有一个活动 context（CID 1），
+其 `CGCONTRDP` 实际 APN=ims、IPv6 /64 与 MM grant 一致、没有 P-CSCF、reporting 全关。
+释放应用自有资源后，仅在这个已确认的 context 上开启 reporting，通过原 MM unique owner
+执行一次 Disable→Low Power→Enable，没有变更 ctlte/ctwap/ims 定义或 Initial EPS。
+脚本等待条件误用了 `state>=9`（MM REGISTERED 实为 8，9 为 DISCONNECTING），因此错误地
+报告等待超时；后继自动恢复的回归必须覆盖状态 8，不用这个错误结果推断重新驻网失败。
+
+**现场结果**（程序仍为 `1.1.5 / 02dfdc5`，主 PID 455798）：
+
+- 06:29:36 UTC 开始从 retained MM bearer 成功关联两个 P-CSCF；此时实际活动 context 已为 CID 3。
+- 第一个派生槽位在认证阶段收到终止 401；第二槽位实际也回落 derived，终止 403。
+- 第三槽位仍是 `derived_3gpp_lte_46011`，先遇到无响应，按已有候选轮换后，
+  **06:32:29 UTC 初始注册成功，registered=true，registration_mode=ipsec**。
+- 配置仍是 `ipv4v6 → ipv6 → ipv4`，CID 3 仍为 IPV4V6，普通数据关闭，MM daemon 与 secondary
+  PID 未变。不据此声称短信、通话或自然续期已通过；也不把实际源 derived 误写成数据库 profile。
+- 有效证据：`deploy-02dfdc5/mm-reattach-once.json`（含脚本等待错误）、
+  `deploy-02dfdc5/observed-20260928T063308Z.json`（运行哈希、API、SIP元数据、PDP、服务状态）。
+
+这证实本次组合维护后 P-CSCF 和注册恢复，不能单凭这一次对照证明是某条写命令独自起效，
+更不能声称所有 modem/运营商都需要重新附着。通用实现保持以下边界：
+
+- 原 P-CSCF 发现、DNS、配置来源和地址族兜底先执行；只对最终的 derived/P-CSCF 缺失评估恢复。
+- 使用原 MM 自有 lease、unique owner、SIM、唯一 bearer、当前 grant 与实际协商 APN 的多重核验。
+  非同 CID 的实际上下文只生成恢复提示，不把相同前缀当作可借用别的 context 的 P-CSCF 证明。
+- 没有通话、数据或同 modem 其他线路冲突，确认原 lease 完全释放、定义/EPS 未改后，才执行一次。
+- `/run/simadmin/mm-pcscf-recovery/` 的每 MM owner/设备/SIM 预算在写入之前独占持久化，
+  正常重试、profile 轮换或应用重启不能清零；失败不会再触发 Disable/Low Power 循环。
+- MM REGISTERED 状态 8 即可重新运行原 profile/address-family batch，不等待先出现应用 bearer。
+  取消和错误路径仍受原 owner/用户意图控制，不偷偷重启服务、改初始 EPS 或固定地址族。
+
+代码和自动路径的实际 CI/部署验收需另外记录，不能把上述手动维护窗口冒充新代码已执行。
+
 
 
 ### 部署授权及取证文件

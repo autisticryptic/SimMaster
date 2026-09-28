@@ -41,6 +41,9 @@ use super::{
     primary_ims_settings::{self, MmIpFamily},
 };
 
+#[path = "primary_ims_recovery.rs"]
+pub mod recovery;
+
 const SERVICE: &str = "org.freedesktop.ModemManager1";
 const MODEM: &str = "org.freedesktop.ModemManager1.Modem";
 const BEARER: &str = "org.freedesktop.ModemManager1.Bearer";
@@ -868,7 +871,7 @@ pub(super) fn cleanup_in_background(lease: Arc<OwnedLease>) {
 }
 
 fn ensure_directory(directory: &Path) -> Result<(), String> {
-    if directory == Path::new(STATE_DIR) {
+    if directory.starts_with("/run/simadmin/") {
         let parent = directory.parent().expect("runtime parent");
         if parent.exists() {
             let metadata = fs::symlink_metadata(parent)

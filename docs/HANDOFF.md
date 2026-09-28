@@ -10,7 +10,9 @@
    两架构包实际下载后确认 SHA-256、包内版本/commit 与 ELF 架构一致，不是只改 Release 标题。
 2. **SIM-06 中国电信 IMS 注册失败**：用户已确认上线并授权修复、提交 GitHub、部署新的 **1.1.5 构建**。
    2026-09-27/28 已通过固定公钥 SSH 与只读 API 重连；当前已覆盖为 **`1.1.5 / 02dfdc5`**，
-   MM 默认后端。空闲 IMS CID 3 已创建、reporting 已打开，但 P-CSCF 仍未取得，尚未进入 REGISTER。
+   MM 默认后端。经本次明确授权的一次 reporting/重新附着窗口，**06:32:29 UTC 已实际注册成功（IPsec）**。
+   有两个 P-CSCF，实际 profile 仍为标准 derived；前两槽认证失败，第三槽轮换 P-CSCF 后成功。
+   通用的一次性自动恢复正在实现/验证，不能把手动维护成功直接视为新恢复代码已验收。
    当前 CID 1=`ctlte`、CID 2=`ctwap` 保持原样；CID 3=`IPV4V6/ims`。
    IPv6-only 对照无效且被用户指出会影响原兜底，已撤销，**不得用固定 IPv6 替代原地址族策略**。
    新现场与部署进展见 [IMS 诊断 §9](IMS_DIAGNOSTICS.md#9-sim-06-现场与-cid-修复2026-09-2728)。
@@ -31,7 +33,7 @@ SIM-04 自然续期、SIM-05 手动测试已由用户确认完成，不重复等
 | 同机不同 modem 混合 MM/native | 尚未实现；目前全局二选一 |
 | 未知孤儿资源自动恢复、完全统一跨旧 IMS 的去重/通知恰好一次 | 不在已实现承诺内；未知 receipt 保持阻断 |
 | 双注册、多线路、VoWiFi/视频、UT/MWI、E911、CS 音频、1.1.6 | 保留各自实现或实机/发布门槛，不能一并勾选完成 |
-| SIM-06 | 空闲 CID/reporting 与 CLI 适配已部署；P-CSCF 仍缺失，注册未成功，不能标完成 |
+| SIM-06 | `02dfdc5` 经已授权 MM 维护后初始 IPsec 注册成功；通用恢复收尾及自然续期仍待核验 |
 
 详见 [原生后端当前状态](NATIVE_BACKEND_STATUS.md)。旧总计划存在日期较早的条目，
 逐项以最新代码和证据核对，不机械地把所有旧复选框重开或清空。
@@ -74,7 +76,7 @@ SIM-04 自然续期、SIM-05 手动测试已由用户确认完成，不重复等
 此前对其他提交号、已完成身份错误码补丁或“native 全部验收”的口述不能当证据；
 以 Git、明确的 CI run、实际下载包和当前源码为准。
 
-### 后继安全列表修补：代码/CI 已完成，尚未发布或部署
+### 后继安全列表修补：代码/CI 已完成，已随候选部署，未覆盖旧 Release
 
 `dfda6cd2ed51e6ee450752a7b565cdb97d4b7906` 补齐多行/逗号 Security-Server 的候选边界与
 完整 Security-Verify 回传，不改变默认客户端算法、MMTEL 或 MM 后端。
@@ -117,16 +119,23 @@ SIM-04 自然续期、SIM-05 手动测试已由用户确认完成，不重复等
   后续不再创建备份，不删除既有历史诊断、私密资料或用户数据。仍先确认无通话、管理走 `wlan0`、
   制品与目标一致；不得重启 modem/MM、修改 Initial EPS、NV/USB 或扩大到 SIM-04/05 测试。
 
-## 5. 当前排查范围与待确认的 MM 窗口
+## 5. MM 维护结果与通用恢复边界
 
 - 用户再次明确：**本轮只修 ModemManager**；native/直接 AT 硬件控制迁移留后续，不再做 AT/QMI 旁路实验。
 - 已完整读取用户指定的 [P-CSCF 对照 §7](archive/2026-09/IMS_PCSCF_BETA8_COMPARISON_2026-09-15.md#7-sim-04-实机结论更新2026-09-20--2026-09-21)。
   该节的较新实测结论是：SIM-04 先启用 reporting，再经 MM 做一次 `Disable → Low Power → Enable`
   重新附着，才取得 P-CSCF 和注册；不是固定 IPv6或临时直接 AT 激活的效果。
-- SIM-06 此前只重启了 SimAdmin，MM 一直运行、未执行重新附着。该时序值得单独验证，
-  **不是已确定的 SIM-06 根因，也不能复用旧 SIM-04 的维护授权**。
-- 已提出一次当前 MM 重新附着窗口的确认请求；批准前不执行。会短暂中断蜂窝，但不停止 MM daemon、
-  不重启系统、不修改初始 EPS/APN/地址族顺序，不用直接 AT/native 旁路，无备份或自动循环。
+- 用户已明确批准本轮的一次 MM reporting/重新附着操作。执行前核验唯一活动上下文的实际 APN、
+  与原 MM grant 的关联、唯一自有 bearer、无通话和 Wi-Fi 管理路径；只将已确认上下文的 reporting
+  打开，经原 MM owner 执行 Disable/Low Power/Enable。未更改 PDP 定义、Initial EPS 或地址族策略。
+- 本地脚本误把 MM 的 REGISTERED 状态 8 写成 `>=9`，因此其等待阶段报告超时；这不是网络未恢复的
+  证据。只读日志随后确认驻网恢复，程序取得两个 P-CSCF 并在 06:32:29 UTC 完成 IPsec 注册。
+  MM/secondary PID 未变，只有主服务按维护操作重启。证据在 `.local/evidence/sim06/deploy-02dfdc5/`。
+- 正在加入的通用恢复：只在派生配置最终停于 P-CSCF、普通发现/各 profile 槽位耗尽后考虑；
+  严格绑定原 MM owner/lease/SIM/实际 grant，唯一活动且实际 APN 匹配的上下文仅作恢复提示，
+  **不放宽现有 P-CSCF 地址归属规则**。无通话/数据/VoWiFi或同 modem 其他线路冲突时，释放原 lease
+  后至多一次恢复，再运行原 profile 和地址族顺序。预算持久化到 `/run`，普通重试/应用重启不重置。
+  不硬编码 MCC/MNC/APN，不调用 native/direct WDS，不向初始 EPS 或现有 profile 写入新值。
 - ZIP 与 6 份生产入口文件的字节已再次核验一致；ZIP 注册走 Python 独立 WDS 路径，不能将其
   固定 IPv6/3gnet 激活直接套入本项目 MM 修复。暂不需要新 IDA 解析；确需具体 beta8 分支时再通知用户开启 MCP。
 

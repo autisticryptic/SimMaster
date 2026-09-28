@@ -10621,6 +10621,120 @@ async fn run_line_cellular_ims_restore_batch(
     line: &Arc<crate::services::line_registry::LineRuntime>,
     source: &'static str,
 ) {
+    let generation = line.cellular_ims.generation();
+    run_line_cellular_ims_restore_round(app, line, source).await;
+    // Recovery is considered only after normal configured/PCO/DNS and profile
+    // fallbacks have failed. It never interrupts an already registered line.
+    // Shield the admitted maintenance task: dropping this caller must not
+    // release its gates while MM is disabled or a command is still in flight.
+    let recovery_app = app.clone();
+    let recovery_line = Arc::clone(line);
+    let recovered = tokio::spawn(async move {
+        try_mm_pcscf_reattach(&recovery_app, &recovery_line, generation).await
+    }).await.unwrap_or(false);
+    if recovered && line.cellular_ims.generation() == generation {
+        // Exactly one extra ordered batch, not recursion. The durable driver
+        // budget is not reset by profile changes, application restarts or retry.
+        run_line_cellular_ims_restore_round(app, line, source).await;
+    }
+}
+
+fn mm_pcscf_recovery_is_candidate(
+    status: &crate::connectivity::modems::ims::cellular_ims::CellularImsRuntimeStatus,
+) -> bool {
+    !status.registered && status.phase == "degraded" && status.stage == "pcscf"
+        && status.recovery_state == "exhausted" && status.profile_source.as_deref() == Some("derived")
+        && status.last_error.as_deref() == Some(code::RUNTIME_ALL_PCSCF_FAILED)
+}
+
+async fn mm_pcscf_recovery_policy_current(
+    app: &AppState,
+    line: &crate::services::line_registry::LineRuntime,
+    generation: u64,
+    modem: &str,
+) -> bool {
+    let binding = line.binding();
+    let profile = app.config_manager.get_line_profile(&binding.line_id);
+    line.cellular_ims.generation() == generation && binding.present && binding.modem_path == modem
+        && !binding.slot_conflict && profile.enabled && profile.cellular_ims_connection_enabled
+        && !profile.airplane_mode_enabled && !profile.data_connection_enabled && !profile.vowifi.enabled
+        && app.config_manager.get_cellular_backend().mode == crate::hardware::cellular::backends::config::BackendMode::Modemmanager
+        && crate::hardware::cellular::backends::active_native().is_none()
+        && app.line_registry.device_kind() == crate::hardware::devices::DeviceKind::Qcm410
+        && !line_has_call_blocking_ims_switch(app, &binding.line_id).await
+}
+
+async fn try_mm_pcscf_reattach(
+    app: &AppState,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
+    generation: u64,
+) -> bool {
+    if !mm_pcscf_recovery_is_candidate(&line.cellular_ims.status().await) { return false; }
+    let _transition = line.ims_registration.transition_lock.lock().await;
+    let _bearer = line.bearer_operation_lock.lock().await;
+    let _connect = line.cellular_ims_connect_lock.lock().await;
+    let binding = line.binding();
+    if !mm_pcscf_recovery_policy_current(app, line, generation, &binding.modem_path).await
+        || !mm_pcscf_recovery_is_candidate(&line.cellular_ims.status().await) { return false; }
+    // One physical modem can back multiple line objects. Never cycle it while
+    // any other line on the same endpoint may own calls or data.
+    if app.line_registry.all().await.iter().any(|other| {
+        let other = other.binding();
+        other.line_id != binding.line_id && other.present && (
+            other.modem_path == binding.modem_path
+                || other.qmi_device.as_ref().is_some_and(|device| binding.qmi_device.as_ref() == Some(device)))
+    }) { return false; }
+    match list_calls_for_line(app, &binding.line_id, &binding.modem_path).await {
+        Ok(calls) if calls.calls.is_empty() => {},
+        _ => return false,
+    }
+    let plan = match crate::hardware::devices::qcm410::mm_pcscf_recovery::RecoveryPlan::inspect(&binding.modem_path).await {
+        Ok(Some(plan)) if plan.budget_available() => plan,
+        Ok(_) => return false,
+        Err(_) => {
+            tracing::info!("MM P-CSCF recovery not admitted: context ownership is unverified");
+            return false;
+        }
+    };
+    // Normal cleanup observes the existing firmware grace period, releases the
+    // namespace and bearer, and keeps unknown receipts. The driver refuses the
+    // operation unless its exact original lease reports successful cleanup.
+    crate::connectivity::modems::ims::cellular_ims::live::cleanup_live_for_profile_switch(
+        &line.cellular_ims_live, &line.cellular_ims,
+    ).await;
+    if !mm_pcscf_recovery_policy_current(app, line, generation, &binding.modem_path).await { return false; }
+    let cid = plan.context_id();
+    line.cellular_ims.update(|state| {
+        state.recovery_state = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::WaitingModem;
+        state.manual_retry_available = false;
+        state.next_retry_at = None;
+    }).await;
+    tracing::info!(line_id = %binding.line_id, cid, "MM P-CSCF reporting recovery starting; one bounded reattach");
+    let result = plan.execute(|| mm_pcscf_recovery_policy_current(app, line, generation, &binding.modem_path)).await;
+    if line.cellular_ims.generation() != generation { return false; }
+    match result {
+        Ok(()) => {
+            tracing::info!(line_id = %binding.line_id, cid, "MM P-CSCF reporting recovery completed; retrying original profile/family order");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(line_id = %binding.line_id, %error, "MM P-CSCF recovery stopped; no automatic repeat");
+            line.cellular_ims.update(|state| {
+                state.recovery_state = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::Exhausted;
+                state.manual_retry_available = true;
+                state.next_retry_at = None;
+                state.last_error = Some(format!("{}:mm_reporting_recovery_stopped", code::RUNTIME_ALL_PCSCF_FAILED));
+            }).await;
+            false
+        }
+    }
+}
+
+async fn run_line_cellular_ims_restore_round(
+    app: &AppState,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
+    source: &'static str,
+) {
     let batch_generation = line.cellular_ims.generation();
     match wait_for_line_modem(app, line, batch_generation).await {
         LineModemWait::Ready => {}
@@ -14251,6 +14365,39 @@ pub async fn delete_e911_address_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cellular_ims_profile_batch_mm_recovery_requires_exhausted_derived_pcscf_failure() {
+        use crate::connectivity::modems::ims::cellular_ims::CellularImsRuntimeStatus;
+        let eligible = || CellularImsRuntimeStatus {
+            registered: false,
+            phase: "degraded".into(),
+            stage: "pcscf".into(),
+            recovery_state: "exhausted".into(),
+            profile_source: Some("derived".into()),
+            last_error: Some(code::RUNTIME_ALL_PCSCF_FAILED.into()),
+            ..Default::default()
+        };
+        assert!(mm_pcscf_recovery_is_candidate(&eligible()));
+        let mut registered = eligible();
+        registered.registered = true;
+        assert!(!mm_pcscf_recovery_is_candidate(&registered));
+        for stage in ["radio", "bearer", "register_initial", "registered"] {
+            let mut state = eligible(); state.stage = stage.into();
+            assert!(!mm_pcscf_recovery_is_candidate(&state));
+        }
+        for source in [None, Some("database"), Some("carrier_catalog")] {
+            let mut state = eligible(); state.profile_source = source.map(str::to_string);
+            assert!(!mm_pcscf_recovery_is_candidate(&state));
+        }
+        for error in [None, Some(code::REGISTER_AUTH_UNEXPECTED_STATUS), Some(code::RUNTIME_IMS_BASEBAND_WEDGED)] {
+            let mut state = eligible(); state.last_error = error.map(str::to_string);
+            assert!(!mm_pcscf_recovery_is_candidate(&state));
+        }
+        let mut pending = eligible(); pending.recovery_state = "connecting".into();
+        assert!(!mm_pcscf_recovery_is_candidate(&pending));
+    }
+
     use crate::hardware::cellular::control::SimIdentity;
 
     #[test]

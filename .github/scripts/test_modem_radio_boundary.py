@@ -72,7 +72,7 @@ class ModemRadioBoundaryTests(unittest.TestCase):
     def test_watchdog_and_ims_recheck_intent_inside_the_bearer_gate(self):
         watchdog = handler("reconcile_line_data_health")
         self.assertLess(watchdog.index("bearer_operation_lock.try_lock()"), watchdog.index("get_line_profile("))
-        restore = handler("run_line_cellular_ims_restore_batch").split("let result = {", 1)[1]
+        restore = handler("run_line_cellular_ims_restore_round").split("let result = {", 1)[1]
         self.assertLess(restore.index("bearer_operation_lock.lock()"), restore.index("get_line_profile("))
         for gate in ("line.cellular_ims.generation()", "!profile.enabled", "profile.airplane_mode_enabled", "!profile.cellular_ims_connection_enabled"):
             self.assertLess(restore.index(gate), restore.index("prepare_line_data_slot_for_cellular_ims("))

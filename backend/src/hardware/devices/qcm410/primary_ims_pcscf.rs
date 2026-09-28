@@ -402,6 +402,78 @@ where
     }))
 }
 
+/// Identify a missing-reporting recovery candidate, NOT a P-CSCF source.
+/// A network-assigned APN can differ from the stored definition. Only the
+/// retained MM owner with one exclusive bearer may call this observation.
+/// It never lends addresses from that context to another profile; a fresh
+/// post-reattach bearer must pass the normal discovery checks above.
+pub(super) fn missing_reporting_context(
+    expected: &CgcontrdpSettings,
+    profile_id: Option<u32>,
+    apn: &str,
+    activity: &str,
+    definitions: &str,
+    observed: &str,
+) -> Result<Option<u8>, ImsBearerError> {
+    let state = context_state(activity, definitions)?;
+    let Some(profile) = profile_id.and_then(|value| u8::try_from(value).ok()) else {
+        return Ok(None);
+    };
+    if !state
+        .definitions
+        .get(&profile)
+        .is_some_and(|def| def.apn.eq_ignore_ascii_case(apn))
+        || !expected.pcscf.is_empty()
+    {
+        return Ok(None);
+    }
+    let [active] = state.active.as_slice() else {
+        return Ok(None);
+    };
+    // `context_rows` verifies actual CID, negotiated APN, row consistency and
+    // address shape. Mismatches do not authorize recovery of an unrelated PDN.
+    let rows = context_rows(observed, *active, apn)?;
+    if rows.is_empty() || rows.iter().any(|row| !row.candidates.is_empty()) {
+        return Ok(None);
+    }
+    for row in &rows {
+        let local = if row.local.is_ipv4() {
+            expected.ipv4_address
+        } else {
+            expected.ipv6_address
+        };
+        let Some(local) = local.filter(|address| usable(*address)) else {
+            return Ok(None);
+        };
+        if row.local == local {
+            continue;
+        }
+        let (IpAddr::V6(at), IpAddr::V6(mm)) = (row.local, local) else {
+            return Ok(None);
+        };
+        if expected.ipv6_prefix != Some(64)
+            || row.prefix.is_some_and(|prefix| prefix != 64)
+            || at.octets()[..8] != mm.octets()[..8]
+            || at.octets()[8..] == [0; 8]
+            || mm.octets()[8..] == [0; 8]
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(*active))
+}
+
+pub(super) fn sole_active_context(
+    activity: &str,
+    definitions: &str,
+) -> Result<Option<u8>, ImsBearerError> {
+    let state = context_state(activity, definitions)?;
+    Ok(match state.active.as_slice() {
+        [cid] => Some(*cid),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +521,67 @@ mod tests {
             |command| ready(Ok(response(&command, activity, definitions, row))),
         )
         .await
+    }
+
+    #[test]
+    fn recovery_identifies_negotiated_apn_without_relaxing_pcscf_publication() {
+        let definitions = "+CGDCONT: 1,\"IPV4V6\",\"internet\"\n+CGDCONT: 3,\"IPV4V6\",\"ims\"";
+        let row = "+CGCONTRDP: 1,6,ims,2001:db8:1::a,2001:db8:1::b,,";
+        assert_eq!(
+            missing_reporting_context(
+                &settings(),
+                Some(3),
+                "ims",
+                "+CGACT: 1,1\n+CGACT: 3,0",
+                definitions,
+                row
+            )
+            .unwrap(),
+            Some(1)
+        );
+        for (activity, pin, observed) in [
+            ("+CGACT: 1,1\n+CGACT: 3,1", Some(3), row.to_string()),
+            ("+CGACT: 1,1\n+CGACT: 3,0", None, row.to_string()),
+            (
+                "+CGACT: 1,1\n+CGACT: 3,0",
+                Some(3),
+                row.replace("2001:db8:1::a", "2001:db8:2::a"),
+            ),
+            (
+                "+CGACT: 1,1\n+CGACT: 3,0",
+                Some(3),
+                format!("{row},2001:db8:2::10"),
+            ),
+        ] {
+            assert_eq!(
+                missing_reporting_context(
+                    &settings(),
+                    pin,
+                    "ims",
+                    activity,
+                    definitions,
+                    &observed
+                )
+                .unwrap(),
+                None
+            );
+        }
+        assert!(missing_reporting_context(
+            &settings(),
+            Some(3),
+            "ims",
+            "+CGACT: 1,1",
+            definitions,
+            &row.replace(",ims,", ",other,")
+        )
+        .is_err());
+        let mut unbound = settings();
+        unbound.ipv6_prefix = Some(48);
+        assert_eq!(
+            missing_reporting_context(&unbound, Some(3), "ims", "+CGACT: 1,1", definitions, row)
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
