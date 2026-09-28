@@ -274,7 +274,8 @@ where
         return Err(profile_definition_error("ims_profile_arguments_invalid"));
     }
     let before = query("AT+CGDCONT?".to_string()).await?;
-    let contexts = checked_profile_definitions(&before)?;
+    let before = profile_at_response(&before)?;
+    let contexts = checked_profile_definitions(before)?;
     // Reusing an existing definition does not need a capability probe or write.
     if let Ok(profile) = select_ims_profile_context(&contexts, preferred, apn, &[]) {
         return Ok(profile);
@@ -288,7 +289,8 @@ where
     // Never turn a stale absent slot into an overwrite after the capability and
     // activity awaits. Compare complete definition rows, not just CID/APN/type.
     let current = query("AT+CGDCONT?".to_string()).await?;
-    checked_profile_definitions(&current)?;
+    let current = profile_at_response(&current)?;
+    checked_profile_definitions(current)?;
     let rows = |text: &str| {
         let mut rows = text
             .lines()
@@ -299,7 +301,7 @@ where
         rows.sort();
         rows
     };
-    if rows(&before) != rows(&current) {
+    if rows(before) != rows(current) {
         return Err(profile_definition_error("ims_profile_definition_changed"));
     }
     query(format!(
@@ -327,7 +329,27 @@ fn profile_definition_error(detail: &'static str) -> CellularImsError {
     CellularImsError::with_detail(code::IMS_PROFILE_DEFINITION_AMBIGUOUS, detail)
 }
 
+/// MM's CLI wraps Command replies in `response: '...'`; native AT returns the
+/// payload directly. Normalize only that complete, known envelope, never an
+/// arbitrary prefix or error tail, before validating profile responses.
+fn profile_at_response(output: &str) -> Result<&str, CellularImsError> {
+    if output.len() > 16384 {
+        return Err(profile_definition_error("ims_profile_response_limit"));
+    }
+    let output = output.trim();
+    if let Some(envelope) = output.strip_prefix("response:") {
+        envelope
+            .trim()
+            .strip_prefix('\'')
+            .and_then(|value| value.strip_suffix('\''))
+            .ok_or_else(|| profile_definition_error("ims_profile_response_envelope_invalid"))
+    } else {
+        Ok(output)
+    }
+}
+
 fn checked_profile_definitions(output: &str) -> Result<Vec<PdpContext>, CellularImsError> {
+    let output = profile_at_response(output)?;
     let contexts = parse_pdp_contexts(output);
     if output.len() > 16384
         || output.trim().is_empty()
@@ -350,6 +372,7 @@ fn checked_profile_definitions(output: &str) -> Result<Vec<PdpContext>, Cellular
 }
 
 fn supported_profile_cids(output: &str, pdp_type: &str) -> Result<Vec<u8>, CellularImsError> {
+    let output = profile_at_response(output)?;
     let invalid = || profile_definition_error("ims_profile_capabilities_invalid");
     if output.len() > 16384 {
         return Err(invalid());
@@ -1597,6 +1620,61 @@ IPv4 primary DNS: 10.0.0.53";
             ]
         );
         assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ims_profile_creation_accepts_the_real_mmcli_response_envelope() {
+        let mut replies = std::collections::VecDeque::from([
+            CTCC_DEFINITIONS,
+            PROFILE_CAPABILITIES,
+            "+CGACT: 1,1\n+CGACT: 2,0",
+            CTCC_DEFINITIONS,
+            "OK",
+            CREATED_IMS,
+        ]);
+        let mut commands = Vec::new();
+        let result = prepare_ims_profile_with(2, "ims", "IPV4V6", |command| {
+            commands.push(command);
+            std::future::ready(Ok(format!(
+                "response: '{}'\n",
+                replies.pop_front().expect("bounded mmcli sequence")
+            )))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            ImsProfileContext {
+                cid: 3,
+                created: true
+            }
+        );
+        assert!(replies.is_empty());
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| *command == "AT+CGDCONT=3,\"IPV4V6\",\"ims\"")
+                .count(),
+            1
+        );
+        assert_eq!(
+            supported_profile_cids(&format!("response: '{PROFILE_CAPABILITIES}'"), "IPV4V6")
+                .unwrap(),
+            PROFILE_CIDS
+        );
+    }
+
+    #[test]
+    fn ims_profile_response_envelope_does_not_hide_partial_or_error_replies() {
+        for response in [
+            "response: '+CGDCONT: 2,\"IP\",\"ims\"",
+            "response: 'OK'\nERROR",
+            "response: \"OK\"",
+            "response: 'ERROR'",
+        ] {
+            assert!(checked_profile_definitions(response).is_err(), "{response}");
+        }
+        assert!(profile_at_response(&" ".repeat(16385)).is_err());
     }
 
     #[tokio::test]

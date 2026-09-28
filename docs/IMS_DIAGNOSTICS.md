@@ -220,15 +220,30 @@ MD5/null 测试 SA 一致的严格测试 profile，并验证认证请求完整�
 5. 新定义保留供复用；写入未确认不自动重复或删除，不套用旧 prefetch 的覆盖/恢复逻辑。
 
 新增纯解析和异步假 IO 回归覆盖能力按族匹配、能力范围无效、保留 attach/占位定义、并发占用、
-活动 CID、原样复用、未确认写入及 AT 参数注入。Rust 编译与执行仍只在 Actions；补强版 CI 与
-设备验收须另列实际结果，不能用初版 CI 替代。
+活动 CID、原样复用、未确认写入及 AT 参数注入。Rust 编译与执行仍只在 Actions。补强版 `e0ade97` 的 Build `36368975285`、Validate
+`36368975330` 全部通过，7 项新 Rust 回归实际执行，本地 173 项 Python 检查通过。
+
+### 首次覆盖结果与后继适配
+
+`1.1.5 / e0ade97` 已于 2026-09-28 02:28 UTC 部署，主进程 PID 288352；
+实际运行 SHA-256=`badb454b965a4e68d3e69b7c7ddf1dbaf035fe4eebaea62527ef5189894a6c33`。
+MM PID 410、secondary PID 283 均未变化。现场仍在创建 profile 前被
+`cellular_ims_profile_definition_ambiguous` 拒绝，没有覆盖原 CID 1/2，也没有注册成功。
+
+原因是生产 `control::at_command` 通过 **mmcli stdout** 返回 `response: '…'` 外壳，
+而新增严格定义/能力校验只接受纯 AT payload；D-Bus 的原始回复与 CLI 输出不能混为一谈。
+已补充只剥离完整已知外壳的归一化，并增加完整创建流程的 CLI 回包测试、残缺外壳/ERROR 回包拒绝测试。
+后继版须独立 CI 与覆盖验证，不能以首次候选 CI 通过代替实际注册。
+
 
 ### 部署授权及取证文件
 
 用户已授权提交 GitHub、部署新的 **1.1.5 构建**并做一次 SIM-06 注册验证。已发布 Release
 仍为 `v1.1.5 / 16998ae`，新候选使用独立 Actions 制品，不覆盖历史 tag 或 Release。
-切换前核验官方 artifact digest、包内 commit/版本/架构、无通话、管理路径和备份；不启停 MM、
+切换前核验官方 artifact digest、包内 commit/版本/架构、无通话和管理路径；不启停 MM、
 不写 NV/USB、不修改 Initial EPS，不恢复旧的测试窗口自动回滚策略。
+用户随后明确实验机**直接覆盖，不再保留备份**；首次部署刚生成的备份已删除，后续不再创建备份。
+这不包括删除历史诊断、凭据或现有配置/数据库。
 
 本地脱敏证据在 `.local/evidence/sim06/`：`connection-summary.json`、
 `runtime-readonly-20260927T123301Z.json`、`pcscf-readonly-20260927T123754Z.json`、

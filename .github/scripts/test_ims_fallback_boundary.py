@@ -41,6 +41,8 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         self.assertIn("ims_profile_creation_checks_capability_activity_and_definitions_before_writing", text)
         self.assertIn("ims_profile_creation_refuses_an_active_or_concurrently_filled_slot", text)
         self.assertIn("ims_profile_creation_does_not_retry_or_delete_an_unconfirmed_write", text)
+        self.assertIn("ims_profile_creation_accepts_the_real_mmcli_response_envelope", text)
+        self.assertIn("ims_profile_response_envelope_does_not_hide_partial_or_error_replies", text)
 
     def test_both_automatic_resolvers_use_the_same_home_boundary(self):
         text = (SRC / "vowifi/profile_store.rs").read_text()
