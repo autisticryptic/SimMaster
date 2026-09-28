@@ -235,57 +235,187 @@ pub fn configured_ims_cid() -> u8 {
         .unwrap_or(DEFAULT_IMS_CID)
 }
 
-/// Reuse a matching IMS PDP context, or define a new one in an absent CID that
-/// is confirmed inactive. The configured preferred CID is used when free;
-/// otherwise the lowest absent CID in 1..=16 is used (the Qualcomm
-/// `$QCPDPIMSCFGE` table covers the same range). Existing definitions
-/// (including empty-APN placeholders and the default-attach/Internet/WAP
-/// profiles) are never overwritten. Without a pinned IMS profile the P-CSCF
-/// reporting flag cannot be armed and carriers such as 46011 never deliver a
-/// P-CSCF in PCO. This never activates/deactivates a context; the bearer
-/// remains the activation owner.
+/// Reuse an IMS definition, or create one in a supported, absent, inactive CID.
+/// New definitions require the modem's +CGDCONT test response for the requested
+/// PDP type; a reporting table alone does not prove profile-creation support.
+/// CID 1 is never newly defined because it may be the default-attach profile.
+/// Existing definitions, including empty APN placeholders, are never overwritten.
+/// No activation occurs here; the retained bearer remains the activation owner.
 pub async fn prepare_ims_profile_context(
     modem: &str,
     plan: &ImsConnectionPlan,
     apn: &str,
 ) -> Result<ImsProfileContext, CellularImsError> {
-    let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
-    let contexts = parse_pdp_contexts(&contexts_output);
-    // A malformed or duplicate row must not look like a free profile slot.
-    if contexts_output
-        .lines()
-        .filter(|line| line.contains("+CGDCONT:"))
-        .count()
-        != contexts.len()
+    let pdp_type = plan.pdp_types().into_iter().next().unwrap_or("IPV4V6");
+    prepare_ims_profile_with(configured_ims_cid(), apn, pdp_type, |command| async move {
+        run_at(modem, &command).await
+    })
+    .await
+}
+
+async fn prepare_ims_profile_with<Run, Fut>(
+    preferred: u8,
+    apn: &str,
+    pdp_type: &str,
+    mut query: Run,
+) -> Result<ImsProfileContext, CellularImsError>
+where
+    Run: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, CellularImsError>>,
+{
+    // These strings become AT arguments, not free-form command text.
+    if apn.is_empty()
+        || apn.len() > 100
+        || !apn
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        || !matches!(pdp_type, "IP" | "IPV6" | "IPV4V6")
     {
-        return Err(CellularImsError::new(
-            code::IMS_PROFILE_DEFINITION_AMBIGUOUS,
-        ));
+        return Err(profile_definition_error("ims_profile_arguments_invalid"));
     }
-    let profile = select_ims_profile_context(&contexts, configured_ims_cid(), apn)?;
-    if !profile.created {
+    let before = query("AT+CGDCONT?".to_string()).await?;
+    let contexts = checked_profile_definitions(&before)?;
+    // Reusing an existing definition does not need a capability probe or write.
+    if let Ok(profile) = select_ims_profile_context(&contexts, preferred, apn, &[]) {
         return Ok(profile);
     }
-    let active = run_at(modem, "AT+CGACT?").await?;
+    let capabilities = query("AT+CGDCONT=?".to_string()).await?;
+    let supported = supported_profile_cids(&capabilities, pdp_type)?;
+    let profile = select_ims_profile_context(&contexts, preferred, apn, &supported)?;
+    let active = query("AT+CGACT?".to_string()).await?;
     ensure_profile_inactive(&active, profile.cid)?;
 
-    let pdp_type = plan.pdp_types().into_iter().next().unwrap_or("IPV4V6");
-    run_at(
-        modem,
-        &format!("AT+CGDCONT={},\"{pdp_type}\",\"{apn}\"", profile.cid),
-    )
+    // Never turn a stale absent slot into an overwrite after the capability and
+    // activity awaits. Compare complete definition rows, not just CID/APN/type.
+    let current = query("AT+CGDCONT?".to_string()).await?;
+    checked_profile_definitions(&current)?;
+    let rows = |text: &str| {
+        let mut rows = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("+CGDCONT:"))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    if rows(&before) != rows(&current) {
+        return Err(profile_definition_error("ims_profile_definition_changed"));
+    }
+    query(format!(
+        "AT+CGDCONT={},\"{pdp_type}\",\"{apn}\"",
+        profile.cid
+    ))
     .await?;
+    // Do not retry an uncertain write or guess a different profile. A newly
+    // created definition is retained for reuse, not deleted by failure cleanup.
+    let after = query("AT+CGDCONT?".to_string()).await?;
+    let verified = checked_profile_definitions(&after)?;
+    if !verified.iter().any(|context| {
+        context.cid == profile.cid
+            && context.apn.eq_ignore_ascii_case(apn)
+            && context.pdp_type.eq_ignore_ascii_case(pdp_type)
+    }) {
+        return Err(profile_definition_error(
+            "ims_profile_definition_not_confirmed",
+        ));
+    }
     Ok(profile)
+}
+
+fn profile_definition_error(detail: &'static str) -> CellularImsError {
+    CellularImsError::with_detail(code::IMS_PROFILE_DEFINITION_AMBIGUOUS, detail)
+}
+
+fn checked_profile_definitions(output: &str) -> Result<Vec<PdpContext>, CellularImsError> {
+    let contexts = parse_pdp_contexts(output);
+    if output.len() > 16384
+        || output.trim().is_empty()
+        || output.lines().map(str::trim).any(|line| {
+            !line.is_empty()
+                && line != "OK"
+                && line != "AT+CGDCONT?"
+                && !line.starts_with("+CGDCONT:")
+        })
+        || output
+            .lines()
+            .filter(|line| line.trim().starts_with("+CGDCONT:"))
+            .count()
+            != contexts.len()
+        || contexts.iter().any(|context| context.cid == 0)
+    {
+        return Err(profile_definition_error("ims_profile_definition_invalid"));
+    }
+    Ok(contexts)
+}
+
+fn supported_profile_cids(output: &str, pdp_type: &str) -> Result<Vec<u8>, CellularImsError> {
+    let invalid = || profile_definition_error("ims_profile_capabilities_invalid");
+    if output.len() > 16384 {
+        return Err(invalid());
+    }
+    let mut supported = Vec::new();
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if matches!(line, "OK" | "AT+CGDCONT=?") {
+            continue;
+        }
+        let rest = line.strip_prefix("+CGDCONT:").ok_or_else(invalid)?.trim();
+        let (range, rest) = rest
+            .strip_prefix('(')
+            .and_then(|rest| rest.split_once(')'))
+            .ok_or_else(invalid)?;
+        let rest = rest.trim().strip_prefix(',').ok_or_else(invalid)?.trim();
+        let types = if let Some(rest) = rest.strip_prefix('(') {
+            rest.split_once(')').ok_or_else(invalid)?.0
+        } else {
+            rest.split_once(',').map_or(rest, |(types, _)| types)
+        };
+        let mut matching = false;
+        for value in types.split(',').map(str::trim) {
+            let value = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .ok_or_else(invalid)?;
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return Err(invalid());
+            }
+            matching |= value.eq_ignore_ascii_case(pdp_type);
+        }
+        for span in range.split(',').map(str::trim) {
+            let (start, end) = span.split_once('-').unwrap_or((span, span));
+            let start = start.trim().parse::<u8>().map_err(|_| invalid())?;
+            let end = end.trim().parse::<u8>().map_err(|_| invalid())?;
+            if start > end {
+                return Err(invalid());
+            }
+            if matching {
+                supported.extend((start..=end).filter(|cid| (2..=16).contains(cid)));
+            }
+        }
+    }
+    supported.sort_unstable();
+    supported.dedup();
+    if supported.is_empty() {
+        return Err(profile_definition_error(
+            "ims_profile_supported_cid_unavailable",
+        ));
+    }
+    Ok(supported)
 }
 
 fn select_ims_profile_context(
     contexts: &[PdpContext],
     preferred: u8,
     apn: &str,
+    supported_cids: &[u8],
 ) -> Result<ImsProfileContext, CellularImsError> {
     if let Some(context) = contexts
         .iter()
-        .filter(|context| context.apn.eq_ignore_ascii_case(apn))
+        .filter(|context| (1..=16).contains(&context.cid) && context.apn.eq_ignore_ascii_case(apn))
         .min_by_key(|context| (context.cid != preferred, context.cid))
     {
         return Ok(ImsProfileContext {
@@ -296,41 +426,27 @@ fn select_ims_profile_context(
     if !(1..=16).contains(&preferred) {
         return Err(CellularImsError::new(code::IMS_PREFERRED_PROFILE_OCCUPIED));
     }
-    let absent = |cid: u8| !contexts.iter().any(|context| context.cid == cid);
-    // CID 1 is the default LTE attach profile on Qualcomm firmware even when
-    // AT does not list it; defining an IMS APN there could change attach.
-    // Search above the preferred CID first, then below it, never CID 1.
     let cid = std::iter::once(preferred)
-        .chain(preferred.saturating_add(1)..=16)
-        .chain(2..preferred)
-        .find(|cid| *cid != 1 && absent(*cid))
+        .chain(2..=16)
+        .find(|cid| {
+            (2..=16).contains(cid)
+                && supported_cids.contains(cid)
+                && !contexts.iter().any(|context| context.cid == *cid)
+        })
         .ok_or_else(|| CellularImsError::new(code::IMS_PREFERRED_PROFILE_OCCUPIED))?;
     Ok(ImsProfileContext { cid, created: true })
 }
 
 fn ensure_profile_inactive(output: &str, cid: u8) -> Result<(), CellularImsError> {
-    let mut observed = false;
-    for values in output
-        .lines()
-        .filter_map(|line| line.split_once("+CGACT:").map(|(_, rest)| rest))
-    {
-        observed = true;
-        let fields = values
-            .split(',')
-            .map(|field| field.trim().trim_matches('\''))
-            .collect::<Vec<_>>();
-        let parsed = fields.first().and_then(|field| field.parse::<u8>().ok());
-        if fields.len() != 2 || parsed.is_none_or(|id| id == 0) || !matches!(fields[1], "0" | "1") {
-            return Err(CellularImsError::new(code::IMS_PROFILE_ACTIVITY_AMBIGUOUS));
-        }
-        if parsed == Some(cid) && fields[1] == "1" {
-            return Err(CellularImsError::new(code::IMS_PREFERRED_PROFILE_ACTIVE));
-        }
-    }
-    if !observed {
+    if !output.lines().any(|line| line.contains("+CGACT:")) {
         return Err(CellularImsError::new(
             code::IMS_PROFILE_ACTIVITY_UNAVAILABLE,
         ));
+    }
+    let active = parse_active_context_cids(output)
+        .map_err(|_| CellularImsError::new(code::IMS_PROFILE_ACTIVITY_AMBIGUOUS))?;
+    if active.contains(&cid) {
+        return Err(CellularImsError::new(code::IMS_PREFERRED_PROFILE_ACTIVE));
     }
     Ok(())
 }
@@ -1331,74 +1447,250 @@ IPv4 primary DNS: 10.0.0.53";
         assert_eq!(parse_ims_context_cids(contexts, "ims"), vec![2, 7]);
     }
 
+    const PROFILE_CIDS: &[u8] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    const CTCC_DEFINITIONS: &str =
+        "+CGDCONT: 1,\"IPV4V6\",\"ctlte\"\n+CGDCONT: 2,\"IPV4V6\",\"ctwap\"";
+    const PROFILE_CAPABILITIES: &str = "+CGDCONT: (1-16),\"IP\",,,(0-2)\n+CGDCONT: (1-16),\"IPV6\",,,(0-2)\n+CGDCONT: (1-16),\"IPV4V6\",,,(0-2)";
+    const CREATED_IMS: &str = "+CGDCONT: 1,\"IPV4V6\",\"ctlte\"\n+CGDCONT: 2,\"IPV4V6\",\"ctwap\"\n+CGDCONT: 3,\"IPV4V6\",\"ims\"";
+
     #[test]
     fn ims_profile_preserves_existing_definitions_instead_of_overwriting_them() {
-        let contexts = parse_pdp_contexts(
-            "response: '+CGDCONT: 1,\"IPV4V6\",\"\",\"0.0.0.0\",0,0\n+CGDCONT: 2,\"IPV4V6\",\"\",\"0.0.0.0\",0,0'",
-        );
-        // Empty-APN placeholders are occupied definitions, never rewritten.
-        assert_eq!(
-            select_ims_profile_context(&contexts, 2, "ims").unwrap(),
-            ImsProfileContext {
-                cid: 3,
-                created: true
-            }
-        );
-        // An unlisted CID 1 is still never chosen: it is the attach profile.
-        let occupied = parse_pdp_contexts("+CGDCONT: 2,\"IPV4V6\",\"internet\"");
-        assert_eq!(
-            select_ims_profile_context(&occupied, 2, "ims").unwrap(),
-            ImsProfileContext {
-                cid: 3,
-                created: true
-            }
-        );
-        // Even an explicitly configured CID 1 is never newly defined.
-        assert_eq!(
-            select_ims_profile_context(&occupied, 1, "ims").unwrap().cid,
-            3
-        );
-        // SIM-06 (46011): CID 1 ctlte default attach, CID 2 ctwap.
-        let ctcc = parse_pdp_contexts(
-            "+CGDCONT: 1,\"IPV4V6\",\"ctlte\"\n+CGDCONT: 2,\"IPV4V6\",\"ctwap\"",
-        );
-        assert_eq!(
-            select_ims_profile_context(&ctcc, 2, "ims").unwrap(),
-            ImsProfileContext {
-                cid: 3,
-                created: true
-            }
-        );
-        // Every CID occupied: nothing is overwritten.
-        let all = (1..=16)
+        for output in [
+            "+CGDCONT: 1,\"IPV4V6\",\"\"\n+CGDCONT: 2,\"IPV4V6\",\"\"",
+            "+CGDCONT: 2,\"IPV4V6\",\"internet\"",
+            CTCC_DEFINITIONS,
+        ] {
+            let contexts = parse_pdp_contexts(output);
+            assert_eq!(
+                select_ims_profile_context(&contexts, 2, "ims", PROFILE_CIDS).unwrap(),
+                ImsProfileContext {
+                    cid: 3,
+                    created: true
+                }
+            );
+            // Neither occupied definitions nor an unlisted attach CID 1 are
+            // used when the device has not advertised a free supported CID.
+            assert!(select_ims_profile_context(&contexts, 2, "ims", &[1, 2]).is_err());
+            assert!(select_ims_profile_context(&contexts, 2, "ims", &[]).is_err());
+        }
+        let all = (2..=16)
             .map(|cid| PdpContext {
                 cid,
                 pdp_type: "IPV4V6".into(),
                 apn: "internet".into(),
             })
             .collect::<Vec<_>>();
-        assert!(select_ims_profile_context(&all, 2, "ims").is_err());
+        assert!(select_ims_profile_context(&all, 2, "ims", PROFILE_CIDS).is_err());
     }
 
     #[test]
-    fn ims_profile_reuses_matching_definitions_or_only_the_absent_preferred_cid() {
+    fn ims_profile_reuses_definitions_or_selects_only_supported_absent_cids() {
         let contexts =
             parse_pdp_contexts("+CGDCONT: 1,\"IPV4V6\",\"internet\"\n+CGDCONT: 7,\"IPV6\",\"IMS\"");
         assert_eq!(
-            select_ims_profile_context(&contexts, 2, "ims").unwrap(),
+            select_ims_profile_context(&contexts, 2, "ims", &[]).unwrap(),
             ImsProfileContext {
                 cid: 7,
                 created: false
             }
         );
         assert_eq!(
-            select_ims_profile_context(&contexts[..1], 2, "ims").unwrap(),
+            select_ims_profile_context(&contexts[..1], 2, "ims", PROFILE_CIDS).unwrap(),
             ImsProfileContext {
                 cid: 2,
                 created: true
             }
         );
-        assert!(select_ims_profile_context(&[], 0, "ims").is_err());
+        assert_eq!(
+            select_ims_profile_context(&contexts[..1], 2, "ims", &[6, 9])
+                .unwrap()
+                .cid,
+            6
+        );
+        assert_eq!(
+            select_ims_profile_context(&contexts[..1], 9, "ims", &[6, 9])
+                .unwrap()
+                .cid,
+            9
+        );
+        assert_eq!(
+            select_ims_profile_context(&[], 1, "ims", &[1, 3])
+                .unwrap()
+                .cid,
+            3
+        );
+        assert!(select_ims_profile_context(&[], 0, "ims", PROFILE_CIDS).is_err());
+        assert!(select_ims_profile_context(&[], 17, "ims", PROFILE_CIDS).is_err());
+        assert!(select_ims_profile_context(&[], 2, "ims", &[0, 1, 17]).is_err());
+    }
+
+    #[test]
+    fn ims_profile_capabilities_bind_cids_to_the_requested_pdp_type() {
+        assert_eq!(
+            supported_profile_cids(PROFILE_CAPABILITIES, "IPV4V6").unwrap(),
+            PROFILE_CIDS
+        );
+        let split = "+CGDCONT: (1-2),\"IP\"\n+CGDCONT: (4,6-8),(\"IPV6\",\"IPV4V6\"),,,(0-2)";
+        assert_eq!(
+            supported_profile_cids(split, "IPV4V6").unwrap(),
+            vec![4, 6, 7, 8]
+        );
+        assert_eq!(supported_profile_cids(split, "IP").unwrap(), vec![2]);
+        assert!(supported_profile_cids(split, "PPP").is_err());
+    }
+
+    #[test]
+    fn ims_profile_capabilities_reject_missing_malformed_and_unbounded_ranges() {
+        for output in [
+            "",
+            "ERROR",
+            "OK",
+            "+CGDCONT: (1-16),\"IP\"",
+            "+CGDCONT: (16-2),\"IPV6\"",
+            "+CGDCONT: (1-256),\"IPV6\"",
+            "+CGDCONT: (x),\"IPV6\"",
+            "+CGDCONT: (1-16),IPV6",
+            "+CGDCONT: (1-16),\"IPV6\"\nERROR",
+            "+CGDCONT: (0-1),\"IPV6\"",
+        ] {
+            assert!(supported_profile_cids(output, "IPV6").is_err(), "{output}");
+        }
+        assert!(supported_profile_cids(&" ".repeat(16385), "IPV6").is_err());
+    }
+
+    #[tokio::test]
+    async fn ims_profile_creation_checks_capability_activity_and_definitions_before_writing() {
+        let mut replies = std::collections::VecDeque::from([
+            CTCC_DEFINITIONS,
+            PROFILE_CAPABILITIES,
+            "+CGACT: 1,1\n+CGACT: 2,0",
+            CTCC_DEFINITIONS,
+            "OK",
+            CREATED_IMS,
+        ]);
+        let mut commands = Vec::new();
+        let result = prepare_ims_profile_with(2, "ims", "IPV4V6", |command| {
+            commands.push(command);
+            std::future::ready(Ok(replies
+                .pop_front()
+                .expect("bounded creation")
+                .to_string()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            ImsProfileContext {
+                cid: 3,
+                created: true
+            }
+        );
+        assert_eq!(
+            commands,
+            vec![
+                "AT+CGDCONT?",
+                "AT+CGDCONT=?",
+                "AT+CGACT?",
+                "AT+CGDCONT?",
+                "AT+CGDCONT=3,\"IPV4V6\",\"ims\"",
+                "AT+CGDCONT?"
+            ]
+        );
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ims_profile_reuse_does_not_probe_capabilities_or_write() {
+        let mut commands = Vec::new();
+        let result = prepare_ims_profile_with(2, "ims", "IPV4V6", |command| {
+            commands.push(command);
+            std::future::ready(Ok(CREATED_IMS.to_string()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            ImsProfileContext {
+                cid: 3,
+                created: false
+            }
+        );
+        assert_eq!(commands, vec!["AT+CGDCONT?"]);
+    }
+
+    #[tokio::test]
+    async fn ims_profile_creation_refuses_an_active_or_concurrently_filled_slot() {
+        for (activity, current) in [
+            ("+CGACT: 1,1\n+CGACT: 3,1", CTCC_DEFINITIONS),
+            ("+CGACT: 3,0\n+CGACT: 3,0", CTCC_DEFINITIONS),
+            ("+CGACT: 1,1", CREATED_IMS),
+        ] {
+            let mut replies = std::collections::VecDeque::from([
+                CTCC_DEFINITIONS,
+                PROFILE_CAPABILITIES,
+                activity,
+                current,
+            ]);
+            let result = prepare_ims_profile_with(2, "ims", "IPV4V6", |command| {
+                assert!(matches!(
+                    command.as_str(),
+                    "AT+CGDCONT?" | "AT+CGDCONT=?" | "AT+CGACT?"
+                ));
+                std::future::ready(Ok(replies
+                    .pop_front()
+                    .expect("stop before write")
+                    .to_string()))
+            })
+            .await;
+            assert!(result.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn ims_profile_creation_does_not_retry_or_delete_an_unconfirmed_write() {
+        let mut writes = 0;
+        let mut replies = std::collections::VecDeque::from([
+            CTCC_DEFINITIONS,
+            PROFILE_CAPABILITIES,
+            "+CGACT: 1,1",
+            CTCC_DEFINITIONS,
+            "OK",
+            CTCC_DEFINITIONS,
+        ]);
+        let result = prepare_ims_profile_with(2, "ims", "IPV4V6", |command| {
+            if command == "AT+CGDCONT=3,\"IPV4V6\",\"ims\"" {
+                writes += 1;
+            } else {
+                assert!(matches!(
+                    command.as_str(),
+                    "AT+CGDCONT?" | "AT+CGDCONT=?" | "AT+CGACT?"
+                ));
+            }
+            std::future::ready(Ok(replies
+                .pop_front()
+                .expect("no automatic repeat")
+                .to_string()))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(writes, 1);
+        assert!(result
+            .to_string()
+            .contains("ims_profile_definition_not_confirmed"));
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ims_profile_creation_rejects_at_argument_injection_before_io() {
+        for apn in ["", "ims\"\rAT+CFUN=0", "ims,other"] {
+            let result = prepare_ims_profile_with(2, apn, "IPV4V6", |_| {
+                panic!("invalid AT arguments must not reach IO");
+                #[allow(unreachable_code)]
+                std::future::ready(Ok(String::new()))
+            })
+            .await;
+            assert!(result.is_err());
+        }
     }
 
     #[test]
@@ -1410,10 +1702,21 @@ IPv4 primary DNS: 10.0.0.53";
             "+CGACT: 2,2",
             "+CGACT: 2",
             "+CGACT: x,0",
+            "+CGACT: 2,0\n+CGACT: 2,0",
+            "+CGACT: 2,0\n+CGACT: 2,1",
             "ERROR",
             "",
         ] {
             assert!(ensure_profile_inactive(response, 2).is_err(), "{response}");
+        }
+        for response in [
+            "",
+            "ERROR",
+            "+CGDCONT: 2,\"IP\",\"ims\"\nERROR",
+            "+CGDCONT: x,\"IP\",\"ims\"",
+            "+CGDCONT: 2,\"IP\",\"ims\"\n+CGDCONT: 2,\"IP\",\"other\"",
+        ] {
+            assert!(checked_profile_definitions(response).is_err(), "{response}");
         }
     }
 

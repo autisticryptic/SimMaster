@@ -19,8 +19,12 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
     def test_profile_definition_is_checked_before_any_cgdcont_write(self):
         text = (SRC / "cellular_ims/pcscf.rs").read_text()
         prepare = text[text.index("pub async fn prepare_ims_profile_context("):text.index("fn select_ims_profile_context(")]
-        self.assertLess(prepare.index("select_ims_profile_context("), prepare.index('AT+CGDCONT='))
-        self.assertLess(prepare.index("ensure_profile_inactive("), prepare.index('AT+CGDCONT='))
+        write = prepare.index('"AT+CGDCONT={},')
+        self.assertLess(prepare.index("select_ims_profile_context("), write)
+        self.assertLess(prepare.index("supported_profile_cids("), write)
+        self.assertLess(prepare.index("ensure_profile_inactive("), write)
+        self.assertLess(prepare.index('"ims_profile_definition_changed"'), write)
+        self.assertIn('"ims_profile_definition_not_confirmed"', prepare)
         # The codes themselves live in the central `errors::code` table; the
         # call site must reference them rather than re-spelling the literal.
         self.assertIn("code::IMS_PREFERRED_PROFILE_OCCUPIED", text)
@@ -28,6 +32,15 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         errors = (SRC / "cellular_ims/errors.rs").read_text()
         self.assertIn('"cellular_ims_preferred_profile_occupied"', errors)
         self.assertIn('"cellular_ims_profile_definition_ambiguous"', errors)
+
+    def test_profile_creation_is_capability_bound_and_has_runtime_regressions(self):
+        text = (SRC / "cellular_ims/pcscf.rs").read_text()
+        selection = text[text.index("fn select_ims_profile_context("):text.index("fn ensure_profile_inactive(")]
+        self.assertIn("supported_cids.contains(cid)", selection)
+        self.assertIn("(2..=16).contains(cid)", selection)
+        self.assertIn("ims_profile_creation_checks_capability_activity_and_definitions_before_writing", text)
+        self.assertIn("ims_profile_creation_refuses_an_active_or_concurrently_filled_slot", text)
+        self.assertIn("ims_profile_creation_does_not_retry_or_delete_an_unconfirmed_write", text)
 
     def test_both_automatic_resolvers_use_the_same_home_boundary(self):
         text = (SRC / "vowifi/profile_store.rs").read_text()

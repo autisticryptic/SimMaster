@@ -80,7 +80,8 @@ SIM 作用域、backend、runtime 的 `phase/stage/last_error`、尝试记录及
 
 用户确认 **beta8** 与 **`simadmin-volte-main.zip` 构建的成品** 都能注册同一张 SIM-06 中国电信卡。
 这是两套成品，不混称为同一个实现；也不以本项目暂时失败推断该卡不支持 IMS。
-本项目设备仍离线，本节是代码/历史静态资料对照，**不是现场根因或修复验收**。
+本节形成时设备仍离线，是代码/历史静态资料对照，**不是现场根因或修复验收**；
+2026-09-27/28 上线后的新证据见第 9 节。
 
 - **P**：本项目已发布 `1.1.5 / 16998ae`，下列 P 行号固定于该源码。
 - **R**：上级目录源码 ZIP，SHA-256 为
@@ -179,3 +180,57 @@ MD5/null 测试 SA 一致的严格测试 profile，并验证认证请求完整�
 
 **代码/CI 已完成，但未实机验证，也未覆盖已发布 `v1.1.5 / 16998ae` 的资产。**
 如 SIM-06 实际停在承载或 P-CSCF 阶段，本修补并不能解释它的失败；仍先取得现场分层证据。
+
+## 9. SIM-06 现场与 CID 修复（2026-09-27/28）
+
+### 已实际核验的失败阶段
+
+用户在历史会话末尾确认设备上线，本次恢复后已通过现有 Cookie、SSH 固定公钥和应用登录。
+只读核验实际运行及安装文件 SHA-256 均为
+`afcc9ecbe4331dd3cfa31b392920bad1cf096fb0f10f35f864490804790d6588`，metadata 为
+`1.1.4-beta3 / 2129282`，不是发布的 `1.1.5 / 16998ae`。采样主进程 PID 454，未重启。
+`/api/modem/backend` 显示 `modemmanager`；唯一现存线路 `line-50ad…`，SIM operator `46011`。
+
+- 线路启用 IMS、普通数据开关关闭，配置地址族顺序为 `ipv4v6 → ipv6 → ipv4`。
+- 三个 profile 槽位（derived/catalog/database）实际均回落到 `derived_3gpp_lte_46011`。
+- 三次日志均先报 `cellular_ims_preferred_profile_occupied`，没有 `REPORTING_ENABLED`。
+  随后创建 APN-only 的 MM IMS bearer，请求双栈、实际仅授予 IPv6（有网关及两个 DNS）。
+- retained-MM P-CSCF 观察返回 `qca410_primary_mm_pcscf:context_pcscf_absent`；最终
+  `stage=pcscf`、`recovery_state=exhausted`、`retry_attempt=3`、`registered=false`。
+  08:55–08:59 UTC 三次尝试日志属于 PID 454，并与 API 时间和 bearer path 交叉核对；尚未进入 REGISTER。
+- 只读 AT 查询确认：CID 1=`IPV4V6/ctlte`（活动），CID 2=`IPV4V6/ctwap`（不活动），
+  **没有独立 `ims` 定义**。reporting 表 CID 1–16 均为 `0,0,0`。
+  2026-09-28 再查 `AT+CGDCONT=?` 明确报告 IP、IPV6、IPV4V6 均支持 CID 1–16。
+
+这说明当前代码在首选 CID 被其他 APN 占用时没有准备专用 IMS profile，也就跳过了该 profile
+的 reporting 启用。它是已证实的前置失败路径；**尚不能证明创建 profile 后一定下发 P-CSCF或注册成功**。
+不能把“未发现 P-CSCF”进一步推断为运营商在所有情况下都不下发，也不能据此调整 AKA/安全算法。
+
+### 修复与验证边界
+
+`8df57a9` 初版允许在首选 CID 被占用时选空闲 CID；其 Build `36325894646` 和 Validate
+`36325894682` 实际全绿。本次部署前进一步要求：
+
+1. 已有匹配 IMS 定义原样复用；没有时读取 `AT+CGDCONT=?`，按所请求 PDP 类型解析支持集合。
+2. 从支持集合选未定义 CID，保留首选优先，否则选最低空闲 CID；**从不新建 CID 1**，不覆盖
+   `ctlte/ctwap`、其他定义或空 APN 占位；全满、能力缺失/损坏均失败，不猜支持范围。
+3. 创建前确认不活动，重新读取完整定义行并对照快照；出现并发变化则不写。
+4. 只写一个新的 `CGDCONT` 定义，读回确认 CID/APN/PDP 类型。不发 `CGACT=1/0`、不改默认附着，
+   不执行普通数据激活；后续 bearer 仍由原 MM 路径管理，并在建立前开启对应 CID 的 reporting。
+5. 新定义保留供复用；写入未确认不自动重复或删除，不套用旧 prefetch 的覆盖/恢复逻辑。
+
+新增纯解析和异步假 IO 回归覆盖能力按族匹配、能力范围无效、保留 attach/占位定义、并发占用、
+活动 CID、原样复用、未确认写入及 AT 参数注入。Rust 编译与执行仍只在 Actions；补强版 CI 与
+设备验收须另列实际结果，不能用初版 CI 替代。
+
+### 部署授权及取证文件
+
+用户已授权提交 GitHub、部署新的 **1.1.5 构建**并做一次 SIM-06 注册验证。已发布 Release
+仍为 `v1.1.5 / 16998ae`，新候选使用独立 Actions 制品，不覆盖历史 tag 或 Release。
+切换前核验官方 artifact digest、包内 commit/版本/架构、无通话、管理路径和备份；不启停 MM、
+不写 NV/USB、不修改 Initial EPS，不恢复旧的测试窗口自动回滚策略。
+
+本地脱敏证据在 `.local/evidence/sim06/`：`connection-summary.json`、
+`runtime-readonly-20260927T123301Z.json`、`pcscf-readonly-20260927T123754Z.json`、
+`pdp-readonly-*.json`、`cid-fallback-initial-ci.json`、`cid-initial-artifacts.json`、`cid-initial-jobs.json`。
+本地采证辅助脚本只导出类型化元数据；raw journal、API 凭据、SIM 标识及网络地址不公开。
