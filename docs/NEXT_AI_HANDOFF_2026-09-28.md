@@ -1,9 +1,222 @@
 # 下一位 AI 接手说明与 Prompt 模板
 
-> 状态快照：2026-09-28 10:52 UTC（北京时间 18:52）。
-> 当前接手总入口仍是 [HANDOFF.md](HANDOFF.md)。本文专门说明本轮新增的 **MM SIM/CID 绑定校准**任务、未提交修改和下一步。
-> **以下为历史暂停时的快照。用户随后已要求继续实现，最新进展和 CI 以 [HANDOFF.md](HANDOFF.md) 为准。**
-> 当时尚未完成的内容和未提交列表保留作审查依据，不是当前工作树清单。
+> **最新续接：2026-09-28 12:38 UTC（北京时间 20:38）。请先读新增 §0。**
+> 总入口仍是 [HANDOFF.md](HANDOFF.md)。本文件同时保留上午的 MM 校准交接快照和下午新增的定时拨号/呼叫准入交接。
+> **用户现要求整理交接，让另一位 AI 继续；本次没有把在途语音代码提交或部署。**
+> §1–§9 是 10:52 UTC 的历史快照，其中“5 个未提交文件”和首版 CI 状态已过时；§0 的最新状态优先。
+
+## 0. 最新续接：定时拨号失败与可选非漫游呼叫准入
+
+### 0.1 三个版本必须分开
+
+| 范围 | 最新事实 |
+|---|---|
+| 已发布 Release | `v1.1.5 / 16998ae3c5172890075b2392ded3ce9c711d72b8`；没有覆盖或移动 tag |
+| 已验证但未部署的 MM 校准候选 | **`dc2355c095f08c075f4d6b334c3f5982a9cfc609`**，已经推送 GitHub，两套 Actions / 双架构成功 |
+| 最近实机采样 | **仍为 `1.1.5 / dd8ba1f`**，不是 `dc2355c`，也不含下面的语音在途修改 |
+
+本轮开始语音实现前的代码 HEAD 为 `f3164480c1ab8954cfba1cf30f9244212ecc6866`（仅补充校准验证文档）。
+本次交接若有后继 docs-only commit，**不意味着语音工作树代码已提交**。以 `git status` / `git diff` 为准。
+
+### 0.2 上午的 MM 校准任务已推进到哪里
+
+已保留原 5 文件补强，并完成旧任务 generation/未知库存/全部线路先失效、Create 前预期 SIM、
+绑定错误停止地址族循环、串行锁内 reporting 核验，以及未知 network receipt / Create intent 保留等补强。
+详见 [校准设计](IMS_MM_SIM_BINDING_CALIBRATION.md) 及 [HANDOFF](HANDOFF.md) 的校准候选段落。
+
+- Validate **`36416118351`** / Rust job `108907556481`：success。
+- Build **`36416117791`** / Rust job `108907860151` / ARM64 `108907860170` / AMD64 `108907860149`：success。
+- 两套日志实际核实 **14 项新增 Rust/mock/D-Bus 测试通过**；双架构包实际下载，核对 GitHub artifact digest、
+  包内 `1.1.5 / dc2355c`、ELF 架构、二进制与前端校验值。Publish Release 按 push 门禁 skipped。
+- 校准候选当时本地 **188 项 Python、定向 rustfmt、diff 检查通过**。
+- 原始证据：`.local/evidence/mm-cid-calibration/resume/dc2355c/verified.json` 及同目录日志。
+- **仍未完成**：候选覆盖部署、真实实体/eSIM/外部切换、自动重新附着故障注入验收。
+  不清一次性恢复预算，不自动切卡、打断健康会话或把 CI 当成实机验收。
+
+### 0.3 用户新增要求（以本节为准）
+
+1. 通过原 Cloudflare Tunnel 连接设备，修复“定时任务里的定时拨打电话立即报 failed”。
+2. 用户提供了拨号目标，已规范化为 E.164，**只保存在本地**：
+   `.local/evidence/automation-dial/requested-task.json`（公有文档仅记 `+86 …3423`）。不要把真实号码写入源码或提交 Git。
+3. 用户明确允许解除设备当前严格 VoWiFi-only，并希望准入为：
+   **已注册 VoWiFi，或明确已驻网且非漫游的蜂窝接入**；未知/漫游不能当成非漫游。
+4. 用户随后补充：**必须保留原开关，可手动关闭限制，强行允许漫游时接打电话**。
+   不能把“禁止漫游”写死，也不能把旧配置默默迁移成新条件模式。
+5. 语音新模式不顺带放宽短信限制。VoWiFi/非漫游实际资费仍取决于运营商，不能保证“必然当地资费”。
+6. 用户最新要求先完善本接手文档，让另一位 AI 继续。当前暂停功能实现，保持在途修改。
+
+**授权边界：** 已允许连接诊断和调整语音限制，不等于已批准任意次数真实呼叫。
+目前没有明确的任务执行时间/周期、持续秒数，也没有主动测试电话的明确授权；不要自行创建会立即触发的 interval 任务。
+已有 no-backup 部署规则继续有效，但本轮没有部署；部署/重启主服务仍须确认当次维护影响。
+
+### 0.4 实际设备证据，不猜历史失败原因
+
+2026-09-28 **11:51–11:56 UTC** 使用固定 SSH 公钥 pin 经 Cloudflare WebSocket/SSH 成功连接，登录既有应用账户。
+没有重置密码、改设备配置、创建任务、拨号、发送短信、切卡、重启主服务/MM 或部署。
+只执行诊断脚本及 GET API；需注意旧的 calls GET 实现可能清理已结束的 MM call 对象，不应宣传为绝对零副作用接口。
+
+- 主进程 PID `511308`，运行中 `/proc/511308/exe` SHA-256：
+  `3ae12007b981bbeb0efca220365b8701f391ab16009346fa7ad457f072900e4d`，匹配 **dd8ba1f ARM64**。
+  MM PID `410`，secondary PID `283`；采样期间稳定。
+- 同物理线路 IMS：`registered / ipsec`、`derived_3gpp_lte_46011`；续期计数 **4**，最近一次 `11:14:31 UTC`。
+- calls API：**空列表**。Voice service 为 `unknown / ims_voice_service_route_missing`；IMS 已注册不等于语音能力实机已通过。
+- 配置：`vowifi.enabled=false`；`trunk.enabled=false` 但 **`trunk.vowifi_only=true`**；
+  语音层 VoWiFi/Cellular IMS 均启用，data disabled、airplane disabled。
+- **automation.enabled=true，但 tasks=[]；dial_call 日志 API 为空。**
+  journal 只找到 `09:32:42 UTC` 的 `Triggering automation task: call (...)`，没有完整失败因果链。
+  不能证明任务由谁删除，也不能说历史那一次已精确复现。
+
+本地证据：
+- `.local/evidence/automation-dial/connection.log`
+- `.local/evidence/automation-dial/readonly.json`、`readonly-console.log`
+- 新的诊断入口 `.local/active/ims/inspect_automation_dial.py`（仅本地、不随 Git）
+- 原连接入口 `.local/active/ims/connect_readonly.py`；凭据 bundle 和公钥路径仍由它引用，不复制凭据。
+- 设备无 `python3`；诊断在本地 WSL Python 环境运行，通过 SSH 下发已审阅命令/localhost curl。
+
+### 0.5 已确认的代码问题及一次重要更正
+
+**确定缺陷：**
+- `automation/tasks/dial_call.rs` 用 anyhow context 包住底层拨号/挂机错误，`scheduler.rs` 却用 `{}` 格式化，
+  导致数据库和通知只剩“执行失败: 定时拨号失败”，丢失 `voice_vowifi_only_required` 等真正原因。
+- `AutomationCenter.tsx` 的 `updateConfig` 吞掉保存错误，外层仍提示添加/编辑/删除成功，Dialog 会关闭。
+  同一函数还会把 scheduler 的全局 enabled 强制设为 true。
+- 自动化 target 的保存校验接受前后空白，执行查表不 trim，而普通电话入口会 trim，造成不一致。
+
+**先前口述已更正：** 一度将“关闭 Trunk 后仍限制本地拨号”称为路由 bug。随后完整核对
+[IMS 注册与资费保护](IMS_REGISTRATION_POLICY.md)，确认这是此前刻意覆盖 API/自动化的资费门禁，不能未经授权删除。
+用户现在明确批准新增条件模式并保留原开关，因此应实现兼容的新选项，而不是直接绕过原门禁或改默认值。
+当前配置能解释为什么普通/定时拨号会被阻断，但历史失败日志缺失，**不是根因已实机复现的证据**。
+
+### 0.6 当前在途设计及代码位置（未提交、未验收）
+
+拟兼容字段：`TrunkProfileConfig.allow_home_cellular_calls`，serde 默认 false。
+
+| 原 `vowifi_only` | 新选项 | 期望语音行为 |
+|---|---|---|
+| false | 任意 | 保留原无限制模式；可手动允许漫游接打电话，仍遵守线路/无线/语音启用等既有约束 |
+| true | false/缺失 | 保留严格仅 VoWiFi，不因为升级放开蜂窝 |
+| true | true | VoWiFi 或经新鲜证据确认非漫游的蜂窝；未知失败关闭 |
+
+短信继续只读原 `vowifi_only` 等短信策略，不因新语音选项改变。字段所在 Trunk 配置仍涵盖现有网关/API/自动化入口。
+
+**这批修改还没有提交，不能直接部署：**
+
+| 文件 | 在途内容 |
+|---|---|
+| `.github/workflows/{beta-validation,build-release}.yml` | 加入 automation scheduler/target/dial_call Rust 测试过滤器 |
+| `.github/scripts/test_automation_dial_boundary.py`（新文件） | 接线/门禁静态守卫，目前有一项需适配新 helper |
+| `backend/src/services/automation/scheduler.rs` | `task_outcome` 为 dial 保留错误链、屏蔽目标号码、长度/控制字符限制，修正 timeout 秒数，明确失败日志；新增测试 |
+| `backend/src/services/automation/target.rs` | `canonical_line_id` 及空白规范化测试 |
+| `backend/src/api/handlers.rs` | `cellular_call_cost_rule`、`same_voice_binding`、`admit_cellular_call_cost`；初始/当前策略、绑定与 generation 校验；拨号/接听走 checked adapter；保留 IMS + modem 错误 |
+| `backend/src/hardware/cellular/{control,modem_manager}.rs` | `make_call_on_modem_checked` / `answer_call_on_modem_checked`；等待串行锁后、ATD/ATA/MM Start/Accept 前重查调用方授权；旧函数兼容 wrapper |
+| `backend/src/hardware/cellular/observations.rs` | 新 `registered_home_voice` 只读 hook，默认 unsupported，不猜 native 能力 |
+| `backend/src/hardware/cellular/mm_observations.rs` | unique owner、无缓存 GetAll、两次 SIM/ICCID/端口/slot/驻网观测；MM slot 0/缺失归一 1，home SMS-only 不准入 |
+| `backend/src/platform/config.rs` | 新字段默认 false；尚需补序列化/配置/API 回归 |
+| `backend/src/services/line_registry.rs` | binding 改为 Arc；注入弱耦合只读 home observer，观测前后比较绑定/generation；同步两个语音限制字段 |
+| `backend/src/services/trunk/access_router.rs` | `VoiceCostGate`；初始/当前策略交集；`CostCheckedAction` + JoinSet 异步准入，避免阻塞主路由而吞掉 Cancel/Hangup；按 ticket 拒绝过期结果；新增 5 个 home/cancel 测试 |
+| `backend/src/services/trunk/operator.rs` | `incoming_auto_answer_allowed`，条件模式不能未经 home 检查先自动发 200 |
+| `frontend/src/api/contracts.ts` | 新 optional 字段，兼容旧 API |
+| `frontend/src/pages/sim/TrunkProfileDialog.tsx` | 保留原开关，新增允许非漫游蜂窝语音的子开关和资费说明 |
+| `frontend/src/pages/AutomationCenter.tsx` | 保存失败向 Dialog 传播；成功后才更新状态/关闭删除框；不强行开启全局 scheduler |
+| `frontend/src/utils/automationConfig.ts`（新文件） | 可测试的持久化响应检查 |
+| `frontend/tests/automationConfig.test.ts`（新文件）、`frontend/package.json` | 3 项保存/错误传播单元测试接入 unit 脚本 |
+
+共 **17 个 tracked 功能文件修改 + 3 个新功能文件**，另有本次交接文档修改。以实际 Git 为准。
+`.local/active/ims/inspect_automation_dial.py` 和证据目录受 ignore 保护；普通远端 clone 不包含这些材料。
+
+### 0.7 停止时的真实验证结果
+
+| 检查 | 最新事实 |
+|---|---|
+| Python 全量 | **192 项，1 failure**（不是全部通过） |
+| 失败测试 | `test_call_cost_and_radio_guards_are_not_removed_for_automation`：它只截取 start helper，期待内联 `voice_vowifi_only_required`；现在该错误在 `cellular_call_cost_rule` 中，测试要验证 helper 接线，不能删除门禁断言敷衍通过 |
+| 前端 unit | **11/11 通过**，含 3 项新增保存反馈测试 |
+| 前端 type-check | `tsc -b --noEmit` 通过 |
+| 前端 lint | 全量 ESLint 通过；早期 7 条 unit 测试 lint 错误已修正并重跑 |
+| Rust 定向格式 | `rustfmt --check` **exit 1**，有格式 diff，未观察到语法解析报错；不等于编译通过 |
+| Rust 编译 / 单元 / D-Bus | **这批语音修改未执行**，仍必须在 Actions；禁止本地 cargo 编译测试 |
+| `git diff --check` | 通过 |
+| GitHub / 部署 | 语音工作树未提交、未推送、未部署、未真实拨号，设备目标号码和资费配置也尚未改动 |
+
+最新日志在 `.local/evidence/automation-dial/`：
+`handoff-python.log`、`handoff-frontend-unit.log`、`handoff-type-check.log`、`handoff-lint.log`、`handoff-rustfmt.log`。
+早先该目录 `python.log` 的 192 全通过只覆盖新增条件准入之前的中间版本，不得覆盖以上较新失败结果。
+
+### 0.8 下一位 AI 必须优先审查，不要直接提交大块在途代码
+
+1. **编译与接口完整性**：新增 async closure / JoinSet 推断、Send/lifetime、zbus Value/ObjectPath 转换、
+   `TrunkProfileConfig` 构造点/JSON 默认/前端 roundtrip 均需确认；当前只有 rustfmt 解析及前端检查，未有 Rust 编译事实。
+2. **异步取消边界**：最初 `run_router` 在主 select 分支 await home 查询会让取消晚于拨号。
+   已改为 pending action + JoinSet/ticket，但尚未测试。复核 pending 同 call_id 重复请求、终止/取消/事件交错、
+   API receiver 关闭、任务 panic、路由删除、历史初始策略是否丢失及队列上限。已添加 5 项 Rust 测试但均未运行。
+3. **新鲜证据和重绑**：observer 核对 old/new binding/generation，checked CS helper 固定 expected binding；
+   仍需 fake-D-Bus 证明 unknown/roaming、owner/SIM/slot/端口变化、串行锁等待后换代不会放行。
+   特别复核两个采样结束后至真正拨号的间隙，不把一次 bool 当永久许可。
+4. **注册 VoWiFi 应可用**：当前 home 条件模式可能也为本来只需 VoWiFi 的请求执行最多约 800ms 的 home 查询；
+   查询失败应只剔除蜂窝、不影响已注册 VoWiFi，不能因慢观测让健康 VoWiFi 失效。
+5. **入向与自动接听**：用户要求保留漫游接打的手动开关。当前条件模式让蜂窝来电进入 router 后检查，
+   在核验前抑制底层 auto-answer，再对 `AcceptCall` 重新检查。需确认 `BoundImmediate`、API answer 的反馈、
+   旧已接通通话控制、已发送 200 的竞争；不能既拒绝网络又把 UI 标成“已接通”。
+6. **呼叫生命周期**：原自动化“start accepted + sleep + hangup”并不证明接通；异步 IMS 拒绝也可能最终显示 success。
+   scheduler timeout 取消时是否确实挂断自有那通电话、不能误挂别人的呼叫，仍是待审范围，未声称修好。
+7. **原 modem 路径缺陷尚未改**：MM Voice `ListCalls` 清理失败会在 ATD 前返回；ATD 发出但观测不到通话后又走 MM
+   fallback 可能造成歧义重拨。无现场错误不要盲目忽略 busy/cleanup 异常或自动重拨；如要修，必须补 mock 和取消测试。
+8. **诊断隐私**：新 dial 错误链目前只屏蔽本任务目标号码、限制长度/控制字符，不保证可公开原始 provider 错误。
+   审查日志/通知是否可能带 URL、认证或其他身份，不将未经脱敏的现场日志提交。
+9. **配置/UI 错误反馈**：AutomationCenter 保存路径已补强；TrunkProfileDialog 的保存仍需核对 API 在 error envelope
+   时是否会抛出，避免条件开关未保存却关闭 Dialog。前端中文错误映射对 `voice_registered_home_required` 等尚未补。
+10. **严格保护兼容**：保持现有 VoWiFi-only Rust 测试，不把它们改成“允许蜂窝”来掩盖回归。
+    新字段缺失等价旧严格行为；关闭原开关才是用户主动允许漫游。短信限制、P-CSCF/IMS 兜底、native 后端边界均不放宽。
+
+### 0.9 推荐执行顺序与未完成任务
+
+- [x] 原校准补强提交 `dc2355c`，两套 CI、14 项新增测试和双架构制品核验。
+- [x] 本次经 Tunnel 连接并核实版本、健康 IMS、空任务列表和语音限制配置。
+- [ ] 审查并完成上表未提交语音代码；处理 Python 静态守卫失败，定向 rustfmt，再跑完整本地允许检查。
+- [ ] 补齐新资费开关兼容、MM fresh-home fake-D-Bus、取消/回退/接听/mock 以及用户可见错误测试。
+- [ ] 显式选择要提交的功能文件，推送 `simmaster`，核验**最新完整 SHA** 的两套 CI、测试明细和双架构制品；不覆盖旧 Release。
+- [ ] 确认维护影响后部署验证候选；包含校准补丁但不能将其部署称为切卡验收。直接覆盖、不建备份，保留配置/数据库。
+- [ ] 重新只读确认目标线路/home 状态，按用户授权设置新条件模式，保留原无限制开关；当前设备配置尚未改。
+- [ ] 用户确认周期/时间、持续秒数后配置目标号码；设备任务为空，不凭空恢复旧时间表。真实测试通话需确认次数/时长。
+- [ ] 原 MM 换卡和自动重新附着故障注入依旧单独待验收。
+
+本地 shell 是 WSL，文件工具是 Windows 路径；无 `node` 但有 **`node.exe` v24.14.1**，前端命令可用：
+
+```sh
+cd frontend
+node.exe --experimental-strip-types --test tests/imsRegistrationPolicy.test.ts tests/cellularImsErrorFormat.test.ts tests/automationConfig.test.ts
+node.exe node_modules/typescript/bin/tsc -b --noEmit
+node.exe node_modules/eslint/bin/eslint.js . --max-warnings 0
+```
+
+Git 仅推 `simmaster`。WSL 直接用 `.git/codex_push_key` 会因 Windows 文件权限映射 0666 被 SSH 拒绝；
+本轮已验证 Windows **`git.exe`** 配合既有 `core.sshCommand` / 固定主机校验可推送。
+不要复制私钥到公共目录、修改 key 为开放权限、force-push 或重置/丢弃在途工作树。
+
+### 0.10 最新可复制 Prompt（替代历史 §9）
+
+```text
+请接手当前 SimAdmin，先完整读 docs/HANDOFF.md、docs/NEXT_AI_HANDOFF_2026-09-28.md 的最新 §0、
+docs/IMS_MM_SIM_BINDING_CALIBRATION.md、docs/IMS_REGISTRATION_POLICY.md，然后核对实际 Git/diff。
+
+当前任务：定时拨号失败诊断与“VoWiFi 或已驻网非漫游蜂窝”的可选语音准入。
+用户要求保留原限制开关，关闭时仍可强制允许漫游接打电话；旧严格模式不改默认，短信保护不变。
+目标号码在 .local/evidence/automation-dial/requested-task.json，不写入公有文档/源码。
+任务API当前为空，未确认周期/持续秒数，不能自行创建立即触发任务或主动拨打测试电话。
+
+版本：Release仍16998ae；校准候选dc2355c已通过两套CI、14新增测试和双架构核验但未部署。
+设备最近11:51–11:56 UTC采样仍dd8ba1f，IPsec注册、4次续期、暂无通话；严格vowifi_only=true且VoWiFi关闭。
+历史只有call任务触发记录，没有失败链，不要把配置推断写成已复现根因。
+当前语音代码有17 tracked+3新文件未提交；不要只checkout远端，不能部署此工作树。
+最新本地192 Python有1静态守卫failure；前端11 unit/type-check/lint通过；rustfmt --check有格式diff；
+Rust编译测试尚未运行，必须只在Actions。
+
+请先审查§0.8风险，尤其pending准入/取消/回退/接听和当前SIM/owner绑定；补回归与中文错误反馈，
+修静态守卫接线而非删门禁。完成本地允许检查后提交simmaster，核对最新完整SHA的Actions测试明细/双架构。
+保留原IPv4v6→IPv6→IPv4、P-CSCF归属和恢复预算，不扩大native、切卡、故障注入或自动重拨范围。
+部署须确认维护影响，直接覆盖不建备份但保留数据；配置号码/执行任务前确认时间、持续秒数和测试授权。
+请先报告核实后的完成/未完成和下一步，再继续。
+```
 
 ## 1. 先看这三个结论
 

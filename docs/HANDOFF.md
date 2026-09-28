@@ -3,7 +3,29 @@
 > 更新：2026-09-28。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 最新开发进展：2026-09-28 11:41 UTC
+## 最新开发交接：2026-09-28 12:38 UTC
+
+**用户要求先整理交接，由另一位 AI 继续。请优先完整阅读
+[NEXT_AI_HANDOFF_2026-09-28.md §0](NEXT_AI_HANDOFF_2026-09-28.md#0-最新续接定时拨号失败与可选非漫游呼叫准入)。**
+该节取代同文件上午 §1–§9 的过期状态，包含最新需求、代码清单、失败检查与可复制 Prompt。
+
+- **新增优先任务**：定时拨号立即 failed 的诊断，以及可选“已注册 VoWiFi / 明确已驻网非漫游蜂窝”语音准入。
+  用户要求保留原限制开关，关闭后仍能主动允许漫游接打电话。旧严格模式默认不变，短信保护不变。
+- **当前在途代码未提交、未推送、未部署**：17 个 tracked 功能文件修改 + 3 个新功能文件；不要丢弃，
+  不要将本次 docs-only 提交误认作包含这些语音修改。新增 `allow_home_cellular_calls`、异步 pending 准入、
+  checked modem 拨号/接听、错误链报告和保存反馈均还需要审查/回归。
+- 最新检查：**192 Python 有 1 failure**（静态守卫仍按旧内联门禁位置检索）；前端 **11 unit / type-check / lint 通过**；
+  Rust 定向格式检查有 diff；这批语音 Rust **未编译测试，仍只能在 Actions**。证据 `.local/evidence/automation-dial/handoff-*`。
+- **11:51–11:56 UTC 实机采样**：经固定 SSH 公钥的 Cloudflare Tunnel 连接成功，设备仍运行 `dd8ba1f`，
+  `/proc/511308/exe` 哈希与已验证 ARM64 一致；IMS IPsec 已注册、续期计数 4、最近续期 11:14:31 UTC，calls 列表为空。
+  没有部署、改资费配置、创建任务、主动拨号、发短信或切卡。
+- 设备 **automation.tasks=[]、dial_call 日志为空**，只找到 09:32:42 UTC 历史 call 触发记录。
+  `trunk.enabled=false / trunk.vowifi_only=true / vowifi.enabled=false` 是当前阻断条件，不是历史根因已复现的证明。
+  该限制以前是刻意的资费保护，不应直接删除；用户新授权通过可选模式实现。
+- 目标号码仅在 `.local/evidence/automation-dial/requested-task.json`，不提交原始号码；**任务周期、持续秒数及主动测试通话授权待确认**。
+- 下面 `dc2355c` 校准候选的 CI/制品证明依旧有效，但候选没有部署；真实换卡与自动重新附着故障注入仍独立待验收。
+
+## 上一阶段已验证进展：2026-09-28 11:41 UTC
 
 本轮已按用户要求恢复实现；历史交接快照保留在
 [接手说明与可复制 Prompt](NEXT_AI_HANDOFF_2026-09-28.md)，以下记录优先于该快照。
