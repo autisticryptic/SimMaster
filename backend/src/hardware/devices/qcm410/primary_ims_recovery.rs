@@ -272,10 +272,16 @@ impl RecoveryPlan {
     /// Caller holds all lifecycle gates in a shielded task and rechecks its
     /// live policy (calls, data intent, generation, enabled flags) between steps.
     /// A consumed budget is intentionally never erased, including on failure.
-    pub async fn execute<Allowed, AllowedFuture>(&self, allowed: Allowed) -> Result<(), String>
+    pub async fn execute<Allowed, AllowedFuture, Restore, RestoreFuture>(
+        &self,
+        allowed: Allowed,
+        restore_radio: Restore,
+    ) -> Result<(), String>
     where
         Allowed: Fn() -> AllowedFuture,
         AllowedFuture: Future<Output = bool>,
+        Restore: Fn() -> RestoreFuture,
+        RestoreFuture: Future<Output = bool>,
     {
         self.released_and_unchanged().await?;
         if !allowed().await {
@@ -284,6 +290,19 @@ impl RecoveryPlan {
         if reporting_flags(&command(&self.bus, "AT$QCPDPIMSCFGE?").await?, self.cid)? != [0, 0, 0] {
             return Err("mm_pcscf_reporting_changed".into());
         }
+        // Never turn on a modem that was already disabled by another actor.
+        let state: i32 = timed(5, async {
+            self.bus
+                .proxy(&self.bus.modem, MODEM)
+                .await?
+                .get_property("State")
+                .await
+                .map_err(|_| "mm_pcscf_state_unavailable".to_string())
+        })
+        .await?;
+        if !matches!(state, 6 | 7 | 8 | 10 | 11) {
+            return Err("mm_pcscf_radio_not_enabled".into());
+        }
         ensure_directory(Path::new(BUDGET_DIR))?;
         claim_budget(&budget_path(
             &self.bus.bus_id,
@@ -291,61 +310,117 @@ impl RecoveryPlan {
             &self.bus.device,
             &self.sim_id,
         ))?;
-        run_cycle_with(|step| {
-            let allowed = &allowed;
-            async move {
-                if !allowed().await {
-                    return Err("mm_pcscf_recovery_cancelled".into());
-                }
-                self.identity_is_current().await?;
-                match step {
-                    Step::Arm => {
-                        self.released_and_unchanged().await?;
-                        command(&self.bus, &format!("AT$QCPDPIMSCFGE={},1,1,1", self.cid)).await?;
-                        if reporting_flags(
-                            &command(&self.bus, "AT$QCPDPIMSCFGE?").await?,
-                            self.cid,
-                        )? != [1, 1, 1]
-                        {
-                            return Err("mm_pcscf_reporting_not_confirmed".into());
+        run_cycle_with(
+            |step| {
+                let allowed = &allowed;
+                let restore_radio = &restore_radio;
+                async move {
+                    self.identity_is_current().await?;
+                    // The final Enable is compensation for our own Disable. An IMS
+                    // generation/data/call change stops work, not radio restoration.
+                    // Explicit airplane mode, a replacement owner or SIM still wins.
+                    let permitted = if step == Step::Enable {
+                        restore_radio().await
+                    } else {
+                        allowed().await
+                    };
+                    if !permitted {
+                        return Err("mm_pcscf_recovery_cancelled".into());
+                    }
+                    match step {
+                        Step::Arm => {
+                            self.released_and_unchanged().await?;
+                            command(&self.bus, &format!("AT$QCPDPIMSCFGE={},1,1,1", self.cid))
+                                .await?;
+                            if reporting_flags(
+                                &command(&self.bus, "AT$QCPDPIMSCFGE?").await?,
+                                self.cid,
+                            )? != [1, 1, 1]
+                            {
+                                return Err("mm_pcscf_reporting_not_confirmed".into());
+                            }
+                        }
+                        Step::Disable | Step::Enable => {
+                            if step == Step::Disable {
+                                self.released_and_unchanged().await?;
+                                // Recheck MM itself after inspection and the firmware
+                                // cleanup grace period, not only the app call cache.
+                                let calls: Vec<OwnedObjectPath> = timed(5, async {
+                                    self.bus
+                                        .proxy(
+                                            &self.bus.modem,
+                                            "org.freedesktop.ModemManager1.Modem.Voice",
+                                        )
+                                        .await?
+                                        .call("ListCalls", &())
+                                        .await
+                                        .map_err(|_| "mm_pcscf_calls_unavailable".to_string())
+                                })
+                                .await?;
+                                if !calls.is_empty() {
+                                    return Err("mm_pcscf_calls_active".into());
+                                }
+                                self.identity_is_current().await?;
+                                if !allowed().await {
+                                    return Err("mm_pcscf_recovery_cancelled".into());
+                                }
+                            }
+                            timed(60, async {
+                                self.bus
+                                    .proxy(&self.bus.modem, MODEM)
+                                    .await?
+                                    .call::<_, _, ()>("Enable", &(step == Step::Enable,))
+                                    .await
+                                    .map_err(|_| "mm_pcscf_enable_failed".to_string())
+                            })
+                            .await?;
+                        }
+                        Step::Low => {
+                            wait_for_state(
+                                &self.bus,
+                                |state| state == 3,
+                                Duration::from_secs(50),
+                                || async {
+                                    allowed().await && self.identity_is_current().await.is_ok()
+                                },
+                            )
+                            .await?;
+                            self.identity_is_current().await?;
+                            if !allowed().await {
+                                return Err("mm_pcscf_recovery_cancelled".into());
+                            }
+                            timed(15, async {
+                                self.bus
+                                    .proxy(&self.bus.modem, MODEM)
+                                    .await?
+                                    .call::<_, _, ()>("SetPowerState", &(2_u32,))
+                                    .await
+                                    .map_err(|_| "mm_pcscf_low_power_failed".to_string())
+                            })
+                            .await?;
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
+                        Step::WaitRegistered => {
+                            // MM REGISTERED is 8, not 9 (DISCONNECTING). Do not require
+                            // an application bearer before starting the IMS attempt.
+                            wait_for_state(
+                                &self.bus,
+                                registered_state,
+                                Duration::from_secs(180),
+                                || async {
+                                    allowed().await && self.identity_is_current().await.is_ok()
+                                },
+                            )
+                            .await?;
+                            self.released_and_unchanged().await?;
                         }
                     }
-                    Step::Disable | Step::Enable => {
-                        timed(60, async {
-                            self.bus
-                                .proxy(&self.bus.modem, MODEM)
-                                .await?
-                                .call::<_, _, ()>("Enable", &(step == Step::Enable,))
-                                .await
-                                .map_err(|_| "mm_pcscf_enable_failed".to_string())
-                        })
-                        .await?;
-                    }
-                    Step::Low => {
-                        wait_for_state(&self.bus, |state| state == 3, Duration::from_secs(50))
-                            .await?;
-                        timed(15, async {
-                            self.bus
-                                .proxy(&self.bus.modem, MODEM)
-                                .await?
-                                .call::<_, _, ()>("SetPowerState", &(2_u32,))
-                                .await
-                                .map_err(|_| "mm_pcscf_low_power_failed".to_string())
-                        })
-                        .await?;
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                    }
-                    Step::WaitRegistered => {
-                        // MM REGISTERED is 8, not 9 (DISCONNECTING). Do not require
-                        // an application bearer before starting the IMS attempt.
-                        wait_for_state(&self.bus, registered_state, Duration::from_secs(180))
-                            .await?;
-                        self.released_and_unchanged().await?;
-                    }
+                    self.identity_is_current().await
                 }
-                self.identity_is_current().await
-            }
-        })
+            },
+            &allowed,
+            &restore_radio,
+        )
         .await
     }
 }
@@ -354,24 +429,53 @@ fn registered_state(state: i32) -> bool {
     matches!(state, 8 | 10 | 11)
 }
 
-async fn wait_for_state(
+async fn wait_for_state<Allowed, AllowedFuture>(
     bus: &MmBus,
     ready: impl Fn(i32) -> bool,
     budget: Duration,
-) -> Result<(), String> {
-    let deadline = Instant::now() + budget;
-    loop {
+    allowed: Allowed,
+) -> Result<(), String>
+where
+    Allowed: Fn() -> AllowedFuture,
+    AllowedFuture: Future<Output = bool>,
+{
+    wait_for_state_with(ready, budget, allowed, || async {
         if !bus.owner_is_current().await? {
             return Err("mm_pcscf_owner_changed".into());
         }
-        let state: i32 = timed(5, async {
+        timed(5, async {
             bus.proxy(&bus.modem, MODEM)
                 .await?
                 .get_property("State")
                 .await
                 .map_err(|_| "mm_pcscf_state_unavailable".to_string())
         })
-        .await?;
+        .await
+    })
+    .await
+}
+
+async fn wait_for_state_with<Allowed, AllowedFuture, Read, ReadFuture>(
+    ready: impl Fn(i32) -> bool,
+    budget: Duration,
+    allowed: Allowed,
+    read: Read,
+) -> Result<(), String>
+where
+    Allowed: Fn() -> AllowedFuture,
+    AllowedFuture: Future<Output = bool>,
+    Read: Fn() -> ReadFuture,
+    ReadFuture: Future<Output = Result<i32, String>>,
+{
+    let deadline = Instant::now() + budget;
+    loop {
+        if !allowed().await {
+            return Err("mm_pcscf_recovery_cancelled".into());
+        }
+        let state = read().await?;
+        if !allowed().await {
+            return Err("mm_pcscf_recovery_cancelled".into());
+        }
         if ready(state) {
             return Ok(());
         }
@@ -391,21 +495,45 @@ enum Step {
     WaitRegistered,
 }
 
-async fn run_cycle_with<Run, Fut>(mut run: Run) -> Result<(), String>
+async fn run_cycle_with<Run, Fut, Allowed, AllowedFuture, Restore, RestoreFuture>(
+    mut run: Run,
+    allowed: Allowed,
+    restore_radio: Restore,
+) -> Result<(), String>
 where
     Run: FnMut(Step) -> Fut,
     Fut: Future<Output = Result<(), String>>,
+    Allowed: Fn() -> AllowedFuture,
+    AllowedFuture: Future<Output = bool>,
+    Restore: Fn() -> RestoreFuture,
+    RestoreFuture: Future<Output = bool>,
 {
+    let cancelled = || Err("mm_pcscf_recovery_cancelled".to_string());
+    if !allowed().await {
+        return cancelled();
+    }
     run(Step::Arm).await?;
-    // Disabling may succeed even if its acknowledgement is lost. On any
-    // pre-enable failure attempt Enable once, subject to the same owner/policy.
+    // No Disable dispatched yet: cancellation needs no radio compensation.
+    if !allowed().await {
+        return cancelled();
+    }
+    // Disabling may succeed even if its acknowledgement is lost. Once sent,
+    // restore once under radio intent, independently of ordinary IMS cancellation.
     let down = match run(Step::Disable).await {
-        Ok(()) => run(Step::Low).await,
+        Ok(()) if allowed().await => run(Step::Low).await,
+        Ok(()) => cancelled(),
         Err(error) => Err(error),
     };
-    let enabled = run(Step::Enable).await;
+    let enabled = if restore_radio().await {
+        run(Step::Enable).await
+    } else {
+        cancelled()
+    };
     down?;
     enabled?;
+    if !allowed().await {
+        return cancelled();
+    }
     run(Step::WaitRegistered).await
 }
 
@@ -472,10 +600,14 @@ mod tests {
     #[tokio::test]
     async fn one_cycle_arms_before_detach_and_never_repeats_a_radio_step() {
         let mut steps = Vec::new();
-        run_cycle_with(|step| {
-            steps.push(step);
-            ready(Ok(()))
-        })
+        run_cycle_with(
+            |step| {
+                steps.push(step);
+                ready(Ok(()))
+            },
+            || ready(true),
+            || ready(true),
+        )
         .await
         .unwrap();
         assert_eq!(
@@ -500,14 +632,18 @@ mod tests {
             Step::WaitRegistered,
         ] {
             let mut steps = Vec::new();
-            let result = run_cycle_with(|step| {
-                steps.push(step);
-                ready(if step == fail {
-                    Err("failed".into())
-                } else {
-                    Ok(())
-                })
-            })
+            let result = run_cycle_with(
+                |step| {
+                    steps.push(step);
+                    ready(if step == fail {
+                        Err("failed".into())
+                    } else {
+                        Ok(())
+                    })
+                },
+                || ready(true),
+                || ready(true),
+            )
             .await;
             assert!(result.is_err());
             assert!(steps.iter().filter(|step| **step == Step::Disable).count() <= 1);
@@ -520,6 +656,121 @@ mod tests {
                 assert_eq!(steps, vec![Step::Arm]);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_disable_restores_radio_but_does_not_continue() {
+        use std::cell::Cell;
+        for cancel_at in [Step::Arm, Step::Disable, Step::Low] {
+            let permitted = Cell::new(true);
+            let mut sent = Vec::new();
+            let result = run_cycle_with(
+                |step| {
+                    sent.push(step);
+                    if step == cancel_at {
+                        permitted.set(false);
+                    }
+                    ready(Ok(()))
+                },
+                || ready(permitted.get()),
+                || ready(true),
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(
+                sent.iter().filter(|step| **step == Step::Enable).count(),
+                usize::from(cancel_at != Step::Arm)
+            );
+            assert!(!sent.contains(&Step::WaitRegistered));
+            if cancel_at == Step::Disable {
+                assert!(!sent.contains(&Step::Low));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_radio_off_or_replacement_blocks_compensating_enable() {
+        use std::cell::Cell;
+        let radio_allowed = Cell::new(true);
+        let mut sent = Vec::new();
+        let result = run_cycle_with(
+            |step| {
+                sent.push(step);
+                if step == Step::Disable {
+                    radio_allowed.set(false);
+                }
+                ready(Ok(()))
+            },
+            || ready(radio_allowed.get()),
+            || ready(radio_allowed.get()),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(sent, vec![Step::Arm, Step::Disable]);
+    }
+
+    #[tokio::test]
+    async fn state_wait_checks_cancellation_before_and_after_io() {
+        use std::cell::Cell;
+        let reads = Cell::new(0);
+        let result = wait_for_state_with(
+            registered_state,
+            Duration::from_secs(180),
+            || ready(false),
+            || {
+                reads.set(reads.get() + 1);
+                ready(Ok(8))
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "mm_pcscf_recovery_cancelled");
+        assert_eq!(reads.get(), 0);
+        let current = Cell::new(true);
+        let result = wait_for_state_with(
+            registered_state,
+            Duration::from_secs(180),
+            || ready(current.get()),
+            || {
+                current.set(false);
+                ready(Ok(8))
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "mm_pcscf_recovery_cancelled");
+    }
+
+    #[tokio::test]
+    async fn state_wait_accepts_registered_and_bounds_unregistered_or_failed_io() {
+        assert!(wait_for_state_with(
+            registered_state,
+            Duration::ZERO,
+            || ready(true),
+            || ready(Ok(8))
+        )
+        .await
+        .is_ok());
+        assert_eq!(
+            wait_for_state_with(
+                registered_state,
+                Duration::ZERO,
+                || ready(true),
+                || ready(Ok(7))
+            )
+            .await
+            .unwrap_err(),
+            "mm_pcscf_registration_wait_expired"
+        );
+        assert_eq!(
+            wait_for_state_with(
+                registered_state,
+                Duration::ZERO,
+                || ready(true),
+                || ready(Err("read_failed".into()))
+            )
+            .await
+            .unwrap_err(),
+            "read_failed"
+        );
     }
 
     #[test]

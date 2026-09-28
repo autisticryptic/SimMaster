@@ -10664,6 +10664,35 @@ async fn mm_pcscf_recovery_policy_current(
         && !line_has_call_blocking_ims_switch(app, &binding.line_id).await
 }
 
+// Compensation is not another IMS attempt. Only explicit radio-off or a
+// different owner/endpoint/SIM may veto restoring the radio we disabled.
+// The driver independently verifies its retained unique owner and SIM.
+fn mm_pcscf_radio_restore_policy_current(
+    app: &AppState,
+    line: &crate::services::line_registry::LineRuntime,
+    modem: &str,
+) -> bool {
+    let binding = line.binding();
+    let profile = app.config_manager.get_line_profile(&binding.line_id);
+    binding.present && binding.modem_path == modem && !binding.slot_conflict
+        && !profile.airplane_mode_enabled
+        && app.config_manager.get_cellular_backend().mode == crate::hardware::cellular::backends::config::BackendMode::Modemmanager
+        && crate::hardware::cellular::backends::active_native().is_none()
+        && app.line_registry.device_kind() == crate::hardware::devices::DeviceKind::Qcm410
+}
+
+fn mm_pcscf_recovery_stopped(
+    state: &mut crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsSnapshot,
+) {
+    use crate::connectivity::modems::ims::cellular_ims::runtime::{CellularImsPhase, CellularImsStage, CellularImsRecoveryState};
+    state.phase = CellularImsPhase::Degraded;
+    state.stage = CellularImsStage::Modem;
+    state.recovery_state = CellularImsRecoveryState::Exhausted;
+    state.manual_retry_available = true;
+    state.next_retry_at = None;
+    state.last_error = Some(format!("{}:mm_reporting_recovery_stopped", code::RUNTIME_ALL_PCSCF_FAILED));
+}
+
 async fn try_mm_pcscf_reattach(
     app: &AppState,
     line: &Arc<crate::services::line_registry::LineRuntime>,
@@ -10702,15 +10731,24 @@ async fn try_mm_pcscf_reattach(
     crate::connectivity::modems::ims::cellular_ims::live::cleanup_live_for_profile_switch(
         &line.cellular_ims_live, &line.cellular_ims,
     ).await;
-    if !mm_pcscf_recovery_policy_current(app, line, generation, &binding.modem_path).await { return false; }
+    if !mm_pcscf_recovery_policy_current(app, line, generation, &binding.modem_path).await {
+        if line.cellular_ims.generation() == generation {
+            line.cellular_ims.update(mm_pcscf_recovery_stopped).await;
+        }
+        return false;
+    }
     let cid = plan.context_id();
     line.cellular_ims.update(|state| {
+        state.stage = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsStage::Modem;
         state.recovery_state = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::WaitingModem;
         state.manual_retry_available = false;
         state.next_retry_at = None;
     }).await;
     tracing::info!(line_id = %binding.line_id, cid, "MM P-CSCF reporting recovery starting; one bounded reattach");
-    let result = plan.execute(|| mm_pcscf_recovery_policy_current(app, line, generation, &binding.modem_path)).await;
+    let result = plan.execute(
+        || mm_pcscf_recovery_policy_current(app, line, generation, &binding.modem_path),
+        || std::future::ready(mm_pcscf_radio_restore_policy_current(app, line, &binding.modem_path)),
+    ).await;
     if line.cellular_ims.generation() != generation { return false; }
     match result {
         Ok(()) => {
@@ -10719,12 +10757,7 @@ async fn try_mm_pcscf_reattach(
         }
         Err(error) => {
             tracing::warn!(line_id = %binding.line_id, %error, "MM P-CSCF recovery stopped; no automatic repeat");
-            line.cellular_ims.update(|state| {
-                state.recovery_state = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::Exhausted;
-                state.manual_retry_available = true;
-                state.next_retry_at = None;
-                state.last_error = Some(format!("{}:mm_reporting_recovery_stopped", code::RUNTIME_ALL_PCSCF_FAILED));
-            }).await;
+            line.cellular_ims.update(mm_pcscf_recovery_stopped).await;
             false
         }
     }
@@ -14365,6 +14398,19 @@ pub async fn delete_e911_address_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cellular_ims_profile_batch_mm_recovery_failure_is_not_left_starting() {
+        use crate::connectivity::modems::ims::cellular_ims::runtime::{CellularImsSnapshot, CellularImsPhase, CellularImsStage, CellularImsRecoveryState};
+        let mut state = CellularImsSnapshot::default();
+        mm_pcscf_recovery_stopped(&mut state);
+        assert_eq!(state.phase, CellularImsPhase::Degraded);
+        assert_eq!(state.stage, CellularImsStage::Modem);
+        assert_eq!(state.recovery_state, CellularImsRecoveryState::Exhausted);
+        assert!(state.manual_retry_available);
+        assert!(state.next_retry_at.is_none());
+        assert_eq!(state.last_error.as_deref(), Some("cellular_ims_runtime_all_pcscf_failed:mm_reporting_recovery_stopped"));
+    }
 
     #[test]
     fn cellular_ims_profile_batch_mm_recovery_requires_exhausted_derived_pcscf_failure() {

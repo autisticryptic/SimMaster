@@ -45,6 +45,21 @@ class MmPcscfRecoveryBoundaryTests(unittest.TestCase):
         for forbidden in ("set_line_cellular_ims_ip_families", "Ipv6Only", "AT+", "46011", "sim06", "set_airplane_mode", "SetInitialEpsBearerSettings"):
             self.assertNotIn(forbidden, recovery)
 
+    def test_radio_compensation_is_independent_of_ims_cancellation(self):
+        text = (ROOT / "backend/src/api/handlers.rs").read_text()
+        policy = text[text.index("fn mm_pcscf_radio_restore_policy_current("):text.index("fn mm_pcscf_recovery_stopped(")]
+        self.assertIn("!profile.airplane_mode_enabled", policy)
+        self.assertIn("binding.modem_path == modem", policy)
+        self.assertIn("active_native().is_none()", policy)
+        for forbidden in ("generation()", "profile.enabled", "cellular_ims_connection_enabled", "data_connection_enabled", "vowifi.enabled", "line_has_call"):
+            self.assertNotIn(forbidden, policy)
+        driver = (DEVICE / "primary_ims_recovery.rs").read_text()
+        self.assertIn('"ListCalls"', driver)
+        self.assertIn("mm_pcscf_calls_unavailable", driver)
+        self.assertIn("restore_radio().await", driver)
+        self.assertIn("state_wait_checks_cancellation_before_and_after_io", driver)
+        self.assertIn("cancellation_after_disable_restores_radio_but_does_not_continue", driver)
+
     def test_actions_execute_recovery_and_admission_regressions(self):
         for name in ("build-release.yml", "beta-validation.yml"):
             text = (ROOT / ".github/workflows" / name).read_text()

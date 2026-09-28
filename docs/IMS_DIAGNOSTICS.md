@@ -296,6 +296,24 @@ MM/secondary 的 PID 不变。证据：`.local/evidence/sim06/deploy-02dfdc5/add
 
 代码和自动路径的实际 CI/部署验收需另外记录，不能把上述手动维护窗口冒充新代码已执行。
 
+### 2026-09-28 续接核验与恢复安全补强
+
+- `7896e05` 的 Build `36389546245`、Validate `36389546247` 均 success；官方 artifact SHA-256、
+  双架构包版本/commit/ELF 及 7 项新增 Rust 恢复/准入回归已实际核验，旧 Release 没有覆盖。
+- 07:25 UTC 只读复查仍为 `02dfdc5` / PID 455798：registered=true、IPsec，
+  `last_register_refresh_at=07:22:30 UTC`、`register_refresh_count=1`。这证明旧部署在维护后完成
+  一次自然续期，不冒充新候选部署证据。无通话、管理走 wlan0、地址族顺序未变。
+- 部署前审查发现：旧恢复步骤的补偿 Enable 也依赖 IMS generation/data/VoWiFi 条件，
+  Disable 后普通配置取消可能阻止无线电归位。补强将继续恢复与 radio 补偿分离：
+  只有本次已经尝试 Disable 后才补偿一次；原 owner/endpoint/SIM 和明确 airplane/off 意图仍可阻止 Enable，
+  不因普通 IMS 取消而把无线电留在低功耗状态，也不再执行第二次 Disable。
+- 真实 Disable 前再次经原 MM unique owner 查询 ListCalls，未知/有通话不执行破坏性步骤；
+  Low Power 写入前及等待循环内重查意图/身份。失败明确显示 degraded/modem/exhausted，
+  不因清理重置而停留在 starting。新增硬件无关取消/状态等待/诊断回归；本地 179 项 Python 检查通过。
+- 自动路径仍需新构建与部署核验；当前已启用 reporting 的已注册设备不应为强制覆盖测试而关回上报、
+  清除预算或反复重新附着。预算仅在同一系统启动内的 MM owner/device/SIM 范围持久有效，
+  不宣称跨系统重启或 MM owner 变化后永久耗尽。
+
 
 
 ### 部署授权及取证文件
