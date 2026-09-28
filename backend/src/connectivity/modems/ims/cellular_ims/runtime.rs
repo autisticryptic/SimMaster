@@ -532,6 +532,24 @@ pub struct CellularImsRuntime {
     snapshot: Arc<RwLock<CellularImsSnapshot>>,
     advance_lock: Arc<Mutex<()>>,
     generation: Arc<AtomicU64>,
+    mm_binding: Arc<std::sync::Mutex<super::mm_binding::Calibration>>,
+}
+
+/// Keeps admission closed throughout an explicit eSIM operation, including
+/// error/cancellation exits. Only its own maintenance ticket may be released.
+pub struct MmBindingSwitchGuard {
+    runtime: Arc<CellularImsRuntime>,
+    ticket: u64,
+}
+
+impl Drop for MmBindingSwitchGuard {
+    fn drop(&mut self) {
+        self.runtime
+            .mm_binding
+            .lock()
+            .unwrap()
+            .end_switch(self.ticket);
+    }
 }
 
 impl Default for CellularImsRuntime {
@@ -546,6 +564,7 @@ impl CellularImsRuntime {
             snapshot: Arc::new(RwLock::new(CellularImsSnapshot::default())),
             advance_lock: Arc::new(Mutex::new(())),
             generation: Arc::new(AtomicU64::new(0)),
+            mm_binding: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
 
@@ -563,6 +582,60 @@ impl CellularImsRuntime {
     /// and re-checks it to detect a concurrent `reset_runtime`.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Inventory publication calls this before exposing the new SIM binding.
+    /// The same lock guards final registration publication against a SIM change.
+    pub fn observe_mm_binding(&self, binding: &crate::hardware::cellular::bindings::ModemBinding) {
+        let mut state = self.mm_binding.lock().unwrap();
+        if state.observe(binding) {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub fn begin_mm_switch(self: &Arc<Self>) -> Result<Option<MmBindingSwitchGuard>, &'static str> {
+        let mut binding = self.mm_binding.lock().unwrap();
+        if binding.switch_in_progress() {
+            return Err("cellular_ims_mm_sim_switch_in_progress");
+        }
+        let Some(ticket) = binding.begin_switch() else {
+            return Ok(None);
+        };
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(MmBindingSwitchGuard {
+            runtime: Arc::clone(self),
+            ticket,
+        }))
+    }
+
+    pub fn expected_mm_sim(&self) -> Option<(String, u8)> {
+        self.mm_binding.lock().unwrap().expected_sim()
+    }
+
+    pub fn mm_binding_ready(&self) -> bool {
+        self.mm_binding.lock().unwrap().ready()
+    }
+
+    pub fn mm_calibration_ticket(&self) -> Option<u64> {
+        self.mm_binding.lock().unwrap().ticket()
+    }
+
+    pub fn finish_mm_calibration(&self, ticket: u64) -> bool {
+        self.mm_binding.lock().unwrap().finish(ticket)
+    }
+
+    pub async fn update_current(
+        &self,
+        generation: u64,
+        f: impl FnOnce(&mut CellularImsSnapshot),
+    ) -> bool {
+        let mut snapshot = self.snapshot.write().await;
+        let binding = self.mm_binding.lock().unwrap();
+        if !binding.can_publish() || self.generation() != generation {
+            return false;
+        }
+        f(&mut snapshot);
+        true
     }
 
     /// Apply a mutation to the snapshot under the write lock.
@@ -808,6 +881,66 @@ mod tests {
         assert_eq!(CellularImsRecoveryState::Connecting.as_str(), "connecting");
         assert_eq!(CellularImsRecoveryState::Registered.as_str(), "registered");
         assert_eq!(CellularImsRecoveryState::Exhausted.as_str(), "exhausted");
+    }
+
+    fn mm_test_binding(iccid: &str) -> crate::hardware::cellular::bindings::ModemBinding {
+        crate::hardware::cellular::bindings::ModemBinding {
+            modem_path: "/org/freedesktop/ModemManager1/Modem/0".into(),
+            sim_path: Some("/org/freedesktop/ModemManager1/SIM/0".into()),
+            sim_iccid: iccid.into(),
+            primary_port: "wwan0qmi0".into(),
+            present: true,
+            uim_slot: 1,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn mm_sim_change_blocks_stale_registration_publication_until_cleanup() {
+        let rt = CellularImsRuntime::new();
+        rt.observe_mm_binding(&mm_test_binding("8900000000000000001"));
+        let old = rt.generation();
+        rt.observe_mm_binding(&mm_test_binding("8900000000000000002"));
+        assert_ne!(old, rt.generation());
+        assert!(!rt.mm_binding_ready());
+        assert!(
+            !rt.update_current(old, |_| panic!("old SIM published"))
+                .await
+        );
+        let current = rt.generation();
+        assert!(
+            !rt.update_current(current, |_| panic!("cleanup not completed"))
+                .await
+        );
+        rt.observe_mm_binding(&mm_test_binding("8900000000000000002"));
+        assert!(rt.finish_mm_calibration(rt.mm_calibration_ticket().unwrap()));
+        assert!(
+            rt.update_current(current, |s| s.phase = CellularImsPhase::Registered)
+                .await
+        );
+        assert!(
+            !rt.update_current(old, |_| panic!("old completion after cleanup"))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn mm_explicit_switch_guard_requires_fresh_samples_even_on_failure() {
+        let rt = Arc::new(CellularImsRuntime::new());
+        let binding = mm_test_binding("8900000000000000001");
+        rt.observe_mm_binding(&binding);
+        let old = rt.generation();
+        let guard = rt.begin_mm_switch().unwrap().unwrap();
+        assert!(rt.begin_mm_switch().is_err());
+        assert_ne!(old, rt.generation());
+        rt.observe_mm_binding(&binding);
+        assert_eq!(rt.mm_calibration_ticket(), None);
+        drop(guard);
+        assert!(!rt.mm_binding_ready());
+        rt.observe_mm_binding(&binding);
+        assert_eq!(rt.mm_calibration_ticket(), None);
+        rt.observe_mm_binding(&binding);
+        assert!(rt.mm_calibration_ticket().is_some());
     }
 
     #[test]

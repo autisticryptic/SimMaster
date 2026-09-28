@@ -57,9 +57,26 @@ impl ImsBearerHandle for Qcm410ImsBearerHandle {
             .check_liveness()
             .map_err(|detail| ImsBearerError {
                 kind: ImsBearerErrorKind::SessionLost,
-                hint: ImsBearerFailureHint::None,
+                hint: classify_session_failure(&detail),
                 detail,
             })
+    }
+
+    fn verify_mm_sim_binding<'a>(
+        &'a mut self,
+        iccid: &'a str,
+        slot: u8,
+    ) -> TransportFuture<'a, Result<(), ImsBearerError>> {
+        Box::pin(async move {
+            self.session
+                .verify_expected_sim(iccid, slot)
+                .await
+                .map_err(|detail| ImsBearerError {
+                    kind: ImsBearerErrorKind::SessionLost,
+                    hint: classify_session_failure(&detail),
+                    detail,
+                })
+        })
     }
 
     fn discover_pcscf(
@@ -464,6 +481,14 @@ fn netdev_config_for(settings: &CgcontrdpSettings, family: u8) -> Option<NetdevC
 }
 
 fn classify_session_failure(detail: &str) -> ImsBearerFailureHint {
+    if matches!(
+        detail,
+        "qca410_primary_mm_binding_changed"
+            | "qca410_primary_mm_binding_unavailable"
+            | "qca410_primary_mm_owner_missing"
+    ) {
+        return ImsBearerFailureHint::BindingChanged;
+    }
     let error = detail.to_ascii_lowercase();
     if error.contains("ipv6onlyallowed")
         || error.contains("ipv6-only-allowed")

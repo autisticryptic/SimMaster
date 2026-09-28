@@ -141,6 +141,26 @@ async fn timed<T>(
         .map_err(|_| "qca410_primary_mm_command_timeout".to_string())?
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct MmSimBinding {
+    path: String,
+    id: String,
+    slot: u32,
+}
+
+const BINDING_CHANGED: &str = "qca410_primary_mm_binding_changed";
+const BINDING_UNAVAILABLE: &str = "qca410_primary_mm_binding_unavailable";
+
+fn validate_sim_binding(expected: &MmSimBinding, observed: &MmSimBinding) -> Result<(), String> {
+    if observed.path == "/" || observed.id.is_empty() {
+        return Err(BINDING_UNAVAILABLE.into());
+    }
+    if expected != observed {
+        return Err(BINDING_CHANGED.into());
+    }
+    Ok(())
+}
+
 pub(super) struct MmBus {
     connection: Connection,
     pub bus_id: String,
@@ -148,6 +168,7 @@ pub(super) struct MmBus {
     pub modem: String,
     pub device: String,
     pub interface: String,
+    sim_binding: OnceLock<MmSimBinding>,
 }
 
 pub(super) struct BearerStatus {
@@ -174,6 +195,7 @@ impl MmBus {
                 modem: modem.to_string(),
                 device: device.to_string(),
                 interface: interface.to_string(),
+                sim_binding: OnceLock::new(),
             }))
         })
         .await
@@ -210,6 +232,85 @@ impl MmBus {
             }
         })
         .await
+    }
+
+    async fn read_sim_binding(&self) -> Result<MmSimBinding, String> {
+        timed(10, async {
+            if !self.owner_is_current().await? {
+                return Err(OWNER_MISSING.into());
+            }
+            if self.device.strip_prefix("/dev/") != Some(self.primary_port().await?.as_str()) {
+                return Err(BINDING_CHANGED.to_string());
+            }
+            let modem = self.proxy(&self.modem, MODEM).await?;
+            let path: OwnedObjectPath = modem.get_property("Sim").await.map_err(bus_error)?;
+            if path.as_str() == "/" {
+                return Err(BINDING_UNAVAILABLE.into());
+            }
+            let slot: u32 = modem
+                .get_property("PrimarySimSlot")
+                .await
+                .map_err(bus_error)?;
+            let id: String = self
+                .proxy(path.as_str(), "org.freedesktop.ModemManager1.Sim")
+                .await?
+                .get_property("SimIdentifier")
+                .await
+                .map_err(bus_error)?;
+            let id = crate::platform::utils::normalize_iccid(&id);
+            let after: OwnedObjectPath = modem.get_property("Sim").await.map_err(bus_error)?;
+            if after != path || !self.owner_is_current().await? {
+                return Err(BINDING_CHANGED.into());
+            }
+            if id.is_empty() {
+                return Err(BINDING_UNAVAILABLE.into());
+            }
+            Ok(MmSimBinding {
+                path: path.to_string(),
+                id,
+                slot,
+            })
+        })
+        .await
+        .map_err(|error| {
+            if error == BINDING_CHANGED || error == OWNER_MISSING {
+                error
+            } else {
+                BINDING_UNAVAILABLE.into()
+            }
+        })
+    }
+
+    /// Two uncached snapshots before creating a bearer. Do not infer identity
+    /// from an APN, carrier, reusable modem path or numeric CID.
+    pub async fn pin_sim_binding(&self) -> Result<(), String> {
+        let before = self.read_sim_binding().await?;
+        let after = self.read_sim_binding().await?;
+        validate_sim_binding(&before, &after)?;
+        self.sim_binding
+            .set(before)
+            .map_err(|_| BINDING_CHANGED.to_string())
+    }
+
+    pub async fn verify_expected_sim(&self, iccid: &str, slot: u8) -> Result<(), String> {
+        self.ensure_sim_binding().await?;
+        let pinned = self
+            .sim_binding
+            .get()
+            .ok_or_else(|| BINDING_UNAVAILABLE.to_string())?;
+        if pinned.id != iccid || pinned.slot != u32::from(slot) {
+            return Err(BINDING_CHANGED.into());
+        }
+        Ok(())
+    }
+
+    pub async fn ensure_sim_binding(&self) -> Result<(), String> {
+        let expected = self
+            .sim_binding
+            .get()
+            .ok_or_else(|| BINDING_UNAVAILABLE.to_string())?;
+        let observed = self.read_sim_binding().await?;
+        validate_sim_binding(expected, &observed)
     }
 
     pub async fn primary_port(&self) -> Result<String, String> {
@@ -289,9 +390,7 @@ impl MmBus {
         family: MmIpFamily,
     ) -> Result<Option<CgcontrdpSettings>, String> {
         timed(10, async {
-            if !self.owner_is_current().await? {
-                return Err(OWNER_MISSING.to_string());
-            }
+            self.ensure_sim_binding().await?;
             let properties: primary_ims_settings::Properties = self
                 .proxy(bearer, "org.freedesktop.DBus.Properties")
                 .await?
@@ -307,9 +406,7 @@ impl MmBus {
                 &self.interface,
                 apn,
             )?;
-            if !self.owner_is_current().await? {
-                return Err(OWNER_MISSING.to_string());
-            }
+            self.ensure_sim_binding().await?;
             Ok(settings)
         })
         .await
@@ -358,6 +455,9 @@ impl MmBus {
     }
 
     async fn pcscf_owner_check(&self) -> Result<(), ImsBearerError> {
+        self.ensure_sim_binding()
+            .await
+            .map_err(|_| session_changed("sim_binding_changed_or_unavailable"))?;
         if !self
             .owner_is_current()
             .await
@@ -1111,7 +1211,25 @@ mod ip_config_dbus_tests {
         changed_ip: Arc<AtomicBool>,
     }
 
+    struct FakeSim {
+        changed: Arc<AtomicBool>,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.ModemManager1.Sim")]
+    impl FakeSim {
+        #[zbus(property)]
+        fn sim_identifier(&self) -> String {
+            if self.changed.load(Ordering::Acquire) {
+                "8900000000000000002"
+            } else {
+                "8900000000000000001"
+            }
+            .into()
+        }
+    }
+
     struct FakeModem {
+        sim_changed: Arc<AtomicBool>,
         connected: Arc<AtomicBool>,
         profile_id: Arc<std::sync::atomic::AtomicI32>,
         changed_ip: Arc<AtomicBool>,
@@ -1121,6 +1239,14 @@ mod ip_config_dbus_tests {
 
     #[zbus::interface(name = "org.freedesktop.ModemManager1.Modem")]
     impl FakeModem {
+        #[zbus(property)]
+        fn sim(&self) -> OwnedObjectPath {
+            OwnedObjectPath::try_from("/org/freedesktop/ModemManager1/SIM/0").unwrap()
+        }
+        #[zbus(property)]
+        fn primary_sim_slot(&self) -> u32 {
+            1
+        }
         #[zbus(property)]
         fn primary_port(&self) -> String {
             "wwan0qmi0".to_string()
@@ -1138,6 +1264,7 @@ mod ip_config_dbus_tests {
                 }
                 "AT+CGCONTRDP=2" => {
                     match self.action {
+                        "sim" => self.sim_changed.store(true, Ordering::Release),
                         "disconnect" => self.connected.store(false, Ordering::Release),
                         "profile" => self.profile_id.store(3, Ordering::Release),
                         "ip" => self.changed_ip.store(true, Ordering::Release),
@@ -1250,6 +1377,7 @@ mod ip_config_dbus_tests {
         let profile_id = Arc::new(std::sync::atomic::AtomicI32::new(2));
         let changed_ip = Arc::new(AtomicBool::new(false));
         let commands = Arc::new(Mutex::new(Vec::new()));
+        let sim_changed = Arc::new(AtomicBool::new(false));
         let connection = zbus::connection::Builder::system()
             .unwrap()
             .name(SERVICE)
@@ -1257,11 +1385,19 @@ mod ip_config_dbus_tests {
             .serve_at(
                 "/org/freedesktop/ModemManager1/Modem/0",
                 FakeModem {
+                    sim_changed: Arc::clone(&sim_changed),
                     connected: Arc::clone(&connected),
                     profile_id: Arc::clone(&profile_id),
                     changed_ip: Arc::clone(&changed_ip),
                     commands: Arc::clone(&commands),
                     action,
+                },
+            )
+            .unwrap()
+            .serve_at(
+                "/org/freedesktop/ModemManager1/SIM/0",
+                FakeSim {
+                    changed: sim_changed,
                 },
             )
             .unwrap()
@@ -1282,17 +1418,69 @@ mod ip_config_dbus_tests {
     }
 
     async fn bus() -> Arc<MmBus> {
-        MmBus::new(
+        let bus = MmBus::new(
             "/dev/wwan0qmi0",
             "/org/freedesktop/ModemManager1/Modem/0",
             "wwan0",
         )
         .await
-        .unwrap()
+        .unwrap();
+        bus.pin_sim_binding().await.unwrap();
+        bus
     }
 
     fn observation_guard() -> NetworkGuard {
         Arc::new(NetworkActivity::default()).enter().unwrap()
+    }
+
+    #[tokio::test]
+    async fn retained_mm_binding_must_match_the_callers_derived_sim() {
+        let (_server, commands) = probe_server(false, "").await;
+        let bus = bus().await;
+        bus.verify_expected_sim("8900000000000000001", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            bus.verify_expected_sim("8900000000000000002", 1)
+                .await
+                .unwrap_err(),
+            BINDING_CHANGED
+        );
+        assert_eq!(
+            bus.verify_expected_sim("8900000000000000001", 2)
+                .await
+                .unwrap_err(),
+            BINDING_CHANGED
+        );
+        assert!(commands.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sim_replacement_during_pcscf_read_is_terminal_even_on_same_object() {
+        let (_server, _) = probe_server(false, "sim").await;
+        let bus = bus().await;
+        let expected = bus
+            .ip_settings(PATH, "ims", MmIpFamily::Ipv6)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = bus
+            .discover_pcscf(
+                PATH,
+                "ims",
+                MmIpFamily::Ipv6,
+                Some(2),
+                &expected,
+                &observation_guard(),
+            )
+            .await
+            .unwrap_err();
+        assert_ne!(error.kind, ImsBearerErrorKind::PcscfUnavailable);
+        assert_eq!(bus.ensure_sim_binding().await.unwrap_err(), BINDING_CHANGED);
+        assert!(bus
+            .ip_settings(PATH, "ims", MmIpFamily::Ipv6)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1690,6 +1878,39 @@ mod tests {
         assert!(same_generation(&record, &record.bus_id, &record.owner));
         assert!(!same_generation(&record, &record.bus_id, ":1.43"));
         assert!(!same_generation(&record, "different-bus", &record.owner));
+    }
+
+    #[test]
+    fn sim_binding_requires_identity_path_and_slot_not_just_cid_or_apn() {
+        let expected = MmSimBinding {
+            path: "/org/freedesktop/ModemManager1/SIM/0".into(),
+            id: "8900000000000000001".into(),
+            slot: 1,
+        };
+        assert!(validate_sim_binding(&expected, &expected).is_ok());
+        let mut changed = expected.clone();
+        changed.id = "8900000000000000002".into();
+        assert_eq!(
+            validate_sim_binding(&expected, &changed).unwrap_err(),
+            BINDING_CHANGED
+        );
+        changed = expected.clone();
+        changed.slot = 2;
+        assert_eq!(
+            validate_sim_binding(&expected, &changed).unwrap_err(),
+            BINDING_CHANGED
+        );
+        changed = expected.clone();
+        changed.path.push('1');
+        assert_eq!(
+            validate_sim_binding(&expected, &changed).unwrap_err(),
+            BINDING_CHANGED
+        );
+        changed.id.clear();
+        assert_eq!(
+            validate_sim_binding(&expected, &changed).unwrap_err(),
+            BINDING_UNAVAILABLE
+        );
     }
 
     #[test]

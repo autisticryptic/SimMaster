@@ -1078,6 +1078,13 @@ async fn main() -> Result<()> {
                             .copied()
                             .unwrap_or(false);
                         next_presence.insert(binding.line_id.clone(), binding.present);
+                        if let Some(ticket) = line.cellular_ims.mm_calibration_ticket() {
+                            let app = refresh_app.clone();
+                            let target = Arc::clone(&line);
+                            tokio::spawn(async move {
+                                api::handlers::recalibrate_line_mm_binding(&app, &target, ticket).await;
+                            });
+                        }
                         if binding.present == was_present {
                             continue;
                         }

@@ -239,6 +239,7 @@ jobs:
             connectivity::modems::ims::cellular_ims::native_bearer::tests \
             connectivity::modems::ims::cellular_ims::data_slot::tests \
             connectivity::modems::ims::cellular_ims::runtime::tests \
+            connectivity::modems::ims::cellular_ims::mm_binding::tests \
             connectivity::modems::ims::cellular_ims::pcscf::tests \
             connectivity::modems::ims::cellular_ims::pcscf_dns::tests \
             api::handlers::tests::cellular_ims_profile_batch \

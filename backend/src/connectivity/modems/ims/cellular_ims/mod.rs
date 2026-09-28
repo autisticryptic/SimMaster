@@ -42,6 +42,7 @@ mod pcscf_dns;
 pub mod plan;
 pub mod readiness;
 pub mod rtp_relay;
+mod mm_binding;
 pub mod runtime;
 mod security_agreement;
 pub mod sip;

@@ -921,6 +921,20 @@ pub async fn enable_esim_profile_handler(
         Ok((line, _)) => line,
         Err(err) => return esim_error_response::<EsimCommandResponse>(err).into_response(),
     };
+    // Close MM IMS admission before lpac can change the SIM. This guard is
+    // moved into the background operation and also releases on error/cancel.
+    let mm_switch = match line.cellular_ims.begin_mm_switch() {
+        Ok(guard) => guard,
+        Err(reason) => return (StatusCode::CONFLICT, Json(ApiResponse::<EsimCommandResponse>::error(reason))).into_response(),
+    };
+    if mm_switch.is_some() {
+        let _bearer = line.bearer_operation_lock.lock().await;
+        let _connect = line.cellular_ims_connect_lock.lock().await;
+        let _advance = line.cellular_ims.advance_guard().await;
+        crate::connectivity::modems::ims::cellular_ims::live::discard_live_for_mm_binding_change(
+            &line.cellular_ims_live, &line.cellular_ims,
+        ).await;
+    }
     let event_entity = mask_identifier(&iccid);
     let bg_line_id = line_id.clone();
     let bg_binding = line.binding();
@@ -978,6 +992,7 @@ pub async fn enable_esim_profile_handler(
         progress_line_id,
         async move {
             let _guard = modem::BasebandRestartRunGuard::for_line(&bg_line_id);
+            let _mm_switch = mm_switch;
 
             match bg_app
                 .esim_supervisor
@@ -3589,6 +3604,38 @@ pub fn spawn_line_data_supervisor(app: AppState) {
     });
 }
 
+/// Reconcile an observed MM SIM/binding change, including external eSIM
+/// switches and physical replacement at an unchanged line_id/modem path.
+/// Inventory never waits for bearer locks: refresh can also run inside a
+/// restore operation. The maintenance ticket prevents a delayed job from
+/// acknowledging another SIM's transition.
+pub(crate) async fn recalibrate_line_mm_binding(
+    app: &AppState,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
+    ticket: u64,
+) {
+    {
+        // Do not queue one cleanup task on every inventory tick behind a slow
+        // connection. The pending ticket is retried by the next inventory pass.
+        let Ok(_bearer) = line.bearer_operation_lock.try_lock() else { return; };
+        let Ok(_connect) = line.cellular_ims_connect_lock.try_lock() else { return; };
+        let _advance = line.cellular_ims.advance_guard().await;
+        if line.cellular_ims.mm_calibration_ticket() != Some(ticket) { return; }
+        crate::connectivity::modems::ims::cellular_ims::live::discard_live_for_mm_binding_change(
+            &line.cellular_ims_live, &line.cellular_ims,
+        ).await;
+        if line.cellular_ims.mm_calibration_ticket() != Some(ticket) { return; }
+        let binding = line.binding();
+        modem::invalidate_sim_identity_cache(binding.qmi_device.as_deref(), binding.uim_slot);
+        crate::connectivity::core::own_numbers::clear(&binding.line_id);
+        if !line.cellular_ims.finish_mm_calibration(ticket) { return; }
+        info!(line_id = %binding.line_id, "MM IMS binding recalibrated; next connection will reselect and verify its profile");
+    }
+    // Existing intent/access-policy/cooldown/profile/family controls decide
+    // whether to connect. Calibration itself never enables radio or data.
+    start_line_cellular_ims_restore(app.clone(), Arc::clone(line), "automatic").await;
+}
+
 /// Tear down only volatile resources for a removed line. Persisted switches are
 /// deliberately untouched so the same stable line can recover after hotplug.
 pub(crate) async fn suspend_line_runtime_for_hotplug(
@@ -3598,6 +3645,8 @@ pub(crate) async fn suspend_line_runtime_for_hotplug(
     let binding = line.binding();
     {
         let _bearer_guard = line.bearer_operation_lock.lock().await;
+        // A queued absence observation must not tear down a returned line.
+        if line.binding().present { return; }
         line.data_proxy.stop().await;
         line.cellular_data.stop().await;
         let _connect_guard = line.cellular_ims_connect_lock.lock().await;
@@ -10275,7 +10324,7 @@ async fn start_line_cellular_ims_restore(
     line: Arc<crate::services::line_registry::LineRuntime>,
     source: &'static str,
 ) -> bool {
-    if !line_cellular_ims_restore_enabled(&app, &line) {
+    if !line_cellular_ims_restore_enabled(&app, &line) || !line.cellular_ims.mm_binding_ready() {
         return false;
     }
     // The access policy can forbid this leg even when the line's own VoLTE

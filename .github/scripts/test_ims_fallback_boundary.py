@@ -76,7 +76,13 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         lifecycle = (device / "primary_ims_lifecycle.rs").read_text()
         read = lifecycle[lifecycle.index("pub async fn ip_settings("):lifecycle.index("pub async fn connect(")]
         self.assertIn('.call("GetAll", &(BEARER,))', read)
-        self.assertEqual(read.count("owner_is_current().await?"), 2)
+        ip_read = read[:read.index("pub async fn discover_pcscf(")]
+        self.assertEqual(ip_read.count("self.ensure_sim_binding().await?"), 2)
+        identity = lifecycle[lifecycle.index("async fn read_sim_binding("):lifecycle.index("pub async fn primary_port(")]
+        self.assertGreaterEqual(identity.count("owner_is_current().await?"), 2)
+        self.assertIn('get_property("SimIdentifier")', identity)
+        self.assertIn('get_property("PrimarySimSlot")', identity)
+        self.assertIn("validate_sim_binding(expected, &observed)", identity)
         self.assertIn("primary_ims_settings::validate_binding(", read)
         self.assertIn("CacheProperties::No", lifecycle)
         session = (device / "primary_ims_session.rs").read_text()
@@ -183,7 +189,7 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         self.assertNotIn("restore_from_worker(", provider_only)
         self.assertNotIn("disable_pcscf_reporting(", cleanup)
         self.assertNotIn("cleanup_ims_profile_lease(", cleanup)
-        self.assertEqual(text.count("cleanup_unverified_native_bearer(&mut native_bearer).await"), 2)
+        self.assertEqual(text.count("cleanup_unverified_native_bearer(&mut native_bearer).await"), 3)
         self.assertIn("Err(error) if !pcscf_observation_allows_fallback(&error)", text)
         policy = text[text.index("fn pcscf_observation_allows_fallback("):text.index("async fn cleanup_unverified_native_bearer(")]
         self.assertIn("error.code() == code::RUNTIME_ALL_PCSCF_FAILED", policy)

@@ -222,6 +222,7 @@ impl LineRuntime {
             &binding.line_id,
             Arc::clone(&supplementary),
         );
+        cellular_ims.observe_mm_binding(&binding);
         let ue_context = UeContext::for_binding(&binding);
         let line_id = binding.line_id.clone();
         let namespace = ue_context.namespace.clone();
@@ -311,10 +312,9 @@ impl LineRuntime {
     }
 
     fn mark_absent(&self) {
-        self.binding
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .present = false;
+        let mut binding = self.binding.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        binding.present = false;
+        self.cellular_ims.observe_mm_binding(&binding);
     }
 
     pub async fn status(&self) -> LineRuntimeStatus {
@@ -918,6 +918,9 @@ impl LineRuntimeRegistry {
 
         let mut prepared_existing = Vec::with_capacity(existing_lines.len());
         for (line, binding) in &existing_lines {
+            // Invalidate old IMS work before any asynchronous worker/context
+            // transition. No hardware cleanup is performed under refresh_lock.
+            line.cellular_ims.observe_mm_binding(binding);
             self.refresh_ims_access_network(line, binding).await;
             prepared_existing.push(self.reconcile_ue_context(line, binding).await);
         }

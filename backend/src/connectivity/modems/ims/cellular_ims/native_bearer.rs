@@ -101,6 +101,17 @@ impl NativeImsBearer {
             .map_err(cellular_ims_error_from_ims_bearer)
     }
 
+    pub async fn verify_mm_sim_binding(
+        &mut self,
+        iccid: &str,
+        slot: u8,
+    ) -> Result<(), CellularImsError> {
+        self.handle
+            .verify_mm_sim_binding(iccid, slot)
+            .await
+            .map_err(cellular_ims_error_from_ims_bearer)
+    }
+
     /// Use the retained provider's association if supported. Only an explicit
     /// unsupported result permits the legacy exact-address observation.
     pub async fn discover_pcscf<F, Fut>(
@@ -376,7 +387,10 @@ pub async fn establish_native_ims_bearer(
             Err(error) => {
                 let hint = error.hint;
                 let error = cellular_ims_error_from_ims_bearer(error);
-                if hint == ImsBearerFailureHint::BasebandWedged {
+                if matches!(
+                    hint,
+                    ImsBearerFailureHint::BasebandWedged | ImsBearerFailureHint::BindingChanged
+                ) {
                     return Err(error);
                 }
                 tracing::warn!(
@@ -511,6 +525,9 @@ fn forced_native_family(hint: ImsBearerFailureHint) -> Option<u8> {
 /// Fold a device-agnostic [`ImsBearerError`] into the stack's [`CellularImsError`],
 /// preserving the exact codes and detail strings used by runtime diagnostics.
 pub(crate) fn cellular_ims_error_from_ims_bearer(error: ImsBearerError) -> CellularImsError {
+    if error.hint == ImsBearerFailureHint::BindingChanged {
+        return CellularImsError::with_detail(code::BEARER_SESSION_LOST, error.detail);
+    }
     if error.hint == ImsBearerFailureHint::BasebandWedged {
         return CellularImsError::with_detail(code::RUNTIME_IMS_BASEBAND_WEDGED, error.detail);
     }

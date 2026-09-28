@@ -102,6 +102,7 @@ impl PrimaryImsSession {
             return Err("qca410_primary_mm_setup_cancelled".to_string());
         }
         let bus = MmBus::new(&request.device, &request.modem, &request.interface).await?;
+        bus.pin_sim_binding().await?;
         let controller = Arc::new(Controller {
             bus,
             request,
@@ -147,6 +148,11 @@ impl PrimaryImsSession {
             loss,
             monitor,
         })
+    }
+
+    pub async fn verify_expected_sim(&self, iccid: &str, slot: u8) -> Result<(), String> {
+        self.check_liveness()?;
+        self.controller.bus.verify_expected_sim(iccid, slot).await
     }
 
     pub fn path(&self) -> &str {
@@ -356,6 +362,10 @@ impl Controller {
         if args.len() != 3 {
             return Err("qca410_primary_mm_internal_operation_invalid".to_string());
         }
+        let cleanup = args[2] == "--disconnect" || args[2].starts_with("--delete-bearer=");
+        if !cleanup {
+            self.bus.ensure_sim_binding().await?;
+        }
         match (args[0].as_str(), args[2].as_str()) {
             ("-m", "-K") if args[1] == self.bus.modem => {
                 let port = self.bus.primary_port().await?;
@@ -407,6 +417,7 @@ impl Controller {
             }
             ("-b", "-K") => {
                 let status = self.bus.status(&args[1]).await?;
+                self.bus.ensure_sim_binding().await?;
                 Ok(format!(
                     "bearer.status.connected : {}\nbearer.status.interface : {}\nbearer.properties.apn : {}",
                     if status.connected { "yes" } else { "no" },
@@ -639,7 +650,13 @@ fn observed_loss(result: &Result<String, String>) -> Option<String> {
             Some(false) => Some("qca410_primary_mm_bearer_disconnected".to_string()),
             None => Some("qca410_primary_mm_bearer_status_invalid".to_string()),
         },
-        Err(error) if error == OWNER_MISSING => Some(error.clone()),
+        Err(error)
+            if error == OWNER_MISSING
+                || error == "qca410_primary_mm_binding_changed"
+                || error == "qca410_primary_mm_binding_unavailable" =>
+        {
+            Some(error.clone())
+        }
         // A failed status read is not proof that the WDS owner has gone away.
         Err(_) => None,
     }

@@ -1859,6 +1859,9 @@ pub async fn connect_live_for_line(
     // Connection, media and address-family intent are all supplied for this
     // physical line.
     let _advance = runtime.advance_guard().await;
+    if !runtime.mm_binding_ready() {
+        return Err(CellularImsError::new("cellular_ims_mm_binding_calibrating"));
+    }
     if live.session.lock().await.is_some() {
         return Ok(runtime.status().await);
     }
@@ -1912,13 +1915,12 @@ pub async fn connect_live_for_line(
             };
             let pcscf = session.pcscf.to_string();
             let data_path_mode = session.data_slot_mode.as_str().to_string();
-            *live.session.lock().await = Some(session);
-            // A registered IMS session IS the voice capability: MMTEL is what the
-            // registration was for. There is no local switch left to consult --
-            // a carrier that refuses voice says so with a SIP status.
-            live.operator.set_ready(true);
-            runtime
-                .update(|state| {
+            let mut session = Some(session);
+            let mut slot = live.session.lock().await;
+            let published = runtime
+                .update_current(generation, |state| {
+                    *slot = session.take();
+                    live.operator.set_ready(true);
                     state.phase = CellularImsPhase::Registered;
                     state.stage = CellularImsStage::Registered;
                     state.registration_mode = mode;
@@ -1936,6 +1938,15 @@ pub async fn connect_live_for_line(
                     state.next_retry_at = None;
                 })
                 .await;
+            if !published {
+                // advance_guard and the calibration admission gate exclude a
+                // new session. Release only this just-completed old attempt.
+                *slot = session.take();
+                drop(slot);
+                cleanup_live_session_with_binding(live, false).await;
+                return Err(CellularImsError::new(code::RUNTIME_NOT_RUNNING));
+            }
+            drop(slot);
             start_live_listener(
                 live.clone(),
                 device.line_id.clone(),
@@ -1951,7 +1962,7 @@ pub async fn connect_live_for_line(
         Err(error) => {
             let message = error.to_string();
             runtime
-                .update(|state| {
+                .update_current(generation, |state| {
                     state.phase = CellularImsPhase::Degraded;
                     if let Some(stage) = failure_stage(&error) {
                         state.stage = stage;
@@ -2055,6 +2066,7 @@ async fn connect_inner(
     runtime
         .update(|state| state.stage = CellularImsStage::Identity)
         .await;
+    let expected_mm_sim = runtime.expected_mm_sim();
     let device_identity = load_device_identity(
         &device,
         runtime,
@@ -2109,6 +2121,7 @@ async fn connect_inner(
             None
         }
     };
+    ensure_generation(runtime, generation)?;
     let mut request = BearerRequest::for_apn(ims_apn, allow_roaming);
     request.profile_id = ims_profile.map(|profile| u32::from(profile.cid));
 
@@ -2179,11 +2192,25 @@ async fn connect_inner(
                     Some("native_qmi".to_string()),
                 )
                 .await;
-            disable_pcscf_reporting(&device.modem_id, pcscf_reporting_cid).await;
-            cleanup_ims_profile_lease(ims_profile_lease.take()).await;
+            if ensure_generation(runtime, generation).is_ok() && error.code() != code::BEARER_SESSION_LOST {
+                disable_pcscf_reporting(&device.modem_id, pcscf_reporting_cid).await;
+                cleanup_ims_profile_lease(ims_profile_lease.take()).await;
+            }
             return Err(error);
         }
     };
+    let verified = async {
+        ensure_generation(runtime, generation)?;
+        if let Some((iccid, slot)) = expected_mm_sim.as_ref() {
+            native_bearer.as_mut().expect("native bearer was established")
+                .verify_mm_sim_binding(iccid, *slot).await?;
+        }
+        ensure_generation(runtime, generation)
+    }.await;
+    if let Err(error) = verified {
+        cleanup_unverified_native_bearer(&mut native_bearer).await;
+        return Err(error);
+    }
     let mut bearer = native_bearer
         .as_ref()
         .expect("native bearer was established")
@@ -3131,6 +3158,20 @@ pub async fn cleanup_live_for_profile_switch(
     runtime.prepare_profile_switch().await;
 }
 
+/// Caller holds bearer/connect/advance locks and admission remains closed.
+/// A replacement SIM must never receive the old SIM's unregister or AT cleanup.
+pub async fn discard_live_for_mm_binding_change(
+    live: &CellularImsLiveHandle,
+    runtime: &Arc<CellularImsRuntime>,
+) {
+    if let Some(listener) = live.listener.lock().await.take() {
+        listener.abort();
+        let _ = listener.await;
+    }
+    cleanup_live_session_with_binding(live, false).await;
+    runtime.reset_runtime("cellular_ims_mm_binding_recalibrated").await;
+}
+
 pub async fn disconnect_live_for_line(
     live: &CellularImsLiveHandle,
     runtime: &Arc<CellularImsRuntime>,
@@ -3402,7 +3443,10 @@ async fn live_receive_loop(
                 })
                 .await;
             tracing::warn!(error = %error, "VoLTE retained IMS bearer ended");
-            cleanup_live_session(&live).await;
+            // A lost MM binding can be a replacement SIM even before the
+            // inventory watcher notices. Never restore old CID settings there.
+            let legacy_cleanup = runtime.expected_mm_sim().is_none() && runtime.mm_binding_ready();
+            cleanup_live_session_with_binding(&live, legacy_cleanup).await;
             break;
         }
         if let Some(pending) = pending_options.as_ref() {
@@ -4182,6 +4226,10 @@ struct CellularImsRefreshAttempt {
 }
 
 async fn cleanup_live_session(live: &CellularImsLiveHandle) {
+    cleanup_live_session_with_binding(live, true).await;
+}
+
+async fn cleanup_live_session_with_binding(live: &CellularImsLiveHandle, binding_current: bool) {
     live.operator.set_ready(false);
     let session = live.session.lock().await.take();
     if let Some(session) = session {
@@ -4200,6 +4248,7 @@ async fn cleanup_live_session(live: &CellularImsLiveHandle) {
         // own a private MM object, but the synthetic path is not an MM object
         // that this upper layer may disconnect by itself.
         match session.native_bearer {
+            Some(native) if !binding_current => native_bearer::release_unverified_native_ims_bearer(native).await,
             Some(native) => native_bearer::release_native_ims_bearer(native).await,
             None if session.worker_binding.is_current() => {
                 super::bearer::teardown_bearer_network_in_worker(
@@ -4215,18 +4264,24 @@ async fn cleanup_live_session(live: &CellularImsLiveHandle) {
                 );
             }
         }
-        disable_pcscf_reporting(&session.device.modem_id, session.pcscf_reporting_cid).await;
-        cleanup_ims_profile_lease(session.ims_profile_lease).await;
+        if binding_current {
+            disable_pcscf_reporting(&session.device.modem_id, session.pcscf_reporting_cid).await;
+            cleanup_ims_profile_lease(session.ims_profile_lease).await;
+        }
     }
     if let Some(runtime) = live.supplementary_runtime() {
         runtime
             .clear_registration(ImsRegistrationAccess::CellularIms)
             .await;
     }
-    cleanup_retained_failed_bearer(live).await;
+    cleanup_retained_failed_bearer_with_binding(live, binding_current).await;
 }
 
 async fn cleanup_retained_failed_bearer(live: &CellularImsLiveHandle) {
+    cleanup_retained_failed_bearer_with_binding(live, true).await;
+}
+
+async fn cleanup_retained_failed_bearer_with_binding(live: &CellularImsLiveHandle, binding_current: bool) {
     let Some(retained) = live.failed_bearer.lock().await.take() else {
         return;
     };
@@ -4235,6 +4290,7 @@ async fn cleanup_retained_failed_bearer(live: &CellularImsLiveHandle) {
         tokio::time::sleep(FAILED_BEARER_MIN_RETENTION - elapsed).await;
     }
     match retained.native_bearer {
+        Some(native) if !binding_current => native_bearer::release_unverified_native_ims_bearer(native).await,
         Some(native) => native_bearer::release_native_ims_bearer(native).await,
         None if retained.worker_binding.is_current() => {
             super::bearer::teardown_bearer_network_in_worker(
@@ -4255,8 +4311,10 @@ async fn cleanup_retained_failed_bearer(live: &CellularImsLiveHandle) {
             );
         }
     }
-    disable_pcscf_reporting(&retained.modem_id, retained.pcscf_reporting_cid).await;
-    cleanup_ims_profile_lease(retained.ims_profile_lease).await;
+    if binding_current {
+        disable_pcscf_reporting(&retained.modem_id, retained.pcscf_reporting_cid).await;
+        cleanup_ims_profile_lease(retained.ims_profile_lease).await;
+    }
 }
 
 async fn cleanup_ims_profile_lease(lease: Option<ImsProfileLease>) {
@@ -6691,6 +6749,13 @@ async fn load_device_identity(
         );
         String::new()
     };
+    if let Some((expected, slot)) = runtime.expected_mm_sim() {
+        let observed = key_value(&sim, "sim.properties.iccid")
+            .map(|value| crate::platform::utils::normalize_iccid(&value));
+        if observed.as_deref() != Some(expected.as_str()) || slot != device.uim_slot {
+            return Err(CellularImsError::with_detail(code::BEARER_SESSION_LOST, "mm_sim_identity_changed_or_unavailable"));
+        }
+    }
     let sim_imsi = key_value(&sim, "sim.properties.imsi")
         .filter(|value| value.len() >= 5 && value.bytes().all(|byte| byte.is_ascii_digit()));
     // Resolve the full AID for this slot before a UIM identity fallback needs

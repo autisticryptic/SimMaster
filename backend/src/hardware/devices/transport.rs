@@ -143,6 +143,17 @@ pub trait ImsBearerHandle: Send {
     /// another control connection or sending network probes.
     fn check_liveness(&mut self) -> Result<(), ImsBearerError>;
 
+    /// MM adapters additionally bind their retained session to the SIM used by
+    /// the caller to derive IMS identity. Other transports retain their own
+    /// existing SIM/session generation contract; this hook does not select a CID.
+    fn verify_mm_sim_binding<'a>(
+        &'a mut self,
+        _iccid: &'a str,
+        _slot: u8,
+    ) -> TransportFuture<'a, Result<(), ImsBearerError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Read supplementary P-CSCF on this retained session's own control path.
     /// None means the provider does not implement this observation. An error
     /// must not be retried through a weaker, modem-wide AT association path.
@@ -208,6 +219,8 @@ pub enum ImsBearerFailureHint {
     #[default]
     None,
     BasebandWedged,
+    /// The retained MM SIM/owner binding changed or cannot be verified.
+    BindingChanged,
     NetworkForcedIpv4,
     NetworkForcedIpv6,
 }
