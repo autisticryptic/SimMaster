@@ -3,7 +3,7 @@
 > 更新：2026-09-28。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 最新开发交接：2026-09-28 15:42 UTC
+## 最新开发交接：2026-09-28 16:03 UTC
 
 **用户已要求当前 AI 恢复实施，并逐步更新交接文档。请优先完整阅读
 [NEXT_AI_HANDOFF_2026-09-28.md §0](NEXT_AI_HANDOFF_2026-09-28.md#0-最新续接定时拨号失败与可选非漫游呼叫准入)，尤其 §0.0 的逐步记录。**
@@ -11,11 +11,15 @@
 
 - **新增优先任务**：定时拨号立即 failed 的诊断，以及可选“已注册 VoWiFi / 明确已驻网非漫游蜂窝”语音准入。
   用户要求保留原限制开关，关闭后仍能主动允许漫游接打电话。旧严格模式默认不变，短信保护不变。
-- 语音代码已补齐审查发现的 pending 取消/owner/重复请求边界、VoWiFi 快速路径、配置兼容、MM fresh-home/unique-owner checked call 和前端错误反馈；正在准备候选 CI，尚未部署。
+- **最新语音候选：`1.1.5 / a6a327e1246576c57655ff7c3d615ec4289e18aa`**，已提交并推送，**两套 CI 与双架构制品核验通过，尚未部署**。
+  已补齐 pending 取消/owner/重复请求边界、VoWiFi 快速路径、配置兼容、MM fresh-home/unique-owner checked call 和前端错误反馈。
   定时任务只操作自己创建的 IMS call ID，不再把同号码既有 modem 呼叫或 CLCC index 当成自有资源；取消后保留任务完成精确挂机请求。真实接通/音频/挂机仍需实机验收。
 - 最新本地检查：**192 Python 全通过、11 前端 unit / type-check / lint 通过、定向 rustfmt / diff 通过**；
-  12:38 静态守卫失败与格式 diff 已解决。这批语音 Rust **仍需 Actions 编译/测试**。证据 `.local/evidence/automation-dial/resume-*`。
-  每步最新状态、后续候选 SHA/CI 记录见上述文档 §0.0；不要将旧校准候选的绿色 CI 套用到语音修改。
+  12:38 静态守卫失败与格式 diff 已解决。最新 SHA 的 **28 项新增 Rust/mock/private-D-Bus + 4 项重点兼容测试**在两套日志中均逐项核实为 ok；Rust 只在 Actions 执行。
+  Validate [`36446861013`](https://github.com/autisticryptic/SimMaster/actions/runs/36446861013)（Rust job `109011304514`）、
+  Build [`36446860858`](https://github.com/autisticryptic/SimMaster/actions/runs/36446860858)（Rust `109011983233`、AMD64 `109011983037`、ARM64 `109011983099`）全绿。
+  两架构包已实际下载核对官方 artifact digest、`1.1.5/a6a327e` metadata、ELF、二进制/前端校验；完整证据 `.local/evidence/automation-dial/a6a327e/verified.json`。
+  Publish Release skipped；16:03 UTC 再次核对既有 Release/tag 仍为 `16998ae`。每步记录见上述文档 §0.0。
 - **11:51–11:56 UTC 实机采样**：经固定 SSH 公钥的 Cloudflare Tunnel 连接成功，设备仍运行 `dd8ba1f`，
   `/proc/511308/exe` 哈希与已验证 ARM64 一致；IMS IPsec 已注册、续期计数 4、最近续期 11:14:31 UTC，calls 列表为空。
   没有部署、改资费配置、创建任务、主动拨号、发短信或切卡。
@@ -23,7 +27,9 @@
   `trunk.enabled=false / trunk.vowifi_only=true / vowifi.enabled=false` 是当前阻断条件，不是历史根因已复现的证明。
   该限制以前是刻意的资费保护，不应直接删除；用户新授权通过可选模式实现。
 - 目标号码仅在 `.local/evidence/automation-dial/requested-task.json`，不提交原始号码；**任务周期、持续秒数及主动测试通话授权待确认**。
-- 下面 `dc2355c` 校准候选的 CI/制品证明依旧有效，但候选没有部署；真实换卡与自动重新附着故障注入仍独立待验收。
+- **下一步待用户确认**：主服务部署维护窗口、任务周期/持续秒数、是否允许一次真实测试呼叫。当前设备配置/任务/目标号码均未改，未主动拨号。
+  新条件模式应设置 `vowifi_only=true / allow_home_cellular_calls=true`，保留原开关 false 可允许漫游；不要为方便直接取消全部限制。
+- 下面 `dc2355c` 校准候选的 CI/制品证明依旧有效，语音候选包含其代码但仍未部署；真实换卡与自动重新附着故障注入仍独立待验收。
 
 ## 上一阶段已验证进展：2026-09-28 11:41 UTC
 

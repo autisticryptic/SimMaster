@@ -1,8 +1,8 @@
 # 下一位 AI 接手说明与 Prompt 模板
 
-> **最新续接：2026-09-28 15:42 UTC（北京时间 23:42）。请先读 §0.0 的逐步记录。**
+> **最新续接：2026-09-28 16:03 UTC（北京时间 09-29 00:03）。请先读 §0.0 的逐步记录。**
 > 总入口仍是 [HANDOFF.md](HANDOFF.md)。本文件同时保留上午的 MM 校准交接快照和下午新增的定时拨号/呼叫准入交接。
-> **用户要求由当前 AI 继续实现，并在每个步骤完成后更新本文。语音候选已推送，CI 尚待完成；未部署。**
+> **用户要求由当前 AI 继续实现，并在每个步骤完成后更新本文。语音候选已推送、两套 CI/制品核验通过；尚未部署或真实拨号。**
 > §1–§9 是 10:52 UTC 的历史快照，其中“5 个未提交文件”和首版 CI 状态已过时；§0 的最新状态优先。
 
 ## 0. 最新续接：定时拨号失败与可选非漫游呼叫准入
@@ -11,27 +11,38 @@
 
 - **恢复实施／进行中**：用户取消交给另一位 AI，要求当前 AI 继续，并每步更新本文。
   已核对保留的 20 个在途功能文件；基线 docs-only `fa891c5`，没有重置工作区。
-- **步骤 A：代码审查与回归补齐／代码已补齐，Rust 执行待 CI**（15:42 UTC）。已修 pending action 的 owner/重复请求/取消优先级/异常清理和队列上限；注册 VoWiFi 不等待蜂窝观测；新号码发起/回退有绑定检查；API IMS answer 只报告已请求接听，不提前标成已接通。
+- **步骤 A：代码审查与回归补齐／完成，Rust 执行结果见 C2**（代码 15:42 UTC，验证 16:03 UTC）。已修 pending action 的 owner/重复请求/取消优先级/异常清理和队列上限；注册 VoWiFi 不等待蜂窝观测；新号码发起/回退有绑定检查；API IMS answer 只报告已请求接听，不提前标成已接通。
   新增配置兼容、路由准入/取消、定时拨号所有权、private-D-Bus home 观测和 checked MM owner 变更回归。严格模式仍有原拒绝测试，仅拒绝码改为更明确的 `voice_vowifi_only_required`。
   **安全收口**：定时拨号使用唯一 IMS call ID、订阅启动前的拒绝事件、受保护任务在取消/超时后请求精确挂机；不再借用同号码既有 modem 呼叫或可复用 CLCC index。它暂不做 CS/直接 AT 自动拨号兜底。
   政策检查的普通 MM fallback 改用 unique-owner MM Voice 对象，Create/Start/Accept/失败 Delete 不改投新 owner，不跟随歧义 ATD 自动重拨；旧兼容未检查函数保留，但新 API 调用 checked 入口。
   诊断只发布可识别阶段/原因码，不转发任意 provider 错误文本。真实接通/音频/自动挂机完成仍须实机确认，不能把“已请求挂机”说成网络已结束。
 - **步骤 B：本地允许检查／已通过**（15:42 UTC）：Python **192/192**，前端 **11/11 unit、type-check、lint**，定向 rustfmt 和 diff 检查通过。`resume-python.log`、`resume-frontend-unit.log`、`resume-types.log`、`resume-lint.log` 在 `.local/evidence/automation-dial/`。先前 12:38 的失败已过期；Rust 未在本地编译/测试。
 - **步骤 C1：已提交并推送**（15:45 UTC）：语音候选 **`5ae4f8e6855b4590bc9af8299f884bd76564642c`**，remote `simmaster/master`，无 Release 发布。
-- **步骤 C2：首轮 CI 已有 Rust 成功证据／最终候选继续验证**（15:50 UTC）：`5ae4f8e` 的 Validate `36445913787` 和 Frontend `36445913454` 已 success，Build `36445913545` 尚在运行。首轮新增 **26 项 Rust/mock/private-D-Bus 测试**进入验证清单，逐项日志与双架构仍待下载核验。
-  后续复核将 API call plan 的线路引用改为 Weak，避免路线表/线路对象形成持有环；另补旧接入换代后不得接收旧呼叫控制、等待过程中放宽开关不能追认旧请求两项回归。此小补强须单独提交并按最新 SHA 重新核验，不能用首轮成功代替。证据 `.local/evidence/automation-dial/5ae4f8e/status.json`。
+- **步骤 C2：最新代码 CI 已完成**（16:03 UTC）：最终语音候选 **`a6a327e1246576c57655ff7c3d615ec4289e18aa`** 已推送，包含 Weak 引用防持有环及两项换代补强；首轮 `5ae4f8e` 亦通过 CI，但不再是部署目标。
+  [Validate `36446861013`](https://github.com/autisticryptic/SimMaster/actions/runs/36446861013) 的 Rust job `109011304514` success；
+  [Build `36446860858`](https://github.com/autisticryptic/SimMaster/actions/runs/36446860858) 的 Rust job `109011983233`、AMD64 `109011983037`、ARM64 `109011983099` 全部 success，Publish Release skipped。
+  两套测试日志均已实际下载并核对官方 digest；**28 项新增 Rust/mock/private-D-Bus 回归 + 4 项重点兼容回归在两套日志中均逐项为 ok**，不是仅查看绿色 workflow。
+  单独 Frontend Checks 对 backend-only push 不触发，但两套必需 workflow 的前端 job 均 success；本地 11 项前端 unit/type-check/lint 也通过。
+- **步骤 C3：最新制品核验已完成**：ARM64 artifact `10981625555`、AMD64 artifact `10981635676` 均实际下载，
+  核对 GitHub 官方 artifact SHA-256、包内 `1.1.5 / a6a327e`、ELF 架构及二进制/前端校验。
+  ARM64 包 SHA-256 `d313a62d27aead78b93a2bb9a57c070ffd6f8a4f2851b8bd841d6e39fc34ff1a`；
+  AMD64 包 SHA-256 `75999c2bd0c14df27021295c2de3c561cbae32a8597fd315c4545f2f1dc9cbb0`。
+  完整证据 `.local/evidence/automation-dial/a6a327e/verified.json`、`jobs-*`、`tests-*`、`release-unchanged.json`；可复核脚本 `.local/evidence/automation-dial/verify_ci.py`。
+  Release `397300521 / v1.1.5` 再次确认仍指向 `16998ae`，未覆盖、未移 tag。
 - **步骤 D：部署／任务配置／真实通话验收／待授权细节**。周期、持续秒数、测试次数及维护窗口仍待确认，不自动拨号。
 
-### 0.1 三个版本必须分开
+### 0.1 版本必须分开
 
 | 范围 | 最新事实 |
 |---|---|
 | 已发布 Release | `v1.1.5 / 16998ae3c5172890075b2392ded3ce9c711d72b8`；没有覆盖或移动 tag |
 | 已验证但未部署的 MM 校准候选 | **`dc2355c095f08c075f4d6b334c3f5982a9cfc609`**，已经推送 GitHub，两套 Actions / 双架构成功 |
-| 最近实机采样 | **仍为 `1.1.5 / dd8ba1f`**，不是 `dc2355c`，也不含下面的语音在途修改 |
+| 最新语音候选（含校准） | **`a6a327e1246576c57655ff7c3d615ec4289e18aa`**，两套 CI/28 新回归/双架构制品核验成功；未部署 |
+| 最近实机采样 | **`1.1.5 / dd8ba1f`**（11:51–11:56 UTC），不含校准/语音候选；本轮恢复实施后没有再次连接设备证明实时状态 |
 
 本轮开始语音实现前的代码 HEAD 为 `f3164480c1ab8954cfba1cf30f9244212ecc6866`（仅补充校准验证文档）。
-本次交接若有后继 docs-only commit，**不意味着语音工作树代码已提交**。以 `git status` / `git diff` 为准。
+语音功能已随 `5ae4f8e` + `a6a327e` 提交；此前的 20 文件未提交清单已转为历史记录。
+后继 docs-only commit 不改变候选二进制 SHA。以 §0.0 和实际 Git 为准，不用文档 HEAD 替代候选 commit。
 
 ### 0.2 上午的 MM 校准任务已推进到哪里
 
@@ -187,9 +198,9 @@
 
 - [x] 原校准补强提交 `dc2355c`，两套 CI、14 项新增测试和双架构制品核验。
 - [x] 本次经 Tunnel 连接并核实版本、健康 IMS、空任务列表和语音限制配置。
-- [ ] 审查并完成上表未提交语音代码；处理 Python 静态守卫失败，定向 rustfmt，再跑完整本地允许检查。
-- [ ] 补齐新资费开关兼容、MM fresh-home fake-D-Bus、取消/回退/接听/mock 以及用户可见错误测试。
-- [ ] 显式选择要提交的功能文件，推送 `simmaster`，核验**最新完整 SHA** 的两套 CI、测试明细和双架构制品；不覆盖旧 Release。
+- [x] 代码阶段审查及本地检查完成；Python 192 全通过、定向 rustfmt/diff、前端 11 unit/type-check/lint 通过。
+- [x] 新资费兼容、fresh-home private-D-Bus、取消/回退/接听/mock 和前端反馈回归进入 CI；最新 SHA 两套实际通过。
+- [x] 已推送 `a6a327e`；最新完整 SHA 的两套 CI、28 新测试与双架构制品核验完成，旧 Release 未覆盖。
 - [ ] 确认维护影响后部署验证候选；包含校准补丁但不能将其部署称为切卡验收。直接覆盖、不建备份，保留配置/数据库。
 - [ ] 重新只读确认目标线路/home 状态，按用户授权设置新条件模式，保留原无限制开关；当前设备配置尚未改。
 - [ ] 用户确认周期/时间、持续秒数后配置目标号码；设备任务为空，不凭空恢复旧时间表。真实测试通话需确认次数/时长。
@@ -224,10 +235,12 @@ docs/IMS_MM_SIM_BINDING_CALIBRATION.md、docs/IMS_REGISTRATION_POLICY.md，然�
 历史只有call任务触发记录，没有失败链，不要把配置推断写成已复现根因。
 语音候选的最新工作树/提交/CI状态以本文§0.0为准，不要把历史17+3文件清单当当前清单。
 15:42本地192 Python、11前端unit/type-check/lint及定向rustfmt已通过，较早1 failure已解决；
-Rust编译测试必须在Actions，未取得对应SHA证据前不能部署。
+语音候选a6a327e的两套Actions、28新增Rust/mock/private-D-Bus回归和双架构已验证（见§0.0）；
+尚未部署，后续不要重开这些已完成代码步骤。
 
-请先审查§0.8风险，尤其pending准入/取消/回退/接听和当前SIM/owner绑定；补回归与中文错误反馈，
-修静态守卫接线而非删门禁。完成本地允许检查后提交simmaster，核对最新完整SHA的Actions测试明细/双架构。
+§0.8是之前的审查清单，已实施补强与CI结果见§0.0。下一步先确认维护窗口及定时任务周期/持续秒数/测试授权；
+再核实设备实时版本/通话/网络状态，使用已验证a6a327e制品部署。条件模式设置vowifi_only=true且allow_home_cellular_calls=true，
+原开关false仍表示用户主动解除限制；短信保护不变。不要未经确认创建会立刻触发的interval任务。
 保留原IPv4v6→IPv6→IPv4、P-CSCF归属和恢复预算，不扩大native、切卡、故障注入或自动重拨范围。
 部署须确认维护影响，直接覆盖不建备份但保留数据；配置号码/执行任务前确认时间、持续秒数和测试授权。
 请先报告核实后的完成/未完成和下一步，再继续。
