@@ -3,11 +3,19 @@
 > 更新：2026-09-28。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 最新开发交接：2026-09-28 16:35 UTC
+## 最新阶段收尾：2026-09-28 16:52 UTC
 
-**用户已要求当前 AI 恢复实施，并逐步更新交接文档。请优先完整阅读
+**用户已确认测试来电送达，要求完成文档后阶段性结束。本轮不再操作设备。请优先完整阅读
 [NEXT_AI_HANDOFF_2026-09-28.md §0](NEXT_AI_HANDOFF_2026-09-28.md#0-最新续接定时拨号失败与可选非漫游呼叫准入)，尤其 §0.0 的逐步记录。**
-该节取代同文件上午 §1–§9 的过期状态，包含最新需求、代码清单、失败检查与可复制 Prompt。
+该节取代同文件上午 §1–§9 的过期状态，包含逐步验证、用户确认、阶段收尾、保留边界和后续任务。
+
+**16:52:07 UTC 最终只读核验：** 实际主程序仍是 `a6a327e / PID808982`，二进制哈希与ARM64制品一致；
+IMS `registered / ipsec / derived_3gpp_lte_46011`，本版本新注册时间 **16:27:54 UTC**，`last_error=null`，home、活动通话0，测试任务disabled。
+证据 `.local/evidence/automation-dial/a6a327e/stage-closeout.json`。因此“最新含 CID 自动校准补强的版本可以实际注册 IMS”已有实机证据；
+**不等于真实换卡后的自动校准全链路已验收**。本版本自然续期计数目前0，不借用旧dd8ba1f的续期证据。
+
+本阶段完成：代码/CI/双架构核验、部署、新版本IMS注册、按用户标准的测试来电送达。
+保留后续：§0.11的拨号任务结果分类、真实换卡/恢复故障注入、接通后音频/时长及原长期事项；不笼统宣称所有模块没有问题。
 
 - **新增优先任务**：定时拨号立即 failed 的诊断，以及可选“已注册 VoWiFi / 明确已驻网非漫游蜂窝”语音准入。
   用户要求保留原限制开关，关闭后仍能主动允许漫游接打电话。旧严格模式默认不变，短信保护不变。
@@ -32,8 +40,10 @@
   已设置并读回 `vowifi_only=true / allow_home_cellular_calls=true`，其他线路配置/短信未变。
   任务 `task-voice-acceptance-a6a327e` 已创建：目标与用户给定号码匹配，60秒、默认disabled（每日04:00仅作可编辑时间表）。
   **16:31:57 UTC 只立即触发一次**：预检 home/IMS注册/calls=0；设备 dialing→ringing，16:32:29终局 SIP408/Q85031，任务failed、未接通。
-  **16:34:32 calls=[]，没有重拨**。已问用户是否实际收到来电，尚未答复，不能把设备侧ringing或请求accepted当验收成功。
-  下一步如用户未收到，诊断 INVITE/临时响应/终局408，不清预算、不重复播放立即触发请求。证据 `.local/evidence/automation-dial/a6a327e/{deployment,task-configured,immediate-trigger,call-observations,post-call}.json`。
+  **用户已确认看到了北京时间00:32的未接电话，只是错过接听**。按用户“收到电话即成功”的约定，**来电送达验收通过**；未接听，不代表音频或接通后时长验收通过。
+  **16:34:32 calls=[]，没有重拨**，任务保持disabled。现有failed/408历史不改写。证据 `.local/evidence/automation-dial/a6a327e/{deployment,task-configured,immediate-trigger,call-observations,post-call}.json`，用户确认见本轮会话及私有requested-task.json。
+- **新增后续待办（仅登记，未实现）**：用户要求自定义/计划拨号中，对方未接听、非本端原因超时等情况算拨号任务success，而非failed；仍保存真实SIP/Q850/未接听结果，不把本端故障或所有408都成功化。
+  详细任务列表在 [NEXT_AI_HANDOFF §0.11](NEXT_AI_HANDOFF_2026-09-28.md#011-新增后续任务区分拨号任务成功与对端接听结果尚未实现)。当前 `observe_call` / `task_outcome` 仍使用原失败分类。
 - 下面 `dc2355c` 校准候选的 CI/制品证明依旧有效，已部署语音程序包含其代码；真实换卡与自动重新附着故障注入仍独立待验收。
 
 ## 上一阶段已验证进展：2026-09-28 11:41 UTC
