@@ -5100,10 +5100,13 @@ async fn start_routed_ims_voice_call(
     if force_vowifi && !has_vowifi {
         return Err("vowifi_voice_ready_not_reached".to_string());
     }
-    let scoped_line = Arc::clone(&line);
+    let scoped_line = Arc::downgrade(&line);
     let config = Arc::clone(&app.config_manager);
     plan = plan.with_admission(
         Arc::new(move || {
+            let Some(scoped_line) = scoped_line.upgrade() else {
+                return false;
+            };
             let profile = config.get_line_profile(&expected.line_id);
             profile.enabled
                 && !cancelled

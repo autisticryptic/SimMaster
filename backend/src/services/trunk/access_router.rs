@@ -1725,6 +1725,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_access_cannot_receive_an_old_calls_hangup() {
+        let cell = OperatorLink::default();
+        let mut commands = cell.subscribe_commands();
+        cell.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![(AccessPathKind::CellularIms, cell.clone())],
+        );
+        let trunk = router.operator_link();
+        let mut events = trunk.subscribe_events();
+        router
+            .start_call(call_plan("retired-access"))
+            .await
+            .unwrap();
+        recv_command(&mut commands).await;
+        assert!(matches!(
+            recv_event(&mut events).await,
+            OperatorEvent::Started { .. }
+        ));
+        cell.set_ready(false);
+        cell.set_ready(true);
+        trunk
+            .send_command(OperatorCommand::HangupCall {
+                call_id: "retired-access".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_event(&mut events).await,
+            OperatorEvent::Unavailable { .. }
+        ));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn relaxing_policy_during_home_wait_does_not_bless_an_old_attempt() {
+        let cell = OperatorLink::default();
+        let mut commands = cell.subscribe_commands();
+        cell.set_ready(true);
+        let router = Arc::new(VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![(AccessPathKind::CellularIms, cell)],
+        ));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let e = Arc::clone(&entered);
+        let r = Arc::clone(&release);
+        router.set_home_voice_observer(Arc::new(move || {
+            let e = Arc::clone(&e);
+            let r = Arc::clone(&r);
+            Box::pin(async move {
+                e.notify_one();
+                r.notified().await;
+                false
+            })
+        }));
+        router.set_trunk_voice_cost_policy(true, true);
+        let clone = Arc::clone(&router);
+        let task = tokio::spawn(async move { clone.start_call(call_plan("old-restricted")).await });
+        entered.notified().await;
+        router.set_trunk_vowifi_only(false);
+        release.notify_one();
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            VoiceCallStartError::RegisteredHomeRequired
+        );
+        assert!(commands.try_recv().is_err());
+        assert!(router
+            .start_call(call_plan("new-unrestricted"))
+            .await
+            .is_ok());
+        assert!(matches!(
+            recv_command(&mut commands).await,
+            OperatorCommand::StartCall { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn registered_wifi_never_waits_for_home_observation() {
         let wifi = OperatorLink::default();
         let mut commands = wifi.subscribe_commands();

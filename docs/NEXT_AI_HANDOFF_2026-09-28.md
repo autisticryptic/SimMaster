@@ -2,7 +2,7 @@
 
 > **最新续接：2026-09-28 15:42 UTC（北京时间 23:42）。请先读 §0.0 的逐步记录。**
 > 总入口仍是 [HANDOFF.md](HANDOFF.md)。本文件同时保留上午的 MM 校准交接快照和下午新增的定时拨号/呼叫准入交接。
-> **用户随后要求由当前 AI 继续实现，并在每个步骤完成后更新本文。语音工作树仍待完成验证；不因恢复实施而视为已提交/部署。**
+> **用户要求由当前 AI 继续实现，并在每个步骤完成后更新本文。语音候选已推送，CI 尚待完成；未部署。**
 > §1–§9 是 10:52 UTC 的历史快照，其中“5 个未提交文件”和首版 CI 状态已过时；§0 的最新状态优先。
 
 ## 0. 最新续接：定时拨号失败与可选非漫游呼叫准入
@@ -17,7 +17,9 @@
   政策检查的普通 MM fallback 改用 unique-owner MM Voice 对象，Create/Start/Accept/失败 Delete 不改投新 owner，不跟随歧义 ATD 自动重拨；旧兼容未检查函数保留，但新 API 调用 checked 入口。
   诊断只发布可识别阶段/原因码，不转发任意 provider 错误文本。真实接通/音频/自动挂机完成仍须实机确认，不能把“已请求挂机”说成网络已结束。
 - **步骤 B：本地允许检查／已通过**（15:42 UTC）：Python **192/192**，前端 **11/11 unit、type-check、lint**，定向 rustfmt 和 diff 检查通过。`resume-python.log`、`resume-frontend-unit.log`、`resume-types.log`、`resume-lint.log` 在 `.local/evidence/automation-dial/`。先前 12:38 的失败已过期；Rust 未在本地编译/测试。
-- **步骤 C：提交与最新 SHA 的 Actions／进行中**。对应语音修改必须重新编译/测试和核验双架构。
+- **步骤 C1：已提交并推送**（15:45 UTC）：语音候选 **`5ae4f8e6855b4590bc9af8299f884bd76564642c`**，remote `simmaster/master`，无 Release 发布。
+- **步骤 C2：首轮 CI 已有 Rust 成功证据／最终候选继续验证**（15:50 UTC）：`5ae4f8e` 的 Validate `36445913787` 和 Frontend `36445913454` 已 success，Build `36445913545` 尚在运行。首轮新增 **26 项 Rust/mock/private-D-Bus 测试**进入验证清单，逐项日志与双架构仍待下载核验。
+  后续复核将 API call plan 的线路引用改为 Weak，避免路线表/线路对象形成持有环；另补旧接入换代后不得接收旧呼叫控制、等待过程中放宽开关不能追认旧请求两项回归。此小补强须单独提交并按最新 SHA 重新核验，不能用首轮成功代替。证据 `.local/evidence/automation-dial/5ae4f8e/status.json`。
 - **步骤 D：部署／任务配置／真实通话验收／待授权细节**。周期、持续秒数、测试次数及维护窗口仍待确认，不自动拨号。
 
 ### 0.1 三个版本必须分开
