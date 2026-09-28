@@ -3,7 +3,7 @@
 > 更新：2026-09-28。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 最新开发进展：2026-09-28 11:26 UTC
+## 最新开发进展：2026-09-28 11:41 UTC
 
 本轮已按用户要求恢复实现；历史交接快照保留在
 [接手说明与可复制 Prompt](NEXT_AI_HANDOFF_2026-09-28.md)，以下记录优先于该快照。
@@ -16,10 +16,37 @@
 - 新增补强包括：全线路先同步失效再异步 reconcile；MM discovery 失败不伪造 absence；派生 SIM 在 Create 前及 SIP 前后核验；
   终止性绑定错误贯穿设置读取/清理错误；恢复 reporting 在取得串行锁后重验 SIM/槽位/策略；未知网络清理保留 receipt；
   Create 前持久化 intent，歧义结果或 lease+Delete 失败保持阻断，不丢弃晚到的 Create 回复。
-- 本地 **188 项 Python 测试、定向 rustfmt、diff 检查通过**。上述最新修改仍需对应 SHA 的 Actions Rust/双架构验证；
-  不能用首版 CI 代替。本轮证据目录 `.local/evidence/mm-cid-calibration/resume/`。
+- **最新已验证校准候选：`1.1.5 / dc2355c095f08c075f4d6b334c3f5982a9cfc609`**，已推送 `simmaster/master`。
+  本地 **188 项 Python、定向 rustfmt、diff 检查通过**；两套 Actions、14 项新增 Rust/mock/D-Bus 回归及双架构制品已核验，详见下节。
+  后续仅文档提交不改变这个二进制候选 SHA，不用文档 HEAD 或旧 Release 代替制品 commit。
 - 自动校准整体仍未实机验收；真实切卡/外部 eSIM 切换及自动重新附着故障注入须用户另行确认维护窗口。
 - 设计与限制：[MM SIM/承载绑定校准](IMS_MM_SIM_BINDING_CALIBRATION.md)。
+
+### 校准候选的代码/CI 验证（未部署）
+
+- [Validate `36416118351`](https://github.com/autisticryptic/SimMaster/actions/runs/36416118351)：success；
+  Rust 回归 job `108907556481` 实际完成编译、硬件无关测试和隔离 D-Bus 测试。
+- [Build `36416117791`](https://github.com/autisticryptic/SimMaster/actions/runs/36416117791)：success；
+  Rust 回归 job `108907860151`、ARM64 job `108907860170`、AMD64 job `108907860149` 均 success。
+  前端构建/测试也通过；Publish Release 按 push 门禁 skipped。
+- 实际下载两套测试日志并核对 **14 个新增测试名均为 `ok`**，不是仅查看 workflow 标题。
+  覆盖 slot=0/非法槽、未知库存暂停、旧任务状态与 AKA 拒绝、IP 读取期间换卡、串行锁内 reporting 准入、
+  终止性错误/族循环、owner 丢失 receipt 与 Create intent 保留。测试日志 artifact digest 同样已校验。
+- 两架构包均实际下载：GitHub 官方 artifact SHA-256、包内 `1.1.5 / dc2355c`、ELF 架构、二进制与前端校验均匹配。
+
+| 架构 | Artifact ID | 包 SHA-256 |
+|---|---|---|
+| ARM64 | `10967856151` | `cdf7ab74683778f8a59795e242f61294f5e98332b45dfbb66261e2a4851e9a25` |
+| AMD64 | `10968306519` | `40bd4932f136d5b4197fb3b5ce0d271b512191448092142d4cc786eea96285d1` |
+
+完整 artifact digest、二进制哈希、metadata、run/job/step 与逐项测试证据：
+`.local/evidence/mm-cid-calibration/resume/dc2355c/verified.json` 及同目录 `jobs-*`、`tests-*`、`release-unchanged.json`。
+再次只读核实：Release `397300521 / v1.1.5` 仍指向 `16998ae3c5172890075b2392ded3ce9c711d72b8`；未覆盖、未移 tag。
+
+**下一步必须先确认维护窗口：** 当次核实设备状态、无通话及管理链路后，才可按用户批准覆盖部署候选（不创建备份，
+保留配置/数据库/历史证据），随后分别验收正常注册/自然续期、用户安排的 eSIM/实体换卡、外部切换。
+自动重新附着故障分支需独立故障注入授权及可用的一次性预算；预算已消耗时不清除、不靠应用重启重置。
+未进行上述实机步骤，不能宣称自动校准或自动重新附着实机验收完成。未知 `.create`/network receipt 仍需独立人工核验，不自动删除解锁。
 
 以下既有 SIM-06 修复/发布记录保留作已验证基线，不能与新校准候选混同。
 
