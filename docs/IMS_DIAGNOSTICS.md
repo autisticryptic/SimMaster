@@ -310,11 +310,35 @@ MM/secondary 的 PID 不变。证据：`.local/evidence/sim06/deploy-02dfdc5/add
 - 真实 Disable 前再次经原 MM unique owner 查询 ListCalls，未知/有通话不执行破坏性步骤；
   Low Power 写入前及等待循环内重查意图/身份。失败明确显示 degraded/modem/exhausted，
   不因清理重置而停留在 starting。新增硬件无关取消/状态等待/诊断回归；本地 179 项 Python 检查通过。
-- 自动路径仍需新构建与部署核验；当前已启用 reporting 的已注册设备不应为强制覆盖测试而关回上报、
+- 后继 `dd8ba1f` 新构建与部署已核验（见下节）；自动重新附着的实机故障注入分支仍未验收。
+  当前已启用 reporting 的已注册设备不应为强制覆盖测试而关回上报、
   清除预算或反复重新附着。预算仅在同一系统启动内的 MM owner/device/SIM 范围持久有效，
   不宣称跨系统重启或 MM owner 变化后永久耗尽。
 
 
+
+### 2026-09-28 09:49 UTC 注册与自然续期收尾
+
+本轮重新读取两份历史会话后，以当前设备和 GitHub 状态纠正交接滞后：
+
+- `dd8ba1f` 的 Build `36392766359`、Validate `36392766357` 均 success。
+  已重新校验本地双架构 artifact digest、包/二进制 SHA-256 及日志中的 21 项新增 Rust 回归；
+  其中 12 项为 MM 恢复/取消/状态等待回归。本地 179 项 Python 测试通过。
+- 设备安装 metadata 为 `1.1.5 / dd8ba1f`；当前 PID 511308 的运行二进制 SHA-256
+  `3ae12007b981bbeb0efca220365b8701f391ab16009346fa7ad457f072900e4d` 与 ARM64 制品一致。
+  采样前后进程稳定，MM PID 410、secondary PID 283。本轮未重复部署、未重新附着。
+- 同线路 API 确认 `registered=true`、`registration_mode=ipsec`、有效源为 derived，
+  profile 为 `derived_3gpp_lte_46011`。07:54:27 UTC 初始注册成功；08:44:28、09:34:30 UTC
+  的 `REGISTER_SUCCESS register_phase=refresh` 与 API 续期时间/计数 2 对应。
+  三个配置槽的有效源均为 derived，第三槽轮换 P-CSCF 后成功，不归功于数据库专用配置。
+- 原 `ipv4v6 → ipv6 → ipv4` 顺序保留。实际授予 IPv6，不是固定 IPv6 配置。
+- **注册与自然续期已验证；新自动重新附着分支的实机故障注入未验证。** 当前 P-CSCF 已存在，
+  不能将普通自动注册的 `recovery_source=automatic` 当作该分支触发证据。不为测试而关闭上报、
+  清除预算或破坏健康会话；取消/恢复边界目前依赖硬件无关回归，不扩称全设备验收。
+
+本轮证据位于 `.local/session-review/` 的 `verified-runtime.json`、`connection-result.txt`、
+`current-ci.json`、`python-tests.log`；既有制品与回归证据位于 `deploy-dd8ba1f/`。
+本次仅核验既有部署，不覆盖 Release，不将短信、通话、native 或长期业务矩阵勾选完成。
 
 ### 部署授权及取证文件
 

@@ -12,7 +12,9 @@
    2026-09-27/28 已通过固定公钥 SSH 与只读 API 重连；当前已覆盖为 **`1.1.5 / 02dfdc5`**，
    MM 默认后端。经本次明确授权的一次 reporting/重新附着窗口，**06:32:29 UTC 已实际注册成功（IPsec）**。
    有两个 P-CSCF，实际 profile 仍为标准 derived；前两槽认证失败，第三槽轮换 P-CSCF 后成功。
-   通用的一次性自动恢复正在实现/验证，不能把手动维护成功直接视为新恢复代码已验收。
+   **09:49 UTC 续接核验：设备实际已运行 `1.1.5 / dd8ba1f`，IPsec 已注册并完成两次自然续期。**
+   下述 `02dfdc5` 为历史维护基线，不是当前运行版本。通用恢复及取消安全补强的 CI、制品和部署
+   已核验；故意制造 P-CSCF 缺失的自动重新附着实机分支仍未验收，不打断健康会话来强测。
    当前 CID 1=`ctlte`、CID 2=`ctwap` 保持原样；CID 3=`IPV4V6/ims`。
    IPv6-only 对照无效且被用户指出会影响原兜底，已撤销，**不得用固定 IPv6 替代原地址族策略**。
    新现场与部署进展见 [IMS 诊断 §9](IMS_DIAGNOSTICS.md#9-sim-06-现场与-cid-修复2026-09-2728)。
@@ -33,7 +35,7 @@ SIM-04 自然续期、SIM-05 手动测试已由用户确认完成，不重复等
 | 同机不同 modem 混合 MM/native | 尚未实现；目前全局二选一 |
 | 未知孤儿资源自动恢复、完全统一跨旧 IMS 的去重/通知恰好一次 | 不在已实现承诺内；未知 receipt 保持阻断 |
 | 双注册、多线路、VoWiFi/视频、UT/MWI、E911、CS 音频、1.1.6 | 保留各自实现或实机/发布门槛，不能一并勾选完成 |
-| SIM-06 | `02dfdc5` 经已授权 MM 维护后初始 IPsec 注册成功；通用恢复收尾及自然续期仍待核验 |
+| SIM-06 | `dd8ba1f` 已部署，IPsec 注册及两次自然续期通过；自动重新附着故障注入分支仍未实机验收 |
 
 详见 [原生后端当前状态](NATIVE_BACKEND_STATUS.md)。旧总计划存在日期较早的条目，
 逐项以最新代码和证据核对，不机械地把所有旧复选框重开或清空。
@@ -131,13 +133,30 @@ SIM-04 自然续期、SIM-05 手动测试已由用户确认完成，不重复等
 - 本地脚本误把 MM 的 REGISTERED 状态 8 写成 `>=9`，因此其等待阶段报告超时；这不是网络未恢复的
   证据。只读日志随后确认驻网恢复，程序取得两个 P-CSCF 并在 06:32:29 UTC 完成 IPsec 注册。
   MM/secondary PID 未变，只有主服务按维护操作重启。证据在 `.local/evidence/sim06/deploy-02dfdc5/`。
-- 正在加入的通用恢复：只在派生配置最终停于 P-CSCF、普通发现/各 profile 槽位耗尽后考虑；
+- 已实现并通过 CI、部署核验的通用恢复（`7896e05`，取消安全补强 `dd8ba1f`）：只在派生配置最终停于 P-CSCF、普通发现/各 profile 槽位耗尽后考虑；
   严格绑定原 MM owner/lease/SIM/实际 grant，唯一活动且实际 APN 匹配的上下文仅作恢复提示，
   **不放宽现有 P-CSCF 地址归属规则**。无通话/数据/VoWiFi或同 modem 其他线路冲突时，释放原 lease
   后至多一次恢复，再运行原 profile 和地址族顺序。预算持久化到 `/run`，普通重试/应用重启不重置。
   不硬编码 MCC/MNC/APN，不调用 native/direct WDS，不向初始 EPS 或现有 profile 写入新值。
 - ZIP 与 6 份生产入口文件的字节已再次核验一致；ZIP 注册走 Python 独立 WDS 路径，不能将其
   固定 IPv6/3gnet 激活直接套入本项目 MM 修复。暂不需要新 IDA 解析；确需具体 beta8 分支时再通知用户开启 MCP。
+
+### 2026-09-28 09:49 UTC 最新验收
+
+- GitHub Build `36392766359`、Validate `36392766357` 均 success，对应完整提交
+  `dd8ba1f7314150e10c5ce38cafcb18c8c0cf735c`。两架构制品摘要、包/二进制哈希及 21 项新增 Rust
+  回归重新核验通过；本地 179 项 Python 检查通过。
+- 当前 `/proc/511308/exe` SHA-256 为
+  `3ae12007b981bbeb0efca220365b8701f391ab16009346fa7ad457f072900e4d`，与 ARM64 制品一致。
+  MM PID 410、secondary PID 283；本轮仅只读采证，没有重复部署或重启。
+- 同线路 API 确认 `registered=true / ipsec`，有效 profile 为 `derived_3gpp_lte_46011`。
+  初始注册 07:54:27 UTC；08:44:28、09:34:30 UTC 两次自然续期成功，计数为 2。
+  地址族顺序仍为 `ipv4v6 → ipv6 → ipv4`，本次实际 IPv6 不代表固定 IPv6。
+- 已完成：设备重连、恢复补丁 CI/制品/部署核验、SIM-06 初始注册及自然续期核验。
+  未验收：故障注入触发的自动重新附着全链路及取消分支；不关闭 reporting、不清预算强测。
+  API 的 `recovery_source=automatic` 不能单独证明新重新附着分支执行过。
+- 证据：`.local/session-review/verified-runtime.json`、`connection-result.txt`、`current-ci.json`、
+  `python-tests.log`，及 `.local/evidence/sim06/deploy-dd8ba1f/`。旧 Release 仍未覆盖。
 
 ## 6. 本地资料布局
 
