@@ -233,7 +233,32 @@ MM PID 410、secondary PID 283 均未变化。现场仍在创建 profile 前被
 原因是生产 `control::at_command` 通过 **mmcli stdout** 返回 `response: '…'` 外壳，
 而新增严格定义/能力校验只接受纯 AT payload；D-Bus 的原始回复与 CLI 输出不能混为一谈。
 已补充只剥离完整已知外壳的归一化，并增加完整创建流程的 CLI 回包测试、残缺外壳/ERROR 回包拒绝测试。
-后继版须独立 CI 与覆盖验证，不能以首次候选 CI 通过代替实际注册。
+后继 `02dfdc5` 的 Build `36370931907` 与 Validate `36370931916` 均实际成功，9 项新增
+Rust 回归执行通过，本地 173 项 Python 检查通过。已于 02:55 UTC 直接覆盖部署，无新增备份。
+实际二进制 SHA-256=`8041d6860fd5866245517bdf450183a643e82e307df792632711b186358e4784`。
+
+新程序成功创建 `CID 3 / IPV4V6 / ims`，并执行 `REPORTING_ENABLED cid=3`；原 CID 1/2 未改。
+但三次尝试仍为 `context_pcscf_absent`，没有 REGISTER。只读查询进一步发现：
+
+- MM Bearer Properties 报 `profile-id=3`、APN=ims、已连接、授予 IPv6。
+- AT `CGACT?` 仅 CID 1 活动；`CGCONTRDP=1` 实际 APN 为 ims，地址与 MM 同 /64、不同 IID，
+  仅 7 个字段（无 P-CSCF 列）。CID 3 未活动、`CGPADDR=3` 未给有效地址。
+- QMI profile 列表明确 profile 1/2/3 的 PDP context number 分别为 1/2/3，不是简单静态编号偏移。
+- 本机 MM 为 1.18.4；其 profile pin 优先加载 profile 的 PDP 类型，不保证调用者的 `ip-type` 覆盖它。
+
+### 撤销 IPv6-only 对照，保留原兜底
+
+仅对本次程序新建、确认已释放的 CID 3 做过一次 `IPV4V6 → IPV6` 单变量对照，未修改源码的
+默认策略或持久化 `cellular_ims_ip_families`，也未修改原 `ctlte/ctwap`。该对照**仍未获得 P-CSCF**。
+用户指出这种固定 profile 类型会干扰原 `ipv4v6 → ipv6 → ipv4` 兜底，意见成立：MM pin 会优先
+使用 profile 类型，所以“配置顺序没改”不等于真实兜底完全不受影响。
+
+已于 2026-09-28 03:23 UTC 撤销这个实验，读回确认 CID 3 为 **IPV4V6/ims**，CID 1/2 完全保留，
+配置顺序仍为 `ipv4v6 → ipv6 → ipv4`。未回滚程序，仍运行 `1.1.5 / 02dfdc5`，PID 307733，
+MM/secondary 的 PID 不变。证据：`.local/evidence/sim06/deploy-02dfdc5/address-family-restored.json`。
+后续不得把固定 IPv6 当作最终修复，也不能据此宣布其他族/配置已验收；继续围绕实际 MM bearer、
+活动 PDP 与 PCO 来源排查，保留并正确实现原地址族策略。
+
 
 
 ### 部署授权及取证文件

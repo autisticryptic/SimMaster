@@ -9,11 +9,11 @@
    Build-Release `36253740079` 已全绿，GitHub `/releases/latest` 已为 `v1.1.5`。
    两架构包实际下载后确认 SHA-256、包内版本/commit 与 ELF 架构一致，不是只改 Release 标题。
 2. **SIM-06 中国电信 IMS 注册失败**：用户已确认上线并授权修复、提交 GitHub、部署新的 **1.1.5 构建**。
-   2026-09-27/28 已通过固定公钥 SSH 与只读 API 重连；设备仍运行 `1.1.4-beta3 / 2129282`，
-   MM 默认后端，三次自动尝试停在 P-CSCF，尚未进入 REGISTER。
-   现场缺少独立 `ims` PDP 定义，CID 1=`ctlte`、CID 2=`ctwap`；首选 CID 冲突后走 APN-only，
-   没有启用对应 profile 的 P-CSCF reporting。新建空闲、支持的 IMS CID 是待实测的修复，
-   不是已证明注册成功。新现场与部署进展见 [IMS 诊断 §9](IMS_DIAGNOSTICS.md#9-sim-06-现场与-cid-修复2026-09-2728)。
+   2026-09-27/28 已通过固定公钥 SSH 与只读 API 重连；当前已覆盖为 **`1.1.5 / 02dfdc5`**，
+   MM 默认后端。空闲 IMS CID 3 已创建、reporting 已打开，但 P-CSCF 仍未取得，尚未进入 REGISTER。
+   当前 CID 1=`ctlte`、CID 2=`ctwap` 保持原样；CID 3=`IPV4V6/ims`。
+   IPv6-only 对照无效且被用户指出会影响原兜底，已撤销，**不得用固定 IPv6 替代原地址族策略**。
+   新现场与部署进展见 [IMS 诊断 §9](IMS_DIAGNOSTICS.md#9-sim-06-现场与-cid-修复2026-09-2728)。
 3. native 真机及其他长期任务按 [开发总计划](DEVELOPMENT_PLAN.md) 和
    [后端路线图](MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md) 单独推进，不并行抢占同一设备。
 
@@ -31,7 +31,7 @@ SIM-04 自然续期、SIM-05 手动测试已由用户确认完成，不重复等
 | 同机不同 modem 混合 MM/native | 尚未实现；目前全局二选一 |
 | 未知孤儿资源自动恢复、完全统一跨旧 IMS 的去重/通知恰好一次 | 不在已实现承诺内；未知 receipt 保持阻断 |
 | 双注册、多线路、VoWiFi/视频、UT/MWI、E911、CS 音频、1.1.6 | 保留各自实现或实机/发布门槛，不能一并勾选完成 |
-| SIM-06 | 已定位缺少 IMS profile、CID 2 被占用后没有启用 reporting 的前置失败；新 CID 修复仍待部署/实机验收 |
+| SIM-06 | 空闲 CID/reporting 与 CLI 适配已部署；P-CSCF 仍缺失，注册未成功，不能标完成 |
 
 详见 [原生后端当前状态](NATIVE_BACKEND_STATUS.md)。旧总计划存在日期较早的条目，
 逐项以最新代码和证据核对，不机械地把所有旧复选框重开或清空。
@@ -105,7 +105,14 @@ SIM-04 自然续期、SIM-05 手动测试已由用户确认完成，不重复等
 - 已于 2026-09-28 部署 `1.1.5 / e0ade97`，实际主进程 SHA-256 为
   `badb454b965a4e68d3e69b7c7ddf1dbaf035fe4eebaea62527ef5189894a6c33`；主服务更新，MM/secondary 未重启。
   实机发现 `mmcli` 的 `response: '…'` 外壳被新校验拒绝，仍未创建 IMS CID，注册未成功；
-  已追加外壳归一化和真实格式回归，后继版尚待 CI/覆盖验证。
+  已追加外壳归一化和真实格式回归，后继 `02dfdc5` 的 Build `36370931907` 与 Validate `36370931916`
+  均通过，9 项新增回归实际执行。已直接覆盖部署，主进程实际 SHA-256 为
+  `8041d6860fd5866245517bdf450183a643e82e307df792632711b186358e4784`。
+- `02dfdc5` 已实际创建 CID 3、打开 reporting，但 P-CSCF 仍缺失；AT 活动 CID 与 MM profile pin
+  的对应关系仍待排查，不能认定“创建 profile 就一定修好”。仅本次新建的 CID 3 曾临时改为 IPv6，
+  对照无效；用户指出会干扰原兜底后，已于 2026-09-28 03:23 UTC 明确撤销为 **IPV4V6**。
+  当前主服务 PID 307733，仍为 `02dfdc5`；配置 `ipv4v6 → ipv6 → ipv4` 未改，原 CID 1/2 未改。
+  固定 MM profile 的 PDP 类型会优先于请求族，后续应修正真实兜底接线，不再用固定 IPv6 绕过。
 - **用户最新要求：实验机直接覆盖，不再保留备份。** 本次新建的部署备份已按要求删除；
   后续不再创建备份，不删除既有历史诊断、私密资料或用户数据。仍先确认无通话、管理走 `wlan0`、
   制品与目标一致；不得重启 modem/MM、修改 Initial EPS、NV/USB 或扩大到 SIM-04/05 测试。
