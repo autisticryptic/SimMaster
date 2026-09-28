@@ -41,6 +41,8 @@ import {
   SmartToy,
 } from '@mui/icons-material'
 import { api } from '../api/current'
+import { persistAutomationConfig } from '../utils/automationConfig'
+import { humanizeCostPolicyError } from '../policies/imsRegistration'
 import type {
   AutomationConfig,
   AutomationTask,
@@ -274,24 +276,21 @@ export default function AutomationCenter({ lineId, embedded = false, fixedTarget
 
   // Save config immediately to backend
   const updateConfig = async (newConfig: AutomationConfig) => {
-    try {
-      const configToSave = { ...newConfig, enabled: true }
-      const res = await api.setAutomationConfig(configToSave)
-      if (res.status === 'ok') {
-        setConfig(configToSave)
-        void loadData()
-      } else {
-        setError(res.message)
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    }
+    setError(null)
+    setSuccess(null)
+    const saved = await persistAutomationConfig(newConfig, (value) => api.setAutomationConfig(value))
+    setConfig(saved)
+    void loadData()
   }
 
   // Toggle single task enabled
   const handleToggleTask = async (taskId: string, checked: boolean) => {
     const nextTasks = config.tasks.map((t) => (t.id === taskId ? { ...t, enabled: checked } : t))
-    await updateConfig({ ...config, tasks: nextTasks })
+    try {
+      await updateConfig({ ...config, tasks: nextTasks })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
   }
 
   // Delete task click
@@ -304,10 +303,14 @@ export default function AutomationCenter({ lineId, embedded = false, fixedTarget
   const handleConfirmDelete = async () => {
     if (!taskToDelete) return
     const nextTasks = config.tasks.filter((t) => t.id !== taskToDelete.id)
-    setDeleteConfirmOpen(false)
-    await updateConfig({ ...config, tasks: nextTasks })
-    setSuccess('任务删除成功')
-    setTaskToDelete(null)
+    try {
+      await updateConfig({ ...config, tasks: nextTasks })
+      setDeleteConfirmOpen(false)
+      setSuccess('任务删除成功')
+      setTaskToDelete(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
   }
 
   // Manual Trigger Run
@@ -658,7 +661,7 @@ export default function AutomationCenter({ lineId, embedded = false, fixedTarget
                           {log.status === 'success' ? '成功' : '失败'}
                         </TableCell>
                         <TableCell sx={{ fontWeight: 400, wordBreak: 'break-all' }} title={log.detail}>
-                          {log.detail}
+                          {humanizeCostPolicyError(log.detail)}
                         </TableCell>
                       </TableRow>
                     ))

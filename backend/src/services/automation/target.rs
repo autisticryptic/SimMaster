@@ -25,6 +25,14 @@ pub fn target_line_id(target: Option<&AutomationTarget>) -> Option<&str> {
     }
 }
 
+fn canonical_line_id(line_id: &str) -> Result<String> {
+    let line_id = line_id.trim();
+    if line_id.is_empty() {
+        return Err(anyhow!("automation_target_line_required"));
+    }
+    Ok(line_id.to_string())
+}
+
 pub async fn resolve_line_target(
     app: &AppState,
     params: &serde_json::Value,
@@ -35,7 +43,7 @@ pub async fn resolve_line_target(
         .map(|value| serde_json::from_value::<AutomationTarget>(value.clone()))
         .transpose()?;
     let requested_line_id = match target {
-        Some(AutomationTarget::ModemLine { line_id }) => line_id,
+        Some(AutomationTarget::ModemLine { line_id }) => canonical_line_id(&line_id)?,
         Some(AutomationTarget::StandaloneSimSlot { slot_id }) => {
             let slot = app
                 .config_manager
@@ -105,6 +113,19 @@ pub async fn resolve_modem_target(
 #[cfg(test)]
 mod tests {
     use crate::platform::config::AutomationTarget;
+
+    #[test]
+    fn automation_target_matches_normal_call_whitespace_handling() {
+        assert_eq!(
+            super::canonical_line_id("  line-test\n").unwrap(),
+            "line-test"
+        );
+        assert_eq!(
+            super::canonical_line_id("line-other").unwrap(),
+            "line-other"
+        );
+        assert!(super::canonical_line_id(" \t ").is_err());
+    }
 
     #[test]
     fn modem_target_json_keeps_the_explicit_line() {

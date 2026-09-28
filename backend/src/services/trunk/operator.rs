@@ -29,8 +29,10 @@ pub struct OperatorLink {
 
 struct OperatorLinkInner {
     ready: AtomicBool,
+    access_generation: AtomicU64,
     video_enabled: AtomicBool,
     incoming_call_allowed: AtomicBool,
+    incoming_auto_answer_allowed: AtomicBool,
     trunk_local_ip: RwLock<Option<IpAddr>>,
     incoming_mode: RwLock<TrunkIncomingMode>,
     ip_connect_mode: RwLock<TrunkIpConnectMode>,
@@ -145,8 +147,10 @@ impl Default for OperatorLink {
         Self {
             inner: Arc::new(OperatorLinkInner {
                 ready: AtomicBool::new(false),
+                access_generation: AtomicU64::new(0),
                 video_enabled: AtomicBool::new(false),
                 incoming_call_allowed: AtomicBool::new(true),
+                incoming_auto_answer_allowed: AtomicBool::new(true),
                 trunk_local_ip: RwLock::new(None),
                 incoming_mode: RwLock::new(TrunkIncomingMode::default()),
                 ip_connect_mode: RwLock::new(TrunkIpConnectMode::default()),
@@ -173,12 +177,29 @@ impl OperatorLink {
         self.inner.incoming_call_allowed.load(Ordering::SeqCst)
     }
 
+    pub fn set_incoming_auto_answer_allowed(&self, allowed: bool) {
+        self.inner
+            .incoming_auto_answer_allowed
+            .store(allowed, Ordering::SeqCst);
+    }
+
     pub fn may_auto_answer_incoming(&self) -> bool {
-        self.incoming_call_allowed() && self.incoming_mode() == TrunkIncomingMode::BoundImmediate
+        self.incoming_call_allowed()
+            && self
+                .inner
+                .incoming_auto_answer_allowed
+                .load(Ordering::SeqCst)
+            && self.incoming_mode() == TrunkIncomingMode::BoundImmediate
     }
 
     pub fn set_ready(&self, ready: bool) {
-        self.inner.ready.store(ready, Ordering::SeqCst);
+        if self.inner.ready.swap(ready, Ordering::SeqCst) && !ready {
+            self.inner.access_generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub fn access_generation(&self) -> u64 {
+        self.inner.access_generation.load(Ordering::SeqCst)
     }
 
     pub fn is_available(&self) -> bool {

@@ -111,7 +111,7 @@ impl BasebandWedgeState {
 }
 
 pub struct LineRuntime {
-    binding: RwLock<ModemBinding>,
+    binding: Arc<RwLock<ModemBinding>>,
     /// Per-UE identity for this line. Every access leg (VoLTE, VoWiFi, data
     /// proxy, trunk) resolves through this context, which owns the line's
     /// mandatory Linux network namespace.
@@ -254,7 +254,7 @@ impl LineRuntime {
             None => devices::cellular_data_transport(device_kind),
         };
         Self {
-            binding: RwLock::new(binding),
+            binding: Arc::new(RwLock::new(binding)),
             ue: RwLock::new(ue_context),
             ue_worker: UeWorkerHandle::for_line(&line_id, namespace),
             cellular_ims,
@@ -449,6 +449,37 @@ impl LineRuntime {
         self.vowifi_restore_running.load(Ordering::SeqCst)
     }
 
+    fn bind_voice_home_observer(&self, observations: Arc<dyn ModemObservationProvider>) {
+        let binding = Arc::clone(&self.binding);
+        let runtime = Arc::clone(&self.cellular_ims);
+        self.voice_access.set_home_voice_observer(Arc::new(move || {
+            let binding = Arc::clone(&binding);
+            let runtime = Arc::clone(&runtime);
+            let observations = Arc::clone(&observations);
+            Box::pin(async move {
+                let before = binding.read().unwrap_or_else(|p| p.into_inner()).clone();
+                let generation = runtime.generation();
+                if !before.present || before.slot_conflict || !runtime.mm_binding_ready() {
+                    return false;
+                }
+                let home = observations
+                    .registered_home_voice(&before)
+                    .await
+                    .unwrap_or(false);
+                let after = binding.read().unwrap_or_else(|p| p.into_inner());
+                home && runtime.generation() == generation
+                    && runtime.mm_binding_ready()
+                    && after.present
+                    && !after.slot_conflict
+                    && before.modem_path == after.modem_path
+                    && before.sim_path == after.sim_path
+                    && before.sim_iccid == after.sim_iccid
+                    && before.uim_slot == after.uim_slot
+                    && before.primary_port == after.primary_port
+            })
+        }));
+    }
+
     fn effective_trunk_profile(&self, profile: &TrunkProfileConfig) -> TrunkProfileConfig {
         let mut effective = profile.clone();
         if !self.binding().present {
@@ -459,8 +490,10 @@ impl LineRuntime {
 
     pub async fn activate_trunk_profile(&self, profile: &TrunkProfileConfig) -> TrunkRuntimeStatus {
         let effective = self.effective_trunk_profile(profile);
-        self.voice_access
-            .set_trunk_vowifi_only(effective.vowifi_only);
+        self.voice_access.set_trunk_voice_cost_policy(
+            effective.vowifi_only,
+            effective.allow_home_cellular_calls,
+        );
         self.trunk.activate_profile(&effective).await;
         self.trunk.status().await
     }
@@ -470,8 +503,10 @@ impl LineRuntime {
         profile: &TrunkProfileConfig,
     ) -> TrunkRuntimeStatus {
         let effective = self.effective_trunk_profile(profile);
-        self.voice_access
-            .set_trunk_vowifi_only(effective.vowifi_only);
+        self.voice_access.set_trunk_voice_cost_policy(
+            effective.vowifi_only,
+            effective.allow_home_cellular_calls,
+        );
         self.trunk.reconcile_profile(&effective).await;
         self.trunk.status().await
     }
@@ -621,6 +656,7 @@ impl LineRuntimeRegistry {
             VoicePathPolicy::default(),
             DeviceKind::Unknown,
         ));
+        line.bind_voice_home_observer(Arc::clone(&self.observations));
         self.lines.write().await.insert(line_id, Arc::clone(&line));
         line
     }
@@ -869,6 +905,7 @@ impl LineRuntimeRegistry {
                     voice_policy,
                     self.device_kind,
                 ));
+                line.bind_voice_home_observer(Arc::clone(&self.observations));
                 new_lines.push((line_id, line));
             }
 

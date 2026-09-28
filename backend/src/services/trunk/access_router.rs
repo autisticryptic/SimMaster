@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
         Arc, RwLock,
     },
     time::Duration,
@@ -24,6 +24,48 @@ use super::{
     operator::{OperatorDiagnostics, OperatorLink},
 };
 
+/// Read-only, per-line evidence. It must never enable radio or establish IMS.
+pub type HomeVoiceObserver =
+    Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, bool> + Send + Sync>;
+
+#[derive(Default)]
+struct VoiceCostGate {
+    // 0: unrestricted legacy policy; 1: strict VoWiFi; 2: VoWiFi or verified home.
+    mode: AtomicU8,
+    observer: RwLock<Option<HomeVoiceObserver>>,
+}
+
+impl VoiceCostGate {
+    fn incoming_vowifi_only(&self) -> bool {
+        self.mode.load(Ordering::SeqCst) == 1
+    }
+
+    fn combined_mode(&self, initial: u8) -> u8 {
+        let current = self.mode.load(Ordering::SeqCst);
+        if initial == 1 || current == 1 {
+            1
+        } else if initial == 2 || current == 2 {
+            2
+        } else {
+            0
+        }
+    }
+
+    async fn registered_home(&self) -> bool {
+        let observer = self
+            .observer
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(observer) = observer else {
+            return false;
+        };
+        tokio::time::timeout(Duration::from_millis(800), observer())
+            .await
+            .unwrap_or(false)
+    }
+}
+
 #[derive(Clone)]
 struct AccessBackend {
     kind: AccessPathKind,
@@ -32,6 +74,7 @@ struct AccessBackend {
 
 struct CallRoute {
     owner: AccessPathKind,
+    access_generation: u64,
     remaining: Vec<AccessPathKind>,
     start: Option<OperatorCommand>,
     /// Present only for a local/API call whose media offer varies by access.
@@ -47,13 +90,15 @@ struct CallRoute {
 /// between the LTE and ePDG catalog records, however, and the selected leg
 /// must receive the matching media offer.  This plan keeps both facts
 /// together: selection remains centralized while media remains access-aware.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VoiceCallPlan {
     pub call_id: String,
     pub caller: String,
     pub callee: String,
     pub trunk_local_ip: std::net::IpAddr,
     offers: Vec<(AccessPathKind, super::bridge::MediaOffer)>,
+    admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    initial_cost_mode: u8,
 }
 
 impl VoiceCallPlan {
@@ -69,7 +114,30 @@ impl VoiceCallPlan {
             callee: callee.into(),
             trunk_local_ip,
             offers: Vec::new(),
+            admission: None,
+            initial_cost_mode: 0,
         }
+    }
+
+    pub fn with_admission(
+        mut self,
+        check: Arc<dyn Fn() -> bool + Send + Sync>,
+        only_wifi: bool,
+        allow_home: bool,
+    ) -> Self {
+        self.admission = Some(check);
+        self.initial_cost_mode = if !only_wifi {
+            0
+        } else if allow_home {
+            2
+        } else {
+            1
+        };
+        self
+    }
+
+    fn admission_current(&self) -> bool {
+        self.admission.as_ref().is_none_or(|check| check())
     }
 
     pub fn with_offer(mut self, access: AccessPathKind, offer: super::bridge::MediaOffer) -> Self {
@@ -114,6 +182,9 @@ pub struct RoutedVoiceCall {
 pub enum VoiceCallStartError {
     RouterUnavailable,
     RouteTimedOut,
+    CallAlreadyExists,
+    WifiOnlyRequired,
+    RegisteredHomeRequired,
     NoEligibleImsAccess,
 }
 
@@ -122,6 +193,9 @@ impl VoiceCallStartError {
         match self {
             Self::RouterUnavailable => "voice_access_router_unavailable",
             Self::RouteTimedOut => "voice_access_router_timeout",
+            Self::CallAlreadyExists => "voice_call_already_pending",
+            Self::WifiOnlyRequired => "voice_vowifi_only_required",
+            Self::RegisteredHomeRequired => "voice_registered_home_required",
             Self::NoEligibleImsAccess => "voice_ims_access_unavailable",
         }
     }
@@ -155,7 +229,7 @@ pub struct VoiceAccessRouter {
     backends: Vec<AccessBackend>,
     requests: Option<mpsc::Sender<RouterRequest>>,
     task: Option<JoinHandle<()>>,
-    trunk_vowifi_only: Arc<AtomicBool>,
+    cost_gate: Arc<VoiceCostGate>,
 }
 
 impl VoiceAccessRouter {
@@ -168,8 +242,8 @@ impl VoiceAccessRouter {
             .collect::<Vec<_>>();
 
         let (requests, request_rx) = mpsc::channel(16);
-        let trunk_vowifi_only = Arc::new(AtomicBool::new(false));
-        sync_incoming_permissions(&current_policy(&policy), &backends, false);
+        let cost_gate = Arc::new(VoiceCostGate::default());
+        sync_incoming_permissions(&current_policy(&policy), &backends, false, false);
 
         let task = tokio::runtime::Handle::try_current().ok().map(|handle| {
             let command_rx = trunk.subscribe_commands();
@@ -180,13 +254,13 @@ impl VoiceAccessRouter {
             let trunk_task = trunk.clone();
             let policy_task = Arc::clone(&policy);
             let backends_task = backends.clone();
-            let vowifi_only_task = Arc::clone(&trunk_vowifi_only);
+            let cost_task = Arc::clone(&cost_gate);
             handle.spawn(async move {
                 run_router(
                     trunk_task,
                     policy_task,
                     backends_task,
-                    vowifi_only_task,
+                    cost_task,
                     command_rx,
                     event_receivers,
                     request_rx,
@@ -201,7 +275,7 @@ impl VoiceAccessRouter {
             backends,
             requests: task.as_ref().map(|_| requests),
             task,
-            trunk_vowifi_only,
+            cost_gate,
         }
     }
 
@@ -217,13 +291,44 @@ impl VoiceAccessRouter {
         sync_incoming_permissions(
             &current_policy(&self.policy),
             &self.backends,
-            self.trunk_vowifi_only.load(Ordering::SeqCst),
+            self.cost_gate.incoming_vowifi_only(),
+            self.cost_gate.mode.load(Ordering::SeqCst) == 2,
         );
     }
 
     pub fn set_trunk_vowifi_only(&self, enabled: bool) {
-        self.trunk_vowifi_only.store(enabled, Ordering::SeqCst);
-        sync_incoming_permissions(&current_policy(&self.policy), &self.backends, enabled);
+        self.set_trunk_voice_cost_policy(enabled, false);
+    }
+
+    pub fn set_trunk_voice_cost_policy(&self, vowifi_only: bool, allow_home: bool) {
+        self.cost_gate.mode.store(
+            if !vowifi_only {
+                0
+            } else if allow_home {
+                2
+            } else {
+                1
+            },
+            Ordering::SeqCst,
+        );
+        sync_incoming_permissions(
+            &current_policy(&self.policy),
+            &self.backends,
+            vowifi_only && !allow_home,
+            vowifi_only && allow_home,
+        );
+    }
+
+    pub fn set_home_voice_observer(&self, observer: HomeVoiceObserver) {
+        *self
+            .cost_gate
+            .observer
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = Some(observer);
+    }
+
+    pub async fn registered_home_voice(&self) -> bool {
+        self.cost_gate.registered_home().await
     }
 
     pub fn set_backend_video_enabled(&self, kind: AccessPathKind, enabled: bool) {
@@ -276,7 +381,7 @@ impl VoiceAccessRouter {
             })
             .await
             .map_err(|_| VoiceCallStartError::RouterUnavailable)?;
-        match tokio::time::timeout(Duration::from_secs(1), response_rx).await {
+        match tokio::time::timeout(Duration::from_secs(2), response_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(VoiceCallStartError::RouterUnavailable),
             Err(_) => Err(VoiceCallStartError::RouteTimedOut),
@@ -311,11 +416,206 @@ impl Drop for VoiceAccessRouter {
     }
 }
 
+enum CostCheckedAction {
+    Command(OperatorCommand),
+    Request {
+        plan: VoiceCallPlan,
+        response: oneshot::Sender<Result<RoutedVoiceCall, VoiceCallStartError>>,
+    },
+    Event(AccessPathKind, OperatorEvent),
+}
+
+impl CostCheckedAction {
+    fn call_id(&self) -> &str {
+        match self {
+            Self::Command(command) => command_call_id(command),
+            Self::Request { plan, .. } => &plan.call_id,
+            Self::Event(_, event) => event_call_id(event),
+        }
+    }
+
+    fn needs_admission(&self) -> bool {
+        matches!(
+            self,
+            Self::Request { .. }
+                | Self::Command(
+                    OperatorCommand::StartCall { .. }
+                        | OperatorCommand::AcceptCall { .. }
+                        | OperatorCommand::TransferCall { .. }
+                )
+                | Self::Event(
+                    _,
+                    OperatorEvent::Incoming { .. } | OperatorEvent::Unavailable { .. }
+                )
+        )
+    }
+
+    fn cancels_pending(&self) -> bool {
+        match self {
+            Self::Command(command) => is_terminal_command(command),
+            Self::Event(_, event) => {
+                matches!(event, OperatorEvent::Answered { .. })
+                    || (is_terminal_event(event)
+                        && !matches!(event, OperatorEvent::Unavailable { .. }))
+            }
+            _ => false,
+        }
+    }
+}
+
+struct PendingAdmission {
+    ticket: u64,
+    initial: u8,
+    owner: Option<AccessPathKind>,
+    action: CostCheckedAction,
+    task: tokio::task::AbortHandle,
+}
+
+fn action_owner(
+    action: &CostCheckedAction,
+    routes: &HashMap<String, CallRoute>,
+) -> Option<AccessPathKind> {
+    routes
+        .get(action.call_id())
+        .map(|route| route.owner)
+        .or_else(|| match action {
+            CostCheckedAction::Event(kind, OperatorEvent::Incoming { .. }) => Some(*kind),
+            _ => None,
+        })
+}
+
+fn needs_home_observation(
+    action: &CostCheckedAction,
+    policy: &RwLock<VoicePathPolicy>,
+    backends: &[AccessBackend],
+    routes: &HashMap<String, CallRoute>,
+) -> bool {
+    if !action.needs_admission() {
+        return false;
+    }
+    let first = match action {
+        CostCheckedAction::Request { plan, .. } => {
+            route_plan(&current_policy(policy), backends, false)
+                .into_iter()
+                .find(|kind| plan.command_for(*kind).is_some())
+        }
+        CostCheckedAction::Command(OperatorCommand::StartCall { offer, .. }) => {
+            route_plan(&current_policy(policy), backends, offer.video.is_some())
+                .first()
+                .copied()
+        }
+        CostCheckedAction::Event(kind, OperatorEvent::Incoming { .. }) => Some(*kind),
+        CostCheckedAction::Event(_, OperatorEvent::Unavailable { .. }) => routes
+            .get(action.call_id())
+            .and_then(|route| route.remaining.first().copied()),
+        _ => routes.get(action.call_id()).map(|route| route.owner),
+    };
+    first.is_some_and(|kind| kind != AccessPathKind::Vowifi)
+}
+
+fn reject_cost_checked(
+    action: CostCheckedAction,
+    trunk: &OperatorLink,
+    backends: &[AccessBackend],
+    routes: &mut HashMap<String, CallRoute>,
+    modes: &mut HashMap<String, u8>,
+) {
+    let call_id = action.call_id().to_string();
+    match action {
+        CostCheckedAction::Request { response, .. } => {
+            let _ = response.send(Err(VoiceCallStartError::RouterUnavailable));
+        }
+        CostCheckedAction::Event(kind, OperatorEvent::Incoming { .. }) => {
+            reject_incoming_collision(kind, &call_id, backends)
+        }
+        CostCheckedAction::Command(OperatorCommand::TransferCall { .. }) => {
+            trunk.send_event(OperatorEvent::TransferResponse {
+                call_id: call_id.clone(),
+                status: 503,
+            })
+        }
+        CostCheckedAction::Command(OperatorCommand::AcceptCall { .. }) => {
+            if let Some(route) = routes.remove(&call_id) {
+                reject_incoming_collision(route.owner, &call_id, backends);
+            }
+            trunk.send_event(OperatorEvent::Unavailable {
+                call_id: call_id.clone(),
+            });
+        }
+        _ => {
+            routes.remove(&call_id);
+            trunk.send_event(OperatorEvent::Unavailable {
+                call_id: call_id.clone(),
+            });
+        }
+    }
+    if !routes.contains_key(&call_id) {
+        modes.remove(&call_id);
+    }
+}
+
+fn dispatch_cost_checked(
+    action: CostCheckedAction,
+    initial_mode: u8,
+    only_wifi: bool,
+    trunk: &OperatorLink,
+    policy: &RwLock<VoicePathPolicy>,
+    backends: &[AccessBackend],
+    routes: &mut HashMap<String, CallRoute>,
+    modes: &mut HashMap<String, u8>,
+) {
+    let call_id = action.call_id().to_string();
+    match action {
+        CostCheckedAction::Command(command) => {
+            route_command(command, trunk, policy, backends, routes, only_wifi)
+        }
+        CostCheckedAction::Event(kind, event) => {
+            route_event(kind, event, trunk, policy, backends, routes, only_wifi)
+        }
+        CostCheckedAction::Request { plan, response } => {
+            if response.is_closed() {
+                return;
+            }
+            let result = route_call_plan(plan, trunk, policy, backends, routes, only_wifi).map_err(
+                |error| {
+                    if error == VoiceCallStartError::NoEligibleImsAccess && only_wifi {
+                        match initial_mode {
+                            1 => VoiceCallStartError::WifiOnlyRequired,
+                            2 => VoiceCallStartError::RegisteredHomeRequired,
+                            _ => error,
+                        }
+                    } else {
+                        error
+                    }
+                },
+            );
+            if response.send(result).is_err() && routes.contains_key(&call_id) {
+                // The waiter disappeared between the final check and delivery.
+                route_command(
+                    OperatorCommand::CancelCall {
+                        call_id: call_id.clone(),
+                    },
+                    trunk,
+                    policy,
+                    backends,
+                    routes,
+                    only_wifi,
+                );
+            }
+        }
+    }
+    if routes.contains_key(&call_id) {
+        modes.insert(call_id, initial_mode);
+    } else {
+        modes.remove(&call_id);
+    }
+}
+
 async fn run_router(
     trunk: OperatorLink,
     policy: Arc<RwLock<VoicePathPolicy>>,
     backends: Vec<AccessBackend>,
-    trunk_vowifi_only: Arc<AtomicBool>,
+    cost_gate: Arc<VoiceCostGate>,
     mut commands: tokio::sync::broadcast::Receiver<OperatorCommand>,
     event_receivers: Vec<(
         AccessPathKind,
@@ -350,6 +650,10 @@ async fn run_router(
     drop(event_tx);
 
     let mut routes = HashMap::<String, CallRoute>::new();
+    let mut modes = HashMap::<String, u8>::new();
+    let mut pending = HashMap::<String, PendingAdmission>::new();
+    let mut admissions = tokio::task::JoinSet::<(String, u64, bool, std::time::Instant)>::new();
+    let mut revision = 0_u64;
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -359,37 +663,168 @@ async fn run_router(
             &policy,
             &backends,
             &routes,
-            trunk_vowifi_only.load(Ordering::SeqCst),
+            cost_gate.incoming_vowifi_only(),
+            cost_gate.mode.load(Ordering::SeqCst) == 1,
+            cost_gate.mode.load(Ordering::SeqCst) == 2,
         );
-        tokio::select! {
+        // Observations run separately so Cancel/Hangup/Ended can invalidate
+        // pending starts and failovers before any late result is dispatched.
+        let action = tokio::select! {
+            // A cancellation already buffered at dispatch wins over observation
+            // completion. New cancellation linearizes when received here.
+            biased;
             command = commands.recv() => match command {
-                Ok(command) => route_command(command, &trunk, &policy, &backends, &mut routes, trunk_vowifi_only.load(Ordering::SeqCst)),
+                Ok(command) => CostCheckedAction::Command(command),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::error!(skipped, "Trunk access command receiver lagged");
+                    for (_, item) in pending.drain() {
+                        item.task.abort();
+                        reject_cost_checked(item.action, &trunk, &backends, &mut routes, &mut modes);
+                    }
+                    continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
             request = requests.recv() => match request {
                 Some(RouterRequest::StartCall { plan, response }) => {
-                    // A timed-out HTTP caller drops its receiver. Do not start
-                    // a dial after reporting an error to that caller.
-                    if response.is_closed() {
-                        continue;
-                    }
-                    let result = route_call_plan(plan, &trunk, &policy, &backends, &mut routes, trunk_vowifi_only.load(Ordering::SeqCst));
-                    let _ = response.send(result);
+                    if response.is_closed() { continue; }
+                    CostCheckedAction::Request { plan, response }
                 }
                 Some(RouterRequest::CallAccess { call_id, response }) => {
-                    let access = routes.get(&call_id).map(|route| route.owner);
-                    let _ = response.send(access);
+                    let _ = response.send(routes.get(&call_id).map(|route| route.owner)); continue;
                 }
                 None => break,
             },
             event = events.recv() => match event {
-                Some((kind, event)) => route_event(kind, event, &trunk, &policy, &backends, &mut routes, trunk_vowifi_only.load(Ordering::SeqCst)),
+                Some((kind, event)) => CostCheckedAction::Event(kind, event),
                 None => break,
             },
-            _ = ticker.tick() => {}
+            result = admissions.join_next(), if !admissions.is_empty() => {
+                if let Some(Ok((call_id, ticket, home, checked_at))) = result {
+                    if pending.get(&call_id).is_some_and(|item| item.ticket == ticket) {
+                        let item = pending.remove(&call_id).expect("ticket matched");
+                        let mode = cost_gate.combined_mode(item.initial);
+                        let fresh = std::time::Instant::now().duration_since(checked_at) < Duration::from_millis(250);
+                        dispatch_cost_checked(item.action, mode, mode == 1 || (mode == 2 && !(home && fresh)),
+                            &trunk, &policy, &backends, &mut routes, &mut modes);
+                    }
+                }
+                continue;
+            },
+            _ = ticker.tick() => continue,
+        };
+        let call_id = action.call_id().to_string();
+        let owner = routes
+            .get(&call_id)
+            .map(|route| route.owner)
+            .or_else(|| pending.get(&call_id).and_then(|item| item.owner));
+        if let CostCheckedAction::Event(kind, event) = &action {
+            if owner.is_some_and(|owner| owner != *kind) {
+                if matches!(event, OperatorEvent::Incoming { .. }) {
+                    reject_incoming_collision(*kind, &call_id, &backends);
+                }
+                continue; // A retired/foreign leg cannot cancel the current owner.
+            }
+        }
+        if action.cancels_pending() {
+            if let Some(item) = pending.remove(&call_id) {
+                item.task.abort();
+            }
+        }
+        let requested_mode = match &action {
+            CostCheckedAction::Request { plan, .. } => plan.initial_cost_mode,
+            _ => modes.get(&call_id).copied().unwrap_or(0),
+        };
+        let initial = cost_gate.combined_mode(requested_mode);
+        if pending.contains_key(&call_id) && action.needs_admission() {
+            match &action {
+                CostCheckedAction::Event(_, OperatorEvent::Unavailable { .. }) => {
+                    // Access loss while waiting to accept/transfer is terminal,
+                    // not permission to dispatch the now stale queued command.
+                    let item = pending.remove(&call_id).expect("pending action");
+                    item.task.abort();
+                    if let Some(route) = routes.get_mut(&call_id) {
+                        route.remaining.clear();
+                    }
+                    dispatch_cost_checked(
+                        action,
+                        initial,
+                        true,
+                        &trunk,
+                        &policy,
+                        &backends,
+                        &mut routes,
+                        &mut modes,
+                    );
+                }
+                CostCheckedAction::Request { .. } => {
+                    if let CostCheckedAction::Request { response, .. } = action {
+                        let _ = response.send(Err(VoiceCallStartError::CallAlreadyExists));
+                    }
+                }
+                CostCheckedAction::Event(_, OperatorEvent::Incoming { .. }) => {} // same-owner retransmission
+                CostCheckedAction::Command(OperatorCommand::TransferCall { .. }) => {
+                    trunk.send_event(OperatorEvent::TransferResponse {
+                        call_id,
+                        status: 491,
+                    });
+                }
+                _ => {} // duplicate Start/Accept does not replace the original request
+            }
+            continue;
+        }
+        if matches!(
+            &action,
+            CostCheckedAction::Request { .. }
+                | CostCheckedAction::Command(OperatorCommand::StartCall { .. })
+        ) && routes.contains_key(&call_id)
+        {
+            if let CostCheckedAction::Request { response, .. } = action {
+                let _ = response.send(Err(VoiceCallStartError::CallAlreadyExists));
+            }
+            continue;
+        }
+        if initial == 2 && needs_home_observation(&action, &policy, &backends, &routes) {
+            if pending.len() >= 16 {
+                reject_cost_checked(action, &trunk, &backends, &mut routes, &mut modes);
+                continue;
+            }
+            revision = revision.wrapping_add(1);
+            let ticket = revision;
+            let gate = Arc::clone(&cost_gate);
+            let pending_id = call_id.clone();
+            let task = admissions.spawn(async move {
+                use futures_util::FutureExt;
+                let home = std::panic::AssertUnwindSafe(async { gate.registered_home().await })
+                    .catch_unwind()
+                    .await
+                    .unwrap_or(false);
+                (pending_id, ticket, home, std::time::Instant::now())
+            });
+            pending.insert(
+                call_id,
+                PendingAdmission {
+                    ticket,
+                    initial,
+                    owner: action_owner(&action, &routes),
+                    action,
+                    task,
+                },
+            );
+        } else {
+            // Without a home observation, only WiFi is eligible in conditional
+            // mode. Retain potential fallback candidates for a later new check.
+            let only_wifi = initial != 0;
+            dispatch_cost_checked(
+                action,
+                initial,
+                only_wifi,
+                &trunk,
+                &policy,
+                &backends,
+                &mut routes,
+                &mut modes,
+            );
         }
     }
 
@@ -405,10 +840,16 @@ fn route_call_plan(
     routes: &mut HashMap<String, CallRoute>,
     vowifi_only: bool,
 ) -> Result<RoutedVoiceCall, VoiceCallStartError> {
-    let candidates = route_plan_for_trunk(&current_policy(policy), backends, false, vowifi_only);
+    if !plan.admission_current() {
+        return Err(VoiceCallStartError::RouterUnavailable);
+    }
+    let candidates = route_plan(&current_policy(policy), backends, false);
     let mut remaining = candidates.clone();
     while let Some(kind) = remaining.first().copied() {
         remaining.remove(0);
+        if vowifi_only && kind != AccessPathKind::Vowifi {
+            continue;
+        }
         let Some(command) = plan.command_for(kind) else {
             continue;
         };
@@ -431,6 +872,7 @@ fn route_call_plan(
                     remaining,
                     start: Some(command),
                     start_plan: Some(plan.clone()),
+                    access_generation: selected.link.access_generation(),
                 },
             );
             return Ok(RoutedVoiceCall {
@@ -493,10 +935,14 @@ fn refresh_router_state(
     backends: &[AccessBackend],
     routes: &HashMap<String, CallRoute>,
     vowifi_only: bool,
+    outgoing_vowifi_only: bool,
+    guarded_home: bool,
 ) {
     let policy = current_policy(policy);
-    sync_incoming_permissions(&policy, backends, vowifi_only);
-    let candidates = route_plan_for_trunk(&policy, backends, false, vowifi_only);
+    sync_incoming_permissions(&policy, backends, vowifi_only, guarded_home);
+    // This is potential availability, not admission. Every actual outgoing
+    // start/failover below still requires its own fresh home observation.
+    let candidates = route_plan_for_trunk(&policy, backends, false, outgoing_vowifi_only);
     let owned_consumer = routes.values().any(|route| {
         backend(backends, route.owner).is_some_and(|backend| backend.link.has_command_consumer())
     });
@@ -544,8 +990,14 @@ fn sync_incoming_permissions(
     policy: &VoicePathPolicy,
     backends: &[AccessBackend],
     vowifi_only: bool,
+    guarded_home: bool,
 ) {
     for backend in backends {
+        // In conditional mode cellular may signal an incoming call, but cannot
+        // send an automatic 200 before the router verifies home registration.
+        backend.link.set_incoming_auto_answer_allowed(
+            !guarded_home || backend.kind == AccessPathKind::Vowifi,
+        );
         let allowed = (!vowifi_only || backend.kind == AccessPathKind::Vowifi)
             && policy.enabled_layers().any(|kind| kind == backend.kind);
         backend.link.set_incoming_call_allowed(allowed);
@@ -577,15 +1029,13 @@ fn route_command(
             &command,
             OperatorCommand::StartCall { offer, .. } if offer.video.is_some()
         );
-        let candidates = route_plan_for_trunk(
-            &current_policy(policy),
-            backends,
-            video_required,
-            vowifi_only,
-        );
+        let candidates = route_plan(&current_policy(policy), backends, video_required);
         let mut remaining = candidates.clone();
         while let Some(kind) = remaining.first().copied() {
             remaining.remove(0);
+            if vowifi_only && kind != AccessPathKind::Vowifi {
+                continue;
+            }
             let Some(selected) = backend(backends, kind) else {
                 continue;
             };
@@ -597,6 +1047,7 @@ fn route_command(
                         remaining,
                         start: Some(command),
                         start_plan: None,
+                        access_generation: selected.link.access_generation(),
                     },
                 );
                 return;
@@ -606,6 +1057,14 @@ fn route_command(
         return;
     }
 
+    if routes.get(&call_id).is_some_and(|route| {
+        backend(backends, route.owner)
+            .is_none_or(|selected| selected.link.access_generation() != route.access_generation)
+    }) {
+        routes.remove(&call_id);
+        trunk.send_event(OperatorEvent::Unavailable { call_id });
+        return;
+    }
     let Some(owner) = routes.get(&call_id).map(|route| route.owner) else {
         if matches!(&command, OperatorCommand::TransferCall { .. }) {
             trunk.send_event(OperatorEvent::TransferResponse {
@@ -685,6 +1144,8 @@ fn route_event(
                 remaining: Vec::new(),
                 start: None,
                 start_plan: None,
+                access_generation: backend(backends, kind)
+                    .map_or(0, |selected| selected.link.access_generation()),
             },
         );
         trunk.send_event(event);
@@ -697,8 +1158,23 @@ fn route_event(
     if route.owner != kind {
         return;
     }
+    if backend(backends, kind)
+        .is_none_or(|selected| selected.link.access_generation() != route.access_generation)
+        && !(matches!(&event, OperatorEvent::Unavailable { .. }) && route.start.is_some())
+    {
+        routes.remove(&call_id);
+        trunk.send_event(OperatorEvent::Unavailable { call_id });
+        return;
+    }
 
     if matches!(&event, OperatorEvent::Unavailable { .. }) {
+        if route
+            .start_plan
+            .as_ref()
+            .is_some_and(|plan| !plan.admission_current())
+        {
+            route.remaining.clear();
+        }
         while let Some(next) = route.remaining.first().copied() {
             route.remaining.remove(0);
             let start = route
@@ -729,6 +1205,7 @@ fn route_event(
             };
             if selected.link.send_command(start.clone()).is_ok() {
                 route.owner = next;
+                route.access_generation = selected.link.access_generation();
                 route.start = Some(start);
                 tracing::warn!(call_id = %call_id, access = next.as_str(), "Voice call failed over to next access leg");
                 return;
@@ -892,6 +1369,503 @@ mod tests {
         .unwrap();
     }
 
+    fn set_home_observer(router: &VoiceAccessRouter, home: Arc<std::sync::atomic::AtomicBool>) {
+        router.set_home_voice_observer(Arc::new(move || {
+            let home = Arc::clone(&home);
+            Box::pin(async move { home.load(Ordering::SeqCst) })
+        }));
+    }
+
+    #[tokio::test]
+    async fn home_cost_mode_preserves_strict_and_unrestricted_roaming_switches() {
+        let cell = OperatorLink::default();
+        let mut commands = cell.subscribe_commands();
+        cell.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![(AccessPathKind::CellularIms, cell)],
+        );
+        let home = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        set_home_observer(&router, Arc::clone(&home));
+        router.set_trunk_voice_cost_policy(true, true);
+        assert_eq!(
+            router
+                .start_call(call_plan("unknown-home"))
+                .await
+                .unwrap_err(),
+            VoiceCallStartError::RegisteredHomeRequired
+        );
+        assert!(commands.try_recv().is_err());
+        home.store(true, Ordering::SeqCst);
+        assert_eq!(
+            router
+                .start_call(call_plan("verified-home"))
+                .await
+                .unwrap()
+                .access,
+            AccessPathKind::CellularIms
+        );
+        assert!(matches!(
+            recv_command(&mut commands).await,
+            OperatorCommand::StartCall { .. }
+        ));
+        router.set_trunk_vowifi_only(true);
+        assert_eq!(
+            router
+                .start_call(call_plan("strict-home"))
+                .await
+                .unwrap_err(),
+            VoiceCallStartError::WifiOnlyRequired
+        );
+        home.store(false, Ordering::SeqCst);
+        router.set_trunk_voice_cost_policy(false, true);
+        assert_eq!(
+            router
+                .start_call(call_plan("manual-roaming-override"))
+                .await
+                .unwrap()
+                .access,
+            AccessPathKind::CellularIms
+        );
+        assert!(matches!(
+            recv_command(&mut commands).await,
+            OperatorCommand::StartCall { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn home_cost_mode_rechecks_roaming_before_cached_cellular_fallback() {
+        let wifi = OperatorLink::default();
+        let cell = OperatorLink::default();
+        let mut wifi_commands = wifi.subscribe_commands();
+        let mut cell_commands = cell.subscribe_commands();
+        wifi.set_ready(true);
+        cell.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![
+                (AccessPathKind::Vowifi, wifi.clone()),
+                (AccessPathKind::CellularIms, cell),
+            ],
+        );
+        let home = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        set_home_observer(&router, Arc::clone(&home));
+        router.set_trunk_voice_cost_policy(true, true);
+        let mut events = router.operator_link().subscribe_events();
+        assert_eq!(
+            router
+                .start_call(call_plan("home-fallback"))
+                .await
+                .unwrap()
+                .access,
+            AccessPathKind::Vowifi
+        );
+        recv_command(&mut wifi_commands).await;
+        assert!(matches!(
+            recv_event(&mut events).await,
+            OperatorEvent::Started { .. }
+        ));
+        home.store(false, Ordering::SeqCst);
+        wifi.send_event(OperatorEvent::Unavailable {
+            call_id: "home-fallback".into(),
+        });
+        assert!(matches!(
+            recv_event(&mut events).await,
+            OperatorEvent::Unavailable { .. }
+        ));
+        assert!(cell_commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn home_cost_mode_defers_cellular_auto_answer_and_rechecks_accept() {
+        let cell = OperatorLink::default();
+        let mut commands = cell.subscribe_commands();
+        cell.set_ready(true);
+        cell.set_incoming_mode(crate::platform::config::TrunkIncomingMode::BoundImmediate);
+        let router = VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![(AccessPathKind::CellularIms, cell.clone())],
+        );
+        let home = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        set_home_observer(&router, Arc::clone(&home));
+        router.set_trunk_voice_cost_policy(true, true);
+        assert!(cell.incoming_call_allowed());
+        assert!(!cell.may_auto_answer_incoming());
+        let trunk = router.operator_link();
+        let mut events = trunk.subscribe_events();
+        cell.send_event(OperatorEvent::Incoming {
+            call_id: "home-answer".into(),
+            caller: "test".into(),
+            body: vec![],
+        });
+        assert!(matches!(
+            recv_event(&mut events).await,
+            OperatorEvent::Incoming { .. }
+        ));
+        home.store(false, Ordering::SeqCst);
+        trunk
+            .send_command(OperatorCommand::AcceptCall {
+                call_id: "home-answer".into(),
+                body: vec![],
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_command(&mut commands).await,
+            OperatorCommand::RejectCall { status: 480, .. }
+        ));
+        router.set_trunk_vowifi_only(false);
+        cell.set_incoming_mode(crate::platform::config::TrunkIncomingMode::BoundImmediate);
+        assert!(
+            cell.may_auto_answer_incoming(),
+            "manual unrestricted override remains available"
+        );
+    }
+
+    #[tokio::test]
+    async fn home_cost_wait_cancellation_never_dispatches_a_late_api_or_trunk_dial() {
+        for api in [false, true] {
+            let cell = OperatorLink::default();
+            let mut commands = cell.subscribe_commands();
+            cell.set_ready(true);
+            let router = Arc::new(VoiceAccessRouter::new(
+                VoicePathPolicy::default(),
+                vec![(AccessPathKind::CellularIms, cell)],
+            ));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let e = Arc::clone(&entered);
+            let r = Arc::clone(&release);
+            router.set_home_voice_observer(Arc::new(move || {
+                let e = Arc::clone(&e);
+                let r = Arc::clone(&r);
+                Box::pin(async move {
+                    e.notify_one();
+                    r.notified().await;
+                    true
+                })
+            }));
+            router.set_trunk_voice_cost_policy(true, true);
+            let trunk = router.operator_link();
+            let mut events = trunk.subscribe_events();
+            let waiter = if api {
+                let router = Arc::clone(&router);
+                Some(tokio::spawn(async move {
+                    router.start_call(call_plan("cancel-home")).await
+                }))
+            } else {
+                trunk.send_command(start("cancel-home")).unwrap();
+                None
+            };
+            tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                .await
+                .unwrap();
+            if let Some(waiter) = waiter {
+                waiter.abort();
+                let _ = waiter.await;
+            } else {
+                trunk
+                    .send_command(OperatorCommand::CancelCall {
+                        call_id: "cancel-home".into(),
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    recv_event(&mut events).await,
+                    OperatorEvent::Unavailable { .. }
+                ));
+            }
+            release.notify_one();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), commands.recv())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn home_cost_wait_cancelled_fallback_never_starts_cellular() {
+        let wifi = OperatorLink::default();
+        let cell = OperatorLink::default();
+        let mut wifi_commands = wifi.subscribe_commands();
+        let mut cell_commands = cell.subscribe_commands();
+        wifi.set_ready(true);
+        cell.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![
+                (AccessPathKind::Vowifi, wifi.clone()),
+                (AccessPathKind::CellularIms, cell),
+            ],
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let e = Arc::clone(&entered);
+        let r = Arc::clone(&release);
+        router.set_home_voice_observer(Arc::new(move || {
+            let e = Arc::clone(&e);
+            let r = Arc::clone(&r);
+            Box::pin(async move {
+                e.notify_one();
+                r.notified().await;
+                true
+            })
+        }));
+        router.set_trunk_voice_cost_policy(true, true);
+        router
+            .start_call(call_plan("cancel-fallback"))
+            .await
+            .unwrap();
+        recv_command(&mut wifi_commands).await;
+        wifi.send_event(OperatorEvent::Unavailable {
+            call_id: "cancel-fallback".into(),
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        router
+            .operator_link()
+            .send_command(OperatorCommand::CancelCall {
+                call_id: "cancel-fallback".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_command(&mut wifi_commands).await,
+            OperatorCommand::CancelCall { .. }
+        ));
+        release.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), cell_commands.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn home_observer_panic_or_duplicate_request_cannot_poison_pending_calls() {
+        let cell = OperatorLink::default();
+        let mut commands = cell.subscribe_commands();
+        cell.set_ready(true);
+        let router = Arc::new(VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![(AccessPathKind::CellularIms, cell)],
+        ));
+        router.set_trunk_voice_cost_policy(true, true);
+        router.set_home_voice_observer(Arc::new(|| {
+            Box::pin(async { panic!("fixture observer panic") })
+        }));
+        assert!(router.start_call(call_plan("panic-home")).await.is_err());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let e = Arc::clone(&entered);
+        let r = Arc::clone(&release);
+        router.set_home_voice_observer(Arc::new(move || {
+            let e = Arc::clone(&e);
+            let r = Arc::clone(&r);
+            Box::pin(async move {
+                e.notify_one();
+                r.notified().await;
+                true
+            })
+        }));
+        let waiting = Arc::clone(&router);
+        let start = tokio::spawn(async move { waiting.start_call(call_plan("panic-home")).await });
+        entered.notified().await;
+        assert_eq!(
+            router
+                .start_call(call_plan("panic-home"))
+                .await
+                .unwrap_err(),
+            VoiceCallStartError::CallAlreadyExists
+        );
+        release.notify_one();
+        assert!(start.await.unwrap().is_ok());
+        assert!(matches!(
+            recv_command(&mut commands).await,
+            OperatorCommand::StartCall { .. }
+        ));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn plan_binding_change_during_home_wait_prevents_dispatch() {
+        let cell = OperatorLink::default();
+        let mut commands = cell.subscribe_commands();
+        cell.set_ready(true);
+        let router = Arc::new(VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![(AccessPathKind::CellularIms, cell)],
+        ));
+        let current = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let guard = Arc::clone(&current);
+        let plan = call_plan("stale-binding").with_admission(
+            Arc::new(move || guard.load(Ordering::SeqCst)),
+            true,
+            true,
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let e = Arc::clone(&entered);
+        let r = Arc::clone(&release);
+        router.set_home_voice_observer(Arc::new(move || {
+            let e = Arc::clone(&e);
+            let r = Arc::clone(&r);
+            Box::pin(async move {
+                e.notify_one();
+                r.notified().await;
+                true
+            })
+        }));
+        let waiting = Arc::clone(&router);
+        let task = tokio::spawn(async move { waiting.start_call(plan).await });
+        entered.notified().await;
+        current.store(false, Ordering::SeqCst);
+        release.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn registered_wifi_never_waits_for_home_observation() {
+        let wifi = OperatorLink::default();
+        let mut commands = wifi.subscribe_commands();
+        wifi.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![(AccessPathKind::Vowifi, wifi)],
+        );
+        router.set_trunk_voice_cost_policy(true, true);
+        router.set_home_voice_observer(Arc::new(|| {
+            Box::pin(async { panic!("WiFi must not query cellular roaming") })
+        }));
+        assert_eq!(
+            router
+                .start_call(call_plan("wifi-no-query"))
+                .await
+                .unwrap()
+                .access,
+            AccessPathKind::Vowifi
+        );
+        assert!(matches!(
+            recv_command(&mut commands).await,
+            OperatorCommand::StartCall { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn buffered_cancel_wins_when_home_observation_is_already_ready() {
+        let cell = OperatorLink::default();
+        let mut commands = cell.subscribe_commands();
+        cell.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![(AccessPathKind::CellularIms, cell)],
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let e = Arc::clone(&entered);
+        let r = Arc::clone(&release);
+        router.set_home_voice_observer(Arc::new(move || {
+            let e = Arc::clone(&e);
+            let r = Arc::clone(&r);
+            Box::pin(async move {
+                e.notify_one();
+                r.notified().await;
+                true
+            })
+        }));
+        router.set_trunk_voice_cost_policy(true, true);
+        let trunk = router.operator_link();
+        let mut events = trunk.subscribe_events();
+        trunk.send_command(start("simultaneous-cancel")).unwrap();
+        entered.notified().await;
+        // Queue both without yielding; the router must process cancel first.
+        release.notify_one();
+        trunk
+            .send_command(OperatorCommand::CancelCall {
+                call_id: "simultaneous-cancel".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_event(&mut events).await,
+            OperatorEvent::Unavailable { .. }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), commands.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_loss_during_accept_aborts_admission_but_foreign_events_do_not() {
+        let wifi = OperatorLink::default();
+        let cell = OperatorLink::default();
+        let _wifi_commands = wifi.subscribe_commands();
+        let mut commands = cell.subscribe_commands();
+        cell.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![
+                (AccessPathKind::Vowifi, wifi.clone()),
+                (AccessPathKind::CellularIms, cell.clone()),
+            ],
+        );
+        set_home_observer(&router, Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        router.set_trunk_voice_cost_policy(true, true);
+        let trunk = router.operator_link();
+        let mut events = trunk.subscribe_events();
+        cell.send_event(OperatorEvent::Incoming {
+            call_id: "pending-answer".into(),
+            caller: "fixture".into(),
+            body: vec![],
+        });
+        assert!(matches!(
+            recv_event(&mut events).await,
+            OperatorEvent::Incoming { .. }
+        ));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let e = Arc::clone(&entered);
+        let r = Arc::clone(&release);
+        router.set_home_voice_observer(Arc::new(move || {
+            let e = Arc::clone(&e);
+            let r = Arc::clone(&r);
+            Box::pin(async move {
+                e.notify_one();
+                r.notified().await;
+                true
+            })
+        }));
+        trunk
+            .send_command(OperatorCommand::AcceptCall {
+                call_id: "pending-answer".into(),
+                body: vec![],
+            })
+            .unwrap();
+        entered.notified().await;
+        wifi.send_event(OperatorEvent::Ended {
+            call_id: "pending-answer".into(),
+        });
+        // A CallAccess request serves as a control responsiveness check.
+        assert_eq!(
+            router.call_access("pending-answer").await,
+            Some(AccessPathKind::CellularIms)
+        );
+        cell.send_event(OperatorEvent::Unavailable {
+            call_id: "pending-answer".into(),
+        });
+        assert!(matches!(
+            recv_event(&mut events).await,
+            OperatorEvent::Unavailable { .. }
+        ));
+        release.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), commands.recv())
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn enabling_wifi_only_during_dial_blocks_cached_fallback_for_all_entry_points() {
         for local_api in [false, true] {
@@ -978,7 +1952,7 @@ mod tests {
                 .start_call(call_plan("cost-no-wifi"))
                 .await
                 .unwrap_err(),
-            VoiceCallStartError::NoEligibleImsAccess
+            VoiceCallStartError::WifiOnlyRequired
         );
         let mut events = router.operator_link().subscribe_events();
         cellular.send_event(OperatorEvent::Incoming {

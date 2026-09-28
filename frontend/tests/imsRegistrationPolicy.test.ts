@@ -36,6 +36,8 @@ await test('a failed additional flow is not reported as successful dual registra
 await test('cost restrictions produce clear Chinese errors without hiding unrelated failures', () => {
   assert.match(humanizeCostPolicyError('send failed;sms_vowifi_only_required'), /未回退/)
   assert.match(humanizeCostPolicyError('ims unavailable;voice_vowifi_only_required'), /阻止蜂窝/)
+  assert.match(humanizeCostPolicyError('voice_registered_home_required'), /非漫游/)
+  assert.match(humanizeCostPolicyError('voice_call_binding_changed'), /SIM 已变化/)
   assert.equal(humanizeCostPolicyError('unrelated_error'), 'unrelated_error')
 })
 

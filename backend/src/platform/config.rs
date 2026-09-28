@@ -3105,6 +3105,41 @@ line_profiles:
     }
 
     #[test]
+    fn trunk_home_voice_policy_is_opt_in_and_round_trips_without_sms_changes() {
+        let legacy: TrunkProfileConfig =
+            serde_json::from_value(serde_json::json!({"vowifi_only": true})).unwrap();
+        assert!(legacy.vowifi_only);
+        assert!(!legacy.allow_home_cellular_calls);
+        let (manager, path) = trunk_test_manager();
+        for (restricted, home) in [(true, false), (true, true), (false, true), (false, false)] {
+            let original = manager.get_line_profile(TRUNK_TEST_LINE);
+            manager
+                .set_line_trunk_profile(
+                    TRUNK_TEST_LINE,
+                    TrunkProfileConfig {
+                        vowifi_only: restricted,
+                        allow_home_cellular_calls: home,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let reloaded = ConfigManager::new(path.clone()).get_line_profile(TRUNK_TEST_LINE);
+            assert_eq!(reloaded.trunk.vowifi_only, restricted);
+            assert_eq!(reloaded.trunk.allow_home_cellular_calls, home);
+            assert!(!reloaded.trunk.enabled);
+            assert_eq!(
+                serde_json::to_value(reloaded.sms_path).unwrap(),
+                serde_json::to_value(original.sms_path).unwrap()
+            );
+            assert_eq!(
+                reloaded.cellular_ims_connection_enabled,
+                original.cellular_ims_connection_enabled
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn trunk_enable_requires_asterisk_host() {
         let (manager, path) = trunk_test_manager();
         let err = manager
@@ -4524,6 +4559,11 @@ pub struct TrunkProfileConfig {
     /// trunk, to the VoWiFi IMS leg. This does not alter Web/API routing.
     #[serde(default)]
     pub vowifi_only: bool,
+    /// Explicit opt-in for voice only: while VoWiFi-only is enabled, also
+    /// allow cellular calls on fresh, verified registered-home observations.
+    /// SMS restrictions remain unchanged; cellular auto-answer waits for admission.
+    #[serde(default)]
+    pub allow_home_cellular_calls: bool,
 }
 
 impl Default for TrunkProfileConfig {
@@ -4545,6 +4585,7 @@ impl Default for TrunkProfileConfig {
             register_expiry_secs: default_trunk_register_expiry_secs(),
             match_host: None,
             vowifi_only: false,
+            allow_home_cellular_calls: false,
         }
     }
 }

@@ -39,6 +39,7 @@ function cloneProfile(profile: TrunkProfileConfig): TrunkProfileConfig {
   return {
     ...profile,
     vowifi_only: Boolean(profile.vowifi_only),
+    allow_home_cellular_calls: Boolean(profile.allow_home_cellular_calls),
     codec_allow: [...profile.codec_allow],
     secret: '',
   }
@@ -123,10 +124,17 @@ export default function TrunkProfileDialog({ open, line, enableOnOpen = false, o
           />
           <FormControlLabel
             control={<Switch checked={draft.vowifi_only} onChange={(_, enabled) => update('vowifi_only', enabled)} />}
-            label="Trunk 仅通过 VoWiFi 接打电话、发送短信"
+            label="开启 VoWiFi 资费保护（关闭可允许漫游接打电话）"
+          />
+          <FormControlLabel
+            control={<Switch checked={Boolean(draft.allow_home_cellular_calls)} disabled={!draft.vowifi_only}
+              onChange={(_, enabled) => update('allow_home_cellular_calls', enabled)} />}
+            label="同时允许已驻网、明确非漫游的蜂窝语音"
           />
           <Typography variant="caption" color="text.secondary">
-            开启后，电话和短信发送均不会回退到 4G/5G IMS 或 CS；蜂窝 IMS 来电在接通前拒绝，不能自动改道到 VoWiFi。接收短信不限制通道，仍保留去重。已发出的短信无法撤回，已有通话不会自动迁移。
+            保留原开关：关闭保护时按线路语音策略接打电话，包括漫游；开启保护且不选上项时仍仅 VoWiFi。
+            选择上项后，蜂窝拨号、回退和接听须重新确认非漫游，未知或漫游均拒绝；蜂窝来电不会在核验前自动接通。
+            此选项不放宽短信发送限制。VoWiFi 及非漫游通话的实际资费由运营商决定；已有通话不会自动迁移。
           </Typography>
 
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: '1fr 1fr' }} gap={2}>

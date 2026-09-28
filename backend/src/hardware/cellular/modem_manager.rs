@@ -5456,7 +5456,85 @@ pub async fn make_call_on_modem(
     modem_path: &str,
     phone_number: &str,
 ) -> zbus::Result<String> {
+    make_call_on_modem_legacy(conn, modem_path, phone_number, || {
+        std::future::ready(Ok(()))
+    })
+    .await
+}
+
+/// Policy-checked calls own an MM Voice object under one unique daemon owner.
+/// Do not fall back to raw ATD: a CLCC index cannot prove ownership after reuse,
+/// and an unconfirmed ATD must not be followed by an automatic second dial.
+pub async fn make_call_on_modem_checked<Allowed, Fut>(
+    conn: &Connection,
+    modem_path: &str,
+    phone_number: &str,
+    allowed: Allowed,
+) -> zbus::Result<String>
+where
+    Allowed: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
     with_serial_for(modem_path, async {
+        let manager = zbus::fdo::DBusProxy::new(conn).await?;
+        let owner = manager
+            .get_name_owner(MM_SERVICE.try_into().expect("MM service"))
+            .await?;
+        let voice = Proxy::new(conn, owner.as_str(), modem_path, MM_VOICE).await?;
+        allowed().await.map_err(zbus::fdo::Error::Failed)?;
+        let calls: Vec<OwnedObjectPath> = voice.call("ListCalls", &()).await?;
+        for path in calls {
+            let call = Proxy::new(conn, owner.as_str(), path.as_str(), MM_CALL).await?;
+            let state: i32 = call.get_property("State").await?;
+            if state != 7 {
+                return Err(zbus::fdo::Error::Failed("voice_modem_busy_or_unknown".into()).into());
+            }
+        }
+        allowed().await.map_err(zbus::fdo::Error::Failed)?;
+        if manager
+            .get_name_owner(MM_SERVICE.try_into().expect("MM service"))
+            .await?
+            != owner
+        {
+            return Err(zbus::fdo::Error::Failed("voice_call_binding_changed".into()).into());
+        }
+        let number = sanitize_voice_number(phone_number).map_err(zbus::fdo::Error::InvalidArgs)?;
+        let properties = HashMap::from([("number", Value::from(number.as_str()))]);
+        let path: OwnedObjectPath = voice.call("CreateCall", &(properties,)).await?;
+        let start = async {
+            let call = Proxy::new(conn, owner.as_str(), path.as_str(), MM_CALL).await?;
+            allowed().await.map_err(zbus::fdo::Error::Failed)?;
+            if manager
+                .get_name_owner(MM_SERVICE.try_into().expect("MM service"))
+                .await?
+                != owner
+            {
+                return Err(zbus::fdo::Error::Failed("voice_call_binding_changed".into()).into());
+            }
+            call.call::<_, _, ()>("Start", &()).await
+        }
+        .await;
+        if let Err(error) = start {
+            let _ = voice.call::<_, _, ()>("DeleteCall", &(&path,)).await;
+            return Err(error);
+        }
+        Ok(path.to_string())
+    })
+    .await
+}
+
+async fn make_call_on_modem_legacy<Allowed, Fut>(
+    conn: &Connection,
+    modem_path: &str,
+    phone_number: &str,
+    allowed: Allowed,
+) -> zbus::Result<String>
+where
+    Allowed: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    with_serial_for(modem_path, async {
+        allowed().await.map_err(zbus::fdo::Error::Failed)?;
         let modem_path = modem_path.to_string();
         wait_until_voice_ready(conn, &modem_path).await?;
         cleanup_finished_calls(conn, &modem_path).await?;
@@ -5478,7 +5556,7 @@ pub async fn make_call_on_modem(
             }
         }
 
-        match create_and_start_at_call_for_modem(conn, &modem_path, phone_number).await {
+        match create_and_start_at_call_for_modem(conn, &modem_path, phone_number, &allowed).await {
             Ok(path) => return Ok(path),
             Err(err) => {
                 warn!(error = %err, "AT voice dial failed, falling back to ModemManager Voice")
@@ -5487,7 +5565,7 @@ pub async fn make_call_on_modem(
 
         let mut last_error = None;
         for attempt in 0..2 {
-            match create_and_start_mm_call(conn, &modem_path, phone_number).await {
+            match create_and_start_mm_call(conn, &modem_path, phone_number, &allowed).await {
                 Ok(path) => return Ok(path),
                 Err(err) if attempt == 0 && is_retryable_call_setup_error(&err) => {
                     last_error = Some(err);
@@ -5754,12 +5832,18 @@ async fn list_at_calls_for_modem(
         .collect())
 }
 
-async fn create_and_start_at_call_for_modem(
+async fn create_and_start_at_call_for_modem<Allowed, Fut>(
     conn: &Connection,
     modem_path: &str,
     phone_number: &str,
-) -> Result<String, String> {
+    allowed: &Allowed,
+) -> Result<String, String>
+where
+    Allowed: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
     let number = sanitize_voice_number(phone_number)?;
+    allowed().await?;
     run_direct_at_command_for_modem(conn, modem_path, &format!("ATD{};", number)).await?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -5783,16 +5867,28 @@ async fn create_and_start_at_call_for_modem(
     Err(format!("ATD 已发送，但未检测到语音通话状态；{ceer}"))
 }
 
-async fn create_and_start_mm_call(
+async fn create_and_start_mm_call<Allowed, Fut>(
     conn: &Connection,
     modem_path: &str,
     phone_number: &str,
-) -> zbus::Result<String> {
+    allowed: &Allowed,
+) -> zbus::Result<String>
+where
+    Allowed: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
     let voice_proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_VOICE).await?;
+    allowed().await.map_err(zbus::fdo::Error::Failed)?;
     let mut call_props: HashMap<String, Value<'_>> = HashMap::new();
     call_props.insert("number".to_string(), Value::new(phone_number));
     let call_path: OwnedObjectPath = voice_proxy.call("CreateCall", &(call_props,)).await?;
     let call_proxy = Proxy::new(conn, MM_SERVICE, &call_path, MM_CALL).await?;
+    if let Err(reason) = allowed().await {
+        let _ = voice_proxy
+            .call::<_, _, ()>("DeleteCall", &(&call_path,))
+            .await;
+        return Err(zbus::fdo::Error::Failed(reason).into());
+    }
     if let Err(err) = call_proxy.call::<_, _, ()>("Start", &()).await {
         delete_call_object_for_modem(conn, modem_path, call_path.as_str())
             .await
@@ -5871,8 +5967,60 @@ pub async fn answer_call_on_modem(
     modem_path: &str,
     call_path: &str,
 ) -> zbus::Result<()> {
+    answer_call_on_modem_legacy(conn, modem_path, call_path, || std::future::ready(Ok(()))).await
+}
+
+pub async fn answer_call_on_modem_checked<Allowed, Fut>(
+    conn: &Connection,
+    modem_path: &str,
+    call_path: &str,
+    allowed: Allowed,
+) -> zbus::Result<()>
+where
+    Allowed: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    // A synthetic AT index is reusable and has no retained unique-owner receipt.
+    if is_at_call_path(call_path) {
+        return Err(zbus::fdo::Error::Failed("voice_at_call_ownership_unverified".into()).into());
+    }
+    with_serial_for(modem_path, async {
+        let manager = zbus::fdo::DBusProxy::new(conn).await?;
+        let owner = manager
+            .get_name_owner(MM_SERVICE.try_into().expect("MM service"))
+            .await?;
+        let voice = Proxy::new(conn, owner.as_str(), modem_path, MM_VOICE).await?;
+        let calls: Vec<OwnedObjectPath> = voice.call("ListCalls", &()).await?;
+        if !calls.iter().any(|path| path.as_str() == call_path) {
+            return Err(zbus::fdo::Error::Failed("call_not_found_on_selected_line".into()).into());
+        }
+        let call = Proxy::new(conn, owner.as_str(), call_path, MM_CALL).await?;
+        allowed().await.map_err(zbus::fdo::Error::Failed)?;
+        if manager
+            .get_name_owner(MM_SERVICE.try_into().expect("MM service"))
+            .await?
+            != owner
+        {
+            return Err(zbus::fdo::Error::Failed("voice_call_binding_changed".into()).into());
+        }
+        call.call::<_, _, ()>("Accept", &()).await
+    })
+    .await
+}
+
+async fn answer_call_on_modem_legacy<Allowed, Fut>(
+    conn: &Connection,
+    modem_path: &str,
+    call_path: &str,
+    allowed: Allowed,
+) -> zbus::Result<()>
+where
+    Allowed: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
     with_serial_for(modem_path, async {
         get_call_by_path_for_modem(conn, modem_path, call_path).await?;
+        allowed().await.map_err(zbus::fdo::Error::Failed)?;
         if is_at_call_path(call_path) {
             run_direct_at_command_for_modem(conn, modem_path, "ATA")
                 .await
@@ -5880,6 +6028,7 @@ pub async fn answer_call_on_modem(
             return Ok(());
         }
         let call_proxy = Proxy::new(conn, MM_SERVICE, call_path, MM_CALL).await?;
+        allowed().await.map_err(zbus::fdo::Error::Failed)?;
         call_proxy.call::<_, _, ()>("Accept", &()).await?;
         Ok(())
     })

@@ -624,6 +624,7 @@ export interface TrunkProfileConfig {
   register_expiry_secs: number
   match_host?: string | null
   vowifi_only: boolean
+  allow_home_cellular_calls?: boolean
 }
 
 export interface TrunkRuntimeStatus {

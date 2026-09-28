@@ -3,19 +3,19 @@
 > 更新：2026-09-28。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 最新开发交接：2026-09-28 12:38 UTC
+## 最新开发交接：2026-09-28 15:42 UTC
 
-**用户要求先整理交接，由另一位 AI 继续。请优先完整阅读
-[NEXT_AI_HANDOFF_2026-09-28.md §0](NEXT_AI_HANDOFF_2026-09-28.md#0-最新续接定时拨号失败与可选非漫游呼叫准入)。**
+**用户已要求当前 AI 恢复实施，并逐步更新交接文档。请优先完整阅读
+[NEXT_AI_HANDOFF_2026-09-28.md §0](NEXT_AI_HANDOFF_2026-09-28.md#0-最新续接定时拨号失败与可选非漫游呼叫准入)，尤其 §0.0 的逐步记录。**
 该节取代同文件上午 §1–§9 的过期状态，包含最新需求、代码清单、失败检查与可复制 Prompt。
 
 - **新增优先任务**：定时拨号立即 failed 的诊断，以及可选“已注册 VoWiFi / 明确已驻网非漫游蜂窝”语音准入。
   用户要求保留原限制开关，关闭后仍能主动允许漫游接打电话。旧严格模式默认不变，短信保护不变。
-- **当前在途代码未提交、未推送、未部署**：17 个 tracked 功能文件修改 + 3 个新功能文件；不要丢弃，
-  不要将本次 docs-only 提交误认作包含这些语音修改。新增 `allow_home_cellular_calls`、异步 pending 准入、
-  checked modem 拨号/接听、错误链报告和保存反馈均还需要审查/回归。
-- 最新检查：**192 Python 有 1 failure**（静态守卫仍按旧内联门禁位置检索）；前端 **11 unit / type-check / lint 通过**；
-  Rust 定向格式检查有 diff；这批语音 Rust **未编译测试，仍只能在 Actions**。证据 `.local/evidence/automation-dial/handoff-*`。
+- 语音代码已补齐审查发现的 pending 取消/owner/重复请求边界、VoWiFi 快速路径、配置兼容、MM fresh-home/unique-owner checked call 和前端错误反馈；正在准备候选 CI，尚未部署。
+  定时任务只操作自己创建的 IMS call ID，不再把同号码既有 modem 呼叫或 CLCC index 当成自有资源；取消后保留任务完成精确挂机请求。真实接通/音频/挂机仍需实机验收。
+- 最新本地检查：**192 Python 全通过、11 前端 unit / type-check / lint 通过、定向 rustfmt / diff 通过**；
+  12:38 静态守卫失败与格式 diff 已解决。这批语音 Rust **仍需 Actions 编译/测试**。证据 `.local/evidence/automation-dial/resume-*`。
+  每步最新状态、后续候选 SHA/CI 记录见上述文档 §0.0；不要将旧校准候选的绿色 CI 套用到语音修改。
 - **11:51–11:56 UTC 实机采样**：经固定 SSH 公钥的 Cloudflare Tunnel 连接成功，设备仍运行 `dd8ba1f`，
   `/proc/511308/exe` 哈希与已验证 ARM64 一致；IMS IPsec 已注册、续期计数 4、最近续期 11:14:31 UTC，calls 列表为空。
   没有部署、改资费配置、创建任务、主动拨号、发短信或切卡。

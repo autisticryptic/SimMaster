@@ -346,17 +346,17 @@ async fn execute_task(
     };
 
     // 执行任务并控制超时（基准60秒 + 动作需要的等待时间）
+    let timeout_seconds = 60 + delay_secs;
     let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(60 + delay_secs),
+        tokio::time::Duration::from_secs(timeout_seconds),
         handler.execute(app, &params),
     )
     .await;
 
-    let (status, detail) = match result {
-        Ok(Ok(_)) => ("success", "执行成功".to_string()),
-        Ok(Err(e)) => ("failed", format!("执行失败: {}", e)),
-        Err(_) => ("failed", "执行超时 (超过60秒限制)".to_string()),
-    };
+    let (status, detail) = task_outcome(result.ok(), timeout_seconds, &task.action);
+    if status == "failed" {
+        warn!(task_id = %task.id, task_type, detail = %detail, "Automation execution failed");
+    }
 
     // 1. 写入 SQLite 日志表
     let _ = app.database.insert_automation_log(
@@ -390,9 +390,171 @@ async fn execute_task(
     Ok(())
 }
 
+fn dial_failure_summary(error: &anyhow::Error) -> String {
+    // A provider error can embed phone numbers, URLs or authentication values.
+    // Preserve actionable stage/codes, not its arbitrary text, in DB/notifications.
+    const CODES: &[&str] = &[
+        "voice_vowifi_only_required",
+        "voice_registered_home_required",
+        "voice_call_binding_changed",
+        "voice_access_router_unavailable",
+        "voice_access_router_timeout",
+        "voice_call_already_pending",
+        "voice_ims_access_unavailable",
+        "voice_modem_busy_or_unknown",
+        "voice_at_call_ownership_unverified",
+        "vowifi_voice_disabled",
+        "vowifi_voice_ready_not_reached",
+        "ims_operator_channel_unavailable",
+        "line_not_found",
+        "line_not_present",
+        "line_disabled",
+        "cs_blocked_by_airplane_mode",
+        "airplane_mode_state_unavailable",
+        "modem_call_failed",
+        "call_not_found_on_selected_line",
+        "automation_target_line_required",
+        "automation_target_refresh_failed",
+        "automation_target_line_not_found",
+        "automation_target_line_not_present",
+        "automation_target_line_disabled",
+        "automation_target_reader_slot_not_found",
+        "automation_call_ownership_unverified",
+        "automation_call_rejected",
+        "automation_call_access_unavailable",
+        "automation_call_ended_before_duration",
+        "automation_call_observation_lost",
+        "automation_call_cancelled",
+        "automation_call_cleanup_unavailable",
+        "automation_call_task_failed",
+        "org.freedesktop.DBus.Error.UnknownMethod",
+        "org.freedesktop.DBus.Error.UnknownInterface",
+        "org.freedesktop.ModemManager1.Error.Core.Unsupported",
+        "org.freedesktop.DBus.Error.NoReply",
+    ];
+    let mut parts: Vec<String> = Vec::new();
+    for cause in error.chain().take(8) {
+        let text: String = cause.to_string().chars().take(8192).collect();
+        for stage in [
+            "定时拨号失败",
+            "自动挂机失败",
+            "国家区号格式必须为 +数字",
+            "手机号码主体只能包含数字",
+        ] {
+            if text == stage && !parts.iter().any(|part| part == stage) {
+                parts.push(stage.into());
+            }
+        }
+        for token in text.split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.')))
+        {
+            if CODES.contains(&token) && !parts.iter().any(|part| part == token) {
+                parts.push(token.into());
+            }
+        }
+    }
+    if parts.is_empty() {
+        parts.push("automation_call_failed_detail_redacted".into());
+    }
+    format!("执行失败: {}", parts.join(": "))
+}
+
+/// One outcome supplies both the database and notification. Keep the dial
+/// stage AND its cause: Display alone drops anyhow's context chain. Do not
+/// include the dial target in forwarded failure diagnostics.
+fn task_outcome(
+    result: Option<Result<()>>,
+    timeout_seconds: u64,
+    action: &AutomationAction,
+) -> (&'static str, String) {
+    match result {
+        Some(Ok(())) => ("success", "执行成功".into()),
+        Some(Err(error)) => {
+            let detail = if let AutomationAction::DialCall {
+                country_code,
+                phone_number,
+                ..
+            } = action
+            {
+                let mut detail = dial_failure_summary(&error);
+                for number in [
+                    format!("{}{}", country_code.trim(), phone_number.trim()),
+                    phone_number.trim().to_string(),
+                ] {
+                    if !number.is_empty() {
+                        detail = detail.replace(&number, "[number-redacted]");
+                    }
+                }
+                detail
+            } else {
+                format!("执行失败: {error}")
+            };
+            (
+                "failed",
+                detail
+                    .chars()
+                    .take(4096)
+                    .map(|ch| if ch.is_control() { ' ' } else { ch })
+                    .collect(),
+            )
+        }
+        None => ("failed", format!("执行超时 (超过{timeout_seconds}秒限制)")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dial_outcome_preserves_stage_and_cause_without_the_number() {
+        let action = AutomationAction::DialCall {
+            country_code: "+86".into(),
+            phone_number: "13800138000".into(),
+            duration_seconds: 30,
+        };
+        for stage in ["定时拨号失败", "自动挂机失败"] {
+            let cause = anyhow::anyhow!(
+                "voice_ims_access_unavailable;voice_vowifi_only_required:+8613800138000"
+            )
+            .context(stage);
+            let (status, detail) = task_outcome(Some(Err(cause)), 90, &action);
+            assert_eq!(status, "failed");
+            assert!(detail.contains(stage));
+            assert!(detail.contains("voice_vowifi_only_required"));
+            assert!(!detail.contains("13800138000"));
+        }
+        assert_eq!(
+            task_outcome(None, 90, &action),
+            ("failed", "执行超时 (超过90秒限制)".into())
+        );
+        assert_eq!(task_outcome(Some(Ok(())), 90, &action).0, "success");
+    }
+
+    #[test]
+    fn dial_outcome_bounds_and_flattens_untrusted_errors() {
+        let action = AutomationAction::DialCall {
+            country_code: "+1".into(),
+            phone_number: "2025550100".into(),
+            duration_seconds: 10,
+        };
+        let error =
+            anyhow::anyhow!(format!("bad\nreply\r\n{}", "x".repeat(5000))).context("定时拨号失败");
+        let (_, detail) = task_outcome(Some(Err(error)), 70, &action);
+        assert!(detail.chars().count() <= 4096);
+        assert!(!detail.chars().any(char::is_control));
+        let error = anyhow::anyhow!("voice_registered_home_required: cookie=private-value https://name:password@example.invalid/ phone=12025550101").context("定时拨号失败");
+        let (_, detail) = task_outcome(Some(Err(error)), 70, &action);
+        assert!(detail.contains("voice_registered_home_required"));
+        for secret in [
+            "cookie",
+            "private-value",
+            "password",
+            "example.invalid",
+            "12025550101",
+        ] {
+            assert!(!detail.contains(secret));
+        }
+    }
 
     fn line_task(task_id: &str, line_id: &str) -> AutomationTask {
         AutomationTask {

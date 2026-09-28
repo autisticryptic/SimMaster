@@ -40,14 +40,15 @@ use crate::{
         },
         sms::{MoSmsSipOutcome, MtSmsDeliver},
     },
+    hardware::cellular::bindings::ModemBinding,
     hardware::cellular::control::{
-        answer_call_on_modem, get_band_lock_status_for_modem,
+        answer_call_on_modem_checked, get_band_lock_status_for_modem,
         get_baseband_restart_progress_for_line, get_call_by_path_for_modem,
         get_call_settings_for_modem, get_cell_location_for_modem, get_cells_data_for_modem,
         get_device_info_for_modem, get_is_roaming_for_modem, get_network_info_for_modem,
         get_operators_list_for_modem, get_radio_mode_for_modem, get_signal_strength_for_modem,
         get_sim_info_for_modem_with_cache, hangup_all_calls_for_modem, hangup_call_on_modem,
-        list_current_calls_for_modem, make_call_on_modem,
+        list_current_calls_for_modem, make_call_on_modem_checked,
         power_cycle_sim_for_profile_switch_via_modem, recover_absent_baseband_via_qmi,
         register_operator_for_modem, request_operator_registration_for_modem,
         restart_baseband_via_modem, scan_operators_for_modem, send_call_dtmf_on_modem,
@@ -5037,6 +5038,8 @@ async fn start_routed_ims_voice_call(
     requested_line_id: &str,
     phone_number: &str,
     force_vowifi: bool,
+    expected: Option<(&ModemBinding, u64)>,
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(String, String, &'static str), String> {
     let (line_id, _) = resolve_call_line(app, requested_line_id).await?;
     let line = app
@@ -5044,6 +5047,14 @@ async fn start_routed_ims_voice_call(
         .get(&line_id)
         .await
         .ok_or_else(|| "line_not_found".to_string())?;
+    let (expected, generation) = expected
+        .map(|(binding, generation)| (binding.clone(), generation))
+        .unwrap_or_else(|| (line.binding(), line.cellular_ims.generation()));
+    if !same_voice_binding(&expected, &line.binding())
+        || generation != line.cellular_ims.generation()
+    {
+        return Err("voice_call_binding_changed".into());
+    }
     ensure_ims_voice_listener(app, &line);
     let profile = app.config_manager.get_line_profile(&line_id);
     if force_vowifi && !profile.vowifi.enabled {
@@ -5089,6 +5100,21 @@ async fn start_routed_ims_voice_call(
     if force_vowifi && !has_vowifi {
         return Err("vowifi_voice_ready_not_reached".to_string());
     }
+    let scoped_line = Arc::clone(&line);
+    let config = Arc::clone(&app.config_manager);
+    plan = plan.with_admission(
+        Arc::new(move || {
+            let profile = config.get_line_profile(&expected.line_id);
+            profile.enabled
+                && !cancelled
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                && same_voice_binding(&expected, &scoped_line.binding())
+                && generation == scoped_line.cellular_ims.generation()
+        }),
+        profile.trunk.vowifi_only,
+        profile.trunk.allow_home_cellular_calls,
+    );
     let queued = line
         .voice_access
         .start_call(plan)
@@ -5110,7 +5136,16 @@ pub async fn place_call_handler(
     Json(payload): Json<PlaceCallRequest>,
 ) -> impl IntoResponse {
     let resolved_line_id = line_id.trim().to_string();
-    match start_routed_ims_voice_call(&app, &resolved_line_id, &payload.phone_number, true).await {
+    match start_routed_ims_voice_call(
+        &app,
+        &resolved_line_id,
+        &payload.phone_number,
+        true,
+        None,
+        None,
+    )
+    .await
+    {
         Ok((line_id, path, transport)) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -5873,61 +5908,192 @@ async fn dial_call_on_line(
     }
 }
 
+fn cellular_call_cost_rule(
+    initial_only: bool,
+    initial_home: bool,
+    current_only: bool,
+    current_home: bool,
+) -> Result<bool, &'static str> {
+    if (initial_only && !initial_home) || (current_only && !current_home) {
+        return Err("voice_vowifi_only_required");
+    }
+    Ok(initial_only || current_only)
+}
+
+fn same_voice_binding(a: &ModemBinding, b: &ModemBinding) -> bool {
+    a.line_id == b.line_id
+        && a.modem_path == b.modem_path
+        && a.sim_path == b.sim_path
+        && a.sim_iccid == b.sim_iccid
+        && a.uim_slot == b.uim_slot
+        && a.primary_port == b.primary_port
+        && b.present
+        && !b.slot_conflict
+}
+
+async fn admit_cellular_call_cost(
+    app: &AppState,
+    line: &crate::services::line_registry::LineRuntime,
+    initial_only: bool,
+    initial_home: bool,
+    expected: &ModemBinding,
+    generation: u64,
+) -> Result<(), &'static str> {
+    if !same_voice_binding(expected, &line.binding())
+        || line.cellular_ims.generation() != generation
+    {
+        return Err("voice_call_binding_changed");
+    }
+    let current = app.config_manager.get_line_profile(&expected.line_id).trunk;
+    let needs_home = cellular_call_cost_rule(
+        initial_only,
+        initial_home,
+        current.vowifi_only,
+        current.allow_home_cellular_calls,
+    )?;
+    if needs_home {
+        let home = line.voice_access.registered_home_voice().await;
+        let current = app
+            .config_manager
+            .get_line_profile(&line.binding().line_id)
+            .trunk;
+        cellular_call_cost_rule(
+            initial_only,
+            initial_home,
+            current.vowifi_only,
+            current.allow_home_cellular_calls,
+        )?;
+        if !home {
+            return Err("voice_registered_home_required");
+        }
+    }
+    if !same_voice_binding(expected, &line.binding())
+        || line.cellular_ims.generation() != generation
+    {
+        return Err("voice_call_binding_changed");
+    }
+    let profile = app.config_manager.get_line_profile(&expected.line_id);
+    if !profile.enabled {
+        return Err("line_disabled");
+    }
+    if profile.airplane_mode_enabled {
+        return Err("cs_blocked_by_airplane_mode");
+    }
+    Ok(())
+}
+
+/// Timed automation requires an owned IMS call ID. Raw AT/CLCC indices and
+/// same-number modem-call reuse cannot safely own a later automatic hangup.
+pub(crate) async fn start_owned_automation_call(
+    app: &AppState,
+    line_id: &str,
+    phone_number: &str,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<String, String> {
+    let (resolved, _) = resolve_call_line(app, line_id).await?;
+    let line = app
+        .line_registry
+        .get(&resolved)
+        .await
+        .ok_or_else(|| "line_not_found".to_string())?;
+    let binding = line.binding();
+    let generation = line.cellular_ims.generation();
+    let (_, path, _) = start_routed_ims_voice_call(
+        app,
+        &resolved,
+        phone_number,
+        false,
+        Some((&binding, generation)),
+        Some(cancelled),
+    )
+    .await?;
+    ims_call_id_for_line(&path, &resolved)
+        .map(str::to_string)
+        .ok_or_else(|| "automation_call_ownership_unverified".into())
+}
+
 pub(crate) async fn start_call_for_automation(
     app: &AppState,
     requested_line_id: &str,
     phone_number: &str,
 ) -> Result<(String, String, &'static str), String> {
-    let initially_vowifi_only = app
-        .config_manager
-        .get_line_profile(requested_line_id.trim())
-        .trunk
-        .vowifi_only;
-    match start_routed_ims_voice_call(app, requested_line_id, phone_number, false).await {
+    let (line_id, modem_path) = resolve_call_line(app, requested_line_id).await?;
+    let line = app
+        .line_registry
+        .get(&line_id)
+        .await
+        .ok_or_else(|| "line_not_found".to_string())?;
+    let binding = line.binding();
+    let generation = line.cellular_ims.generation();
+    let initial_trunk = app.config_manager.get_line_profile(&line_id).trunk;
+    let initially_vowifi_only = initial_trunk.vowifi_only;
+    let initially_home_allowed = initial_trunk.allow_home_cellular_calls;
+    match start_routed_ims_voice_call(
+        app,
+        &line_id,
+        phone_number,
+        false,
+        Some((&binding, generation)),
+        None,
+    )
+    .await
+    {
         Ok(result) => return Ok(result),
         Err(ims_error) => {
-            let (line_id, modem_path) = resolve_call_line(app, requested_line_id).await?;
             if modem_path.trim().is_empty() {
                 return Err(ims_error);
             }
-            if initially_vowifi_only
-                || app
-                    .config_manager
-                    .get_line_profile(&line_id)
-                    .trunk
-                    .vowifi_only
-            {
-                return Err(format!("{ims_error};voice_vowifi_only_required"));
-            }
-            let line = app
-                .line_registry
-                .get(&line_id)
-                .await
-                .ok_or_else(|| "line_not_found".to_string())?;
+            admit_cellular_call_cost(
+                app,
+                &line,
+                initially_vowifi_only,
+                initially_home_allowed,
+                &binding,
+                generation,
+            )
+            .await
+            .map_err(|reason| format!("{ims_error};{reason}"))?;
             let _bearer_guard = line.bearer_operation_lock.lock().await;
             let current = app.config_manager.get_line_profile(&line_id);
             if !current.enabled {
                 return Err("line_disabled".to_string());
             }
-            let binding = line.binding();
             native_call_radio_admission(
                 current.airplane_mode_enabled,
                 app.modem_radio.observe(&binding).await,
             )
             .map_err(|reason| format!("{ims_error};{reason}"))?;
-            // The same restriction covers automation's native-modem escape
-            // path; an unavailable IMS router must not turn into a paid CS call.
-            if app
-                .config_manager
-                .get_line_profile(&line_id)
-                .trunk
-                .vowifi_only
-            {
-                return Err(format!("{ims_error};voice_vowifi_only_required"));
-            }
-            let path = make_call_on_modem(&app.dbus_conn, &binding.modem_path, phone_number)
-                .await
-                .map_err(|error| error.to_string())?;
+            // Recheck both the cost policy and fresh network evidence after
+            // waiting for the bearer/radio gates. Unknown is not non-roaming.
+            admit_cellular_call_cost(
+                app,
+                &line,
+                initially_vowifi_only,
+                initially_home_allowed,
+                &binding,
+                generation,
+            )
+            .await
+            .map_err(|reason| format!("{ims_error};{reason}"))?;
+            let path = make_call_on_modem_checked(
+                &app.dbus_conn,
+                &binding.modem_path,
+                phone_number,
+                || async {
+                    admit_cellular_call_cost(
+                        app,
+                        &line,
+                        initially_vowifi_only,
+                        initially_home_allowed,
+                        &binding,
+                        generation,
+                    )
+                    .await
+                    .map_err(str::to_string)
+                },
+            )
+            .await
+            .map_err(|error| format!("{ims_error};modem_call_failed:{error}"))?;
             drop(_bearer_guard);
             track_call_start(app, &line_id, &path, "outgoing", phone_number, false).await;
             return Ok((line_id, path, "modem"));
@@ -6254,25 +6420,62 @@ async fn answer_call_on_line(
             body,
         })
         .map_err(|_| "ims_operator_channel_unavailable".to_string())
-    } else if app
-        .config_manager
-        .get_line_profile(&line_id)
-        .trunk
-        .vowifi_only
-    {
-        Err("voice_vowifi_only_required".to_string())
     } else {
-        answer_call_on_modem(&app.dbus_conn, &modem_path, &path)
+        async {
+            let line = app
+                .line_registry
+                .get(&line_id)
+                .await
+                .ok_or_else(|| "line_not_found".to_string())?;
+            let expected = line.binding();
+            if expected.modem_path != modem_path {
+                return Err("voice_call_binding_changed".into());
+            }
+            let generation = line.cellular_ims.generation();
+            let initial = app.config_manager.get_line_profile(&line_id).trunk;
+            let _bearer = line.bearer_operation_lock.lock().await;
+            admit_cellular_call_cost(
+                app,
+                &line,
+                initial.vowifi_only,
+                initial.allow_home_cellular_calls,
+                &expected,
+                generation,
+            )
+            .await
+            .map_err(str::to_string)?;
+            answer_call_on_modem_checked(&app.dbus_conn, &modem_path, &path, || async {
+                admit_cellular_call_cost(
+                    app,
+                    &line,
+                    initial.vowifi_only,
+                    initial.allow_home_cellular_calls,
+                    &expected,
+                    generation,
+                )
+                .await
+                .map_err(str::to_string)
+            })
             .await
             .map_err(|error| error.to_string())
+        }
+        .await
     };
     match answer_result {
         Ok(()) => {
-            mark_tracked_call_answered(app, &path).await;
+            // IMS enqueue is an answer request, not a network-confirmed 200.
+            // The operator lifecycle alone publishes Answered/Connected.
+            if !is_ims_call_path(&path) {
+                mark_tracked_call_answered(app, &path).await;
+            }
             (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message(
-                    "Call answered",
+                    if is_ims_call_path(&path) {
+                        "Call answer requested"
+                    } else {
+                        "Call answered"
+                    },
                     json!({ "line_id": line_id }),
                 )),
             )
@@ -6312,14 +6515,12 @@ async fn build_ims_answer_body(
         .call_access(call_id)
         .await
         .ok_or_else(|| "ims_call_access_unavailable".to_string())?;
-    if access != AccessPathKind::Vowifi
-        && app
-            .config_manager
-            .get_line_profile(line_id)
-            .trunk
-            .vowifi_only
-    {
-        return Err("voice_vowifi_only_required".to_string());
+    if access != AccessPathKind::Vowifi {
+        let expected = line.binding();
+        let generation = line.cellular_ims.generation();
+        admit_cellular_call_cost(app, &line, false, false, &expected, generation)
+            .await
+            .map_err(str::to_string)?;
     }
     let local_ip = std::net::Ipv4Addr::LOCALHOST;
     let addr_type = crate::connectivity::core::voice::SdpAddrType::Ip4;
@@ -15017,6 +15218,53 @@ mod tests {
             }
         }
         unreachable!("a non-empty batch always terminates")
+    }
+
+    #[test]
+    fn voice_home_cost_rule_keeps_strict_defaults_and_manual_roaming_override() {
+        assert_eq!(
+            cellular_call_cost_rule(false, false, false, false),
+            Ok(false)
+        );
+        assert_eq!(cellular_call_cost_rule(false, true, false, true), Ok(false));
+        assert_eq!(cellular_call_cost_rule(true, true, true, true), Ok(true));
+        assert_eq!(cellular_call_cost_rule(true, true, false, false), Ok(true));
+        assert_eq!(cellular_call_cost_rule(false, false, true, true), Ok(true));
+        assert_eq!(
+            cellular_call_cost_rule(true, false, false, true),
+            Err("voice_vowifi_only_required")
+        );
+        assert_eq!(
+            cellular_call_cost_rule(true, true, true, false),
+            Err("voice_vowifi_only_required")
+        );
+    }
+
+    #[test]
+    fn voice_home_binding_check_rejects_replacement_sim_endpoint_or_absence() {
+        let expected = ModemBinding {
+            line_id: "line-voice-fixture".into(),
+            modem_path: "/org/freedesktop/ModemManager1/Modem/9".into(),
+            sim_path: Some("/org/freedesktop/ModemManager1/SIM/9".into()),
+            sim_iccid: "8900000000000000001".into(),
+            primary_port: "wwan0qmi0".into(),
+            uim_slot: 1,
+            present: true,
+            ..Default::default()
+        };
+        assert!(same_voice_binding(&expected, &expected));
+        for change in 0..6 {
+            let mut observed = expected.clone();
+            match change {
+                0 => observed.sim_iccid.push('2'),
+                1 => observed.modem_path.push('1'),
+                2 => observed.primary_port.push('1'),
+                3 => observed.uim_slot = 2,
+                4 => observed.present = false,
+                _ => observed.slot_conflict = true,
+            }
+            assert!(!same_voice_binding(&expected, &observed));
+        }
     }
 
     #[test]

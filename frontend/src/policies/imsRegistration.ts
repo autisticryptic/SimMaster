@@ -44,6 +44,12 @@ export function humanizeCostPolicyError(message: string) {
   if (message.includes('sms_vowifi_only_required')) {
     return '仅通过 VoWiFi 发送短信的限制已生效。本次 VoWiFi 发送未成功，未回退到 4G/5G IMS 或 CS。'
   }
+  if (message.includes('voice_registered_home_required')) {
+    return '当前呼叫保护只允许已注册 VoWiFi，或明确已驻网且非漫游的蜂窝接入。蜂窝正在漫游、状态未知或核验失败，未发起本次蜂窝通话。'
+  }
+  if (message.includes('voice_call_binding_changed')) {
+    return '线路或 SIM 已变化，本次通话已停止。请确认当前线路后重新操作。'
+  }
   if (message.includes('voice_vowifi_only_required')) {
     return '仅通过 VoWiFi 通话的限制已生效。当前不能通过 VoWiFi 呼出，已阻止蜂窝或 CS 回退。'
   }

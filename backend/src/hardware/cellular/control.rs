@@ -391,6 +391,26 @@ pub async fn make_call_on_modem(
         mm::make_call_on_modem(conn, path, number).await
     }
 }
+
+pub async fn make_call_on_modem_checked<Allowed, Fut>(
+    conn: &Connection,
+    path: &str,
+    number: &str,
+    allowed: Allowed,
+) -> zbus::Result<String>
+where
+    Allowed: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if let Some(device) = route(path).map_err(bus_error)? {
+        allowed()
+            .await
+            .map_err(|error| zbus::fdo::Error::Failed(error))?;
+        device.dial(number).await.map_err(bus_error)
+    } else {
+        mm::make_call_on_modem_checked(conn, path, number, allowed).await
+    }
+}
 pub async fn get_call_by_path_for_modem(
     conn: &Connection,
     path: &str,
@@ -414,6 +434,26 @@ pub async fn answer_call_on_modem(conn: &Connection, path: &str, call: &str) -> 
         device.answer(call).await.map_err(bus_error)
     } else {
         mm::answer_call_on_modem(conn, path, call).await
+    }
+}
+
+pub async fn answer_call_on_modem_checked<Allowed, Fut>(
+    conn: &Connection,
+    path: &str,
+    call: &str,
+    allowed: Allowed,
+) -> zbus::Result<()>
+where
+    Allowed: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if let Some(device) = route(path).map_err(bus_error)? {
+        allowed()
+            .await
+            .map_err(|error| zbus::fdo::Error::Failed(error))?;
+        device.answer(call).await.map_err(bus_error)
+    } else {
+        mm::answer_call_on_modem_checked(conn, path, call, allowed).await
     }
 }
 pub async fn send_call_dtmf_on_modem(

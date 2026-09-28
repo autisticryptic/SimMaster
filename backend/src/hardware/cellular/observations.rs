@@ -56,6 +56,20 @@ pub trait ModemObservationProvider: Send + Sync {
 
     fn discover(&self) -> TransportFuture<'_, Result<Vec<ModemBinding>, ObservationError>>;
 
+    /// Fresh, positive evidence for registered non-roaming cellular voice.
+    /// Unknown/unsupported providers fail closed; never infer home from an APN
+    /// or from a default `roaming=false` on a missing registration property.
+    fn registered_home_voice<'a>(
+        &'a self,
+        _binding: &'a ModemBinding,
+    ) -> TransportFuture<'a, Result<bool, ObservationError>> {
+        Box::pin(async {
+            Err(ObservationError::Unavailable(
+                "voice_home_observation_unsupported".into(),
+            ))
+        })
+    }
+
     fn serving_access<'a>(
         &'a self,
         binding: &'a ModemBinding,
