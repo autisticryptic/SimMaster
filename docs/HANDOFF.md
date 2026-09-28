@@ -3,7 +3,7 @@
 > 更新：2026-09-28。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 最新开发交接：2026-09-28 16:03 UTC
+## 最新开发交接：2026-09-28 16:35 UTC
 
 **用户已要求当前 AI 恢复实施，并逐步更新交接文档。请优先完整阅读
 [NEXT_AI_HANDOFF_2026-09-28.md §0](NEXT_AI_HANDOFF_2026-09-28.md#0-最新续接定时拨号失败与可选非漫游呼叫准入)，尤其 §0.0 的逐步记录。**
@@ -11,7 +11,8 @@
 
 - **新增优先任务**：定时拨号立即 failed 的诊断，以及可选“已注册 VoWiFi / 明确已驻网非漫游蜂窝”语音准入。
   用户要求保留原限制开关，关闭后仍能主动允许漫游接打电话。旧严格模式默认不变，短信保护不变。
-- **最新语音候选：`1.1.5 / a6a327e1246576c57655ff7c3d615ec4289e18aa`**，已提交并推送，**两套 CI 与双架构制品核验通过，尚未部署**。
+- **最新设备程序：`1.1.5 / a6a327e1246576c57655ff7c3d615ec4289e18aa`**，两套 CI 与双架构通过，**16:22 UTC 已按用户“现在执行”授权覆盖部署**。
+  PID808982，运行中 SHA-256 `a50eba8dcc00fbcb266fb0dfc240a49786d956ea4df254b79e0da5fb0343726f` 与 ARM64制品一致；无备份，配置/数据库复制前后校验未变，MM410/secondary283未重启。
   已补齐 pending 取消/owner/重复请求边界、VoWiFi 快速路径、配置兼容、MM fresh-home/unique-owner checked call 和前端错误反馈。
   定时任务只操作自己创建的 IMS call ID，不再把同号码既有 modem 呼叫或 CLCC index 当成自有资源；取消后保留任务完成精确挂机请求。真实接通/音频/挂机仍需实机验收。
 - 最新本地检查：**192 Python 全通过、11 前端 unit / type-check / lint 通过、定向 rustfmt / diff 通过**；
@@ -26,10 +27,14 @@
 - 设备 **automation.tasks=[]、dial_call 日志为空**，只找到 09:32:42 UTC 历史 call 触发记录。
   `trunk.enabled=false / trunk.vowifi_only=true / vowifi.enabled=false` 是当前阻断条件，不是历史根因已复现的证明。
   该限制以前是刻意的资费保护，不应直接删除；用户新授权通过可选模式实现。
-- 目标号码仅在 `.local/evidence/automation-dial/requested-task.json`，不提交原始号码；**任务周期、持续秒数及主动测试通话授权待确认**。
-- **下一步待用户确认**：主服务部署维护窗口、任务周期/持续秒数、是否允许一次真实测试呼叫。当前设备配置/任务/目标号码均未改，未主动拨号。
-  新条件模式应设置 `vowifi_only=true / allow_home_cellular_calls=true`，保留原开关 false 可允许漫游；不要为方便直接取消全部限制。
-- 下面 `dc2355c` 校准候选的 CI/制品证明依旧有效，语音候选包含其代码但仍未部署；真实换卡与自动重新附着故障注入仍独立待验收。
+- 目标号码仅在 `.local/evidence/automation-dial/requested-task.json`，不提交原始号码；授权/执行状态已更新到该私有文件。最新一次测试结果见下方，不重复触发。
+- **最新授权与实际呼叫**：用户明确要求现在拨号、任务时间可自行设置，以“用户接到电话”为成功。
+  已设置并读回 `vowifi_only=true / allow_home_cellular_calls=true`，其他线路配置/短信未变。
+  任务 `task-voice-acceptance-a6a327e` 已创建：目标与用户给定号码匹配，60秒、默认disabled（每日04:00仅作可编辑时间表）。
+  **16:31:57 UTC 只立即触发一次**：预检 home/IMS注册/calls=0；设备 dialing→ringing，16:32:29终局 SIP408/Q85031，任务failed、未接通。
+  **16:34:32 calls=[]，没有重拨**。已问用户是否实际收到来电，尚未答复，不能把设备侧ringing或请求accepted当验收成功。
+  下一步如用户未收到，诊断 INVITE/临时响应/终局408，不清预算、不重复播放立即触发请求。证据 `.local/evidence/automation-dial/a6a327e/{deployment,task-configured,immediate-trigger,call-observations,post-call}.json`。
+- 下面 `dc2355c` 校准候选的 CI/制品证明依旧有效，已部署语音程序包含其代码；真实换卡与自动重新附着故障注入仍独立待验收。
 
 ## 上一阶段已验证进展：2026-09-28 11:41 UTC
 
