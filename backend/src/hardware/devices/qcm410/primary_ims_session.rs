@@ -48,6 +48,7 @@ pub(super) struct PrimaryImsRequest<'a> {
     pub profile_id: Option<u32>,
     pub family: MmIpFamily,
     pub allow_roaming: bool,
+    pub expected_sim: Option<(&'a str, u8)>,
 }
 
 pub(super) struct PrimaryImsSession {
@@ -86,8 +87,9 @@ impl PrimaryImsSession {
             })
             .await;
         });
-        let result = receiver
+        let result = tokio::time::timeout(Duration::from_secs(90), receiver)
             .await
+            .map_err(|_| "qca410_primary_mm_setup_timeout_unverified".to_string())?
             .map_err(|_| "qca410_primary_mm_setup_task_failed".to_string())?;
         cancellation.armed = false;
         result
@@ -103,6 +105,9 @@ impl PrimaryImsSession {
         }
         let bus = MmBus::new(&request.device, &request.modem, &request.interface).await?;
         bus.pin_sim_binding().await?;
+        if let Some((iccid, slot)) = request.expected_sim.as_ref() {
+            bus.verify_expected_sim(iccid, *slot).await?;
+        }
         let controller = Arc::new(Controller {
             bus,
             request,
@@ -148,6 +153,10 @@ impl PrimaryImsSession {
             loss,
             monitor,
         })
+    }
+
+    pub async fn verify_sim_binding(&self) -> Result<(), String> {
+        self.controller.bus.ensure_sim_binding().await
     }
 
     pub async fn verify_expected_sim(&self, iccid: &str, slot: u8) -> Result<(), String> {
@@ -309,6 +318,7 @@ struct OwnedRequest {
     profile_id: Option<u32>,
     family: MmIpFamily,
     allow_roaming: bool,
+    expected_sim: Option<(String, u8)>,
 }
 
 impl From<PrimaryImsRequest<'_>> for OwnedRequest {
@@ -321,6 +331,9 @@ impl From<PrimaryImsRequest<'_>> for OwnedRequest {
             profile_id: request.profile_id,
             family: request.family,
             allow_roaming: request.allow_roaming,
+            expected_sim: request
+                .expected_sim
+                .map(|(iccid, slot)| (iccid.to_string(), slot)),
         }
     }
 }
@@ -335,6 +348,10 @@ impl OwnedRequest {
             profile_id: self.profile_id,
             family: self.family,
             allow_roaming: self.allow_roaming,
+            expected_sim: self
+                .expected_sim
+                .as_ref()
+                .map(|(iccid, slot)| (iccid.as_str(), *slot)),
         }
     }
 }
@@ -392,18 +409,26 @@ impl Controller {
                     self.previous.lock().unwrap().clone().ok_or_else(|| {
                         "qca410_primary_mm_missing_ownership_snapshot".to_string()
                     })?;
+                let mut intent = lifecycle::PendingCreate::new(&self.bus)?;
                 let bearer = self.bus.create(&self.request.borrowed()).await?;
+                // Even if this metadata update fails, keep the original intent
+                // until a durable lease or confirmed Delete takes ownership.
+                let _ = intent.created(&bearer);
                 if !previous.contains(&bearer) {
                     match OwnedLease::create(Arc::clone(&self.bus), &bearer) {
                         Ok(lease) => *self.owned.lock().unwrap() = Some(lease),
                         Err(error) => {
-                            // The object is known and still disconnected. Do
-                            // not activate if durable ownership cannot be saved.
-                            let _ = self.bus.delete(&bearer).await;
+                            if let Err(cleanup) = self.bus.delete(&bearer).await {
+                                return Err(format!(
+                                    "{error}:owned_bearer_cleanup_failed:{cleanup}"
+                                ));
+                            }
+                            intent.complete()?;
                             return Err(error);
                         }
                     }
                 }
+                intent.complete()?;
                 Ok(bearer)
             }
             ("-b", "--connect") => {
@@ -726,6 +751,7 @@ mod tests {
             profile_id: Some(2),
             family: MmIpFamily::Ipv4,
             allow_roaming: true,
+            expected_sim: None,
         }
     }
 

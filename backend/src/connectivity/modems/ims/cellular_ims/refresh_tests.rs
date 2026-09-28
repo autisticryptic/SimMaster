@@ -151,6 +151,33 @@ fn response(request: &[u8], status: &str, extra: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn stale_mm_authenticator_rejects_aka_and_min_expires_before_io() {
+    let (mut session, runtime, _server, _old_client) = protected_session().await;
+    let task = runtime.for_generation(runtime.generation());
+    let mut auth = authenticator(&session, &task, session.security_binding);
+    runtime.reset_runtime("sim_changed").await;
+    // Invalid input deliberately proves cancellation wins before parsing or AKA.
+    assert_eq!(
+        auth.prepare_authenticated_channel(b"not a challenge", &mut session.channel)
+            .await
+            .unwrap_err()
+            .code(),
+        code::RUNTIME_NOT_RUNNING
+    );
+    assert_eq!(
+        auth.authenticated_request(b"", 2).await.unwrap_err().code(),
+        code::RUNTIME_NOT_RUNNING
+    );
+    assert_eq!(
+        auth.rebuild_register_with_min_expires(b"", 2, 3600, false)
+            .await
+            .unwrap_err()
+            .code(),
+        code::RUNTIME_NOT_RUNNING
+    );
+}
+
+#[tokio::test]
 async fn challenged_refresh_freezes_offer_and_rolls_back_sockets_and_nonce_on_timeout() {
     let (mut session, runtime, server, old_client) = protected_session().await;
     let old_route = session.channel.send_route();

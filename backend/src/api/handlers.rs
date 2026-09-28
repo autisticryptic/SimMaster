@@ -925,15 +925,23 @@ pub async fn enable_esim_profile_handler(
     // moved into the background operation and also releases on error/cancel.
     let mm_switch = match line.cellular_ims.begin_mm_switch() {
         Ok(guard) => guard,
-        Err(reason) => return (StatusCode::CONFLICT, Json(ApiResponse::<EsimCommandResponse>::error(reason))).into_response(),
+        Err(reason) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiResponse::<EsimCommandResponse>::error(reason)),
+            )
+                .into_response()
+        }
     };
     if mm_switch.is_some() {
         let _bearer = line.bearer_operation_lock.lock().await;
         let _connect = line.cellular_ims_connect_lock.lock().await;
         let _advance = line.cellular_ims.advance_guard().await;
         crate::connectivity::modems::ims::cellular_ims::live::discard_live_for_mm_binding_change(
-            &line.cellular_ims_live, &line.cellular_ims,
-        ).await;
+            &line.cellular_ims_live,
+            &line.cellular_ims,
+        )
+        .await;
     }
     let event_entity = mask_identifier(&iccid);
     let bg_line_id = line_id.clone();
@@ -3617,18 +3625,30 @@ pub(crate) async fn recalibrate_line_mm_binding(
     {
         // Do not queue one cleanup task on every inventory tick behind a slow
         // connection. The pending ticket is retried by the next inventory pass.
-        let Ok(_bearer) = line.bearer_operation_lock.try_lock() else { return; };
-        let Ok(_connect) = line.cellular_ims_connect_lock.try_lock() else { return; };
+        let Ok(_bearer) = line.bearer_operation_lock.try_lock() else {
+            return;
+        };
+        let Ok(_connect) = line.cellular_ims_connect_lock.try_lock() else {
+            return;
+        };
         let _advance = line.cellular_ims.advance_guard().await;
-        if line.cellular_ims.mm_calibration_ticket() != Some(ticket) { return; }
+        if line.cellular_ims.mm_calibration_ticket() != Some(ticket) {
+            return;
+        }
         crate::connectivity::modems::ims::cellular_ims::live::discard_live_for_mm_binding_change(
-            &line.cellular_ims_live, &line.cellular_ims,
-        ).await;
-        if line.cellular_ims.mm_calibration_ticket() != Some(ticket) { return; }
+            &line.cellular_ims_live,
+            &line.cellular_ims,
+        )
+        .await;
+        if line.cellular_ims.mm_calibration_ticket() != Some(ticket) {
+            return;
+        }
         let binding = line.binding();
         modem::invalidate_sim_identity_cache(binding.qmi_device.as_deref(), binding.uim_slot);
         crate::connectivity::core::own_numbers::clear(&binding.line_id);
-        if !line.cellular_ims.finish_mm_calibration(ticket) { return; }
+        if !line.cellular_ims.finish_mm_calibration(ticket) {
+            return;
+        }
         info!(line_id = %binding.line_id, "MM IMS binding recalibrated; next connection will reselect and verify its profile");
     }
     // Existing intent/access-policy/cooldown/profile/family controls decide
@@ -3646,7 +3666,9 @@ pub(crate) async fn suspend_line_runtime_for_hotplug(
     {
         let _bearer_guard = line.bearer_operation_lock.lock().await;
         // A queued absence observation must not tear down a returned line.
-        if line.binding().present { return; }
+        if line.binding().present {
+            return;
+        }
         line.data_proxy.stop().await;
         line.cellular_data.stop().await;
         let _connect_guard = line.cellular_ims_connect_lock.lock().await;
@@ -4857,7 +4879,8 @@ async fn send_sms_over_cellular_ims_path(
                 state.last_error = None;
             })
             .await;
-        run_line_cellular_ims_restore_batch(app, &line, "sms").await;
+        let generation = line.cellular_ims.generation();
+        run_line_cellular_ims_restore_batch(app, &line, "sms", generation).await;
         line.finish_cellular_ims_retry();
         let status = line.cellular_ims.status().await;
         if !status.registered {
@@ -4929,10 +4952,17 @@ async fn send_sms_over_cs_path(
         }
         let device = crate::hardware::cellular::backends::native_device(&binding.modem_path)
             .map_err(|error| error.to_string())?;
-        if device.spec.line_id() != line_id { return Err("native_sms_line_scope_mismatch".into()); }
-        let result = device.send_sms_persisted(
-            app.database.as_ref().clone(), &payload.phone_number, &payload.content,
-        ).await.map_err(|error| error.to_string())?;
+        if device.spec.line_id() != line_id {
+            return Err("native_sms_line_scope_mismatch".into());
+        }
+        let result = device
+            .send_sms_persisted(
+                app.database.as_ref().clone(),
+                &payload.phone_number,
+                &payload.content,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         // An uncertain multipart send is not an invitation to resend/fallback.
         // Its pending DB row and submitted prefix remain available for diagnosis.
         return Ok(json!({
@@ -10324,6 +10354,8 @@ async fn start_line_cellular_ims_restore(
     line: Arc<crate::services::line_registry::LineRuntime>,
     source: &'static str,
 ) -> bool {
+    let generation = line.cellular_ims.generation();
+    let runtime = line.cellular_ims.for_admission_generation(generation);
     if !line_cellular_ims_restore_enabled(&app, &line) || !line.cellular_ims.mm_binding_ready() {
         return false;
     }
@@ -10350,13 +10382,16 @@ async fn start_line_cellular_ims_restore(
         );
         return false;
     }
+    if !runtime.task_is_current() {
+        return false;
+    }
     if line.baseband_wedge_permanent() {
         tracing::warn!(
             line_id = %line.binding().line_id,
             source,
             "Skipping VoLTE restore: baseband data path is latched until a full system reboot"
         );
-        line.cellular_ims
+        runtime
             .update(|state| {
                 state.phase = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsPhase::Degraded;
                 state.recovery_state =
@@ -10396,7 +10431,7 @@ async fn start_line_cellular_ims_restore(
     let ims_video = app.config_manager.get_line_ims_video_config(&line_id);
     line.voice_access
         .set_backend_video_enabled(AccessPathKind::CellularIms, ims_video.cellular_ims_enabled);
-    line.cellular_ims
+    runtime
         .update(|state| {
             state.recovery_state =
                 crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::Connecting;
@@ -10417,7 +10452,7 @@ async fn start_line_cellular_ims_restore(
         // from the device-wide schedulers is what makes the log readable when
         // several cards are retrying at once.
         diagnostic_log::with_ue_worker_context(async {
-            run_line_cellular_ims_restore_batch(&app, &line, source).await;
+            run_line_cellular_ims_restore_batch(&app, &line, source, generation).await;
             line.finish_cellular_ims_retry();
         })
         .await;
@@ -10619,10 +10654,14 @@ async fn wait_for_line_modem(
         }
         let refreshed = app.line_registry.refresh().await.is_ok();
         if refreshed && line.binding().present {
-            return LineModemWait::Ready;
+            return if line.cellular_ims.mm_binding_ready() {
+                LineModemWait::Ready
+            } else {
+                LineModemWait::Deferred
+            };
         }
         line.cellular_ims
-            .update(|state| {
+            .update_current(batch_generation, |state| {
                 state.phase = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsPhase::Degraded;
                 state.stage = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsStage::Modem;
                 state.recovery_state =
@@ -10669,9 +10708,9 @@ async fn run_line_cellular_ims_restore_batch(
     app: &AppState,
     line: &Arc<crate::services::line_registry::LineRuntime>,
     source: &'static str,
+    generation: u64,
 ) {
-    let generation = line.cellular_ims.generation();
-    run_line_cellular_ims_restore_round(app, line, source).await;
+    run_line_cellular_ims_restore_round(app, line, source, generation).await;
     // Recovery is considered only after normal configured/PCO/DNS and profile
     // fallbacks have failed. It never interrupts an already registered line.
     // Shield the admitted maintenance task: dropping this caller must not
@@ -10680,19 +10719,24 @@ async fn run_line_cellular_ims_restore_batch(
     let recovery_line = Arc::clone(line);
     let recovered = tokio::spawn(async move {
         try_mm_pcscf_reattach(&recovery_app, &recovery_line, generation).await
-    }).await.unwrap_or(false);
+    })
+    .await
+    .unwrap_or(false);
     if recovered && line.cellular_ims.generation() == generation {
         // Exactly one extra ordered batch, not recursion. The durable driver
         // budget is not reset by profile changes, application restarts or retry.
-        run_line_cellular_ims_restore_round(app, line, source).await;
+        run_line_cellular_ims_restore_round(app, line, source, generation).await;
     }
 }
 
 fn mm_pcscf_recovery_is_candidate(
     status: &crate::connectivity::modems::ims::cellular_ims::CellularImsRuntimeStatus,
 ) -> bool {
-    !status.registered && status.phase == "degraded" && status.stage == "pcscf"
-        && status.recovery_state == "exhausted" && status.profile_source.as_deref() == Some("derived")
+    !status.registered
+        && status.phase == "degraded"
+        && status.stage == "pcscf"
+        && status.recovery_state == "exhausted"
+        && status.profile_source.as_deref() == Some("derived")
         && status.last_error.as_deref() == Some(code::RUNTIME_ALL_PCSCF_FAILED)
 }
 
@@ -10704,10 +10748,18 @@ async fn mm_pcscf_recovery_policy_current(
 ) -> bool {
     let binding = line.binding();
     let profile = app.config_manager.get_line_profile(&binding.line_id);
-    line.cellular_ims.generation() == generation && binding.present && binding.modem_path == modem
-        && !binding.slot_conflict && profile.enabled && profile.cellular_ims_connection_enabled
-        && !profile.airplane_mode_enabled && !profile.data_connection_enabled && !profile.vowifi.enabled
-        && app.config_manager.get_cellular_backend().mode == crate::hardware::cellular::backends::config::BackendMode::Modemmanager
+    line.cellular_ims.generation() == generation
+        && line.cellular_ims.mm_binding_ready()
+        && binding.present
+        && binding.modem_path == modem
+        && !binding.slot_conflict
+        && profile.enabled
+        && profile.cellular_ims_connection_enabled
+        && !profile.airplane_mode_enabled
+        && !profile.data_connection_enabled
+        && !profile.vowifi.enabled
+        && app.config_manager.get_cellular_backend().mode
+            == crate::hardware::cellular::backends::config::BackendMode::Modemmanager
         && crate::hardware::cellular::backends::active_native().is_none()
         && app.line_registry.device_kind() == crate::hardware::devices::DeviceKind::Qcm410
         && !line_has_call_blocking_ims_switch(app, &binding.line_id).await
@@ -10723,9 +10775,12 @@ fn mm_pcscf_radio_restore_policy_current(
 ) -> bool {
     let binding = line.binding();
     let profile = app.config_manager.get_line_profile(&binding.line_id);
-    binding.present && binding.modem_path == modem && !binding.slot_conflict
+    binding.present
+        && binding.modem_path == modem
+        && !binding.slot_conflict
         && !profile.airplane_mode_enabled
-        && app.config_manager.get_cellular_backend().mode == crate::hardware::cellular::backends::config::BackendMode::Modemmanager
+        && app.config_manager.get_cellular_backend().mode
+            == crate::hardware::cellular::backends::config::BackendMode::Modemmanager
         && crate::hardware::cellular::backends::active_native().is_none()
         && app.line_registry.device_kind() == crate::hardware::devices::DeviceKind::Qcm410
 }
@@ -10733,13 +10788,18 @@ fn mm_pcscf_radio_restore_policy_current(
 fn mm_pcscf_recovery_stopped(
     state: &mut crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsSnapshot,
 ) {
-    use crate::connectivity::modems::ims::cellular_ims::runtime::{CellularImsPhase, CellularImsStage, CellularImsRecoveryState};
+    use crate::connectivity::modems::ims::cellular_ims::runtime::{
+        CellularImsPhase, CellularImsRecoveryState, CellularImsStage,
+    };
     state.phase = CellularImsPhase::Degraded;
     state.stage = CellularImsStage::Modem;
     state.recovery_state = CellularImsRecoveryState::Exhausted;
     state.manual_retry_available = true;
     state.next_retry_at = None;
-    state.last_error = Some(format!("{}:mm_reporting_recovery_stopped", code::RUNTIME_ALL_PCSCF_FAILED));
+    state.last_error = Some(format!(
+        "{}:mm_reporting_recovery_stopped",
+        code::RUNTIME_ALL_PCSCF_FAILED
+    ));
 }
 
 async fn try_mm_pcscf_reattach(
@@ -10747,26 +10807,42 @@ async fn try_mm_pcscf_reattach(
     line: &Arc<crate::services::line_registry::LineRuntime>,
     generation: u64,
 ) -> bool {
-    if !mm_pcscf_recovery_is_candidate(&line.cellular_ims.status().await) { return false; }
+    let runtime = Arc::new(line.cellular_ims.for_admission_generation(generation));
+    if !runtime.task_is_current() || !mm_pcscf_recovery_is_candidate(&runtime.status().await) {
+        return false;
+    }
     let _transition = line.ims_registration.transition_lock.lock().await;
     let _bearer = line.bearer_operation_lock.lock().await;
     let _connect = line.cellular_ims_connect_lock.lock().await;
     let binding = line.binding();
     if !mm_pcscf_recovery_policy_current(app, line, generation, &binding.modem_path).await
-        || !mm_pcscf_recovery_is_candidate(&line.cellular_ims.status().await) { return false; }
+        || !mm_pcscf_recovery_is_candidate(&line.cellular_ims.status().await)
+    {
+        return false;
+    }
     // One physical modem can back multiple line objects. Never cycle it while
     // any other line on the same endpoint may own calls or data.
     if app.line_registry.all().await.iter().any(|other| {
         let other = other.binding();
-        other.line_id != binding.line_id && other.present && (
-            other.modem_path == binding.modem_path
-                || other.qmi_device.as_ref().is_some_and(|device| binding.qmi_device.as_ref() == Some(device)))
-    }) { return false; }
+        other.line_id != binding.line_id
+            && other.present
+            && (other.modem_path == binding.modem_path
+                || other
+                    .qmi_device
+                    .as_ref()
+                    .is_some_and(|device| binding.qmi_device.as_ref() == Some(device)))
+    }) {
+        return false;
+    }
     match list_calls_for_line(app, &binding.line_id, &binding.modem_path).await {
-        Ok(calls) if calls.calls.is_empty() => {},
+        Ok(calls) if calls.calls.is_empty() => {}
         _ => return false,
     }
-    let plan = match crate::hardware::devices::qcm410::mm_pcscf_recovery::RecoveryPlan::inspect(&binding.modem_path).await {
+    let plan = match crate::hardware::devices::qcm410::mm_pcscf_recovery::RecoveryPlan::inspect(
+        &binding.modem_path,
+    )
+    .await
+    {
         Ok(Some(plan)) if plan.budget_available() => plan,
         Ok(_) => return false,
         Err(_) => {
@@ -10778,27 +10854,39 @@ async fn try_mm_pcscf_reattach(
     // namespace and bearer, and keeps unknown receipts. The driver refuses the
     // operation unless its exact original lease reports successful cleanup.
     crate::connectivity::modems::ims::cellular_ims::live::cleanup_live_for_profile_switch(
-        &line.cellular_ims_live, &line.cellular_ims,
-    ).await;
+        &line.cellular_ims_live,
+        &runtime,
+    )
+    .await;
     if !mm_pcscf_recovery_policy_current(app, line, generation, &binding.modem_path).await {
         if line.cellular_ims.generation() == generation {
-            line.cellular_ims.update(mm_pcscf_recovery_stopped).await;
+            runtime.update(mm_pcscf_recovery_stopped).await;
         }
         return false;
     }
     let cid = plan.context_id();
-    line.cellular_ims.update(|state| {
+    runtime.update(|state| {
         state.stage = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsStage::Modem;
         state.recovery_state = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::WaitingModem;
         state.manual_retry_available = false;
         state.next_retry_at = None;
     }).await;
     tracing::info!(line_id = %binding.line_id, cid, "MM P-CSCF reporting recovery starting; one bounded reattach");
-    let result = plan.execute(
-        || mm_pcscf_recovery_policy_current(app, line, generation, &binding.modem_path),
-        || std::future::ready(mm_pcscf_radio_restore_policy_current(app, line, &binding.modem_path)),
-    ).await;
-    if line.cellular_ims.generation() != generation { return false; }
+    let result = plan
+        .execute(
+            || mm_pcscf_recovery_policy_current(app, line, generation, &binding.modem_path),
+            || {
+                std::future::ready(mm_pcscf_radio_restore_policy_current(
+                    app,
+                    line,
+                    &binding.modem_path,
+                ))
+            },
+        )
+        .await;
+    if line.cellular_ims.generation() != generation {
+        return false;
+    }
     match result {
         Ok(()) => {
             tracing::info!(line_id = %binding.line_id, cid, "MM P-CSCF reporting recovery completed; retrying original profile/family order");
@@ -10806,7 +10894,7 @@ async fn try_mm_pcscf_reattach(
         }
         Err(error) => {
             tracing::warn!(line_id = %binding.line_id, %error, "MM P-CSCF recovery stopped; no automatic repeat");
-            line.cellular_ims.update(mm_pcscf_recovery_stopped).await;
+            runtime.update(mm_pcscf_recovery_stopped).await;
             false
         }
     }
@@ -10816,22 +10904,12 @@ async fn run_line_cellular_ims_restore_round(
     app: &AppState,
     line: &Arc<crate::services::line_registry::LineRuntime>,
     source: &'static str,
+    batch_generation: u64,
 ) {
-    let batch_generation = line.cellular_ims.generation();
+    let runtime = Arc::new(line.cellular_ims.for_admission_generation(batch_generation));
     match wait_for_line_modem(app, line, batch_generation).await {
         LineModemWait::Ready => {}
-        LineModemWait::Cancelled => {
-            line.cellular_ims
-                .update(|state| {
-                    state.recovery_state =
-                        crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::Idle;
-                    state.recovery_source = None;
-                    state.next_retry_at = None;
-                    state.manual_retry_available = false;
-                })
-                .await;
-            return;
-        }
+        LineModemWait::Cancelled => return,
         LineModemWait::Deferred => return,
     }
 
@@ -10842,15 +10920,15 @@ async fn run_line_cellular_ims_restore_round(
         let error = crate::connectivity::modems::ims::cellular_ims::CellularImsError::new(
             crate::connectivity::modems::ims::cellular_ims::errors::code::DATA_SLOT_MODE_MISSING,
         );
-        line.cellular_ims.begin_profile_attempt_batch().await;
-        line.cellular_ims
+        runtime.begin_profile_attempt_batch().await;
+        runtime
             .update(|state| cellular_ims_wait_for_native_endpoint(state, &error))
             .await;
         return;
     }
 
     let _transition_guard = line.ims_registration.transition_lock.lock().await;
-    if line.cellular_ims.generation() != batch_generation
+    if !runtime.task_is_current()
         || !apply_line_ims_access_policy_locked(
             app,
             line,
@@ -10866,8 +10944,8 @@ async fn run_line_cellular_ims_restore_round(
     let restore_policy = line_profile.cellular_ims_auto_restore;
     let candidates = line_profile.cellular_ims_profile_selection.attempts;
     let max_attempts = candidates.len() as u32;
-    line.cellular_ims.begin_profile_attempt_batch().await;
-    line.cellular_ims
+    runtime.begin_profile_attempt_batch().await;
+    runtime
         .update(|state| {
             state.retry_attempt = 0;
             state.retry_max = max_attempts;
@@ -10875,7 +10953,7 @@ async fn run_line_cellular_ims_restore_round(
         .await;
 
     for (candidate_offset, candidate) in candidates.iter().enumerate() {
-        if line.cellular_ims.generation() != batch_generation
+        if !runtime.task_is_current()
             || !line_ims_access_permits_bringup(
                 app,
                 line,
@@ -10894,19 +10972,19 @@ async fn run_line_cellular_ims_restore_round(
             // generation stable so this remains one ordered recovery batch.
             let _bearer_guard = line.bearer_operation_lock.lock().await;
             let _guard = line.cellular_ims_connect_lock.lock().await;
-            if line.cellular_ims.generation() != batch_generation {
+            if !runtime.task_is_current() {
                 return;
             }
             crate::connectivity::modems::ims::cellular_ims::live::cleanup_live_for_profile_switch(
                 &line.cellular_ims_live,
-                &line.cellular_ims,
+                &runtime,
             )
             .await;
         }
         let attempt = candidate_offset as u32 + 1;
         let profile = app.config_manager.get_line_profile(&line.binding().line_id);
         if !profile.enabled || !profile.cellular_ims_connection_enabled {
-            line.cellular_ims
+            runtime
                 .update(|state| {
                     state.recovery_state =
                         crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::Idle;
@@ -10918,17 +10996,18 @@ async fn run_line_cellular_ims_restore_round(
             return;
         }
 
-        line.cellular_ims
-            .begin_profile_attempt(attempt, candidate)
-            .await;
+        runtime.begin_profile_attempt(attempt, candidate).await;
         let refreshed = app.line_registry.refresh().await;
+        if !runtime.task_is_current() {
+            return;
+        }
         if let Err(error) = refreshed {
             let attempt_error =
                 crate::connectivity::modems::ims::cellular_ims::CellularImsError::with_detail(
                     code::MODEM_REFRESH_FAILED,
                     error.to_string(),
                 );
-            line.cellular_ims
+            runtime
                 .update(|state| {
                     state.phase = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsPhase::Degraded;
                     state.stage = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsStage::Modem;
@@ -10939,7 +11018,7 @@ async fn run_line_cellular_ims_restore_round(
                         Some(cellular_ims_next_retry_at(CELLULAR_IMS_MODEM_MISSING_POLL_DELAY_SECS));
                 })
                 .await;
-            line.cellular_ims
+            runtime
                 .finish_profile_attempt(attempt, candidate, "failed", Some(&attempt_error))
                 .await;
             if attempt < max_attempts {
@@ -10969,16 +11048,16 @@ async fn run_line_cellular_ims_restore_round(
             ) {
                 Ok(device) => device,
                 Err(error) => {
-                    line.cellular_ims
+                    runtime
                         .update(|state| state.last_error = Some(error.to_string()))
                         .await;
-                    line.cellular_ims
+                    runtime
                         .finish_profile_attempt(attempt, candidate, "failed", Some(&error))
                         .await;
                     continue;
                 }
             };
-        line.cellular_ims
+        runtime
             .update(|state| {
                 state.recovery_state =
                     crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::Connecting;
@@ -10996,7 +11075,7 @@ async fn run_line_cellular_ims_restore_round(
             // for the bearer gate. Its old profile/device snapshot is not new
             // permission to allocate an IMS bearer or turn RF back on.
             let profile = app.config_manager.get_line_profile(&binding.line_id);
-            if line.cellular_ims.generation() != batch_generation
+            if !runtime.task_is_current()
                 || !line.binding().present
                 || !profile.enabled
                 || profile.airplane_mode_enabled
@@ -11014,6 +11093,7 @@ async fn run_line_cellular_ims_restore_round(
                     ),
                     Ok((_, sim_override)) => {
                         let _guard = line.cellular_ims_connect_lock.lock().await;
+                        if !runtime.task_is_current() { return; }
                         if line.cellular_ims.status().await.registered {
                             Ok(line.cellular_ims.status().await)
                         } else {
@@ -11024,7 +11104,7 @@ async fn run_line_cellular_ims_restore_round(
                                 &line.cellular_ims_live,
                                 &device,
                                 line.ims_bearer.as_deref(),
-                                &line.cellular_ims,
+                                &runtime,
                                 &line.ims_access_network,
                                 candidate,
                                 &ip_families,
@@ -11047,6 +11127,14 @@ async fn run_line_cellular_ims_restore_round(
                 Err(error) => Err(error),
             }
         };
+        if !runtime.task_is_current()
+            || result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.code() == "cellular_ims_mm_binding_calibrating")
+        {
+            return; // Unknown MM inventory is a prerequisite, not profile exhaustion.
+        }
         let batch_action = cellular_ims_profile_batch_action(
             line.cellular_ims.generation() == batch_generation,
             attempt,
@@ -11058,14 +11146,14 @@ async fn run_line_cellular_ims_restore_round(
         }
         match result {
             Ok(_) => {
-                line.cellular_ims
+                runtime
                     .finish_profile_attempt(attempt, candidate, "succeeded", None)
                     .await;
                 // This baseband accepted an IMS session, so any earlier wedge was
                 // a transient firmware race rather than a standing refusal. Drop
                 // the backoff so the next failure starts from the base window.
                 line.clear_baseband_wedge();
-                line.cellular_ims
+                runtime
                     .update(|state| {
                         state.recovery_state =
                             crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::Registered;
@@ -11084,13 +11172,13 @@ async fn run_line_cellular_ims_restore_round(
                 return;
             }
             Err(error) => {
-                line.cellular_ims
+                runtime
                     .finish_profile_attempt(attempt, candidate, "failed", Some(&error))
                     .await;
                 // Pre-live errors do not pass through connect_live_for_line's
                 // diagnostic update. Preserve their actual cause instead of
                 // replacing it with "profile attempts exhausted".
-                line.cellular_ims
+                runtime
                     .update(|state| {
                         state.last_error = Some(error.to_string());
                         state.last_failure_at = Some(chrono::Utc::now().to_rfc3339());
@@ -11113,7 +11201,7 @@ async fn run_line_cellular_ims_restore_round(
                 // modem reaches registered/connected.
                 if batch_action == CellularImsProfileBatchAction::WaitForNetwork {
                     let delay = 30;
-                    line.cellular_ims
+                    runtime
                         .update(|state| {
                             state.phase = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsPhase::Degraded;
                             state.stage = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsStage::Radio;
@@ -11128,7 +11216,7 @@ async fn run_line_cellular_ims_restore_round(
                     return;
                 }
                 if batch_action == CellularImsProfileBatchAction::WaitForNativeEndpoint {
-                    line.cellular_ims
+                    runtime
                         .update(|state| cellular_ims_wait_for_native_endpoint(state, &error))
                         .await;
                     return;
@@ -11156,7 +11244,7 @@ async fn run_line_cellular_ims_restore_round(
                         cooldown_secs = cooldown.map(|value| value.as_secs()),
                         "VoLTE IMS restore aborted: the baseband refused the session in a way that is unsafe to retry"
                     );
-                    line.cellular_ims
+                    runtime
                         .update(|state| {
                             state.phase = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsPhase::Degraded;
                             state.recovery_state =
@@ -11171,7 +11259,7 @@ async fn run_line_cellular_ims_restore_round(
                 }
                 if batch_action == CellularImsProfileBatchAction::Continue {
                     let delay = restore_policy.retry_delay_secs.clamp(5, 180);
-                    line.cellular_ims
+                    runtime
                         .update(|state| {
                             state.next_retry_at = Some(cellular_ims_next_retry_at(delay))
                         })
@@ -11190,7 +11278,7 @@ async fn run_line_cellular_ims_restore_round(
         }
     }
 
-    line.cellular_ims
+    runtime
         .update(|state| {
             state.phase = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsPhase::Degraded;
             state.recovery_state =
@@ -14450,7 +14538,9 @@ mod tests {
 
     #[test]
     fn cellular_ims_profile_batch_mm_recovery_failure_is_not_left_starting() {
-        use crate::connectivity::modems::ims::cellular_ims::runtime::{CellularImsSnapshot, CellularImsPhase, CellularImsStage, CellularImsRecoveryState};
+        use crate::connectivity::modems::ims::cellular_ims::runtime::{
+            CellularImsPhase, CellularImsRecoveryState, CellularImsSnapshot, CellularImsStage,
+        };
         let mut state = CellularImsSnapshot::default();
         mm_pcscf_recovery_stopped(&mut state);
         assert_eq!(state.phase, CellularImsPhase::Degraded);
@@ -14458,7 +14548,10 @@ mod tests {
         assert_eq!(state.recovery_state, CellularImsRecoveryState::Exhausted);
         assert!(state.manual_retry_available);
         assert!(state.next_retry_at.is_none());
-        assert_eq!(state.last_error.as_deref(), Some("cellular_ims_runtime_all_pcscf_failed:mm_reporting_recovery_stopped"));
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("cellular_ims_runtime_all_pcscf_failed:mm_reporting_recovery_stopped")
+        );
     }
 
     #[test]
@@ -14478,18 +14571,26 @@ mod tests {
         registered.registered = true;
         assert!(!mm_pcscf_recovery_is_candidate(&registered));
         for stage in ["radio", "bearer", "register_initial", "registered"] {
-            let mut state = eligible(); state.stage = stage.into();
+            let mut state = eligible();
+            state.stage = stage.into();
             assert!(!mm_pcscf_recovery_is_candidate(&state));
         }
         for source in [None, Some("database"), Some("carrier_catalog")] {
-            let mut state = eligible(); state.profile_source = source.map(str::to_string);
+            let mut state = eligible();
+            state.profile_source = source.map(str::to_string);
             assert!(!mm_pcscf_recovery_is_candidate(&state));
         }
-        for error in [None, Some(code::REGISTER_AUTH_UNEXPECTED_STATUS), Some(code::RUNTIME_IMS_BASEBAND_WEDGED)] {
-            let mut state = eligible(); state.last_error = error.map(str::to_string);
+        for error in [
+            None,
+            Some(code::REGISTER_AUTH_UNEXPECTED_STATUS),
+            Some(code::RUNTIME_IMS_BASEBAND_WEDGED),
+        ] {
+            let mut state = eligible();
+            state.last_error = error.map(str::to_string);
             assert!(!mm_pcscf_recovery_is_candidate(&state));
         }
-        let mut pending = eligible(); pending.recovery_state = "connecting".into();
+        let mut pending = eligible();
+        pending.recovery_state = "connecting".into();
         assert!(!mm_pcscf_recovery_is_candidate(&pending));
     }
 

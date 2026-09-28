@@ -312,7 +312,10 @@ impl LineRuntime {
     }
 
     fn mark_absent(&self) {
-        let mut binding = self.binding.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut binding = self
+            .binding
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         binding.present = false;
         self.cellular_ims.observe_mm_binding(&binding);
     }
@@ -630,16 +633,18 @@ impl LineRuntimeRegistry {
         // Keep discovery/reconciliation passes ordered, while the registry write
         // lock remains reserved for the short snapshot publication below.
         let _refresh_guard = self.refresh_lock.lock().await;
+        let mut discovery_failed = false;
         let mut discovered = match self.observations.discover().await {
             Ok(bindings) => bindings,
             Err(error) => {
-                // Preserve the current discovery failure policy in this
-                // extraction. Last-known baseband inventory retention is a
-                // separate policy decision from serving-snapshot TTL.
-                tracing::warn!(backend = self.observations.name(), error = %error, "Modem discovery unavailable; continuing with non-baseband lines");
+                discovery_failed = true;
+                tracing::warn!(backend = self.observations.name(), error = %error, "Modem discovery unavailable; pausing MM admission without declaring absence");
                 Vec::new()
             }
         };
+        // Invalidate every known MM line before any reader/serving/worker await.
+        // One slow line must not leave another discovered SIM change admitted.
+        Self::observe_mm_inventory(&*self.lines.read().await, &discovered, discovery_failed);
         if let Some(config_manager) = &self.config_manager {
             let observations = discovered
                 .iter()
@@ -874,6 +879,14 @@ impl LineRuntimeRegistry {
                 .collect::<Vec<_>>();
             (absent_lines, existing_lines, new_lines)
         };
+        let (retained_mm_lines, absent_lines): (Vec<_>, Vec<_>) =
+            absent_lines.into_iter().partition(|line| {
+                discovery_failed
+                    && line
+                        .binding()
+                        .modem_path
+                        .starts_with("/org/freedesktop/ModemManager1/Modem/")
+            });
         let (deferred_absent_lines, absent_lines): (Vec<_>, Vec<_>) = absent_lines
             .into_iter()
             .partition(|line| line.bearer_operation_in_progress());
@@ -918,9 +931,6 @@ impl LineRuntimeRegistry {
 
         let mut prepared_existing = Vec::with_capacity(existing_lines.len());
         for (line, binding) in &existing_lines {
-            // Invalidate old IMS work before any asynchronous worker/context
-            // transition. No hardware cleanup is performed under refresh_lock.
-            line.cellular_ims.observe_mm_binding(binding);
             self.refresh_ims_access_network(line, binding).await;
             prepared_existing.push(self.reconcile_ue_context(line, binding).await);
         }
@@ -958,6 +968,10 @@ impl LineRuntimeRegistry {
             + new_lines
                 .iter()
                 .filter(|(_, line)| line.binding().present)
+                .count()
+            + retained_mm_lines
+                .iter()
+                .filter(|line| line.binding().present)
                 .count();
 
         // Shut down workers whose hardware anchor disappeared. This is also
@@ -986,6 +1000,45 @@ impl LineRuntimeRegistry {
             );
         }
         Ok(present_count)
+    }
+
+    fn observe_mm_inventory(
+        lines: &BTreeMap<String, Arc<LineRuntime>>,
+        discovered: &[ModemBinding],
+        discovery_failed: bool,
+    ) {
+        for line in lines.values() {
+            let previous = line.binding();
+            if !previous
+                .modem_path
+                .starts_with("/org/freedesktop/ModemManager1/Modem/")
+            {
+                continue;
+            }
+            let observed = (!discovery_failed)
+                .then(|| {
+                    discovered
+                        .iter()
+                        .find(|binding| binding.line_id == previous.line_id)
+                })
+                .flatten();
+            let mut binding = observed.cloned().unwrap_or(previous);
+            if observed.is_some() {
+                binding.slot_conflict |= discovered
+                    .iter()
+                    .filter(|other| {
+                        other.hardware_key == binding.hardware_key
+                            && other.uim_slot == binding.uim_slot
+                    })
+                    .count()
+                    > 1;
+            } else {
+                // Keep published presence and last-known identity unchanged on
+                // failed discovery; this sample only closes new IMS admission.
+                binding.sim_iccid.clear();
+            }
+            line.cellular_ims.observe_mm_binding(&binding);
+        }
     }
 
     async fn refresh_ims_access_network(&self, line: &LineRuntime, binding: &ModemBinding) {
@@ -1498,6 +1551,60 @@ mod tests {
             VoicePathPolicy::default(),
             DeviceKind::Unknown,
         )
+    }
+
+    #[tokio::test]
+    async fn mm_discovery_error_pauses_admission_without_publishing_absence() {
+        let mut provider = TestObservations::new(Ok(serving_snapshot()));
+        provider.discovery_failure = true;
+        let registry = LineRuntimeRegistry::new(DeviceKind::Unknown, Arc::new(provider));
+        let mut observed = binding("mm-discovery-error", true);
+        observed.modem_path = "/org/freedesktop/ModemManager1/Modem/0".into();
+        observed.sim_path = Some("/org/freedesktop/ModemManager1/SIM/0".into());
+        observed.sim_iccid = "8900000000000000001".into();
+        observed.primary_port = "wwan0qmi0".into();
+        let line = registry.insert_control_test_line(observed).await;
+        let generation = line.cellular_ims.generation();
+        assert!(line.cellular_ims.mm_binding_ready());
+        assert_eq!(registry.refresh().await.unwrap(), 1);
+        assert!(line.binding().present);
+        assert!(!line.cellular_ims.mm_binding_ready());
+        assert_eq!(line.cellular_ims.generation(), generation);
+        assert_eq!(line.cellular_ims.mm_calibration_ticket(), None);
+        assert_eq!(registry.observations.name(), "test-observations");
+    }
+
+    #[tokio::test]
+    async fn mm_inventory_invalidates_all_lines_before_async_reconcile() {
+        let registry = LineRuntimeRegistry::new(
+            DeviceKind::Unknown,
+            Arc::new(TestObservations::new(Ok(serving_snapshot()))),
+        );
+        let mut observed = Vec::new();
+        let mut lines = Vec::new();
+        for index in 0..2 {
+            let mut item = binding(&format!("mm-pass-{index}"), true);
+            item.hardware_key = format!("mm-slot-{index}");
+            item.modem_path = format!("/org/freedesktop/ModemManager1/Modem/{index}");
+            item.sim_path = Some(format!("/org/freedesktop/ModemManager1/SIM/{index}"));
+            item.sim_iccid = "8900000000000000001".into();
+            item.primary_port = "wwan0qmi0".into();
+            lines.push(registry.insert_control_test_line(item.clone()).await);
+            observed.push(item);
+        }
+        let generation = lines[1].cellular_ims.generation();
+        observed[0].sim_iccid.clear();
+        observed[1].sim_iccid = "8900000000000000002".into();
+        LineRuntimeRegistry::observe_mm_inventory(&*registry.lines.read().await, &observed, false);
+        assert!(!lines[0].cellular_ims.mm_binding_ready());
+        assert!(!lines[1].cellular_ims.mm_binding_ready());
+        assert_eq!(lines[1].cellular_ims.generation(), generation + 1);
+        assert!(lines[0].binding().present && lines[1].binding().present);
+        assert_eq!(
+            lines[1].cellular_ims.mm_calibration_ticket(),
+            None,
+            "one inventory pass must not count twice"
+        );
     }
 
     #[tokio::test]

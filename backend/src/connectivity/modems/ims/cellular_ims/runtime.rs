@@ -533,6 +533,10 @@ pub struct CellularImsRuntime {
     advance_lock: Arc<Mutex<()>>,
     generation: Arc<AtomicU64>,
     mm_binding: Arc<std::sync::Mutex<super::mm_binding::Calibration>>,
+    /// Optional token carried by MM connection/listener clones. Nested async
+    /// helpers must not publish into a replacement SIM's runtime snapshot.
+    publication_generation: Option<u64>,
+    require_admission: bool,
 }
 
 /// Keeps admission closed throughout an explicit eSIM operation, including
@@ -565,6 +569,8 @@ impl CellularImsRuntime {
             advance_lock: Arc::new(Mutex::new(())),
             generation: Arc::new(AtomicU64::new(0)),
             mm_binding: Arc::new(std::sync::Mutex::new(Default::default())),
+            publication_generation: None,
+            require_admission: false,
         }
     }
 
@@ -612,6 +618,16 @@ impl CellularImsRuntime {
         self.mm_binding.lock().unwrap().expected_sim()
     }
 
+    pub fn admitted_generation(&self) -> Option<u64> {
+        let binding = self.mm_binding.lock().unwrap();
+        let generation = self.generation();
+        (binding.ready()
+            && self
+                .publication_generation
+                .is_none_or(|expected| expected == generation))
+        .then_some(generation)
+    }
+
     pub fn mm_binding_ready(&self) -> bool {
         self.mm_binding.lock().unwrap().ready()
     }
@@ -638,10 +654,46 @@ impl CellularImsRuntime {
         true
     }
 
-    /// Apply a mutation to the snapshot under the write lock.
+    /// Scope every nested update/attempt, not just the final REGISTER result.
+    /// The inventory/control handle remains unscoped so it can reset state.
+    pub(crate) fn for_generation(&self, generation: u64) -> Self {
+        Self {
+            publication_generation: Some(generation),
+            require_admission: false,
+            ..self.clone()
+        }
+    }
+
+    /// Recovery batches must also defer on unknown inventory. Unlike live
+    /// sessions they must not consume attempts or latch exhaustion in that gap.
+    pub(crate) fn for_admission_generation(&self, generation: u64) -> Self {
+        Self {
+            require_admission: true,
+            ..self.for_generation(generation)
+        }
+    }
+
+    pub(crate) fn task_is_current(&self) -> bool {
+        let binding = self.mm_binding.lock().unwrap();
+        self.publication_generation.is_none_or(|generation| {
+            self.generation() == generation
+                && binding.can_publish()
+                && (!self.require_admission || binding.ready())
+        })
+    }
+
+    /// Apply a mutation to the snapshot under the write and binding locks.
+    /// Stale scoped tasks get the current snapshot without running their closure.
     pub async fn update(&self, f: impl FnOnce(&mut CellularImsSnapshot)) -> CellularImsSnapshot {
         let mut guard = self.snapshot.write().await;
-        f(&mut guard);
+        let binding = self.mm_binding.lock().unwrap();
+        if self.publication_generation.is_none_or(|generation| {
+            self.generation() == generation
+                && binding.can_publish()
+                && (!self.require_admission || binding.ready())
+        }) {
+            f(&mut guard);
+        }
         guard.clone()
     }
 
@@ -828,6 +880,83 @@ impl CellularImsRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unknown_mm_admission_never_latches_batch_exhaustion() {
+        let rt = CellularImsRuntime::new();
+        let binding = mm_test_binding("8900000000000000001");
+        rt.observe_mm_binding(&binding);
+        let batch = rt.for_admission_generation(rt.generation());
+        rt.observe_mm_binding(&mm_test_binding(""));
+        assert!(!batch.task_is_current());
+        batch
+            .update(|s| {
+                s.manual_retry_available = true;
+                s.recovery_state = CellularImsRecoveryState::Exhausted;
+            })
+            .await;
+        batch
+            .finish_profile_attempt(
+                1,
+                &ImsProfileCandidate::automatic(crate::platform::config::ImsProfileSource::Derived),
+                "failed",
+                None,
+            )
+            .await;
+        let snapshot = rt.snapshot().await;
+        assert!(!snapshot.manual_retry_available);
+        assert!(snapshot.profile_attempt_results.is_empty());
+        rt.observe_mm_binding(&binding);
+        assert!(batch.task_is_current());
+        assert!(rt.mm_binding_ready());
+        assert_eq!(rt.mm_calibration_ticket(), None);
+        // Final state checks occur while holding the snapshot and binding locks.
+        let write = rt.snapshot.write().await;
+        let old_batch = batch.clone();
+        let delayed = tokio::spawn(async move {
+            old_batch
+                .update(|_| panic!("old batch exhausted a replacement SIM"))
+                .await;
+        });
+        tokio::task::yield_now().await;
+        rt.observe_mm_binding(&mm_test_binding("8900000000000000002"));
+        drop(write);
+        delayed.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scoped_mm_tasks_cannot_publish_nested_updates_after_sim_change() {
+        let rt = CellularImsRuntime::new();
+        rt.observe_mm_binding(&mm_test_binding("8900000000000000001"));
+        let task = rt.for_generation(rt.generation());
+        task.update(|s| s.phase = CellularImsPhase::Registered)
+            .await;
+        assert!(task.task_is_current());
+        let mut unknown = mm_test_binding("");
+        unknown.present = false;
+        rt.observe_mm_binding(&unknown);
+        assert!(
+            task.task_is_current(),
+            "unknown inventory must not cancel a live session"
+        );
+        rt.observe_mm_binding(&mm_test_binding("8900000000000000002"));
+        assert!(!task.task_is_current());
+        task.update(|_| panic!("stale nested task published")).await;
+        task.record_attempt(CellularImsStage::Registered, None, "succeeded", None, None)
+            .await;
+        assert!(rt.snapshot().await.connection_attempts.is_empty());
+        rt.observe_mm_binding(&mm_test_binding("8900000000000000002"));
+        assert!(rt.finish_mm_calibration(rt.mm_calibration_ticket().unwrap()));
+        assert!(
+            !task.task_is_current(),
+            "calibration must not bless an old task"
+        );
+        task.clone()
+            .update(|_| panic!("stale listener clone published"))
+            .await;
+        rt.update(|s| s.phase = CellularImsPhase::Disabled).await;
+        assert_eq!(rt.snapshot().await.phase, CellularImsPhase::Disabled);
+    }
 
     #[test]
     fn stage_strings_match_frontend_contract() {

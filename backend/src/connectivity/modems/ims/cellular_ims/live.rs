@@ -1270,6 +1270,13 @@ impl CellularImsRegisterAuthenticator {
         }
     }
 
+    fn ensure_task_current(&self) -> Result<(), ImsError> {
+        if !self.runtime.task_is_current() {
+            return Err(ImsError::new(code::RUNTIME_NOT_RUNNING));
+        }
+        ensure_worker_binding_current_ims(&self.worker_binding)
+    }
+
     fn with_expires_seconds(mut self, expires_seconds: u32) -> Self {
         self.expires_seconds = expires_seconds;
         self
@@ -1622,7 +1629,7 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         challenge_response: &[u8],
         channel: &mut CellularImsSipChannel,
     ) -> Result<(), ImsError> {
-        ensure_worker_binding_current_ims(&self.worker_binding)?;
+        self.ensure_task_current()?;
         self.runtime
             .update(|state| state.stage = CellularImsStage::IdentityAka)
             .await;
@@ -1649,7 +1656,12 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         let autn = aka_challenge.autn;
         let qmi_device = self.device.qmi_device.clone();
         let uim_slot = self.device.uim_slot;
+        let aka_runtime = self.runtime.clone();
+        self.ensure_task_current()?;
         let aka = tokio::task::spawn_blocking(move || {
+            if !aka_runtime.task_is_current() {
+                return Err(CellularImsError::new(code::RUNTIME_NOT_RUNNING));
+            }
             identity::run_usim_aka(
                 QMI_PROXY_SOCKET,
                 qmi_device.as_str(),
@@ -1666,6 +1678,7 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         .map_err(|_| ImsError::new(code::USIM_AKA_FAILED))?
         .map_err(to_ims_error)?;
 
+        self.ensure_task_current()?;
         self.prepare_aka_result(challenge, aka, security_server, channel)
             .await
     }
@@ -1675,10 +1688,11 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         _challenge_response: &[u8],
         cseq: u32,
     ) -> Result<Vec<u8>, ImsError> {
-        ensure_worker_binding_current_ims(&self.worker_binding)?;
+        self.ensure_task_current()?;
         self.runtime
             .update(|state| state.stage = CellularImsStage::RegisterAuthenticated)
             .await;
+        self.ensure_task_current()?;
         let mut prepared = self
             .pending
             .clone()
@@ -1741,7 +1755,7 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         min_expires: u32,
         authenticated: bool,
     ) -> Result<Vec<u8>, ImsError> {
-        ensure_worker_binding_current_ims(&self.worker_binding)?;
+        self.ensure_task_current()?;
         if authenticated {
             // Keep the negotiated security context and challenge proof; only
             // the lease floor changes for the retry.
@@ -1866,7 +1880,18 @@ pub async fn connect_live_for_line(
         return Ok(runtime.status().await);
     }
     cleanup_retained_failed_bearer(live).await;
-    let generation = runtime.generation();
+    let generation = runtime
+        .admitted_generation()
+        .ok_or_else(|| CellularImsError::new("cellular_ims_mm_binding_calibrating"))?;
+    // Carry the immutable token through all nested MM helpers and the live
+    // listener. Final-result checks alone miss delayed refresh/error updates.
+    let scoped_runtime;
+    let runtime = if !crate::hardware::cellular::backends::is_native_selector(&device.modem_id) {
+        scoped_runtime = Arc::new(runtime.for_generation(generation));
+        &scoped_runtime
+    } else {
+        runtime
+    };
     runtime
         .update(|state| {
             state.phase = CellularImsPhase::Starting;
@@ -2040,6 +2065,9 @@ async fn connect_inner(
     profile_candidate: &ImsProfileCandidate,
     sim_override: &SimOverride,
 ) -> Result<CellularImsLiveSession, CellularImsError> {
+    if !runtime.task_is_current() {
+        return Err(CellularImsError::new(code::RUNTIME_NOT_RUNNING));
+    }
     // The canonical connection plan is built by the caller from this line's
     // explicit ordered families. All family-selection consumers (AT probe
     // order, bearer fallback, IPv6 preflight hint, SIP local-address order)
@@ -2073,6 +2101,7 @@ async fn connect_inner(
         profile_store,
         profile_candidate,
         sim_override,
+        expected_mm_sim.as_ref(),
     )
     .await?;
     // The line's ordered family list is authoritative. Catalog `ip_stack` is
@@ -2164,6 +2193,7 @@ async fn connect_inner(
         &device.modem_id,
         &request,
         &plan,
+        expected_mm_sim.as_ref(),
     )
     .await
     {
@@ -2192,7 +2222,10 @@ async fn connect_inner(
                     Some("native_qmi".to_string()),
                 )
                 .await;
-            if ensure_generation(runtime, generation).is_ok() && error.code() != code::BEARER_SESSION_LOST {
+            if crate::hardware::cellular::backends::is_native_selector(&device.modem_id)
+                && ensure_generation(runtime, generation).is_ok()
+                && error.code() != code::BEARER_SESSION_LOST
+            {
                 disable_pcscf_reporting(&device.modem_id, pcscf_reporting_cid).await;
                 cleanup_ims_profile_lease(ims_profile_lease.take()).await;
             }
@@ -2202,11 +2235,15 @@ async fn connect_inner(
     let verified = async {
         ensure_generation(runtime, generation)?;
         if let Some((iccid, slot)) = expected_mm_sim.as_ref() {
-            native_bearer.as_mut().expect("native bearer was established")
-                .verify_mm_sim_binding(iccid, *slot).await?;
+            native_bearer
+                .as_mut()
+                .expect("native bearer was established")
+                .verify_mm_sim_binding(iccid, *slot)
+                .await?;
         }
         ensure_generation(runtime, generation)
-    }.await;
+    }
+    .await;
     if let Err(error) = verified {
         cleanup_unverified_native_bearer(&mut native_bearer).await;
         return Err(error);
@@ -2631,6 +2668,16 @@ async fn connect_inner(
             });
             return Err(error.clone());
         }
+        if !crate::hardware::cellular::backends::is_native_selector(&device.modem_id) {
+            cleanup_pending_native_bearer(
+                &mut native_bearer,
+                &device.modem_id,
+                pcscf_reporting_cid,
+                &mut ims_profile_lease,
+            )
+            .await;
+            return Err(error.clone());
+        }
         if let Some(established) = native_bearer.take() {
             // Native release owns worker network cleanup, interface restore
             // and WDS teardown. Avoid performing the same worker cleanup
@@ -2658,6 +2705,23 @@ async fn connect_inner(
         session.ims_profile_lease = ims_profile_lease;
         session
     })
+}
+
+async fn verify_mm_task_bearer(
+    runtime: &CellularImsRuntime,
+    bearer: Option<&mut NativeImsBearer>,
+) -> Result<(), CellularImsError> {
+    if !runtime.task_is_current() {
+        return Err(CellularImsError::new(code::RUNTIME_NOT_RUNNING));
+    }
+    if let Some((iccid, slot)) = runtime.expected_mm_sim() {
+        let bearer = bearer.ok_or_else(|| CellularImsError::new(code::BEARER_SESSION_LOST))?;
+        bearer.verify_mm_sim_binding(&iccid, slot).await?;
+    }
+    if !runtime.task_is_current() {
+        return Err(CellularImsError::new(code::RUNTIME_NOT_RUNNING));
+    }
+    Ok(())
 }
 
 async fn connect_family(
@@ -2907,8 +2971,13 @@ async fn connect_family(
         )
         .with_worker_binding(worker_binding.clone());
         ensure_worker_binding_current(worker_binding)?;
+        verify_mm_task_bearer(runtime, native_bearer.as_deref_mut()).await?;
         let registration_result =
             run_register_observed(&mut channel, &initial, &mut authenticator).await;
+        if let Err(error) = verify_mm_task_bearer(runtime, native_bearer.as_deref_mut()).await {
+            authenticator.rollback_security(&mut channel).await;
+            return Err(error);
+        }
         if let Some(native) = native_bearer.as_deref_mut() {
             if let Err(error) = native.check_liveness() {
                 authenticator.rollback_security(&mut channel).await;
@@ -3169,7 +3238,9 @@ pub async fn discard_live_for_mm_binding_change(
         let _ = listener.await;
     }
     cleanup_live_session_with_binding(live, false).await;
-    runtime.reset_runtime("cellular_ims_mm_binding_recalibrated").await;
+    runtime
+        .reset_runtime("cellular_ims_mm_binding_recalibrated")
+        .await;
 }
 
 pub async fn disconnect_live_for_line(
@@ -3204,6 +3275,12 @@ async fn unregister_live_session(
         return UnregisterResult::AlreadyExpired;
     }
 
+    if verify_mm_task_bearer(runtime, session.native_bearer.as_mut())
+        .await
+        .is_err()
+    {
+        return UnregisterResult::AccessLost;
+    }
     let mut ids = session.register_ids.clone();
     ids.cseq = session.next_register_cseq;
     let security_verify = session.channel.security_verify().map(str::to_string);
@@ -3781,6 +3858,9 @@ async fn refresh_live_registration(
     line_id: &str,
     database: &Database,
 ) -> CellularImsRefreshAttempt {
+    if let Err(error) = verify_mm_task_bearer(runtime, session.native_bearer.as_mut()).await {
+        return lost_refresh_attempt(error);
+    }
     // Do not start another SIP/XFRM attempt after the network lease has
     // actually expired. A retry cooldown can race the lease boundary, and
     // entering the refresh path in that state would otherwise recreate
@@ -3991,8 +4071,15 @@ async fn refresh_live_registration(
         )
         .with_worker_binding(session.worker_binding.clone())
         .with_expires_seconds(refresh_expires);
+        if let Err(error) = verify_mm_task_bearer(runtime, session.native_bearer.as_mut()).await {
+            return lost_refresh_attempt(error);
+        }
         let registration_result =
             run_register_observed(&mut session.channel, &initial, &mut authenticator).await;
+        if let Err(error) = verify_mm_task_bearer(runtime, session.native_bearer.as_mut()).await {
+            authenticator.rollback_security(&mut session.channel).await;
+            return lost_refresh_attempt(error);
+        }
         // RFC 3261 requires monotonically increasing REGISTER CSeq values for
         // one Call-ID. A timeout still consumed the emitted CSeq.
         session.next_register_cseq =
@@ -4219,6 +4306,16 @@ async fn refresh_live_registration(
     }
 }
 
+fn lost_refresh_attempt(error: CellularImsError) -> CellularImsRefreshAttempt {
+    CellularImsRefreshAttempt {
+        outcome: RegistrationRefreshResult::RebuildAccess(
+            RegistrationLossReason::AccessTransportLost,
+        ),
+        error: Some(error),
+        retry_after: None,
+    }
+}
+
 struct CellularImsRefreshAttempt {
     outcome: RegistrationRefreshResult,
     error: Option<CellularImsError>,
@@ -4233,6 +4330,11 @@ async fn cleanup_live_session_with_binding(live: &CellularImsLiveHandle, binding
     live.operator.set_ready(false);
     let session = live.session.lock().await.take();
     if let Some(session) = session {
+        // MM profile/reporting settings are persistent, not a lease owned by
+        // this SIP session. Never restore them through a reusable selector.
+        // Let the unique-owner retained provider reconcile its own netdev.
+        let binding_current = binding_current
+            && crate::hardware::cellular::backends::is_native_selector(&session.device.modem_id);
         for plan in session
             .xfrm_plan
             .iter()
@@ -4248,7 +4350,9 @@ async fn cleanup_live_session_with_binding(live: &CellularImsLiveHandle, binding
         // own a private MM object, but the synthetic path is not an MM object
         // that this upper layer may disconnect by itself.
         match session.native_bearer {
-            Some(native) if !binding_current => native_bearer::release_unverified_native_ims_bearer(native).await,
+            Some(native) if !binding_current => {
+                native_bearer::release_unverified_native_ims_bearer(native).await
+            }
             Some(native) => native_bearer::release_native_ims_bearer(native).await,
             None if session.worker_binding.is_current() => {
                 super::bearer::teardown_bearer_network_in_worker(
@@ -4281,16 +4385,23 @@ async fn cleanup_retained_failed_bearer(live: &CellularImsLiveHandle) {
     cleanup_retained_failed_bearer_with_binding(live, true).await;
 }
 
-async fn cleanup_retained_failed_bearer_with_binding(live: &CellularImsLiveHandle, binding_current: bool) {
+async fn cleanup_retained_failed_bearer_with_binding(
+    live: &CellularImsLiveHandle,
+    binding_current: bool,
+) {
     let Some(retained) = live.failed_bearer.lock().await.take() else {
         return;
     };
+    let binding_current = binding_current
+        && crate::hardware::cellular::backends::is_native_selector(&retained.modem_id);
     let elapsed = retained.retained_at.elapsed();
     if elapsed < FAILED_BEARER_MIN_RETENTION {
         tokio::time::sleep(FAILED_BEARER_MIN_RETENTION - elapsed).await;
     }
     match retained.native_bearer {
-        Some(native) if !binding_current => native_bearer::release_unverified_native_ims_bearer(native).await,
+        Some(native) if !binding_current => {
+            native_bearer::release_unverified_native_ims_bearer(native).await
+        }
         Some(native) => native_bearer::release_native_ims_bearer(native).await,
         None if retained.worker_binding.is_current() => {
             super::bearer::teardown_bearer_network_in_worker(
@@ -4352,6 +4463,13 @@ async fn cleanup_pending_native_bearer(
     pcscf_reporting_cid: Option<u8>,
     ims_profile_lease: &mut Option<ImsProfileLease>,
 ) {
+    if !crate::hardware::cellular::backends::is_native_selector(modem_id) {
+        cleanup_unverified_native_bearer(native_bearer).await;
+        // No AT profile lease is created by the retained MM path. Drop legacy
+        // metadata rather than replaying writes against a replacement SIM.
+        *ims_profile_lease = None;
+        return;
+    }
     if let Some(native) = native_bearer.take() {
         native_bearer::release_native_ims_bearer(native).await;
     }
@@ -6724,6 +6842,7 @@ async fn load_device_identity(
     profile_store: &ProfileStore,
     profile_candidate: &ImsProfileCandidate,
     sim_override: &SimOverride,
+    expected_mm_sim: Option<&(String, u8)>,
 ) -> Result<DeviceIdentity, CellularImsError> {
     let modem = command_output(
         "mmcli",
@@ -6749,11 +6868,14 @@ async fn load_device_identity(
         );
         String::new()
     };
-    if let Some((expected, slot)) = runtime.expected_mm_sim() {
+    if let Some((expected, slot)) = expected_mm_sim {
         let observed = key_value(&sim, "sim.properties.iccid")
             .map(|value| crate::platform::utils::normalize_iccid(&value));
-        if observed.as_deref() != Some(expected.as_str()) || slot != device.uim_slot {
-            return Err(CellularImsError::with_detail(code::BEARER_SESSION_LOST, "mm_sim_identity_changed_or_unavailable"));
+        if observed.as_deref() != Some(expected.as_str()) || *slot != device.uim_slot {
+            return Err(CellularImsError::with_detail(
+                code::BEARER_SESSION_LOST,
+                "mm_sim_identity_changed_or_unavailable",
+            ));
         }
     }
     let sim_imsi = key_value(&sim, "sim.properties.imsi")
@@ -6930,6 +7052,22 @@ async fn load_device_identity(
         roaming_visited_network = ?visited_network_header,
         "Resolved native VoLTE carrier profile"
     );
+    // Identity probes can span a SIM change before inventory observes it.
+    // Re-read MM rather than pairing a pre-change ICCID with post-change IMSI.
+    if let Some((expected, _)) = expected_mm_sim {
+        let path = sim_path
+            .as_deref()
+            .ok_or_else(|| CellularImsError::new(code::BEARER_SESSION_LOST))?;
+        let fresh = command_output("mmcli", &["-i", path, "--output-keyvalue"]).await?;
+        let observed = key_value(&fresh, "sim.properties.iccid")
+            .map(|value| crate::platform::utils::normalize_iccid(&value));
+        if observed.as_deref() != Some(expected.as_str()) || !runtime.task_is_current() {
+            return Err(CellularImsError::with_detail(
+                code::BEARER_SESSION_LOST,
+                "mm_sim_changed_during_identity_read",
+            ));
+        }
+    }
     Ok(DeviceIdentity {
         ims: ImsIdentity {
             private_user: format!("{imsi}@{}", effective_ims.realm.value),

@@ -247,10 +247,16 @@ impl MmBus {
             if path.as_str() == "/" {
                 return Err(BINDING_UNAVAILABLE.into());
             }
-            let slot: u32 = modem
-                .get_property("PrimarySimSlot")
+            // Inventory uses logical UIM slot 1 for MM's single-SIM value 0
+            // (or an absent slot property). Read failure is still an error;
+            // only a successfully returned property dictionary may default.
+            let properties: HashMap<String, OwnedValue> = self
+                .proxy(&self.modem, "org.freedesktop.DBus.Properties")
+                .await?
+                .call("GetAll", &(MODEM,))
                 .await
                 .map_err(bus_error)?;
+            let slot = logical_sim_slot(&properties)?;
             let id: String = self
                 .proxy(path.as_str(), "org.freedesktop.ModemManager1.Sim")
                 .await?
@@ -338,17 +344,16 @@ impl MmBus {
     }
 
     pub async fn create(&self, request: &PrimaryImsRequest<'_>) -> Result<String, String> {
-        timed(15, async {
-            let properties = create_properties(request)?;
-            let path: OwnedObjectPath = self
-                .proxy(&self.modem, MODEM)
-                .await?
-                .call("CreateBearer", &(properties,))
-                .await
-                .map_err(bus_error)?;
-            Ok(path.to_string())
-        })
-        .await
+        // The owning setup task is shielded. Do not drop a dispatched Create
+        // at an inner deadline: MM may still return a newly allocated object.
+        let properties = create_properties(request)?;
+        let path: OwnedObjectPath = self
+            .proxy(&self.modem, MODEM)
+            .await?
+            .call("CreateBearer", &(properties,))
+            .await
+            .map_err(bus_error)?;
+        Ok(path.to_string())
     }
 
     pub async fn status(&self, bearer: &str) -> Result<BearerStatus, String> {
@@ -647,6 +652,17 @@ where
     .map_err(|_| session_changed("at_read_task_failed"))?
 }
 
+fn logical_sim_slot(properties: &HashMap<String, OwnedValue>) -> Result<u32, String> {
+    match properties.get("PrimarySimSlot") {
+        None => Ok(1),
+        Some(value) => match u32::try_from(value) {
+            Ok(0) => Ok(1),
+            Ok(slot) if slot <= u8::MAX as u32 => Ok(slot),
+            _ => Err(BINDING_UNAVAILABLE.into()),
+        },
+    }
+}
+
 fn create_properties<'a>(
     request: &'a PrimaryImsRequest<'_>,
 ) -> Result<HashMap<&'static str, Value<'a>>, String> {
@@ -773,6 +789,47 @@ impl LeaseRecord {
     }
 }
 
+/// Durable intent precedes Create. An ambiguous RPC or failed lease+delete
+/// keeps this marker and blocks automatic allocation, including after restart.
+/// It contains no SIM identity and is never replayed against a replacement MM.
+pub(super) struct PendingCreate {
+    file: PathBuf,
+    record: serde_json::Value,
+}
+
+impl PendingCreate {
+    pub fn new(bus: &MmBus) -> Result<Self, String> {
+        Self::new_in(bus, Path::new(STATE_DIR))
+    }
+
+    fn new_in(bus: &MmBus, directory: &Path) -> Result<Self, String> {
+        ensure_directory(directory)?;
+        let file = directory.join(format!(
+            "create-{}-{}-{}.create",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let record = serde_json::json!({"bus_id": bus.bus_id, "owner": bus.owner,
+            "modem": bus.modem, "device": bus.device, "interface": bus.interface,
+            "bearer": null, "process_id": std::process::id()});
+        write_record(&file, &record)?;
+        Ok(Self { file, record })
+    }
+
+    pub fn created(&mut self, bearer: &str) -> Result<(), String> {
+        self.record["bearer"] = bearer.into();
+        write_record(&self.file, &self.record)
+    }
+
+    pub fn complete(self) -> Result<(), String> {
+        remove_record(&self.file)
+    }
+}
+
 pub(super) struct OwnedLease {
     bus: Arc<MmBus>,
     record: Mutex<LeaseRecord>,
@@ -888,6 +945,7 @@ impl OwnedLease {
         if !self.bus.owner_is_current().await? {
             // IDs can be reused by a new MM daemon. Never redirect an old lease
             // to that daemon, and do not mutate its interface using old metadata.
+            retain_unverified_network(&record)?;
             return self.forget(&record);
         }
         let mut network_error = None;
@@ -916,8 +974,11 @@ impl OwnedLease {
                 tracing::warn!(
                     "Skipping old IMS interface cleanup: another MM bearer owns the interface"
                 );
+                network_error = retain_unverified_network(&record).err();
             }
-            Err(error) if error == OWNER_MISSING => {}
+            Err(error) if error == OWNER_MISSING => {
+                network_error = retain_unverified_network(&record).err();
+            }
             Err(error) => network_error = Some(error),
         }
         let _ = self.bus.disconnect(&record.bearer).await;
@@ -936,6 +997,16 @@ impl OwnedLease {
         remove_record(&self.file)?;
         self.done.store(true, Ordering::Release);
         leases().lock().unwrap().remove(&record.key());
+        Ok(())
+    }
+}
+
+/// Losing the bearer owner proves only that it cannot be addressed anymore.
+/// It does not prove host rules/addresses or namespace ownership disappeared.
+fn retain_unverified_network(record: &LeaseRecord) -> Result<(), String> {
+    if record.namespace.is_some() || record.networks().next().is_some() {
+        Err("qca410_primary_mm_network_cleanup_unverified".into())
+    } else {
         Ok(())
     }
 }
@@ -1025,7 +1096,7 @@ fn ensure_directory(directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn write_record(file: &Path, record: &LeaseRecord) -> Result<(), String> {
+fn write_record(file: &Path, record: &impl Serialize) -> Result<(), String> {
     let parent = file
         .parent()
         .ok_or_else(|| "qca410_primary_mm_lease_path_invalid".to_string())?;
@@ -1131,6 +1202,9 @@ pub(super) async fn recover_owned() -> Result<(), String> {
     for entry in entries {
         let entry = entry.map_err(|_| "qca410_primary_mm_lease_scan_failed".to_string())?;
         let file = entry.path();
+        if file.extension().and_then(|value| value.to_str()) == Some("create") {
+            return Err("qca410_primary_mm_create_unresolved".into());
+        }
         if file.extension().and_then(|value| value.to_str()) != Some("json") {
             continue; // Incomplete atomic writes cannot precede an active bearer.
         }
@@ -1148,12 +1222,14 @@ pub(super) async fn recover_owned() -> Result<(), String> {
         let bus = match MmBus::new(&record.device, &record.modem, &record.interface).await {
             Ok(bus) => bus,
             Err(error) if error == OWNER_MISSING => {
+                retain_unverified_network(&record)?;
                 remove_record(&file)?;
                 continue;
             }
             Err(error) => return Err(error),
         };
         if !same_generation(&record, &bus.bus_id, &bus.owner) {
+            retain_unverified_network(&record)?;
             remove_record(&file)?;
             continue; // A new daemon may have reused the exact same object path.
         }
@@ -1207,6 +1283,7 @@ mod ip_config_dbus_tests {
     struct FakeBearer {
         connected: Arc<AtomicBool>,
         disconnect_during_read: bool,
+        sim_change_during_read: Option<Arc<AtomicBool>>,
         profile_id: Arc<std::sync::atomic::AtomicI32>,
         changed_ip: Arc<AtomicBool>,
     }
@@ -1245,7 +1322,11 @@ mod ip_config_dbus_tests {
         }
         #[zbus(property)]
         fn primary_sim_slot(&self) -> u32 {
-            1
+            if self.action == "slot_zero" {
+                0
+            } else {
+                1
+            }
         }
         #[zbus(property)]
         fn primary_port(&self) -> String {
@@ -1339,6 +1420,9 @@ mod ip_config_dbus_tests {
         }
         #[zbus(property)]
         fn ip4_config(&self) -> HashMap<String, OwnedValue> {
+            if let Some(changed) = &self.sim_change_during_read {
+                changed.store(true, Ordering::Release);
+            }
             if self.disconnect_during_read {
                 self.connected.store(false, Ordering::Release);
             }
@@ -1397,7 +1481,7 @@ mod ip_config_dbus_tests {
             .serve_at(
                 "/org/freedesktop/ModemManager1/SIM/0",
                 FakeSim {
-                    changed: sim_changed,
+                    changed: Arc::clone(&sim_changed),
                 },
             )
             .unwrap()
@@ -1406,6 +1490,7 @@ mod ip_config_dbus_tests {
                 FakeBearer {
                     connected,
                     disconnect_during_read,
+                    sim_change_during_read: (action == "sim_ip").then_some(sim_changed),
                     profile_id,
                     changed_ip,
                 },
@@ -1431,6 +1516,132 @@ mod ip_config_dbus_tests {
 
     fn observation_guard() -> NetworkGuard {
         Arc::new(NetworkActivity::default()).enter().unwrap()
+    }
+
+    #[tokio::test]
+    async fn unresolved_mm_creation_intent_survives_drop_and_records_known_path() {
+        let (_server, _) = probe_server(false, "").await;
+        let bus = bus().await;
+        let root = std::env::temp_dir().join(format!(
+            "mm-create-test-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut intent = PendingCreate::new_in(&bus, &root).unwrap();
+        let file = intent.file.clone();
+        intent.created(PATH).unwrap();
+        drop(intent); // Cancellation/ambiguous RPC/failed Delete is not success.
+        assert!(file.exists());
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert_eq!(stored["bearer"], PATH);
+        let second = PendingCreate::new_in(&bus, &root).unwrap();
+        let completed = second.file.clone();
+        second.complete().unwrap();
+        assert!(!completed.exists());
+        assert!(file.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mm_owner_loss_retains_network_receipt_without_interface_mutation() {
+        let (_server, commands) = probe_server(false, "").await;
+        let mut bus = bus().await;
+        Arc::get_mut(&mut bus).unwrap().owner = ":1.999999".into();
+        let mut record = super::tests::record();
+        record.owner = bus.owner.clone();
+        let root = std::env::temp_dir().join(format!(
+            "mm-owner-test-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        ensure_directory(&root).unwrap();
+        let file = root.join("lease.json");
+        write_record(&file, &record).unwrap();
+        let lease = OwnedLease {
+            bus,
+            record: Mutex::new(record),
+            file: file.clone(),
+            cleanup_lock: tokio::sync::Mutex::new(()),
+            network_activity: Arc::default(),
+            done: AtomicBool::new(false),
+            abandoned: AtomicBool::new(true),
+        };
+        assert_eq!(
+            lease.cleanup().await.unwrap_err(),
+            "qca410_primary_mm_network_cleanup_unverified"
+        );
+        assert!(!lease.is_done());
+        assert!(file.exists());
+        assert!(commands.lock().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mm_sim_change_during_ip_get_all_is_terminal() {
+        let (_server, _) = probe_server(false, "sim_ip").await;
+        let bus = bus().await;
+        assert_eq!(
+            bus.ip_settings(PATH, "ims", MmIpFamily::Ipv4v6)
+                .await
+                .unwrap_err(),
+            BINDING_CHANGED
+        );
+    }
+
+    #[tokio::test]
+    async fn mm_queued_reporting_write_rechecks_sim_and_policy_inside_serial_gate() {
+        for change_sim in [false, true] {
+            let (server, commands) = probe_server(false, "").await;
+            let bus = bus().await;
+            let permit = serial::acquire_for(&bus.modem).await;
+            let allowed = Arc::new(AtomicBool::new(true));
+            let write_bus = Arc::clone(&bus);
+            let write_allowed = Arc::clone(&allowed);
+            let queued = tokio::spawn(async move {
+                recovery::command_checked(&write_bus, "AT$QCPDPIMSCFGE=2,1,1,1", || {
+                    std::future::ready(write_allowed.load(Ordering::Acquire))
+                })
+                .await
+            });
+            tokio::task::yield_now().await;
+            assert!(commands.lock().unwrap().is_empty());
+            if change_sim {
+                server
+                    .object_server()
+                    .interface::<_, FakeSim>("/org/freedesktop/ModemManager1/SIM/0")
+                    .await
+                    .unwrap()
+                    .get()
+                    .await
+                    .changed
+                    .store(true, Ordering::Release);
+            } else {
+                allowed.store(false, Ordering::Release);
+            }
+            drop(permit);
+            assert!(queued.await.unwrap().is_err());
+            assert!(
+                commands.lock().unwrap().is_empty(),
+                "old reporting mutation reached the modem"
+            );
+            drop(bus);
+            drop(server);
+        }
+    }
+
+    #[tokio::test]
+    async fn mm_single_sim_slot_zero_matches_inventory_logical_slot_one() {
+        let (_server, _) = probe_server(false, "slot_zero").await;
+        let bus = bus().await;
+        bus.verify_expected_sim("8900000000000000001", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            bus.verify_expected_sim("8900000000000000001", 2)
+                .await
+                .unwrap_err(),
+            BINDING_CHANGED
+        );
     }
 
     #[tokio::test]
@@ -1855,7 +2066,7 @@ mod tests {
         assert_eq!(activity.active.load(Ordering::Acquire), 0);
     }
 
-    fn record() -> LeaseRecord {
+    pub(super) fn record() -> LeaseRecord {
         LeaseRecord {
             version: 1,
             bus_id: "0123456789abcdef0123456789abcdef".to_string(),
@@ -1911,6 +2122,37 @@ mod tests {
             validate_sim_binding(&expected, &changed).unwrap_err(),
             BINDING_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn logical_sim_slots_default_only_for_zero_or_missing() {
+        assert_eq!(logical_sim_slot(&HashMap::new()).unwrap(), 1);
+        for (raw, expected) in [(0, 1), (1, 1), (2, 2), (255, 255)] {
+            let properties =
+                HashMap::from([("PrimarySimSlot".into(), OwnedValue::from(raw as u32))]);
+            assert_eq!(logical_sim_slot(&properties).unwrap(), expected);
+        }
+        for value in [
+            OwnedValue::from(256_u32),
+            OwnedValue::from(-1_i32),
+            OwnedValue::try_from(Value::from("1")).unwrap(),
+        ] {
+            assert!(logical_sim_slot(&HashMap::from([("PrimarySimSlot".into(), value)])).is_err());
+        }
+    }
+
+    #[test]
+    fn only_proven_empty_network_intent_may_be_forgotten_after_owner_loss() {
+        let mut stored = record();
+        assert!(retain_unverified_network(&stored).is_err());
+        stored.namespace = None;
+        stored.network = None;
+        stored.additional_networks.clear();
+        assert!(retain_unverified_network(&stored).is_ok());
+        stored
+            .set_networks(&[network(true), network(false)])
+            .unwrap();
+        assert!(retain_unverified_network(&stored).is_err());
     }
 
     #[test]
@@ -1976,6 +2218,7 @@ mod tests {
                 profile_id: Some(2),
                 family,
                 allow_roaming: false,
+                expected_sim: None,
             };
             let properties = create_properties(&request).unwrap();
             assert_eq!(

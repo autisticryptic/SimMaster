@@ -123,6 +123,7 @@ impl ImsBearerTransport for Qcm410ImsBearer {
         cid: u8,
         families: &'a [u8],
         allow_roaming: bool,
+        expected_mm_sim: Option<(&'a str, u8)>,
     ) -> TransportFuture<'a, Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>>
     {
         Box::pin(async move {
@@ -157,6 +158,7 @@ impl ImsBearerTransport for Qcm410ImsBearer {
                 cid,
                 families,
                 allow_roaming,
+                expected_mm_sim,
             )
             .await
             .map(|established| {
@@ -184,6 +186,7 @@ async fn establish_bearer(
     _context_cid: u8,
     families: &[u8],
     allow_roaming: bool,
+    expected_mm_sim: Option<(&str, u8)>,
 ) -> Result<Established, ImsBearerError> {
     // A two-family request is MM's distinct IPV4V6 flag, not two independent
     // owners and not an instruction to silently start only the first family.
@@ -197,6 +200,7 @@ async fn establish_bearer(
         profile_id,
         family: requested_family,
         allow_roaming,
+        expected_sim: expected_mm_sim,
     })
     .await
     {
@@ -225,7 +229,7 @@ async fn establish_bearer(
         stop_primary_session(&mut session).await;
         return Err(ImsBearerError {
             kind: ImsBearerErrorKind::SessionLost,
-            hint: ImsBearerFailureHint::None,
+            hint: classify_session_failure(&detail),
             detail,
         });
     }
@@ -292,11 +296,15 @@ async fn establish_bearer(
         stop_primary_session(&mut session).await;
         return Err(ImsBearerError {
             kind: ImsBearerErrorKind::SessionLost,
-            hint: ImsBearerFailureHint::None,
+            hint: classify_session_failure(&detail),
             detail,
         });
     }
 
+    if let Err(detail) = session.verify_sim_binding().await {
+        stop_primary_session(&mut session).await;
+        return Err(settings_missing(detail));
+    }
     let expected_settings = settings.clone();
     let info = ImsBearerInfo {
         interface: resolution.interface.clone(),
@@ -482,10 +490,18 @@ fn netdev_config_for(settings: &CgcontrdpSettings, family: u8) -> Option<NetdevC
 
 fn classify_session_failure(detail: &str) -> ImsBearerFailureHint {
     if matches!(
-        detail,
+        detail
+            .split(":owned_bearer_cleanup_failed:")
+            .next()
+            .unwrap_or(detail),
         "qca410_primary_mm_binding_changed"
             | "qca410_primary_mm_binding_unavailable"
             | "qca410_primary_mm_owner_missing"
+            | "qca410_primary_mm_ip_config_timeout"
+            | "qca410_primary_mm_command_timeout"
+            | "qca410_primary_mm_setup_timeout_unverified"
+            | "qca410_primary_mm_create_unresolved"
+            | "qca410_primary_mm_network_cleanup_unverified"
     ) {
         return ImsBearerFailureHint::BindingChanged;
     }
@@ -524,7 +540,7 @@ fn session_start_error(detail: &str) -> ImsBearerError {
 fn settings_missing(detail: String) -> ImsBearerError {
     ImsBearerError {
         kind: ImsBearerErrorKind::SettingsMissing,
-        hint: ImsBearerFailureHint::None,
+        hint: classify_session_failure(&detail),
         detail,
     }
 }
@@ -532,6 +548,36 @@ fn settings_missing(detail: String) -> ImsBearerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mm_binding_hints_survive_settings_and_cleanup_error_wrapping() {
+        for detail in [
+            "qca410_primary_mm_binding_changed",
+            "qca410_primary_mm_binding_unavailable",
+            "qca410_primary_mm_owner_missing",
+            "qca410_primary_mm_ip_config_timeout",
+            "qca410_primary_mm_command_timeout",
+            "qca410_primary_mm_create_unresolved",
+        ] {
+            for detail in [
+                detail.to_string(),
+                format!("{detail}:owned_bearer_cleanup_failed:unavailable"),
+            ] {
+                assert_eq!(
+                    settings_missing(detail.clone()).hint,
+                    ImsBearerFailureHint::BindingChanged
+                );
+                assert_eq!(
+                    classify_session_failure(&detail),
+                    ImsBearerFailureHint::BindingChanged
+                );
+            }
+        }
+        assert_eq!(
+            settings_missing("qca410_primary_mm_ip_config_not_ready".into()).hint,
+            ImsBearerFailureHint::None
+        );
+    }
     use std::{
         net::{IpAddr, Ipv4Addr},
         sync::{Arc, Mutex},

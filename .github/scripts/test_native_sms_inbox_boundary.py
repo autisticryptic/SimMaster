@@ -50,7 +50,7 @@ class NativeSmsInboxBoundaryTests(unittest.TestCase):
         self.assertIn("p.started_at-2 AND p.finished_at+120", source)
         self.assertIn("confirmed && parts != total", source)
         api = (BACKEND / "api/handlers.rs").read_text()
-        self.assertIn("device.send_sms_persisted", api)
+        self.assertRegex(api, r"device\s*\.send_sms_persisted")
         self.assertIn('"submission_state": if result.confirmed', api)
         ui = (ROOT / "frontend/src/pages/SMS.tsx").read_text()
         self.assertIn("submission_state === 'unconfirmed'", ui)

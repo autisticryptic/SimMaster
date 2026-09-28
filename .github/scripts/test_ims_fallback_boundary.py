@@ -81,7 +81,9 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         identity = lifecycle[lifecycle.index("async fn read_sim_binding("):lifecycle.index("pub async fn primary_port(")]
         self.assertGreaterEqual(identity.count("owner_is_current().await?"), 2)
         self.assertIn('get_property("SimIdentifier")', identity)
-        self.assertIn('get_property("PrimarySimSlot")', identity)
+        self.assertIn('logical_sim_slot(&properties)?', identity)
+        self.assertIn('properties.get("PrimarySimSlot")', lifecycle)
+        self.assertIn('.call("GetAll", &(MODEM,))', identity)
         self.assertIn("validate_sim_binding(expected, &observed)", identity)
         self.assertIn("primary_ims_settings::validate_binding(", read)
         self.assertIn("CacheProperties::No", lifecycle)

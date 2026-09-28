@@ -76,9 +76,24 @@ fn reporting_flags(text: &str, cid: u8) -> Result<[u8; 3], String> {
 }
 
 async fn command(bus: &MmBus, command: &str) -> Result<String, String> {
+    command_checked(bus, command, || std::future::ready(true)).await
+}
+
+pub(super) async fn command_checked<Allowed, AllowedFuture>(
+    bus: &MmBus,
+    command: &str,
+    allowed: Allowed,
+) -> Result<String, String>
+where
+    Allowed: Fn() -> AllowedFuture,
+    AllowedFuture: Future<Output = bool>,
+{
     serial::with_serial_for(&bus.modem, async {
-        if !bus.owner_is_current().await? {
-            return Err("mm_pcscf_owner_changed".into());
+        // The serial wait can span a SIM change with the same MM owner.
+        // Validate the retained slot/SIM and live policy inside the permit.
+        bus.ensure_sim_binding().await?;
+        if !allowed().await {
+            return Err("mm_pcscf_recovery_cancelled".into());
         }
         let result = timed(6, async {
             bus.proxy(&bus.modem, MODEM)
@@ -88,8 +103,9 @@ async fn command(bus: &MmBus, command: &str) -> Result<String, String> {
                 .map_err(|_| "mm_pcscf_command_failed".to_string())
         })
         .await?;
-        if !bus.owner_is_current().await? {
-            return Err("mm_pcscf_owner_changed".into());
+        bus.ensure_sim_binding().await?;
+        if !allowed().await {
+            return Err("mm_pcscf_recovery_cancelled".into());
         }
         if result.len() > 16384 {
             return Err("mm_pcscf_response_limit".into());
@@ -243,6 +259,7 @@ impl RecoveryPlan {
     }
 
     async fn identity_is_current(&self) -> Result<(), String> {
+        self.bus.ensure_sim_binding().await?;
         if !self.bus.owner_is_current().await?
             || self.bus.primary_port().await? != self.bus.device.trim_start_matches("/dev/")
         {
@@ -330,8 +347,12 @@ impl RecoveryPlan {
                     match step {
                         Step::Arm => {
                             self.released_and_unchanged().await?;
-                            command(&self.bus, &format!("AT$QCPDPIMSCFGE={},1,1,1", self.cid))
-                                .await?;
+                            command_checked(
+                                &self.bus,
+                                &format!("AT$QCPDPIMSCFGE={},1,1,1", self.cid),
+                                allowed,
+                            )
+                            .await?;
                             if reporting_flags(
                                 &command(&self.bus, "AT$QCPDPIMSCFGE?").await?,
                                 self.cid,

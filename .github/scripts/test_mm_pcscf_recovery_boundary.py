@@ -41,7 +41,8 @@ class MmPcscfRecoveryBoundaryTests(unittest.TestCase):
         recovery = text[text.index("async fn run_line_cellular_ims_restore_batch("):text.index("async fn run_line_cellular_ims_restore_round(")]
         for guard in ("!status.registered", 'Some("derived")', "RUNTIME_ALL_PCSCF_FAILED", "profile.airplane_mode_enabled", "profile.data_connection_enabled", "profile.vowifi.enabled", "active_native().is_none()", "list_calls_for_line", "calls.calls.is_empty()", "plan.budget_available()", "tokio::spawn", "cleanup_live_for_profile_switch", "transition_lock", "bearer_operation_lock"):
             self.assertIn(guard, recovery)
-        self.assertEqual(recovery.count("run_line_cellular_ims_restore_round(app, line, source).await"), 2)
+        self.assertEqual(recovery.count("run_line_cellular_ims_restore_round(app, line, source, generation).await"), 2)
+        self.assertIn('line.cellular_ims.mm_binding_ready()', recovery)
         for forbidden in ("set_line_cellular_ims_ip_families", "Ipv6Only", "AT+", "46011", "sim06", "set_airplane_mode", "SetInitialEpsBearerSettings"):
             self.assertNotIn(forbidden, recovery)
 

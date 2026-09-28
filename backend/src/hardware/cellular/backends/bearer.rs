@@ -163,8 +163,13 @@ impl Session {
                 // receipt write must never make a later cleanup reuse a CID
                 // which the modem has already returned to its allocator.
                 self.clients.remove(index);
-                if self.save(false).is_err() { clean = false; break; }
-            } else { clean = false; }
+                if self.save(false).is_err() {
+                    clean = false;
+                    break;
+                }
+            } else {
+                clean = false;
+            }
         }
         // Stopping WDS/MBIM is not proof that a moved interface came home.
         // Cancellation, a failed move or a stale worker can all leave the
@@ -801,6 +806,7 @@ impl ImsBearerTransport for NativeImsTransport {
         _cid: u8,
         families: &'a [u8],
         roaming: bool,
+        _expected_mm_sim: Option<(&'a str, u8)>,
     ) -> TransportFuture<'a, Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>>
     {
         Box::pin(async move {
@@ -1465,17 +1471,31 @@ mod tests {
     async fn repeated_cleanup_does_not_replay_released_cids_while_namespace_is_pending() {
         let (device, io) = memory_device(None);
         let mut session = Session {
-            device: device.clone(), endpoint: endpoint(), role: Role::Ims,
-            clients: vec![Client { cid: Some(17), packet_handle: Some(42), mbim_session: None }],
-            receipt: receipt_path(&device, Role::Ims), namespace: "sa-ue0123456789ab".into(),
-            lost: Arc::new(AtomicBool::new(false)), monitor: None,
+            device: device.clone(),
+            endpoint: endpoint(),
+            role: Role::Ims,
+            clients: vec![Client {
+                cid: Some(17),
+                packet_handle: Some(42),
+                mbim_session: None,
+            }],
+            receipt: receipt_path(&device, Role::Ims),
+            namespace: "sa-ue0123456789ab".into(),
+            lost: Arc::new(AtomicBool::new(false)),
+            monitor: None,
         };
         session.save(true).unwrap();
         assert!(!session.cleanup_locked().await);
         assert!(session.clients.is_empty());
         assert!(!session.cleanup_locked().await);
         let requests = io.requests.lock().unwrap();
-        assert_eq!(requests.iter().filter(|r| r.arguments.iter().any(|a| a == "--wds-noop")).count(), 1);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.arguments.iter().any(|a| a == "--wds-noop"))
+                .count(),
+            1
+        );
         assert!(!io.receipts.lock().unwrap().is_empty());
     }
 

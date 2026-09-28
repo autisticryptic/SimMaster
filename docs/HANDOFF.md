@@ -3,6 +3,26 @@
 > 更新：2026-09-28。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
+## 最新开发进展：2026-09-28 11:26 UTC
+
+本轮已按用户要求恢复实现；历史交接快照保留在
+[接手说明与可复制 Prompt](NEXT_AI_HANDOFF_2026-09-28.md)，以下记录优先于该快照。
+
+- **已部署实测基线仍为 `1.1.5 / dd8ba1f`**：SIM-06 IPsec 注册及两次自然续期通过；本轮没有连接或部署设备。
+- 校准首版 **`9a8fe726c55669d789bfed9586153689a3b4f42f`** 的 Validate `36411614418`、Build `36411614307`
+  已核实均 success，含 Rust/D-Bus 测试步骤、ARM64/AMD64 构建；Release 按 push 门禁 skipped。
+- 已保留并完成原 5 文件补强的进一步审查：MM 持久 reporting/profile 不再经旧 CID 清理；单卡 slot=0/缺失归一为 1，
+  非法槽值仍拒绝；嵌套 live/恢复批次更新携带不可变 generation，未知库存不消耗 profile 重试预算。
+- 新增补强包括：全线路先同步失效再异步 reconcile；MM discovery 失败不伪造 absence；派生 SIM 在 Create 前及 SIP 前后核验；
+  终止性绑定错误贯穿设置读取/清理错误；恢复 reporting 在取得串行锁后重验 SIM/槽位/策略；未知网络清理保留 receipt；
+  Create 前持久化 intent，歧义结果或 lease+Delete 失败保持阻断，不丢弃晚到的 Create 回复。
+- 本地 **188 项 Python 测试、定向 rustfmt、diff 检查通过**。上述最新修改仍需对应 SHA 的 Actions Rust/双架构验证；
+  不能用首版 CI 代替。本轮证据目录 `.local/evidence/mm-cid-calibration/resume/`。
+- 自动校准整体仍未实机验收；真实切卡/外部 eSIM 切换及自动重新附着故障注入须用户另行确认维护窗口。
+- 设计与限制：[MM SIM/承载绑定校准](IMS_MM_SIM_BINDING_CALIBRATION.md)。
+
+以下既有 SIM-06 修复/发布记录保留作已验证基线，不能与新校准候选混同。
+
 ## 1. 当前优先级
 
 1. **版本/发布已完成**：源码、tag、发布包统一为 **1.1.5 / `16998ae`**，用户手动触发的

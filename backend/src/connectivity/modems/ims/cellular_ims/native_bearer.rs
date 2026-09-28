@@ -344,6 +344,7 @@ pub async fn establish_native_ims_bearer(
     modem_id: &str,
     request: &BearerRequest,
     plan: &ImsConnectionPlan,
+    expected_mm_sim: Option<&(String, u8)>,
 ) -> Result<NativeImsBearer, CellularImsError> {
     let cid = ims_context_cid(request);
     let families = requested_families_for(plan);
@@ -380,6 +381,7 @@ pub async fn establish_native_ims_bearer(
                 cid,
                 attempt_families,
                 request.allow_roaming,
+                expected_mm_sim.map(|(iccid, slot)| (iccid.as_str(), *slot)),
             )
             .await;
         match result {
@@ -432,6 +434,7 @@ pub async fn establish_native_ims_bearer(
                 cid,
                 &[forced],
                 request.allow_roaming,
+                expected_mm_sim.map(|(iccid, slot)| (iccid.as_str(), *slot)),
             )
             .await
         {
@@ -584,6 +587,55 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
+
+    #[tokio::test]
+    async fn mm_binding_failure_stops_family_loop_and_preserves_expected_sim() {
+        struct Changed(AtomicUsize);
+        impl ImsBearerTransport for Changed {
+            fn endpoint_available(&self, _: &str) -> bool {
+                true
+            }
+            fn establish_ims_bearer<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+                _: &'a str,
+                _: Option<u32>,
+                _: u8,
+                _: &'a [u8],
+                _: bool,
+                expected: Option<(&'a str, u8)>,
+            ) -> TransportFuture<
+                'a,
+                Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>,
+            > {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::AcqRel);
+                    assert_eq!(expected, Some(("8900000000000000001", 1)));
+                    Err(ImsBearerError {
+                        kind: ImsBearerErrorKind::SettingsMissing,
+                        hint: ImsBearerFailureHint::BindingChanged,
+                        detail: "binding changed during IP read".into(),
+                    })
+                })
+            }
+        }
+        let transport = Changed(AtomicUsize::new(0));
+        let expected = ("8900000000000000001".into(), 1);
+        let error = establish_native_ims_bearer(
+            &transport,
+            "/dev/wwan0qmi0",
+            "0",
+            &BearerRequest::ims(false),
+            &ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First),
+            Some(&expected),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.code(), code::BEARER_SESSION_LOST);
+        assert_eq!(transport.0.load(Ordering::Acquire), 1);
+    }
 
     struct PcscfHandle {
         result: Option<Result<Option<ImsPcscfDiscovery>, ImsBearerError>>,

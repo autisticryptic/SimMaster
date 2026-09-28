@@ -275,6 +275,7 @@ pub trait ImsBearerTransport: Send + Sync {
         cid: u8,
         families: &'a [u8],
         allow_roaming: bool,
+        expected_mm_sim: Option<(&'a str, u8)>,
     ) -> TransportFuture<'a, Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>>;
 }
 
