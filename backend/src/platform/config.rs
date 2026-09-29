@@ -2048,8 +2048,7 @@ mod tests {
         let manager = ConfigManager::new(path.clone());
         let line = "line-0123456789abcdef0123456789abcdef";
 
-        // Default keeps both legs registered, matching the coexistence invariant
-        // in services::orchestrator::ims_access.
+        // Automatic coordination is not permission to turn on either leg.
         assert_eq!(
             manager.get_line_ims_access_preference(line),
             ImsAccessPreference::Concurrent
@@ -2067,11 +2066,17 @@ mod tests {
             ImsAccessPreference::CellularPreferred,
             ImsAccessPreference::Concurrent,
         ] {
-            manager
-                .set_line_ims_access_preference(line, preference)
-                .unwrap();
+            let result = manager.set_line_ims_access_preference(line, preference);
+            if preference == ImsAccessPreference::Concurrent {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err(), "ims_registration_mode_automatic_only");
+            }
             let profile = manager.get_line_profile(line);
-            assert_eq!(profile.ims_access_preference, preference);
+            assert_eq!(
+                profile.ims_access_preference,
+                ImsAccessPreference::Concurrent
+            );
             assert!(
                 profile.cellular_ims_connection_enabled,
                 "{preference:?} must not clear the VoLTE enable intent"
@@ -2084,12 +2089,12 @@ mod tests {
 
         // And it survives a reload.
         manager
-            .set_line_ims_access_preference(line, ImsAccessPreference::WlanPreferred)
+            .set_line_ims_access_preference(line, ImsAccessPreference::Concurrent)
             .unwrap();
         let reloaded = ConfigManager::new(path.clone());
         assert_eq!(
             reloaded.get_line_ims_access_preference(line),
-            ImsAccessPreference::WlanPreferred
+            ImsAccessPreference::Concurrent
         );
 
         let _ = std::fs::remove_file(path);
@@ -2097,6 +2102,48 @@ mod tests {
 
     /// A line that never set a preference must deserialize to the coexisting
     /// default rather than failing or silently parking a leg.
+    #[test]
+    fn legacy_registration_mode_migrates_without_changing_enable_or_cost_intents() {
+        let (manager, path) = trunk_test_manager();
+        let line = TRUNK_TEST_LINE;
+        for old_mode in [
+            ImsAccessPreference::WlanPreferred,
+            ImsAccessPreference::CellularPreferred,
+        ] {
+            manager.reconcile_line_profiles(&[line.into()]).unwrap();
+            {
+                let mut config = manager.config.write().unwrap();
+                let profile = config
+                    .line_profiles
+                    .iter_mut()
+                    .find(|p| p.line_id == line)
+                    .unwrap();
+                profile.ims_access_preference = old_mode;
+                profile.cellular_ims_connection_enabled = false;
+                profile.vowifi.enabled = true;
+                profile.trunk.vowifi_only = true;
+                profile.sms_path.force_vowifi_send = true;
+            }
+            manager.save().unwrap();
+            let before = serde_json::to_value(manager.get_line_profile(line)).unwrap();
+            let loaded = ConfigManager::new(path.clone());
+            let after = serde_json::to_value(loaded.get_line_profile(line)).unwrap();
+            assert_eq!(
+                after, before,
+                "only obsolete mode may change, not enable or cost intent"
+            );
+            assert_eq!(
+                loaded.config.read().unwrap().line_profiles[0].ims_access_preference,
+                ImsAccessPreference::Concurrent
+            );
+            assert_eq!(
+                loaded.get_line_ims_access_preference(line),
+                ImsAccessPreference::Concurrent
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn line_profile_without_ims_access_preference_defaults_to_concurrent() {
         let profile: LineProfileConfig = serde_json::from_value(serde_json::json!({
@@ -3772,7 +3819,7 @@ device_network:
             .set_line_vowifi_connection_enabled(line, true)
             .unwrap();
         manager
-            .set_line_ims_access_preference(line, ImsAccessPreference::WlanPreferred)
+            .set_line_ims_access_preference(line, ImsAccessPreference::Concurrent)
             .unwrap();
         let mut apn = ApnConfig::default();
         apn.apn = "ims.example".to_string();
@@ -3791,7 +3838,7 @@ device_network:
         assert!(profile.vowifi.enabled);
         assert_eq!(
             profile.ims_access_preference,
-            ImsAccessPreference::WlanPreferred
+            ImsAccessPreference::Concurrent
         );
         assert_eq!(reloaded.get_line_apn_config(line).apn, "ims.example");
 
@@ -5772,6 +5819,20 @@ impl ConfigFileBackend {
     }
 }
 
+/// Registration is automatically coordinated from the two enable switches.
+/// Legacy stored preferences remain readable, but cannot park an enabled leg
+/// merely because a removed UI mode was selected in an older version.
+fn migrate_automatic_ims_registration(config: &mut AppConfig) -> bool {
+    let mut changed = false;
+    for profile in &mut config.line_profiles {
+        if profile.ims_access_preference != ImsAccessPreference::Concurrent {
+            profile.ims_access_preference = ImsAccessPreference::Concurrent;
+            changed = true;
+        }
+    }
+    changed
+}
+
 impl ConfigManager {
     /// Load the persisted configuration from its two halves.
     ///
@@ -5816,6 +5877,7 @@ impl ConfigManager {
         main.cellular_backend.validate()?;
         let stored = crate::platform::config_store::load(&database)?;
         let mut config = AppConfig::merge(main, stored);
+        let automatic_registration_changed = migrate_automatic_ims_registration(&mut config);
 
         let templates_changed = migrate_templates_to_remove_md5(&mut config);
         let github_download_proxy_changed = migrate_legacy_github_download_proxy(&mut config);
@@ -5831,6 +5893,7 @@ impl ConfigManager {
         };
 
         if !file_existed
+            || automatic_registration_changed
             || templates_changed
             || github_download_proxy_changed
             || video_gates_changed
@@ -5963,7 +6026,17 @@ impl ConfigManager {
     }
 
     pub fn get_line_profiles(&self) -> Vec<LineProfileConfig> {
-        self.config.read().unwrap().line_profiles.clone()
+        self.config
+            .read()
+            .unwrap()
+            .line_profiles
+            .iter()
+            .cloned()
+            .map(|mut profile| {
+                profile.ims_access_preference = ImsAccessPreference::Concurrent;
+                profile
+            })
+            .collect()
     }
 
     /// Ensure every discovered physical line has one explicit persisted profile.
@@ -6346,6 +6419,7 @@ impl ConfigManager {
             .cloned()
             .unwrap_or_else(|| LineProfileConfig::for_line(line_id));
         profile.sync_ims_video_access_gates();
+        profile.ims_access_preference = ImsAccessPreference::Concurrent;
         profile
     }
 
@@ -6964,21 +7038,19 @@ impl ConfigManager {
         self.get_line_profile(line_id).ims_access_preference
     }
 
-    /// Set one line's IMS access (registration) preference.
-    ///
-    /// Deliberately independent of `volte_connection_enabled` and
-    /// `vowifi.enabled`: this says which *enabled* legs may register, and must
-    /// never edit the enable intent itself. Coupling the two is the bug
-    /// `enabling_one_ims_access_never_disables_the_other` pins shut — the user's
-    /// switch has to survive a preference change so flipping it back is enough
-    /// to restore the leg.
+    /// Compatibility endpoint: only automatic coordination is selectable now.
+    /// Reject removed modes explicitly rather than silently promising a policy
+    /// the runtime will not apply. Never edit either enable intent or cost gate.
     pub fn set_line_ims_access_preference(
         &self,
         line_id: &str,
         preference: ImsAccessPreference,
     ) -> Result<ImsAccessPreference, String> {
+        if preference != ImsAccessPreference::Concurrent {
+            return Err("ims_registration_mode_automatic_only".into());
+        }
         self.update_line_profile(line_id, |profile| {
-            profile.ims_access_preference = preference;
+            profile.ims_access_preference = ImsAccessPreference::Concurrent;
         })?;
         Ok(self.get_line_ims_access_preference(line_id))
     }

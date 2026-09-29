@@ -22,6 +22,7 @@ import {
   Dialog,
   DialogContent,
   DialogTitle,
+  DialogActions,
   ToggleButton,
   ToggleButtonGroup,
   FormControlLabel,
@@ -58,6 +59,7 @@ import AutomationCenter from './AutomationCenter'
 import NotificationCenterPage from './NotificationCenter'
 import SMSPage from './SMS'
 import SupplementaryServicesPanel from './sim/SupplementaryServicesPanel'
+import { esimProfileActive, esimSwitchBlockReason, switchEsimProfile } from '../utils/esimQuickSwitch'
 
 function lineNotificationScope(line: CellularImsLineControlResponse | null) {
   if (!line) return undefined
@@ -366,10 +368,29 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: CellularImsLineC
   const [reloadKey, setReloadKey] = useState(0)
   const [managerOpen, setManagerOpen] = useState(false)
   const [lpacSettingsOpen, setLpacSettingsOpen] = useState(false)
+  const [switchTarget, setSwitchTarget] = useState<EsimProfile | null>(null)
+  const [switching, setSwitching] = useState(false)
+  const [switchMessage, setSwitchMessage] = useState<string | null>(null)
+  const [switchError, setSwitchError] = useState<string | null>(null)
+  const switchEpoch = useRef(0)
+  const loadEpoch = useRef(0)
+  const switchInFlight = useRef(false)
+  const invalidateSwitch = useCallback(() => { switchEpoch.current++ }, [])
   const esimEnabled = controlMode === 'enabled' || (controlMode === 'auto' && (esimReported || autoProbe === 'detected'))
   const lineId = line?.modem.line_id
 
   useEffect(() => {
+    invalidateSwitch()
+    switchInFlight.current = false
+    setSwitchTarget(null)
+    setSwitching(false)
+    setSwitchMessage(null)
+    setSwitchError(null)
+    return invalidateSwitch
+  }, [lineId, invalidateSwitch])
+
+  useEffect(() => {
+    let active = true
     setControlMode(initialMode)
     setAutoProbe(esimReported ? 'detected' : 'idle')
     setEuicc(null)
@@ -384,14 +405,19 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: CellularImsLineC
     setLpacConfig(DEFAULT_ESIM_READER_CONFIG)
     if (lineId) {
       void api.getLineEsimReaderConfig(lineId).then((response) => {
-        if (response.data) setLpacConfig(response.data)
-      }).catch((err) => setLpacConfigError(err instanceof Error ? err.message : String(err)))
+        if (active && response.data) setLpacConfig(response.data)
+      }).catch((err) => { if (active) setLpacConfigError(err instanceof Error ? err.message : String(err)) })
     }
+    return () => { active = false }
   }, [esimReported, initialMode, lineId])
 
   useEffect(() => {
     let active = true
-    if (!lineId) return () => { active = false }
+    const epoch = ++loadEpoch.current
+    if (!lineId || !line?.modem.present || switching) {
+      setLoading(false)
+      return () => { active = false }
+    }
     if (controlMode === 'disabled') {
       setLoading(false)
       return () => { active = false }
@@ -402,7 +428,7 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: CellularImsLineC
       let euiccConfirmed = false
       try {
         const lpacResponse = await api.getEsimLpacStatus()
-        if (!active) return
+        if (!active || loadEpoch.current !== epoch) return
         const nextLpac = lpacResponse.data ?? null
         setLpac(nextLpac)
         if (!nextLpac) {
@@ -417,24 +443,73 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: CellularImsLineC
 
         if (controlMode === 'auto' && !esimReported) setAutoProbe('probing')
         const euiccResponse = await api.getEsimEuicc(lineId)
-        if (!active) return
+        if (!active || loadEpoch.current !== epoch) return
         euiccConfirmed = true
         if (controlMode === 'auto') setAutoProbe('detected')
         const profileResponse = await api.getEsimProfiles(lineId)
-        if (!active) return
+        if (!active || loadEpoch.current !== epoch) return
         setEuicc(euiccResponse.data ?? null)
         setProfiles(profileResponse.data?.profiles ?? [])
       } catch (err) {
-        if (active) {
+        if (active && loadEpoch.current === epoch) {
           if (controlMode === 'auto' && !esimReported && !euiccConfirmed) setAutoProbe('not-detected')
           setError(err instanceof Error ? err.message : String(err))
         }
       } finally {
-        if (active) setLoading(false)
+        if (active && loadEpoch.current === epoch) setLoading(false)
       }
     })()
     return () => { active = false }
-  }, [controlMode, esimReported, lineId, reloadKey])
+  }, [controlMode, esimReported, lineId, line?.modem.present, reloadKey, switching])
+
+  const confirmProfileSwitch = async () => {
+    if (!lineId || !switchTarget || !line?.modem.present || !esimEnabled || loading || controlSaving || switchInFlight.current) return
+    const target = switchTarget
+    const scope = lineId
+    const epoch = ++switchEpoch.current
+    loadEpoch.current++
+    const isCurrent = () => switchEpoch.current === epoch
+    switchInFlight.current = true
+    setSwitching(true)
+    setSwitchError(null)
+    setSwitchMessage('切换中，请等待配置及网络恢复…')
+    try {
+      const refreshed = await switchEsimProfile({
+        profiles: async (id) => {
+          const response = await api.getEsimProfiles(id)
+          if (!response.data) throw new Error('未读取到配置列表')
+          return response.data.profiles
+        },
+        progress: async (id) => {
+          const response = await api.getBasebandRestartStatus(id)
+          if (!response.data) throw new Error('未读取到切换状态')
+          return response.data
+        },
+        enable: async (id, iccid) => {
+          const response = await api.enableEsimProfile(id, iccid)
+          if (!response.data) throw new Error('切换请求未被确认')
+          return response.data
+        },
+        delay: (ms) => new Promise((resolve) => window.setTimeout(resolve, ms)),
+      }, scope, target.iccid, isCurrent)
+      if (!isCurrent()) return
+      setProfiles(refreshed)
+      setSwitchMessage('配置切换已确认')
+      setSwitchTarget(null)
+    } catch (err) {
+      if (isCurrent()) {
+        setSwitchMessage(null)
+        setSwitchError(`${err instanceof Error ? err.message : String(err)}；请刷新确认当前状态，勿连续重复提交`)
+        setSwitchTarget(null)
+      }
+    } finally {
+      if (isCurrent()) {
+        switchInFlight.current = false
+        setSwitching(false)
+        setReloadKey((value) => value + 1)
+      }
+    }
+  }
 
   const repairLpac = async () => {
     setLpacRepairing(true)
@@ -504,8 +579,9 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: CellularImsLineC
       <Box display="flex" justifyContent="space-between" alignItems="flex-start" gap={1} mb={2}>
         <Box><Box display="flex" alignItems="center" gap={1}><Memory color={esimEnabled ? 'primary' : 'disabled'} /><Typography variant="subtitle1" fontWeight={800}>eSIM 管理</Typography></Box><Typography variant="caption" color="text.secondary">{line.modem.model || '当前线路'} · {shortLineId(line.modem.line_id)}</Typography></Box>
         <Stack direction="row" spacing={1} flexWrap="wrap" justifyContent="flex-end">
-          <Button size="small" variant="outlined" startIcon={<Build />} onClick={() => setLpacSettingsOpen(true)}>lpac 接口</Button>
-          <Button size="small" variant="outlined" onClick={() => setManagerOpen(true)} disabled={!esimEnabled}>完整管理</Button>
+          <Button size="small" variant="outlined" onClick={() => setReloadKey((value) => value + 1)} disabled={loading || switching || !line.modem.present}>刷新</Button>
+          <Button size="small" variant="outlined" startIcon={<Build />} onClick={() => setLpacSettingsOpen(true)} disabled={switching}>lpac 接口</Button>
+          <Button size="small" variant="outlined" onClick={() => setManagerOpen(true)} disabled={!esimEnabled || switching}>完整管理</Button>
         </Stack>
       </Box>
 
@@ -514,7 +590,7 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: CellularImsLineC
         size="small"
         value={controlMode}
         onChange={(_, value: EsimControlMode | null) => value && void updateControlMode(value)}
-        disabled={controlSaving}
+        disabled={controlSaving || switching}
         aria-label="eSIM 控制模式"
         sx={{ mb: 1.5, alignSelf: 'flex-start' }}
       >
@@ -535,6 +611,9 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: CellularImsLineC
         </Typography>
       </Box>
       {controlError && <Alert severity="error" sx={{ mb: 1.5 }}>{controlError}</Alert>}
+      {!line.modem.present && <Alert severity="info" sx={{ mb: 1.5 }}>设备离线，暂不能切换配置</Alert>}
+      {switchMessage && <Alert severity={switching ? 'info' : 'success'} sx={{ mb: 1.5 }}>{switchMessage}</Alert>}
+      {switchError && <Alert severity="error" onClose={() => setSwitchError(null)} sx={{ mb: 1.5 }}>{switchError}</Alert>}
       {!esimEnabled && !loading && <Alert severity={controlMode === 'disabled' ? 'warning' : 'info'}>{controlMode === 'disabled' ? 'eSIM 管理已强制关闭。' : '自动模式下未识别到 eSIM；可切换到“开启”以检查自定义 lpac 接口配置。'}</Alert>}
       {!esimEnabled && !loading && error && <Alert severity="warning" sx={{ mt: 1.5 }}>{error}</Alert>}
       {esimEnabled && loading && <Box display="grid" sx={{ placeItems: 'center', minHeight: 180 }}><CircularProgress size={26} /></Box>}
@@ -558,10 +637,30 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: CellularImsLineC
           </Paper>
         </Box>
         <Box display="grid" gridTemplateColumns={{ xs: 'minmax(0, 1fr)', lg: 'repeat(2, minmax(0, 1fr))' }} gap={0.75} sx={{ overflowY: 'auto', maxHeight: 320 }}>
-          {profiles.map((profile) => <Box key={profile.iccid} display="flex" alignItems="center" justifyContent="space-between" gap={1} sx={{ p: 1, border: '1px solid', borderColor: 'divider', borderRadius: 1 }}><Box minWidth={0}><Typography variant="body2" fontWeight={600} noWrap>{profile.name || profile.provider || '未命名 Profile'}</Typography><Typography variant="caption" color="text.secondary" noWrap>{maskedIccid(profile.iccid)} · {profile.state}</Typography></Box><Chip size="small" label={profile.state === 'enabled' || profile.state === 'active' ? '启用' : '可用'} color={profile.state === 'enabled' || profile.state === 'active' ? 'success' : 'default'} /></Box>)}
+          {profiles.map((profile) => {
+            const active = esimProfileActive(profile)
+            const blocked = esimSwitchBlockReason(profile, profiles)
+            return <Box key={profile.iccid} display="flex" alignItems="center" justifyContent="space-between" gap={1} sx={{ p: 1, border: '1px solid', borderColor: 'divider', borderRadius: 1 }}>
+              <Box minWidth={0}><Typography variant="body2" fontWeight={600} noWrap>{profile.name || profile.provider || '未命名 Profile'}</Typography><Typography variant="caption" color="text.secondary" noWrap>{maskedIccid(profile.iccid)} · {profile.state}</Typography></Box>
+              {active ? <Chip size="small" label="已启用" color="success" /> : <Button size="small" variant="outlined" title={blocked ?? undefined}
+                disabled={Boolean(blocked) || switching || controlSaving || loading || !line.modem.present}
+                onClick={() => { setSwitchError(null); setSwitchTarget(profile) }}>切换</Button>}
+            </Box>
+          })}
           {profiles.length === 0 && <Typography variant="body2" color="text.secondary">尚未读取到 Profile</Typography>}
         </Box>
       </>}
+      <Dialog open={Boolean(switchTarget)} onClose={switching ? undefined : () => setSwitchTarget(null)} maxWidth="xs" fullWidth>
+        <DialogTitle>切换 eSIM 配置</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2">确认切换到 {switchTarget?.name || switchTarget?.provider || '所选配置'}？当前线路连接和通话可能中断。</Typography>
+          {switching && <Box display="flex" alignItems="center" gap={1} mt={2}><CircularProgress size={18} /><Typography variant="body2">正在切换并核实状态…</Typography></Box>}
+        </DialogContent>
+        <DialogActions>
+          <Button disabled={switching} onClick={() => setSwitchTarget(null)}>取消</Button>
+          <Button variant="contained" disabled={switching || loading || controlSaving || !line.modem.present} onClick={() => void confirmProfileSwitch()}>确认切换</Button>
+        </DialogActions>
+      </Dialog>
       <Dialog open={managerOpen} onClose={() => setManagerOpen(false)} fullWidth maxWidth="lg"><DialogTitle sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>eSIM 完整管理<IconButton onClick={() => setManagerOpen(false)} aria-label="关闭"><Close /></IconButton></DialogTitle><DialogContent dividers><EsimManagerPage lineId={line.modem.line_id} /></DialogContent></Dialog>
       <Dialog open={lpacSettingsOpen} onClose={() => setLpacSettingsOpen(false)} fullWidth maxWidth="lg">
         <DialogTitle sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>

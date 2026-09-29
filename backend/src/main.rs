@@ -585,18 +585,36 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Some(CliCommand::NativeRecovery {
-        receipt, config, apply, expected_revision, confirm_line_id, confirm_physical_key,
-    }) = &cli.command {
+        receipt,
+        config,
+        apply,
+        expected_revision,
+        confirm_line_id,
+        confirm_physical_key,
+    }) = &cli.command
+    {
         use hardware::cellular::backends::recovery;
         if let Some(file) = receipt {
-            let backend = read_backend_config(config.clone().unwrap_or_else(get_default_config_path))?;
+            let backend =
+                read_backend_config(config.clone().unwrap_or_else(get_default_config_path))?;
             let plan = if *apply {
-                recovery::apply(file, &backend.devices,
-                    expected_revision.as_deref().ok_or_else(|| anyhow::anyhow!("native_recovery_revision_required"))?,
-                    confirm_line_id.as_deref().ok_or_else(|| anyhow::anyhow!("native_recovery_line_confirmation_required"))?,
-                    confirm_physical_key.as_deref().ok_or_else(|| anyhow::anyhow!("native_recovery_physical_confirmation_required"))?,
-                ).await?
-            } else { recovery::plan(file, &backend.devices)? };
+                recovery::apply(
+                    file,
+                    &backend.devices,
+                    expected_revision
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("native_recovery_revision_required"))?,
+                    confirm_line_id.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("native_recovery_line_confirmation_required")
+                    })?,
+                    confirm_physical_key.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("native_recovery_physical_confirmation_required")
+                    })?,
+                )
+                .await?
+            } else {
+                recovery::plan(file, &backend.devices)?
+            };
             println!("{}", serde_json::to_string_pretty(&plan)?);
         } else {
             println!("{}", serde_json::to_string_pretty(&recovery::inventory()?)?);
@@ -1082,7 +1100,8 @@ async fn main() -> Result<()> {
                             let app = refresh_app.clone();
                             let target = Arc::clone(&line);
                             tokio::spawn(async move {
-                                api::handlers::recalibrate_line_mm_binding(&app, &target, ticket).await;
+                                api::handlers::recalibrate_line_mm_binding(&app, &target, ticket)
+                                    .await;
                             });
                         }
                         if binding.present == was_present {
@@ -2871,7 +2890,7 @@ mod http_router_tests {
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let cookie = authenticate(&served).await;
-        for preference in ["wlan_preferred", "concurrent"] {
+        for preference in ["wlan_preferred", "cellular_preferred", "concurrent"] {
             let (status, _, body) = post_json(
                 &served,
                 &path,
@@ -2881,13 +2900,20 @@ mod http_router_tests {
             .await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let response: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(response["data"]["preference"], preference);
+            if preference == "concurrent" {
+                assert_eq!(response["data"]["preference"], "concurrent");
+            } else {
+                assert_eq!(response["status"], "error");
+                assert!(response["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("ims_registration_mode_automatic_only"));
+            }
             let (status, body) = get_with_cookie(&served, &path, &cookie).await;
             assert_eq!(status, StatusCode::OK);
             let response: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(response["data"]["preference"], preference);
-            let mut expected = before.clone();
-            expected["ims_access_preference"] = preference.into();
+            assert_eq!(response["data"]["preference"], "concurrent");
+            let expected = before.clone();
             assert_eq!(
                 serde_json::to_value(state.config_manager.get_line_profile(&line_id)).unwrap(),
                 expected,

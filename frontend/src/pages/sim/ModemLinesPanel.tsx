@@ -39,7 +39,7 @@ import CellularImsProfileDialog from './CellularImsProfileDialog'
 import { LineActivityLog, LineTrunkDetails, LineCellularImsDetails, LineVowifiDetails } from './LineRuntimeDetails'
 import { standardDerivedProfileMessage, cellularImsErrorMessage, cellularImsErrorStatusLabel } from './cellularImsErrorFormat'
 import { formatBytes } from '../Dashboard/utils'
-import ImsRegistrationSettings from './ImsRegistrationSettings'
+import { airplaneControlLabel } from '../../utils/lineControlLabels'
 
 const cellularImsStageStatusLabels: Record<string, string> = {
   disabled: 'IMS 未连接',
@@ -870,17 +870,15 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         <Typography variant="body2" fontWeight={700} noWrap>飞行模式</Typography>
                       </Box>
                       <Stack minWidth={0} justifyContent="center" spacing={0.25} sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' }, minHeight: 40 }}>
-                        <Typography variant="caption" color="text.secondary" display="block">
-                          {networkLoadLabel || (!line.modem.present ? '配置可修改，设备恢复后自动应用；当前射频状态未知' : network?.airplane_stage || '射频状态尚未确认')}
-                        </Typography>
-                        <Typography variant="caption" color="text.disabled" title={network?.airplane_error ?? undefined}>
-                          开关表示保存的意图，不代表射频已完成切换
+                        <Typography variant="caption" color="text.secondary" noWrap title={network?.airplane_error ?? undefined}>
+                          {airplaneControlLabel(network, line.modem.present, airplaneBusy, supplementalStatus.network === 'pending')}
                         </Typography>
                       </Stack>
                       <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.5} sx={{ gridColumn: { xs: 2, sm: 3 }, gridRow: 1 }}>
                         {airplaneBusy && <CircularProgress size={16} />}
                         <Switch
                           color="warning"
+                          slotProps={{ input: { 'aria-label': '飞行模式' } }}
                           checked={airplaneEnabled}
                           onChange={(_, enabled) => void toggleAirplaneMode(line.modem.line_id, enabled)}
                           disabled={!network || savingKey !== null}
@@ -1040,9 +1038,6 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       {basicInfoForLine && <Grid size={12}>{basicInfoForLine(line, overviewControls)}</Grid>}
                     </Grid>}
 
-                    {(!workbench || workbenchTab === 'ims') && (
-                      <ImsRegistrationSettings key={line.modem.line_id} lineId={line.modem.line_id} disabled={savingKey !== null} />
-                    )}
                     {(!workbench || workbenchTab === 'ims') && line.profile.cellular_ims_connection_enabled && !line.runtime.registered && (recovery || displayError) && (
                       <Alert severity={line.runtime.recovery_state === 'exhausted' ? 'error' : 'warning'} sx={{ mt: 2, py: 0.25 }}>
                         {fallbackMessage && (

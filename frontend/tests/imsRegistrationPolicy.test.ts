@@ -2,20 +2,19 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   humanizeCostPolicyError,
-  isSelectableRegistrationPreference,
+  hasConfirmedDualRegistration,
   orderedVoicePaths,
-  registrationModeOptions,
-  registrationPreferenceLabel,
   registrationSupportText,
 } from '../src/policies/imsRegistration.ts'
 
-await test('only AUTO and single-WLAN are offered, without changing legacy saved values', () => {
-  assert.deepEqual(registrationModeOptions.map((item) => item.value), ['concurrent', 'wlan_preferred'])
-  assert.equal(isSelectableRegistrationPreference('concurrent'), true)
-  assert.equal(isSelectableRegistrationPreference('wlan_preferred'), true)
-  assert.equal(isSelectableRegistrationPreference('cellular_preferred'), false)
-  assert.equal(isSelectableRegistrationPreference('force_dual'), false)
-  assert.match(registrationPreferenceLabel('cellular_preferred'), /旧设置/)
+await test('dual registration requires both switches, both successful flows and negotiation', () => {
+  const ready = { cellularEnabled: true, wlanEnabled: true, cellularRegistered: true, wlanRegistered: true,
+    cellularValidated: true, wlanValidated: true, negotiated: true, blocked: false }
+  assert.equal(hasConfirmedDualRegistration(ready), true)
+  for (const key of ['cellularEnabled', 'wlanEnabled', 'cellularRegistered', 'wlanRegistered', 'cellularValidated', 'wlanValidated', 'negotiated'] as const) {
+    assert.equal(hasConfirmedDualRegistration({ ...ready, [key]: false }), false)
+  }
+  assert.equal(hasConfirmedDualRegistration({ ...ready, blocked: true }), false)
 })
 
 await test('a failed additional flow is not reported as successful dual registration', () => {
@@ -30,7 +29,7 @@ await test('a failed additional flow is not reported as successful dual registra
   }), /不能把等待或超时/)
   assert.match(registrationSupportText({
     requested: 'wlan_preferred', concurrent_support: 'negotiated',
-  }), /不追加第二路/)
+  }), /两路开关都开启/)
 })
 
 await test('cost restrictions produce clear Chinese errors without hiding unrelated failures', () => {
@@ -38,6 +37,7 @@ await test('cost restrictions produce clear Chinese errors without hiding unrela
   assert.match(humanizeCostPolicyError('ims unavailable;voice_vowifi_only_required'), /阻止蜂窝/)
   assert.match(humanizeCostPolicyError('voice_registered_home_required'), /非漫游/)
   assert.match(humanizeCostPolicyError('voice_call_binding_changed'), /SIM 已变化/)
+  assert.match(humanizeCostPolicyError('ims_registration_mode_automatic_only'), /不再支持/)
   assert.equal(humanizeCostPolicyError('unrelated_error'), 'unrelated_error')
 })
 

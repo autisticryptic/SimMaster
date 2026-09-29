@@ -423,7 +423,7 @@ class SimAdminCurrentAPI {
   }
 
   async getBasebandRestartStatus(lineId: string) {
-    return request<ApiResponse<BasebandRestartResponse>>(modemLinePath(lineId, '/baseband/restart/status'))
+    return request<ApiResponse<BasebandRestartResponse>>(modemLinePath(lineId, '/baseband/restart/status'), { timeoutMs: 10000 })
   }
 
   async restartService() {

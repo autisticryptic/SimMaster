@@ -340,7 +340,9 @@ docs/IMS_MM_SIM_BINDING_CALIBRATION.md、docs/IMS_REGISTRATION_POLICY.md，然�
   服务active/running、NRestarts=0、cwd恢复/opt/simadmin；www校验通过、网页HTTP200、数据库quick_check=ok、原Web账号仍存在。
   MM516 / secondary339未重启；维护时临时暂停的恢复timer已恢复active。原数据库线路配置保留：蜂窝IMS和VoWiFi均enabled、trunk/data关闭；没有改为旧Cloudflare设备的单蜂窝配置。
   **未登录受保护API，不能据此宣称此LAN目标IMS/通话验收通过**。部署验证证据 `lan-deploy/reinstall-result.json`、`installed-verified.json`；脚本 `.local/active/lan/reinstall.py` 仅供审阅，不能重放（旧PID/FD前置已不成立）。
-- [ ] **G4：外置数据库来源核实／进行中**。部署完成后才开始检查本地Pixel/iOS/IPCC文件与相邻carrier_Bundles。已定位根目录三份库及.local内历史副本；尚未得出字段差异/根因结论，不切换设备配置或拨号。
+- [x] **G4：外置数据库离线静态对比完成**（2026-09-29 08:40 UTC）。报告见 [Pixel/iOS/IPCC对比](IMS_CATALOG_PIXEL_IOS_COMPARISON_2026-09-29.md)。
+  已核实六份v7库来源/SHA；三组新旧profile_id/config_json内容相同（非整文件相同）。Pixel无显式Contact表，历史空表漏MMTEL的2b743e2修复已包含当前版本，不能再次当作现存必然原因。
+  已记录有效profile回退差异，以及UA template、安全策略路径、access-specific SIP、Contact overlay解释等可验证覆盖缺口；**没有认定用户历史来电的唯一根因**，未改库或设备，源库哈希未变。现场对照等用户手机测试结果/上线授权。
 
 本地证据：`.local/evidence/lan-deploy/{host-check,preflight-initial,layout,db-readonly,db-snapshot-readonly,web-access-check}.json`；
 只读传输助手 `.local/active/lan/device.py`。注意初始baseline的readlink失败令exe字段与下一行粘连，安装状态以独立 `layout.json` 为准，不机械读取错误字段。
@@ -355,22 +357,28 @@ iOS/IPCC提取配置则可以注册并正常接打。当前派生配置以iOS提
 
 ### 0.14 用户新增UI待办与设备离线边界（2026-09-29 08:24 UTC）
 
-用户明确要求**加入todos，改回以下界面行为**。本次仅记录，不能宣称已实现：
+用户明确要求改回以下界面行为，随后要求继续完成。**三项代码/本地测试已完成，整体Actions验证见本节末尾；尚未部署，不能宣称实机切换已验证。**
 
-- [ ] **概述 → 线路控制 → 飞行模式**：删除开关右侧的大段说明，显示密度/标签形式与另外三个控件一致，不再堆叠解释文字。保留真实开关逻辑、必要状态和错误反馈，不因此改变无线控制及安全准入。
-- [ ] **IMS与Trunk页面 → 移除IMS注册模式选择**：不再提供额外模式选项，保留VoWiFi与蜂窝IMS各自的启用开关。
+- [x] **概述 → 线路控制 → 飞行模式（代码/定向检查完成）**：大段说明已改为单行短状态，与其他控件布局一致；未知射频仍显示未知，不把保存意图当已生效。保留原开关请求/禁用条件和错误反馈。新增前端单测，type-check及定向lint通过；整批UI的完整CI待后续。证据 `.local/evidence/ui-offline/flight-*`。
+- [x] **IMS与Trunk页面 → 移除IMS注册模式选择（代码/本地检查完成，Rust待整批CI）**：已移除模式选择组件，保留VoWiFi与蜂窝IMS各自的启用开关；旧保存模式在启动时仅迁移此字段为自动，原开关/资费不变，兼容API明确拒绝旧手动模式。定向前端unit/type-check/lint与Python通过，新增核心/配置/HTTP回归待Actions。
   **用户补充前提：只有两个开关都开启，才允许尝试双注册；两路实际注册成功且网络双注册协商通过，才显示/保留双注册成功。**
   只开启一项时仅使用该项，不擅自开启或尝试另一项；两项都开启但双注册不成立时，仅在已启用、可注册的接入中按 **VoWiFi → 4G/5G IMS** 回退，均不可用如实报告。
   实现时同步审查后端默认和已保存旧选择，不能只隐藏UI却仍运行矛盾模式；不绕过网络协商、不强制不被允许的第二路注册，不取消原会话/通话与语音、短信资费保护。
-- [ ] **eSIM管理 → 自动检测后的profile直接切换**：将“可用”展示改成真正的“切换”按钮，接入现有profile enable流程，不要求跳转“完整配置管理”才能切。复用维护锁、绑定校准、授权校验、loading/失败提示和成功刷新；当前已启用或不可切换条目正确禁用，防重复提交。
+- [x] **eSIM管理 → 自动检测后的profile直接切换（代码/本地检查完成）**：列表已提供“切换”按钮/确认框，复用现有profile enable和恢复进度接口，不要求跳转完整管理。一次POST后有界读取进度与新鲜profile，只有目标实际enabled才显示确认；不乐观改状态、不自动重发。
+  已启用、PPR禁止停用、未知状态、离线、加载中和忙碌条目正确禁用；线路切换隔离迟到结果，切换期间不并发自动加载覆盖新状态。新增helper回归，前端unit/type-check/lint通过，整批CI待后续；没有真实切卡。
 
 **最新操作约束：** 用户说本机设备和eSIM卡暂时下线，正在用手机测试哪些组合能正确注册IMS，测试后再安排修复。
 因此停止对已知设备的SSH/API连接、轮询、部署、实际切卡和电话/SMS操作，直至用户明确确认上线与当次操作范围。
 允许继续本地文件/数据库只读对比和代码审查；手机测试结果与本项目实机结果分开记录，不据此直接宣布项目已通过。
 此离线要求优先于上文已经执行完毕的一次性部署/拨号授权，不重放旧脚本。
 
+**H1：UI整批本地验证（2026-09-29 10:19 UTC）**：199 Python、21前端unit、TypeScript检查和全量lint通过；定向rustfmt通过。
+新增检查覆盖飞行模式短状态、双开关/双成功/协商的显示门槛、eSIM一次POST/忙碌/失效线路/失败与读回确认；后端补旧模式迁移/HTTP契约/自动回退回归，Rust尚待Actions。
+初次并行本地检查超时，Python已顺序重跑通过；本地产物Vite构建停于transforming并超时，**未记为成功**，将在Actions验证正式构建。
+证据 `.local/evidence/ui-offline/`。本次没有设备连接，也未修改相邻carrier_Bundles源码。
+
 本地库已定位：根目录三份2026-08-08 schema-v7库，以及 `.local/archive/root/.codex-cf-catalogs/` 中2026-08-19的四库（包括iOS 26.6.1）。
-当前仅完成来源与部分字段核对，**尚未形成Pixel呼入问题的最终根因结论**；对比进度/证据保存在 `.local/evidence/carrier-voice-compare/`。
+离线静态对比报告已完成，见 [数据库语音差异分析](IMS_CATALOG_PIXEL_IOS_COMPARISON_2026-09-29.md)；**尚不能认定用户历史呼入问题的唯一实机根因**。证据保存在 `.local/evidence/carrier-voice-compare/`。
 旧的Pixel redfin/schema-v5文档不是当前Mustang/v7的直接解释；旧历史已明确当时SIM/版本/接入腿/有效profile未固定，不能盲目归因。
 
 ## 1. 先看这三个结论

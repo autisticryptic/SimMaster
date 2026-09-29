@@ -258,6 +258,42 @@ mod tests {
     }
 
     #[test]
+    fn automatic_registration_never_attempts_a_disabled_access_even_with_stale_success() {
+        for cellular_enabled in [false, true] {
+            for wlan_enabled in [false, true] {
+                let decision = decide(ImsAccessInputs {
+                    cellular_enabled,
+                    wlan_enabled,
+                    cellular_available: true,
+                    wlan_available: true,
+                    cellular_registered: true,
+                    wlan_registered: true,
+                    concurrent_support: ConcurrentRegistrationSupport::Negotiated,
+                    ..Default::default()
+                });
+                assert_eq!(decision.cellular_registers, cellular_enabled);
+                assert_eq!(decision.wlan_registers, wlan_enabled);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_registration_falls_back_only_among_enabled_viable_accesses() {
+        let mut inputs = both(ImsAccessPreference::Concurrent);
+        assert_eq!(decide(inputs).effective_mode(), "single_registration");
+        assert!(decide(inputs).wlan_registers);
+        inputs.wlan_available = false;
+        assert!(decide(inputs).cellular_registers);
+        assert!(!decide(inputs).wlan_registers);
+        inputs.cellular_enabled = false;
+        assert_eq!(decide(inputs).effective_mode(), "none");
+        inputs.wlan_available = true;
+        inputs.multiple_registration_blocked = true;
+        assert!(decide(inputs).wlan_registers);
+        assert!(!decide(inputs).cellular_registers);
+    }
+
+    #[test]
     fn reg_ids_are_distinct_stable_and_positive_not_a_capability_gate() {
         assert_eq!(ImsAccess::Cellular.reg_id(), 1);
         assert_eq!(ImsAccess::Wlan.reg_id(), 2);

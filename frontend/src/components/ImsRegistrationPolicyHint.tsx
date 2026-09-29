@@ -1,6 +1,6 @@
 import { Tooltip, Typography } from '@mui/material'
 import type { ImsSubsystemState } from '@/api/contracts'
-import { registrationSupportText } from '../policies/imsRegistration'
+import { hasConfirmedDualRegistration, registrationSupportText } from '../policies/imsRegistration'
 
 /** A configured concurrent preference is not proof of two valid bindings. */
 export default function ImsRegistrationPolicyHint({ ims }: { ims: ImsSubsystemState | null }) {
@@ -11,9 +11,16 @@ export default function ImsRegistrationPolicyHint({ ims }: { ims: ImsSubsystemSt
 
   const selected = policy.applied.wlan_registers ? 'VoWiFi' : policy.applied.cellular_registers ? '4G/5G' : null
   const bothRegistered = ims.three_gpp.registered && ims.non_three_gpp.registered
-  const bothValidated = bothRegistered
-    && policy.cellular_flow?.transport_validated
-    && policy.wlan_flow?.transport_validated
+  const bothValidated = hasConfirmedDualRegistration({
+    cellularEnabled: ims.three_gpp.configured,
+    wlanEnabled: ims.non_three_gpp.configured,
+    cellularRegistered: ims.three_gpp.registered,
+    wlanRegistered: ims.non_three_gpp.registered,
+    cellularValidated: Boolean(policy.cellular_flow?.transport_validated),
+    wlanValidated: Boolean(policy.wlan_flow?.transport_validated),
+    negotiated: policy.concurrent_support === 'negotiated',
+    blocked: Boolean(policy.multiple_registration_blocked),
+  })
   const label = policy.switch_deferred_for_call
     ? '有通话，等待切换'
     : policy.effective === 'single_registration'
