@@ -293,7 +293,9 @@ docs/IMS_MM_SIM_BINDING_CALIBRATION.md、docs/IMS_REGISTRATION_POLICY.md，然�
   - 新 observation-only 通道区分真实初始INVITE接听与早期RTP/IP-leg Answered；回退前先清掉旧振铃证据，转发丢帧/接入失效/本地帧处理错误，手动挂机可被任务观察，不改变现有SIP桥接或call history事件流。
   - 任务成功详情保留SIP/Q.850、ringing/answered观察值与固定原因说明；成功卡片显示具体结果，不再只写“上次成功”。配置标签明确为“拨号观察时间”，不是接听后的通话时长。
   - 本地 **195项Python、13项前端unit、type-check、lint、定向rustfmt及diff检查通过**；证据 `.local/evidence/dial-outcomes/{python,frontend-unit,types,lint}.log`。未本地运行cargo。
-- **步骤 F2：提交／Actions与制品核验／准备中**。上述修改还未取得对应提交的Rust/mock测试执行证据，不能当作已部署功能。
+- **步骤 F2：已提交，Actions验证进行中**（04:28 UTC）：候选 **`098ae04ae1fa900ccd82293c74c50add56065416`** 已推送 `simmaster/master`。
+  **首轮失败事实（04:30 UTC）**：Build `36521722228`、Validate `36521722274` 的Rust编译失败（E0004），`handlers.rs` 旧通话历史监听器未穷尽新增 `AttemptChanged/Observation`；Frontend `36521722221` success。
+  已定位并补显式忽略分支（元数据不修改历史），正准备新SHA重新执行完整门禁。没有跳过失败测试、没有部署。编译日志和官方artifact摘要在 `.local/evidence/dial-outcomes/098ae04/`。首轮绿色前端不代表Rust成功。
 - 原换卡／自动恢复故障注入验收保持待维护窗口。已询问用户窗口及换卡方式，未切卡、未重启 MM/基带、未清预算。
 - 本次不重复拨打上次测试电话。每完成实现／本地验证／CI步骤都更新本文。部署目标与在机版本仍分开记录。
 - 基线 `b3f18aa`（docs），代码/部署基线 `a6a327e`；此续接开始时工作区干净。

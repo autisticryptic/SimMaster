@@ -5685,7 +5685,11 @@ fn ensure_ims_voice_listener(
                     let path = ims_call_path(&line_id, &call_id);
                     let _ = finish_tracked_call(&app, &path, false).await;
                 }
-                crate::services::trunk::bridge::OperatorEvent::Renegotiate { .. }
+                // Observation-only metadata travels on a separate subscriber
+                // bus. Even if delivered here, it must not rewrite call history.
+                crate::services::trunk::bridge::OperatorEvent::AttemptChanged { .. }
+                | crate::services::trunk::bridge::OperatorEvent::Observation { .. }
+                | crate::services::trunk::bridge::OperatorEvent::Renegotiate { .. }
                 | crate::services::trunk::bridge::OperatorEvent::Dtmf { .. }
                 | crate::services::trunk::bridge::OperatorEvent::TransferResponse { .. }
                 | crate::services::trunk::bridge::OperatorEvent::TransferNotify { .. } => {}
