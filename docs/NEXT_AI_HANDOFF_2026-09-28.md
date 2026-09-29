@@ -1,6 +1,6 @@
 # 下一位 AI 接手说明与 Prompt 模板
 
-> **剩余任务续接：2026-09-29 04:44 UTC（北京时间 12:44）。结果分类代码/CI已完成，部署与实机维护项待确认；详见 §0.12。**
+> **最新续接：2026-09-29 06:43 UTC（北京时间 14:43）。新局域网目标部署遇到安装目录/数据库已被删除的前置问题，未停服务；详见 §0.13。结果分类候选7c6cf86的CI证明见 §0.12。**
 > 总入口仍是 [HANDOFF.md](HANDOFF.md)。本文件同时保留上午的 MM 校准交接快照和下午新增的定时拨号/呼叫准入交接。
 > **上一阶段已完成部署 a6a327e、IMS注册与用户确认的00:32来电送达。最新结果分类候选7c6cf86已完成代码/CI，尚未部署；真实换卡/故障注入仍待维护窗口，不宣称所有todo或全项目全部完成。详见 §0.11–§0.12。**
 > §1–§9 是 10:52 UTC 的历史快照，其中“5 个未提交文件”和首版 CI 状态已过时；§0 的最新状态优先。
@@ -317,6 +317,39 @@ docs/IMS_MM_SIM_BINDING_CALIBRATION.md、docs/IMS_REGISTRATION_POLICY.md，然�
 - 原换卡／自动恢复故障注入验收保持待维护窗口。已询问用户窗口及换卡方式，未切卡、未重启 MM/基带、未清预算。
 - 本次不重复拨打上次测试电话。每完成实现／本地验证／CI步骤都更新本文。部署目标与在机版本仍分开记录。
 - 基线 `b3f18aa`（docs），代码/部署基线 `a6a327e`；此续接开始时工作区干净。
+
+### 0.13 新局域网目标部署及外置数据库对比（2026-09-29 06:43 UTC）
+
+用户新增顺序要求：**先将最新已验证构建直接替换到指定局域网设备，再研究本地 Pixel / iOS / IPCC 外置数据库差异**。
+目标地址/SSH凭据仅保存在本机私有材料，不复制到公有交接；入口索引 `.local/evidence/lan-deploy/target-reference.json`，
+凭据实际在仓库外 `/root/.codex/private-handoffs/simadmin/LAN_DEPLOY_2026-09-29.json`（0600）。不要回显或提交内容。
+本次是新目标，**不要套用旧 Cloudflare 实验机的 PID/安装状态/已部署结论**。
+
+- [x] **G1：只读连接与身份核实完成**。直接LAN SSH公钥匹配本机已有known_hosts，不是自动信任新主机；root登录成功。
+  系统Linux/aarch64，管理连接经wlan0；目标服务PID470，MM516、secondary339。最新可用制品仍为已验证7c6cf86 ARM64，不使用旧Release代替。
+- [ ] **G2：部署前数据保全／等待用户确认恢复方案**。实际发现：`/opt/simadmin` 不存在；
+  `/proc/470/exe` 指向 `/opt/simadmin/simadmin (deleted)`，cwd也标记deleted；fd10仍持有 `/opt/simadmin/data.db (deleted)`。
+  普通SQLite通过/proc别名打开失败，因此使用标准rollback-journal共享读锁读取已打开inode，再仅在内存反序列化；
+  **数据库约5.9MB，header为rollback模式，quick_check=ok**，可见auth_config/auth_sessions、config_documents、
+  config_line_profiles、通知/任务/短信/通话等表，尚有保全数据的机会。
+  **未停止旧进程、未写目标安装文件、未恢复/改写数据库、未重置密码，也未创建备份**。
+  全局config.yaml未在/opt、/data、/etc/simadmin、/var/lib/simadmin发现；数据库保存的是配置的一部分，不能据此宣称全局配置已恢复。
+  Web认证开启；用户提供的SSH凭据单次尝试Web登录不适用，未猜测重试。
+  需要用户提供原全局配置文件，或提供Web管理密码以尝试导出当前内存配置；若全局配置无需保留，则须明确授权“保全数据库后使用默认全局配置重建”。
+  **在方案明确前不能停PID470**，以免失去最后的数据库文件句柄；也不能直接让新程序创建空数据库/默认配置并称作正常覆盖。
+- [ ] **G3：完成最新制品覆盖与只读验收**。G2解决后核实旧数据/架构/摘要/无通话，恢复正常安装布局再部署，保持不生成备份、不改无关配置/凭据。
+- [ ] **G4：部署后才做外置数据库分析**。目前未开始相邻carrier_Bundles产物或本地Pixel/iOS/IPCC文件比较，遵守用户要求的顺序。
+
+本地证据：`.local/evidence/lan-deploy/{host-check,preflight-initial,layout,db-readonly,db-snapshot-readonly,web-access-check}.json`；
+只读传输助手 `.local/active/lan/device.py`。注意初始baseline的readlink失败令exe字段与下一行粘连，安装状态以独立 `layout.json` 为准，不机械读取错误字段。
+
+**后续数据库问题的需求记录：**
+
+用户报告通过旁边carrier_Bundles生成的外置库，Pixel提取库可注册IMS，但呼入直接转语音信箱、设备没有IMS来电通知；
+iOS/IPCC提取配置则可以注册并正常接打。当前派生配置以iOS提取模式为最初模板。可能较旧的对照数据库已下载本地。
+部署完成后先确认文件来源、schema、版本和同运营商/同作用域条目，再比较REGISTER身份/能力声明、路由、接入、安全、
+语音服务配置以及程序导入/有效配置映射。不以“注册成功”证明语音可达，也不先断定某个字段就是根因。
+只读分析，不在未授权时自动切换生产配置、拨号或重放旧验收；不要提交真实SIM身份、凭据或完整私有原始库。
 
 ## 1. 先看这三个结论
 
