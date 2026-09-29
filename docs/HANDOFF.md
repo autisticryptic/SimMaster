@@ -3,16 +3,19 @@
 > 更新：2026-09-28。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 最新UI实现与离线边界：2026-09-29 10:19 UTC
+## 最新UI实现与离线边界：2026-09-29 10:37 UTC
 
 用户明确设备与eSIM卡暂时下线，正在用手机测试IMS兼容性。**停止SSH/API连接、轮询、部署、切卡、拨号和短信操作**，直到用户确认上线。
 
-三项UI代码及本地验证已完成，记录在 [NEXT_AI_HANDOFF §0.14](NEXT_AI_HANDOFF_2026-09-28.md#014-用户新增ui待办与设备离线边界2026-09-29-0824-utc)，尚待整批Actions、未部署：
+三项UI代码、本地检查及整批Actions已完成，候选 **`33d16f3d78ea0456682a2469810625efe29805ec`** 已推送，**设备离线、未部署**。记录在 [NEXT_AI_HANDOFF §0.14](NEXT_AI_HANDOFF_2026-09-28.md#014-用户新增ui待办与设备离线边界2026-09-29-0824-utc)：
 1. 概述线路控制的飞行模式移除冗长说明，与另外三个控件显示形式一致。
 2. IMS与Trunk页移除额外“IMS注册模式”选择。**只有VoWiFi与蜂窝IMS两个开关都开启，才允许尝试双注册；两路都注册成功且网络协商允许，才算双注册成功。** 仅开一项只用该项，不擅自打开另一项；双注册不成立则在已启用/可用的接入中VoWiFi→4G/5G IMS回退，保留原会话及资费保护。
 3. eSIM自动检测后的profile列表将“可用”改成可实际执行的“切换”按钮，复用现有授权、维护锁和绑定校准，不再仅展示或强制跳完整配置管理。
 
-199 Python、21前端unit、TypeScript、lint、定向格式检查通过。本机Vite生产构建超时未完成，正式构建和Rust回归交由Actions核验，不把超时记为通过。
+199 Python、21前端unit、TypeScript、lint、定向格式检查通过。本机Vite限时构建未完成的事实保留；**正式前端构建已在Actions通过**。
+最新 Validate `36555415147`、Build `36555415060`、Frontend `36555414932` 全success；下载日志逐项核实3新增Rust回归+6重点兼容回归通过，两架构制品已下载核验commit/架构/digest/二进制及前端校验。
+证据 `.local/evidence/ui-offline/33d16f3/verified.json`；Publish Release skipped。当前已部署的LAN目标仍以07:14核验的7c6cf86为准，不拿候选当在机版本。
+设备上线后再确认部署/实机切换窗口；原历史文档 `docs/archive/2026-09/ESIM_IMS_PROFILE_TEST_2026-09-01.md` 的非本轮未提交修改保留未动。
 
 本地数据库静态对比已完成：[Pixel/iOS/IPCC分析报告](IMS_CATALOG_PIXEL_IOS_COMPARISON_2026-09-29.md)。六份源库哈希保持不变；三组对应新旧config_json无差异。
 报告区分历史空Contact/MMTEL缺陷（已修）、来源回退与现存字段投影缺口；没有宣称用户原来那次呼入失败的唯一根因。
