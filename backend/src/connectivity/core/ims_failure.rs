@@ -21,6 +21,11 @@ pub struct ImsFailureDiagnostic {
     pub retryable: bool,
     pub retry_after_seconds: Option<u32>,
     pub carrier_reason: Option<String>,
+    /// Internal provenance: locally synthesized 408/486 is not a peer response.
+    #[serde(skip)]
+    pub network_response: bool,
+    #[serde(skip)]
+    pub initial_invite: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +46,8 @@ impl ImsFailureDiagnostic {
             retryable: rule.retryable,
             retry_after_seconds: None,
             carrier_reason: None,
+            network_response: false,
+            initial_invite: false,
         }
     }
 
@@ -63,7 +70,15 @@ impl ImsFailureDiagnostic {
             retryable: rule.retryable,
             retry_after_seconds: parse_retry_after(frame),
             carrier_reason: warning.or(reason_text),
+            network_response: true,
+            initial_invite: false,
         })
+    }
+
+    /// Call producers opt in only for the original INVITE, never re-INVITEs.
+    pub fn for_initial_invite(mut self, initial: bool) -> Self {
+        self.initial_invite = initial;
+        self
     }
 
     /// A bounded diagnostic header for the local Asterisk leg. Raw carrier
@@ -583,6 +598,26 @@ fn split_quoted(value: &str, separator: char) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_provenance_is_internal_and_local_status_never_becomes_remote() {
+        let local = ImsFailureDiagnostic::from_status(486).for_initial_invite(true);
+        let remote = ImsFailureDiagnostic::from_response(b"SIP/2.0 486 Busy Here\r\n\r\n")
+            .unwrap()
+            .for_initial_invite(true);
+        assert!(!local.network_response);
+        assert!(remote.network_response && remote.initial_invite);
+        assert!(
+            !ImsFailureDiagnostic::from_response(b"SIP/2.0 408 Request Timeout\r\n\r\n")
+                .unwrap()
+                .initial_invite
+        );
+        // The existing public call diagnostic shape remains identical.
+        assert_eq!(
+            serde_json::to_value(&local).unwrap(),
+            serde_json::to_value(&remote).unwrap()
+        );
+    }
 
     #[test]
     fn captured_cap_release_is_actionable_carrier_policy() {

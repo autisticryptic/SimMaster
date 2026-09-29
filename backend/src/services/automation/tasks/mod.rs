@@ -2,6 +2,7 @@ pub mod baseband_reboot;
 pub mod consume_data;
 pub mod device_reboot;
 pub mod dial_call;
+pub mod dial_outcome;
 pub mod send_sms;
 
 use crate::services::automation::traits::AutomationTaskHandler;

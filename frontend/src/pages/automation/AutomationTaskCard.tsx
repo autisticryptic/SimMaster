@@ -22,7 +22,7 @@ import {
   Error as ErrorIcon,
 } from '@mui/icons-material'
 import type { AutomationTask, AutomationLogEntry } from '../../api/contracts'
-import { humanizeCostPolicyError } from '../../policies/imsRegistration'
+import { automationOutcomeLabel } from '../../utils/automationOutcome'
 
 type AutomationTaskCardProps = {
   task: AutomationTask
@@ -275,7 +275,7 @@ export default function AutomationTaskCard({
                   <ErrorIcon color="error" sx={{ fontSize: 16, flexShrink: 0 }} />
                 )}
                 <Typography variant="caption" color="text.secondary" noWrap sx={{ maxWidth: 140 }} title={latestLog.detail}>
-                  {latestLog.status === 'success' ? '上次成功' : `上次失败: ${humanizeCostPolicyError(latestLog.detail)}`}
+                  {automationOutcomeLabel(latestLog.status, latestLog.detail)}
                 </Typography>
               </>
             ) : (

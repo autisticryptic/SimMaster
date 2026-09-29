@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::{
-    bridge::{OperatorCommand, OperatorEvent},
+    bridge::{OperatorCommand, OperatorEvent, VoiceCallObservation},
     operator::{OperatorDiagnostics, OperatorLink},
 };
 
@@ -249,7 +249,7 @@ impl VoiceAccessRouter {
             let command_rx = trunk.subscribe_commands();
             let event_receivers = backends
                 .iter()
-                .map(|backend| (backend.kind, backend.link.subscribe_events()))
+                .map(|backend| (backend.kind, backend.link.subscribe_call_events()))
                 .collect();
             let trunk_task = trunk.clone();
             let policy_task = Arc::clone(&policy);
@@ -636,6 +636,19 @@ async fn run_router(
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        if sender
+                            .send((
+                                kind,
+                                OperatorEvent::Observation {
+                                    call_id: String::new(),
+                                    fact: VoiceCallObservation::EvidenceLost,
+                                },
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                         tracing::warn!(
                             access = kind.as_str(),
                             skipped,
@@ -714,6 +727,26 @@ async fn run_router(
             _ = ticker.tick() => continue,
         };
         let call_id = action.call_id().to_string();
+        if let CostCheckedAction::Event(
+            kind,
+            OperatorEvent::Observation {
+                fact: VoiceCallObservation::EvidenceLost,
+                ..
+            },
+        ) = &action
+        {
+            if call_id.is_empty() {
+                for (id, route) in &routes {
+                    if route.owner == *kind {
+                        trunk.send_event(OperatorEvent::Observation {
+                            call_id: id.clone(),
+                            fact: VoiceCallObservation::EvidenceLost,
+                        });
+                    }
+                }
+                continue;
+            }
+        }
         let owner = routes
             .get(&call_id)
             .map(|route| route.owner)
@@ -725,6 +758,16 @@ async fn run_router(
                 }
                 continue; // A retired/foreign leg cannot cancel the current owner.
             }
+        }
+        if matches!(
+            &action,
+            CostCheckedAction::Event(_, OperatorEvent::Unavailable { .. })
+        ) && owner.is_some()
+        {
+            // Invalidate evidence BEFORE a potentially slow fallback admission.
+            trunk.send_event(OperatorEvent::AttemptChanged {
+                call_id: call_id.clone(),
+            });
         }
         if action.cancels_pending() {
             if let Some(item) = pending.remove(&call_id) {
@@ -1110,6 +1153,10 @@ fn route_command(
         }
     }
     if is_terminal_command(&command) {
+        trunk.send_event(OperatorEvent::Observation {
+            call_id: call_id.clone(),
+            fact: VoiceCallObservation::LocalCancelled,
+        });
         routes.remove(&call_id);
     }
 }
@@ -1207,13 +1254,23 @@ fn route_event(
                 route.owner = next;
                 route.access_generation = selected.link.access_generation();
                 route.start = Some(start);
+                trunk.send_event(OperatorEvent::AttemptChanged {
+                    call_id: call_id.clone(),
+                });
                 tracing::warn!(call_id = %call_id, access = next.as_str(), "Voice call failed over to next access leg");
                 return;
             }
         }
     }
 
-    if matches!(&event, OperatorEvent::Answered { .. }) {
+    if matches!(
+        &event,
+        OperatorEvent::Answered { .. }
+            | OperatorEvent::Observation {
+                fact: VoiceCallObservation::RemoteAnswered,
+                ..
+            }
+    ) {
         route.start = None;
         route.start_plan = None;
         route.remaining.clear();
@@ -1253,6 +1310,8 @@ fn command_call_id(command: &OperatorCommand) -> &str {
 fn event_call_id(event: &OperatorEvent) -> &str {
     match event {
         OperatorEvent::Started { call_id, .. }
+        | OperatorEvent::AttemptChanged { call_id }
+        | OperatorEvent::Observation { call_id, .. }
         | OperatorEvent::Connected { call_id }
         | OperatorEvent::Incoming { call_id, .. }
         | OperatorEvent::Provisional { call_id, .. }
@@ -1799,6 +1858,107 @@ mod tests {
             recv_command(&mut commands).await,
             OperatorCommand::StartCall { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn call_evidence_resets_before_pending_fallback_and_manual_cancel_is_observable() {
+        let wifi = OperatorLink::default();
+        let cell = OperatorLink::default();
+        let mut wifi_commands = wifi.subscribe_commands();
+        let _cell_commands = cell.subscribe_commands();
+        wifi.set_ready(true);
+        cell.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![
+                (AccessPathKind::Vowifi, wifi.clone()),
+                (AccessPathKind::CellularIms, cell),
+            ],
+        );
+        router.set_trunk_voice_cost_policy(true, true);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let e = Arc::clone(&entered);
+        let r = Arc::clone(&release);
+        router.set_home_voice_observer(Arc::new(move || {
+            let e = Arc::clone(&e);
+            let r = Arc::clone(&r);
+            Box::pin(async move {
+                e.notify_one();
+                r.notified().await;
+                true
+            })
+        }));
+        let trunk = router.operator_link();
+        let mut observations = trunk.subscribe_call_events();
+        router
+            .start_call(call_plan("evidence-attempt"))
+            .await
+            .unwrap();
+        recv_command(&mut wifi_commands).await;
+        assert!(matches!(
+            recv_event(&mut observations).await,
+            OperatorEvent::Started { .. }
+        ));
+        wifi.send_event(OperatorEvent::Observation {
+            call_id: "evidence-attempt".into(),
+            fact: VoiceCallObservation::RemoteRinging,
+        });
+        assert!(matches!(
+            recv_event(&mut observations).await,
+            OperatorEvent::Observation {
+                fact: VoiceCallObservation::RemoteRinging,
+                ..
+            }
+        ));
+        wifi.send_event(OperatorEvent::Unavailable {
+            call_id: "evidence-attempt".into(),
+        });
+        entered.notified().await;
+        // Still waiting for home admission: previous ringing is already retired.
+        assert!(matches!(
+            recv_event(&mut observations).await,
+            OperatorEvent::AttemptChanged { .. }
+        ));
+        trunk
+            .send_command(OperatorCommand::HangupCall {
+                call_id: "evidence-attempt".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_command(&mut wifi_commands).await,
+            OperatorCommand::HangupCall { .. }
+        ));
+        assert!(matches!(
+            recv_event(&mut observations).await,
+            OperatorEvent::Observation {
+                fact: VoiceCallObservation::LocalCancelled,
+                ..
+            }
+        ));
+        release.notify_one();
+    }
+
+    #[tokio::test]
+    async fn upstream_event_gap_is_reported_to_owned_call_observers() {
+        let cell = OperatorLink::default();
+        let mut commands = cell.subscribe_commands();
+        cell.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![(AccessPathKind::CellularIms, cell.clone())],
+        );
+        let mut observations = router.operator_link().subscribe_call_events();
+        router.start_call(call_plan("gap")).await.unwrap();
+        recv_command(&mut commands).await;
+        recv_event(&mut observations).await;
+        cell.send_event(OperatorEvent::Observation {
+            call_id: String::new(),
+            fact: VoiceCallObservation::EvidenceLost,
+        });
+        assert!(
+            matches!(recv_event(&mut observations).await,OperatorEvent::Observation {call_id, fact:VoiceCallObservation::EvidenceLost} if call_id=="gap")
+        );
     }
 
     #[tokio::test]

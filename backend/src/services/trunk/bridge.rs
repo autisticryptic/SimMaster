@@ -136,6 +136,18 @@ pub enum OperatorCommand {
     },
 }
 
+/// Observation-only lifecycle facts, separate from Asterisk early-media/answer
+/// behavior. These variants never cause a protocol response by themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceCallObservation {
+    RemoteRinging,
+    RemoteAnswered,
+    RemoteEnded,
+    LocalCancelled,
+    LocalFailure,
+    EvidenceLost,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatorEvent {
     /// Emitted by the aggregate voice router when a StartCall command is
@@ -144,6 +156,14 @@ pub enum OperatorEvent {
         call_id: String,
         caller: String,
         callee: String,
+    },
+    /// Router-only metadata; fresh access attempts reset progress evidence.
+    AttemptChanged {
+        call_id: String,
+    },
+    Observation {
+        call_id: String,
+        fact: VoiceCallObservation,
     },
     /// Lifecycle metadata emitted after an incoming call's 200 OK has been
     /// sent to the operator. It must not generate another SIP response.
@@ -437,7 +457,10 @@ impl TrunkBridge {
         // represent a SIP response or in-dialog request for Asterisk.
         if matches!(
             &event,
-            OperatorEvent::Started { .. } | OperatorEvent::Connected { .. }
+            OperatorEvent::Started { .. }
+                | OperatorEvent::Connected { .. }
+                | OperatorEvent::AttemptChanged { .. }
+                | OperatorEvent::Observation { .. }
         ) {
             return Ok(BridgeOutput::default());
         }
@@ -450,7 +473,10 @@ impl TrunkBridge {
             return self.start_operator_incoming(call_id, &caller, &body);
         }
         let call_id = match &event {
-            OperatorEvent::Started { .. } | OperatorEvent::Connected { .. } => {
+            OperatorEvent::Started { .. }
+            | OperatorEvent::Connected { .. }
+            | OperatorEvent::AttemptChanged { .. }
+            | OperatorEvent::Observation { .. } => {
                 unreachable!("handled above")
             }
             OperatorEvent::Incoming { .. } => unreachable!("handled above"),
@@ -491,7 +517,10 @@ impl TrunkBridge {
             .clone()
             .unwrap_or_else(|| call.dialog.initial_invite.clone());
         match event {
-            OperatorEvent::Started { .. } | OperatorEvent::Connected { .. } => {
+            OperatorEvent::Started { .. }
+            | OperatorEvent::Connected { .. }
+            | OperatorEvent::AttemptChanged { .. }
+            | OperatorEvent::Observation { .. } => {
                 unreachable!("handled above")
             }
             OperatorEvent::Incoming { .. } => unreachable!("handled above"),
@@ -1764,6 +1793,40 @@ mod tests {
             })
             .unwrap();
         assert_eq!(output, BridgeOutput::default());
+    }
+
+    #[test]
+    fn task_observation_metadata_does_not_emit_protocol_frames_or_create_dialogs() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        );
+        for fact in [
+            VoiceCallObservation::RemoteRinging,
+            VoiceCallObservation::RemoteAnswered,
+            VoiceCallObservation::RemoteEnded,
+            VoiceCallObservation::LocalCancelled,
+            VoiceCallObservation::LocalFailure,
+            VoiceCallObservation::EvidenceLost,
+        ] {
+            assert_eq!(
+                bridge
+                    .handle_operator_event(OperatorEvent::Observation {
+                        call_id: "no-dialog".into(),
+                        fact
+                    })
+                    .unwrap(),
+                BridgeOutput::default()
+            );
+        }
+        assert_eq!(
+            bridge
+                .handle_operator_event(OperatorEvent::AttemptChanged {
+                    call_id: "no-dialog".into()
+                })
+                .unwrap(),
+            BridgeOutput::default()
+        );
     }
 
     #[test]

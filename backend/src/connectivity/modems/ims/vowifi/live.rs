@@ -4252,7 +4252,10 @@ fn operator_event_call_outcome(
     event: &OperatorEvent,
 ) -> Option<(voice::MoCallSipOutcome, bool)> {
     let event_call_id = match event {
-        OperatorEvent::Started { .. } | OperatorEvent::Connected { .. } => return None,
+        OperatorEvent::Started { .. }
+        | OperatorEvent::Connected { .. }
+        | OperatorEvent::AttemptChanged { .. }
+        | OperatorEvent::Observation { .. } => return None,
         OperatorEvent::Provisional { call_id, .. }
         | OperatorEvent::Answered { call_id, .. }
         | OperatorEvent::Rejected { call_id, .. }
@@ -4321,6 +4324,8 @@ fn operator_event_call_outcome(
             true
         }
         OperatorEvent::Started { .. }
+        | OperatorEvent::AttemptChanged { .. }
+        | OperatorEvent::Observation { .. }
         | OperatorEvent::Connected { .. }
         | OperatorEvent::Incoming { .. }
         | OperatorEvent::Renegotiate { .. }

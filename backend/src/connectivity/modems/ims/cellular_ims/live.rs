@@ -58,7 +58,7 @@ use crate::{
     services::trunk::{
         bridge::{
             parse_rtp_telephone_event, DtmfCapabilities, DtmfSource, MediaOffer, OperatorCommand,
-            OperatorEvent, RtpTelephoneEvent, VideoOffer,
+            OperatorEvent, RtpTelephoneEvent, VideoOffer, VoiceCallObservation,
         },
         operator::OperatorLink,
     },
@@ -5163,6 +5163,34 @@ async fn handle_operator_sip_frame(
     runtime: &Arc<CellularImsRuntime>,
     frame: &[u8],
 ) -> Result<bool, CellularImsError> {
+    let observed_call = if let Some(ims_id) = sip::header_value(frame, "Call-ID") {
+        live.session.lock().await.as_ref().and_then(|session| {
+            session
+                .voice_calls
+                .iter()
+                .find(|(_, call)| call.dialog.call_id == ims_id)
+                .map(|(id, _)| id.clone())
+        })
+    } else {
+        None
+    };
+    let result = handle_operator_sip_frame_inner(live, runtime, frame).await;
+    if result.is_err() {
+        if let Some(call_id) = observed_call {
+            live.operator.send_event(OperatorEvent::Observation {
+                call_id,
+                fact: VoiceCallObservation::LocalFailure,
+            });
+        }
+    }
+    result
+}
+
+async fn handle_operator_sip_frame_inner(
+    live: &CellularImsLiveHandle,
+    runtime: &Arc<CellularImsRuntime>,
+    frame: &[u8],
+) -> Result<bool, CellularImsError> {
     // An inbound INVITE left no trace until it had already been accepted, so a
     // terminating call that we dropped on a missing Call-ID, an absent session
     // or a local gate was indistinguishable from one the network never
@@ -5447,6 +5475,10 @@ async fn handle_operator_sip_frame(
             .await
             .map_err(map_channel_error)?;
         session.voice_calls.remove(&trunk_call_id);
+        live.operator.send_event(OperatorEvent::Observation {
+            call_id: trunk_call_id.clone(),
+            fact: VoiceCallObservation::RemoteEnded,
+        });
         live.operator.send_event(OperatorEvent::Ended {
             call_id: trunk_call_id,
         });
@@ -5576,6 +5608,12 @@ async fn handle_operator_sip_frame(
                     .map_err(map_channel_error)?;
                 runtime.update(|state| state.last_tx_at = Some(now())).await;
             }
+            if status == 180 {
+                live.operator.send_event(OperatorEvent::Observation {
+                    call_id: trunk_call_id.clone(),
+                    fact: VoiceCallObservation::RemoteRinging,
+                });
+            }
             live.operator.send_event(OperatorEvent::Provisional {
                 call_id: trunk_call_id.clone(),
                 status,
@@ -5643,6 +5681,12 @@ async fn handle_operator_sip_frame(
                 .await
                 .map_err(map_channel_error)?;
             runtime.update(|state| state.last_tx_at = Some(now())).await;
+            if !is_asterisk_reinvite && answer.is_ok() {
+                live.operator.send_event(OperatorEvent::Observation {
+                    call_id: trunk_call_id.clone(),
+                    fact: VoiceCallObservation::RemoteAnswered,
+                });
+            }
             match answer {
                 Ok(answer) if immediate_ip_connect || is_asterisk_reinvite => {
                     live.operator.send_event(OperatorEvent::Answered {
@@ -5702,7 +5746,8 @@ async fn handle_operator_sip_frame(
             call_id: trunk_call_id,
             status,
             diagnostic: ImsFailureDiagnostic::from_response(frame)
-                .unwrap_or_else(|_| ImsFailureDiagnostic::from_status(status)),
+                .unwrap_or_else(|_| ImsFailureDiagnostic::from_status(status))
+                .for_initial_invite(!is_asterisk_reinvite),
         });
         return Ok(true);
     }
@@ -10416,9 +10461,50 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[tokio::test]
+    async fn local_media_failure_is_visible_to_task_observer_after_ringing() {
+        let (live, runtime, pcscf) = test_voice_session().await;
+        let mut observations = live.operator.subscribe_call_events();
+        let rtp = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        handle_operator_command(
+            &live,
+            &runtime,
+            OperatorCommand::StartCall {
+                call_id: "media-failure".into(),
+                caller: "fixture".into(),
+                callee: "+12025550100".into(),
+                trunk_local_ip: "127.0.0.1".parse().unwrap(),
+                offer: test_audio_offer(rtp.local_addr().unwrap(), MediaDirection::SendRecv),
+            },
+        )
+        .await
+        .unwrap();
+        let invite = recv_test_sip(&pcscf).await;
+        let ringing = sip::build_response(&invite, 180, "Ringing", Some("peer"), None, None);
+        handle_operator_sip_frame(&live, &runtime, &ringing)
+            .await
+            .unwrap();
+        while observations.try_recv().is_ok() {}
+        let invalid = sip::build_response(
+            &invite,
+            183,
+            "Session Progress",
+            Some("peer"),
+            None,
+            Some(b"not SDP"),
+        );
+        assert!(handle_operator_sip_frame(&live, &runtime, &invalid)
+            .await
+            .is_err());
+        assert!(
+            matches!(observations.try_recv().unwrap(), OperatorEvent::Observation { call_id, fact: VoiceCallObservation::LocalFailure } if call_id == "media-failure")
+        );
+    }
+
+    #[tokio::test]
     async fn two_dialogs_keep_progress_media_dtmf_and_reinvite_state_independent() {
         let (live, runtime, pcscf) = test_voice_session().await;
         let mut events = live.operator.subscribe_events();
+        let mut observations = live.operator.subscribe_call_events();
         let trunk_rtp_a = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
         let trunk_rtp_b = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
         let trunk_rtp_c = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
@@ -10483,9 +10569,21 @@ Content-Length: 0\r\n\r\n";
                 .await
                 .unwrap()
                 .unwrap(),
-            OperatorEvent::Rejected { call_id, status: 486, .. }
-                if call_id == "matrix-call-b"
+            OperatorEvent::Rejected { call_id, status: 486, diagnostic }
+                if call_id == "matrix-call-b" && diagnostic.network_response && diagnostic.initial_invite
         ));
+
+        let mut ringing_seen = false;
+        while let Ok(event) = observations.try_recv() {
+            if matches!(event, OperatorEvent::Observation { call_id, fact: VoiceCallObservation::RemoteRinging } if call_id == "matrix-call-a")
+            {
+                ringing_seen = true;
+            }
+        }
+        assert!(
+            ringing_seen,
+            "real initial 180 emits observation-only ringing"
+        );
 
         // Reuse the rejected slot while call A remains in its original dialog.
         handle_operator_command(

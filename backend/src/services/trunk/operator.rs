@@ -38,6 +38,7 @@ struct OperatorLinkInner {
     ip_connect_mode: RwLock<TrunkIpConnectMode>,
     commands: broadcast::Sender<OperatorCommand>,
     events: broadcast::Sender<OperatorEvent>,
+    call_observations: broadcast::Sender<OperatorEvent>,
     sms_requests: broadcast::Sender<SmsRequest>,
     sms_deliveries: broadcast::Sender<SmsDelivery>,
     metrics: Arc<OperatorMediaMetrics>,
@@ -142,6 +143,7 @@ impl Default for OperatorLink {
     fn default() -> Self {
         let (commands, _) = broadcast::channel(32);
         let (events, _) = broadcast::channel(32);
+        let (call_observations, _) = broadcast::channel(64);
         let (sms_requests, _) = broadcast::channel(32);
         let (sms_deliveries, _) = broadcast::channel(32);
         Self {
@@ -156,6 +158,7 @@ impl Default for OperatorLink {
                 ip_connect_mode: RwLock::new(TrunkIpConnectMode::default()),
                 commands,
                 events,
+                call_observations,
                 sms_requests,
                 sms_deliveries,
                 metrics: Arc::new(OperatorMediaMetrics::default()),
@@ -195,6 +198,10 @@ impl OperatorLink {
     pub fn set_ready(&self, ready: bool) {
         if self.inner.ready.swap(ready, Ordering::SeqCst) && !ready {
             self.inner.access_generation.fetch_add(1, Ordering::SeqCst);
+            self.send_event(OperatorEvent::Observation {
+                call_id: String::new(),
+                fact: super::bridge::VoiceCallObservation::EvidenceLost,
+            });
         }
     }
 
@@ -267,6 +274,12 @@ impl OperatorLink {
         self.inner.commands.subscribe()
     }
 
+    /// Includes observation-only metadata; subscribing does NOT add a command
+    /// consumer or make a disconnected provider appear available.
+    pub fn subscribe_call_events(&self) -> broadcast::Receiver<OperatorEvent> {
+        self.inner.call_observations.subscribe()
+    }
+
     pub fn subscribe_events(&self) -> broadcast::Receiver<OperatorEvent> {
         self.inner.events.subscribe()
     }
@@ -325,6 +338,13 @@ impl OperatorLink {
     }
 
     pub fn send_event(&self, event: OperatorEvent) {
+        let _ = self.inner.call_observations.send(event.clone());
+        if matches!(
+            &event,
+            OperatorEvent::Observation { .. } | OperatorEvent::AttemptChanged { .. }
+        ) {
+            return; // No SIP bridge, call-history or media side effects.
+        }
         let is_dtmf = matches!(&event, OperatorEvent::Dtmf { .. });
         let _ = self.inner.events.send(event);
         self.inner
@@ -343,6 +363,22 @@ impl OperatorLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_metadata_does_not_add_command_consumers_or_bridge_events() {
+        let link = OperatorLink::default();
+        let mut bridge = link.subscribe_events();
+        let mut observer = link.subscribe_call_events();
+        link.set_ready(true);
+        assert!(!link.is_available());
+        link.send_event(OperatorEvent::Observation {
+            call_id: "fixture".into(),
+            fact: super::super::bridge::VoiceCallObservation::RemoteRinging,
+        });
+        assert!(observer.try_recv().is_ok());
+        assert!(bridge.try_recv().is_err());
+        assert!(!link.is_available());
+    }
 
     #[test]
     fn incoming_cost_gate_prevents_immediate_answer_without_disabling_registration() {

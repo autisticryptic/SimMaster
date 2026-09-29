@@ -4,6 +4,7 @@ use crate::platform::config::{
 use crate::platform::db::beijing_sms_now_string;
 use crate::services::automation::target::target_line_id;
 use crate::services::automation::tasks::TaskRegistry;
+use crate::services::automation::traits::AutomationExecutionReport;
 use crate::services::notify::notification::AutomationEvent;
 use crate::state::AppState;
 use anyhow::Result;
@@ -349,7 +350,7 @@ async fn execute_task(
     let timeout_seconds = 60 + delay_secs;
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(timeout_seconds),
-        handler.execute(app, &params),
+        handler.execute_report(app, &params),
     )
     .await;
 
@@ -423,6 +424,10 @@ fn dial_failure_summary(error: &anyhow::Error) -> String {
         "automation_call_rejected",
         "automation_call_access_unavailable",
         "automation_call_ended_before_duration",
+        "automation_call_ended_before_answer",
+        "automation_call_ended_without_remote_evidence",
+        "automation_call_delivery_unconfirmed",
+        "automation_call_local_failure",
         "automation_call_observation_lost",
         "automation_call_cancelled",
         "automation_call_cleanup_unavailable",
@@ -462,12 +467,12 @@ fn dial_failure_summary(error: &anyhow::Error) -> String {
 /// stage AND its cause: Display alone drops anyhow's context chain. Do not
 /// include the dial target in forwarded failure diagnostics.
 fn task_outcome(
-    result: Option<Result<()>>,
+    result: Option<Result<AutomationExecutionReport>>,
     timeout_seconds: u64,
     action: &AutomationAction,
 ) -> (&'static str, String) {
     match result {
-        Some(Ok(())) => ("success", "执行成功".into()),
+        Some(Ok(report)) => ("success", report.detail()),
         Some(Err(error)) => {
             let detail = if let AutomationAction::DialCall {
                 country_code,
@@ -506,6 +511,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn report_preserves_peer_no_answer_but_cleanup_failure_still_wins() {
+        use super::super::tasks::dial_outcome::{DialOutcome, DialReport};
+        let report = DialReport {
+            outcome: DialOutcome::PeerNoAnswer,
+            ringing_observed: true,
+            answered_observed: false,
+            sip_status: Some(408),
+            q850_cause: Some(31),
+        };
+        let action = AutomationAction::DialCall {
+            country_code: "+1".into(),
+            phone_number: "2025550100".into(),
+            duration_seconds: 60,
+        };
+        let (status, detail) = task_outcome(
+            Some(Ok(AutomationExecutionReport::Dial(report))),
+            120,
+            &action,
+        );
+        assert_eq!(status, "success");
+        assert!(detail.contains("对方未接听"));
+        assert!(detail.contains("SIP=408"));
+        assert!(detail.contains("answered_observed=false"));
+        assert!(!detail.contains("2025550100"));
+        let cleanup =
+            anyhow::anyhow!("automation_call_cleanup_unavailable").context("自动挂机失败");
+        assert_eq!(task_outcome(Some(Err(cleanup)), 120, &action).0, "failed");
+        assert_eq!(task_outcome(None, 120, &action).0, "failed");
+    }
+
+    #[test]
     fn dial_outcome_preserves_stage_and_cause_without_the_number() {
         let action = AutomationAction::DialCall {
             country_code: "+86".into(),
@@ -527,7 +563,10 @@ mod tests {
             task_outcome(None, 90, &action),
             ("failed", "执行超时 (超过90秒限制)".into())
         );
-        assert_eq!(task_outcome(Some(Ok(())), 90, &action).0, "success");
+        assert_eq!(
+            task_outcome(Some(Ok(AutomationExecutionReport::Completed)), 90, &action).0,
+            "success"
+        );
     }
 
     #[test]

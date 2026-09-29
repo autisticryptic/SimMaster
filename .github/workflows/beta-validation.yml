@@ -93,6 +93,8 @@ jobs:
             services::orchestrator::radio_intent::tests \
             services::automation::tasks::consume_data::tests \
             services::automation::tasks::dial_call::tests \
+            services::automation::tasks::dial_outcome::tests \
+            connectivity::core::ims_failure::tests \
             services::automation::scheduler::tests \
             services::automation::target::tests \
             services::line_registry::tests \
@@ -129,10 +131,12 @@ jobs:
             services::trunk::transport::tests \
             services::trunk::access_router::tests \
             services::trunk::operator::tests \
+            services::trunk::bridge::tests \
             services::orchestrator::voice_router::tests \
             services::orchestrator::sms_router \
             connectivity::modems::ims::cellular_ims::live::tests \
             connectivity::modems::ims::vowifi::operator::tests::incoming_cost_gate \
+            connectivity::modems::ims::vowifi::operator::tests::two_dialogs_keep_progress_media_dtmf_and_reinvite_state_independent \
             services::e911::ssrf::tests \
             services::e911::ts43::tests \
             connectivity::core::outbound::tests \

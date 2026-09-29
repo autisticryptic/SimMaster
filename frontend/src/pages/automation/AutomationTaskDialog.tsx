@@ -453,7 +453,7 @@ export default function AutomationTaskDialog({
                 <MenuItem value="+86">中国 +86</MenuItem><MenuItem value="+1">美国/加拿大 +1</MenuItem><MenuItem value="+44">英国 +44</MenuItem><MenuItem value="+81">日本 +81</MenuItem><MenuItem value="+82">韩国 +82</MenuItem><MenuItem value="manual">手动输入</MenuItem>
               </TextField>}
               <TextField label="号码主体" value={formCallPhone} onChange={(e) => setFormCallPhone(e.target.value)} />
-              <TextField label="拨号保持时间（秒）" type="number" value={formCallDuration} onChange={(e) => setFormCallDuration(Math.min(7200, Math.max(1, Number(e.target.value) || 1)))} slotProps={{ htmlInput: { min: 1, max: 7200 } }} sx={{ gridColumn: '1 / -1' }} />
+              <TextField label="拨号观察时间（秒）" helperText="从拨号启动计时，并非接通后通话时长；对端未接／忙／拒接可算任务成功，实际通话结果另行保留。" type="number" value={formCallDuration} onChange={(e) => setFormCallDuration(Math.min(7200, Math.max(1, Number(e.target.value) || 1)))} slotProps={{ htmlInput: { min: 1, max: 7200 } }} sx={{ gridColumn: '1 / -1' }} />
             </Box>
           )}
 

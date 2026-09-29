@@ -1,6 +1,7 @@
+use super::dial_outcome::{DialEvidence, DialReport};
 use crate::api::handlers::start_owned_automation_call;
 use crate::services::automation::target::resolve_line_target;
-use crate::services::automation::traits::AutomationTaskHandler;
+use crate::services::automation::traits::{AutomationExecutionReport, AutomationTaskHandler};
 use crate::services::trunk::bridge::{OperatorCommand, OperatorEvent};
 use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
@@ -48,16 +49,16 @@ impl Drop for CancelCallTask {
 
 /// This future runs in a shielded task. A dropped scheduler waiter cancels its
 /// admission and wait, but cannot abandon the exact call ID after dispatch.
-async fn run_owned_call<S, W, WF, H, HF>(
+async fn run_owned_call<S, W, WF, H, HF, T>(
     start: S,
     wait: W,
     hangup: H,
     mut cancelled: oneshot::Receiver<()>,
-) -> Result<()>
+) -> Result<T>
 where
     S: Future<Output = Result<String>>,
     W: FnOnce(String) -> WF,
-    WF: Future<Output = Result<()>>,
+    WF: Future<Output = Result<T>>,
     H: FnOnce(String) -> HF,
     HF: Future<Output = Result<()>>,
 {
@@ -75,18 +76,36 @@ async fn observe_call(
     mut events: broadcast::Receiver<OperatorEvent>,
     call_id: String,
     duration: Duration,
-) -> Result<()> {
+) -> Result<DialReport> {
     let deadline = tokio::time::Instant::now() + duration;
+    let mut evidence = DialEvidence::default();
     loop {
+        // Bound a drain pass. Lag/overload fails closed instead of using stale
+        // ringing; already buffered failure/cancel wins over deadline success.
+        for index in 0..=64 {
+            match events.try_recv() {
+                Ok(event) => {
+                    if index == 64 {
+                        return Err(anyhow!("automation_call_observation_lost"));
+                    }
+                    if let Some(result) = evidence.event(&call_id, &event) {
+                        return result;
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(_) => return Err(anyhow!("automation_call_observation_lost")),
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return evidence.deadline();
+        }
         tokio::select! {
+            biased;
             event = events.recv() => match event {
-                Ok(OperatorEvent::Rejected { call_id: id, status, .. }) if id == call_id => return Err(anyhow!("automation_call_rejected:sip_status={status}")),
-                Ok(OperatorEvent::Unavailable { call_id: id }) if id == call_id => return Err(anyhow!("automation_call_access_unavailable")),
-                Ok(OperatorEvent::Ended { call_id: id } | OperatorEvent::Cancelled { call_id: id }) if id == call_id => return Err(anyhow!("automation_call_ended_before_duration")),
-                Ok(_) => {},
+                Ok(event) => if let Some(result) = evidence.event(&call_id, &event) { return result; },
                 Err(_) => return Err(anyhow!("automation_call_observation_lost")),
             },
-            _ = tokio::time::sleep_until(deadline) => return Ok(()),
+            _ = tokio::time::sleep_until(deadline) => {}, // recheck buffered events
         }
     }
 }
@@ -101,6 +120,14 @@ impl AutomationTaskHandler for DialCallHandler {
         app: &'a AppState,
         params: &'a serde_json::Value,
     ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.execute_report(app, params).await.map(|_| ()) })
+    }
+
+    fn execute_report<'a>(
+        &'a self,
+        app: &'a AppState,
+        params: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<AutomationExecutionReport>> {
         async move {
             let phone = normalize_phone(params.get("country_code").and_then(|v| v.as_str()).unwrap_or(""),
                 params.get("phone_number").and_then(|v| v.as_str()).unwrap_or(""))?;
@@ -108,7 +135,7 @@ impl AutomationTaskHandler for DialCallHandler {
             let target = resolve_line_target(app, params).await?;
             let line = app.line_registry.get(&target.line_id).await.ok_or_else(|| anyhow!("automation_target_line_not_found"))?;
             let link = line.voice_access.operator_link();
-            let events = link.subscribe_events(); // Subscribe BEFORE Start, including fast rejection.
+            let events = link.subscribe_call_events(); // Before Start; includes attempt/loss metadata.
             let app = app.clone();
             let flag = Arc::new(AtomicBool::new(false));
             let (signal, cancelled) = oneshot::channel();
@@ -130,6 +157,7 @@ impl AutomationTaskHandler for DialCallHandler {
                 result
             });
             task.await.map_err(|_| anyhow!("automation_call_task_failed"))?
+                .map(AutomationExecutionReport::Dial)
         }.boxed()
     }
 }
@@ -180,7 +208,7 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let error = run_owned_call(
             async { Ok("owned".into()) },
-            |_| async { Err(anyhow!("automation_call_rejected")) },
+            |_| async { Err::<(), _>(anyhow!("automation_call_rejected")) },
             |id| {
                 let calls = &calls;
                 async move {
@@ -195,6 +223,103 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("automation_call_rejected"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_report_defaults_preserve_non_dial_handlers() {
+        use crate::services::automation::traits::AutomationExecutionReport;
+        assert_eq!(AutomationExecutionReport::Completed.detail(), "执行成功");
+    }
+
+    #[tokio::test]
+    async fn no_answer_cleanup_failure_does_not_publish_success() {
+        let (_sender, cancelled) = oneshot::channel();
+        let error = run_owned_call(
+            async { Ok("owned".into()) },
+            |_| async { Ok(()) },
+            |_| async { Err(anyhow!("automation_call_cleanup_unavailable")) },
+            cancelled,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("自动挂机失败"));
+    }
+
+    #[tokio::test]
+    async fn deadline_after_ringing_succeeds_but_buffered_failure_or_cancel_wins() {
+        use super::super::dial_outcome::DialOutcome;
+        use crate::services::trunk::bridge::VoiceCallObservation;
+        for terminal in [
+            None,
+            Some(VoiceCallObservation::LocalCancelled),
+            Some(VoiceCallObservation::EvidenceLost),
+        ] {
+            let (tx, rx) = broadcast::channel(8);
+            tx.send(OperatorEvent::Observation {
+                call_id: "owned".into(),
+                fact: VoiceCallObservation::RemoteRinging,
+            })
+            .unwrap();
+            if let Some(fact) = terminal {
+                tx.send(OperatorEvent::Observation {
+                    call_id: "owned".into(),
+                    fact,
+                })
+                .unwrap();
+            }
+            let result = observe_call(rx, "owned".into(), Duration::ZERO).await;
+            if terminal.is_some() {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap().outcome, DialOutcome::RingingAtDeadline);
+            }
+        }
+        let (_tx, rx) = broadcast::channel(8);
+        assert!(observe_call(rx, "owned".into(), Duration::ZERO)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("delivery_unconfirmed"));
+    }
+
+    #[tokio::test]
+    async fn observation_lag_fails_closed_and_duplicate_terminal_commits_once() {
+        use crate::services::trunk::bridge::VoiceCallObservation;
+        let (tx, rx) = broadcast::channel(2);
+        for _ in 0..6 {
+            tx.send(OperatorEvent::Observation {
+                call_id: "owned".into(),
+                fact: VoiceCallObservation::RemoteRinging,
+            })
+            .unwrap();
+        }
+        assert!(observe_call(rx, "owned".into(), Duration::ZERO)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("observation_lost"));
+        let (tx, rx) = broadcast::channel(8);
+        let diagnostic =
+            crate::connectivity::core::ims_failure::ImsFailureDiagnostic::from_response(
+                b"SIP/2.0 486 Busy Here\r\n\r\n",
+            )
+            .unwrap()
+            .for_initial_invite(true);
+        for _ in 0..2 {
+            tx.send(OperatorEvent::Rejected {
+                call_id: "owned".into(),
+                status: 486,
+                diagnostic: diagnostic.clone(),
+            })
+            .unwrap();
+        }
+        tx.send(OperatorEvent::Unavailable {
+            call_id: "owned".into(),
+        })
+        .unwrap();
+        assert!(observe_call(rx, "owned".into(), Duration::ZERO)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

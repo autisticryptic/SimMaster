@@ -45,6 +45,7 @@ use crate::{
             bridge::{
                 parse_rtp_telephone_event, DtmfCapabilities, DtmfSource, MediaOffer,
                 OperatorCommand, OperatorEvent, RtpTelephoneEvent, VideoOffer,
+                VoiceCallObservation,
             },
             operator::OperatorLink,
         },
@@ -1336,6 +1337,31 @@ async fn handle_frame(
     mt_sms: &broadcast::Sender<crate::connectivity::core::sms_codec::MtSmsDeliver>,
     frame: &[u8],
 ) -> Result<(), String> {
+    let observed_call = sip_frame::header_value(frame, "Call-ID").and_then(|ims_id| {
+        session
+            .calls
+            .iter()
+            .find(|(_, call)| call.dialog.call_id == ims_id)
+            .map(|(id, _)| id.clone())
+    });
+    let result = handle_frame_inner(session, link, mt_sms, frame).await;
+    if result.is_err() {
+        if let Some(call_id) = observed_call {
+            link.send_event(OperatorEvent::Observation {
+                call_id,
+                fact: VoiceCallObservation::LocalFailure,
+            });
+        }
+    }
+    result
+}
+
+async fn handle_frame_inner(
+    session: &mut VoiceSession,
+    link: &OperatorLink,
+    mt_sms: &broadcast::Sender<crate::connectivity::core::sms_codec::MtSmsDeliver>,
+    frame: &[u8],
+) -> Result<(), String> {
     let active_call_id = session
         .mwi_subscription
         .as_ref()
@@ -1593,6 +1619,10 @@ async fn handle_frame(
                 .await
                 .map_err(|error| error.code().to_string())?;
             session.calls.remove(&call_id);
+            link.send_event(OperatorEvent::Observation {
+                call_id: call_id.clone(),
+                fact: VoiceCallObservation::RemoteEnded,
+            });
             link.send_event(OperatorEvent::Ended { call_id });
             return Ok(());
         }
@@ -1790,6 +1820,12 @@ async fn handle_response(
                     .map_err(|error| error.code().to_string())?;
             }
         }
+        if status == 180 && !call.pending_trunk_reinvite {
+            link.send_event(OperatorEvent::Observation {
+                call_id: call_id.to_string(),
+                fact: VoiceCallObservation::RemoteRinging,
+            });
+        }
         link.send_event(OperatorEvent::Provisional {
             call_id: call_id.to_string(),
             status,
@@ -1818,6 +1854,12 @@ async fn handle_response(
             .await
             .map_err(|error| error.code().to_string())?;
         let was_reinvite = call.pending_trunk_reinvite;
+        if !was_reinvite {
+            link.send_event(OperatorEvent::Observation {
+                call_id: call_id.to_string(),
+                fact: VoiceCallObservation::RemoteAnswered,
+            });
+        }
         call.operator_answered = true;
         call.pending_trunk_reinvite = false;
         call.renegotiation_deadline = None;
@@ -1864,7 +1906,8 @@ async fn handle_response(
         call_id: call_id.to_string(),
         status,
         diagnostic: ImsFailureDiagnostic::from_response(frame)
-            .unwrap_or_else(|_| ImsFailureDiagnostic::from_status(status)),
+            .unwrap_or_else(|_| ImsFailureDiagnostic::from_status(status))
+            .for_initial_invite(!was_reinvite),
     });
     if !was_reinvite {
         session.calls.remove(call_id);
@@ -3473,6 +3516,7 @@ mod tests {
         let (client, mut server) = tcp_pair().await;
         let line_id = "operator-test-two-dialog-matrix";
         let link = operator_link_for_line(line_id);
+        let mut observations = link.subscribe_call_events();
         let mut events = link.subscribe_events();
         let route_context = context(line_id, &client, &server);
         install_registered_channel(
@@ -3537,8 +3581,8 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            OperatorEvent::Rejected { call_id, status: 486, .. }
-                if call_id == "matrix-call-b"
+            OperatorEvent::Rejected { call_id, status: 486, diagnostic }
+                if call_id == "matrix-call-b" && diagnostic.network_response && diagnostic.initial_invite
         ));
 
         let operator_rtp_a = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
@@ -3563,6 +3607,26 @@ mod tests {
                 .unwrap(),
             OperatorEvent::Answered { call_id, .. } if call_id == "matrix-call-a"
         ));
+
+        let mut ringing = false;
+        let mut remote_answer = false;
+        while let Ok(event) = observations.try_recv() {
+            match event {
+                OperatorEvent::Observation {
+                    call_id,
+                    fact: VoiceCallObservation::RemoteRinging,
+                } if call_id == "matrix-call-a" => ringing = true,
+                OperatorEvent::Observation {
+                    call_id,
+                    fact: VoiceCallObservation::RemoteAnswered,
+                } if call_id == "matrix-call-a" => remote_answer = true,
+                _ => {}
+            }
+        }
+        assert!(
+            ringing && remote_answer,
+            "network evidence is separate from IP/media events"
+        );
 
         // The rejected slot can be reused while call A remains confirmed.
         let rtp_c = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
