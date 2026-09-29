@@ -168,6 +168,7 @@ pub(super) struct MmBus {
     pub modem: String,
     pub device: String,
     pub interface: String,
+    selected_interface: OnceLock<String>,
     sim_binding: OnceLock<MmSimBinding>,
 }
 
@@ -195,10 +196,61 @@ impl MmBus {
                 modem: modem.to_string(),
                 device: device.to_string(),
                 interface: interface.to_string(),
+                selected_interface: OnceLock::new(),
                 sim_binding: OnceLock::new(),
             }))
         })
         .await
+    }
+
+    pub fn data_interface(&self) -> &str {
+        self.selected_interface
+            .get()
+            .map(String::as_str)
+            .unwrap_or(&self.interface)
+    }
+
+    async fn verify_data_interface(&self, bearer: &str, interface: &str) -> Result<(), String> {
+        self.verify_data_interface_with(bearer, interface, netdev::verify_mm_data_interface)
+            .await
+    }
+
+    async fn verify_data_interface_with<F>(
+        &self,
+        bearer: &str,
+        interface: &str,
+        topology: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(&str, &str) -> Result<(), String>,
+    {
+        self.ensure_sim_binding().await?;
+        let own = self.status(bearer).await?;
+        if !own.connected || own.interface != interface {
+            return Err("qca410_primary_mm_data_interface_changed".into());
+        }
+        let ports: Vec<(String, u32)> = self
+            .proxy(&self.modem, MODEM)
+            .await?
+            .get_property("Ports")
+            .await
+            .map_err(bus_error)?;
+        if !ports
+            .iter()
+            .any(|(name, kind)| name == interface && *kind == 2)
+        {
+            return Err("qca410_primary_mm_data_interface_unverified".into());
+        }
+        topology(&self.device, interface)?;
+        for other in self.bearers().await? {
+            if other != bearer {
+                let status = self.status(&other).await?;
+                if status.connected && status.interface == interface {
+                    return Err("qca410_primary_mm_interface_already_owned".into());
+                }
+            }
+        }
+        self.ensure_sim_binding().await
     }
 
     async fn proxy<'a>(
@@ -402,13 +454,14 @@ impl MmBus {
                 .call("GetAll", &(BEARER,))
                 .await
                 .map_err(bus_error)?;
-            let settings = primary_ims_settings::parse(&properties, &self.interface, apn, family)?;
+            let settings =
+                primary_ims_settings::parse(&properties, self.data_interface(), apn, family)?;
             let status = self.status(bearer).await?;
             primary_ims_settings::validate_binding(
                 status.connected,
                 &status.interface,
                 &status.apn,
-                &self.interface,
+                self.data_interface(),
                 apn,
             )?;
             self.ensure_sim_binding().await?;
@@ -504,14 +557,15 @@ impl MmBus {
             if profile_id.is_some() && actual_profile != profile_id {
                 return Err("profile_pin_changed".to_string());
             }
-            let settings = primary_ims_settings::parse(&properties, &self.interface, apn, family)?
-                .ok_or_else(|| "ip_config_unavailable".to_string())?;
+            let settings =
+                primary_ims_settings::parse(&properties, self.data_interface(), apn, family)?
+                    .ok_or_else(|| "ip_config_unavailable".to_string())?;
             let status = self.status(bearer).await?;
             primary_ims_settings::validate_binding(
                 status.connected,
                 &status.interface,
                 &status.apn,
-                &self.interface,
+                self.data_interface(),
                 apn,
             )?;
             Ok(settings)
@@ -610,7 +664,7 @@ impl MmBus {
                 continue;
             }
             match self.status(&other).await {
-                Ok(status) if status.connected && status.interface == self.interface => {
+                Ok(status) if status.connected && status.interface == self.data_interface() => {
                     return Ok(false)
                 }
                 Ok(_) => {}
@@ -760,8 +814,8 @@ impl LeaseRecord {
             || !valid_path(&self.modem, "/org/freedesktop/ModemManager1/Modem/")
             || !valid_path(&self.bearer, "/org/freedesktop/ModemManager1/Bearer/")
             || !self.device.starts_with("/dev/")
-            || netdev::primary_netdev_for_qmi(&self.device).as_deref()
-                != Some(self.interface.as_str())
+            || netdev::primary_netdev_for_qmi(&self.device).is_none()
+            || !netdev::valid_mm_data_interface(&self.interface)
             || self.interface.len() >= 16
             || self.process_id == 0
             || self.process_start == 0
@@ -904,6 +958,28 @@ impl OwnedLease {
         Ok(guard)
     }
 
+    pub async fn bind_data_interface(&self, bearer: &str, interface: &str) -> Result<(), String> {
+        if let Some(selected) = self.bus.selected_interface.get() {
+            return if selected == interface {
+                Ok(())
+            } else {
+                Err("qca410_primary_mm_data_interface_changed".into())
+            };
+        }
+        self.bus.verify_data_interface(bearer, interface).await?;
+        let _guard = self.update(|record| {
+            if record.namespace.is_some() || record.networks().next().is_some() {
+                return Err("qca410_primary_mm_data_interface_changed".into());
+            }
+            record.interface = interface.to_string();
+            Ok(())
+        })?;
+        self.bus
+            .selected_interface
+            .set(interface.to_string())
+            .map_err(|_| "qca410_primary_mm_data_interface_changed".to_string())
+    }
+
     pub fn network_will_be_configured(
         &self,
         networks: &[NetdevConfig],
@@ -949,37 +1025,41 @@ impl OwnedLease {
             return self.forget(&record);
         }
         let mut network_error = None;
-        match self.bus.may_clean_interface(&record.bearer).await {
-            Ok(true) => {
-                if let Some(namespace) = record.namespace.as_deref() {
-                    let namespace = NetnsName::adopt(namespace).map_err(|e| e.to_string())?;
-                    if netns::exists(&namespace) {
-                        if let Err(error) =
-                            netns::move_iface_out(&namespace, &record.interface).await
-                        {
-                            network_error = Some(error.to_string());
+        // Before configuration, the lease owns only its MM object. Do not
+        // move the default interface, which may belong to a host data bearer.
+        if record.namespace.is_some() || record.networks().next().is_some() {
+            match self.bus.may_clean_interface(&record.bearer).await {
+                Ok(true) => {
+                    if let Some(namespace) = record.namespace.as_deref() {
+                        let namespace = NetnsName::adopt(namespace).map_err(|e| e.to_string())?;
+                        if netns::exists(&namespace) {
+                            if let Err(error) =
+                                netns::move_iface_out(&namespace, &record.interface).await
+                            {
+                                network_error = Some(error.to_string());
+                            }
                         }
                     }
+                    if network_error.is_none() {
+                        network_error =
+                            cleanup_networks_with(&record, |interface, network| async move {
+                                netdev::teardown_verified(&interface, &network).await
+                            })
+                            .await
+                            .err();
+                    }
                 }
-                if network_error.is_none() {
-                    network_error =
-                        cleanup_networks_with(&record, |interface, network| async move {
-                            netdev::teardown_verified(&interface, &network).await
-                        })
-                        .await
-                        .err();
+                Ok(false) => {
+                    tracing::warn!(
+                        "Skipping old IMS interface cleanup: another MM bearer owns the interface"
+                    );
+                    network_error = retain_unverified_network(&record).err();
                 }
+                Err(error) if error == OWNER_MISSING => {
+                    network_error = retain_unverified_network(&record).err();
+                }
+                Err(error) => network_error = Some(error),
             }
-            Ok(false) => {
-                tracing::warn!(
-                    "Skipping old IMS interface cleanup: another MM bearer owns the interface"
-                );
-                network_error = retain_unverified_network(&record).err();
-            }
-            Err(error) if error == OWNER_MISSING => {
-                network_error = retain_unverified_network(&record).err();
-            }
-            Err(error) => network_error = Some(error),
         }
         let _ = self.bus.disconnect(&record.bearer).await;
         match self.bus.delete(&record.bearer).await {
@@ -1281,6 +1361,7 @@ mod ip_config_dbus_tests {
     const PATH: &str = "/org/freedesktop/ModemManager1/Bearer/91";
 
     struct FakeBearer {
+        interface: String,
         connected: Arc<AtomicBool>,
         disconnect_during_read: bool,
         sim_change_during_read: Option<Arc<AtomicBool>>,
@@ -1331,6 +1412,14 @@ mod ip_config_dbus_tests {
         #[zbus(property)]
         fn primary_port(&self) -> String {
             "wwan0qmi0".to_string()
+        }
+        #[zbus(property)]
+        fn ports(&self) -> Vec<(String, u32)> {
+            vec![
+                ("wwan0".into(), 2),
+                ("wwan2".into(), 2),
+                ("wwan9".into(), 0),
+            ]
         }
         #[zbus(property)]
         fn bearers(&self) -> Vec<OwnedObjectPath> {
@@ -1406,7 +1495,7 @@ mod ip_config_dbus_tests {
         }
         #[zbus(property)]
         fn interface(&self) -> String {
-            "wwan0".to_string()
+            self.interface.clone()
         }
         #[zbus(property)]
         fn properties(&self) -> HashMap<String, OwnedValue> {
@@ -1488,6 +1577,12 @@ mod ip_config_dbus_tests {
             .serve_at(
                 PATH,
                 FakeBearer {
+                    interface: if action == "alternate_interface" {
+                        "wwan2"
+                    } else {
+                        "wwan0"
+                    }
+                    .into(),
                     connected,
                     disconnect_during_read,
                     sim_change_during_read: (action == "sim_ip").then_some(sim_changed),
@@ -1627,6 +1722,39 @@ mod ip_config_dbus_tests {
             drop(bus);
             drop(server);
         }
+    }
+
+    #[tokio::test]
+    async fn reported_mm_net_port_is_verified_before_adopting_alternate_interface() {
+        let (server, commands) = probe_server(false, "alternate_interface").await;
+        let bus = bus().await;
+        bus.verify_data_interface_with(PATH, "wwan2", |device, iface| {
+            assert_eq!(device, "/dev/wwan0qmi0");
+            assert_eq!(iface, "wwan2");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(bus
+            .verify_data_interface_with(PATH, "wwan2", |_, _| Err("wrong_topology".into()))
+            .await
+            .is_err());
+        assert!(bus
+            .verify_data_interface_with(PATH, "wwan9", |_, _| panic!(
+                "unreported interface reached topology"
+            ))
+            .await
+            .is_err());
+        bus.selected_interface.set("wwan2".into()).unwrap();
+        assert_eq!(bus.data_interface(), "wwan2");
+        let ip = bus
+            .ip_settings(PATH, "ims", MmIpFamily::Ipv4v6)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ip.ipv4_address.is_some());
+        assert!(commands.lock().unwrap().is_empty());
+        server.release_name(SERVICE).await.unwrap();
     }
 
     #[tokio::test]
@@ -2153,6 +2281,22 @@ mod tests {
             .set_networks(&[network(true), network(false)])
             .unwrap();
         assert!(retain_unverified_network(&stored).is_err());
+    }
+
+    #[test]
+    fn alternate_mm_interface_receipt_round_trips_without_rebinding_to_primary() {
+        let mut stored = record();
+        stored.interface = "wwan2".into();
+        stored.validate().unwrap();
+        let loaded: LeaseRecord =
+            serde_json::from_slice(&serde_json::to_vec(&stored).unwrap()).unwrap();
+        assert_eq!(loaded.interface, "wwan2");
+        assert_eq!(loaded.device, stored.device);
+        for name in ["eth0", "../wwan2", "wwan2/other", ""] {
+            let mut bad = stored.clone();
+            bad.interface = name.into();
+            assert!(bad.validate().is_err());
+        }
     }
 
     #[test]

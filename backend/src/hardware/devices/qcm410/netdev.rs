@@ -192,6 +192,58 @@ pub fn primary_netdev_for_qmi(device: &str) -> Option<String> {
     Some(modem.to_string())
 }
 
+pub(super) fn valid_mm_data_interface(interface: &str) -> bool {
+    interface.len() < 16
+        && interface
+            .strip_prefix("wwan")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// MM may allocate another BAM-DMUX data channel when the primary netdev is
+/// already occupied. The *reported* interface must belong to this QMI device;
+/// a name or matching APN alone is not ownership evidence.
+pub(super) fn verify_mm_data_interface(device: &str, interface: &str) -> Result<(), String> {
+    verify_mm_data_interface_at(std::path::Path::new("/sys"), device, interface)
+}
+
+fn verify_mm_data_interface_at(
+    root: &std::path::Path,
+    device: &str,
+    interface: &str,
+) -> Result<(), String> {
+    let invalid = || "qca410_primary_mm_data_interface_unverified".to_string();
+    if primary_netdev_for_qmi(device).is_none() || !valid_mm_data_interface(interface) {
+        return Err(invalid());
+    }
+    let control_name = device.strip_prefix("/dev/").ok_or_else(invalid)?;
+    let control =
+        std::fs::canonicalize(root.join("class/wwan").join(control_name)).map_err(|_| invalid())?;
+    let network =
+        std::fs::canonicalize(root.join("class/net").join(interface)).map_err(|_| invalid())?;
+    // Both nodes must be siblings under the same remoteproc, with the data node
+    // in its BAM-DMUX net directory. Do not allow arbitrary prefix substring matches.
+    let baseband = control
+        .ancestors()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(".remoteproc"))
+        })
+        .ok_or_else(invalid)?;
+    let relative = network.strip_prefix(baseband).map_err(|_| invalid())?;
+    let parts = relative.components().collect::<Vec<_>>();
+    if parts.len() != 3
+        || !parts[0]
+            .as_os_str()
+            .to_string_lossy()
+            .ends_with(":bam-dmux")
+        || parts[1].as_os_str() != "net"
+        || parts[2].as_os_str() != interface
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 impl NetdevConfig {
     /// Build the probe configuration from a session's settings.
     ///
@@ -917,6 +969,66 @@ async fn run_ip_child(mut child: Child, deadline: Duration) -> Result<(), String
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[cfg(unix)]
+    #[test]
+    fn mm_data_interface_requires_exact_remoteproc_and_bam_dmux_membership() {
+        use std::{fs, os::unix::fs::symlink};
+        let root = std::env::temp_dir().join(format!(
+            "mm-iface-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("class/wwan")).unwrap();
+        fs::create_dir_all(root.join("class/net")).unwrap();
+        let control = root.join("devices/soc/4080000.remoteproc/wwan/wwan0/wwan0qmi0");
+        fs::create_dir_all(&control).unwrap();
+        symlink(&control, root.join("class/wwan/wwan0qmi0")).unwrap();
+        for (name, owner, group, expected) in [
+            (
+                "wwan0",
+                "4080000.remoteproc",
+                "4080000.remoteproc:bam-dmux",
+                true,
+            ),
+            (
+                "wwan2",
+                "4080000.remoteproc",
+                "4080000.remoteproc:bam-dmux",
+                true,
+            ),
+            (
+                "wwan3",
+                "4090000.remoteproc",
+                "4090000.remoteproc:bam-dmux",
+                false,
+            ),
+            ("wwan4", "4080000.remoteproc", "other-driver", false),
+        ] {
+            let network = root.join(format!("devices/soc/{owner}/{group}/net/{name}"));
+            fs::create_dir_all(&network).unwrap();
+            symlink(network, root.join("class/net").join(name)).unwrap();
+            assert_eq!(
+                verify_mm_data_interface_at(&root, "/dev/wwan0qmi0", name).is_ok(),
+                expected
+            );
+        }
+        for name in [
+            "../wwan2",
+            "eth0",
+            "wwan",
+            "wwan2/child",
+            "wwan999999999999999",
+        ] {
+            assert!(!valid_mm_data_interface(name));
+        }
+        assert!(verify_mm_data_interface_at(&root, "/dev/wwan0at1", "wwan2").is_err());
+        assert!(verify_mm_data_interface_at(&root, "/dev/wwan1qmi0", "wwan2").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[cfg(unix)]
     #[tokio::test]

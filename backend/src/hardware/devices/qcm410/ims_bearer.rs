@@ -270,7 +270,7 @@ async fn establish_bearer(
     // Both families configure this same verified interface; no candidate probe
     // or independent WDS start is introduced for the second family.
     let baseband = baseband.to_string();
-    let interface = primary_netdev.to_string();
+    let interface = session.interface().to_string();
     let resolution = match configure_primary_networks(networks, network_guard, move |config| {
         let baseband = baseband.clone();
         let interface = interface.clone();
@@ -502,6 +502,8 @@ fn classify_session_failure(detail: &str) -> ImsBearerFailureHint {
             | "qca410_primary_mm_setup_timeout_unverified"
             | "qca410_primary_mm_create_unresolved"
             | "qca410_primary_mm_network_cleanup_unverified"
+            | "qca410_primary_mm_data_interface_changed"
+            | "qca410_primary_mm_data_interface_unverified"
     ) {
         return ImsBearerFailureHint::BindingChanged;
     }

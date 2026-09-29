@@ -1,6 +1,6 @@
 # 下一位 AI 接手说明与 Prompt 模板
 
-> **最新续接：2026-09-29 10:37 UTC（北京时间 18:37）。三项UI修改及整批CI/双架构验证已完成，候选33d16f3尚未部署，见 §0.14。设备/eSIM仍离线：不连接、不轮询、不切卡或拨号；本地数据库对比报告见 §0.13。**
+> **最新续接：2026-09-29 11:16 UTC（北京时间19:16）。用户确认设备上线并授权部署，LAN目标已运行33d16f3；新增当前eSIM的IMS承载失败修复任务，见§0.15。不得据此自动切卡/拨号。**
 > 总入口仍是 [HANDOFF.md](HANDOFF.md)。本文件同时保留上午的 MM 校准交接快照和下午新增的定时拨号/呼叫准入交接。
 > **上一阶段已完成部署 a6a327e、IMS注册与用户确认的00:32来电送达。最新结果分类候选7c6cf86已完成代码/CI，尚未部署；真实换卡/故障注入仍待维护窗口，不宣称所有todo或全项目全部完成。详见 §0.11–§0.12。**
 > §1–§9 是 10:52 UTC 的历史快照，其中“5 个未提交文件”和首版 CI 状态已过时；§0 的最新状态优先。
@@ -395,6 +395,21 @@ ARM64 artifact11027263175，包SHA-256 `b3c37cf12c106d66e15bce4f4645fff11c7caeba
 本地库已定位：根目录三份2026-08-08 schema-v7库，以及 `.local/archive/root/.codex-cf-catalogs/` 中2026-08-19的四库（包括iOS 26.6.1）。
 离线静态对比报告已完成，见 [数据库语音差异分析](IMS_CATALOG_PIXEL_IOS_COMPARISON_2026-09-29.md)；**尚不能认定用户历史呼入问题的唯一实机根因**。证据保存在 `.local/evidence/carrier-voice-compare/`。
 旧的Pixel redfin/schema-v5文档不是当前Mustang/v7的直接解释；旧历史已明确当时SIM/版本/接入腿/有效profile未固定，不能盲目归因。
+
+### 0.15 上线后UI部署与当前eSIM注册失败（2026-09-29）
+
+- **I1 部署完成**（11:16:47 UTC）：用户明确设备上线并授权安装最新版本，按最近LAN目标固定host pin连接；预检旧7c6cf86、管理wlan0、无MM活动通话、无启用任务、数据库完整。
+  已覆盖为 **33d16f3 / PID11064**，运行SHA-256 `cb2180653db7c937bd6e9695653b615c57d4e3bde9b72e511b0ee406180d5de4` 匹配验证ARM64；前端checksum/HTTP200、DB quick_check通过。
+  无备份，复制前后配置/数据库哈希不变；MM577/secondary343未重启，恢复timer已恢复active。两次暂存后预检因本地脚本未strip换行误拒绝，未停旧服务；修正后执行成功，记录保留。
+  证据 `.local/evidence/lan-ui-deploy/{preflight,before-ims-evidence,deployment,installed-verified}.json`。
+- **I2 当前eSIM注册流程修复／进行中**：用户手机测试此eSIM可注册IMS，但项目不成功。已加入todo；未确认手机测试是LTE/NR IMS还是VoWiFi，已询问，不需要原始SIM身份。
+  部署前：仅蜂窝IMS开启，VoWiFi关闭、airplane/data关闭；MM State11/RegistrationState5（漫游），原三槽停在 `cellular_ims_runtime_ims_bearer_start_failed`，没有SIP注册日志。外置catalog未安装，槽位database→carrier_catalog→derived。
+  先采集新程序具体承载错误与实际SIM/PLMN/端点关联再修，不以手机成功直接猜运营商特例；不固定IPv6、不清恢复预算、不放宽P-CSCF归属。
+  **I3 具体故障与候选修复**：后台登录成功；当前SIM归属51502、服务网50212漫游，实际derived_3gpp_lte_51502，失败码 `qca410_primary_mm_data_interface_mismatch`。
+  host bearer使用wwan0，MM已给IMS尝试返回IPv4 grant但随后被程序固定主网卡检查拒绝；尚未发SIP。修复为绑定MM实际返回net口，并同时校验MM Ports、相同remoteproc/BAM-DMUX sysfs拓扑及exclusive bearer归属，再持久化lease并配置/搬迁网络；不抢host bearer、不把profile-id等同CID。
+  新Rust/mock/D-Bus回归已写，待Actions编译执行。当前本地202 Python中仅文档链接检查受用户未提交的ESIM文档移动影响；其余通过，提交时用候选Git树另验，不丢用户文件。
+- 用户此次授权上线部署与诊断，**没有授权自动切换eSIM或真实呼叫**。原独立换卡/故障注入验收仍待明确窗口。
+- 历史eSIM文档现被外部改为 `docs/ESIM_IMS_PROFILE_TEST_2026-09-01.md`（原archive路径删除、新根docs文件未跟踪），不是本轮修改；仅修正新位置的HANDOFF相对链接，其余内容保留、不夹带提交。该文件含用户身份材料，不原样推送。
 
 ## 1. 先看这三个结论
 

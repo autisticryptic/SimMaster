@@ -155,6 +155,10 @@ impl PrimaryImsSession {
         })
     }
 
+    pub fn interface(&self) -> &str {
+        self.controller.bus.data_interface()
+    }
+
     pub async fn verify_sim_binding(&self) -> Result<(), String> {
         self.controller.bus.ensure_sim_binding().await
     }
@@ -438,11 +442,29 @@ impl Controller {
                 }
                 let _connection_guard = lease.connection_will_start()?;
                 self.bus.connect(&args[1]).await?;
+                let status = self.bus.status(&args[1]).await?;
+                if !status.connected {
+                    return Err("qca410_primary_mm_bearer_not_connected".into());
+                }
+                lease
+                    .bind_data_interface(&args[1], &status.interface)
+                    .await?;
+                tracing::info!(interface = %status.interface, "Pinned exclusive MM IMS data interface");
                 Ok("connected".to_string())
             }
             ("-b", "-K") => {
                 let status = self.bus.status(&args[1]).await?;
                 self.bus.ensure_sim_binding().await?;
+                if self
+                    .owned
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|lease| lease.path() == args[1])
+                    && status.interface != self.bus.data_interface()
+                {
+                    return Err("qca410_primary_mm_data_interface_changed".into());
+                }
                 Ok(format!(
                     "bearer.status.connected : {}\nbearer.status.interface : {}\nbearer.properties.apn : {}",
                     if status.connected { "yes" } else { "no" },
@@ -597,9 +619,11 @@ where
         if connected(&status) != Some(true) {
             return Err("qca410_primary_mm_bearer_not_connected".to_string());
         }
-        if value(&status, "bearer.status.interface") != Some(request.interface) {
-            return Err("qca410_primary_mm_data_interface_mismatch".to_string());
-        }
+        let interface = value(&status, "bearer.status.interface")
+            .filter(|interface| netdev::valid_mm_data_interface(interface))
+            .ok_or_else(|| "qca410_primary_mm_data_interface_mismatch".to_string())?;
+        // Production runner has verified same-device sysfs topology and pinned
+        // the MM-reported interface before this shared ownership check.
         if !value(&status, "bearer.properties.apn")
             .is_some_and(|apn| apn.eq_ignore_ascii_case(request.apn))
         {
@@ -623,8 +647,7 @@ where
             let Some(is_connected) = connected(&status) else {
                 return Err("qca410_primary_mm_other_bearer_status_unknown".to_string());
             };
-            if is_connected && value(&status, "bearer.status.interface") == Some(request.interface)
-            {
+            if is_connected && value(&status, "bearer.status.interface") == Some(interface) {
                 return Err("qca410_primary_mm_interface_already_owned".to_string());
             }
         }
@@ -678,6 +701,7 @@ fn observed_loss(result: &Result<String, String>) -> Option<String> {
         Err(error)
             if error == OWNER_MISSING
                 || error == "qca410_primary_mm_binding_changed"
+                || error == "qca410_primary_mm_data_interface_changed"
                 || error == "qca410_primary_mm_binding_unavailable" =>
         {
             Some(error.clone())
@@ -960,9 +984,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reported_secondary_mm_interface_does_not_steal_primary_data() {
+        let mut replies = successful_replies();
+        replies[3] = Ok(status("wwan2", true));
+        replies[4] = Ok(format!("modem.generic.bearers : {BEARER}, {OTHER}"));
+        replies.push(Ok(status("wwan0", true)));
+        let (run, calls) = runner(replies);
+        assert_eq!(prepare_with(&request(), run).await.unwrap(), BEARER);
+        assert!(!calls.lock().unwrap().iter().any(|args| args
+            .iter()
+            .any(|a| a == "--disconnect" || a.starts_with("--delete-bearer"))));
+    }
+
+    #[tokio::test]
+    async fn reported_secondary_mm_interface_still_requires_exclusive_ownership() {
+        let mut replies = successful_replies();
+        replies[3] = Ok(status("wwan2", true));
+        replies[4] = Ok(format!("modem.generic.bearers : {BEARER}, {OTHER}"));
+        replies.extend([
+            Ok(status("wwan2", true)),
+            Ok("disconnected".into()),
+            Ok("deleted".into()),
+        ]);
+        let (run, calls) = runner(replies);
+        assert!(prepare_with(&request(), run)
+            .await
+            .unwrap_err()
+            .contains("interface_already_owned"));
+        assert_eq!(
+            calls.lock().unwrap().last().unwrap()[2],
+            format!("--delete-bearer={BEARER}")
+        );
+    }
+
+    #[tokio::test]
     async fn interface_or_apn_mismatch_rolls_back_the_created_object() {
         for bad_status in [
-            status("wwan1", true),
+            status("eth0", true),
             status("wwan0", false),
             status("wwan0", true).replace("apn : ims", "apn : internet"),
         ] {

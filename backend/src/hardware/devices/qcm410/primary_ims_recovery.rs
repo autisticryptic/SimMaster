@@ -177,7 +177,7 @@ impl RecoveryPlan {
             return Ok(None);
         }
         let status = bus.status(&bearer).await?;
-        if !status.connected || status.interface != bus.interface {
+        if !status.connected || status.interface != bus.data_interface() {
             return Ok(None);
         }
         let properties: primary_ims_settings::Properties = timed(5, async {
