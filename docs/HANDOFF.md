@@ -3,12 +3,14 @@
 > 更新：2026-09-28。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 最新续接：2026-09-29 04:21 UTC
+## 最新续接：2026-09-29 04:44 UTC
 
 用户要求继续剩余todos。最新逐步记录在 [NEXT_AI_HANDOFF §0.12](NEXT_AI_HANDOFF_2026-09-28.md#012-剩余任务续接2026-09-29最新步骤)。
 
-- 对端未接/非本端超时的任务结果分类已写入工作树：typed report、当前接入180/远端终局证据、local/re-INVITE错误隔离、观察丢失与取消保护、成功详情展示；尚待对应SHA的Actions验证，不是已部署状态。
-- 本地195 Python、13前端unit/type-check/lint、定向格式/diff通过；新结果语义不改写历史失败记录。
+- **结果分类候选 `7c6cf8635971f738a8af3a79a01f50ba6af4e641` 的代码/CI/双架构核验完成，尚未部署**：typed report、当前接入真实180/远端初始INVITE终局证据、local/re-INVITE错误隔离、观察丢失与取消保护、成功详情展示。
+- 本地195 Python、13前端unit/type-check/lint、定向格式/diff通过；新结果语义不改写历史失败记录。首版098ae04有E0004编译失败，已修复并保留失败证据，没有跳过门禁。
+- 最新 Validate [`36522353436`](https://github.com/autisticryptic/SimMaster/actions/runs/36522353436) / Build [`36522353454`](https://github.com/autisticryptic/SimMaster/actions/runs/36522353454) 全success；两套日志实际核实 **18新回归+4重点兼容检查**均ok，ARM64/AMD64制品实际下载核对官方digest、meta版本/commit/架构、ELF与二进制/前端摘要。
+  证据 `.local/evidence/dial-outcomes/7c6cf86/verified.json`；Publish Release skipped。
 - 设备最后验证仍为a6a327e，本次没有部署、再次拨号、切卡或故障注入。
 - MM换卡/自动恢复故障注入的维护窗口与切换方式已询问用户，待明确确认，不为完成待办打断已注册会话。
 
@@ -51,8 +53,8 @@ IMS `registered / ipsec / derived_3gpp_lte_46011`，本版本新注册时间 **1
   **16:31:57 UTC 只立即触发一次**：预检 home/IMS注册/calls=0；设备 dialing→ringing，16:32:29终局 SIP408/Q85031，任务failed、未接通。
   **用户已确认看到了北京时间00:32的未接电话，只是错过接听**。按用户“收到电话即成功”的约定，**来电送达验收通过**；未接听，不代表音频或接通后时长验收通过。
   **16:34:32 calls=[]，没有重拨**，任务保持disabled。现有failed/408历史不改写。证据 `.local/evidence/automation-dial/a6a327e/{deployment,task-configured,immediate-trigger,call-observations,post-call}.json`，用户确认见本轮会话及私有requested-task.json。
-- **新增后续待办（仅登记，未实现）**：用户要求自定义/计划拨号中，对方未接听、非本端原因超时等情况算拨号任务success，而非failed；仍保存真实SIP/Q850/未接听结果，不把本端故障或所有408都成功化。
-  详细任务列表在 [NEXT_AI_HANDOFF §0.11](NEXT_AI_HANDOFF_2026-09-28.md#011-新增后续任务区分拨号任务成功与对端接听结果尚未实现)。当前 `observe_call` / `task_outcome` 仍使用原失败分类。
+- **上阶段新增、现已完成代码/CI的需求**：自定义/计划拨号的对端未接/超时受限成功分类，保留SIP/Q850和未接听事实，不把本端故障或所有408都成功化。
+  详见 [NEXT_AI_HANDOFF §0.11](NEXT_AI_HANDOFF_2026-09-28.md#011-拨号任务成功与对端接听结果代码ci完成尚未部署)。设备a6a327e仍使用旧失败分类；只有部署7c6cf86后新语义才生效。
 - 下面 `dc2355c` 校准候选的 CI/制品证明依旧有效，已部署语音程序包含其代码；真实换卡与自动重新附着故障注入仍独立待验收。
 
 ## 上一阶段已验证进展：2026-09-28 11:41 UTC
