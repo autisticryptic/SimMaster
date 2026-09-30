@@ -22,6 +22,7 @@
 新增显式 `--action probe --expected-plan <当前 inspect token>`，只准入 `Owned` 租约且 APN/family 与完整快照一致。发请求前持久化 `Probing`，结束后记为 `Probed`；取消或崩溃后不能再次 probe 同一租约。
 
 - 复用现有派生身份、AKA、REGISTER 核心；独立 UE namespace、内存数据库，不启动 Web 服务、调度器、通话/短信监听或生产恢复循环。
+- P-CSCF reporting 在持久化 `Probing` 后经原 unique-owner bus、串行锁内 SIM/静止检查启用并读回；探针跳过生产核心的 mmcli reporting 写入。启用结果未知、读回不符、取消或结束状态无法持久化时保留 `Probing` 并阻断自动 release，不以观察到旧值就盲删记录。
 - capability 校验实际 CID/APN/MM 端点与族，最多调用一次底层承载建立；强制单族错误不能借此对同一 profile 再激活。REGISTER 核心窗口 240 秒，注销另限 40 秒；成功报告仅表示本次注册成功，随后主动注销，不是维持在线服务。
 - 注销结果分别报告 confirmed/already_expired/rejected/access_lost/timeout，不把清理成功当作网络已确认注销。承载回收后停止 worker，仅在自有 namespace 只剩 loopback 且清理已核验时删除；profile 仍须显式 release。
 - 同一 MM owner 内对象重新枚举，只在旧 modem 确认消失、物理控制口及稳定 SIM/slot、原 profile/EPS 全匹配且两次快照一致时衔接 profile 清理；不把 bearer 清理重定向到新对象，不接受旧 receipt 缺失稳定归属证据的换代。

@@ -2322,7 +2322,15 @@ async fn connect_inner(
     // WDS must be the only activation owner. Arm P-CSCF reporting on the
     // inactive profile, then read the resulting PCO through CGCONTRDP after the
     // WDS session is established.
-    let pcscf_reporting_cid = if let Some(profile) = ims_profile {
+    #[cfg(target_os = "linux")]
+    let reporting_prepared_by_probe = diagnostic_profile.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let reporting_prepared_by_probe = false;
+    let pcscf_reporting_cid = if reporting_prepared_by_probe {
+        // probe_with already armed and verified reporting on its retained MM
+        // owner before entering this core. Never write via a reusable selector.
+        ims_profile.map(|profile| profile.cid)
+    } else if let Some(profile) = ims_profile {
         match set_pcscf_reporting(&device.modem_id, profile.cid, true).await {
             Ok(()) => {
                 tracing::info!(cid = profile.cid, "Enabled IMS P-CSCF reporting");

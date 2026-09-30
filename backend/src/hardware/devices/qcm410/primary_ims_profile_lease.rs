@@ -296,7 +296,7 @@ async fn release_with<I: ProfileIo, S: Store>(
     store: &S,
     mut receipt: Receipt,
 ) -> Result<(), String> {
-    if receipt.version != 1 || receipt.phase == Phase::Creating {
+    if receipt.version != 1 || matches!(receipt.phase, Phase::Creating | Phase::Probing) {
         return Err("mm_ims_profile_lease_creation_unresolved".into());
     }
     let snapshot = io.snapshot().await?;
@@ -744,6 +744,16 @@ where
     }
     receipt.phase = Phase::Probing;
     store.save(&receipt)?; // a probe is never repeated after cancellation/crash
+                           // Arm reporting through the retained owner while still quiescent, never
+                           // through mmcli's reusable selector. An uncertain write/readback leaves
+                           // Probing, which cannot authorize automatic profile deletion.
+    let id = owned_matches(&receipt, &current)?;
+    io.restore_reporting(id, [1, 1, 1]).await?;
+    let armed = io.snapshot().await?;
+    owned_matches(&receipt, &armed)?;
+    if armed.reporting.get(&id) != Some(&[1, 1, 1]) || io.snapshot().await? != armed {
+        return Err("mm_ims_profile_probe_reporting_unverified".into());
+    }
     let result = probe(receipt.clone()).await;
     receipt.phase = Phase::Probed;
     store.save(&receipt)?;
@@ -1508,7 +1518,10 @@ mod tests {
                 .is_err());
             }
             release_with(&io, &store, saved).await.unwrap();
-            assert_eq!(*io.calls.lock().unwrap(), ["Set-without-id", "Delete:9"]);
+            assert_eq!(
+                *io.calls.lock().unwrap(),
+                ["Set-without-id", "reporting:9", "reporting:9", "Delete:9"]
+            );
             assert!(store.saved.lock().unwrap().is_none());
         }
     }
@@ -1608,7 +1621,12 @@ mod tests {
                         .is_err()
                 );
             }
-            assert_eq!(*io.calls.lock().unwrap(), ["Set-without-id"]);
+            let expected = if failure == "intent" {
+                vec!["Set-without-id"]
+            } else {
+                vec!["Set-without-id", "reporting:9"]
+            };
+            assert_eq!(*io.calls.lock().unwrap(), expected);
         }
     }
 
@@ -1636,7 +1654,9 @@ mod tests {
                 assert_eq!(reconciled.phase, phase);
                 store.save(&reconciled).unwrap();
                 let result = release_with(&io, &store, reconciled).await;
-                if phase == Phase::RestoringReporting && reporting == [1, 1, 1] {
+                if phase == Phase::Probing
+                    || (phase == Phase::RestoringReporting && reporting == [1, 1, 1])
+                {
                     assert!(result.is_err());
                     assert_eq!(*io.calls.lock().unwrap(), ["Set-without-id"]);
                     assert!(store.saved.lock().unwrap().is_some());
@@ -1650,6 +1670,32 @@ mod tests {
                     assert_eq!(io.snapshot().await.unwrap(), restored);
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_probe_uncertain_reporting_never_activates_or_authorizes_delete() {
+        for failure in [5, 6] {
+            let io = FakeIo::new(9);
+            let store = MemoryStore::default();
+            let receipt = acquire(&io, &store, 1).await;
+            let token = fingerprint(&("ims", 1_u32, io.snapshot().await.unwrap())).unwrap();
+            io.behavior.store(failure, Ordering::SeqCst);
+            assert!(probe_with(
+                &io,
+                &store,
+                receipt,
+                "ims",
+                1,
+                Some(&token),
+                unexpected_probe
+            )
+            .await
+            .is_err());
+            let pending = store.saved.lock().unwrap().clone().unwrap();
+            assert_eq!(pending.phase, Phase::Probing);
+            assert!(release_with(&io, &store, pending).await.is_err());
+            assert_eq!(*io.calls.lock().unwrap(), ["Set-without-id", "reporting:9"]);
         }
     }
 

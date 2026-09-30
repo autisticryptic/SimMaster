@@ -68,6 +68,17 @@ class ProfileProbeTests(unittest.TestCase):
         self.assertNotIn("MmBus::new", pinned)
         self.assertNotIn("pin_sim_binding", pinned)
 
+    def test_probe_reporting_is_pinned_and_uncertain_arming_keeps_ledger(self):
+        text = (QCM / "primary_ims_profile_lease.rs").read_text(encoding="utf-8")
+        probe = between(text, "async fn probe_with<", "pub(crate) struct VerifiedProfileProbe")
+        self.assertLess(probe.index("store.save(&receipt)?"), probe.index("io.restore_reporting(id, [1, 1, 1])"))
+        self.assertLess(probe.index("io.restore_reporting(id, [1, 1, 1])"), probe.index("let result = probe("))
+        release = between(text, "async fn release_with<", "fn definition_snapshot")
+        self.assertIn("Phase::Creating | Phase::Probing", release)
+        live = LIVE.read_text(encoding="utf-8")
+        branch = between(live, "let pcscf_reporting_cid = if reporting_prepared_by_probe", "} else if let Some(profile)")
+        self.assertNotIn("set_pcscf_reporting", branch)
+
     def test_probe_durable_cleanup_and_namespace_gate_precede_release(self):
         text = (QCM / "primary_ims_profile_lease.rs").read_text(encoding="utf-8")
         drain = between(text, "pub(crate) async fn drain_bearers", "impl crate::hardware::devices::transport")

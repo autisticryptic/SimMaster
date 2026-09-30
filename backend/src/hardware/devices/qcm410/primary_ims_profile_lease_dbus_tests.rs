@@ -131,6 +131,11 @@ impl FakeModem {
                 })
                 .collect::<Vec<_>>()
                 .join("\n")),
+            "AT$QCPDPIMSCFGE=9,1,1,1" => {
+                s.reporting = [1, 1, 1];
+                s.calls.push("arm-reporting".into());
+                Ok("OK".into())
+            }
             "AT$QCPDPIMSCFGE=9,0,0,0" => {
                 s.reporting = [0, 0, 0];
                 s.calls.push("restore-reporting".into());
@@ -272,6 +277,34 @@ async fn temporary_profile_private_bus_uses_indexless_set_and_exact_owned_delete
         ["Set-new", "restore-reporting", "Delete-owned"]
     );
     assert!(store.0.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn profile_probe_private_bus_arms_reporting_before_dispatch_and_restores_on_release() {
+    let (_server, fake, io) = server().await;
+    let store = MemoryStore::default();
+    let before = io.snapshot().await.unwrap();
+    let token = fingerprint(&("ims", 1_u32, &before)).unwrap();
+    let receipt = acquire_with(&io, &store, "ims", 1, &token).await.unwrap();
+    let token = fingerprint(&("ims", 1_u32, io.snapshot().await.unwrap())).unwrap();
+    probe_with(&io, &store, receipt, "ims", 1, Some(&token), |_| {
+        assert_eq!(fake.0.lock().unwrap().reporting, [1, 1, 1]);
+        std::future::ready(Ok(serde_json::json!({"registered": false})))
+    })
+    .await
+    .unwrap();
+    let receipt = store.0.lock().unwrap().clone().unwrap();
+    release_with(&io, &store, receipt).await.unwrap();
+    assert_eq!(io.snapshot().await.unwrap(), before);
+    assert_eq!(
+        *fake.0.lock().unwrap().calls,
+        [
+            "Set-new",
+            "arm-reporting",
+            "restore-reporting",
+            "Delete-owned"
+        ]
+    );
 }
 
 #[tokio::test]
