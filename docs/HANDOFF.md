@@ -7,7 +7,15 @@
 
 已重新核对六份交接、Git、GitHub Actions、旧抓包脚本与实际调用链。**`a269e9d6f7c5b359e142ae7734598c009f091914` 已完成代码、两套 CI / 双架构制品核验，并于06:00 UTC成功部署；路由补全已实测，IMS仍未注册。**
 
-**最新用户指示：用户已确认联网与设备恢复并要求继续；随后要求先只读查看当前目录数据库的IMS连接配置。设备临时IP为 `192.168.68.1`，沿用户明确批准的 `usb0` 管理链路。当前优先事项为数据库字段对照，不自行安装库或改变profile。**
+**最新用户指示：用户已确认联网与设备恢复并要求继续；随后要求先只读查看当前目录数据库的IMS连接配置。设备临时IP为 `192.168.68.1`，沿用户明确批准的 `usb0` 管理链路。数据库只读对照已完成，用户已要求继续修复。当前优先修正有证据的旧ownership清理阻断，不盲改全局派生参数或安装库。**
+
+### 后续修复进行中：旧对象清理阻断（尚待新CI/部署）
+
+- 06:23 UTC只读复核仍运行a269e9d/PID3002，MM598/secondary353未变，管理usb0、DB正常、无通话/启用任务。IMS exhausted，错误引用Modem/0，当前为Modem/1；1条receipt保留。
+- 代码追踪纠正“新连接缓存旧modem路径”的猜测：QCM410 transport是无字段provider，新连接会重读绑定；真正失败在Create前的`recover_owned()`，它先重试旧`OwnedLease.bus`上的清理RPC。旧owner仍存在使该检查通过，但旧modem与bearer已消失，UnknownMethod导致永远无法结案。
+- 已只读看到旧modem/bearer均不存在，wwan2已回主机且地址为0、原namespace无wwan2。现补充程序化保守验证：原owner ObjectManager确认双对象缺失→只读验证原网口/地址/源路由/私有规则/namespace无残留→再次确认对象缺失，才结案。未知/失败/owner变更仍阻断；不删除预算或其他资源、不把UnknownMethod直接当owner丢失。
+- 此补强及Rust/mock/private-D-Bus回归已写，本地213 Python与定向格式/diff通过，**尚待新SHA Actions验证，尚未部署**。当前实机仍a269e9d，首次REGISTER无响应尚不能归因于这个后续清理缺陷。
+- 另已读取ModemManager1.24.0公开源码：qcom-soc按`dev_port`选择A2_MUX_RMNET0…7，并执行WDS Bind Data Port。实机wwan2 dev_port2与该映射一致，尚无实际QMI应答逐消息证明错误，不擅自改用其他通道。
 
 ### 第二次部署成功与实测结果（优先于下方中断记录）
 

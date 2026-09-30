@@ -722,6 +722,15 @@ pub(super) async fn teardown_verified(
     config: &NetdevConfig,
 ) -> Result<(), String> {
     deconfigure(interface, config).await;
+    verify_teardown_readonly(interface, config).await
+}
+
+/// Verify previously completed cleanup without touching a possibly reassigned
+/// interface. Retired MM objects are not permission to replay old mutations.
+pub(super) async fn verify_teardown_readonly(
+    interface: &str,
+    config: &NetdevConfig,
+) -> Result<(), String> {
     timeout(Duration::from_secs(10), async {
         let family = if config.address.is_ipv4() { "-4" } else { "-6" };
         // Do not family-filter this query: `ip -4 address show dev IF` can
@@ -802,6 +811,17 @@ fn verify_teardown(
         };
         if actual_table == table {
             return Err("qca410_primary_ims_cleanup_routes_remaining".to_string());
+        }
+        // Worker host routes use main rather than our legacy private table.
+        // Moving the netdev normally removes them; verify instead of assuming.
+        for key in ["src", "prefsrc"] {
+            if let Some(source) = route.get(key) {
+                let source = source.as_str().ok_or_else(invalid)?;
+                let source: IpAddr = source.parse().map_err(|_| invalid())?;
+                if source == config.address {
+                    return Err("qca410_primary_ims_cleanup_routes_remaining".to_string());
+                }
+            }
         }
     }
     let priority = u64::from(rule_priority(
@@ -968,6 +988,32 @@ async fn run_ip_child(mut child: Child, deadline: Duration) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_network_verification_rejects_main_table_routes_with_old_source() {
+        let config = NetdevConfig {
+            address: "192.0.2.2".parse().unwrap(),
+            prefix: 30,
+            mtu: None,
+            probe_target: None,
+        };
+        let links = serde_json::json!([{"ifname":"wwan2","addr_info":[]}]);
+        let empty = serde_json::json!([]);
+        verify_teardown("wwan2", &config, &links, &empty, &empty).unwrap();
+        for key in ["src", "prefsrc"] {
+            let mut route = serde_json::json!({"dst":"192.0.2.10","dev":"wwan2","table":254});
+            route[key] = "192.0.2.2".into();
+            assert!(verify_teardown(
+                "wwan2",
+                &config,
+                &links,
+                &serde_json::json!([route]),
+                &empty
+            )
+            .is_err());
+        }
+    }
+
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[cfg(unix)]

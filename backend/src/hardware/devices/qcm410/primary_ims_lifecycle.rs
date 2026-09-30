@@ -54,6 +54,8 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
+type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
+
 type LeaseKey = (String, String, String);
 type Leases = BTreeMap<LeaseKey, Arc<OwnedLease>>;
 static LEASES: OnceLock<Mutex<Leases>> = OnceLock::new();
@@ -658,6 +660,31 @@ impl MmBus {
         .await
     }
 
+    /// UnknownMethod alone does not prove disappearance. Ask ObjectManager on
+    /// the retained unique owner and require both recorded objects to be gone.
+    async fn recorded_objects_retired(&self, record: &LeaseRecord) -> Result<bool, String> {
+        if !same_generation(record, &self.bus_id, &self.owner) || !self.owner_is_current().await? {
+            return Err("qca410_primary_mm_retirement_owner_changed".into());
+        }
+        let objects: ManagedObjects = timed(10, async {
+            self.proxy(
+                "/org/freedesktop/ModemManager1",
+                "org.freedesktop.DBus.ObjectManager",
+            )
+            .await?
+            .call("GetManagedObjects", &())
+            .await
+            .map_err(bus_error)
+        })
+        .await?;
+        if !self.owner_is_current().await? {
+            return Err("qca410_primary_mm_retirement_owner_changed".into());
+        }
+        Ok(!objects
+            .keys()
+            .any(|path| path.as_str() == record.modem || path.as_str() == record.bearer))
+    }
+
     async fn may_clean_interface(&self, own_bearer: &str) -> Result<bool, String> {
         for other in self.bearers().await? {
             if other == own_bearer {
@@ -1065,12 +1092,37 @@ impl OwnedLease {
         match self.bus.delete(&record.bearer).await {
             Ok(()) => {}
             Err(error) if error == OWNER_MISSING => {}
-            Err(error) => return Err(error),
+            Err(error) => return self.finish_failed_cleanup(&record, error).await,
         }
         if let Some(error) = network_error {
-            return Err(error); // Keep the ledger so recovery can finish the link cleanup.
+            return self.finish_failed_cleanup(&record, error).await;
         }
         self.forget(&record)
+    }
+
+    async fn finish_failed_cleanup(
+        &self,
+        record: &LeaseRecord,
+        original: String,
+    ) -> Result<(), String> {
+        // This is only an observation-based completion of an old lease, never
+        // a cleanup redirected to a replacement modem or an unknown resource.
+        let verified = retired_cleanup_verified_with(
+            || self.bus.recorded_objects_retired(record),
+            || verify_retired_network_readonly(record),
+        )
+        .await;
+        match verified {
+            Ok(true) => {
+                self.forget(record)?;
+                tracing::info!("Retired old MM IMS ownership record after object and network absence verification");
+                Ok(())
+            }
+            Ok(false) => Err(original),
+            Err(verification) => Err(format!(
+                "{original}; retired_cleanup_unverified:{verification}"
+            )),
+        }
     }
 
     fn forget(&self, record: &LeaseRecord) -> Result<(), String> {
@@ -1079,6 +1131,147 @@ impl OwnedLease {
         leases().lock().unwrap().remove(&record.key());
         Ok(())
     }
+}
+
+/// Both observations are pinned to the original owner; an object returning or
+/// owner change while network absence is checked invalidates the completion.
+async fn retired_cleanup_verified_with<O, OFut, N, NFut>(
+    mut objects_retired: O,
+    network_absent: N,
+) -> Result<bool, String>
+where
+    O: FnMut() -> OFut,
+    OFut: Future<Output = Result<bool, String>>,
+    N: FnOnce() -> NFut,
+    NFut: Future<Output = Result<(), String>>,
+{
+    if !objects_retired().await? {
+        return Ok(false);
+    }
+    network_absent().await?;
+    if !objects_retired().await? {
+        return Err("qca410_primary_mm_retired_object_reappeared".into());
+    }
+    Ok(true)
+}
+
+async fn verify_retired_network_readonly(record: &LeaseRecord) -> Result<(), String> {
+    if record.namespace.is_none() && record.networks().next().is_none() {
+        return Ok(());
+    }
+    // The original physical netdev must already be back on the host. Merely
+    // finding a same-named link, or losing the namespace, is not sufficient.
+    netdev::verify_mm_data_interface(&record.device, &record.interface)?;
+    for network in record.networks() {
+        netdev::verify_teardown_readonly(&record.interface, network).await?;
+    }
+    if let Some(name) = &record.namespace {
+        let namespace = NetnsName::adopt(name).map_err(|e| e.to_string())?;
+        match fs::symlink_metadata(Path::new("/run/netns").join(namespace.as_str())) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("qca410_primary_mm_retired_namespace_unverified".into()),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("qca410_primary_mm_retired_namespace_unverified".into())
+            }
+            Ok(_) => {}
+        }
+        let read = |args: Vec<&'static str>| async move {
+            let output = tokio::process::Command::new("ip")
+                .args(["netns", "exec", name, "ip"])
+                .args(args)
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|_| "qca410_primary_mm_retired_namespace_unverified".to_string())?;
+            if !output.status.success() || output.stdout.len() > 256 * 1024 {
+                return Err("qca410_primary_mm_retired_namespace_unverified".into());
+            }
+            serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .map_err(|_| "qca410_primary_mm_retired_namespace_unverified".into())
+        };
+        timed(10, async {
+            let addresses = read(vec!["-j", "address", "show"]).await?;
+            for family in ["-4", "-6"] {
+                let routes =
+                    read(vec!["-j", "-N", family, "route", "show", "table", "all"]).await?;
+                let rules = read(vec!["-j", "-N", family, "rule", "show"]).await?;
+                verify_retired_namespace_snapshot(record, &addresses, &routes, &rules)?;
+            }
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+fn verify_retired_namespace_snapshot(
+    record: &LeaseRecord,
+    addresses: &serde_json::Value,
+    routes: &serde_json::Value,
+    rules: &serde_json::Value,
+) -> Result<(), String> {
+    let invalid = || "qca410_primary_mm_retired_namespace_unverified".to_string();
+    let remaining = || "qca410_primary_mm_retired_namespace_state_remaining".to_string();
+    for link in addresses.as_array().ok_or_else(invalid)? {
+        let interface = link
+            .get("ifname")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid)?;
+        if interface == record.interface {
+            return Err(remaining());
+        }
+        for address in link
+            .get("addr_info")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(invalid)?
+        {
+            let local = address
+                .get("local")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            let local: std::net::IpAddr = local.parse().map_err(|_| invalid())?;
+            if record.networks().any(|network| network.address == local) {
+                return Err(remaining());
+            }
+        }
+    }
+    for route in routes.as_array().ok_or_else(invalid)? {
+        route
+            .get("dst")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid)?;
+        if route.get("dev").and_then(serde_json::Value::as_str) == Some(record.interface.as_str()) {
+            return Err(remaining());
+        }
+        for key in ["src", "prefsrc"] {
+            if let Some(source) = route.get(key) {
+                let source: std::net::IpAddr = source
+                    .as_str()
+                    .ok_or_else(invalid)?
+                    .parse()
+                    .map_err(|_| invalid())?;
+                if record.networks().any(|network| network.address == source) {
+                    return Err(remaining());
+                }
+            }
+        }
+    }
+    // The IMS worker installs host routes, not policy rules. Unknown rules are
+    // conservatively retained for review instead of guessed away.
+    for rule in rules.as_array().ok_or_else(invalid)? {
+        let priority = rule
+            .get("priority")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(invalid)?;
+        let table = rule
+            .get("table")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(invalid)?;
+        if !matches!((priority, table), (0, 255) | (32766, 254) | (32767, 253)) {
+            return Err(remaining());
+        }
+    }
+    Ok(())
 }
 
 /// Losing the bearer owner proves only that it cannot be addressed anymore.
@@ -1532,6 +1725,88 @@ mod ip_config_dbus_tests {
 
     async fn server(disconnect_during_read: bool) -> Connection {
         probe_server(disconnect_during_read, "").await.0
+    }
+
+    #[tokio::test]
+    async fn retired_objects_require_both_paths_absent_on_the_same_mm_owner() {
+        let server = server(false).await;
+        server
+            .object_server()
+            .at("/org/freedesktop/ModemManager1", zbus::fdo::ObjectManager)
+            .await
+            .unwrap();
+        let bus = MmBus::new(
+            "/dev/wwan0qmi0",
+            "/org/freedesktop/ModemManager1/Modem/0",
+            "wwan0",
+        )
+        .await
+        .unwrap();
+        let mut record = super::tests::record();
+        record.bus_id = bus.bus_id.clone();
+        record.owner = bus.owner.clone();
+        record.bearer = PATH.to_string();
+        assert!(!bus.recorded_objects_retired(&record).await.unwrap());
+        server
+            .object_server()
+            .remove::<FakeModem, _>(record.modem.as_str())
+            .await
+            .unwrap();
+        assert!(
+            !bus.recorded_objects_retired(&record).await.unwrap(),
+            "a remaining bearer still owns resources"
+        );
+        server
+            .object_server()
+            .remove::<FakeBearer, _>(PATH)
+            .await
+            .unwrap();
+        assert!(bus.recorded_objects_retired(&record).await.unwrap());
+        // Same daemon publishes a replacement modem. No old method or deletion
+        // is sent to it; the existing fresh-bus constructor accepts its path.
+        let replacement = "/org/freedesktop/ModemManager1/Modem/1";
+        server
+            .object_server()
+            .at(
+                replacement,
+                FakeModem {
+                    sim_changed: Arc::new(AtomicBool::new(false)),
+                    connected: Arc::new(AtomicBool::new(false)),
+                    profile_id: Arc::new(std::sync::atomic::AtomicI32::new(2)),
+                    changed_ip: Arc::new(AtomicBool::new(false)),
+                    commands: Arc::new(Mutex::new(Vec::new())),
+                    action: "",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(bus.recorded_objects_retired(&record).await.unwrap());
+        let fresh = MmBus::new(&record.device, replacement, &record.interface)
+            .await
+            .unwrap();
+        assert_eq!(fresh.owner, bus.owner);
+        assert_eq!(fresh.modem, replacement);
+        record.owner = ":1.999999".into();
+        assert!(bus.recorded_objects_retired(&record).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn retired_objects_cannot_be_inferred_from_unknown_method() {
+        let _server = server(false).await;
+        let bus = MmBus::new(
+            "/dev/wwan0qmi0",
+            "/org/freedesktop/ModemManager1/Modem/99",
+            "wwan0",
+        )
+        .await
+        .unwrap();
+        let mut record = super::tests::record();
+        record.bus_id = bus.bus_id.clone();
+        record.owner = bus.owner.clone();
+        record.modem = bus.modem.clone();
+        // No ObjectManager at this root: missing/unsupported inventory must
+        // fail closed, not interpret UnknownMethod text as an empty snapshot.
+        assert!(bus.recorded_objects_retired(&record).await.is_err());
     }
 
     async fn probe_server(
@@ -2208,6 +2483,128 @@ mod tests {
             namespace: Some("sa-ue0123456789ab".to_string()),
             network: None,
             additional_networks: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_cleanup_requires_two_object_snapshots_around_network_verification() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let verified = retired_cleanup_verified_with(
+            || {
+                events.borrow_mut().push("objects");
+                std::future::ready(Ok(true))
+            },
+            || {
+                events.borrow_mut().push("network");
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(verified);
+        assert_eq!(*events.borrow(), ["objects", "network", "objects"]);
+    }
+
+    #[tokio::test]
+    async fn retired_cleanup_does_not_skip_live_objects_or_failed_observations() {
+        for observed in [Ok(false), Err("object_inventory_failed".to_string())] {
+            let result = retired_cleanup_verified_with(
+                || std::future::ready(observed.clone()),
+                || {
+                    panic!("network check must not run without confirmed retirement");
+                    #[allow(unreachable_code)]
+                    std::future::ready(Ok(()))
+                },
+            )
+            .await;
+            assert!(!matches!(result, Ok(true)));
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_cleanup_keeps_receipt_when_network_remains_or_object_returns() {
+        let mut count = 0;
+        let result = retired_cleanup_verified_with(
+            || {
+                count += 1;
+                std::future::ready(Ok(true))
+            },
+            || std::future::ready(Err("network_remaining".into())),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "network_remaining");
+        assert_eq!(count, 1);
+        let mut count = 0;
+        let result = retired_cleanup_verified_with(
+            || {
+                count += 1;
+                std::future::ready(Ok(count == 1))
+            },
+            || std::future::ready(Ok(())),
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            "qca410_primary_mm_retired_object_reappeared"
+        );
+        let mut count = 0;
+        assert!(retired_cleanup_verified_with(
+            || {
+                count += 1;
+                std::future::ready(if count == 1 {
+                    Ok(true)
+                } else {
+                    Err("owner_changed".into())
+                })
+            },
+            || std::future::ready(Ok(())),
+        )
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn retired_namespace_requires_no_original_interface_address_route_or_unknown_rule() {
+        let mut record = record();
+        record.network = Some(NetdevConfig {
+            address: "192.0.2.2".parse().unwrap(),
+            prefix: 30,
+            mtu: None,
+            probe_target: None,
+        });
+        let links =
+            serde_json::json!([{"ifname":"veth-test","addr_info":[{"local":"198.51.100.2"}]}]);
+        let routes =
+            serde_json::json!([{"dst":"default","dev":"veth-test","gateway":"198.51.100.1"}]);
+        let rules = serde_json::json!([{"priority":0,"table":255},{"priority":32766,"table":254},{"priority":32767,"table":253}]);
+        verify_retired_namespace_snapshot(&record, &links, &routes, &rules).unwrap();
+        for bad_links in [
+            serde_json::json!([{"ifname":"wwan0","addr_info":[]}]),
+            serde_json::json!([{"ifname":"other","addr_info":[{"local":"192.0.2.2"}]}]),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                verify_retired_namespace_snapshot(&record, &bad_links, &routes, &rules).is_err()
+            );
+        }
+        for bad_routes in [
+            serde_json::json!([{"dev":"wwan0"}]),
+            serde_json::json!([{"dev":"other","prefsrc":"192.0.2.2"}]),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                verify_retired_namespace_snapshot(&record, &links, &bad_routes, &rules).is_err()
+            );
+        }
+        for bad_rules in [
+            serde_json::json!([{"priority":123,"table":500}]),
+            serde_json::json!([{"priority":0,"table":500}]),
+            serde_json::json!([{}]),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                verify_retired_namespace_snapshot(&record, &links, &routes, &bad_rules).is_err()
+            );
         }
     }
 

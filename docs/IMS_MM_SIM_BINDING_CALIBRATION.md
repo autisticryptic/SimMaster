@@ -51,6 +51,8 @@ P-CSCF 发布仍严格检查 bearer/profile、实际 APN、IP grant、唯一接�
 - MM 正常停止和失败只让 retained provider 处理自己的网络、命名空间和 bearer；不执行通用选择器清理。
 - owner 消失或另一 bearer 占用接口时，不据此认定网络已释放。带 network/namespace 的原 receipt 保留，
   后续恢复保持阻断，需要独立人工核验；无网络变更的纯旧 bearer receipt 才可在 owner 消失后遗忘。
+- **同一 MM owner 下的 modem/bearer 对象换代**：新连接前的 `recover_owned` 可能被旧 lease 的清理 RPC 阻断，并非新连接缓存了旧ModemBinding。旧对象清理失败后，只向原 unique owner 的 ObjectManager 查询，要求旧 modem 与 bearer 同时不存在；只读确认原物理网口已在主机、旧地址/源路由/私有表规则与原namespace状态均已消失，然后再次核对对象缺失，才结案自有receipt。
+  不把`UnknownMethod`字符串直接等同对象消失，不向新modem重放旧清理，不因owner变化/观测失败/状态残留丢弃记录。此路径不改profile/地址族兜底或恢复预算；验证状态见HANDOFF。
 - Create 前保存 `.create` intent；对外等待有界，但已派发的 Create 在受保护任务中继续接收结果，晚到对象仍须清理。
   已知新对象的 lease 保存及 Delete 都失败、RPC 结果不明或进程在交接前退出时，intent 留存并阻止再次分配。
   不自动猜测未知对象的所有权、不向新 MM owner 重放清理；这不是未知孤儿资源自动恢复。
