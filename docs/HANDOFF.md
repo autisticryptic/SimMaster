@@ -5,16 +5,35 @@
 
 ## 路由补全续接：2026-09-30（本节优先）
 
-已重新核对六份交接、Git、GitHub Actions、旧抓包脚本与实际调用链。**`a269e9d6f7c5b359e142ae7734598c009f091914` 已完成代码、两套 CI / 双架构制品核验，并于06:00 UTC成功部署；路由补全已实测，IMS仍未注册。**
+已重新核对六份交接、Git、GitHub Actions、旧抓包脚本与实际调用链。**当前已部署 `cf13a666c59d1194401bf4d4229f820ac55f448d / PID3365`，包含a269e9d路由补全及后继旧对象清理修复；两套CI/双架构、部署、路由补全和旧receipt自动结案均已验证，IMS仍未注册。**
 
-**最新用户指示：用户已确认联网与设备恢复并要求继续；随后要求先只读查看当前目录数据库的IMS连接配置。设备临时IP为 `192.168.68.1`，沿用户明确批准的 `usb0` 管理链路。数据库只读对照已完成，用户已要求继续修复。当前优先修正有证据的旧ownership清理阻断，不盲改全局派生参数或安装库。**
+**最新进展：用户确认意外掉线已恢复，08:15 UTC重连成功，08:19 UTC部署cf13a66成功，08:28 UTC安装校验通过。** 设备仍为临时IP `192.168.68.1`，沿用户明确批准的usb0管理链路；未改USB模式/主机网络，不清预算、不重启MM/secondary、不拨号。下面07:14连接失败是已恢复的历史，不再阻塞部署。
 
-### 后续修复进行中：旧对象清理阻断（尚待新CI/部署）
+### cf13a66 最新实机验收与下一步
+
+- 08:15重连看到旧a269e9d/PID489，MM587/secondary346，数据库ok、无通话/启用任务。PID变化发生在重连前，非agent操作。1条旧receipt由安装器只读证明对象和网络已消失，**安装器未删除它**。
+- 08:19:03 UTC新程序cf13a66/PID3365运行，二进制SHA-256 `786c35352d4832aae291ec7dd3096a4493c30a8dbcba71ab125c1f6615b64847`匹配已验证ARM64；复制窗口config.yaml/data.db哈希未变，无备份，MM587/secondary346未重启，timer恢复active，预算目录未被清除。
+- **旧对象清理修复已实机通过**：新程序自行结案旧记录；之后一次IMS承载结束/Modem再次换代时，日志再次出现`Retired old MM IMS ownership record after object and network absence verification`，校准后成功在Modem/2创建Bearer/8。新连接不再被旧Modem路径的receipt永久堵住；原owner/SIM/网络安全边界保留。
+- **IMS注册仍未成功**：受控只读观察窗口内，两条动态P-CSCF路由均预装，UE抓包44个wwan2 Out UDP5060、0个入向；初始REGISTER和强制sec-agree候选均无完整响应/AKA轮数0，MM约120秒后结束IMS承载，仍记录tx1312/rx0。没有触发POST retry或修改库/profile。
+- 08:28:32 UTC再次核验：PID3365/运行hash仍匹配，前端MD5 `01505b0195870511cc8428e1d730b53c`与制品一致，DB quick_check=ok，MM587/secondary346、timer active。
+  证据`.local/evidence/ims-route-completion/cf13a66/{deployment-second,registration-observation,installed-verified}.json`；不要用a269e9d旧采样代替此轮。
+- **下一步先厘清成功对照的接入类型**：已询问手机成功是否在同50212漫游下关闭Wi-Fi的蜂窝IMS，还是Wi-Fi通话，尚待回复。不能凭标准域名/库ready断言运营商必然接受LTE；不能用VoWiFi ePDG当蜂窝P-CSCF。实际QMI绑定仍缺逐消息证据，设备无strace；未为采证安装工具、修改MM日志级别或发direct-QMI绑定命令。
+- 本地Bash已恢复，213 Python/文档检查重跑通过。最终目标“当前eSIM像手机一样注册”仍未完成；真实换卡/故障注入、长通话续期、Pixel受控A/B、MM网口移回导致重新探测等长期项仍保持未验收。
+
+### 后续旧对象清理补强：代码/CI及部署已完成（下列连接失败为历史）
 
 - 06:23 UTC只读复核仍运行a269e9d/PID3002，MM598/secondary353未变，管理usb0、DB正常、无通话/启用任务。IMS exhausted，错误引用Modem/0，当前为Modem/1；1条receipt保留。
 - 代码追踪纠正“新连接缓存旧modem路径”的猜测：QCM410 transport是无字段provider，新连接会重读绑定；真正失败在Create前的`recover_owned()`，它先重试旧`OwnedLease.bus`上的清理RPC。旧owner仍存在使该检查通过，但旧modem与bearer已消失，UnknownMethod导致永远无法结案。
 - 已只读看到旧modem/bearer均不存在，wwan2已回主机且地址为0、原namespace无wwan2。现补充程序化保守验证：原owner ObjectManager确认双对象缺失→只读验证原网口/地址/源路由/私有规则/namespace无残留→再次确认对象缺失，才结案。未知/失败/owner变更仍阻断；不删除预算或其他资源、不把UnknownMethod直接当owner丢失。
-- 此补强及Rust/mock/private-D-Bus回归已写，本地213 Python与定向格式/diff通过，**尚待新SHA Actions验证，尚未部署**。当前实机仍a269e9d，首次REGISTER无响应尚不能归因于这个后续清理缺陷。
+- **最终候选 `cf13a666c59d1194401bf4d4229f820ac55f448d` 已推送并验证**。213 Python、定向格式/diff通过；Validate [`36680824631`](https://github.com/autisticryptic/SimMaster/actions/runs/36680824631) / Rust job109775661618、Build [`36680824551`](https://github.com/autisticryptic/SimMaster/actions/runs/36680824551) / Rust job109776078962、两架构全部success，Publish skipped。
+  下载两套日志逐项核实**27个累计新增/更新回归名（前轮20+本轮7）及8兼容检查**均ok，包括实际private-D-Bus双对象消失/UnknownMethod不能推断为空、网络残留/对象回归/owner变化保护。
+- 初版39baf20两套CI编译失败E0283，已在6f7b190显式指定String错误类型修复；随后根据实机`ip -j -N rule`仍将table编码为数字字符串的事实补回归，最终为cf13a66。失败annotations/记录保留，不以早期SHA代替最终候选。
+- 两包已实际下载核验官方artifact digest、`1.1.5/cf13a66`、ELF与程序/前端摘要：ARM64 artifact11081323457，包SHA-256 `60647bc441d390f8b808096aa7f35d42712360ba8416b5c0d7814cf40cf6a46a`，程序SHA-256 `786c35352d4832aae291ec7dd3096a4493c30a8dbcba71ab125c1f6615b64847`；AMD64 artifact11081328485，包SHA-256 `aa08fd9afb625a7455386f24fc0ef0ec07869ba6c2c577992a524e782c42da17`。
+  证明`.local/evidence/ims-route-completion/cf13a66/verified.json`；首次下载途中DNS临时失败，重试后全部核验通过，旧Release/tag未动。
+- 部署前已只读独立证明旧receipt的原owner/双对象缺失和主机/namespace网络无残留，**未删除receipt**。后继安装脚本只允许保留这种已验证记录给新程序再次核验并结案，不跳过未知资源检查。设备busctl对嵌套MM变体JSON输出报`Failed to create new json object`，这是工具编码错误，已改用完整typed输出保守核验，不当成空对象。
+- **07:14:37 UTC后继部署未执行**：SSH连接TimeoutError，记录只有`phase=preflight`，未登录/上传/停服/改文件；Windows当前无192.168.68.*地址，访问192.168.68.1走WLAN默认网关。已询问用户确认设备/RNDIS或新IP，停止重复连接。
+  已审阅的后继脚本`.local/active/lan/deploy_retired_lease_candidate.py`；连接恢复后仍须重新核对实际运行hash/SIM/服务/通话/任务/管理链路/receipt，不能直接重放。
+- **首次REGISTER无响应仍未解决**，不能归因于这个后续清理缺陷，也不盲套7200秒/required配置。已询问用户：手机成功是否在关闭Wi-Fi、同样50212漫游下走蜂窝IMS，还是VoWiFi；尚待确认。
 - 另已读取ModemManager1.24.0公开源码：qcom-soc按`dev_port`选择A2_MUX_RMNET0…7，并执行WDS Bind Data Port。实机wwan2 dev_port2与该映射一致，尚无实际QMI应答逐消息证明错误，不擅自改用其他通道。
 
 ### 第二次部署成功与实测结果（优先于下方中断记录）
