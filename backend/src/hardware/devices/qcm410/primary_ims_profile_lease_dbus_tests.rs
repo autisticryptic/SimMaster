@@ -54,7 +54,8 @@ impl Fake {
         s.name = <&str>::try_from(&requested["profile-name"])
             .unwrap()
             .to_string();
-        assert!(s.name.starts_with("simadmin-ims-probe-"));
+        assert_eq!(s.name.len(), 16);
+        assert!(s.name.starts_with("sa"));
         s.created = true;
         s.calls.push("Set-new".into());
         let mut result = properties(9, 1, "ims");

@@ -46,6 +46,7 @@ struct Snapshot {
 #[serde(rename_all = "snake_case")]
 enum Phase {
     Creating,
+    Rejected,
     Owned,
     RestoringReporting,
     Deleting,
@@ -124,6 +125,33 @@ fn validate_request(apn: &str, family: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn profile_tag() -> Result<String, String> {
+    use ring::rand::SecureRandom;
+    // A diagnostic tag is not subscriber identity. Keep it to 16 ASCII bytes
+    // for older profile-name implementations; do not send a 44-byte timestamp.
+    let mut random = [0_u8; 7];
+    ring::rand::SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| ERROR)?;
+    Ok(format!(
+        "sa{}",
+        random
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ))
+}
+
+fn explicit_create_rejection(error: &str) -> bool {
+    // Match only the completed Create Profile's parameter rejection, not a
+    // timeout, owner loss, readback failure, or generic UnknownMethod. A
+    // rejection is retained until an explicit release verifies no changes.
+    error.starts_with(
+        "qca410_primary_mm_dbus_failed:org.freedesktop.ModemManager1.Error.Core.Failed:",
+    ) && error.contains("Couldn't create profile: DS profile error: invalid-parameter-length:")
+        && error.contains("QMI protocol error (81): 'ExtendedInternal'")
+}
+
 fn same_binding(before: &Snapshot, after: &Snapshot) -> bool {
     before.bus_id == after.bus_id
         && before.owner == after.owner
@@ -200,19 +228,20 @@ async fn acquire_with<I: ProfileIo, S: Store>(
         before,
         requested_family: family,
         apn: apn.into(),
-        tag: format!(
-            "simadmin-ims-probe-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| ERROR)?
-                .as_nanos()
-        ),
+        tag: profile_tag()?,
         owned: None,
         owned_definition: None,
     };
     store.save(&receipt)?; // durable intent BEFORE dispatch, including timeout/cancellation
-    let owned = io.create(apn, family, &receipt.tag).await?;
+    let owned = match io.create(apn, family, &receipt.tag).await {
+        Ok(owned) => owned,
+        Err(error) if explicit_create_rejection(&error) => {
+            receipt.phase = Phase::Rejected;
+            store.save(&receipt)?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     receipt.owned = Some(owned.clone());
     store.save(&receipt)?; // known returned ID never lost, even if validation fails
     let after = io.snapshot().await?;
@@ -246,7 +275,9 @@ async fn release_with<I: ProfileIo, S: Store>(
         return Err("mm_ims_profile_lease_creation_unresolved".into());
     }
     let snapshot = io.snapshot().await?;
-    if receipt.phase == Phase::Deleting {
+    if receipt.phase == Phase::Deleting || receipt.phase == Phase::Rejected {
+        // Rejected Create has no known allocated object. Only close its intent
+        // if complete original state is observed twice; never issue a Delete.
         // An uncertain Delete is never repeated. Only confirm an already
         // completed deletion after the exact original state has returned.
         if snapshot == receipt.before && io.snapshot().await? == snapshot {
@@ -801,6 +832,9 @@ mod tests {
             if self.behavior.load(Ordering::SeqCst) == 1 {
                 return Err("uncertain-set".into());
             }
+            if self.behavior.load(Ordering::SeqCst) == 11 {
+                return Err("qca410_primary_mm_dbus_failed:org.freedesktop.ModemManager1.Error.Core.Failed: Couldn't create profile: DS profile error: invalid-parameter-length: QMI protocol error (81): 'ExtendedInternal'".into());
+            }
             if self.behavior.load(Ordering::SeqCst) == 2 {
                 std::future::pending::<()>().await;
             }
@@ -865,6 +899,42 @@ mod tests {
         acquire_with(io, store, "ims", family, &token)
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn temporary_profile_tag_is_short_ascii_and_rejection_is_narrow() {
+        let tag = profile_tag().unwrap();
+        assert_eq!(tag.len(), 16);
+        assert!(tag.bytes().all(|b| b.is_ascii_alphanumeric()));
+        let rejected = "qca410_primary_mm_dbus_failed:org.freedesktop.ModemManager1.Error.Core.Failed: Unhandled QMI protocol error (81): Couldn't create profile: DS profile error: invalid-parameter-length: QMI protocol error (81): 'ExtendedInternal'";
+        assert!(explicit_create_rejection(rejected));
+        for error in [
+            "timeout",
+            "unknownmethod",
+            "invalid-parameter-length",
+            "Couldn't read back profile",
+            "owner_missing",
+        ] {
+            assert!(!explicit_create_rejection(error));
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_profile_rejected_intent_is_only_closed_after_original_state_verification() {
+        let io = FakeIo::new(9);
+        let store = MemoryStore::default();
+        io.behavior.store(11, Ordering::SeqCst);
+        let token = fingerprint(&("ims", 1_u32, baseline())).unwrap();
+        assert!(acquire_with(&io, &store, "ims", 1, &token).await.is_err());
+        let receipt = store.saved.lock().unwrap().clone().unwrap();
+        assert_eq!(receipt.phase, Phase::Rejected);
+        assert!(receipt.owned.is_none());
+        io.state.lock().unwrap().eps_fingerprint = "changed".into();
+        assert!(release_with(&io, &store, receipt.clone()).await.is_err());
+        *io.state.lock().unwrap() = baseline();
+        release_with(&io, &store, receipt).await.unwrap();
+        assert_eq!(*io.calls.lock().unwrap(), ["Set-without-id"]);
+        assert!(store.saved.lock().unwrap().is_none());
     }
 
     #[tokio::test]
