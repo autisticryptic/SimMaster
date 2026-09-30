@@ -3,11 +3,11 @@
 > 更新：2026-09-30。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 当前已部署：正式主服务 IMS IPsec 注册成功（2026-09-30 19:14 UTC核验）
+## 当前已部署：正式主服务 IMS IPsec 注册成功（2026-09-30 19:22 UTC核验）
 
 **已按用户新授权完成生产注册修复与部署：正式程序为 `1.1.5 / 48e269ca8b536ef7ba82ed98b58d3623540f0547`，PID119010，主服务运行中，不是维护探针。** 本节优先于下方旧安装cf13a66、主服务停止或“候选未部署”的历史记录。
 
-- **19:07:23 UTC正式注册成功**，实际`derived_3gpp_lte_51502 / ipsec / wwan0 / ipv4`。19:11–19:14五次独立只读采样均保持registered、同一个registered_at、last_error=null；收发时间继续推进、活动通话0。首次连接计数reconnect_count=1未增加，服务NRestarts=0。与最初注册时间相隔超过7分钟，不是单次瞬时快照。
+- **19:07:23 UTC正式注册成功**，实际`derived_3gpp_lte_51502 / ipsec / wwan0 / ipv4`。19:11–19:14五次独立只读采样均保持registered、同一个registered_at、last_error=null；收发时间继续推进、活动通话0。首次连接计数reconnect_count=1未增加，服务NRestarts=0。与最初注册时间相隔超过7分钟，不是单次瞬时快照。**19:22:34 UTC收尾复核仍为同一次IPsec注册、PID119010、Web HTTP200、last_error=null，已超过15分钟**；证明`production-closeout.json`，自然续期计数仍0。
 - **生产profile生命周期已实际启用**：v2账本、`runtime.phase=active / abandoned=false / process_id=119010`，自有动态CID4为IPv4/ims，关联原MM owner和Bearer/155、Modem/77、实际wwan0/本线路namespace。**活跃profile与bearer receipt是正常在用资源，不要删除或按孤儿记录处理。**
 - 原地址族顺序未变：本轮双栈准备被校验拒绝（`mm_ims_profile_lease_unverified`，未断言其唯一根因），IPv6连接收到GGSN拒绝，随后按既有流程新建exact-family IPv4 profile并成功。没有手工固定IPv4、覆盖CID1/2/3，或增加SIP超时后的承载循环。
 - **部署已完整核验**：运行SHA256 `38558365459bc01285b297ebcdf7c899e0d0a16ff9481a0b1d15f0dad91f9c90`、meta48e269c和前端MD5 `01505b0195870511cc8428e1d730b53c`匹配ARM64制品。复制窗口config.yaml/data.db哈希相同，没有重建DB/建备份/清预算；服务启动后的正常运行写库不等同于覆盖原DB。MM仍PID1028，未重启MM/基带；管理仍usb0，recovery timer已恢复active。
