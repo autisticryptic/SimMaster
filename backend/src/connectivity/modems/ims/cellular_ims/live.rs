@@ -8139,10 +8139,19 @@ fn response_warns_missing_sec_agree(response: &[u8]) -> bool {
         let Some((text, trailing)) = quoted.split_once('"') else {
             return false;
         };
-        let text = text.trim().to_ascii_lowercase();
+        let text = text.to_ascii_lowercase();
+        let words: Vec<_> = text
+            .split(|c: char| !c.is_ascii_alphabetic() && c != '-')
+            .filter(|word| !word.is_empty())
+            .collect();
+        // The passive observer established this seven-token sequence, not
+        // literal punctuation/spacing. Do not make commas or a final period
+        // change its meaning, or infer semantics from a generic 420 alone.
         trailing.trim().is_empty()
-            && text.starts_with("without sec-agree and ")
-            && text.ends_with(" on")
+            && matches!(
+                words.as_slice(),
+                ["without", "sec-agree", "and", _, "is", _, "on"]
+            )
     })
 }
 
@@ -9966,6 +9975,36 @@ Content-Length: 0\r\n\r\n";
         );
         assert!(next_dynamic_register_variant(profile, upgraded, &failure).is_none());
         assert!(derived_missing_sec_agree_retry_variant(&GB_EE_23433, base, &failure).is_none());
+    }
+
+    #[test]
+    fn derived_missing_agreement_warning_normalizes_only_observed_words_not_raw_punctuation() {
+        for text in [
+            "Without sec-agree and security is configured on",
+            "Without sec-agree, and IPsec is switched ON.",
+            "Without sec-agree and Rel7 is switched on.",
+            "Without   sec-agree and security is configured on.",
+        ] {
+            let response =
+                format!("SIP/2.0 420 Bad Extension\r\nWarning: 399 proxy \"{text}\"\r\n\r\n");
+            assert!(
+                response_warns_missing_sec_agree(response.as_bytes()),
+                "{text}"
+            );
+        }
+        for text in [
+            "Without sec-agree and security is configured off.",
+            "Not without sec-agree and security is configured on.",
+            "Without sec-agree and security is not configured on.",
+            "sec-agree is unsupported",
+        ] {
+            let response =
+                format!("SIP/2.0 420 Bad Extension\r\nWarning: 399 proxy \"{text}\"\r\n\r\n");
+            assert!(
+                !response_warns_missing_sec_agree(response.as_bytes()),
+                "{text}"
+            );
+        }
     }
 
     #[test]
