@@ -17,7 +17,7 @@ class TemporaryProfileLeaseTests(unittest.TestCase):
         self.assertIn('("profile-name", Value::from(tag))', create)
         self.assertIn('"Set"', create)
         self.assertNotIn('("profile-id",', create)
-        self.assertNotIn("CGDCONT=", text)
+        self.assertNotIn("CGDCONT=", create)
         self.assertNotIn("CGACT=", text)
         self.assertNotIn("SetInitialEpsBearerSettings", text)
 
@@ -54,6 +54,19 @@ class TemporaryProfileLeaseTests(unittest.TestCase):
         for file in ("live.rs", "native_bearer.rs", "pcscf.rs"):
             production = (ROOT / "backend/src/connectivity/modems/ims/cellular_ims" / file).read_text(encoding="utf-8")
             self.assertNotIn("profile_lease::maintain", production)
+
+    def test_explicit_at_creation_never_reuses_an_existing_apn_or_cid(self):
+        text = SRC.read_text(encoding="utf-8")
+        block = part(text, "async fn create_at_with", "fn verify_inactive_context")
+        for required in ("supported_profile_cids(", "!before.profiles.contains_key(id)",
+                         "!before.definitions.contains_key(id)", "verify_inactive_context(",
+                         "io.snapshot().await? != before", "unchanged_except("):
+            self.assertIn(required, block)
+        self.assertLess(block.index("verify_inactive_context("), block.index('AT+CGDCONT={id}'))
+        self.assertLess(block.index("io.snapshot().await? != before"), block.index('AT+CGDCONT={id}'))
+        self.assertNotIn("CGACT=", block)
+        main = (ROOT / "backend/src/main.rs").read_text(encoding="utf-8")
+        self.assertIn('"acquire-at"', main)
 
     def test_both_ci_suites_include_pure_and_private_bus_tests(self):
         for name in ("beta-validation.yml", "build-release.yml"):

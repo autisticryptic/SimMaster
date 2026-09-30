@@ -409,7 +409,7 @@ enum CliCommand {
     },
     /// Explicit temporary IMS profile maintenance. Does not start a bearer or server.
     MmImsProfileLease {
-        #[arg(long, default_value = "inspect", value_parser = ["inspect", "acquire", "release"])]
+        #[arg(long, default_value = "inspect", value_parser = ["inspect", "acquire", "acquire-at", "release"])]
         action: String,
         #[arg(long)]
         modem: String,

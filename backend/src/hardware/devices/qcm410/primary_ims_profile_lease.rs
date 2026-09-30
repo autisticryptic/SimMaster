@@ -52,9 +52,19 @@ enum Phase {
     Deleting,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CreationMethod {
+    #[default]
+    Qmi,
+    At,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Receipt {
     version: u8,
+    #[serde(default)]
+    method: CreationMethod,
     phase: Phase,
     before: Snapshot,
     requested_family: u32,
@@ -65,6 +75,9 @@ struct Receipt {
 }
 
 trait ProfileIo {
+    fn method(&self) -> CreationMethod {
+        CreationMethod::Qmi
+    }
     fn snapshot(&self) -> impl Future<Output = Result<Snapshot, String>> + Send;
     fn create(
         &self,
@@ -224,6 +237,7 @@ async fn acquire_with<I: ProfileIo, S: Store>(
     }
     let mut receipt = Receipt {
         version: 1,
+        method: io.method(),
         phase: Phase::Creating,
         before,
         requested_family: family,
@@ -248,7 +262,7 @@ async fn acquire_with<I: ProfileIo, S: Store>(
     if !(2..=16).contains(&owned.id)
         || owned.apn != apn
         || owned.family != family
-        || owned.name != receipt.tag
+        || (receipt.method == CreationMethod::Qmi && owned.name != receipt.tag)
         || !unchanged_except(&receipt.before, &after, owned.id)
         || after.profiles.get(&owned.id) != Some(&owned)
         || after.reporting != receipt.before.reporting
@@ -428,6 +442,7 @@ fn reporting_snapshot(text: &str) -> Result<BTreeMap<i32, [u8; 3]>, String> {
 
 struct MmProfileIo {
     bus: Arc<MmBus>,
+    method: CreationMethod,
 }
 
 impl MmProfileIo {
@@ -460,6 +475,10 @@ impl MmProfileIo {
 }
 
 impl ProfileIo for MmProfileIo {
+    fn method(&self) -> CreationMethod {
+        self.method
+    }
+
     async fn snapshot(&self) -> Result<Snapshot, String> {
         self.quiescent().await?;
         let index: String = timed(5, async {
@@ -521,6 +540,12 @@ impl ProfileIo for MmProfileIo {
 
     async fn create(&self, apn: &str, family: u32, tag: &str) -> Result<Profile, String> {
         self.quiescent().await?;
+        if self.method == CreationMethod::At {
+            return create_at_with(self, apn, family, |command| async move {
+                self.command(&command).await
+            })
+            .await;
+        }
         // ProfileManager Set without its index invokes QMI Create Profile, not
         // Modify Profile. No requested ID, auth secret, APN-type or EPS writes.
         let properties = HashMap::from([
@@ -568,6 +593,102 @@ impl ProfileIo for MmProfileIo {
         .await?;
         self.bus.ensure_sim_binding().await
     }
+}
+
+/// Explicit alternative for firmware rejecting QMI Create Profile's optional
+/// fields. This never activates a context and is not an automatic fallback.
+/// The same capability parser as normal safe CID preparation is used, but an
+/// APN match never authorizes reuse or overwrite in this maintenance path.
+async fn create_at_with<I, F, Fut>(
+    io: &I,
+    apn: &str,
+    family: u32,
+    mut command: F,
+) -> Result<Profile, String>
+where
+    I: ProfileIo,
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<String, String>>,
+{
+    validate_request(apn, family)?;
+    let pdp_type = match family {
+        1 => "IP",
+        2 => "IPV6",
+        4 => "IPV4V6",
+        _ => return Err(ERROR.into()),
+    };
+    let before = io.snapshot().await?;
+    let capabilities = command("AT+CGDCONT=?".into()).await?;
+    let supported = crate::connectivity::modems::ims::cellular_ims::pcscf::supported_profile_cids(
+        &capabilities,
+        pdp_type,
+    )
+    .map_err(|_| "mm_ims_profile_lease_at_capabilities_invalid")?;
+    let id = supported
+        .into_iter()
+        .map(i32::from)
+        .find(|id| {
+            (2..=16).contains(id)
+                && !before.profiles.contains_key(id)
+                && !before.definitions.contains_key(id)
+        })
+        .ok_or("mm_ims_profile_lease_no_unused_supported_cid")?;
+    let activity = command("AT+CGACT?".into()).await?;
+    verify_inactive_context(&activity, id)?;
+    if io.snapshot().await? != before {
+        return Err("mm_ims_profile_lease_at_inventory_changed".into());
+    }
+    // The explicit stopped-manager maintenance window excludes competing
+    // SimAdmin writers; no selector points at an existing profile, even blank.
+    command(format!("AT+CGDCONT={id},\"{pdp_type}\",\"{apn}\"")).await?;
+    let after = io.snapshot().await?;
+    if !unchanged_except(&before, &after, id)
+        || after.reporting != before.reporting
+        || !after
+            .definitions
+            .get(&id)
+            .is_some_and(|d| d.family == family && d.apn == apn)
+    {
+        return Err("mm_ims_profile_lease_at_readback_mismatch".into());
+    }
+    let owned = after.profiles.get(&id).ok_or(ERROR)?;
+    if owned.family != family || owned.apn != apn {
+        return Err(ERROR.into());
+    }
+    Ok(owned.clone())
+}
+
+fn verify_inactive_context(text: &str, target: i32) -> Result<(), String> {
+    if text.len() > 16384 {
+        return Err(ERROR.into());
+    }
+    let mut seen = BTreeSet::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if matches!(line, "OK" | "AT+CGACT?") {
+            continue;
+        }
+        let values = line
+            .strip_prefix("+CGACT:")
+            .ok_or(ERROR)?
+            .split(',')
+            .map(|s| s.trim().parse::<i32>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ERROR)?;
+        if values.len() != 2
+            || !(1..=16).contains(&values[0])
+            || !matches!(values[1], 0 | 1)
+            || !seen.insert(values[0])
+        {
+            return Err(ERROR.into());
+        }
+        if values[0] == target && values[1] != 0 {
+            return Err("mm_ims_profile_lease_cid_active".into());
+        }
+    }
+    if seen.is_empty() {
+        return Err(ERROR.into());
+    }
+    Ok(())
 }
 
 struct DiskStore {
@@ -643,7 +764,7 @@ pub async fn maintain(
     if unsafe { libc::geteuid() } != 0 {
         return Err("mm_ims_profile_lease_root_required".into());
     }
-    if !matches!(action, "inspect" | "acquire" | "release") {
+    if !matches!(action, "inspect" | "acquire" | "acquire-at" | "release") {
         return Err(ERROR.into());
     }
     let family = match family {
@@ -684,7 +805,14 @@ pub async fn maintain(
     }
     let bus = MmBus::new(device, modem, &interface).await?;
     bus.pin_sim_binding().await?;
-    let io = MmProfileIo { bus };
+    let io = MmProfileIo {
+        bus,
+        method: if action == "acquire-at" {
+            CreationMethod::At
+        } else {
+            CreationMethod::Qmi
+        },
+    };
     let store = DiskStore { file };
     let existing = match fs::symlink_metadata(&store.file) {
         Ok(metadata) => {
@@ -717,7 +845,7 @@ pub async fn maintain(
                 "family":family,"profile_count":snapshot.profiles.len(),"pending_phase":existing.map(|r|r.phase),"mutated_profiles":false}),
             )
         }
-        "acquire" => {
+        "acquire" | "acquire-at" => {
             if existing.is_some() {
                 return Err("mm_ims_profile_lease_pending_receipt".into());
             }
@@ -731,7 +859,7 @@ pub async fn maintain(
             )
             .await?;
             Ok(
-                serde_json::json!({"action":"acquire","profile_id":result.owned.ok_or(ERROR)?.id,"family":family,"receipt":store.file,"existing_profiles_unchanged":true}),
+                serde_json::json!({"action":action,"profile_id":result.owned.ok_or(ERROR)?.id,"family":family,"receipt":store.file,"existing_profiles_unchanged":true}),
             )
         }
         "release" => {
@@ -899,6 +1027,98 @@ mod tests {
         acquire_with(io, store, "ims", family, &token)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn temporary_profile_at_creation_checks_capability_activity_and_snapshot_before_one_write(
+    ) {
+        for failure in [
+            "none",
+            "capability",
+            "active",
+            "changed",
+            "write",
+            "readback",
+        ] {
+            let io = FakeIo::new(9);
+            let mut calls = Vec::new();
+            let result = create_at_with(&io, "ims", 1, |command| {
+                calls.push(command.clone());
+                let result = match command.as_str() {
+                    "AT+CGDCONT=?" if failure == "capability" => {
+                        Ok("+CGDCONT: (1-16),\"IPV6\"".into())
+                    }
+                    "AT+CGDCONT=?" => Ok("+CGDCONT: (3,9-16),\"IP\"".into()),
+                    "AT+CGACT?" => {
+                        if failure == "changed" {
+                            io.state.lock().unwrap().eps_fingerprint = "changed".into();
+                        }
+                        Ok(if failure == "active" {
+                            "+CGACT: 9,1"
+                        } else {
+                            "+CGACT: 3,0"
+                        }
+                        .into())
+                    }
+                    "AT+CGDCONT=9,\"IP\",\"ims\"" => {
+                        if failure == "write" {
+                            Err("write reply lost".into())
+                        } else {
+                            let mut state = io.state.lock().unwrap();
+                            state.profiles.insert(
+                                9,
+                                Profile {
+                                    id: 9,
+                                    family: 1,
+                                    apn: "ims".into(),
+                                    name: String::new(),
+                                    fingerprint: "new".into(),
+                                },
+                            );
+                            state.definitions.insert(
+                                9,
+                                Definition {
+                                    family: if failure == "readback" { 2 } else { 1 },
+                                    apn: "ims".into(),
+                                    fingerprint: "row".into(),
+                                },
+                            );
+                            Ok("OK".into())
+                        }
+                    }
+                    _ => panic!("unexpected AT command {command}"),
+                };
+                std::future::ready(result)
+            })
+            .await;
+            assert_eq!(result.is_ok(), failure == "none");
+            let writes = calls
+                .iter()
+                .filter(|c| c.starts_with("AT+CGDCONT=") && !c.ends_with('?'))
+                .count();
+            assert_eq!(
+                writes,
+                usize::from(matches!(failure, "none" | "write" | "readback"))
+            );
+            assert_eq!(
+                io.state.lock().unwrap().profiles[&3],
+                baseline().profiles[&3]
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_profile_at_activity_requires_valid_unambiguous_observation() {
+        for bad in [
+            "",
+            "ERROR",
+            "+CGACT: 9,1",
+            "+CGACT: 9,0\\n+CGACT: 9,0",
+            "+CGACT: 9,2",
+        ] {
+            assert!(verify_inactive_context(bad, 9).is_err());
+        }
+        verify_inactive_context("+CGACT: 3,0\n+CGACT: 9,0", 9).unwrap();
     }
 
     #[test]

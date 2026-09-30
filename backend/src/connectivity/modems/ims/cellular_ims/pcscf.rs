@@ -371,7 +371,10 @@ fn checked_profile_definitions(output: &str) -> Result<Vec<PdpContext>, Cellular
     Ok(contexts)
 }
 
-fn supported_profile_cids(output: &str, pdp_type: &str) -> Result<Vec<u8>, CellularImsError> {
+pub(crate) fn supported_profile_cids(
+    output: &str,
+    pdp_type: &str,
+) -> Result<Vec<u8>, CellularImsError> {
     let output = profile_at_response(output)?;
     let invalid = || profile_definition_error("ims_profile_capabilities_invalid");
     if output.len() > 16384 {

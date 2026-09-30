@@ -101,6 +101,15 @@ impl FakeModem {
     fn command(&self, command: &str, _timeout: u32) -> zbus::fdo::Result<String> {
         let mut s = self.0 .0.lock().unwrap();
         match command {
+            "AT+CGDCONT=?" => Ok("+CGDCONT: (1-3,9-16),\"IP\",,,(0),(0)".into()),
+            "AT+CGACT?" => Ok("+CGACT: 1,0\n+CGACT: 2,0\n+CGACT: 3,0".into()),
+            "AT+CGDCONT=9,\"IP\",\"ims\"" => {
+                assert!(!s.created);
+                s.created = true;
+                s.name = String::new();
+                s.calls.push("AT-define-unused-9".into());
+                Ok("OK".into())
+            }
             "AT+CGDCONT?" => {
                 let mut text="+CGDCONT: 1,\"IPV4V6\",\"\"\n+CGDCONT: 2,\"IPV4V6\",\"\"\n+CGDCONT: 3,\"IPV4V6\",\"ims\"".to_string();
                 if s.created {
@@ -179,7 +188,14 @@ async fn server() -> (Connection, Fake, MmProfileIo) {
         .unwrap();
     let bus = MmBus::new("/dev/wwan0qmi0", path, "wwan0").await.unwrap();
     bus.pin_sim_binding().await.unwrap();
-    (conn, fake, MmProfileIo { bus })
+    (
+        conn,
+        fake,
+        MmProfileIo {
+            bus,
+            method: CreationMethod::Qmi,
+        },
+    )
 }
 
 #[derive(Default)]
@@ -211,6 +227,24 @@ async fn temporary_profile_private_bus_uses_indexless_set_and_exact_owned_delete
         ["Set-new", "restore-reporting", "Delete-owned"]
     );
     assert!(store.0.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn temporary_profile_private_bus_at_path_creates_only_unused_capability_selected_cid() {
+    let (_server, fake, mut io) = server().await;
+    io.method = CreationMethod::At;
+    let store = MemoryStore::default();
+    let before = io.snapshot().await.unwrap();
+    let token = fingerprint(&("ims", 1_u32, &before)).unwrap();
+    let receipt = acquire_with(&io, &store, "ims", 1, &token).await.unwrap();
+    assert_eq!(receipt.method, CreationMethod::At);
+    assert_eq!(receipt.owned.as_ref().unwrap().id, 9);
+    release_with(&io, &store, receipt).await.unwrap();
+    assert_eq!(io.snapshot().await.unwrap(), before);
+    assert_eq!(
+        fake.0.lock().unwrap().calls,
+        ["AT-define-unused-9", "Delete-owned"]
+    );
 }
 
 #[tokio::test]
