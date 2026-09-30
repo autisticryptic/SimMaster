@@ -1,6 +1,6 @@
 # MM IMS Exact-Family Profile Lease Design
 
-> 状态：2026-09-30 16:29 UTC，83354b6 的有界维护探针已在当前51502 eSIM/50212漫游网、独立IPv4v6 profile上完成IMS IPsec注册；随后本地资源回收，但注销请求被拒绝，不能称网络确认注销。两套CI/双架构已核验，正式安装仍cf13a66且主服务停止；生产profile生命周期、持续在线与续期尚未完成。6a77d92的早期profile闭环及QMI Set拒绝事实保留。
+> 状态：2026-09-30 19:14 UTC，生产候选48e269c已部署并在正式主服务完成当前51502 eSIM/50212漫游网IMS IPsec注册；多次采样保持同一注册和持续收发。自有exact-family IPv4 profile/v2账本在用，不能删除。两套CI/双架构完整核验通过；自然续期/通话/数据共存仍未验收，运营商注销仍返回500。早期83354b6维护探针、6a77d92 profile闭环及QMI Set拒绝事实保留，最新状态以HANDOFF首节为准。
 > 目标：解决 ModemManager 中有效 `profile-id` 优先于请求 `ip-type` 的约束，同时保持单一 MM owner、UE namespace 隔离和可核验恢复。
 
 ## 显式维护入口（代码/CI及 profile 生命周期已实机验证）
@@ -26,9 +26,9 @@
 - capability 校验实际 CID/APN/MM 端点与族，最多调用一次底层承载建立；强制单族错误不能借此对同一 profile 再激活。REGISTER 核心窗口 240 秒，注销另限 40 秒；成功报告仅表示本次注册成功，随后主动注销，不是维持在线服务。
 - 注销结果分别报告 confirmed/already_expired/rejected/access_lost/timeout，不把清理成功当作网络已确认注销。承载回收后停止 worker，仅在自有 namespace 只剩 loopback 且清理已核验时删除；profile 仍须显式 release。
 - 同一 MM owner 内对象重新枚举，只在旧 modem 确认消失、物理控制口及稳定 SIM/slot、原 profile/EPS 全匹配且两次快照一致时衔接 profile 清理；不把 bearer 清理重定向到新对象，不接受旧 receipt 缺失稳定归属证据的换代。
-- 83354b6已验证：临时IPv4v6 CID4（动态选择）、实际IPv4/wwan0，首420后根据精确Warning词序补齐安全声明，401/AKA后返回真实IPsec成功会话；注销结果rejected，本地承载/namespace/profile回收通过。新实例无需强制IPv4、不改原profile，完整证据与生产集成边界见[HANDOFF最新节](HANDOFF.md#最新临时-profile-上实际-ims-ipsec-注册成功2026-09-30-1629-utc)。原6a77d92的profile闭环证明保持独立，不能拿探针成功替代主服务持续在线验收。
+- 83354b6已验证：临时IPv4v6 CID4（动态选择）、实际IPv4/wwan0，首420后根据精确Warning词序补齐安全声明，401/AKA后返回真实IPsec成功会话；注销结果rejected，本地承载/namespace/profile回收通过。新实例无需强制IPv4、不改原profile，完整证据与生产集成边界见[HANDOFF最新节](HANDOFF.md#先前验收临时-profile-上实际-ims-ipsec-注册成功2026-09-30-1629-utc)。原6a77d92的profile闭环证明保持独立，不能拿探针成功替代主服务持续在线验收。
 
-## 生产集成候选（待最终 CI / 部署验收）
+## 生产集成（48e269c已部署，IMS-only注册验收通过）
 
 - 设备 transport 显式 opt-in；仅标准派生、MM、IMS-only 路径进入 runtime adapter。数据开启、catalog或其他设备仍保留原流程；普通流程持有相同设备 flock 到承载准备结束，防止空账本检查后误复用并发新建的自有 profile。
 - 在原有每次 bearer-family 调用内经 MM AT 严格新建空闲 exact-family profile；没有新族循环或 SIP 超时重建循环。仅在前次完整回收后允许下一原定尝试，成功/强制族 hint 保留；不确定操作立即阻断。
@@ -37,6 +37,7 @@
 - opaque handle转发SIM、P-CSCF、namespace操作并携带profile生命周期。承载/network absence证明完成后才恢复reporting、删profile；原MM对象消失时只允许同owner/SIM/物理控制口及原快照一致的profile清理重绑定。短暂MM换代只在未开始reporting/Delete写入时有限等待，未知写入不重放。
 - 运行时不调用维护CLI或全局shutdown。服务退出按SIP/XFRM资源→retained bearer→profile顺序回收；显式exit前执行profile清理而不依赖对象析构，超时保留账本。启动/新尝试先进行原owner安全恢复；恢复不明时不进行全局namespace搬移。
 - 明确限制：MM owner/SIM/boot变化、未知Create/reporting、没有可核验bearer归属等仍保守阻断，需要维护，不承诺跨重启自动删除自有配置。普通数据共存不在首版准入范围，不为启用此功能停用用户数据。
+- 实机：首双栈准备校验失败、IPv6被GGSN拒绝，按原顺序新建IPv4 profile后在正式服务注册IPsec；活跃v2记录绑定PID119010/Bearer155/Modem77/wwan0。19:07注册至19:14核验保持同一registered_at，未清任何记录来解锁；自然续期计数0。停止/取消故障注入仍以代码/回归覆盖为准，不扩大实机验收范围。
 
 ## 维护工具的验证事实（2026-09-30）
 

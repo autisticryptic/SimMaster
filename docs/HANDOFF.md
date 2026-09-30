@@ -3,7 +3,39 @@
 > 更新：2026-09-30。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 最新：临时 profile 上实际 IMS IPsec 注册成功（2026-09-30 16:29 UTC）
+## 当前已部署：正式主服务 IMS IPsec 注册成功（2026-09-30 19:14 UTC核验）
+
+**已按用户新授权完成生产注册修复与部署：正式程序为 `1.1.5 / 48e269ca8b536ef7ba82ed98b58d3623540f0547`，PID119010，主服务运行中，不是维护探针。** 本节优先于下方旧安装cf13a66、主服务停止或“候选未部署”的历史记录。
+
+- **19:07:23 UTC正式注册成功**，实际`derived_3gpp_lte_51502 / ipsec / wwan0 / ipv4`。19:11–19:14五次独立只读采样均保持registered、同一个registered_at、last_error=null；收发时间继续推进、活动通话0。首次连接计数reconnect_count=1未增加，服务NRestarts=0。与最初注册时间相隔超过7分钟，不是单次瞬时快照。
+- **生产profile生命周期已实际启用**：v2账本、`runtime.phase=active / abandoned=false / process_id=119010`，自有动态CID4为IPv4/ims，关联原MM owner和Bearer/155、Modem/77、实际wwan0/本线路namespace。**活跃profile与bearer receipt是正常在用资源，不要删除或按孤儿记录处理。**
+- 原地址族顺序未变：本轮双栈准备被校验拒绝（`mm_ims_profile_lease_unverified`，未断言其唯一根因），IPv6连接收到GGSN拒绝，随后按既有流程新建exact-family IPv4 profile并成功。没有手工固定IPv4、覆盖CID1/2/3，或增加SIP超时后的承载循环。
+- **部署已完整核验**：运行SHA256 `38558365459bc01285b297ebcdf7c899e0d0a16ff9481a0b1d15f0dad91f9c90`、meta48e269c和前端MD5 `01505b0195870511cc8428e1d730b53c`匹配ARM64制品。复制窗口config.yaml/data.db哈希相同，没有重建DB/建备份/清预算；服务启动后的正常运行写库不等同于覆盖原DB。MM仍PID1028，未重启MM/基带；管理仍usb0，recovery timer已恢复active。
+- **遗留secondary服务入口已修正**：停掉旧`secondary-qmi-init`无效重启循环，安装包内canonical `device-init` unit；目前保持inactive，未在线执行硬件初始化。主线路普通数据仍关闭，其配置未变；没有借此重启MM或改变USB。
+- 最终Validate **36760292016** / Build **36760292160**全success，实际下载日志核验 **83累计新增回归+11兼容/更新回归**均ok，双架构制品digest/meta/ELF/程序/前端校验通过。Linux235 Python与定向格式/diff通过。16bf1f9虽然workflow为绿色，逐名核验发现Validate漏跑新增423注销回归；48e269c补齐门禁后重新验证，未拿旧包替代。
+  ARM64 artifact11118397115、包SHA256 `5785843b997b1a8c2ba37b1bd51b02df03c433913f4c342e62f19fb63cdab361`；AMD64 artifact11119515020、包SHA256 `7fc4a2b7852f81dd99a474f6a692b57f2bcb44694e6a53c7397b3c4a38535f61`。Publish skipped，旧Release/tag未动。
+- 证据 `.local/evidence/ims-route-completion/48e269c/{verified.json,production-verified.json,production-install.json,production-active-profile.json,production-stability.json,production-final-facts.json}`。初次stage把正常子UE worker误判为额外程序，另一次遇到MM对象换代空窗；均在只读预检停止、未上传/停服，失败记录已保留。后续按真实父子进程关系和有限只读稳定库存核实后才操作。
+
+### 明确保留的未完成项
+
+1. **运营商注销仍返回SIP500/rejected**：修补了已认证Digest/nonce-count与Security-Verify，以及禁止423将Expires0变正数；48e269c维护窗口内再次成功注册，但注销仍被500拒绝，本地承载/namespace/profile回收均通过。不能声称网络注销修好；该项独立待排查，不再为此打断当前健康注册。
+2. **当前版本自然续期计数仍0**；未做长通话、呼入/音频、真实换卡/故障注入验收。不能把历史其他卡的续期结果或此次短窗稳定观察代替这些项目。
+3. 普通数据共存不在首版新profile准入范围（当前数据关闭）；MM owner/SIM/boot变化、未知持久化/写入仍保留记录并阻断，需要维护，不承诺跨基带/MM重启自动删除旧profile。
+4. 若再次部署或需要注销诊断，必须重新确认当前注册/通话状态和维护窗口，不根据下方“主服务停止”的旧快照直接停服。用户原有历史文档移动仍未提交且未改动。
+
+## 生产候选开发与部署前现场（2026-09-30，以下为历史步骤）
+
+用户在探针成功后明确要求完成项目修复并部署。**新现场不再是下方“服务停止”**：本轮首次只读连接已见旧cf13a66/PID535、MM/PID1028、secondary自动重启；这些变化在本轮连接前已发生。管理仍usb0，当前卡/线路派生51502、漫游50212，IMS未注册、已有真实420响应，数据关闭、无通话/启用任务。证据 `.local/evidence/ims-profile-production/{baseline.json,runtime-before.json}`。
+
+- secondary日志明确旧unit调用已移除的`secondary-qmi-init`，以INVALIDARGUMENT反复退出（不是已证明的基带故障）。部署将保守停止该无效循环并安装包内canonical `device-init` unit，但不在线运行初始化、不重启MM/基带；普通数据当前关闭。没有为绕过问题增加危险的旧命令别名。
+- 生产实现：设备opt-in、标准派生、IMS-only范围；原族循环每次准备独立AT profile；v2持久profile/bearer网络镜像、原owner/SIM、线路代次、设备flock、取消屏蔽、profile清理晚于bearer/网络。普通分支持有同一flock，未知profile不被按APN复用。启动恢复不明则禁止全局namespace搬移。
+- 审查补强：每次承载新建接口选择状态但不换MM owner/SIM，代次谓词到达实际CreateBearer/Connect分发；服务退出按SIP/XFRM→bearer→profile顺序回收，持久写入不明保持阻断。旧8秒watchdog改为有界40秒，覆盖5+5+20秒清理预算。
+- 注销代码问题已补：从已认证会话生成新nonce-count Digest并保留Security-Verify；Expires0注销不允许因423重建正数租期。历史网络500仍保留，不断言此代码差异是运营商返回500的唯一原因，实机注销仍待验收。
+- 初版 `12bd0c7fe81d9b26ebd0d3ea0b918b3ae24c0ca4` Validate已通过；后继 **`16bf1f9309834f97fc649c146df79c08e3cebb48`** 进一步把profile受控setup期限放到外层，内层保留晚到Create结果到profile清理，不因独立90秒超时丢失生命周期衔接。Validate36758599751 / Build36758599884运行中，**尚未宣称最终候选CI、制品或部署通过**。
+- 用户历史文档移动保留未提交。一次rustfmt递归触及无关文件的纯格式变化已根据任务起始干净状态恢复，仅保留本任务文件；初轮静态守卫失败后更新为新安全边界并全量重跑通过。Rust只在Actions。
+- 私有部署脚本 `.local/active/lan/deploy_production_profiles.py` 分stage/open-window/install，要求最终verified.json，固定SSH主机pin、实际SIM/MM/配置/无通话任务/usb0预检；不复制DB/config、不清预算，候选包更新二进制/前端/设备资源。尚未执行停服或覆盖。
+
+## 先前验收：临时 profile 上实际 IMS IPsec 注册成功（2026-09-30 16:29 UTC）
 
 **本节优先于下方“尚未注册”的历史记录。`83354b620530c4b9dd26fa088a86a6d3e36e849f` 已在当前51502 eSIM、50212漫游网的有界维护探针中实际注册成功；不是主服务持续在线或生产集成完成。**
 
