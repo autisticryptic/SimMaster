@@ -30,6 +30,7 @@
 
 use std::{
     fmt,
+    future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -40,6 +41,8 @@ use tokio::{
     net::{TcpStream, UdpSocket},
     sync::Mutex,
 };
+
+use crate::services::ue_worker::{UeSocket, UeSocketKind, UeSocketSpec, UeWorkerBinding};
 
 /// SOCKS protocol version.
 const SOCKS5_VERSION: u8 = 0x05;
@@ -72,6 +75,8 @@ pub enum Socks5Error {
     AuthFailed(String),
     /// The proxy refused `UDP ASSOCIATE`.
     AssociateRejected(u8),
+    /// The captured UE worker changed; never retry on its replacement.
+    WorkerChanged,
     /// An operation exceeded its deadline.
     Timeout(String),
 }
@@ -86,6 +91,7 @@ impl fmt::Display for Socks5Error {
             Self::AssociateRejected(code) => {
                 write!(f, "socks5_associate_rejected:{}", reply_reason(*code))
             }
+            Self::WorkerChanged => f.write_str("socks5_ue_worker_generation_changed"),
             Self::Timeout(d) => write!(f, "socks5_timeout:{d}"),
         }
     }
@@ -334,56 +340,106 @@ impl fmt::Debug for Socks5UdpClient {
 }
 
 impl Socks5UdpClient {
-    /// Establish a UDP association through the proxy.
-    ///
-    /// `local_family_hint` decides whether the local UDP socket is bound v4 or v6;
-    /// it should match the family of the ePDG addresses that will be targeted.
+    /// Establish a host-namespace association (used by the existing DNS path).
+    /// The destination-family hint is retained for API compatibility, but the
+    /// outer UDP socket must match the actual relay, not the ultimate target.
     pub async fn connect(
         endpoint: &Socks5Endpoint,
-        local_family_hint: IpAddr,
+        _target_family_hint: IpAddr,
         connect_timeout: Duration,
     ) -> Result<Self, Socks5Error> {
-        let authority = endpoint.authority();
-        let connect = async {
-            let addresses =
-                crate::platform::dns::resolve_socket_addrs(&endpoint.host, endpoint.port).await?;
-            // Passing resolved socket addresses avoids Tokio's implicit libc
-            // lookup for a hostname authority, including the proxy itself.
-            TcpStream::connect(addresses.as_slice()).await
-        };
-        let mut control = tokio::time::timeout(connect_timeout, connect)
-            .await
-            .map_err(|_| Socks5Error::Timeout(format!("connect {authority}")))?
-            .map_err(|err| Socks5Error::Io(format!("connect {authority}: {}", err.kind())))?;
-        // IKE retransmits on its own; Nagle would only add latency here.
-        let _ = control.set_nodelay(true);
+        let addresses = resolve_proxy_addresses(endpoint, connect_timeout).await?;
+        Self::connect_resolved_with(endpoint, &addresses, connect_timeout, None, host_socket).await
+    }
 
+    /// Keep both TCP control and UDP relay sockets on this captured UE worker.
+    /// A configured proxy must never degrade to a direct/host ePDG socket.
+    pub async fn connect_in_worker(
+        endpoint: &Socks5Endpoint,
+        worker: &UeWorkerBinding,
+        interface: &str,
+        connect_timeout: Duration,
+    ) -> Result<Self, Socks5Error> {
+        if !worker.is_current() {
+            return Err(Socks5Error::WorkerChanged);
+        }
+        let addresses = resolve_proxy_addresses(endpoint, connect_timeout).await?;
+        Self::connect_resolved_with(
+            endpoint,
+            &addresses,
+            connect_timeout,
+            Some(interface),
+            |spec| async move {
+                if !worker.is_current() {
+                    return Err(Socks5Error::WorkerChanged);
+                }
+                let result = worker.worker().create_socket(spec).await;
+                if !worker.is_current() {
+                    return Err(Socks5Error::WorkerChanged);
+                }
+                result.map_err(|_| Socks5Error::Io("ue_socket_creation_failed".into()))
+            },
+        )
+        .await
+    }
+
+    async fn connect_resolved_with<F, Fut>(
+        endpoint: &Socks5Endpoint,
+        addresses: &[SocketAddr],
+        connect_timeout: Duration,
+        interface: Option<&str>,
+        mut create: F,
+    ) -> Result<Self, Socks5Error>
+    where
+        F: FnMut(UeSocketSpec) -> Fut,
+        Fut: Future<Output = Result<UeSocket, Socks5Error>>,
+    {
+        let mut control = tokio::time::timeout(connect_timeout, async {
+            let mut last_error = None;
+            for peer in addresses {
+                let spec = UeSocketSpec::tcp_connected(
+                    relay_local_addr(*peer),
+                    *peer,
+                    interface.map(str::to_string),
+                    connect_timeout.as_secs().max(1),
+                );
+                match create(spec).await {
+                    Ok(UeSocket::Tcp(control)) => return Ok(control),
+                    Ok(_) => {
+                        return Err(Socks5Error::Protocol("expected TCP control socket".into()))
+                    }
+                    Err(Socks5Error::WorkerChanged) => return Err(Socks5Error::WorkerChanged),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| Socks5Error::Io("proxy has no address".into())))
+        })
+        .await
+        .map_err(|_| Socks5Error::Timeout("connect proxy".into()))??;
+        let _ = control.set_nodelay(true);
         negotiate_auth(&mut control, endpoint, connect_timeout).await?;
 
-        // Bind the local UDP socket first so we can tell the proxy where we will
-        // send from. Port 0 lets the OS pick.
-        let bind_addr = match local_family_hint {
-            IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        let peer = control
+            .peer_addr()
+            .map_err(|err| Socks5Error::Io(err.kind().to_string()))?;
+        // RFC 1928 §4 allows all zeroes when the client does not yet know its
+        // UDP endpoint. Learn the relay first: its family can differ from both
+        // the TCP proxy and every ePDG/DNS destination encoded in SOCKS headers.
+        let relay =
+            request_udp_associate(&mut control, relay_local_addr(peer), connect_timeout).await?;
+        let relay = normalize_relay_addr(relay, Some(peer));
+        if relay.port() == 0 || relay.ip().is_unspecified() || relay.ip().is_multicast() {
+            return Err(Socks5Error::Protocol("invalid UDP relay address".into()));
+        }
+        let spec = UeSocketSpec::udp_connected(
+            relay_local_addr(relay),
+            relay,
+            interface.map(str::to_string),
+        );
+        let socket = match create(spec).await? {
+            UeSocket::Udp(socket) => socket,
+            _ => return Err(Socks5Error::Protocol("expected UDP relay socket".into())),
         };
-        let socket = UdpSocket::bind(bind_addr)
-            .await
-            .map_err(|err| Socks5Error::Io(format!("bind local udp: {}", err.kind())))?;
-        let local = socket
-            .local_addr()
-            .map_err(|err| Socks5Error::Io(format!("local_addr: {}", err.kind())))?;
-
-        let relay = request_udp_associate(&mut control, local, connect_timeout).await?;
-        // Proxies routinely answer with a wildcard address meaning "reach me at the
-        // same host you used for TCP". Resolve that to the proxy's real IP.
-        let relay = normalize_relay_addr(relay, control.peer_addr().ok());
-
-        // Connecting the socket to the relay keeps stray datagrams out.
-        socket
-            .connect(relay)
-            .await
-            .map_err(|err| Socks5Error::Io(format!("connect relay {relay}: {}", err.kind())))?;
-
         Ok(Self {
             control: Mutex::new(control),
             socket: Arc::new(socket),
@@ -392,6 +448,10 @@ impl Socks5UdpClient {
             recv_timeout: Duration::from_secs(8),
             max_datagram_bytes: 4096,
         })
+    }
+
+    pub(super) fn udp_socket(&self) -> &UdpSocket {
+        &self.socket
     }
 
     pub fn with_recv_timeout(mut self, recv_timeout: Duration) -> Self {
@@ -430,6 +490,9 @@ impl Socks5UdpClient {
         destination: SocketAddr,
         payload: &[u8],
     ) -> Result<(), Socks5Error> {
+        if !self.is_control_alive().await {
+            return Err(Socks5Error::Io("UDP association control closed".into()));
+        }
         let frame = encode_udp_datagram(destination, payload);
         self.socket
             .send(&frame)
@@ -441,13 +504,74 @@ impl Socks5UdpClient {
     /// Receive one datagram, returning the origin (when the proxy reports one)
     /// and the payload.
     pub async fn recv_from(&self) -> Result<(Option<SocketAddr>, Vec<u8>), Socks5Error> {
-        let mut buffer = vec![0u8; self.max_datagram_bytes];
-        let read = tokio::time::timeout(self.recv_timeout, self.socket.recv(&mut buffer))
+        self.recv_from_with_limits(self.recv_timeout, self.max_datagram_bytes)
+            .await
+    }
+
+    pub(super) async fn recv_from_with_limits(
+        &self,
+        timeout: Duration,
+        max_payload_bytes: usize,
+    ) -> Result<(Option<SocketAddr>, Vec<u8>), Socks5Error> {
+        // Reserve room for the SOCKS header as well as the full IKE/ESP packet.
+        let mut buffer = vec![0u8; max_payload_bytes.saturating_add(22).min(65535)];
+        let read = tokio::time::timeout(timeout, self.socket.recv(&mut buffer))
             .await
             .map_err(|_| Socks5Error::Timeout("recv".to_string()))?
             .map_err(|err| Socks5Error::Io(format!("recv: {}", err.kind())))?;
         let (origin, payload) = decode_udp_datagram(&buffer[..read])?;
         Ok((origin, payload.to_vec()))
+    }
+}
+
+fn relay_local_addr(peer: SocketAddr) -> SocketAddr {
+    SocketAddr::new(
+        if peer.is_ipv4() {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        },
+        0,
+    )
+}
+
+async fn resolve_proxy_addresses(
+    endpoint: &Socks5Endpoint,
+    timeout: Duration,
+) -> Result<Vec<SocketAddr>, Socks5Error> {
+    tokio::time::timeout(
+        timeout,
+        crate::platform::dns::resolve_socket_addrs(&endpoint.host, endpoint.port),
+    )
+    .await
+    .map_err(|_| Socks5Error::Timeout("resolve proxy".into()))?
+    .map_err(|err| Socks5Error::Io(format!("resolve proxy: {}", err.kind())))
+}
+
+/// Legacy host socket factory for DNS/non-worker callers only. Live IKE uses
+/// the injected worker factory instead, with no fallback to this function.
+async fn host_socket(spec: UeSocketSpec) -> Result<UeSocket, Socks5Error> {
+    let remote = spec
+        .connect
+        .ok_or_else(|| Socks5Error::Protocol("missing socket peer".into()))?;
+    let local = spec
+        .bind
+        .ok_or_else(|| Socks5Error::Protocol("missing socket bind".into()))?;
+    match spec.kind {
+        UeSocketKind::Tcp => TcpStream::connect(remote)
+            .await
+            .map(UeSocket::Tcp)
+            .map_err(|err| Socks5Error::Io(format!("connect proxy: {}", err.kind()))),
+        UeSocketKind::Udp => {
+            let socket = UdpSocket::bind(local)
+                .await
+                .map_err(|err| Socks5Error::Io(format!("bind relay: {}", err.kind())))?;
+            socket
+                .connect(remote)
+                .await
+                .map_err(|err| Socks5Error::Io(format!("connect relay: {}", err.kind())))?;
+            Ok(UeSocket::Udp(socket))
+        }
     }
 }
 
@@ -797,6 +921,15 @@ mod tests {
     async fn spawn_test_socks5_server(
         require_auth: Option<(String, String)>,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_test_socks5_server_with_relay(require_auth, "127.0.0.1:0").await
+    }
+
+    async fn spawn_test_socks5_server_with_relay(
+        require_auth: Option<(String, String)>,
+        relay_bind: &str,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let relay = UdpSocket::bind(relay_bind).await.expect("bind relay");
+        let relay_address = relay.local_addr().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test proxy");
@@ -862,19 +995,40 @@ mod tests {
                 .await
                 .expect("associate addr");
 
-            // Stand up the relay socket and answer with a wildcard address, which
-            // is what real proxies do — exercising the client's rewrite path.
-            let relay = UdpSocket::bind("127.0.0.1:0").await.expect("bind relay");
-            let relay_port = relay.local_addr().expect("relay addr").port();
-            let mut reply = vec![SOCKS5_VERSION, REPLY_SUCCEEDED, 0x00, ATYP_IPV4];
-            reply.extend_from_slice(&[0, 0, 0, 0]);
-            reply.extend_from_slice(&relay_port.to_be_bytes());
+            assert!(
+                discard.iter().all(|byte| *byte == 0),
+                "unknown client UDP endpoint is all zeroes"
+            );
+            // IPv4 exercises the common wildcard reply. A concrete IPv6 relay
+            // behind this IPv4 TCP proxy exercises independent outer families.
+            let mut reply = vec![SOCKS5_VERSION, REPLY_SUCCEEDED, 0x00];
+            match relay_address.ip() {
+                IpAddr::V4(_) => {
+                    reply.push(ATYP_IPV4);
+                    reply.extend_from_slice(&[0, 0, 0, 0]);
+                }
+                IpAddr::V6(ip) => {
+                    reply.push(ATYP_IPV6);
+                    reply.extend_from_slice(&ip.octets());
+                }
+            }
+            reply.extend_from_slice(&relay_address.port().to_be_bytes());
             control.write_all(&reply).await.expect("associate reply");
 
             // Relay loop: decode the client's frame, echo the payload back tagged
             // with the destination it asked for.
-            let mut buffer = vec![0u8; 2048];
-            while let Ok((read, from)) = relay.recv_from(&mut buffer).await {
+            let mut buffer = vec![0u8; 65535];
+            let mut control_byte = [0u8; 1];
+            loop {
+                let (read, from) = tokio::select! {
+                    _ = control.read(&mut control_byte) => break,
+                    received = relay.recv_from(&mut buffer) => {
+                        match received {
+                            Ok(received) => received,
+                            Err(_) => break,
+                        }
+                    }
+                };
                 let Ok((destination, payload)) = decode_udp_datagram(&buffer[..read]) else {
                     continue;
                 };
@@ -884,11 +1038,203 @@ mod tests {
                     break;
                 }
             }
-            // Hold the control connection until the task is dropped, mirroring the
-            // RFC 1928 §7 lifetime rule.
+            // RFC 1928 §7: the UDP relay dies with its TCP control connection.
             drop(control);
         });
         (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn worker_socks5_tries_all_proxy_addresses_and_binds_the_actual_relay_family() {
+        use crate::services::ue_worker::UeSocketFamily;
+        let (proxy, server) = spawn_test_socks5_server_with_relay(None, "[::1]:0").await;
+        let endpoint = Socks5Endpoint::parse(&format!("socks5://{proxy}")).unwrap();
+        let unavailable = "192.0.2.99:1080".parse().unwrap();
+        let mut specs = Vec::new();
+        let client = Socks5UdpClient::connect_resolved_with(
+            &endpoint,
+            &[unavailable, proxy],
+            Duration::from_secs(3),
+            Some("test-ue-veth"),
+            |spec| {
+                specs.push(spec.clone());
+                async move {
+                    if spec.connect == Some(unavailable) {
+                        Err(Socks5Error::Io("mock route unavailable".into()))
+                    } else {
+                        host_socket(spec).await
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(specs.len(), 3);
+        assert!(specs
+            .iter()
+            .all(|spec| spec.bind_to_device.as_deref() == Some("test-ue-veth")));
+        assert_eq!(specs[0].connect, Some(unavailable));
+        assert_eq!(specs[1].connect, Some(proxy));
+        assert_eq!(specs[1].family, UeSocketFamily::Ipv4);
+        assert_eq!(specs[2].family, UeSocketFamily::Ipv6);
+        assert_eq!(specs[2].connect, Some(client.relay_addr()));
+        // Neither ultimate target determines the outer socket family.
+        for target in ["192.0.2.10:500", "[2001:db8::10]:4500"] {
+            let target = target.parse().unwrap();
+            client.send_to(target, &[1, 2, 3]).await.unwrap();
+            let (origin, payload) = client.recv_from().await.unwrap();
+            assert_eq!(origin, Some(target));
+            assert_eq!(payload, [1, 2, 3]);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn worker_socks5_socket_failures_never_fall_back_to_a_host_connection() {
+        let endpoint = Socks5Endpoint::parse("socks5://proxy.example:1080").unwrap();
+        let addresses = [
+            "192.0.2.1:1080".parse().unwrap(),
+            "[2001:db8::1]:1080".parse().unwrap(),
+        ];
+        let mut attempted = Vec::new();
+        let error = Socks5UdpClient::connect_resolved_with(
+            &endpoint,
+            &addresses,
+            Duration::from_secs(1),
+            Some("test-ue-veth"),
+            |spec| {
+                attempted.push(spec.connect.unwrap());
+                std::future::ready(Err(Socks5Error::Io("mock worker failure".into())))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(attempted, addresses);
+        assert!(matches!(error, Socks5Error::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn worker_socks5_generation_loss_stops_before_another_socket() {
+        let endpoint = Socks5Endpoint::parse("socks5://proxy.example:1080").unwrap();
+        let addresses = [
+            "192.0.2.1:1080".parse().unwrap(),
+            "192.0.2.2:1080".parse().unwrap(),
+        ];
+        let mut attempted = 0;
+        let error = Socks5UdpClient::connect_resolved_with(
+            &endpoint,
+            &addresses,
+            Duration::from_secs(1),
+            Some("test-ue-veth"),
+            |_| {
+                attempted += 1;
+                std::future::ready(Err(Socks5Error::WorkerChanged))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(attempted, 1);
+        assert_eq!(error, Socks5Error::WorkerChanged);
+    }
+
+    #[tokio::test]
+    async fn socks5_transport_preserves_each_epdg_target_through_ike_nat_t_and_esp() {
+        use super::super::transport::UdpSocketDatagramTransport;
+        let (proxy, server) = spawn_test_socks5_server(None).await;
+        let endpoint = Socks5Endpoint::parse(&format!("socks5://{proxy}")).unwrap();
+        // A v6 final target through a v4 relay used to bind the wrong family.
+        let client = Socks5UdpClient::connect(
+            &endpoint,
+            "2001:db8::1".parse().unwrap(),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert!(client.local_addr().unwrap().is_ipv4());
+        let transport = UdpSocketDatagramTransport::from_socks5(client)
+            .with_recv_timeout(Duration::from_secs(1))
+            .with_max_datagram_bytes(8192);
+        let retained = transport.clone();
+        drop(transport);
+        for target in [
+            "192.0.2.10:500",
+            "192.0.2.11:500",
+            "[2001:db8::10]:500",
+            "[2001:db8::11]:500",
+        ] {
+            let mut target: SocketAddr = target.parse().unwrap();
+            retained
+                .send_ike_metadata(target, &[1, 2, 3])
+                .await
+                .unwrap();
+            let (origin, payload, _) = retained.recv_ike_metadata().await.unwrap();
+            assert_eq!(origin, target);
+            assert_eq!(payload, [1, 2, 3]);
+            target.set_port(4500);
+            retained
+                .send_nat_t_metadata(target, &[4, 5, 6])
+                .await
+                .unwrap();
+            let (origin, payload, _) = retained.recv_nat_t_metadata().await.unwrap();
+            assert_eq!(origin, target);
+            assert_eq!(payload, [4, 5, 6]);
+            let esp = vec![0x42; 8192];
+            retained
+                .send_esp_nat_t_metadata(target, &esp)
+                .await
+                .unwrap();
+            let (origin, payload, _) = retained.recv_nat_t_raw_metadata().await.unwrap();
+            assert_eq!(origin, target);
+            assert_eq!(payload, esp);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn socks5_closed_control_is_an_explicit_failure_not_a_direct_fallback() {
+        let (proxy, server) = spawn_test_socks5_server(None).await;
+        let endpoint = Socks5Endpoint::parse(&format!("socks5://{proxy}")).unwrap();
+        let client = Socks5UdpClient::connect(
+            &endpoint,
+            "192.0.2.1".parse().unwrap(),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.is_control_alive().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(client
+            .send_to("192.0.2.1:500".parse().unwrap(), &[1])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn socks5_transport_keeps_the_callers_receive_timeout_classification() {
+        use super::super::transport::{TransportError, UdpSocketDatagramTransport};
+        let (proxy, server) = spawn_test_socks5_server(None).await;
+        let endpoint = Socks5Endpoint::parse(&format!("socks5://{proxy}")).unwrap();
+        let client = Socks5UdpClient::connect(
+            &endpoint,
+            "192.0.2.1".parse().unwrap(),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let transport = UdpSocketDatagramTransport::from_socks5(client)
+            .with_recv_timeout(Duration::from_millis(10));
+        assert!(matches!(
+            transport.recv_ike_metadata().await,
+            Err(TransportError::Timeout(_))
+        ));
+        server.abort();
     }
 
     #[tokio::test]

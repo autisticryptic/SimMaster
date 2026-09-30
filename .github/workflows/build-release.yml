@@ -257,6 +257,9 @@ jobs:
             connectivity::modems::ims::vowifi::carrier_catalog::v7::tests \
             connectivity::modems::ims::vowifi::profile_store::tests \
             connectivity::modems::ims::vowifi::socks5::tests \
+            connectivity::modems::ims::vowifi::transport::tests \
+            connectivity::modems::ims::vowifi::live::epdg_address_tests \
+            connectivity::modems::ims::vowifi::live::tests::full_handshake_keeps_proposal_and_transport_limits \
             services::trunk::transport::tests \
             services::e911::ssrf::tests \
             services::e911::ts43::tests \

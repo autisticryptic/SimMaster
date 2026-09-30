@@ -106,7 +106,6 @@ const LIVE_UE_DATAPLANE_READY_POLL: Duration = Duration::from_millis(200);
 const LIVE_IKE_NONCE_BYTES: usize = 32;
 const LIVE_IKE_SA_INIT_ATTEMPTS: usize = 1;
 const LIVE_IKE_AUTH_ATTEMPTS: usize = 3;
-const LIVE_IKE_MAX_ENDPOINTS_PER_PASS: usize = 5;
 const LIVE_IKE_MAX_PROPOSAL_GROUPS_PER_PASS: usize = 2;
 const LIVE_IKE_MAX_TRANSPORT_PATHS_PER_PASS: usize = 2;
 const IKE_PORT: u16 = 500;
@@ -2949,6 +2948,32 @@ async fn run_live_ike_until_depth(
     Err(last_error.unwrap_or_else(|| live_stage_error("epdg_no_address")))
 }
 
+/// A full handshake must not discard addresses after a fixed prefix of the
+/// DNS result. Keep host/family/proposal/path priority and the shallow status
+/// probe's one-address budget; stop as soon as an address succeeds.
+async fn try_live_epdg_addresses<T, F, Fut>(
+    addresses: &[SocketAddr],
+    depth: LiveProbeDepth,
+    mut attempt: F,
+) -> Result<T, LiveStageError>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: Future<Output = Result<T, LiveStageError>>,
+{
+    let count = match depth {
+        LiveProbeDepth::StatusSaInit => addresses.len().min(1),
+        LiveProbeDepth::FullHandshake => addresses.len(),
+    };
+    let mut last_error = None;
+    for address in &addresses[..count] {
+        match attempt(*address).await {
+            Ok(session) => return Ok(session),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| live_stage_error("epdg_no_address")))
+}
+
 async fn run_live_ike_until_depth_for_stack(
     line_id: &str,
     profile: &'static CarrierProfile,
@@ -2965,10 +2990,6 @@ async fn run_live_ike_until_depth_for_stack(
         return Err(live_stage_error("epdg_no_address"));
     }
 
-    let endpoint_limit = match depth {
-        LiveProbeDepth::StatusSaInit => 1,
-        LiveProbeDepth::FullHandshake => LIVE_IKE_MAX_ENDPOINTS_PER_PASS,
-    };
     let proposal_group_limit = match depth {
         LiveProbeDepth::StatusSaInit => 1,
         LiveProbeDepth::FullHandshake => LIVE_IKE_MAX_PROPOSAL_GROUPS_PER_PASS,
@@ -2991,117 +3012,159 @@ async fn run_live_ike_until_depth_for_stack(
     // host's addresses/proposals/transport paths before moving to the next UICC
     // or profile-derived host.
     for endpoint in endpoints {
-        let selected_epdg_host = endpoint.host;
-        let addresses = endpoint
-            .addresses
-            .into_iter()
-            .take(endpoint_limit)
-            .collect::<Vec<_>>();
-        if addresses.is_empty() {
-            warn!(host = %selected_epdg_host, "Resolved ePDG candidate had no addresses");
+        if endpoint.addresses.is_empty() {
+            warn!(host = %endpoint.host, "Resolved ePDG candidate had no addresses");
             continue;
         }
         info!(
-            host = %selected_epdg_host,
-            addresses = ?addresses,
+            host = %endpoint.host,
+            addresses = ?endpoint.addresses,
             "Trying resolved ePDG candidate"
         );
-        for address in addresses {
-            for proposal_group in &proposal_groups {
-                for path in transport_paths {
-                    let mut destination = address;
-                    destination.set_port(path.destination_port);
-                    info!(
-                        host = %selected_epdg_host,
-                        destination = ?destination,
-                        local_port_preferred = path.preferred_local_port,
-                        initial_nat_t = path.initial_nat_t,
-                        transport = "udp",
-                        ip_stack,
-                        "Attempting IKE connection path"
-                    );
-                    match run_live_ike_with_destination(
-                        line_id,
-                        profile,
-                        target,
-                        &selected_epdg_host,
-                        destination,
-                        *path,
-                        proposal_group,
-                        ip_stack,
-                    )
-                    .await
-                    {
-                        Ok(session) => {
-                            info!(
-                                host = %selected_epdg_host,
-                                selected_ike_proposals = ?proposal_group.proposals,
-                                destination = ?destination,
-                                "Successfully established IKE session"
-                            );
-                            return Ok(session);
-                        }
-                        Err(error) => {
-                            warn!(
-                                host = %selected_epdg_host,
-                                destination = ?destination,
-                                local_port_preferred = path.preferred_local_port,
-                                error = ?error,
-                                "IKE connection path failed; continuing fallback ladder"
-                            );
-                            last_error = Some(error);
+        let result = try_live_epdg_addresses(&endpoint.addresses, depth, |address| {
+            let selected_epdg_host = endpoint.host.as_str();
+            let route_kind = endpoint.route_policy.kind;
+            let proposal_groups = &proposal_groups;
+            async move {
+                let mut last_error = None;
+                for proposal_group in proposal_groups {
+                    for path in transport_paths {
+                        let mut destination = address;
+                        destination.set_port(path.destination_port);
+                        info!(
+                            host = %selected_epdg_host,
+                            destination = ?destination,
+                            local_port_preferred = path.preferred_local_port,
+                            initial_nat_t = path.initial_nat_t,
+                            transport = "udp",
+                            ip_stack,
+                            "Attempting IKE connection path"
+                        );
+                        match run_live_ike_with_destination(
+                            line_id,
+                            profile,
+                            target,
+                            selected_epdg_host,
+                            destination,
+                            route_kind,
+                            *path,
+                            proposal_group,
+                            ip_stack,
+                        )
+                        .await
+                        {
+                            Ok(session) => {
+                                info!(
+                                    host = %selected_epdg_host,
+                                    selected_ike_proposals = ?proposal_group.proposals,
+                                    destination = ?destination,
+                                    "Successfully established IKE session"
+                                );
+                                return Ok(session);
+                            }
+                            Err(error) => {
+                                warn!(
+                                    host = %selected_epdg_host,
+                                    destination = ?destination,
+                                    local_port_preferred = path.preferred_local_port,
+                                    error = ?error,
+                                    "IKE connection path failed; continuing fallback ladder"
+                                );
+                                last_error = Some(error);
+                            }
                         }
                     }
                 }
+                Err(last_error.unwrap_or_else(|| live_stage_error("epdg_no_address")))
             }
+        })
+        .await;
+        match result {
+            Ok(session) => return Ok(session),
+            Err(error) => last_error = Some(error),
         }
     }
 
     Err(last_error.unwrap_or_else(|| live_stage_error("epdg_no_address")))
 }
+fn live_ike_socket_spec(destination: SocketAddr, local_port: u16, interface: &str) -> UeSocketSpec {
+    let local = SocketAddr::new(unspecified_local_addr_for(destination).ip(), local_port);
+    // Unconnected: NAT-T changes the destination port, not the selected IP.
+    UeSocketSpec::udp_bound(local, Some(interface.to_string()))
+}
+
+fn checked_live_ike_proxy(
+    proxy: Option<LiveProxySetting>,
+    route_kind: ProxyKind,
+) -> Result<Option<LiveProxySetting>, LiveStageError> {
+    match (route_kind, &proxy) {
+        (ProxyKind::Direct, None)
+        | (ProxyKind::Socks5UdpAssociate, Some(LiveProxySetting::Socks5(_))) => Ok(proxy),
+        (ProxyKind::UdpRelay, _) => Err(live_stage_error(
+            "vowifi_proxy_mode_not_implemented:udp_relay",
+        )),
+        _ => Err(live_stage_error("ike_egress_policy_changed")),
+    }
+}
+
+async fn create_live_ike_transport(
+    line_id: &str,
+    destination: SocketAddr,
+    path: LiveIkeTransportPath,
+    route_kind: ProxyKind,
+) -> Result<UdpSocketDatagramTransport, LiveStageError> {
+    let ue_socket = required_ue_socket_context(line_id)?;
+    if !ue_socket.binding.is_current() {
+        return Err(live_stage_error("ike_ue_worker_generation_changed"));
+    }
+    let proxy = checked_live_ike_proxy(line_overrides(line_id).proxy, route_kind)?;
+    let transport = match proxy {
+        Some(LiveProxySetting::Socks5(endpoint)) => {
+            let client = super::socks5::Socks5UdpClient::connect_in_worker(
+                &endpoint,
+                &ue_socket.binding,
+                &ue_socket.ue_veth,
+                LIVE_DNS_TIMEOUT,
+            )
+            .await
+            .map_err(|error| {
+                map_transport_error(TransportError::UnsupportedProxy(error.to_string()))
+            })?;
+            UdpSocketDatagramTransport::from_socks5(client)
+        }
+        None => {
+            let spec =
+                live_ike_socket_spec(destination, path.preferred_local_port, &ue_socket.ue_veth);
+            match ue_socket.worker.create_socket(spec).await {
+                Ok(UeSocket::Udp(socket)) => UdpSocketDatagramTransport::from_socket(socket),
+                Ok(_) => return Err(live_stage_error("ike_ue_socket_family_mismatch")),
+                Err(error) => {
+                    warn!(line_id, error = %error, "UE worker IKE socket creation failed");
+                    return Err(live_stage_error("ike_ue_socket_creation_failed"));
+                }
+            }
+        }
+    };
+    if !ue_socket.binding.is_current() {
+        return Err(live_stage_error("ike_ue_worker_generation_changed"));
+    }
+    Ok(transport
+        .with_recv_timeout(LIVE_IKE_SA_INIT_TIMEOUT)
+        .with_max_datagram_bytes(8192))
+}
+
 async fn run_live_ike_with_destination(
     line_id: &str,
     profile: &'static CarrierProfile,
     target: LiveIkeTarget,
     selected_epdg_host: &str,
     destination: SocketAddr,
+    route_kind: ProxyKind,
     path: LiveIkeTransportPath,
     proposal_group: &LiveIkeProposalGroup,
     ip_stack: &'static str,
 ) -> Result<LiveIkeSession, LiveStageError> {
-    let ue_socket = required_ue_socket_context(line_id)?;
-    let base = unspecified_local_addr_for(destination);
-    let local_addr = SocketAddr::new(base.ip(), path.preferred_local_port);
-    info!(
-        "run_live_ike_with_destination: binding local_addr={:?} for destination={:?}",
-        local_addr, destination
-    );
-    info!(
-        destination = ?destination,
-        ip_stack,
-        transport = "udp",
-        "VoWiFi IKE transport is UDP"
-    );
-    // Use udp_bound (not udp_connected) because IKE switches from port 500 to
-    // port 4500 during NAT-T.
-    let spec = UeSocketSpec::udp_bound(local_addr, Some(ue_socket.ue_veth.clone()));
-    let transport = match ue_socket.worker.create_socket(spec).await {
-        Ok(UeSocket::Udp(socket)) => {
-            info!(
-                line_id,
-                ue_veth = %ue_socket.ue_veth,
-                "IKE transport socket created inside UE namespace"
-            );
-            UdpSocketDatagramTransport::from_socket(socket)
-        }
-        Ok(_) => return Err(live_stage_error("ike_ue_socket_family_mismatch")),
-        Err(error) => {
-            warn!(line_id, error = %error, "UE worker IKE socket creation failed");
-            return Err(live_stage_error("ike_ue_socket_creation_failed"));
-        }
-    }
-    .with_recv_timeout(LIVE_IKE_SA_INIT_TIMEOUT)
-    .with_max_datagram_bytes(8192);
+    let transport = create_live_ike_transport(line_id, destination, path, route_kind).await?;
 
     let initiator_spi = generate_initiator_spi()?;
     let initiator_nonce = generate_nonce()?;
@@ -10252,6 +10315,133 @@ fn stage_result(
 }
 
 #[cfg(test)]
+mod epdg_address_tests {
+    use super::*;
+    use crate::services::ue_worker::UeSocketFamily;
+
+    fn addresses() -> Vec<SocketAddr> {
+        [
+            "192.0.2.1:500",
+            "192.0.2.2:500",
+            "[2001:db8::1]:500",
+            "192.0.2.3:500",
+            "192.0.2.4:500",
+            "[2001:db8::2]:500",
+            "192.0.2.5:500",
+        ]
+        .into_iter()
+        .map(|address| address.parse().unwrap())
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn full_handshake_reaches_sixth_epdg_address_and_stops_after_success() {
+        let addresses = addresses();
+        let mut attempted = Vec::new();
+        let winner =
+            try_live_epdg_addresses(&addresses, LiveProbeDepth::FullHandshake, |address| {
+                attempted.push(address);
+                std::future::ready(if address == addresses[5] {
+                    Ok(address)
+                } else {
+                    Err(live_stage_error("no_response"))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(winner, addresses[5]);
+        assert_eq!(attempted, addresses[..6]);
+    }
+
+    #[tokio::test]
+    async fn all_epdg_addresses_keep_order_and_report_last_explicit_failure() {
+        let addresses = addresses();
+        let mut attempted = Vec::new();
+        let error = try_live_epdg_addresses::<(), _, _>(
+            &addresses,
+            LiveProbeDepth::FullHandshake,
+            |address| {
+                attempted.push(address);
+                std::future::ready(Err(live_stage_error(if address == addresses[6] {
+                    "last_route_failed"
+                } else {
+                    "earlier_failed"
+                })))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(attempted, addresses);
+        assert_eq!(error.reason, "last_route_failed");
+    }
+
+    #[tokio::test]
+    async fn epdg_status_probe_stays_single_address_and_empty_answers_do_not_send() {
+        let addresses = addresses();
+        let mut attempted = Vec::new();
+        let _ = try_live_epdg_addresses::<(), _, _>(
+            &addresses,
+            LiveProbeDepth::StatusSaInit,
+            |address| {
+                attempted.push(address);
+                std::future::ready(Err(live_stage_error("no_response")))
+            },
+        )
+        .await;
+        assert_eq!(attempted, addresses[..1]);
+        let error = try_live_epdg_addresses::<(), _, _>(&[], LiveProbeDepth::FullHandshake, |_| {
+            panic!("empty resolution must not create a socket");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.reason, "epdg_no_address");
+    }
+
+    #[test]
+    fn each_epdg_address_gets_its_own_family_and_worker_interface_binding() {
+        for address in addresses() {
+            for path in &LIVE_IKE_TRANSPORT_PATHS[..LIVE_IKE_MAX_TRANSPORT_PATHS_PER_PASS] {
+                let spec = live_ike_socket_spec(address, path.preferred_local_port, "test-ue-veth");
+                assert_eq!(
+                    spec.family,
+                    if address.is_ipv4() {
+                        UeSocketFamily::Ipv4
+                    } else {
+                        UeSocketFamily::Ipv6
+                    }
+                );
+                assert_eq!(spec.bind.unwrap().port(), path.preferred_local_port);
+                assert_eq!(spec.bind_to_device.as_deref(), Some("test-ue-veth"));
+                assert!(
+                    spec.connect.is_none(),
+                    "NAT-T uses the same selected IP at a new port"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn epdg_proxy_policy_cannot_silently_turn_into_a_direct_target() {
+        let proxy = Some(LiveProxySetting::Socks5(
+            super::super::socks5::Socks5Endpoint::parse("socks5://127.0.0.1:1080").unwrap(),
+        ));
+        assert!(
+            checked_live_ike_proxy(proxy.clone(), ProxyKind::Socks5UdpAssociate)
+                .unwrap()
+                .is_some()
+        );
+        assert!(checked_live_ike_proxy(None, ProxyKind::Direct)
+            .unwrap()
+            .is_none());
+        assert!(checked_live_ike_proxy(proxy, ProxyKind::Direct).is_err());
+        assert!(checked_live_ike_proxy(None, ProxyKind::Socks5UdpAssociate).is_err());
+        assert!(checked_live_ike_proxy(None, ProxyKind::UdpRelay).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -11683,8 +11873,7 @@ mod tests {
     }
 
     #[test]
-    fn full_handshake_covers_all_common_epdg_addresses_before_failing() {
-        assert_eq!(LIVE_IKE_MAX_ENDPOINTS_PER_PASS, 5);
+    fn full_handshake_keeps_proposal_and_transport_limits() {
         assert_eq!(LIVE_IKE_MAX_TRANSPORT_PATHS_PER_PASS, 2);
         assert_eq!(LIVE_IKE_MAX_PROPOSAL_GROUPS_PER_PASS, 2);
     }

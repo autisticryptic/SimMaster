@@ -83,7 +83,8 @@ use crate::connectivity::modems::ims::{
 use super::{
     bearer::{
         configure_bearer_network_in_worker, ensure_bearer_interface_ready,
-        route_media_host_in_worker, route_pcscf_in_worker, BearerConnection, BearerRequest,
+        route_media_host_in_worker, route_pcscf_candidates_in_worker, route_pcscf_in_worker,
+        BearerConnection, BearerRequest,
     },
     channel::CellularImsSipChannel,
     data_slot::DataSlotMode,
@@ -2551,6 +2552,19 @@ async fn connect_inner(
                     return Err(error);
                 }
             };
+            // Route the whole accepted bearer list and the selected discovery
+            // result before the first SIP candidate. This does not merge or
+            // reorder discovery sources, profiles, or address-family fallbacks.
+            verify_mm_task_bearer(runtime, native_bearer.as_mut()).await?;
+            ensure_generation(runtime, generation)?;
+            let prepared_routes = route_pcscf_candidates_in_worker(
+                &bearer,
+                &pcscf_candidates,
+                &network_worker_binding,
+            )
+            .await?;
+            ensure_generation(runtime, generation)?;
+            ensure_worker_binding_current(&network_worker_binding)?;
             tracing::info!(
                 family,
                 pcscf_count = pcscf_candidates.len(),
@@ -2571,21 +2585,34 @@ async fn connect_inner(
                         )),
                     )
                     .await;
-                match connect_family(
-                    runtime,
-                    &bearer,
-                    &device_identity,
-                    local_addr,
-                    pcscf,
-                    has_next_pcscf,
-                    &device,
-                    live.operator.video_enabled(),
-                    access_network_runtime,
-                    &network_worker_binding,
-                    native_bearer.as_mut(),
-                )
-                .await
-                {
+                // Failed route outcomes skip connect_family, so validate the
+                // same ownership/liveness gates before consuming either result.
+                verify_mm_task_bearer(runtime, native_bearer.as_mut()).await?;
+                ensure_generation(runtime, generation)?;
+                ensure_worker_binding_current(&network_worker_binding)?;
+                if let Some(native) = native_bearer.as_mut() {
+                    native.check_liveness()?;
+                }
+                let attempt = match prepared_routes.require(pcscf.ip()) {
+                    Ok(()) => {
+                        connect_family(
+                            runtime,
+                            &bearer,
+                            &device_identity,
+                            local_addr,
+                            pcscf,
+                            has_next_pcscf,
+                            &device,
+                            live.operator.video_enabled(),
+                            access_network_runtime,
+                            &network_worker_binding,
+                            native_bearer.as_mut(),
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match attempt {
                     Ok(session) => {
                         runtime
                             .record_attempt(
@@ -2749,15 +2776,13 @@ async fn connect_family(
         .settings
         .ensure_family_match(local_addr, pcscf.ip())?;
     ensure_worker_binding_current(worker_binding)?;
+    // Keep an idempotent just-in-time guard as well as the all-candidate
+    // preparation barrier: earlier REGISTER attempts may take minutes.
     route_pcscf_in_worker(bearer, pcscf.ip(), worker_binding).await?;
     ensure_worker_binding_current(worker_binding)?;
-    // The policy rule that steers SIP onto this bearer is keyed on the source
-    // address captured when the bearer settings were read. Maxis hands out a
-    // fresh address on every IMS PDN activation, so if the bearer re-addressed
-    // in the meantime that rule no longer matches and the REGISTER would leave
-    // over the host default route instead -- an eight second silent timeout
-    // reported as "all P-CSCF failed". Fail here instead, so the retry picks up
-    // the current address.
+    // Worker host routes are scoped to this namespace and select the captured
+    // bearer source/interface (no host policy-rule indirection). A re-addressed
+    // bearer must fail here, not reuse an old source for the next REGISTER.
     let worker_status = worker.refresh_net_status().await.map_err(|error| {
         CellularImsError::with_detail(code::RUNTIME_UE_WORKER_UNAVAILABLE, error.to_string())
     })?;

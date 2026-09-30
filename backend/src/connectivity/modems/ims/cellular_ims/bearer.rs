@@ -12,7 +12,12 @@
 //! `recreating IMS bearer to match roaming policy`,
 //! `Deleted stale disconnected IMS bearer`.
 
-use std::{collections::VecDeque, future::Future, net::IpAddr, process::Output};
+use std::{
+    collections::VecDeque,
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    process::Output,
+};
 
 use tokio::process::Command;
 
@@ -685,6 +690,87 @@ fn bearer_network_ops(
     Ok(ops)
 }
 
+/// Outcomes are scoped to this bearer/worker preparation, never cached across
+/// reconnects. A missing entry is not permission to use the namespace default.
+#[derive(Debug)]
+pub struct PcscfRoutePreparation {
+    outcomes: Vec<(IpAddr, Result<(), CellularImsError>)>,
+}
+
+impl PcscfRoutePreparation {
+    pub fn require(&self, pcscf: IpAddr) -> Result<(), CellularImsError> {
+        self.outcomes
+            .iter()
+            .find(|(host, _)| *host == pcscf)
+            .map(|(_, outcome)| outcome.clone())
+            .unwrap_or_else(|| {
+                Err(CellularImsError::with_detail(
+                    code::COMMAND_FAILED,
+                    format!("P-CSCF route was not prepared: {pcscf}"),
+                ))
+            })
+    }
+}
+
+/// Prepare every accepted bearer P-CSCF, plus the actual discovery result, before
+/// starting any REGISTER. Discovery precedence and CID attribution stay with the
+/// caller: do not remove failed addresses from settings and accidentally enable
+/// a different discovery fallback. Each route has its own outcome so one failed
+/// `ip route` does not leave later candidates unattempted.
+pub async fn route_pcscf_candidates_in_worker(
+    bearer: &BearerConnection,
+    candidates: &[SocketAddr],
+    worker: &UeWorkerBinding,
+) -> Result<PcscfRoutePreparation, CellularImsError> {
+    prepare_pcscf_routes_with(bearer, candidates, |op| apply_worker_ops(worker, vec![op])).await
+}
+
+async fn prepare_pcscf_routes_with<F, Fut>(
+    bearer: &BearerConnection,
+    candidates: &[SocketAddr],
+    mut apply: F,
+) -> Result<PcscfRoutePreparation, CellularImsError>
+where
+    F: FnMut(NetConfigOp) -> Fut,
+    Fut: Future<Output = Result<(), CellularImsError>>,
+{
+    let mut outcomes = Vec::new();
+    for host in bearer
+        .settings
+        .pcscf
+        .iter()
+        .copied()
+        .chain(candidates.iter().map(SocketAddr::ip))
+    {
+        if outcomes.iter().any(|(prepared, _)| *prepared == host) {
+            continue;
+        }
+        let outcome = match worker_host_route_op(bearer, host) {
+            Ok(op) => apply(op).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &outcome {
+            if error.code() == code::RUNTIME_UE_WORKER_GENERATION_CHANGED {
+                return Err(error.clone());
+            }
+            tracing::warn!(
+                interface = %bearer.interface,
+                pcscf = %host,
+                error = %error,
+                "P-CSCF route preparation failed; candidate cannot send REGISTER"
+            );
+        }
+        outcomes.push((host, outcome));
+    }
+    tracing::info!(
+        interface = %bearer.interface,
+        candidate_count = outcomes.len(),
+        routed_count = outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+        "Prepared all P-CSCF routes on the current IMS bearer before REGISTER"
+    );
+    Ok(PcscfRoutePreparation { outcomes })
+}
+
 pub async fn route_pcscf_in_worker(
     bearer: &BearerConnection,
     pcscf: IpAddr,
@@ -736,7 +822,16 @@ async fn apply_worker_ops(
             code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
         ));
     }
-    let outcome = worker.apply_net_config(ops).await.map_err(|error| {
+    let result = worker.apply_net_config(ops).await;
+    // Check even the error path: mapping a failed reply first would hide a
+    // worker restart as a retryable COMMAND_FAILED in both preparation and
+    // just-in-time routing.
+    if !worker.is_current() {
+        return Err(CellularImsError::new(
+            code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+        ));
+    }
+    let outcome = result.map_err(|error| {
         CellularImsError::with_detail(code::COMMAND_FAILED, format!("worker net-config: {error}"))
     })?;
     if outcome.ok {
@@ -1214,6 +1309,179 @@ fn list_ip_values(output: &str, key_prefix: &str) -> Vec<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pcscf_route_bearer() -> BearerConnection {
+        BearerConnection {
+            path: "owned-mm-bearer:test".into(),
+            interface: "wwan2".into(),
+            ip_type: "ipv4v6".into(),
+            settings: ImsIpSettings {
+                ipv4_address: Some("192.0.2.2".parse().unwrap()),
+                ipv4_gateway: Some("192.0.2.1".parse().unwrap()),
+                ipv6_address: Some("2001:db8:1::2".parse().unwrap()),
+                ipv6_gateway: Some("2001:db8:1::1".parse().unwrap()),
+                pcscf: vec![
+                    "192.0.2.10".parse().unwrap(),
+                    "192.0.2.11".parse().unwrap(),
+                    "2001:db8:2::10".parse().unwrap(),
+                ],
+                ..Default::default()
+            },
+            ipv4_prefix: Some(30),
+            ipv6_prefix: Some(64),
+            mtu: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pcscf_routes_prepare_every_bearer_and_selected_address_before_register() {
+        let bearer = pcscf_route_bearer();
+        // Selected profile/override/DNS endpoints must not hide the accepted
+        // bearer list; conversely, routing only the bearer list misses these.
+        let selected = [
+            "192.0.2.20:5060".parse::<SocketAddr>().unwrap(),
+            "192.0.2.20:5070".parse().unwrap(),
+            "192.0.2.10:5060".parse().unwrap(),
+        ];
+        let mut operations = Vec::new();
+        let prepared = prepare_pcscf_routes_with(&bearer, &selected, |op| {
+            operations.push(op);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        let expected = ["192.0.2.10", "192.0.2.11", "2001:db8:2::10", "192.0.2.20"];
+        assert_eq!(operations.len(), expected.len());
+        for (op, host) in operations.iter().zip(expected) {
+            assert_eq!(
+                op,
+                &worker_host_route_op(&bearer, host.parse().unwrap()).unwrap()
+            );
+        }
+        // The entire preparation barrier has finished before any candidate is
+        // permitted to open its SIP socket, including the alternate port.
+        for candidate in selected {
+            prepared.require(candidate.ip()).unwrap();
+        }
+        assert_eq!(bearer.settings.pcscf.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn pcscf_routes_isolate_each_install_failure_and_never_authorize_default_fallback() {
+        let bearer = pcscf_route_bearer();
+        for failed_index in 0..bearer.settings.pcscf.len() {
+            let mut attempted = 0;
+            let prepared = prepare_pcscf_routes_with(&bearer, &[], |_| {
+                let fails = attempted == failed_index;
+                attempted += 1;
+                std::future::ready(if fails {
+                    Err(CellularImsError::with_detail(
+                        code::COMMAND_FAILED,
+                        "route refused",
+                    ))
+                } else {
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(attempted, bearer.settings.pcscf.len());
+            for (index, host) in bearer.settings.pcscf.iter().copied().enumerate() {
+                assert_eq!(prepared.require(host).is_ok(), index != failed_index);
+            }
+            // An address without a prepared host route must not use veth's
+            // default route, even if other addresses were prepared successfully.
+            assert!(prepared.require("192.0.2.99".parse().unwrap()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn pcscf_routes_report_all_failed_candidates_without_mutating_discovery() {
+        let bearer = pcscf_route_bearer();
+        let original = bearer.clone();
+        let mut attempted = 0;
+        let prepared = prepare_pcscf_routes_with(&bearer, &[], |_| {
+            attempted += 1;
+            std::future::ready(Err(CellularImsError::new(code::COMMAND_FAILED)))
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempted, 3);
+        assert!(bearer
+            .settings
+            .pcscf
+            .iter()
+            .all(|host| prepared.require(*host).is_err()));
+        assert_eq!(bearer, original);
+    }
+
+    #[tokio::test]
+    async fn pcscf_routes_abort_preparation_on_worker_generation_change() {
+        let bearer = pcscf_route_bearer();
+        let mut attempted = 0;
+        let error = prepare_pcscf_routes_with(&bearer, &[], |_| {
+            attempted += 1;
+            std::future::ready(Err(CellularImsError::new(
+                code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+            )))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempted, 1);
+        assert_eq!(error.code(), code::RUNTIME_UE_WORKER_GENERATION_CHANGED);
+    }
+
+    #[tokio::test]
+    async fn pcscf_routes_do_not_borrow_a_source_from_an_ungranted_family() {
+        let mut bearer = pcscf_route_bearer();
+        bearer.settings.ipv6_address = None;
+        let mut operations = Vec::new();
+        let prepared = prepare_pcscf_routes_with(&bearer, &[], |op| {
+            operations.push(op);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(operations.len(), 2);
+        assert!(prepared.require(bearer.settings.pcscf[0]).is_ok());
+        assert_eq!(
+            prepared
+                .require(bearer.settings.pcscf[2])
+                .unwrap_err()
+                .code(),
+            code::ROUTE_FAMILY_MISMATCH
+        );
+    }
+
+    #[test]
+    fn pcscf_host_routes_keep_source_gateway_and_namespace_table_semantics() {
+        let mut bearer = pcscf_route_bearer();
+        let host = "192.0.2.10".parse().unwrap();
+        bearer.settings.ipv4_gateway = None;
+        assert_eq!(
+            worker_host_route_op(&bearer, host).unwrap(),
+            NetConfigOp::RouteReplace {
+                target: "192.0.2.10/32".into(),
+                via: None,
+                dev: Some("wwan2".into()),
+                src: Some("192.0.2.2".into()),
+                table: None,
+                onlink: false,
+            }
+        );
+        for gateway in ["2001:db8::1", "0.0.0.0"] {
+            bearer.settings.ipv4_gateway = Some(gateway.parse().unwrap());
+            assert_eq!(
+                worker_host_route_op(&bearer, host).unwrap_err().code(),
+                code::ROUTE_GATEWAY_FAMILY_MISMATCH
+            );
+        }
+        bearer.settings.ipv4_address = Some("0.0.0.0".parse().unwrap());
+        assert_eq!(
+            worker_host_route_op(&bearer, host).unwrap_err().code(),
+            code::ROUTE_FAMILY_MISMATCH
+        );
+    }
 
     #[test]
     fn worker_brings_moved_link_up_before_installing_routes() {

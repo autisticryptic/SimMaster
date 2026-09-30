@@ -127,8 +127,14 @@ pub struct DatagramPacketMetadata {
 }
 
 #[derive(Debug, Clone)]
+enum DatagramSocket {
+    Direct(Arc<UdpSocket>),
+    Socks5(Arc<super::socks5::Socks5UdpClient>),
+}
+
+#[derive(Debug, Clone)]
 pub struct UdpSocketDatagramTransport {
-    socket: Arc<UdpSocket>,
+    socket: DatagramSocket,
     recv_timeout: Duration,
     max_datagram_bytes: usize,
 }
@@ -142,17 +148,36 @@ impl UdpSocketDatagramTransport {
     }
 
     pub fn from_socket(socket: UdpSocket) -> Self {
-        if let Err(error) = allow_udp_fragmentation(&socket) {
+        Self::from_backend(DatagramSocket::Direct(Arc::new(socket)))
+    }
+
+    /// Retain the UDP association (including its TCP control socket) through
+    /// IKE, NAT-T and the ESP gateway. Each send still carries its own ultimate
+    /// destination, never the first resolved ePDG or the relay as a SIP target.
+    pub fn from_socks5(client: super::socks5::Socks5UdpClient) -> Self {
+        Self::from_backend(DatagramSocket::Socks5(Arc::new(client)))
+    }
+
+    fn from_backend(socket: DatagramSocket) -> Self {
+        let transport = Self {
+            socket,
+            recv_timeout: Duration::from_secs(8),
+            max_datagram_bytes: 4096,
+        };
+        if let Err(error) = allow_udp_fragmentation(transport.raw_socket()) {
             tracing::warn!(
-                local_addr = ?socket.local_addr().ok(),
+                local_addr = ?transport.local_addr().ok(),
                 error = %error,
                 "Could not enable outer UDP/IP fragmentation for ePDG transport"
             );
         }
-        Self {
-            socket: Arc::new(socket),
-            recv_timeout: Duration::from_secs(8),
-            max_datagram_bytes: 4096,
+        transport
+    }
+
+    fn raw_socket(&self) -> &UdpSocket {
+        match &self.socket {
+            DatagramSocket::Direct(socket) => socket,
+            DatagramSocket::Socks5(client) => client.udp_socket(),
         }
     }
 
@@ -167,7 +192,7 @@ impl UdpSocketDatagramTransport {
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
-        self.socket
+        self.raw_socket()
             .local_addr()
             .map_err(|err| TransportError::Io(err.kind().to_string()))
     }
@@ -178,10 +203,20 @@ impl UdpSocketDatagramTransport {
         destination: SocketAddr,
         payload: &[u8],
     ) -> Result<DatagramPacketMetadata, TransportError> {
-        self.socket
-            .send_to(payload, destination)
-            .await
-            .map_err(|err| TransportError::Io(err.kind().to_string()))?;
+        match &self.socket {
+            DatagramSocket::Direct(socket) => {
+                socket
+                    .send_to(payload, destination)
+                    .await
+                    .map_err(|err| TransportError::Io(err.kind().to_string()))?;
+            }
+            DatagramSocket::Socks5(client) => {
+                client
+                    .send_to(destination, payload)
+                    .await
+                    .map_err(|err| TransportError::Io(err.to_string()))?;
+            }
+        }
 
         Ok(DatagramPacketMetadata {
             remote: destination,
@@ -195,13 +230,38 @@ impl UdpSocketDatagramTransport {
         &self,
         channel: &'static str,
     ) -> Result<(SocketAddr, Vec<u8>, DatagramPacketMetadata), TransportError> {
-        let mut buffer = vec![0u8; self.max_datagram_bytes];
-        let received = tokio::time::timeout(self.recv_timeout, self.socket.recv_from(&mut buffer))
-            .await
-            .map_err(|_| TransportError::Timeout(format!("{channel} receive timed out")))?
-            .map_err(|err| TransportError::Io(err.kind().to_string()))?;
-        let (bytes, remote) = received;
-        buffer.truncate(bytes);
+        let (remote, buffer) = match &self.socket {
+            DatagramSocket::Direct(socket) => {
+                let mut buffer = vec![0u8; self.max_datagram_bytes];
+                let (bytes, remote) =
+                    tokio::time::timeout(self.recv_timeout, socket.recv_from(&mut buffer))
+                        .await
+                        .map_err(|_| {
+                            TransportError::Timeout(format!("{channel} receive timed out"))
+                        })?
+                        .map_err(|err| TransportError::Io(err.kind().to_string()))?;
+                buffer.truncate(bytes);
+                (remote, buffer)
+            }
+            DatagramSocket::Socks5(client) => {
+                let (origin, payload) = client
+                    .recv_from_with_limits(self.recv_timeout, self.max_datagram_bytes)
+                    .await
+                    .map_err(|err| match err {
+                        super::socks5::Socks5Error::Timeout(_) => {
+                            TransportError::Timeout(format!("{channel} receive timed out"))
+                        }
+                        other => TransportError::Io(other.to_string()),
+                    })?;
+                // Do not guess that an unidentifiable proxy response came from
+                // the current candidate; keep IKE/ESP peer validation intact.
+                let remote = origin.ok_or_else(|| {
+                    TransportError::Io("SOCKS5 reply has no numeric origin".into())
+                })?;
+                (remote, payload)
+            }
+        };
+        let bytes = buffer.len();
 
         let metadata = DatagramPacketMetadata {
             remote,
@@ -614,7 +674,7 @@ mod tests {
         let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         let result = unsafe {
             libc::getsockopt(
-                transport.socket.as_raw_fd(),
+                transport.raw_socket().as_raw_fd(),
                 libc::IPPROTO_IP,
                 libc::IP_MTU_DISCOVER,
                 &mut value as *mut libc::c_int as *mut libc::c_void,

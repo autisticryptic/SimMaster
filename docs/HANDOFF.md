@@ -3,7 +3,21 @@
 > 更新：2026-09-30。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 本轮交接：2026-09-30（请先读这里）
+## 路由补全续接：2026-09-30（本节优先）
+
+已重新核对六份交接、Git、GitHub Actions、旧抓包脚本与实际调用链。**当前实现仍待对应新 SHA 的 Rust CI / 双架构制品与部署验收，不宣称已经修好注册。**
+
+- 03:32 UTC 固定公钥只读核实 LAN 目标仍为 `828135b / PID85175`，运行 hash 与既有已验证 ARM64 一致；MM577 / secondary343 未变，管理走 `wlan0`，数据库 `quick_check=ok`，无活动通话、无启用任务、未安装 catalog。
+  IMS `registered=false / recovery_state=exhausted`，错误引用已不存在的 `Modem/1`，现存对象为 `Modem/2`；有 1 条 receipt、无 `.create`，**没有删除或重放恢复**。
+- **纠正上一轮根因断言**：`capture.json` 的单条路由、零包/零接口计数是真实记录，但脚本 `route get` 使用写死的历史地址，不是本次承载动态候选；快照主要在首候选阶段。源码对每个实际候选先 await 路由安装，再创建绑定该接口的 socket，失败会传播；日志另有 WDS `tx=1312 bytes`。因此旧证据不能证明实际 REGISTER 经 veth 发出，也不能认定路由是零包的唯一根因。
+- 蜂窝实现：在第一条 REGISTER 前为当前承载已接受的 P-CSCF 及本轮实际发现结果逐项预装路由；按 IP 去重，每个地址独立失败，未成功准备者不能进入 SIP；保留发送前幂等路由检查和代次/承载校验。不改变 PCO→精确归属 AT→配置/DNS 的既有发现优先级，不扩大 CID 归属规则。
+- VoWiFi 实际链路：DNS 已保留 A/AAAA 列表，IPv4 veth 默认路由本来覆盖所有 IPv4 目标；真正的消费截断是完整握手只取前 5 个地址。现改为完整遍历、成功即止，浅状态探针仍只取 1 个，profile/内层地址族/proposal/path 顺序与限制保持。
+  另发现 SOCKS5 原来只用于 DNS，live IKE 仍无条件直连；现通过同一捕获的 UE worker 创建 TCP 控制与 UDP relay，外层 socket 按实际 relay 族绑定，每个 IKE/NAT-T/ESP 数据报携带自己的最终地址/端口，不因代理失败偷偷直连。
+- 保留边界：没有为测试机开启 VoWiFi；未新增主机/UE IPv6 上游配置，缺少外层 IPv6 网络不能靠虚构路由解决。既有代理主机名解析与 DNS 系统回退路径未迁移；不能宣传为所有 DNS 都在 worker 或完全无本地 DNS。UDP relay 私有模式及域名型 SOCKS relay 地址仍明确不支持；本次未改 NAT-T 源端口策略。
+- 本地已通过 209 Python、21 前端 unit、TypeScript / ESLint、定向 rustfmt / diff；Rust 只交给 Actions。新增回归覆盖多候选、路由失败/代次、超过五个 ePDG、SOCKS 不同目标/族/端口、控制连接生命周期、8 KiB 包与超时。
+  证据 `.local/evidence/ims-route-completion/`；最新 CI、部署和实测结果后续追加。
+
+## 本轮交接：2026-09-30（历史快照，以上续接结论优先）
 
 **下一位 AI 的完整入口是 [NEXT_AI_HANDOFF_2026-09-30.md](NEXT_AI_HANDOFF_2026-09-30.md)**，
 已包含当前实机状态、已批准但尚未实现的路由补全，以及用户提过但未进 todo 的全部遗留项。要点：

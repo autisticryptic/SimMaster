@@ -217,8 +217,12 @@ pub async fn resolve_epdg_via_socks5(
     proxy: &super::socks5::Socks5Endpoint,
 ) -> Result<ResolvedEpdgEndpoint, TransportError> {
     let Some(dns_server) = dns_server else {
-        // No server to query through the proxy; keep the existing behaviour.
-        return resolve_epdg_with_dns_override(profile, host, port, dns_server).await;
+        // Keep the existing system-DNS fallback, but do not confuse DNS egress
+        // with the configured IKE/ESP egress policy for any returned address.
+        let mut endpoint = resolve_epdg_with_dns_override(profile, host, port, None).await?;
+        endpoint.route_policy =
+            choose_route_policy(profile, host, Some(ProxyKind::Socks5UdpAssociate));
+        return Ok(endpoint);
     };
 
     let client =
@@ -723,6 +727,70 @@ mod tests {
         profiles::{GB_EE_23433, US_ATT_310410},
         transport::ProxyKind,
     };
+
+    #[tokio::test]
+    async fn epdg_system_dns_fallback_preserves_the_configured_proxy_egress() {
+        let proxy = super::super::socks5::Socks5Endpoint::parse("socks5://127.0.0.1:1080").unwrap();
+        // Literal resolution is offline; no proxy listener or external DNS.
+        let endpoint = resolve_epdg_via_socks5(&GB_EE_23433.meta, "192.0.2.10", 500, None, &proxy)
+            .await
+            .unwrap();
+        assert_eq!(endpoint.addresses, vec!["192.0.2.10:500".parse().unwrap()]);
+        assert_eq!(endpoint.route_policy.kind, ProxyKind::Socks5UdpAssociate);
+    }
+
+    #[tokio::test]
+    async fn epdg_dns_retains_all_a_and_aaaa_candidates_and_the_requested_port() {
+        let responder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns_server = responder.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut request = vec![0u8; 512];
+                let (length, peer) =
+                    tokio::time::timeout(Duration::from_secs(3), responder.recv_from(&mut request))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                request.truncate(length);
+                let qtype = u16::from_be_bytes([request[length - 4], request[length - 3]]);
+                let ips: Vec<IpAddr> = match qtype {
+                    1 => ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"]
+                        .iter()
+                        .map(|ip| ip.parse().unwrap())
+                        .collect(),
+                    28 => ["2001:db8::1", "2001:db8::2", "2001:db8::3"]
+                        .iter()
+                        .map(|ip| ip.parse().unwrap())
+                        .collect(),
+                    _ => panic!("unexpected DNS type"),
+                };
+                let mut response = request;
+                response[2..4].copy_from_slice(&[0x81, 0x80]);
+                response[6..8].copy_from_slice(&(ips.len() as u16).to_be_bytes());
+                for ip in ips {
+                    response.extend_from_slice(&[0xc0, 0x0c]);
+                    response.extend_from_slice(&qtype.to_be_bytes());
+                    response.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+                    let bytes = match ip {
+                        IpAddr::V4(ip) => ip.octets().to_vec(),
+                        IpAddr::V6(ip) => ip.octets().to_vec(),
+                    };
+                    response.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                    response.extend_from_slice(&bytes);
+                }
+                responder.send_to(&response, peer).await.unwrap();
+            }
+        });
+        let endpoint =
+            resolve_epdg_with_dns_override(&GB_EE_23433.meta, "epdg.test", 4500, Some(dns_server))
+                .await
+                .unwrap();
+        task.await.unwrap();
+        assert_eq!(endpoint.addresses.len(), 7);
+        assert_eq!(endpoint.addresses.iter().filter(|a| a.is_ipv4()).count(), 4);
+        assert_eq!(endpoint.addresses.iter().filter(|a| a.is_ipv6()).count(), 3);
+        assert!(endpoint.addresses.iter().all(|a| a.port() == 4500));
+    }
 
     #[test]
     fn plan_preserves_clean_room_profile_metadata() {
