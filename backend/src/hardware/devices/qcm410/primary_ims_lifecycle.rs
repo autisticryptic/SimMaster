@@ -44,6 +44,10 @@ use super::{
 #[path = "primary_ims_recovery.rs"]
 pub mod recovery;
 
+#[cfg(target_os = "linux")]
+#[path = "primary_ims_profile_lease.rs"]
+pub mod profile_lease;
+
 const SERVICE: &str = "org.freedesktop.ModemManager1";
 const MODEM: &str = "org.freedesktop.ModemManager1.Modem";
 const BEARER: &str = "org.freedesktop.ModemManager1.Bearer";

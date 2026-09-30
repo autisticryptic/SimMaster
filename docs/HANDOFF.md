@@ -9,6 +9,15 @@
 
 **最新进展：用户刚在同一设备手工运行 `/root/temp/simadmin`（beta8）并确认蜂窝IMS注册成功，随后已停止beta8，且没有重新启动SimAdmin主服务。10:56 UTC只读核实两程序均无运行进程，`simadmin.service` inactive；安装目录仍是cf13a66但不是正在运行的版本。** 不根据下方旧PID3365记录擅自启动服务。MM当前PID48819、secondary服务inactive，这些变化发生在用户测试前后，不是agent重启/停服；管理仍走usb0。
 
+### Exact-family 显式维护入口（实现完成，Rust待本候选CI）
+
+用户已批准派生侧临时自有IMS profile生命周期和一次受控对照，并确认现有CID自动选择不应重做。已检查MM1.24源码：该QMI驱动IndexField=profile-id，Set不传ID走Create Profile，传ID走Modify；因此新增**显式维护命令**而非改变自动注册循环。
+
+- `mm-ims-profile-lease` 默认inspect，acquire需要匹配当前快照的plan token，release要求APN/family匹配自有记录。严格新建并接受实际返回ID，验证唯一tag/MM与AT族/APN、完整原profile/EPS/reporting未变。
+- 需要两套程序停止、无bearer/call/未知承载receipt；不创建承载、不启动服务、不修改现有PDP、Initial EPS、默认族顺序或profile大兜底。元数据账本在/var/lib持久保存，Set/恢复reporting/Delete结果不明时保留并阻断，不盲重试写操作。
+- 本地218 Python与格式/diff检查已通过；新Rust/mock/private-D-Bus测试已接入两套Actions过滤器，**尚待此候选CI，设备未运行此命令或写profile**。此阶段只建立安全对照能力，尚未证明exact-family能解决当前eSIM。
+- 设计/命令/约束：[MM exact-family profile维护](IMS_MM_EXACT_FAMILY_LEASE_DESIGN.md)。后续必须先验证完整SHA日志和双架构制品，再执行只读inspect及经批准的一次对照。
+
 ### beta8 同机成功对照（最新，优先于下方无成功对照的记录）
 
 - `/root/temp/simadmin` ELF ARM64、8732248字节、SHA-256 `210c35b11f54dd240a83e90dd08d5e8a8f4f2cea227ce3a0503a9ced4140f9b7`，meta为**1.1.7-beta8 / 930365d**，与本地既有二进制分析完全一致，不是只看名称猜版本。

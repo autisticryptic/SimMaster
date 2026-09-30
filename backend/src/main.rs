@@ -407,6 +407,22 @@ enum CliCommand {
         #[arg(long)]
         require_mm: bool,
     },
+    /// Explicit temporary IMS profile maintenance. Does not start a bearer or server.
+    MmImsProfileLease {
+        #[arg(long, default_value = "inspect", value_parser = ["inspect", "acquire", "release"])]
+        action: String,
+        #[arg(long)]
+        modem: String,
+        #[arg(long)]
+        device: String,
+        #[arg(long, value_parser = ["ipv4v6", "ipv6", "ipv4"])]
+        family: String,
+        #[arg(long)]
+        apn: String,
+        /// Token from a matching inspect result, mandatory for acquire.
+        #[arg(long)]
+        expected_plan: Option<String>,
+    },
     /// Run the detected device driver's boot-time native-bearer initializer.
     DeviceInit {
         /// Write any device-owned udev rules and reload udev (default: yes).
@@ -661,6 +677,33 @@ async fn main() -> Result<()> {
         }
         println!("{}", serde_json::to_string_pretty(&bindings)?);
         return Ok(());
+    }
+    if let Some(CliCommand::MmImsProfileLease {
+        action,
+        modem,
+        device,
+        family,
+        apn,
+        expected_plan,
+    }) = &cli.command
+    {
+        #[cfg(target_os = "linux")]
+        {
+            let report = hardware::devices::qcm410::mm_ims_profile_lease::maintain(
+                action,
+                modem,
+                device,
+                family,
+                apn,
+                expected_plan.as_deref(),
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            println!("{}", serde_json::to_string(&report)?);
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("MM IMS profile maintenance requires Linux");
     }
     if let Some(CliCommand::DeviceInit {
         write_udev_rule,

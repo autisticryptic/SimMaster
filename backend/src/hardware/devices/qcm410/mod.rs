@@ -17,6 +17,8 @@ pub mod baseband_faults;
 pub mod ims_bearer;
 pub mod netdev;
 mod primary_ims_lifecycle;
+#[cfg(target_os = "linux")]
+pub use primary_ims_lifecycle::profile_lease as mm_ims_profile_lease;
 pub use primary_ims_lifecycle::recovery as mm_pcscf_recovery;
 mod primary_ims_pcscf;
 mod primary_ims_session;

@@ -1,7 +1,20 @@
 # MM IMS Exact-Family Profile Lease Design
 
-> 状态：设计稿，未接入生产代码，未在设备执行。2026-09-30新增同机beta8成功证据与实施边界见下一节，旧§创建策略不是当前已实现行为。
+> 状态：2026-09-30已实现显式维护入口，尚待本候选Actions/制品验证，未在设备执行。未接入自动注册回退；下文生产lease方案仍是设计，不能把维护入口完成等同于IMS修复。
 > 目标：解决 ModemManager 中有效 `profile-id` 优先于请求 `ip-type` 的约束，同时保持单一 MM owner、UE namespace 隔离和可核验恢复。
+
+## 显式维护入口（实现中，设备尚未执行）
+
+`simadmin mm-ims-profile-lease --modem <MM对象路径> --device <控制设备> --family <ipv4v6|ipv6|ipv4> --apn <派生IMS APN>` 默认`--action inspect`，输出与当前完整快照关联的`plan` token。
+`--action acquire --expected-plan <token>` 才调用不含profile-id的ProfileManager.Set；`--action release`只处理该设备的自有receipt，要求APN/family与记录相符。
+
+- 只接受已验证QCM410 BAM-DMUX/QMI拓扑、同MM unique owner与SIM、IndexField=profile-id。要求两套主程序均已停止、无bearer/通话或未知bearer receipt；不调用Enable/Disable/Connect/CreateBearer，也不启动服务。
+- acquire前读取两次完整MM profile字段指纹、AT定义行及PDP族/APN、Initial EPS、所有CID reporting；仍然自动取得新ID，不写死4，也不向Set传任何现有ID。返回新ID后读回并核验MM/AT族与APN一致、唯一tag、原条目全未改。
+- QMI profile可能跨重启存在，因此元数据receipt保存在`/var/lib/simadmin/mm-ims-profile-lease/`而非仅/run；写前Creating、已知返回ID、Owned、RestoringReporting、Deleting状态均持久化，使用flock/O_NOFOLLOW与目录权限/文件校验。receipt仅保存原字段哈希，不保存原profile认证口令；不是配置/数据库备份。
+- 新ID可能落入任一空闲位置，因此试验前要求所有未定义CID的reporting均为000；不假定删除能恢复非默认reporting。执行release时若该自有CID被应用设成111，先恢复其确切原值，再删除自有profile并验证原完整列表/AT/InitialEPS/reporting恢复；不写回已有普通profile。
+- Set超时/取消/返回值不确定或存储失败保留Creating，禁止新建/猜ID删除。报告恢复与Delete超时不重复写；只有只读证明前次操作已完成才允许推进/结案，未知owner/SIM/字段变化仍失败关闭。
+- **此入口不改变现有自动CID选择、profile来源大兜底或地址族顺序，也没有偷偷增加“无响应再新建profile”的生产流程。** 下一阶段用已通过CI的维护能力进行一次独立profile对照，再根据证据决定生产集成；当前不能声称已经注册。
+- 单元/mock及private-D-Bus测试覆盖无ID Set、非固定返回ID、MM/AT不一致、原字段/owner/SIM变化、每次持久化失败、Set取消、报告恢复和Delete不确定结果、状态回收和身份字段不进入receipt。Rust只在Actions运行。
 
 ## 2026-09-30：同机 beta8 成功带来的新证据
 
