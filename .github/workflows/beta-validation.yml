@@ -144,6 +144,7 @@ jobs:
             connectivity::modems::ims::vowifi::operator::tests::two_dialogs_keep_progress_media_dtmf_and_reinvite_state_independent \
             services::e911::ssrf::tests \
             services::e911::ts43::tests \
+            connectivity::core::register::tests \
             connectivity::core::outbound::tests \
             connectivity::core::ims_access::tests \
             connectivity::core::ims_registration_coordinator::tests \

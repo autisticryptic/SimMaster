@@ -82,6 +82,7 @@ class RuntimeProfileBoundaryTests(unittest.TestCase):
     def test_both_ci_suites_execute_runtime_and_private_bus_regressions(self):
         for name in ("beta-validation.yml", "build-release.yml"):
             text = (ROOT / ".github/workflows" / name).read_text()
+            self.assertIn("connectivity::core::register::tests", text)
             for suffix in ("runtime::tests", "runtime::dbus_tests"):
                 self.assertIn("hardware::devices::qcm410::primary_ims_lifecycle::profile_lease::" + suffix, text)
 
