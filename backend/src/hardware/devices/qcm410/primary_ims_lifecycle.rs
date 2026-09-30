@@ -236,6 +236,10 @@ impl MmBus {
         }))
     }
 
+    pub fn has_profile_setup_guard(&self) -> bool {
+        self.setup_current.is_some()
+    }
+
     fn authorize_setup_dispatch(&self) -> Result<(), String> {
         if self
             .setup_current

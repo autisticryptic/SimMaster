@@ -706,8 +706,9 @@ impl ImsBearerTransport for RuntimeProfileTransport {
                     attempt(context, permit, family, families, allow_roaming, current).await;
                 deliver(sender, result).await;
             });
-            receiver
+            tokio::time::timeout(Duration::from_secs(120), receiver)
                 .await
+                .map_err(|_| failure("mm_ims_profile_runtime_setup_timeout_unverified"))?
                 .map_err(|_| failure("mm_ims_profile_runtime_task_failed"))?
         })
     }

@@ -69,6 +69,16 @@ class RuntimeProfileBoundaryTests(unittest.TestCase):
         self.assertLess(shutdown.index("cleanup_live_for_shutdown"), shutdown.index("hardware::devices::shutdown_owned_ims_sessions().await"))
         self.assertIn("let _ = ims_cleanup_wait.await", main)
 
+    def test_runtime_outer_timeout_keeps_inner_late_result_coupled_to_profile(self):
+        runtime = (QCM / "primary_ims_profile_runtime.rs").read_text()
+        self.assertIn("tokio::time::timeout(Duration::from_secs(120), receiver)", runtime)
+        session = (QCM / "primary_ims_session.rs").read_text()
+        self.assertIn("has_profile_setup_guard()", session)
+        receive = part(session, "async fn receive_setup_result<T>", "async fn deliver_setup")
+        guarded = part(receive, "if profile_owns_timeout {", "} else {")
+        self.assertIn("receiver.await", guarded)
+        self.assertNotIn("timeout(", guarded)
+
     def test_both_ci_suites_execute_runtime_and_private_bus_regressions(self):
         for name in ("beta-validation.yml", "build-release.yml"):
             text = (ROOT / ".github/workflows" / name).read_text()

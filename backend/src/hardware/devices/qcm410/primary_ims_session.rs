@@ -82,6 +82,9 @@ impl PrimaryImsSession {
             armed: true,
         };
         let pending = lifecycle::PendingSetup::new();
+        let profile_owns_timeout = pinned_bus
+            .as_ref()
+            .is_some_and(|bus| bus.has_profile_setup_guard());
         let (sender, receiver) = oneshot::channel();
         // Shield CreateBearer/Connect from caller cancellation. If the caller
         // disappears, the task must still record the returned object and clean
@@ -94,10 +97,8 @@ impl PrimaryImsSession {
             })
             .await;
         });
-        let result = tokio::time::timeout(Duration::from_secs(90), receiver)
-            .await
-            .map_err(|_| "qca410_primary_mm_setup_timeout_unverified".to_string())?
-            .map_err(|_| "qca410_primary_mm_setup_task_failed".to_string())?;
+        let result =
+            receive_setup_result(receiver, profile_owns_timeout, Duration::from_secs(90)).await?;
         cancellation.armed = false;
         result
     }
@@ -300,6 +301,23 @@ fn canonical_modem_path(selector: &str) -> Result<String, String> {
         .parse::<u32>()
         .map_err(|_| "qca410_primary_mm_modem_selector_invalid".to_string())?;
     Ok(format!("{MODEM_PREFIX}{id}"))
+}
+
+async fn receive_setup_result<T>(
+    receiver: oneshot::Receiver<T>,
+    profile_owns_timeout: bool,
+    ordinary_budget: Duration,
+) -> Result<T, String> {
+    let result = if profile_owns_timeout {
+        // The runtime adapter owns the caller's deadline and shields this
+        // receiver so late Create results still reach profile cleanup.
+        receiver.await
+    } else {
+        tokio::time::timeout(ordinary_budget, receiver)
+            .await
+            .map_err(|_| "qca410_primary_mm_setup_timeout_unverified".to_string())?
+    };
+    result.map_err(|_| "qca410_primary_mm_setup_task_failed".to_string())
 }
 
 async fn deliver_setup<T, F, R>(
@@ -787,6 +805,30 @@ mod tests {
     const MODEM: &str = "/org/freedesktop/ModemManager1/Modem/56";
     const BEARER: &str = "/org/freedesktop/ModemManager1/Bearer/45";
     const OTHER: &str = "/org/freedesktop/ModemManager1/Bearer/46";
+
+    #[tokio::test]
+    async fn runtime_profile_outer_deadline_retains_late_setup_results_but_ordinary_timeout_stays()
+    {
+        let (send, receive) = oneshot::channel();
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            send.send("late-owned-result").unwrap();
+        });
+        assert_eq!(
+            receive_setup_result(receive, true, Duration::from_millis(1))
+                .await
+                .unwrap(),
+            "late-owned-result"
+        );
+        sender.await.unwrap();
+        let (_send, receive) = oneshot::channel::<()>();
+        assert_eq!(
+            receive_setup_result(receive, false, Duration::from_millis(1))
+                .await
+                .unwrap_err(),
+            "qca410_primary_mm_setup_timeout_unverified"
+        );
+    }
 
     fn request() -> PrimaryImsRequest<'static> {
         PrimaryImsRequest {
