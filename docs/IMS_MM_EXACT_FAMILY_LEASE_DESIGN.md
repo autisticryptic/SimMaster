@@ -1,20 +1,31 @@
 # MM IMS Exact-Family Profile Lease Design
 
-> 状态：2026-09-30已实现显式维护入口，尚待本候选Actions/制品验证，未在设备执行。未接入自动注册回退；下文生产lease方案仍是设计，不能把维护入口完成等同于IMS修复。
+> 状态：2026-09-30显式维护入口已完成代码/两套CI/双架构，并在设备验证MM-AT安全新建与删除闭环（6a77d92）；QMI Set创建请求被设备拒绝的事实保留。未接入自动注册回退、未进行临时profile上的SIP注册，不能把维护入口完成等同于IMS修复。
 > 目标：解决 ModemManager 中有效 `profile-id` 优先于请求 `ip-type` 的约束，同时保持单一 MM owner、UE namespace 隔离和可核验恢复。
 
-## 显式维护入口（实现中，设备尚未执行）
+## 显式维护入口（代码/CI及 profile 生命周期已实机验证）
 
 `simadmin mm-ims-profile-lease --modem <MM对象路径> --device <控制设备> --family <ipv4v6|ipv6|ipv4> --apn <派生IMS APN>` 默认`--action inspect`，输出与当前完整快照关联的`plan` token。
-`--action acquire --expected-plan <token>` 才调用不含profile-id的ProfileManager.Set；`--action release`只处理该设备的自有receipt，要求APN/family与记录相符。
+`--action acquire --expected-plan <token>` 调用不含profile-id的ProfileManager.Set；`--action acquire-at --expected-plan <token>` 是明确选择的MM Command路径，先查询AT能力/活动与双快照，只在不存在的受支持CID上定义profile。二者不自动相互回退。
+`--action release`只处理该设备的自有receipt，要求APN/family与记录相符；只有自有配置读回一致、无承载/通话、恢复原reporting后才通过MM删除并验证。
 
 - 只接受已验证QCM410 BAM-DMUX/QMI拓扑、同MM unique owner与SIM、IndexField=profile-id。要求两套主程序均已停止、无bearer/通话或未知bearer receipt；不调用Enable/Disable/Connect/CreateBearer，也不启动服务。
-- acquire前读取两次完整MM profile字段指纹、AT定义行及PDP族/APN、Initial EPS、所有CID reporting；仍然自动取得新ID，不写死4，也不向Set传任何现有ID。返回新ID后读回并核验MM/AT族与APN一致、唯一tag、原条目全未改。
+- acquire前读取两次完整MM profile字段指纹、AT定义行及PDP族/APN、Initial EPS、所有CID reporting。QMI路径不传ID、核验设备返回ID及唯一短tag；MM-AT路径由同一安全能力解析器选择在MM与AT两套列表中均不存在的CID，排除CID1，验证不活动并写前重读，绝不因APN相同覆盖旧定义。两条路径均核验新profile的MM/AT族与APN一致、完整原条目未变，不写死4。
 - QMI profile可能跨重启存在，因此元数据receipt保存在`/var/lib/simadmin/mm-ims-profile-lease/`而非仅/run；写前Creating、已知返回ID、Owned、RestoringReporting、Deleting状态均持久化，使用flock/O_NOFOLLOW与目录权限/文件校验。receipt仅保存原字段哈希，不保存原profile认证口令；不是配置/数据库备份。
 - 新ID可能落入任一空闲位置，因此试验前要求所有未定义CID的reporting均为000；不假定删除能恢复非默认reporting。执行release时若该自有CID被应用设成111，先恢复其确切原值，再删除自有profile并验证原完整列表/AT/InitialEPS/reporting恢复；不写回已有普通profile。
-- Set超时/取消/返回值不确定或存储失败保留Creating，禁止新建/猜ID删除。报告恢复与Delete超时不重复写；只有只读证明前次操作已完成才允许推进/结案，未知owner/SIM/字段变化仍失败关闭。
+- Set或AT写入超时/取消/返回值不确定或存储失败保留Creating，禁止新建/猜ID删除。只有完整收到QMI Create的指定参数拒绝才记录Rejected，随后显式release必须两次证明原始快照未变，才结案且不发Delete。报告恢复与Delete超时不重复写；未知owner/SIM/字段变化仍失败关闭。
 - **此入口不改变现有自动CID选择、profile来源大兜底或地址族顺序，也没有偷偷增加“无响应再新建profile”的生产流程。** 下一阶段用已通过CI的维护能力进行一次独立profile对照，再根据证据决定生产集成；当前不能声称已经注册。
 - 单元/mock及private-D-Bus测试覆盖无ID Set、非固定返回ID、MM/AT不一致、原字段/owner/SIM变化、每次持久化失败、Set取消、报告恢复和Delete不确定结果、状态回收和身份字段不进入receipt。Rust只在Actions运行。
+
+## 维护工具的验证事实（2026-09-30）
+
+- `c71bee2`：两套CI/39累计新增与更新回归+8兼容/双架构核验通过，设备inspect成功；QMI Set请求返回`Couldn't create profile: DS profile error: invalid-parameter-length`，原3项profile和完整快照token未变。
+- `b83a0f4`：tag由44字节缩至16字节、增加明确拒绝状态；两套CI/41累计回归+8兼容/双架构通过，但设备仍同样拒绝。因此**不能认定只是名称过长，也不能泛化成所有QMI Create均不支持**。
+- 首版Creating未存明确拒绝分类；现场经原MM日志唯一tag及明确错误、同owner/进程、完整快照一致验证后，将原记录归档为`.rejected`保留，未删profile/预算。新版Rejected记录由工具两次核验原状态后结案。
+- `6a77d9278e5d8fbaf4519fa0c77dfc2a6a5c7835`：新增显式MM-AT创建。Validate36722549817/Build36722549812全部success，下载两套日志核实44累计新增/更新回归+8兼容检查；ARM64/AMD64制品digest/meta/ELF/程序和前端均已核验。
+- **13:43 UTC实机闭环成功**：inspect→acquire-at，自动选空闲CID4创建`IPV4V6/ims`，MM+AT读回/原profile/EPS/reporting检查通过；随后release只删除本次自有profile，最终inspect恢复3项、无pending，token与最初完全相同。没有承载激活或REGISTER，未碰CID1/2/3定义。
+- 工具只在`/opt/simadmin-staging/ims-profile-maintenance-6a77d92/`运行，未替换正式cf13a66或启动主服务/beta8/secondary；MM PID48819未变，recovery timer恢复active。设备recovery service为`oneshot + RemainAfterExit=yes + active/exited + MainPID0 + Result=success`，是已结束检查，不误判为正在恢复；一次预检误拒绝记录保留，未发写操作。
+- 证据`.local/evidence/ims-route-completion/{c71bee2,b83a0f4,6a77d92}/`与`profile-lease-contract/`。**下一步仍是有界注册对照**，需要考虑承载清理引起MM对象换代与临时profile的安全回收；不因profile闭环成功就宣称当前eSIM已注册。
 
 ## 2026-09-30：同机 beta8 成功带来的新证据
 
@@ -23,7 +34,7 @@
 - 不把profile4视为固定答案；需要严格新建、取得实际返回ID，或复用可证明属于本功能的exact-family定义，不覆盖任何既有条目。
 - **只在原bearer族循环内补profile准备，仍可能无法修复这张卡**：dual建立取得IPv4就提前返回成功；后续SIP失败不继续该bearer循环。本次成功beta8的IPv6/IPv4是分别建立的MM承载。因此必须先对照“新profile”与“单族profile”各自作用，不以连接标签变化冒充等价测试。
 - 原地址族顺序IPv4v6→IPv6→IPv4、profile来源大兜底、安全/费用保护保持。若最终需要将SIP阶段的无响应交回按族承载重建，应单独明确授权与有限预算，不在这个准备层偷偷增加另一套重试。
-- 当前用户已停beta8及主服务，保持停机现场；仅完成只读比较，**没有新建/改写profile或执行本设计**。beta8测试前MM重启/secondary停止亦是混杂变量，不能据此要求复现这些操作。
+- 用户已停beta8及主服务，保持停机现场；后来已批准并执行上述临时profile新建/回收闭环，但**尚未在该profile上做SIP注册对照**。beta8测试前MM重启/secondary停止亦是混杂变量，不能据此要求复现这些操作。
 - 下方旧设计曾建议`profile_pin_family_conflict`终止，后续70dfe3d已撤回该生产行为；既有正常forced-family兜底不能因实现本方案被关闭。设计实施应以现代码/最新HANDOFF为准。
 
 ## 背景

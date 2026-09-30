@@ -7,6 +7,9 @@
 
 ## 最新续接校正（2026-09-30）
 
+**最新进展：用户已批准临时自有IMS profile生命周期与受控对照；显式维护工具最终候选6a77d92已通过两套CI/44累计新增与更新回归+8兼容/双架构，并在13:43 UTC完成MM-AT新建与回收闭环。** 动态选择空闲CID4创建IPV4V6/ims，原1/2/3、InitialEPS/reporting不变，删除仅本次自有profile后完整快照恢复。QMI Set创建的c71bee2/b83a0f4均被设备明确参数长度拒绝，短名称未解决；拒绝证据和安全结案记录保留，不伪称QMI创建成功。
+工具仅在独立staging运行，**主服务/beta8/secondary仍停止，MM PID48819未变，正式安装仍cf13a66**。尚未在临时profile上创建承载或发REGISTER，更未证明IMS修复；下一步要实现有界注册对照及MM对象换代后的profile安全回收，不改大兜底。最新证据及制品SHA见HANDOFF顶部和exact-family设计文档。
+
 **当前最新现场是用户已停beta8和SimAdmin主服务，两者均未运行。** 用户在`/root/temp/simadmin`手动运行beta8注册成功后主动停掉；10:56只读验证文件为既有哈希的1.1.7-beta8/930365d，MM日志证明profile4先IPv6拒绝、再IPv4成功并TX4434/RX1463。主服务安装cf13a66但inactive，MM现PID48819、secondary inactive（用户测试前后变化，非agent操作）。当前网络50212，profile4已删除、profile3仍IPV4V6/ims。
 下一步优先对照临时独立profile/实际族，不能再要求用户证明beta8基本可用；运行中完整profile4/网口/SIP摘要仍缺，测试前MM重启/secondary停止也是混杂变量。保持服务停止、只读现有证据，不写死CID4、改已有PDP或绕过MM。详情见HANDOFF顶部与exact-family设计新增节。下方PID3365是此前的部署验收快照，不是当前运行状态。
 

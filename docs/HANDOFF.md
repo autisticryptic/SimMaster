@@ -9,14 +9,20 @@
 
 **最新进展：用户刚在同一设备手工运行 `/root/temp/simadmin`（beta8）并确认蜂窝IMS注册成功，随后已停止beta8，且没有重新启动SimAdmin主服务。10:56 UTC只读核实两程序均无运行进程，`simadmin.service` inactive；安装目录仍是cf13a66但不是正在运行的版本。** 不根据下方旧PID3365记录擅自启动服务。MM当前PID48819、secondary服务inactive，这些变化发生在用户测试前后，不是agent重启/停服；管理仍走usb0。
 
-### Exact-family 显式维护入口（实现完成，Rust待本候选CI）
+### Exact-family 显式维护入口（已完成CI与profile闭环，未注册对照）
 
 用户已批准派生侧临时自有IMS profile生命周期和一次受控对照，并确认现有CID自动选择不应重做。已检查MM1.24源码：该QMI驱动IndexField=profile-id，Set不传ID走Create Profile，传ID走Modify；因此新增**显式维护命令**而非改变自动注册循环。
 
 - `mm-ims-profile-lease` 默认inspect，acquire需要匹配当前快照的plan token，release要求APN/family匹配自有记录。严格新建并接受实际返回ID，验证唯一tag/MM与AT族/APN、完整原profile/EPS/reporting未变。
 - 需要两套程序停止、无bearer/call/未知承载receipt；不创建承载、不启动服务、不修改现有PDP、Initial EPS、默认族顺序或profile大兜底。元数据账本在/var/lib持久保存，Set/恢复reporting/Delete结果不明时保留并阻断，不盲重试写操作。
-- 本地218 Python与格式/diff检查已通过；新Rust/mock/private-D-Bus测试已接入两套Actions过滤器，**尚待此候选CI，设备未运行此命令或写profile**。此阶段只建立安全对照能力，尚未证明exact-family能解决当前eSIM。
-- 设计/命令/约束：[MM exact-family profile维护](IMS_MM_EXACT_FAMILY_LEASE_DESIGN.md)。后续必须先验证完整SHA日志和双架构制品，再执行只读inspect及经批准的一次对照。
+- `c71bee2`与`b83a0f4`两套CI/双架构均通过；设备QMI Set创建请求均返回明确`invalid-parameter-length`，原3项profile/完整快照token未变。44字节tag缩至16仍失败，**不是已证实名称长度根因**。首版明确拒绝记录经MM日志/tag/owner/原快照验证后归档保留；新版Rejected由工具核验后结案，未删任何profile或预算。
+- **最终维护候选 `6a77d9278e5d8fbaf4519fa0c77dfc2a6a5c7835`** 增加显式`acquire-at`：通过原MM owner的Command读取能力/活动、动态选MM与AT列表中均不存在的CID、写前重读、写后核验。不是direct-QMI，不会自动从QMI失败退到AT，不改变生产CID选择和大兜底。
+- 本地**219 Python**、格式/diff通过；Validate [`36722549817`](https://github.com/autisticryptic/SimMaster/actions/runs/36722549817)、Build [`36722549812`](https://github.com/autisticryptic/SimMaster/actions/runs/36722549812)全success，实际下载日志核实**44累计新增/更新回归+8兼容检查**，双架构制品核验通过，Publish skipped。
+  ARM64 artifact11101166888，包SHA-256 `99fb2b31f2b1d742473be503820a8322ea66218eef9fa180098d3c61b9170c86`，程序SHA-256 `d801b34fc7e7b6e817b6d91e3e319cb9dc0a7194d846d06b14df40b4a8756687`；AMD64 artifact11101677001，包SHA-256 `968e453ce637d6e43842b0130db83759a6f640bc598d5f32fce92962b5f21436`。
+- **13:43 UTC profile闭环实机成功**：经inspect token准入，MM-AT自动选CID4创建独立`IPV4V6/ims`，MM/AT读回且原条目、InitialEPS/reporting保持；随后只删除本次自有profile，最终inspect回到原3项、pending为空、完整token与最初相同。没有修改CID1/2/3，**没有创建承载或发送REGISTER**。
+- 主服务/beta8/secondary仍停止，MM PID48819未变，正式安装仍cf13a66；维护候选只放在独立staging运行，没有覆盖安装或创建配置/DB备份。recovery timer在写操作期间暂停并恢复；其service为已成功结束的`oneshot/RemainAfterExit=yes/active-exited/MainPID0`，一次预检误拒绝未发写，记录保留。
+- 证明`.local/evidence/ims-route-completion/6a77d92/verified.json`与`profile-{acquire-at,release,inspect}.json`；前两版拒绝及归档证明保留。设计/命令/约束：[MM exact-family profile维护](IMS_MM_EXACT_FAMILY_LEASE_DESIGN.md)。
+- **未完成：临时profile上的有界注册对照及生产派生侧集成。** 需要先把MM对象换代后的profile归属与清理衔接做好，不能直接把本工具接到无限重试，也不能把“profile创建成功”说成“当前eSIM注册成功”。
 
 ### beta8 同机成功对照（最新，优先于下方无成功对照的记录）
 
