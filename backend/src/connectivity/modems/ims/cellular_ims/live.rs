@@ -2121,6 +2121,16 @@ pub(crate) async fn probe_owned_profile_once(
     Ok(report)
 }
 
+fn runtime_profile_preparation_allowed(
+    profile: &CarrierProfile,
+    data_slot_mode: DataSlotMode,
+) -> bool {
+    // First production scope is IMS-only. Do not stop ordinary data or alter
+    // its profile to make this optional preparation applicable.
+    data_slot_mode == DataSlotMode::UeNativeIms
+        && crate::connectivity::modems::ims::vowifi::profiles::is_standard_derived_profile(profile)
+}
+
 #[cfg(target_os = "linux")]
 async fn prepare_profile_probe_admission(
     coordinator: &crate::connectivity::core::ims_registration_coordinator::ImsRegistrationCoordinator,
@@ -2288,6 +2298,67 @@ async fn connect_inner(
         .await;
     let mut ims_profile_lease: Option<ImsProfileLease> = None;
     #[cfg(target_os = "linux")]
+    let (runtime_profile_transport, _ordinary_profile_guard) = {
+        let supported = diagnostic_profile.is_none()
+            && !crate::hardware::cellular::backends::is_native_selector(&device.modem_id)
+            && ims_bearer_transport
+                .is_some_and(|transport| transport.supports_owned_mm_profile_preparation());
+        let eligible = supported
+            && runtime_profile_preparation_allowed(device_identity.profile, data_slot_mode);
+        let prepared = if eligible {
+            // A previous cancelled/dead generation may have retained a proven
+            // runtime lease. Recover it before creating any new profile; this
+            // hook never resets global bearer shutdown or recovery budgets.
+            crate::hardware::devices::qcm410::mm_ims_profile_lease::runtime::recover(
+                &device.qmi_device,
+            )
+            .await
+            .map_err(|error| CellularImsError::with_detail(code::BEARER_SESSION_LOST, error))?;
+            ensure_generation(runtime, generation)?;
+            let expected = expected_mm_sim
+                .as_ref()
+                .ok_or_else(|| CellularImsError::new(code::BEARER_SESSION_LOST))?;
+            let task = runtime.clone();
+            crate::hardware::devices::qcm410::mm_ims_profile_lease::runtime::prepare(
+                &device.qmi_device,
+                &device.modem_id,
+                ims_apn,
+                (&expected.0, expected.1),
+                &device.line_id,
+                generation,
+                Arc::new(move || task.task_is_current() && task.generation() == generation),
+            )
+            .await
+            .map_err(|error| CellularImsError::with_detail(code::BEARER_SESSION_LOST, error))?
+        } else {
+            None
+        };
+        let ordinary_guard = if supported && prepared.is_none() {
+            // Hold the same device flock throughout legacy selection/setup,
+            // not only while observing that the profile ledger is empty.
+            Some(
+                crate::hardware::devices::qcm410::mm_ims_profile_lease::ordinary_profile_guard(
+                    &device.qmi_device,
+                )
+                .map_err(|error| CellularImsError::with_detail(code::BEARER_SESSION_LOST, error))?,
+            )
+        } else {
+            None
+        };
+        (prepared, ordinary_guard)
+    };
+    #[cfg(target_os = "linux")]
+    let profile_prepared_by_runtime = runtime_profile_transport.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let profile_prepared_by_runtime = false;
+    #[cfg(target_os = "linux")]
+    let ims_bearer_transport: Option<
+        &dyn crate::hardware::devices::transport::ImsBearerTransport,
+    > = runtime_profile_transport
+        .as_ref()
+        .map(|transport| transport as &dyn crate::hardware::devices::transport::ImsBearerTransport)
+        .or(ims_bearer_transport);
+    #[cfg(target_os = "linux")]
     let diagnostic_context = if let Some(probe) = diagnostic_profile {
         if !crate::connectivity::modems::ims::vowifi::profiles::is_standard_derived_profile(
             device_identity.profile,
@@ -2309,7 +2380,12 @@ async fn connect_inner(
     };
     #[cfg(not(target_os = "linux"))]
     let diagnostic_context: Option<super::pcscf::ImsProfileContext> = None;
-    let ims_profile = if let Some(context) = diagnostic_context {
+    let ims_profile = if profile_prepared_by_runtime {
+        // The runtime adapter selects a new exact-family ID at each existing
+        // bearer attempt, arms reporting on its retained owner, and owns its
+        // lifetime. Do not reuse an APN match or write a placeholder CID here.
+        None
+    } else if let Some(context) = diagnostic_context {
         Some(context)
     } else {
         match prepare_ims_profile_context(&device.modem_id, &plan, ims_apn).await {
@@ -2341,7 +2417,7 @@ async fn connect_inner(
     // inactive profile, then read the resulting PCO through CGCONTRDP after the
     // WDS session is established.
     #[cfg(target_os = "linux")]
-    let reporting_prepared_by_probe = diagnostic_profile.is_some();
+    let reporting_prepared_by_probe = diagnostic_profile.is_some() || profile_prepared_by_runtime;
     #[cfg(not(target_os = "linux"))]
     let reporting_prepared_by_probe = false;
     let pcscf_reporting_cid = if reporting_prepared_by_probe {
@@ -3458,6 +3534,17 @@ pub async fn discard_live_for_mm_binding_change(
         .await;
 }
 
+/// Local protocol resources must be released before the device-wide bearer
+/// drain during service shutdown. No new REGISTER/AKA is sent here; explicit
+/// disconnect retains its separately reported network unregister transaction.
+pub async fn cleanup_live_for_shutdown(live: &CellularImsLiveHandle) {
+    if let Some(listener) = live.listener.lock().await.take() {
+        listener.abort();
+        let _ = listener.await;
+    }
+    cleanup_live_session(live).await;
+}
+
 pub async fn disconnect_live_for_line(
     live: &CellularImsLiveHandle,
     runtime: &Arc<CellularImsRuntime>,
@@ -3507,11 +3594,17 @@ async fn unregister_live_session(
         effective_register_target(&session.effective_ims),
         &session.channel.route(),
     );
-    let initial_authorization = session.register_variant.authorization.build(
-        &session.effective_ims.realm.value,
-        &session.registration_identity,
-        &request_uri,
-    );
+    // Deregistration is a request on the authenticated binding, not a new
+    // initial REGISTER. Consume fresh nonce-count state before any send/await.
+    let initial_authorization = match session
+        .refresh_authorization
+        .as_mut()
+        .map(|state| state.authorization_for(&session.registration_identity, &request_uri))
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(_) => return UnregisterResult::Rejected,
+    };
     let register_policy = sip::RegisterRequestPolicy {
         require_sec_agree: security_verify.is_some(),
         ..session.register_variant.policy
@@ -3549,9 +3642,9 @@ async fn unregister_live_session(
         session.visited_network_header.clone(),
         session.access_network.clone(),
         initial_authorization,
-        None,
+        session.refresh_authorization.clone(),
         security_client,
-        None,
+        security_verify,
         session.xfrm_worker.clone(),
     )
     .with_worker_binding(session.worker_binding.clone())
@@ -8389,6 +8482,33 @@ mod tests {
     use super::*;
     use crate::connectivity::core::voice::MediaDirection;
     use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+
+    #[test]
+    fn production_profile_preparation_is_derived_and_ims_only() {
+        let derived =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "515",
+                "02",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
+            )
+            .unwrap();
+        assert!(runtime_profile_preparation_allowed(
+            derived,
+            DataSlotMode::UeNativeIms
+        ));
+        assert!(!runtime_profile_preparation_allowed(
+            derived,
+            DataSlotMode::UeNativeImsWithData
+        ));
+        assert!(!runtime_profile_preparation_allowed(
+            &GB_EE_23433,
+            DataSlotMode::UeNativeIms
+        ));
+        assert!(!runtime_profile_preparation_allowed(
+            &GB_EE_23433,
+            DataSlotMode::UeNativeImsWithData
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

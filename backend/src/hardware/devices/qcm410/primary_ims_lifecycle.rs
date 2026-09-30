@@ -176,6 +176,7 @@ pub(super) struct MmBus {
     pub interface: String,
     selected_interface: OnceLock<String>,
     sim_binding: OnceLock<MmSimBinding>,
+    setup_current: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 pub(super) struct BearerStatus {
@@ -204,9 +205,46 @@ impl MmBus {
                 interface: interface.to_string(),
                 selected_interface: OnceLock::new(),
                 sim_binding: OnceLock::new(),
+                setup_current: None,
             }))
         })
         .await
+    }
+
+    /// A family retry retains the original unique owner and pinned SIM, but
+    /// must not reuse a previous bearer's OnceLock data-interface selection.
+    pub fn for_profile_attempt(
+        &self,
+        current: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Arc<Self>, String> {
+        if !current() || is_shutting_down() {
+            return Err("qca410_primary_mm_setup_cancelled".into());
+        }
+        let sim = self.sim_binding.get().ok_or(BINDING_UNAVAILABLE)?.clone();
+        let binding = OnceLock::new();
+        binding.set(sim).map_err(|_| BINDING_UNAVAILABLE)?;
+        Ok(Arc::new(Self {
+            connection: self.connection.clone(),
+            bus_id: self.bus_id.clone(),
+            owner: self.owner.clone(),
+            modem: self.modem.clone(),
+            device: self.device.clone(),
+            interface: self.interface.clone(),
+            selected_interface: OnceLock::new(),
+            sim_binding: binding,
+            setup_current: Some(current),
+        }))
+    }
+
+    fn authorize_setup_dispatch(&self) -> Result<(), String> {
+        if self
+            .setup_current
+            .as_ref()
+            .is_some_and(|current| !current() || is_shutting_down())
+        {
+            return Err("qca410_primary_mm_setup_cancelled".into());
+        }
+        Ok(())
     }
 
     pub fn data_interface(&self) -> &str {
@@ -405,9 +443,9 @@ impl MmBus {
         // The owning setup task is shielded. Do not drop a dispatched Create
         // at an inner deadline: MM may still return a newly allocated object.
         let properties = create_properties(request)?;
-        let path: OwnedObjectPath = self
-            .proxy(&self.modem, MODEM)
-            .await?
+        let proxy = self.proxy(&self.modem, MODEM).await?;
+        self.authorize_setup_dispatch()?;
+        let path: OwnedObjectPath = proxy
             .call("CreateBearer", &(properties,))
             .await
             .map_err(bus_error)?;
@@ -632,8 +670,9 @@ impl MmBus {
 
     pub async fn connect(&self, bearer: &str) -> Result<(), String> {
         timed(65, async {
-            self.proxy(bearer, BEARER)
-                .await?
+            let proxy = self.proxy(bearer, BEARER).await?;
+            self.authorize_setup_dispatch()?;
+            proxy
                 .call::<_, _, ()>("Connect", &())
                 .await
                 .map_err(bus_error)

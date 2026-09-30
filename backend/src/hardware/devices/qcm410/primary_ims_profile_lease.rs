@@ -8,6 +8,20 @@ use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+#[path = "primary_ims_profile_runtime.rs"]
+pub mod runtime;
+
+/// Read-only guard for ordinary profile paths that are not eligible for the
+/// runtime adapter. Never adopt any unresolved self-owned profile by APN.
+pub fn ensure_no_pending_profile(device: &str) -> Result<(), String> {
+    runtime::ensure_no_pending_profile(device)
+}
+
+/// Exclusion for legacy APN selection while the caller establishes its bearer.
+pub fn ordinary_profile_guard(device: &str) -> Result<fs::File, String> {
+    runtime::ordinary_profile_guard(device)
+}
+
 const PROFILE_MANAGER: &str = "org.freedesktop.ModemManager1.Modem.Modem3gpp.ProfileManager";
 const GPP: &str = "org.freedesktop.ModemManager1.Modem.Modem3gpp";
 const DIRECTORY: &str = "/var/lib/simadmin/mm-ims-profile-lease";
@@ -79,6 +93,10 @@ struct Receipt {
     tag: String,
     owned: Option<Profile>,
     owned_definition: Option<Definition>,
+    // v2 is runtime-only. Older maintenance binaries reject its version rather
+    // than silently treating an active production lease as stopped maintenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<runtime::RuntimeOwnership>,
 }
 
 trait ProfileIo {
@@ -207,7 +225,7 @@ fn unchanged_except(before: &Snapshot, after: &Snapshot, owned: i32) -> bool {
 
 fn owned_matches(receipt: &Receipt, snapshot: &Snapshot) -> Result<i32, String> {
     let owned = receipt.owned.as_ref().ok_or(ERROR)?;
-    if receipt.version != 1
+    if !known_receipt_version(receipt)
         || !(2..=16).contains(&owned.id)
         || owned.apn != receipt.apn
         || owned.family != receipt.requested_family
@@ -219,6 +237,13 @@ fn owned_matches(receipt: &Receipt, snapshot: &Snapshot) -> Result<i32, String> 
         return Err(ERROR.into());
     }
     Ok(owned.id)
+}
+
+fn known_receipt_version(receipt: &Receipt) -> bool {
+    matches!(
+        (receipt.version, receipt.runtime.is_some()),
+        (1, false) | (2, true)
+    )
 }
 
 async fn acquire_with<I: ProfileIo, S: Store>(
@@ -256,6 +281,7 @@ async fn acquire_with<I: ProfileIo, S: Store>(
         tag: profile_tag()?,
         owned: None,
         owned_definition: None,
+        runtime: None,
     };
     store.save(&receipt)?; // durable intent BEFORE dispatch, including timeout/cancellation
     let owned = match io.create(apn, family, &receipt.tag).await {
@@ -296,7 +322,8 @@ async fn release_with<I: ProfileIo, S: Store>(
     store: &S,
     mut receipt: Receipt,
 ) -> Result<(), String> {
-    if receipt.version != 1 || matches!(receipt.phase, Phase::Creating | Phase::Probing) {
+    if !known_receipt_version(&receipt) || matches!(receipt.phase, Phase::Creating | Phase::Probing)
+    {
         return Err("mm_ims_profile_lease_creation_unresolved".into());
     }
     let snapshot = io.snapshot().await?;
@@ -1137,6 +1164,15 @@ pub async fn maintain(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return Err(ERROR.into()),
     };
+    // Runtime leases are never adopted by the stopped-only CLI, including
+    // unknown/incomplete runtime ownership. Only runtime recovery may inspect
+    // its bearer/network coupling and authorize profile-only cleanup.
+    if existing
+        .as_ref()
+        .is_some_and(|r| r.runtime.is_some() || r.version != 1)
+    {
+        return Err("mm_ims_profile_lease_runtime_ownership_pending".into());
+    }
     match action {
         "inspect" => {
             let snapshot = io.snapshot().await?;

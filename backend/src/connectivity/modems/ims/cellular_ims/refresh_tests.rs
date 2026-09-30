@@ -556,6 +556,19 @@ async fn unregister_targets_original_binding_not_originating_default() {
     let (session, runtime, server, _old_client) = protected_session().await;
     let expected_identity = session.registration_identity.clone();
     let expected_from_tag = session.register_ids.from_tag.clone();
+    let expected_cseq = session.next_register_cseq;
+    let expected_call_id = session.register_ids.call_id.clone();
+    let uri = sip::register_request_uri_with_target(
+        session.profile,
+        effective_register_target(&session.effective_ims),
+        &session.channel.route(),
+    );
+    let expected_authorization = session
+        .refresh_authorization
+        .clone()
+        .unwrap()
+        .authorization_for(&session.registration_identity, &uri)
+        .unwrap();
     let old_route = session.channel.send_route();
     let live = CellularImsLiveHandle::new();
     *live.session.lock().await = Some(session);
@@ -578,6 +591,27 @@ async fn unregister_targets_original_binding_not_originating_default() {
             Some("0".to_string())
         );
         assert!(sip::header_value(&request, "Security-Verify").is_some());
+        // A registrar should not need to challenge an empty initial Digest on
+        // a binding which already has AKA credentials. Verify the exact proof,
+        // including the incremented nonce-count and original registration IMPU.
+        assert_eq!(
+            sip::header_value(&request, "Authorization"),
+            Some(
+                expected_authorization
+                    .strip_prefix("Authorization: ")
+                    .unwrap()
+                    .to_string()
+            )
+        );
+        assert!(expected_authorization.contains("nc=00000003"));
+        assert_eq!(
+            sip::header_value(&request, "Call-ID"),
+            Some(expected_call_id)
+        );
+        assert_eq!(
+            sip::header_value(&request, "CSeq"),
+            Some(format!("{expected_cseq} REGISTER"))
+        );
         server
             .send_to(&response(&request, "200 OK", "Expires: 0\r\n"), source)
             .await
@@ -588,6 +622,34 @@ async fn unregister_targets_original_binding_not_originating_default() {
         UnregisterResult::Confirmed
     );
     peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn unregister_nonce_exhaustion_does_not_send_empty_digest_or_claim_success() {
+    let (mut session, runtime, server, _old_client) = protected_session().await;
+    session.refresh_authorization.as_mut().unwrap().nonce_count = u32::MAX;
+    let old_route = session.channel.send_route();
+    let live = CellularImsLiveHandle::new();
+    *live.session.lock().await = Some(session);
+    assert_eq!(
+        unregister_live_session(&live, &runtime).await,
+        UnregisterResult::Rejected
+    );
+    let mut buffer = [0; 8192];
+    assert_eq!(
+        server.try_recv_from(&mut buffer).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        live.session
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .channel
+            .send_route(),
+        old_route
+    );
 }
 
 #[tokio::test]

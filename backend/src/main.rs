@@ -847,8 +847,11 @@ async fn main() -> Result<()> {
     // (unverified), which makes SIP fail silently. Nothing owns a netdev yet at
     // this point, so anything found inside a namespace is a leftover.
     if using_mm {
-        hardware::devices::recover_owned_ims_sessions().await;
-        platform::netns::reclaim_all_stranded_hardware_links().await;
+        if hardware::devices::recover_owned_ims_sessions().await {
+            platform::netns::reclaim_all_stranded_hardware_links().await;
+        } else {
+            warn!("Skipping namespace sweep while owned IMS recovery is unverified");
+        }
     }
     // Native ownership receipts require explicit reconciliation. A global
     // namespace sweep is not proof that an old native resource is ours.
@@ -1279,9 +1282,16 @@ async fn main() -> Result<()> {
     let listener = bind_with_retry(&args.host, args.port, 30).await?;
     info!(addr = %bind_addr, "Server listening");
     // 使用优雅关闭
+    let (ims_cleanup_done, ims_cleanup_wait) = tokio::sync::oneshot::channel();
     axum::serve(listener, app)
-        .with_graceful_shutdown(wait_for_shutdown_signal(shutdown_controller))
+        .with_graceful_shutdown(wait_for_shutdown_signal(
+            shutdown_controller,
+            Arc::clone(&shutdown_registry),
+            using_mm,
+            ims_cleanup_done,
+        ))
         .await?;
+    let _ = ims_cleanup_wait.await;
 
     // Only reached once the drain completes, which is what the shutdown signal
     // above makes possible. Releasing the data sessions here is what keeps the
@@ -1298,8 +1308,8 @@ async fn main() -> Result<()> {
     // otherwise parks in a blocking `read()` on the IMS TUN fd, so once the
     // flag is set it still waits for a packet that may never arrive.
     //
-    // That drop, not the drain, is what held the process for the full 8s
-    // watchdog on the device: the drain finished in 8ms and the bearers were
+    // That drop, not the drain, is what historically held the process for the
+    // full watchdog on the device: the drain finished in 8ms and the bearers were
     // released 155ms in, after which the log went completely silent until the
     // watchdog called `exit`. Everything that has to outlive the process has
     // already happened by this point, so exiting here is deliberate rather
@@ -1499,7 +1509,12 @@ async fn bind_with_retry(
 /// own, so an open browser tab would otherwise hold the drain until the
 /// watchdog below force-exits -- skipping the session teardown that returns
 /// DATA netdevs to the host namespace.
-async fn wait_for_shutdown_signal(controller: platform::shutdown::ShutdownController) {
+async fn wait_for_shutdown_signal(
+    controller: platform::shutdown::ShutdownController,
+    lines: Arc<services::line_registry::LineRuntimeRegistry>,
+    using_mm: bool,
+    cleanup_done: tokio::sync::oneshot::Sender<()>,
+) {
     use tokio::signal;
 
     let ctrl_c = async {
@@ -1526,14 +1541,37 @@ async fn wait_for_shutdown_signal(controller: platform::shutdown::ShutdownContro
 
     warn!("Shutdown signal received; starting graceful shutdown");
     hardware::devices::begin_ims_shutdown();
-    // An SSE/HTTP drain must not postpone releasing controller-owned IMS.
-    // The final join below is idempotent and waits for the same owned leases.
-    tokio::spawn(hardware::devices::shutdown_owned_ims_sessions());
+    // The protocol cleanup and device drain are one ordered task, independent
+    // of the HTTP/SSE drain. Do not race a global bearer stop ahead of the live
+    // session's XFRM removal and its runtime profile ownership handoff.
+    tokio::spawn(async move {
+        if using_mm {
+            let cleanup = async {
+                for line in lines.all().await {
+                    connectivity::modems::ims::cellular_ims::live::cleanup_live_for_shutdown(
+                        &line.cellular_ims_live,
+                    )
+                    .await;
+                }
+            };
+            if tokio::time::timeout(std::time::Duration::from_secs(5), cleanup)
+                .await
+                .is_err()
+            {
+                warn!("IMS protocol shutdown exceeded budget; retained device cleanup follows");
+            }
+        }
+        hardware::devices::shutdown_owned_ims_sessions().await;
+        let _ = cleanup_done.send(());
+    });
     // Before the watchdog, so long-lived responses get the whole window to end.
     controller.trigger();
     std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(8));
-        eprintln!("SimAdmin graceful shutdown exceeded 8s; forcing process exit");
+        // Protocol cleanup (5s), bearer draining (5s) and profile cleanup
+        // (20s) precede process exit. Keep a margin for the final HTTP drain;
+        // interrupted writes still retain their durable ownership record.
+        std::thread::sleep(std::time::Duration::from_secs(40));
+        eprintln!("SimAdmin graceful shutdown exceeded 40s; forcing process exit");
         std::process::exit(0);
     });
 }

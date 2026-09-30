@@ -226,6 +226,20 @@ where
     C: ImsChannel,
     A: RegisterAuthenticator<C>,
 {
+    run_register_exchange(channel, initial_request, authenticator, true).await
+}
+
+// Deregistration must never negotiate a positive lease in response to 423.
+async fn run_register_exchange<C, A>(
+    channel: &mut C,
+    initial_request: &[u8],
+    authenticator: &mut A,
+    allow_min_expires: bool,
+) -> Result<RegisterResult, RegisterFailure>
+where
+    C: ImsChannel,
+    A: RegisterAuthenticator<C>,
+{
     let mut response = send_register_and_receive(
         channel,
         initial_request,
@@ -293,7 +307,7 @@ where
                     auth_rounds,
                 ))
             }
-            423 if min_expires_rounds < MAX_MIN_EXPIRES_ROUNDS => {
+            423 if allow_min_expires && min_expires_rounds < MAX_MIN_EXPIRES_ROUNDS => {
                 // RFC 3261 21.4.4: the registrar requires a longer lease.
                 // Rebuild the current request shape (initial or authenticated)
                 // with Expires >= Min-Expires and keep the same binding.
@@ -355,7 +369,7 @@ where
                     RegisterFailure::new(error, Some(response.clone()), auth_rounds)
                 })?;
             }
-            423 => {
+            423 if allow_min_expires => {
                 let error = if auth_rounds == 0 {
                     "ims_register_initial_min_expires_exhausted"
                 } else {
@@ -413,7 +427,7 @@ where
     C: ImsChannel,
     A: RegisterAuthenticator<C>,
 {
-    match run_register_observed(channel, initial_request, authenticator).await {
+    match run_register_exchange(channel, initial_request, authenticator, false).await {
         Ok(_) => UnregisterResult::Confirmed,
         Err(failure) if failure.response.is_some() => UnregisterResult::Rejected,
         Err(_) => UnregisterResult::AccessLost,
@@ -1028,17 +1042,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unregister_never_rebuilds_a_positive_lease_after_423() {
+        for challenged in [false, true] {
+            let mut responses = VecDeque::new();
+            if challenged {
+                responses.push_back(response(401, "Unauthorized"));
+            }
+            responses.push_back(response_with_header(
+                423,
+                "Interval Too Brief",
+                "Min-Expires: 3600\r\n",
+            ));
+            responses.push_back(response(200, "OK"));
+            let mut channel = FakeChannel {
+                responses,
+                sends: Vec::new(),
+                requeued: VecDeque::new(),
+                transport: SipTransport::Udp,
+            };
+            let mut auth = MinExpiresAuthenticator {
+                rebuilds: Vec::new(),
+            };
+            assert_eq!(
+                run_unregister(
+                    &mut channel,
+                    b"REGISTER sip:ims.example SIP/2.0\r\nExpires: 0\r\n\r\n",
+                    &mut auth,
+                )
+                .await,
+                UnregisterResult::Rejected,
+            );
+            assert!(auth.rebuilds.is_empty());
+            assert_eq!(channel.sends.len(), if challenged { 2 } else { 1 });
+            assert_eq!(channel.responses.len(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn unregister_does_not_confirm_rejection_or_transport_loss() {
-        let mut rejected = FakeChannel {
-            responses: VecDeque::from([response(403, "Forbidden")]),
-            sends: Vec::new(),
-            requeued: VecDeque::new(),
-            transport: SipTransport::Udp,
-        };
-        assert_eq!(
-            run_unregister(&mut rejected, b"unregister", &mut FakeAuthenticator).await,
-            UnregisterResult::Rejected
-        );
+        for (status, reason) in [(403, "Forbidden"), (500, "Server Internal Error")] {
+            let mut rejected = FakeChannel {
+                responses: VecDeque::from([response(status, reason)]),
+                sends: Vec::new(),
+                requeued: VecDeque::new(),
+                transport: SipTransport::Udp,
+            };
+            assert_eq!(
+                run_unregister(&mut rejected, b"unregister", &mut FakeAuthenticator).await,
+                UnregisterResult::Rejected
+            );
+        }
 
         let mut lost = FakeChannel {
             responses: VecDeque::new(),

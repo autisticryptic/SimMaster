@@ -248,6 +248,12 @@ impl fmt::Display for ImsBearerError {
 /// that tears the session down again. On failure the implementation is
 /// responsible for releasing anything it bound.
 pub trait ImsBearerTransport: Send + Sync {
+    /// Opt in only for a provider with a verified owned-profile preparation
+    /// implementation. Other device backends retain their existing path.
+    fn supports_owned_mm_profile_preparation(&self) -> bool {
+        false
+    }
+
     /// Cheap admission check for the device's IMS control endpoint.
     ///
     /// This is intentionally owned by the device transport. A generic handler

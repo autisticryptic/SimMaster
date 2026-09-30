@@ -16,7 +16,8 @@ class NativeRecoveryBoundaryTests(unittest.TestCase):
             self.assertIn(required, body)
         for forbidden in ("backends::initialize", "reclaim_all_stranded", 'Command::new("systemctl")'):
             self.assertNotIn(forbidden, body)
-        self.assertRegex(source, r"if using_mm\s*\{\s*hardware::devices::recover_owned_ims_sessions\(\).await;\s*platform::netns::reclaim_all_stranded_hardware_links\(\).await;")
+        self.assertRegex(source, r"if using_mm\s*\{\s*if hardware::devices::recover_owned_ims_sessions\(\).await\s*\{\s*platform::netns::reclaim_all_stranded_hardware_links\(\).await;")
+        self.assertIn("Skipping namespace sweep while owned IMS recovery is unverified", source)
 
     def test_archive_never_executes_historical_cids_or_forces_a_service_takeover(self):
         source = (BACKENDS / "recovery.rs").read_text()

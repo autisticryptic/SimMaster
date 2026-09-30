@@ -109,6 +109,10 @@ impl ImsBearerHandle for Qcm410ImsBearerHandle {
 pub struct Qcm410ImsBearer;
 
 impl ImsBearerTransport for Qcm410ImsBearer {
+    fn supports_owned_mm_profile_preparation(&self) -> bool {
+        true
+    }
+
     fn endpoint_available(&self, primary_device: &str) -> bool {
         let device = primary_device.trim();
         is_primary_qmi_device(device) && std::path::Path::new(device).exists()

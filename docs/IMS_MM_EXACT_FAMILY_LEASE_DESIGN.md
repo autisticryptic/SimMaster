@@ -28,6 +28,16 @@
 - 同一 MM owner 内对象重新枚举，只在旧 modem 确认消失、物理控制口及稳定 SIM/slot、原 profile/EPS 全匹配且两次快照一致时衔接 profile 清理；不把 bearer 清理重定向到新对象，不接受旧 receipt 缺失稳定归属证据的换代。
 - 83354b6已验证：临时IPv4v6 CID4（动态选择）、实际IPv4/wwan0，首420后根据精确Warning词序补齐安全声明，401/AKA后返回真实IPsec成功会话；注销结果rejected，本地承载/namespace/profile回收通过。新实例无需强制IPv4、不改原profile，完整证据与生产集成边界见[HANDOFF最新节](HANDOFF.md#最新临时-profile-上实际-ims-ipsec-注册成功2026-09-30-1629-utc)。原6a77d92的profile闭环证明保持独立，不能拿探针成功替代主服务持续在线验收。
 
+## 生产集成候选（待最终 CI / 部署验收）
+
+- 设备 transport 显式 opt-in；仅标准派生、MM、IMS-only 路径进入 runtime adapter。数据开启、catalog或其他设备仍保留原流程；普通流程持有相同设备 flock 到承载准备结束，防止空账本检查后误复用并发新建的自有 profile。
+- 在原有每次 bearer-family 调用内经 MM AT 严格新建空闲 exact-family profile；没有新族循环或 SIP 超时重建循环。仅在前次完整回收后允许下一原定尝试，成功/强制族 hint 保留；不确定操作立即阻断。
+- v2 profile ledger 记录线路哈希、代次、进程开始身份、boot、阶段及自有 bearer 网络记录镜像；旧CLI拒绝v2，运行时不会采用v1维护残留。大小限制与每次原子持久化失败阻断，原 profile/EPS/reporting不被覆盖。
+- 每次尝试从**原unique owner及已pin SIM**派生独立接口选择状态，不重新找owner，也不把上次wwan选择带到下一承载。代次/取消谓词到达CreateBearer/Connect实际分发前，已发请求仍受屏蔽并最终回收。
+- opaque handle转发SIM、P-CSCF、namespace操作并携带profile生命周期。承载/network absence证明完成后才恢复reporting、删profile；原MM对象消失时只允许同owner/SIM/物理控制口及原快照一致的profile清理重绑定。短暂MM换代只在未开始reporting/Delete写入时有限等待，未知写入不重放。
+- 运行时不调用维护CLI或全局shutdown。服务退出按SIP/XFRM资源→retained bearer→profile顺序回收；显式exit前执行profile清理而不依赖对象析构，超时保留账本。启动/新尝试先进行原owner安全恢复；恢复不明时不进行全局namespace搬移。
+- 明确限制：MM owner/SIM/boot变化、未知Create/reporting、没有可核验bearer归属等仍保守阻断，需要维护，不承诺跨重启自动删除自有配置。普通数据共存不在首版准入范围，不为启用此功能停用用户数据。
+
 ## 维护工具的验证事实（2026-09-30）
 
 - `c71bee2`：两套CI/39累计新增与更新回归+8兼容/双架构核验通过，设备inspect成功；QMI Set请求返回`Couldn't create profile: DS profile error: invalid-parameter-length`，原3项profile和完整快照token未变。

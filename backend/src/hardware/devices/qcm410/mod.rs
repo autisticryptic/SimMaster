@@ -94,10 +94,30 @@ impl DeviceDriver for Driver {
     }
 
     fn shutdown_owned_ims(&self) -> TransportFuture<'_, ()> {
-        Box::pin(primary_ims_lifecycle::shutdown_owned())
+        Box::pin(async {
+            primary_ims_lifecycle::shutdown_owned().await;
+            #[cfg(target_os = "linux")]
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                mm_ims_profile_lease::runtime::shutdown_profiles(),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("Runtime profile shutdown timed out; ownership ledger retained");
+            }
+        })
     }
 
     fn recover_owned_ims(&self) -> TransportFuture<'_, Result<(), String>> {
-        Box::pin(primary_ims_lifecycle::recover_owned())
+        Box::pin(async {
+            #[cfg(target_os = "linux")]
+            if mm_ims_profile_lease::ensure_no_pending_profile("/dev/wwan0qmi0").is_err() {
+                // Runtime recovery checks original owner/SIM/topology before
+                // touching its associated abandoned bearer or profile.
+                mm_ims_profile_lease::runtime::recover("/dev/wwan0qmi0").await?;
+            }
+            primary_ims_lifecycle::recover_owned().await
+        })
     }
 }

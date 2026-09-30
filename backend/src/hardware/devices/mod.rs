@@ -194,12 +194,15 @@ pub async fn shutdown_owned_ims_sessions() {
 
 /// Reclaim recorded ownership even if the original device is currently absent.
 /// A missing controller is not permission to touch a new daemon's objects.
-pub async fn recover_owned_ims_sessions() {
+pub async fn recover_owned_ims_sessions() -> bool {
+    let mut verified = true;
     for driver in registered_drivers() {
         if let Err(error) = driver.recover_owned_ims().await {
+            verified = false;
             tracing::warn!(kind = ?driver.kind(), error, "Owned IMS recovery deferred");
         }
     }
+    verified
 }
 
 /// Return the registered driver for a detected platform.
