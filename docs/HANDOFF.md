@@ -9,6 +9,23 @@
 
 **最新进展：用户确认意外掉线已恢复，08:15 UTC重连成功，08:19 UTC部署cf13a66成功，08:28 UTC安装校验通过。** 设备仍为临时IP `192.168.68.1`，沿用户明确批准的usb0管理链路；未改USB模式/主机网络，不清预算、不重启MM/secondary、不拨号。下面07:14连接失败是已恢复的历史，不再阻塞部署。
 
+### 继续排查：WDS绑定与包完整性（2026-09-30，最新）
+
+用户已确认手机成功是**非VoWiFi蜂窝IMS**，但不记得当时漫游网。接入类型已确认，不能继续把这个问题当待回复阻塞；仍未证明手机与测试机同在50212网络。
+
+- 09:03及10:40 UTC核实仍为cf13a66/PID3365、MM587/secondary346，管理usb0，DB正常、无活动通话/启用任务。09:03曾停止于`emm-invalid-state`；10:40在既有自动流程的REGISTER阶段、未注册。未修改profile/库/普通PDP、Initial EPS、USB或预算；MM/基带未重启。
+- **120秒释放因果已缩小**：boot-relative日志显示，MM先收到WDS `Packet Service Status: disconnected` / 3GPP原因36 `regular-deactivation`，约9秒后应用才清理网卡并导致MM重新探测。不是应用先在120秒执行Disconnect所造成；这仍不证明运营商主动拒绝，也可能来自基带内部。
+- 在用户要求继续修复范围内，通过原API**只POST一次retry（HTTP202）**进行有界采证，未清任何持久预算。临时将MM日志设DEBUG，远端210秒守卫自动恢复INFO，之后又显式确认恢复INFO；没有重启服务或直接QMI/AT激活/绑定。
+  注意“一次”是一次API批次，不是一条REGISTER：原自动校准会继续建立后续承载，不能隐瞒成只有一次底层尝试。后续仅被动采样，没有再次POST。
+- **已取得真实QMI绑定请求/响应**：IMS WDS IPv4 client4、IPv6 client5均请求`Bind Data Port: a2-mux-rmnet2`，对应事务返回SUCCESS；与已核验wwan2/dev_port2一致。此前“没有实际绑定应答”的缺口已补足，不再据此猜测应换网口。
+- **WDS统计与Linux出向观测不一致**：对应IPv4 client在REGISTER开始前已有TX328，约30秒变1312后不再增长、RX0，随后120秒结束。不能把这1312字节算成已发送的几十个SIP包，也不能凭计数命名认定空口已送达。该差异尚需低层证据解释。
+- **报文完整性被动核验**：另一次100秒只读AF_PACKET观测捕获32个出向UDP5060、0入向；IP/UDP校验和全部正确。同期wwan2 qdisc发送从16包/17639字节增长到49包/63614字节，drop/requeue/backlog均0。只保留地址/长度/校验/消息类别等元数据，不保存SIP身份或包体。
+- 既有MM DEBUG记录还显示重新创建modem时WDA从802.3调整为raw-ip，Set/Get均成功、QoS=no、aggregation=disabled；后续IMS仍无应答。**不能把初始化前的802.3单独当成已证实持续格式错误**，也未手工修改WDA。
+- 只读确认CID3仍`IPV4V6/ims`；未改定义。当前内核`CONFIG_FTRACE`、`CONFIG_KPROBES`均未启用，tracefs无现成追踪入口，不能用现有内核进一步证明DMA/基带内部收发；没有为此刷内核、重启或安装工具。
+- **当前结论仍是未注册，未有证据支持再改域名、7200秒有效期或强制sec-agree就能解决。** 下一步需要同50212漫游手机成功对照/脱敏注册证据，或另行安排能观察驱动/DMA/基带的诊断窗口；不在既有限制下擅自改内核、跨CID/换网口试错或迁移native。
+- 本地证据在`.local/evidence/ims-route-completion/cf13a66/`：`release-timeline.json`、`wds-single-observation.json`、`wds-message-summary.json`、`passive-data-format.json`、`passive-packet-integrity.json`、`kernel-observation-support.json`、`profile-definitions-readonly.json`。
+  首轮元数据提取遇到journal的null MESSAGE而失败，日志级别已恢复；仅重读既有日志补齐证据，未重放retry。该次tcpdump输出未成功保存，**不把它记为新抓包通过**；32包完整性结论来自后来独立的被动AF_PACKET记录。
+
 ### cf13a66 最新实机验收与下一步
 
 - 08:15重连看到旧a269e9d/PID489，MM587/secondary346，数据库ok、无通话/启用任务。PID变化发生在重连前，非agent操作。1条旧receipt由安装器只读证明对象和网络已消失，**安装器未删除它**。
@@ -17,7 +34,7 @@
 - **IMS注册仍未成功**：受控只读观察窗口内，两条动态P-CSCF路由均预装，UE抓包44个wwan2 Out UDP5060、0个入向；初始REGISTER和强制sec-agree候选均无完整响应/AKA轮数0，MM约120秒后结束IMS承载，仍记录tx1312/rx0。没有触发POST retry或修改库/profile。
 - 08:28:32 UTC再次核验：PID3365/运行hash仍匹配，前端MD5 `01505b0195870511cc8428e1d730b53c`与制品一致，DB quick_check=ok，MM587/secondary346、timer active。
   证据`.local/evidence/ims-route-completion/cf13a66/{deployment-second,registration-observation,installed-verified}.json`；不要用a269e9d旧采样代替此轮。
-- **下一步先厘清成功对照的接入类型**：已询问手机成功是否在同50212漫游下关闭Wi-Fi的蜂窝IMS，还是Wi-Fi通话，尚待回复。不能凭标准域名/库ready断言运营商必然接受LTE；不能用VoWiFi ePDG当蜂窝P-CSCF。实际QMI绑定仍缺逐消息证据，设备无strace；未为采证安装工具、修改MM日志级别或发direct-QMI绑定命令。
+- 本次08:28快照时尚缺手机接入类型和QMI绑定应答；**上面的继续排查已确认蜂窝IMS、补齐WDS绑定成功应答，并记录有界日志级别调整**。仍不能凭标准域名/库ready断言运营商必然接受LTE，不用VoWiFi ePDG当蜂窝P-CSCF。设备无strace，未安装工具或发direct-QMI绑定命令。
 - 本地Bash已恢复，213 Python/文档检查重跑通过。最终目标“当前eSIM像手机一样注册”仍未完成；真实换卡/故障注入、长通话续期、Pixel受控A/B、MM网口移回导致重新探测等长期项仍保持未验收。
 
 ### 后续旧对象清理补强：代码/CI及部署已完成（下列连接失败为历史）
