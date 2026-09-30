@@ -5,9 +5,32 @@
 
 ## 路由补全续接：2026-09-30（本节优先）
 
-已重新核对六份交接、Git、GitHub Actions、旧抓包脚本与实际调用链。**候选 `a269e9d6f7c5b359e142ae7734598c009f091914` 已完成代码、两套 CI / 双架构制品核验，尚未部署，不宣称已经修好注册。**
+已重新核对六份交接、Git、GitHub Actions、旧抓包脚本与实际调用链。**`a269e9d6f7c5b359e142ae7734598c009f091914` 已完成代码、两套 CI / 双架构制品核验，并于06:00 UTC成功部署；路由补全已实测，IMS仍未注册。**
 
-**最新用户指示：设备暂时离线，稍后提供临时 IP。停止对旧地址的 SSH/API 连接、轮询与部署，等待新 IP；不能因已有部署授权而继续尝试旧地址。**
+**最新用户指示：用户已确认联网与设备恢复并要求继续；随后要求先只读查看当前目录数据库的IMS连接配置。设备临时IP为 `192.168.68.1`，沿用户明确批准的 `usb0` 管理链路。当前优先事项为数据库字段对照，不自行安装库或改变profile。**
+
+### 第二次部署成功与实测结果（优先于下方中断记录）
+
+- 05:58:59 UTC重连：旧828135b/PID490已运行，MM598/secondary353，管理usb0，DB正常、无通话/启用任务、receipt/create均0；PID变化先于本轮操作。曾见`emm-invalid-state`，未靠重启MM/基带清除。
+- **06:00:28 UTC覆盖部署成功：a269e9d / PID3002**，运行SHA-256 `160cc0da071aab549c2c66ed564dcb704f0716f18e42becf8258234d96edf761`匹配已验证ARM64。无备份，复制窗口config.yaml/data.db校验未变；MM598/secondary353未重启，timer已恢复active，恢复预算未删除。
+  使用独立暂存目录`ims-routes-a269e9d-second`，保留首次失败证据；成功记录`.local/evidence/ims-route-completion/a269e9d/deployment-second.json`。
+- **全候选路由已实机证明**：同一承载CID3精确AT归属得到2个P-CSCF，日志`candidate_count=2 routed_count=2`早于首REGISTER；命名空间两条目标路由均走实际`wwan2`。抓到**44个wwan2 Out UDP5060包**，未见入向SIP响应，AKA轮数0，尚未注册。
+- **不能再用tx_packets=0断言没有发包**：该机bam-dmux所有网口计数为0，但MM普通数据承载有收发统计；仓库`netdev.rs::send_probe`本已有此驱动不更新计数的说明。只读检查wwan2 `dev_port=2`、同bam-dmux父级，未见runtime-PM error；Linux6.17-rc6参考驱动也没有更新这些统计。AF_PACKET出向抓包证明内核交给该接口，不等于基带/运营商已经收到。
+- 对应IMS承载约124秒后结束，MM报告tx1312/rx0（不能等同于44个SIP包已上空口）；网卡移回主机再次引发Modem/0→Modem/1。程序记录binding recalibrated后，后续尝试仍有旧Modem/0错误和保守保留receipt。**实际WDS/SIO绑定尚无逐消息证据，不猜测或用direct-QMI bind-mux试错。**
+- 设备时钟比采证主机慢约89分钟，首次按主机UTC筛选journal为空；已补采本次boot的monotonic日志，以PID/承载/相对时序关联，未改设备时间。证据`registration-observation.json`、`datapath-readonly.json`、`channel-mapping.json`；未发送POST retry、通话或短信。
+- **用户要求的数据库对照已完成**：见[51502连接配置参考](IMS_CATALOG_PIXEL_IOS_COMPARISON_2026-09-29.md#8-当前-esim51502-的连接配置参考2026-09-30)。三库确有Globe/51502参数：iPhone LTE ready，IPCC LTE unsupported（volte=false），Pixel LTE/NR ready。
+  APN/domain/身份/PCO发现/ipv4v6基本与派生一致；iPhone明确required安全策略与7200秒请求有效期，三库有显式VoWiFi ePDG `weconnect.globe.com.ph`。静态值不证明当前无响应原因；iPhone Contact投影缺口、VoWiFi roaming/缺IDi边界均已标明。未安装库/改profile，源库SHA不变。
+
+### 第一次临时 IP 上线与部署中断（历史，第二次已成功）
+
+- 用户提供 `192.168.68.1` 后，使用既有 **root 密码认证**成功连接；原设备主机公钥 pin 匹配。pin 只验证服务器身份，不要求用户配置公钥登录。凭据只在仓库外，未回显/提交。
+- 05:40:37 UTC 新现场：`828135b/PID482`，运行 hash 仍匹配旧验证制品；MM590/secondary341，Modem/0，数据库 ok、无通话/启用任务，receipt/create 当时均 0；管理实际走 `usb0`，不是旧 wlan0。这些 PID 变化在本轮连接前已发生，不是 agent 重启。
+- 用户明确允许沿 `usb0` 部署后，再次预检并上传已验证 ARM64 包到 `/opt/simadmin-staging/ims-routes-a269e9d`。**激活失败：`deployment_phase=verify_owned_cleanup / exit_code=1`。**
+  脚本已停止 `simadmin.service`，随后发现清理后的持久 ownership 记录未归零而保守退出；**未进入 `overwrite_verified_files`，没有覆盖旧828135b程序、前端、配置或数据库**。没有创建备份、删除receipt/预算、重启MM/secondary或拨号。`simadmin-modem-recovery.timer` 已由 finally 恢复active。
+- 用户随即报告 RNDIS 使笔记本失去互联网，并明确为此把设备离线。此后只读检查了笔记本：当前 RNDIS 网卡已不在列表，IPv4互联网默认路径为WLAN；**未更改Windows网卡/路由/DNS，也未继续设备请求**。
+  已建议后续让RNDIS只保留同网段管理地址、无默认网关/DNS，Wi-Fi保持上网，不改设备USB模式。
+- **不能把这次操作称为部署成功。** 最后已知旧主服务被本脚本停止，离线后状态未知；设备上线第一步核实主服务/运行hash/MM与SIM/receipt和实际网络残留，处理服务可用性。不要直接重放脚本（暂存目录已存在），更不能删除未知receipt来绕过检查。
+  本地证据 `.local/evidence/ims-route-completion/a269e9d/deployment.json`、`reviewed-activation.sh`；脚本 `.local/active/lan/deploy_route_candidate.py` 只作为已执行范式审阅。
 
 - 03:32 UTC 固定公钥只读核实 LAN 目标仍为 `828135b / PID85175`，运行 hash 与既有已验证 ARM64 一致；MM577 / secondary343 未变，管理走 `wlan0`，数据库 `quick_check=ok`，无活动通话、无启用任务、未安装 catalog。
   IMS `registered=false / recovery_state=exhausted`，错误引用已不存在的 `Modem/1`，现存对象为 `Modem/2`；有 1 条 receipt、无 `.create`，**没有删除或重放恢复**。

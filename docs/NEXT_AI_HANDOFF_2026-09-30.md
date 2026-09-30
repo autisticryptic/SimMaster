@@ -12,9 +12,13 @@
 
 03:32 UTC 最后可达实机仍运行 `828135b/PID85175`，MM577/secondary343 未变；IMS 恢复耗尽、旧 Modem/1 错误、现存 Modem/2，有 1 条 receipt 未动。
 
-**路由补全与 VoWiFi 全地址/实际 SOCKS 出口候选 `a269e9d6f7c5b359e142ae7734598c009f091914` 已推送并完成两套 CI、20 个新增/更新回归名 + 8 兼容检查、双架构制品实际核验；尚未部署或证明注册成功。** 验证证明在 `.local/evidence/ims-route-completion/a269e9d/verified.json`，run/artifact/hash 详见 HANDOFF。
+**路由补全与 VoWiFi 全地址/实际 SOCKS 出口候选 `a269e9d6f7c5b359e142ae7734598c009f091914` 已推送并完成两套 CI、20 个新增/更新回归名 + 8 兼容检查、双架构制品实际核验；第二次部署于06:00 UTC成功，PID3002，尚未注册成功。** 验证证明在 `.local/evidence/ims-route-completion/a269e9d/verified.json`，run/artifact/hash 详见 HANDOFF。
 
-**用户最新确认：设备暂时离线，稍后更新临时 IP。停止旧地址 SSH/API/轮询和部署，等新 IP 后先验证原 host pin 与现场状态。** 本轮未上传/停服/删 receipt/清预算/重试注册/拨号；不重放旧抓包脚本的删 receipt/POST retry 部分。
+**最新状态：用户提供临时IP `192.168.68.1`，密码登录/原host pin验证成功，明确批准沿 `usb0` 管理链路部署。第一次在停止旧主服务后的 `verify_owned_cleanup` 失败；随后用户因RNDIS网络问题离线，再确认恢复后，05:58预检receipt为0、旧服务已运行，第二次已成功部署a269e9d。** MM598/secondary353未重启，timer恢复active，无备份，不清预算/receipt，不拨号。
+
+**实测两条P-CSCF路由均走wwan2，捕获44个wwan2 Out UDP5060包，但无SIP响应，IMS未注册。** bam-dmux计数器不更新，不能用tx_packets=0当作未发包的证明。约124秒后承载结束，移回网卡引发Modem对象换代及旧路径/receipt残留；WDS/SIO实际映射仍待证据，不用direct-QMI绑定试错。
+
+**用户当前要求先检查本地数据库连接配置，已完成只读对照**：iPhone26.6的Globe/51502 LTE ready，IPCC同项unsupported，Pixel ready；APN/域名/身份等基本同派生，iPhone安全required/有效期7200、三库显式ePDG `weconnect.globe.com.ph`可参考，但不能保证换库解决当前零响应。详见HANDOFF最新部署/实测记录与数据库比较报告§8。本次对照没有安装数据库或改变设备profile。
 
 另已实时核实：现有 `v1.1.5` Release/tag 是本会话前 2026-09-29 05:34 UTC 发布的 `09edc03`，旧文档中的 `16998ae` Release 状态已过期。本轮 Publish skipped，未操作 Release/tag，也不能把旧 Release 包当作新路由候选。
 

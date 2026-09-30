@@ -150,3 +150,49 @@ Pixel有498个非空register，其中456个含`user_agent_template`；不要误�
 5. 单路问题明确之后，再验证用户要求的自动双注册：两开关都开、两路成功且网络允许共存，才保留双注册；否则在已启用接入中VoWiFi优先回退。
 
 **当前已完成：本地库来源、覆盖、同作用域字段与投影代码对比。未完成：对用户那一次历史来电的唯一根因认定、现场A/B和针对这些映射缺口的代码修复。**
+
+## 8. 当前 eSIM：51502 的连接配置参考（2026-09-30）
+
+用户要求查当前目录数据库中的连接配置信息。三份根目录 SQLite 均以 `mode=ro&immutable=1` 查询，`quick_check=ok`，查询前后完整 SHA-256 相同。没有安装库、修改设备配置或发起业务。
+当前卡已知 HPLMN 为51502、服务网50212；下面是**51502通用Globe匹配项**，不是把漫游网Maxis的50212当归属配置。
+
+| 数据库 | 51502 通用 profile | LTE / NR / VoWiFi 静态状态 |
+|---|---|---|
+| `carrier-bundles-iphone16promax-26.6.sqlite3` | `profile-globe-ph-base-51502-60088475d6` | ready / unknown / partial |
+| `carrier-bundles-ios-ipcc.sqlite3` | 同名Globe profile | unsupported / unknown / partial |
+| `carrier-bundles-pixel-mustang.sqlite3` | `profile-globe-ph-51502-183d10cfca` | ready / ready / ready |
+
+iPhone库另有带GID1条件的KnowRoaming/51502项，状态unknown，不能只凭PLMN套用；是否适用当前eSIM尚未核对。50212的BICS/Redtea/Soracom亦有各自匹配条件，不能借用。
+
+### 蜂窝 IMS 可参考字段与当前派生配置
+
+| 字段 | iPhone/IPCC Globe记录 | Pixel Globe记录 | 当前标准派生LTE |
+|---|---|---|---|
+| APN | `ims`，APN认证`none` | `ims`，认证`unspecified` | `ims`；APN认证不同于SIM AKA |
+| 地址族 | `ipv4v6` | 本地/漫游均`ipv4v6` | 保留`IPv4v6→IPv6→IPv4`，没有固定单族依据 |
+| P-CSCF发现 | `pco, epco` | `pco, epco` | 当前精确关联承载的AT观察已取得2个；库未提供固定P-CSCF地址 |
+| home domain / realm | `ims.mnc002.mcc515.3gppnetwork.org` | 相同 | 相同 |
+| IMPI / IMPU | `{imsi}@{home_domain}` / `sip:{imsi}@{home_domain}`，ISIM缺失时派生 | 相同 | 同标准方向，不是可以照抄的真实账号 |
+| IMS认证 | `ims_aka` / `AKAv1-MD5` | `ims_aka`，算法未显式指定 | LTE初始`aka_empty`，SIM参与AKA |
+| 安全协商 | `security_agreement=required`，common REGISTER同样明确required | 无显式SIP策略 | `auto`，提供Security-Client；既有互操作候选包含强制sec-agree形态 |
+| REGISTER请求有效期 | `7200`秒 | 未指定 | `3600`秒；实际续期仍以网络响应为准 |
+| PANI / sip.instance | `PANI` / `always_add_sip_instance=true` | 未显式指定 | 两者已启用，不是明显缺项 |
+| Contact overlay | 三项mid-call / srvcc-alerting / ps2cs-srvcc-orig-pre-alerting | 无显式表 | 已有同三项且MMTEL基线为true |
+
+**有参考价值但不能盲套：** iPhone记录明确给出required安全策略和7200秒请求有效期；这是后续同版本、同卡、同接入受控对照的候选差异，不是当前零响应的已证实原因。新实机日志已见强制sec-agree形态尝试且未收到完整响应。
+库中没有BAM-DMUX/WDS/SIO端口绑定、Linux命名空间路由或可直接执行的“连接脚本”，不能从这些字段推导应改用哪个wwan网口。
+
+**加载/投影边界：** `carrier_catalog_v7.rs::load_profile` 只接受对应接入状态ready；IPCC的`services.volte=false`导致其LTE不适合作本次直接模板，iPhone与Pixel才有LTE可加载候选。iPhone非空Contact表未包含audio/icsi-ref，当前`project_register`会推导`include_mmtel_features=false`，这是§6.2已记录的投影缺口；不能为了“像iPhone”把派生配置已有MMTEL关闭。库内静态ready不等于真实注册成功。
+
+### VoWiFi：比通用派生更具体的参考
+
+三库的Globe记录都提供 **`weconnect.globe.com.ph`**，不同于通用派生的operator-identifier ePDG域名；均指向UDP500/4500、EAP-AKA、IKE配置请求内部地址和P-CSCF。
+
+- iPhone：IKE AES-256 / SHA2-256 / PRF SHA2-256 / DH14，Child SA AES-256 / SHA2-256；生命周期86400秒。
+- IPCC：较旧AES-128 / SHA1 / DH2组合，与iPhone不同，不宜机械降低全局安全基线。
+- Pixel：明确IDi模板 `0{imsi}@nai.epc.mnc{mnc3}.mcc{mcc}.3gppnetwork.org`；IDr模板来自ePDG域名，同时另有`remote_id_type=id_key_id`，须按消费者契约审查，不能把不同字段合并成已验证身份规则。
+- 两份iOS库的VoWiFi为partial，缺少`/access/vowifi/ike/identities/idi`；其`mobility.wifi_calling_allowed_in_roaming=false`又与endpoint的`roaming_scope=both`存在不同层次声明。Pixel endpoint标为`roaming_scope=home`。**这些都不能当作本卡在50212漫游可用VoWiFi的许可。**
+- 当前测试线路VoWiFi关闭，未为验证域名强行开启。IPCC另有Apple entitlement URL，但不是SIP registrar/ePDG，也不是本次应自动访问的开通接口；本次没有调用。
+
+结论：**数据库确有有用连接配置，蜂窝侧优先参考iPhone 26.6的Globe条目，Pixel适合对照；VoWiFi的显式ePDG域名尤其值得后续核对。** 当前通用派生已覆盖大部分蜂窝连接要素，不能据此保证导入数据库就会恢复IMS。
+完整只读结果与字段来源证据保存在 `.local/evidence/ims-route-completion/catalog-51502/profiles.json`；未提交数据库或用户SIM原始身份。
