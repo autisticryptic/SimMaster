@@ -1184,10 +1184,10 @@ async fn verify_retired_network_readonly(record: &LeaseRecord) -> Result<(), Str
                 .await
                 .map_err(|_| "qca410_primary_mm_retired_namespace_unverified".to_string())?;
             if !output.status.success() || output.stdout.len() > 256 * 1024 {
-                return Err("qca410_primary_mm_retired_namespace_unverified".into());
+                return Err("qca410_primary_mm_retired_namespace_unverified".to_string());
             }
             serde_json::from_slice::<serde_json::Value>(&output.stdout)
-                .map_err(|_| "qca410_primary_mm_retired_namespace_unverified".into())
+                .map_err(|_| "qca410_primary_mm_retired_namespace_unverified".to_string())
         };
         timed(10, async {
             let addresses = read(vec!["-j", "address", "show"]).await?;
