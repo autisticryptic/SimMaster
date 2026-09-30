@@ -5,7 +5,9 @@
 
 ## 路由补全续接：2026-09-30（本节优先）
 
-已重新核对六份交接、Git、GitHub Actions、旧抓包脚本与实际调用链。**当前实现仍待对应新 SHA 的 Rust CI / 双架构制品与部署验收，不宣称已经修好注册。**
+已重新核对六份交接、Git、GitHub Actions、旧抓包脚本与实际调用链。**候选 `a269e9d6f7c5b359e142ae7734598c009f091914` 已完成代码、两套 CI / 双架构制品核验，尚未部署，不宣称已经修好注册。**
+
+**最新用户指示：设备暂时离线，稍后提供临时 IP。停止对旧地址的 SSH/API 连接、轮询与部署，等待新 IP；不能因已有部署授权而继续尝试旧地址。**
 
 - 03:32 UTC 固定公钥只读核实 LAN 目标仍为 `828135b / PID85175`，运行 hash 与既有已验证 ARM64 一致；MM577 / secondary343 未变，管理走 `wlan0`，数据库 `quick_check=ok`，无活动通话、无启用任务、未安装 catalog。
   IMS `registered=false / recovery_state=exhausted`，错误引用已不存在的 `Modem/1`，现存对象为 `Modem/2`；有 1 条 receipt、无 `.create`，**没有删除或重放恢复**。
@@ -15,7 +17,23 @@
   另发现 SOCKS5 原来只用于 DNS，live IKE 仍无条件直连；现通过同一捕获的 UE worker 创建 TCP 控制与 UDP relay，外层 socket 按实际 relay 族绑定，每个 IKE/NAT-T/ESP 数据报携带自己的最终地址/端口，不因代理失败偷偷直连。
 - 保留边界：没有为测试机开启 VoWiFi；未新增主机/UE IPv6 上游配置，缺少外层 IPv6 网络不能靠虚构路由解决。既有代理主机名解析与 DNS 系统回退路径未迁移；不能宣传为所有 DNS 都在 worker 或完全无本地 DNS。UDP relay 私有模式及域名型 SOCKS relay 地址仍明确不支持；本次未改 NAT-T 源端口策略。
 - 本地已通过 209 Python、21 前端 unit、TypeScript / ESLint、定向 rustfmt / diff；Rust 只交给 Actions。新增回归覆盖多候选、路由失败/代次、超过五个 ePDG、SOCKS 不同目标/族/端口、控制连接生命周期、8 KiB 包与超时。
-  证据 `.local/evidence/ims-route-completion/`；最新 CI、部署和实测结果后续追加。
+  证据 `.local/evidence/ims-route-completion/`；Rust 验证结果如下，实机注册仍待设备上线。
+
+### 候选已验证，部署因用户确认离线暂停
+
+- 代码已通过 Windows `git.exe` 推送 `simmaster/master`：**`a269e9d6f7c5b359e142ae7734598c009f091914`**。
+- Validate [`36671791336`](https://github.com/autisticryptic/SimMaster/actions/runs/36671791336) / Rust job `109748160357`、Build [`36671791369`](https://github.com/autisticryptic/SimMaster/actions/runs/36671791369) / Rust job `109748379048` 全 success；前端和 ARM64/AMD64 构建通过，Publish Release skipped。
+- 两套日志 artifact 均已下载并校验官方 SHA-256，逐项确认 **20 个本候选新增/更新回归名 + 8 个重点兼容检查为 ok**，不是只看绿色 workflow。
+- ARM64 artifact `11078356878`，包 SHA-256 `a7b270fa97fd53529ec88f0d92578153883a213a19eed2ea9aa685d549fffae6`；二进制 SHA-256 `160cc0da071aab549c2c66ed564dcb704f0716f18e42becf8258234d96edf761`。
+  AMD64 artifact `11078283114`，包 SHA-256 `a0637d577c50b11a8178e78780f2c3f418593dfd52559c8f288f7307aa8ae565`。
+  两包均实际验证 `1.1.5/a269e9d`、ELF 架构、二进制与前端校验；完整证明 `.local/evidence/ims-route-completion/a269e9d/verified.json`。
+- **另一处旧文档事实已校正**：GitHub 现有 `v1.1.5` Release ID `398850006` / tag 指向 `09edc038f3110f23bce43dcbd77747955e0b1fa7`，发布于 **2026-09-29 05:34:39 UTC（本会话前）**，并非旧文档记载的16998ae。
+  核验脚本首次因旧 tag 断言拒绝收尾，重新读取发布日期/tag/资产时间确认后才更新核验基线；没有移动/恢复 tag，也没有覆盖 Release。保留首次核验失败记录和 `release-observed.json`。
+- 03:32 UTC 的 `828135b/PID85175` 是**最后可达实机证据**。之后两次固定公钥 SSH 在 TCP 阶段超时，Windows `192.168.100.13:22` 也超时；05:17:27 UTC 有界复核仍超时。
+  用户随后明确“设备暂时离线，回头更新临时 IP”，因此停止后续连接。**未上传制品、未停止任何服务、未改配置/数据库、未动 receipt/预算、未触发注册重试或呼叫。**
+- **收到新 IP 后继续**：安全更新仓库外目标凭据索引，沿用原 SSH 主机公钥 pin（不同则停止核验，不自动接受）；重新检查当前运行 SHA、SIM/MM owner、无通话/任务、数据库、`wlan0` 和遗留 receipt。
+  `.local/active/lan/route_completion_readonly.py` 与 `route_inventory_remote.py` 是已审阅的只读参考；旧部署/抓包脚本含旧 PID/哈希/删 receipt/POST，不直接重放。receipt 归属与残留网络未核实时不得删除解锁。
+  使用上述已验证 ARM64 包覆盖，不建备份，保留配置与数据库，临时停再恢复 recovery timer，不重启 MM/secondary；随后用**当次动态 P-CSCF、源地址、实际网口与同一承载窗口**核对路由/计数/包与 SIP 响应。若仍不出包，再只读核查 BAM-DMUX/WDS 对应关系。
 
 ## 本轮交接：2026-09-30（历史快照，以上续接结论优先）
 

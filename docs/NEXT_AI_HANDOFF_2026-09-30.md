@@ -10,7 +10,13 @@
 本轮重新接手的代码、现场与证据边界见 [HANDOFF 最新续接](HANDOFF.md#路由补全续接2026-09-30本节优先)。
 **下方“已定位唯一路由根因”是旧结论，现已撤回其确定性**：旧抓包查询的是历史硬编码地址，源码会在每个实际候选发送前装路由并绑定接口；单条路由快照不足以证明后续候选经 veth 发出。全候选预装仍是用户批准的补强，但其注册效果须新制品部署后实测。
 
-03:32 UTC 实机仍运行 `828135b/PID85175`，MM577/secondary343 未变；IMS 恢复耗尽、旧 Modem/1 错误、现存 Modem/2，有 1 条 receipt 未动。路由补全与 VoWiFi 全地址/实际 SOCKS 出口已进入实现与回归阶段，**尚未宣称新 CI、部署或注册成功**。后续以 HANDOFF 与完整 SHA 的实际证据为准，不重放旧抓包脚本的删 receipt/POST retry 部分。
+03:32 UTC 最后可达实机仍运行 `828135b/PID85175`，MM577/secondary343 未变；IMS 恢复耗尽、旧 Modem/1 错误、现存 Modem/2，有 1 条 receipt 未动。
+
+**路由补全与 VoWiFi 全地址/实际 SOCKS 出口候选 `a269e9d6f7c5b359e142ae7734598c009f091914` 已推送并完成两套 CI、20 个新增/更新回归名 + 8 兼容检查、双架构制品实际核验；尚未部署或证明注册成功。** 验证证明在 `.local/evidence/ims-route-completion/a269e9d/verified.json`，run/artifact/hash 详见 HANDOFF。
+
+**用户最新确认：设备暂时离线，稍后更新临时 IP。停止旧地址 SSH/API/轮询和部署，等新 IP 后先验证原 host pin 与现场状态。** 本轮未上传/停服/删 receipt/清预算/重试注册/拨号；不重放旧抓包脚本的删 receipt/POST retry 部分。
+
+另已实时核实：现有 `v1.1.5` Release/tag 是本会话前 2026-09-29 05:34 UTC 发布的 `09edc03`，旧文档中的 `16998ae` Release 状态已过期。本轮 Publish skipped，未操作 Release/tag，也不能把旧 Release 包当作新路由候选。
 
 ## 0. 先读这一段：现在到底卡在哪（旧快照，以上校正优先）
 
