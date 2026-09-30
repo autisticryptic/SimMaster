@@ -1,7 +1,17 @@
 # MM IMS Exact-Family Profile Lease Design
 
-> 状态：设计稿，未接入生产代码，未在设备执行。
-> 目标：解决 ModemManager 1.18 中有效 `profile-id` 优先于请求 `ip-type` 的约束，同时保持单一 MM owner、UE namespace 隔离和可回滚恢复。
+> 状态：设计稿，未接入生产代码，未在设备执行。2026-09-30新增同机beta8成功证据与实施边界见下一节，旧§创建策略不是当前已实现行为。
+> 目标：解决 ModemManager 中有效 `profile-id` 优先于请求 `ip-type` 的约束，同时保持单一 MM owner、UE namespace 隔离和可核验恢复。
+
+## 2026-09-30：同机 beta8 成功带来的新证据
+
+- 用户运行同哈希beta8/930365d成功；MM日志明确profile4先IPv6失败，再IPv4成功并有RX。停止后profile4不存在，原profile3 IPV4V6/ims保持。当前cf13a66用profile3双族配置，SIP无响应。
+- MM1.24.0的`load_settings_from_bearer`/`get_profile_ready`依旧以profile内部族驱动WDS，不是只有1.18才有该语义。当前APN匹配复用不检查每次尝试的PDP族。
+- 不把profile4视为固定答案；需要严格新建、取得实际返回ID，或复用可证明属于本功能的exact-family定义，不覆盖任何既有条目。
+- **只在原bearer族循环内补profile准备，仍可能无法修复这张卡**：dual建立取得IPv4就提前返回成功；后续SIP失败不继续该bearer循环。本次成功beta8的IPv6/IPv4是分别建立的MM承载。因此必须先对照“新profile”与“单族profile”各自作用，不以连接标签变化冒充等价测试。
+- 原地址族顺序IPv4v6→IPv6→IPv4、profile来源大兜底、安全/费用保护保持。若最终需要将SIP阶段的无响应交回按族承载重建，应单独明确授权与有限预算，不在这个准备层偷偷增加另一套重试。
+- 当前用户已停beta8及主服务，保持停机现场；仅完成只读比较，**没有新建/改写profile或执行本设计**。beta8测试前MM重启/secondary停止亦是混杂变量，不能据此要求复现这些操作。
+- 下方旧设计曾建议`profile_pin_family_conflict`终止，后续70dfe3d已撤回该生产行为；既有正常forced-family兜底不能因实现本方案被关闭。设计实施应以现代码/最新HANDOFF为准。
 
 ## 背景
 

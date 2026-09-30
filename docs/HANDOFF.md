@@ -5,9 +5,20 @@
 
 ## 路由补全续接：2026-09-30（本节优先）
 
-已重新核对六份交接、Git、GitHub Actions、旧抓包脚本与实际调用链。**当前已部署 `cf13a666c59d1194401bf4d4229f820ac55f448d / PID3365`，包含a269e9d路由补全及后继旧对象清理修复；两套CI/双架构、部署、路由补全和旧receipt自动结案均已验证，IMS仍未注册。**
+已重新核对六份交接、Git、GitHub Actions、旧抓包脚本与实际调用链。**当前安装的是 `cf13a666c59d1194401bf4d4229f820ac55f448d`，主服务已由用户停止；此前运行PID3365。** 包含a269e9d路由补全及后继旧对象清理修复；两套CI/双架构、部署、路由和旧receipt自动结案均已验证，但本项目版本未注册成功。用户新提供的beta8同机成功对照见下节。
 
-**最新进展：用户确认意外掉线已恢复，08:15 UTC重连成功，08:19 UTC部署cf13a66成功，08:28 UTC安装校验通过。** 设备仍为临时IP `192.168.68.1`，沿用户明确批准的usb0管理链路；未改USB模式/主机网络，不清预算、不重启MM/secondary、不拨号。下面07:14连接失败是已恢复的历史，不再阻塞部署。
+**最新进展：用户刚在同一设备手工运行 `/root/temp/simadmin`（beta8）并确认蜂窝IMS注册成功，随后已停止beta8，且没有重新启动SimAdmin主服务。10:56 UTC只读核实两程序均无运行进程，`simadmin.service` inactive；安装目录仍是cf13a66但不是正在运行的版本。** 不根据下方旧PID3365记录擅自启动服务。MM当前PID48819、secondary服务inactive，这些变化发生在用户测试前后，不是agent重启/停服；管理仍走usb0。
+
+### beta8 同机成功对照（最新，优先于下方无成功对照的记录）
+
+- `/root/temp/simadmin` ELF ARM64、8732248字节、SHA-256 `210c35b11f54dd240a83e90dd08d5e8a8f4f2cea227ce3a0503a9ced4140f9b7`，meta为**1.1.7-beta8 / 930365d**，与本地既有二进制分析完全一致，不是只看名称猜版本。
+- 用户明确确认注册成功。beta8终端输出未作为本次日志保存，不能伪造捕获了SIP200；MM日志独立证明其IMS承载有实际收发：profile-id4/APN ims的IPv4 Bearer/2持续约31秒，TX4434/RX1463，最后收到用户Disconnect。
+- MM请求时序明确：**profile4 + ip type ipv6**的Bearer/1连续三次被`ggsn-reject`拒绝，随后新建**profile4 + ip type ipv4**的Bearer/2成功；这不是从实际IPv4地址反推请求类型。当前项目此前使用profile3/IPV4V6，MM会按profile自身族决定实际WDS路径。
+- 当前网络仍50212；停止后AT+CGDCONT与MM ProfileManager只读列表均只见1/2占位以及3=`IPV4V6/ims`，profile4已不存在。结合相同哈希二进制的既有分析，beta8使用临时独立IMS profile并随尝试族准备定义；**尚无这次profile4完整定义/网口/namespace/SIP参数的运行中快照**，不把数字4当成修复方法。
+- **对照并非只差版本**：系统日志显示测试前主服务停止、secondary停止、MM重启；beta8成功时MM已是新PID48819。agent本轮只读，未重放这些操作。不能将成功直接证明为某个单一profile字段的因果，也不能声称必须重启MM或停secondary。
+- 当前代码的确定性缺口：`prepare_ims_profile_context`仅按APN复用一次profile，随后所有family请求携带相同pin；MM1.24加载pin配置后以其PDP族为准。更重要的是dual bearer拿到IPv4便被视为成功，后面的SIP无响应**不会回到同一个bearer循环执行IPv6/IPv4**；所以只改preferred CID或单族请求标签不能复现beta8路径。
+- 下一步需要独立、可回收的exact-family IMS profile对照，保持既有profile3/普通PDP/Initial EPS/预算不变，不写死4，不借用别人CID或切换direct-QMI。生产修复须明确派生侧准备边界、同owner/SIM/generation账本和失败/取消/删除验证；详见[exact-family设计](IMS_MM_EXACT_FAMILY_LEASE_DESIGN.md)。**这不只是调整REGISTER字段，尚未新建profile、改变地址族设置或启动任一程序。**
+- 本地证据`.local/evidence/ims-route-completion/beta8-success/`：`stopped-snapshot.json`、`selected-config-and-mm.json`、`mm-bearer-metadata.json`、`profile-command-evidence.json`、`post-run-definitions.json`、`current-mm-profiles.json`。未提交凭据、数据库、真实SIM身份或原始日志。
 
 ### 继续排查：WDS绑定与包完整性（2026-09-30，最新）
 
