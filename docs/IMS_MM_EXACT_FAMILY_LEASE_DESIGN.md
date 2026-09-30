@@ -1,6 +1,6 @@
 # MM IMS Exact-Family Profile Lease Design
 
-> 状态：2026-09-30显式维护入口已完成代码/两套CI/双架构，并在设备验证MM-AT安全新建与删除闭环（6a77d92）；QMI Set创建请求被设备拒绝的事实保留。未接入自动注册回退、未进行临时profile上的SIP注册，不能把维护入口完成等同于IMS修复。
+> 状态：2026-09-30 16:29 UTC，83354b6 的有界维护探针已在当前51502 eSIM/50212漫游网、独立IPv4v6 profile上完成IMS IPsec注册；随后本地资源回收，但注销请求被拒绝，不能称网络确认注销。两套CI/双架构已核验，正式安装仍cf13a66且主服务停止；生产profile生命周期、持续在线与续期尚未完成。6a77d92的早期profile闭环及QMI Set拒绝事实保留。
 > 目标：解决 ModemManager 中有效 `profile-id` 优先于请求 `ip-type` 的约束，同时保持单一 MM owner、UE namespace 隔离和可核验恢复。
 
 ## 显式维护入口（代码/CI及 profile 生命周期已实机验证）
@@ -17,7 +17,7 @@
 - **此入口不改变现有自动CID选择、profile来源大兜底或地址族顺序，也没有偷偷增加“无响应再新建profile”的生产流程。** 下一阶段用已通过CI的维护能力进行一次独立profile对照，再根据证据决定生产集成；当前不能声称已经注册。
 - 单元/mock及private-D-Bus测试覆盖无ID Set、非固定返回ID、MM/AT不一致、原字段/owner/SIM变化、每次持久化失败、Set取消、报告恢复和Delete不确定结果、状态回收和身份字段不进入receipt。Rust只在Actions运行。
 
-## 有界注册对照入口（续接实现，尚待 CI 与实机验证）
+## 有界注册对照入口（83354b6已通过CI及实机注册对照）
 
 新增显式 `--action probe --expected-plan <当前 inspect token>`，只准入 `Owned` 租约且 APN/family 与完整快照一致。发请求前持久化 `Probing`，结束后记为 `Probed`；取消或崩溃后不能再次 probe 同一租约。
 
@@ -26,7 +26,7 @@
 - capability 校验实际 CID/APN/MM 端点与族，最多调用一次底层承载建立；强制单族错误不能借此对同一 profile 再激活。REGISTER 核心窗口 240 秒，注销另限 40 秒；成功报告仅表示本次注册成功，随后主动注销，不是维持在线服务。
 - 注销结果分别报告 confirmed/already_expired/rejected/access_lost/timeout，不把清理成功当作网络已确认注销。承载回收后停止 worker，仅在自有 namespace 只剩 loopback 且清理已核验时删除；profile 仍须显式 release。
 - 同一 MM owner 内对象重新枚举，只在旧 modem 确认消失、物理控制口及稳定 SIM/slot、原 profile/EPS 全匹配且两次快照一致时衔接 profile 清理；不把 bearer 清理重定向到新对象，不接受旧 receipt 缺失稳定归属证据的换代。
-- 此节描述待验证代码，不是已部署、已注册或已完成生产集成的证据。原 6a77d92 的 profile 闭环证明保持独立。
+- 83354b6已验证：临时IPv4v6 CID4（动态选择）、实际IPv4/wwan0，首420后根据精确Warning词序补齐安全声明，401/AKA后返回真实IPsec成功会话；注销结果rejected，本地承载/namespace/profile回收通过。新实例无需强制IPv4、不改原profile，完整证据与生产集成边界见[HANDOFF最新节](HANDOFF.md#最新临时-profile-上实际-ims-ipsec-注册成功2026-09-30-1629-utc)。原6a77d92的profile闭环证明保持独立，不能拿探针成功替代主服务持续在线验收。
 
 ## 维护工具的验证事实（2026-09-30）
 

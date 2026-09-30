@@ -3,7 +3,27 @@
 > 更新：2026-09-30。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 路由补全续接：2026-09-30（本节优先）
+## 最新：临时 profile 上实际 IMS IPsec 注册成功（2026-09-30 16:29 UTC）
+
+**本节优先于下方“尚未注册”的历史记录。`83354b620530c4b9dd26fa088a86a6d3e36e849f` 已在当前51502 eSIM、50212漫游网的有界维护探针中实际注册成功；不是主服务持续在线或生产集成完成。**
+
+- 实际路径：独立、动态选择的CID4 `IPV4V6/ims` → MM授予IPv4、实际wwan0 → 2个P-CSCF路由 → 第1候选420 → 第2候选补齐Require/Proxy-Require sec-agree → 401/AKA与Security-Server → 现有REGISTER协议栈返回成功会话，探针`registered=true / registration_mode=ipsec / derived_3gpp_lte_51502`。没有改为固定IPv4或写死CID/接口。
+- 420补强仅针对标准派生配置、auth_rounds=0、唯一Unsupported sec-agree以及明确“without sec-agree … is … on”警告词序；保留安全offer/AKA身份，补齐声明而非删安全头。不改catalog/地址族顺序/原大兜底/候选预算。初版b149b70因按原始标点/空格匹配，分支未命中、仍420；83354b6改为匹配已采得的7词序列，回归拒绝off/not/额外扩展/认证后等情况。
+- **注销未获网络确认**：探针返回`unregister_result=rejected`，不能说已成功向运营商注销，更不能说现在仍可用/在线。本地承载已释放、namespace库存恢复、bearer receipts为空；仅删除本次自有profile，最终原3项profile/Initial EPS/reporting验证恢复。
+- **16:30 UTC最终状态**：MM仍PID48819、当前Modem/5；主服务/beta8/secondary均停止，recovery timer active。正式安装仍cf13a66，配置与DB哈希从写前到清理后相同；没有创建配置/DB备份、没有重启MM/基带或清除恢复预算。此次未拨号、发短信、续期或启动监听。
+- `83354b6` 本地228 Python、定向格式/diff通过。Validate **36743092348** / Build **36743092317** 全success，两套实际下载日志核验 **60项累计新增回归+8项兼容检查**均ok，双架构制品digest/meta/ELF/程序/前端核验通过，Publish skipped，旧Release/tag未改。
+  ARM64 artifact11110863966，包SHA256 `011c46de075f10d6487c7751fd7e4308c3f2fa05c906184ba53da0fe3a9071fc`，程序SHA256 `2d4a6e4f94ac1685eeef771e1ef8ec0bfd5b6134acf646cb4495a9c6690f19b1`；AMD64 artifact11110853550，包SHA256 `813a20347f67544d7511dfd3b936d76689385d1036c434cd42e61b6928efcf0e`。
+- 证据 `.local/evidence/ims-route-completion/83354b6/{verified.json,registration-verified.json,derived-security/}`。被动观察只记录SIP元数据，收到420与带Security-Server/AKA挑战的401；后继IPsec内的注册成功依据程序实际成功会话报告，不伪称AF_PACKET看到了加密内200报文。
+
+### 仍未完成：主服务生产集成与持续在线验收
+
+1. **不能直接将维护CLI接到自动重试**：它要求程序停止、无任何MM bearer；`drain_bearers()`调用全局shutdown，生产进程不能调用。需派生/MM/QCM410专用运行时能力，保留profile持久账本、原MM bus、不可变SIM/线路代次、设备级排他以及取消中的晚到结果。
+2. 自有profile生命周期必须关联到pending/active bearer，等待原对象和网络清理完成后再恢复reporting/删除profile；MM对象换代只能重绑定profile清理，不能把旧bearer操作转发到新对象。未知结果保留并阻断，不能让普通APN复用误采纳遗留自有profile。
+3. 普通数据共存尚未验收：维护快照拒绝任何MM bearer；应先限定无冲突的IMS-only场景，不为准入而停止数据/secondary。新探针wwan0与旧主服务wwan2有占用环境差异，不能宣称独立profile是唯一因果。
+4. 当前成功来自IPv4v6独立profile，无需据此增加“SIP失败后另建IPv4”的新循环；地址族和profile来源大兜底继续保持原顺序。生产覆盖部署/主服务注册/自然续期仍待后继，不能把暂存探针当成已部署主程序。
+5. 注销被拒绝需独立分析（保留该事实）；不要为了得到好看的结论自动重放REGISTER/注销、重启MM或清预算。用户的历史文档移动仍保留未提交。
+
+## 路由补全续接：2026-09-30（以下为此前逐步记录）
 
 已重新核对六份交接、Git、GitHub Actions、旧抓包脚本与实际调用链。**当前安装的是 `cf13a666c59d1194401bf4d4229f820ac55f448d`，主服务已由用户停止；此前运行PID3365。** 包含a269e9d路由补全及后继旧对象清理修复；两套CI/双架构、部署、路由和旧receipt自动结案均已验证，但本项目版本未注册成功。用户新提供的beta8同机成功对照见下节。
 
