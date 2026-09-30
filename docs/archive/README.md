@@ -19,7 +19,8 @@
 - [P-CSCF / beta8 对照](2026-09/IMS_PCSCF_BETA8_COMPARISON_2026-09-15.md)
 - [beta8 深度派生/注册流程分析](2026-09/IMS_DERIVATION_BETA8_COMPARISON_2026-09-17.md)
 - [朋友提供的三网源码审计](2026-09/IMS_REFERENCE_VOLTE_AUDIT_2026-09-21.md)
-- [eSIM IMS Profile 历史测试](2026-09/ESIM_IMS_PROFILE_TEST_2026-09-01.md)
+- eSIM IMS Profile 历史测试（2026-09-01）：记录含真实号码与身份材料，已由用户移出仓库保存，
+  归档副本不再保留在版本库中；需要查阅时向用户索取，不要在仓库内重建。
 - [VoWiFi 历史修复任务](2026-09/VOWIFI_REPAIR_TASK_2026-09-02.md)
 
 ## 已合并的阶段文档
