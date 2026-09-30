@@ -24,6 +24,15 @@ class ProfileProbeTests(unittest.TestCase):
         self.assertIn('"registered":true', block)
         self.assertIn("Ok(Ok(session))", block)
 
+    def test_probe_initializes_only_its_explicit_cellular_admission(self):
+        text = LIVE.read_text(encoding="utf-8")
+        block = between(text, "pub(crate) async fn probe_owned_profile_once(", "fn failure_stage(")
+        self.assertLess(block.index("prepare_profile_probe_admission(&coordinator).await"), block.index(".admit("))
+        self.assertIn("ImsAccessDecision::cellular_only", block)
+        self.assertIn("coordinator.transition_lock.lock().await", block)
+        ordinary = between(text, "pub async fn connect_live_for_line(", "pub(crate) async fn probe_owned_profile_once(")
+        self.assertNotIn("prepare_profile_probe_admission", ordinary)
+
     def test_probe_strict_profile_does_not_run_apn_only_preparation(self):
         text = LIVE.read_text(encoding="utf-8")
         block = between(text, "let diagnostic_context =", "let mut request = BearerRequest::")

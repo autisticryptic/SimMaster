@@ -2029,6 +2029,7 @@ pub(crate) async fn probe_owned_profile_once(
     let scoped = runtime.for_generation(generation);
     let coordinator =
         crate::connectivity::core::ims_registration_coordinator::for_line(&device.line_id);
+    prepare_profile_probe_admission(&coordinator).await;
     let _permit = coordinator
         .admit(crate::connectivity::core::ims_access::ImsAccess::Cellular)
         .await
@@ -2118,6 +2119,23 @@ pub(crate) async fn probe_owned_profile_once(
     report["bearer_cleanup_verified"] = cleaned.into();
     report["profile_release_required"] = true.into();
     Ok(report)
+}
+
+#[cfg(target_os = "linux")]
+async fn prepare_profile_probe_admission(
+    coordinator: &crate::connectivity::core::ims_registration_coordinator::ImsRegistrationCoordinator,
+) {
+    // Only the unique maintenance line reaches this entry, after its persisted
+    // one-shot lease admission. Do not change the default production policy or
+    // authorize WLAN, voice, SMS, or a second access leg.
+    let _transition = coordinator.transition_lock.lock().await;
+    coordinator
+        .publish(
+            crate::connectivity::core::ims_access::ImsAccessDecision::cellular_only(
+                "ims_owned_profile_probe",
+            ),
+        )
+        .await;
 }
 
 #[cfg(target_os = "linux")]
@@ -8311,6 +8329,22 @@ mod tests {
     use super::*;
     use crate::connectivity::core::voice::MediaDirection;
     use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn profile_probe_admits_only_its_cellular_line_without_changing_defaults() {
+        use crate::connectivity::core::ims_access::ImsAccess;
+        use crate::connectivity::core::ims_registration_coordinator::ImsRegistrationCoordinator;
+        let probe = ImsRegistrationCoordinator::default();
+        let ordinary = ImsRegistrationCoordinator::default();
+        assert!(probe.admit(ImsAccess::Cellular).await.is_err());
+        prepare_profile_probe_admission(&probe).await;
+        let permit = probe.admit(ImsAccess::Cellular).await.unwrap();
+        drop(permit);
+        assert!(probe.admit(ImsAccess::Wlan).await.is_err());
+        assert!(ordinary.admit(ImsAccess::Cellular).await.is_err());
+        assert!(ordinary.admit(ImsAccess::Wlan).await.is_err());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
