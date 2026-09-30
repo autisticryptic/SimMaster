@@ -841,7 +841,7 @@ fn verify_teardown(
     Ok(())
 }
 
-fn numeric_ip_id(value: &serde_json::Value) -> Option<u64> {
+pub(super) fn numeric_ip_id(value: &serde_json::Value) -> Option<u64> {
     value.as_u64().or_else(|| match value.as_str()? {
         "unspec" => Some(0),
         "default" => Some(253),

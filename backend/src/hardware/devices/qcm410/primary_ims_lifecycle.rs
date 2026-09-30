@@ -1261,11 +1261,11 @@ fn verify_retired_namespace_snapshot(
     for rule in rules.as_array().ok_or_else(invalid)? {
         let priority = rule
             .get("priority")
-            .and_then(serde_json::Value::as_u64)
+            .and_then(netdev::numeric_ip_id)
             .ok_or_else(invalid)?;
         let table = rule
             .get("table")
-            .and_then(serde_json::Value::as_u64)
+            .and_then(netdev::numeric_ip_id)
             .ok_or_else(invalid)?;
         if !matches!((priority, table), (0, 255) | (32766, 254) | (32767, 253)) {
             return Err(remaining());
@@ -2578,6 +2578,13 @@ mod tests {
             serde_json::json!([{"dst":"default","dev":"veth-test","gateway":"198.51.100.1"}]);
         let rules = serde_json::json!([{"priority":0,"table":255},{"priority":32766,"table":254},{"priority":32767,"table":253}]);
         verify_retired_namespace_snapshot(&record, &links, &routes, &rules).unwrap();
+        // The target's `ip -j -N rule` still encodes numeric table IDs as strings.
+        let string_tables = serde_json::json!([
+            {"priority":0,"src":"all","table":"255"},
+            {"priority":32766,"src":"all","table":"254"},
+            {"priority":32767,"src":"all","table":"253"}
+        ]);
+        verify_retired_namespace_snapshot(&record, &links, &routes, &string_tables).unwrap();
         for bad_links in [
             serde_json::json!([{"ifname":"wwan0","addr_info":[]}]),
             serde_json::json!([{"ifname":"other","addr_info":[{"local":"192.0.2.2"}]}]),
