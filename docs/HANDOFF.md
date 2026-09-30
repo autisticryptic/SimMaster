@@ -9,6 +9,27 @@
 
 **最新进展：用户刚在同一设备手工运行 `/root/temp/simadmin`（beta8）并确认蜂窝IMS注册成功，随后已停止beta8，且没有重新启动SimAdmin主服务。10:56 UTC只读核实两程序均无运行进程，`simadmin.service` inactive；安装目录仍是cf13a66但不是正在运行的版本。** 不根据下方旧PID3365记录擅自启动服务。MM当前PID48819、secondary服务inactive，这些变化发生在用户测试前后，不是agent重启/停服；管理仍走usb0。
 
+### 有界 REGISTER 续接（已收到420；派生安全声明补全待验证）
+
+已读取本轮 JSONL 最后未完成代码并续接；不要把下述候选当成已部署修复。
+
+- 初版 `f65b474f008cf0276e5aca059e2d683cfaf9e4f3` 增加显式 `probe`，复用现有派生身份/AKA/REGISTER，独立 namespace/内存数据库，不启动主服务或自动恢复。持久化一次性探针状态，限制一次底层承载；报告注销结果和清理结果，不把曾注册成功说成仍在线。
+- 补上审查发现的 owner 交接竞态：临时 profile 的原 `MmBus` 直接传到底层建承载，不重新获取 well-known owner；普通生产路径仍按原逻辑发现 MM。清理检查内存与磁盘 bearer receipt，并在 profile release 前阻断遗留探针 namespace。
+- 同 owner 对象重新枚举的 profile 清理要求旧对象消失、稳定 SIM/slot、物理控制口、原 profile/EPS 与双快照一致。旧 receipt 缺少新增稳定身份字段时保守保留，不自动迁移或删除解锁。
+- 后继 **`1381e25623760ef9b45d4ce327e443e8d2d84e15`** 修复复审发现的 reporting 写入竞态：启用 reporting 也经原 unique-owner bus、串行锁内 SIM/静止检查并读回，不再通过探针核心里的 mmcli 可复用选择器写入。结果不明或取消后 `Probing` 不允许自动 release；不会清账本来绕过。
+- 本地 Linux Python **227 项通过**、Windows同227项通过（其中28个POSIX项按平台skip）；定向格式/diff通过。一次Linux全量检查限时中断仅到15项，后来完整重跑通过，记录均保留。Rust仍只在Actions，最新 Validate `36735762535`、Build `36735762412` 运行中，**尚未宣称双套回归或制品通过**；较早f65b474不用于设备试验。
+- **15:00 UTC只读现场复核**：主服务/beta8/secondary均停止，MM PID48819、Modem/0，bearer/call为空，DB ok、启用任务0，管理usb0；正式安装仍cf13a66/hash未变。没有新建profile、创建承载、REGISTER或重启MM。证明 `.local/evidence/ims-route-completion/probe-resume-readonly.json`。
+- **1381e25两套CI/双架构已全部核验**：Validate36735762535/Build36735762412全success，两份日志56累计新增回归+8兼容检查逐项ok，制品digest/meta/ELF/程序/前端摘要通过，Publish skipped。证明 `.local/evidence/ims-route-completion/1381e25/verified.json`。
+- **15:29–15:31 UTC首轮实机闭环**：创建独立IPv4v6/ims CID4并启用reporting，但探针在承载创建前返回 `ims_access_registration_parked`。这是独立维护线路缺少coordinator准入初始化，**没有创建承载或发送REGISTER，不是网络拒绝**。随后release恢复reporting、仅删自有profile；最终3项、pending=null、完整token与试验前一致，config.yaml/data.db哈希未变，原namespace列表未变、无bearer receipts，MM48819及服务状态未变。证据 `1381e25/dual-first/`。
+- 后继 **`8c0e0e6cac91c24789df4e8ffb3ae8e87c7b7e39`** 为独立探针线路在transition lock内发布cellular-only准入；普通生产线路仍默认parked、WLAN不获准。Linux228 Python通过，Validate36737616859/Build36737616747全success；两份日志57累计新增+8兼容均ok，双架构制品完整核验通过，Publish skipped。
+- **8c0e0e6实机已到SIP**：三个独立有界窗口`dual-first`、`dual-metadata`、`dual-warning`均使用临时IPv4v6/ims，动态CID4、MM实际授予IPv4、实际接口wwan0、精确AT关联2个P-CSCF并预装路由；每窗口4个初始候选均收到420，auth_rounds=0，未注册。后两窗口只增加被动元数据观测，不改请求字段；不把三个窗口说成一次REGISTER。
+- 被动证据明确`Unsupported: sec-agree`、Warning399；第三窗口按词白名单保存的警告词序是`without sec-agree and <other> is <other> on`，未保存SIP包体/原始警告/身份。代码当前发送Security-Client但这些候选均无Require/Proxy-Require声明；后继只拟在**标准派生配置+420+唯一Unsupported sec-agree+此明确缺失声明警告+auth0**时，补齐既有安全声明，不删安全头、不扩预算、不改catalog/外层兜底。尚未把假设写成已修复。
+- 每窗口均已验证承载/namespace回收并release临时profile，恢复原3项/原EPS/reporting，配置/DB摘要未变，服务仍停止、MM48819未重启。MM对象因接口归还而换代，release的同owner重绑定通过；因此跨窗口完整token因modem/SIM对象路径变化而不同，**不声称token始终相同**。
+- 第三窗口首次release在PRE阶段看到MM对象列表为空而拒绝，未分发任何写；该失败记录已单独归档，待重新枚举完成后重新预检并成功release。没有删除未知receipt/预算或重启MM。证据 `.local/evidence/ims-route-completion/8c0e0e6/{verified.json,dual-first/,dual-metadata/,dual-warning/}`。
+- 注意实际wwan0与旧主服务wwan2不同，都是MM动态选择且经过拓扑/独占核验；当前隔离窗口与旧主服务的数据承载占用不同，不能把“独立profile”认定为唯一因果，也不能写死网口。生产profile生命周期尚未集成。
+- 当前待办：核验后继两套CI/双架构，再执行独立profile有界对照（仍先保持IPv4v6），安全回收后才决定后继；生产派生侧集成仍未完成。私有脚本 `.local/active/lan/bounded_profile_register.py` 每个动作保留独立记录，不能绕过 `verified.json` 或覆盖失败记录重放。
+- 用户移动历史 `ESIM_IMS_PROFILE_TEST_2026-09-01.md` 的工作区修改保留未提交。
+
 ### Exact-family 显式维护入口（已完成CI与profile闭环，未注册对照）
 
 用户已批准派生侧临时自有IMS profile生命周期和一次受控对照，并确认现有CID自动选择不应重做。已检查MM1.24源码：该QMI驱动IndexField=profile-id，Set不传ID走Create Profile，传ID走Modify；因此新增**显式维护命令**而非改变自动注册循环。

@@ -7929,6 +7929,7 @@ fn next_dynamic_register_variant_with_roaming(
     dynamic_visited_network_fallback: bool,
 ) -> Option<CellularImsRegisterVariant> {
     sec_agree_retry_variant(profile, variant, failure)
+        .or_else(|| derived_missing_sec_agree_retry_variant(profile, variant, failure))
         .or_else(|| sec_agree_timeout_retry_variant(profile, variant, failure))
         .or_else(|| sec_agree_proxy_require_retry_variant(variant, failure))
         // A derived roaming profile already knows the visited PLMN. Once that
@@ -8101,9 +8102,57 @@ fn sec_agree_spaced_security_retry_variant(
     .then(|| variant.with_spaced_security_client())
 }
 
+/// A visited core can report 420/Unsupported: sec-agree while Warning 399
+/// explicitly says the request is *without* sec-agree and security is on.
+/// Only complete the already offered agreement for a standard-derived profile;
+/// never interpret a generic 420 as permission to remove security or broaden
+/// the existing catalog/fallback policy.
+fn derived_missing_sec_agree_retry_variant(
+    profile: &CarrierProfile,
+    variant: CellularImsRegisterVariant,
+    failure: &RegisterFailure,
+) -> Option<CellularImsRegisterVariant> {
+    if !crate::connectivity::modems::ims::vowifi::profiles::is_standard_derived_profile(profile)
+        || profile.ims.register.sec_agree_mode == "disabled"
+        || variant.policy.require_sec_agree
+        || failure.auth_rounds != 0
+        || register_failure_status(failure) != Some(420)
+    {
+        return None;
+    }
+    let response = failure.response.as_deref()?;
+    (response_has_only_extension(response, "Unsupported", "sec-agree")
+        && response_warns_missing_sec_agree(response))
+    .then(|| variant.requiring_sec_agree())
+}
+
+fn response_warns_missing_sec_agree(response: &[u8]) -> bool {
+    sip::header_values(response, "Warning").iter().any(|value| {
+        let Some(rest) = value.trim().strip_prefix("399 ") else {
+            return false;
+        };
+        // Do not log free-form Warning text or its warning-agent (may include
+        // subscriber/network identifiers). Match only the observed shape.
+        let Some((_, quoted)) = rest.split_once('"') else {
+            return false;
+        };
+        let Some((text, trailing)) = quoted.split_once('"') else {
+            return false;
+        };
+        let text = text.trim().to_ascii_lowercase();
+        trailing.trim().is_empty()
+            && text.starts_with("without sec-agree and ")
+            && text.ends_with(" on")
+    })
+}
+
 fn response_requires_only_extension(response: &[u8], supported_extension: &str) -> bool {
+    response_has_only_extension(response, "Require", supported_extension)
+}
+
+fn response_has_only_extension(response: &[u8], header: &str, supported_extension: &str) -> bool {
     let mut found = false;
-    for value in sip::header_values(response, "Require") {
+    for value in sip::header_values(response, header) {
         for extension in value
             .split(',')
             .map(str::trim)
@@ -8306,6 +8355,8 @@ fn log_cellular_ims_register_failure_metadata(
         security_server_count = sip::header_values(response, "Security-Server").len(),
         warning_present = !sip::header_values(response, "Warning").is_empty(),
         unsupported_present = !sip::header_values(response, "Unsupported").is_empty(),
+        unsupported_only_sec_agree = response_has_only_extension(response, "Unsupported", "sec-agree"),
+        missing_sec_agree_warning = response_warns_missing_sec_agree(response),
         require_present = !sip::header_values(response, "Require").is_empty(),
         proxy_require_present = !sip::header_values(response, "Proxy-Require").is_empty(),
         response_route_present = !sip::header_values(response, "Route").is_empty(),
@@ -9885,6 +9936,121 @@ Content-Length: 0\r\n\r\n";
         assert!(variants
             .iter()
             .all(|variant| variant.label != "ims_features_empty_aka_last_resort"));
+    }
+
+    #[test]
+    fn derived_420_missing_agreement_completes_security_without_downgrade_or_new_budget() {
+        let profile =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "515",
+                "02",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
+            )
+            .unwrap();
+        let base = register_variants(profile)[0];
+        let response = b"SIP/2.0 420 Bad Extension\r\nUnsupported: SEC-AGREE\r\nWarning: 399 pcscf.example \"Without sec-agree and security is configured on\"\r\nContent-Length: 0\r\n\r\n";
+        let failure = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(response.to_vec()),
+            auth_rounds: 0,
+        };
+        let upgraded = next_dynamic_register_variant(profile, base, &failure).unwrap();
+        assert!(upgraded.policy.advertise_sec_agree);
+        assert!(upgraded.policy.require_sec_agree);
+        assert!(upgraded.policy.proxy_require_sec_agree);
+        assert_eq!(upgraded.authorization, base.authorization);
+        assert_eq!(upgraded.security_client_offer, base.security_client_offer);
+        assert_eq!(
+            upgraded.policy.include_access_network_info,
+            base.policy.include_access_network_info
+        );
+        assert!(next_dynamic_register_variant(profile, upgraded, &failure).is_none());
+        assert!(derived_missing_sec_agree_retry_variant(&GB_EE_23433, base, &failure).is_none());
+    }
+
+    #[test]
+    fn derived_420_security_completion_requires_exact_unauthenticated_warning_evidence() {
+        let original =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "515",
+                "02",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
+            )
+            .unwrap();
+        let base = register_variants(original)[0];
+        for (status, unsupported, warning, auth_rounds, disabled) in [
+            (420, "sec-agree", "", 0, false),
+            (
+                420,
+                "sec-agree",
+                "399 proxy \"sec-agree is unsupported\"",
+                0,
+                false,
+            ),
+            (
+                420,
+                "sec-agree,path",
+                "399 proxy \"Without sec-agree and security is on\"",
+                0,
+                false,
+            ),
+            (
+                420,
+                "path",
+                "399 proxy \"Without sec-agree and security is on\"",
+                0,
+                false,
+            ),
+            (
+                403,
+                "sec-agree",
+                "399 proxy \"Without sec-agree and security is on\"",
+                0,
+                false,
+            ),
+            (
+                420,
+                "sec-agree",
+                "399 proxy \"Without sec-agree and security is on\"",
+                1,
+                false,
+            ),
+            (
+                420,
+                "sec-agree",
+                "399 proxy \"Without sec-agree and security is on\"",
+                0,
+                true,
+            ),
+            (
+                420,
+                "sec-agree",
+                "399 proxy \"Without sec-agree and security is off\"",
+                0,
+                false,
+            ),
+            (
+                420,
+                "sec-agree",
+                "399 proxy \"Without sec-agree and security is on\", 399 other \"other\"",
+                0,
+                false,
+            ),
+        ] {
+            let mut profile = *original;
+            if disabled {
+                profile.ims.register.sec_agree_mode = "disabled";
+            }
+            let failure = RegisterFailure {
+                error: ImsError::new("ims_register_initial_unexpected_status"),
+                response: Some(format!("SIP/2.0 {status} Result\r\nUnsupported: {unsupported}\r\nWarning: {warning}\r\nContent-Length: 0\r\n\r\n").into_bytes()),
+                auth_rounds,
+            };
+            assert!(
+                derived_missing_sec_agree_retry_variant(&profile, base, &failure).is_none(),
+                "{status}/{unsupported}/{warning}/{auth_rounds}/{disabled}"
+            );
+        }
     }
 
     #[test]
