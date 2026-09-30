@@ -3,6 +3,7 @@
 //! them. An uncertain mutation leaves the receipt and refuses another create.
 
 use super::*;
+use crate::hardware::devices::transport::ImsBearerTransport as _;
 use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -36,6 +37,10 @@ struct Snapshot {
     modem: String,
     device: String,
     sim_fingerprint: String,
+    #[serde(default)]
+    stable_sim_fingerprint: Option<String>,
+    #[serde(default)]
+    control_topology: Option<String>,
     eps_fingerprint: String,
     profiles: BTreeMap<i32, Profile>,
     definitions: BTreeMap<i32, Definition>,
@@ -48,6 +53,8 @@ enum Phase {
     Creating,
     Rejected,
     Owned,
+    Probing,
+    Probed,
     RestoringReporting,
     Deleting,
 }
@@ -171,6 +178,8 @@ fn same_binding(before: &Snapshot, after: &Snapshot) -> bool {
         && before.modem == after.modem
         && before.device == after.device
         && before.sim_fingerprint == after.sim_fingerprint
+        && before.stable_sim_fingerprint == after.stable_sim_fingerprint
+        && before.control_topology == after.control_topology
         && before.eps_fingerprint == after.eps_fingerprint
 }
 
@@ -200,6 +209,8 @@ fn owned_matches(receipt: &Receipt, snapshot: &Snapshot) -> Result<i32, String> 
     let owned = receipt.owned.as_ref().ok_or(ERROR)?;
     if receipt.version != 1
         || !(2..=16).contains(&owned.id)
+        || owned.apn != receipt.apn
+        || owned.family != receipt.requested_family
         || !unchanged_except(&receipt.before, snapshot, owned.id)
         || snapshot.profiles.get(&owned.id) != Some(owned)
         || snapshot.definitions.get(&owned.id) != receipt.owned_definition.as_ref()
@@ -443,6 +454,15 @@ fn reporting_snapshot(text: &str) -> Result<BTreeMap<i32, [u8; 3]>, String> {
 struct MmProfileIo {
     bus: Arc<MmBus>,
     method: CreationMethod,
+    topology: fn(&str) -> Result<String, String>,
+}
+
+fn physical_control_topology(device: &str) -> Result<String, String> {
+    let path = fs::canonicalize(
+        Path::new("/sys/class/wwan").join(device.strip_prefix("/dev/").ok_or(ERROR)?),
+    )
+    .map_err(|_| "mm_ims_profile_lease_topology_unavailable")?;
+    fingerprint(&path.to_string_lossy())
 }
 
 impl MmProfileIo {
@@ -530,7 +550,9 @@ impl ProfileIo for MmProfileIo {
             owner: self.bus.owner.clone(),
             modem: self.bus.modem.clone(),
             device: self.bus.device.clone(),
-            sim_fingerprint: fingerprint(&(sim.path, sim.id, sim.slot))?,
+            sim_fingerprint: fingerprint(&(&sim.path, &sim.id, sim.slot))?,
+            stable_sim_fingerprint: Some(fingerprint(&(&sim.id, sim.slot))?),
+            control_topology: Some((self.topology)(&self.bus.device)?),
             eps_fingerprint: fingerprint(&eps)?,
             profiles,
             definitions,
@@ -691,6 +713,264 @@ fn verify_inactive_context(text: &str, target: i32) -> Result<(), String> {
     Ok(())
 }
 
+/// Persist the one-shot budget before invoking any diagnostic work. Keeping
+/// this boundary independent of the live transport also lets cancellation and
+/// failed persistence be tested without a modem or namespace.
+async fn probe_with<I, S, F, Fut>(
+    io: &I,
+    store: &S,
+    mut receipt: Receipt,
+    apn: &str,
+    family: u32,
+    expected_plan: Option<&str>,
+    probe: F,
+) -> Result<serde_json::Value, String>
+where
+    I: ProfileIo,
+    S: Store,
+    F: FnOnce(Receipt) -> Fut,
+    Fut: Future<Output = Result<serde_json::Value, String>>,
+{
+    if receipt.phase != Phase::Owned || receipt.apn != apn || receipt.requested_family != family {
+        return Err("mm_ims_profile_probe_not_admitted".into());
+    }
+    let current = io.snapshot().await?;
+    owned_matches(&receipt, &current)?;
+    if Some(fingerprint(&(apn, family, &current))?.as_str()) != expected_plan {
+        return Err("mm_ims_profile_lease_plan_changed".into());
+    }
+    if io.snapshot().await? != current {
+        return Err(ERROR.into());
+    }
+    receipt.phase = Phase::Probing;
+    store.save(&receipt)?; // a probe is never repeated after cancellation/crash
+    let result = probe(receipt.clone()).await;
+    receipt.phase = Phase::Probed;
+    store.save(&receipt)?;
+    result
+}
+
+/// Capability issued only from a verified Owned receipt. The diagnostic caller
+/// cannot substitute a CID/APN/modem or turn a forced-family response into a
+/// second activation on a mismatched profile.
+pub(crate) struct VerifiedProfileProbe {
+    bus: Arc<MmBus>,
+    receipt: Receipt,
+    used: AtomicBool,
+}
+
+impl VerifiedProfileProbe {
+    pub(crate) fn cid(&self) -> u8 {
+        self.receipt
+            .owned
+            .as_ref()
+            .expect("verified owned profile")
+            .id as u8
+    }
+    pub(crate) fn family(&self) -> u32 {
+        self.receipt.requested_family
+    }
+    pub(crate) fn apn(&self) -> &str {
+        &self.receipt.apn
+    }
+    pub(crate) fn label(&self) -> &str {
+        &self.receipt.tag
+    }
+    pub(crate) fn accepts_endpoint(&self, modem: &str, device: &str) -> bool {
+        device == self.bus.device
+            && (modem == self.bus.modem || self.bus.modem.rsplit('/').next() == Some(modem))
+    }
+    pub(crate) async fn verify(&self) -> Result<(), String> {
+        let io = MmProfileIo {
+            bus: Arc::clone(&self.bus),
+            method: self.receipt.method,
+            topology: physical_control_topology,
+        };
+        owned_matches(&self.receipt, &io.snapshot().await?)?;
+        Ok(())
+    }
+    pub(crate) async fn binding(
+        &self,
+    ) -> Result<crate::hardware::cellular::bindings::ModemBinding, String> {
+        self.verify().await?;
+        let bindings =
+            crate::hardware::cellular::control::discover_modem_bindings(&self.bus.connection)
+                .await
+                .map_err(bus_error)?;
+        let mut matching = bindings.into_iter().filter(|binding| {
+            binding.present
+                && binding.modem_path == self.bus.modem
+                && binding.control_device() == Some(self.bus.device.as_str())
+        });
+        let binding = matching.next().ok_or(ERROR)?;
+        if matching.next().is_some() {
+            return Err(ERROR.into());
+        }
+        self.bus
+            .verify_expected_sim(&binding.sim_iccid, binding.uim_slot)
+            .await?;
+        Ok(binding)
+    }
+    pub(crate) async fn serving_access(
+        &self,
+        binding: &crate::hardware::cellular::bindings::ModemBinding,
+    ) -> Result<crate::connectivity::core::access_network::ServingAccessSnapshot, String> {
+        use crate::hardware::cellular::observations::ModemObservationProvider;
+        self.verify().await?;
+        let observed = crate::hardware::cellular::mm_observations::ModemManagerObservations::new(
+            Arc::new(self.bus.connection.clone()),
+        )
+        .serving_access(binding)
+        .await
+        .map_err(|error| error.to_string());
+        self.verify().await?;
+        observed
+    }
+
+    pub(crate) async fn drain_bearers(&self) -> Result<(), String> {
+        shutdown_owned().await;
+        // A timed-out shutdown does not authorize deleting namespace/profile.
+        if !leases().lock().unwrap().is_empty() || PENDING.load(Ordering::Acquire) != 0 {
+            return Err("mm_ims_profile_probe_bearer_cleanup_pending".into());
+        }
+        require_no_bearer_receipts()?;
+        Ok(())
+    }
+}
+
+impl crate::hardware::devices::transport::ImsBearerTransport for VerifiedProfileProbe {
+    fn endpoint_available(&self, primary_device: &str) -> bool {
+        primary_device == self.bus.device
+            && crate::hardware::devices::qcm410::ims_bearer::Qcm410ImsBearer
+                .endpoint_available(primary_device)
+    }
+    fn establish_ims_bearer<'a>(
+        &'a self,
+        primary_device: &'a str,
+        modem_id: &'a str,
+        apn: &'a str,
+        profile_id: Option<u32>,
+        cid: u8,
+        families: &'a [u8],
+        allow_roaming: bool,
+        expected_mm_sim: Option<(&'a str, u8)>,
+    ) -> crate::hardware::devices::transport::TransportFuture<
+        'a,
+        Result<
+            (
+                crate::hardware::devices::transport::ImsBearerInfo,
+                Box<dyn crate::hardware::devices::transport::ImsBearerHandle + Send>,
+            ),
+            ImsBearerError,
+        >,
+    > {
+        Box::pin(async move {
+            let family_matches = probe_family_matches(self.family(), families);
+            if primary_device != self.bus.device
+                || !(modem_id == self.bus.modem
+                    || self.bus.modem.rsplit('/').next() == Some(modem_id))
+                || apn != self.apn()
+                || profile_id != Some(u32::from(self.cid()))
+                || cid != self.cid()
+                || !family_matches
+                || expected_mm_sim.is_none()
+                || self.used.swap(true, Ordering::AcqRel)
+            {
+                return Err(session_changed("profile_probe_request_changed_or_repeated"));
+            }
+            self.verify()
+                .await
+                .map_err(|_| session_changed("profile_probe_receipt_changed"))?;
+            crate::hardware::devices::qcm410::ims_bearer::establish_with_bus(
+                primary_device,
+                modem_id,
+                apn,
+                profile_id,
+                cid,
+                families,
+                allow_roaming,
+                expected_mm_sim,
+                Some(Arc::clone(&self.bus)),
+            )
+            .await
+        })
+    }
+}
+
+fn probe_family_matches(family: u32, requested: &[u8]) -> bool {
+    match family {
+        1 => requested == [4],
+        2 => requested == [6],
+        4 => requested == [4, 6] || requested == [6, 4],
+        _ => false,
+    }
+}
+
+async fn original_modem_absent(io: &MmProfileIo, original: &str) -> Result<bool, String> {
+    if !io.bus.owner_is_current().await? {
+        return Err(ERROR.into());
+    }
+    let objects: ManagedObjects = timed(10, async {
+        io.bus
+            .proxy(
+                "/org/freedesktop/ModemManager1",
+                "org.freedesktop.DBus.ObjectManager",
+            )
+            .await?
+            .call("GetManagedObjects", &())
+            .await
+            .map_err(bus_error)
+    })
+    .await?;
+    if !io.bus.owner_is_current().await? {
+        return Err(ERROR.into());
+    }
+    Ok(!objects.keys().any(|path| path.as_str() == original))
+}
+
+fn rebind_profile_receipt(receipt: &Receipt, current: &Snapshot) -> Result<Receipt, String> {
+    let old = &receipt.before;
+    if old.bus_id != current.bus_id
+        || old.owner != current.owner
+        || old.device != current.device
+        || old.stable_sim_fingerprint.is_none()
+        || old.stable_sim_fingerprint != current.stable_sim_fingerprint
+        || old.control_topology.is_none()
+        || old.control_topology != current.control_topology
+        || old.eps_fingerprint != current.eps_fingerprint
+        || !matches!(
+            receipt.phase,
+            Phase::Probing | Phase::Probed | Phase::Owned | Phase::RestoringReporting
+        )
+    {
+        return Err("mm_ims_profile_lease_rebinding_unverified".into());
+    }
+    let mut next = receipt.clone();
+    next.before.modem = current.modem.clone();
+    next.before.sim_fingerprint = current.sim_fingerprint.clone();
+    owned_matches(&next, current)?;
+    Ok(next)
+}
+
+async fn reconcile_profile_modem<S: Store>(
+    io: &MmProfileIo,
+    store: &S,
+    receipt: Receipt,
+) -> Result<Receipt, String> {
+    // This is profile-only reconciliation; never redirect any bearer cleanup.
+    let original = receipt.before.modem.clone();
+    if !original_modem_absent(io, &original).await? {
+        return Err(ERROR.into());
+    }
+    let current = io.snapshot().await?;
+    let next = rebind_profile_receipt(&receipt, &current)?;
+    if io.snapshot().await? != current || !original_modem_absent(io, &original).await? {
+        return Err(ERROR.into());
+    }
+    store.save(&next)?;
+    Ok(next)
+}
+
 struct DiskStore {
     file: PathBuf,
 }
@@ -709,7 +989,7 @@ impl Store for DiskStore {
     }
 }
 
-fn require_stopped() -> Result<(), String> {
+fn require_no_bearer_receipts() -> Result<(), String> {
     match fs::read_dir(STATE_DIR) {
         Ok(entries) => {
             for entry in entries {
@@ -725,6 +1005,11 @@ fn require_stopped() -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(ERROR.into()),
     }
+    Ok(())
+}
+
+fn require_stopped() -> Result<(), String> {
+    require_no_bearer_receipts()?;
     // Maintenance must not race any manager process, including beta8 started
     // manually. Inspect cmdline/exe locally; never print their values.
     for item in fs::read_dir("/proc").map_err(|_| ERROR)? {
@@ -751,8 +1036,9 @@ fn require_stopped() -> Result<(), String> {
     Ok(())
 }
 
-/// Root-only explicit diagnostic command. No service starts, bearer activation,
-/// fallback-policy changes or persistent application configuration writes.
+/// Root-only explicit diagnostic command. Only `probe` activates a bearer;
+/// no service starts, fallback-policy changes or persistent application
+/// configuration writes.
 pub async fn maintain(
     action: &str,
     modem: &str,
@@ -764,7 +1050,10 @@ pub async fn maintain(
     if unsafe { libc::geteuid() } != 0 {
         return Err("mm_ims_profile_lease_root_required".into());
     }
-    if !matches!(action, "inspect" | "acquire" | "acquire-at" | "release") {
+    if !matches!(
+        action,
+        "inspect" | "acquire" | "acquire-at" | "probe" | "release"
+    ) {
         return Err(ERROR.into());
     }
     let family = match family {
@@ -807,6 +1096,7 @@ pub async fn maintain(
     bus.pin_sim_binding().await?;
     let io = MmProfileIo {
         bus,
+        topology: physical_control_topology,
         method: if action == "acquire-at" {
             CreationMethod::At
         } else {
@@ -862,12 +1152,48 @@ pub async fn maintain(
                 serde_json::json!({"action":action,"profile_id":result.owned.ok_or(ERROR)?.id,"family":family,"receipt":store.file,"existing_profiles_unchanged":true}),
             )
         }
-        "release" => {
+        "probe" => {
             let receipt = existing.ok_or("mm_ims_profile_lease_receipt_missing")?;
+            probe_with(
+                &io,
+                &store,
+                receipt,
+                apn,
+                family,
+                expected_plan,
+                |receipt| async {
+                    let capability = VerifiedProfileProbe {
+                        bus: Arc::clone(&io.bus),
+                        receipt,
+                        used: AtomicBool::new(false),
+                    };
+                    crate::connectivity::modems::ims::cellular_ims::live::probe_owned_profile_once(
+                        &capability,
+                    )
+                    .await
+                },
+            )
+            .await
+        }
+        "release" => {
+            let mut receipt = existing.ok_or("mm_ims_profile_lease_receipt_missing")?;
             if receipt.apn != apn || receipt.requested_family != family {
                 return Err("mm_ims_profile_lease_release_selector_mismatch".into());
             }
             require_stopped()?;
+            // The tag also names the unique probe namespace. A leftover
+            // namespace (even empty) needs separate reconciliation; deleting
+            // the profile ledger must not erase the last ownership reference.
+            let namespace = crate::platform::netns::NetnsName::for_line(
+                crate::platform::netns::DEFAULT_NAMESPACE_PREFIX,
+                &format!("ims-profile-probe-{}", receipt.tag),
+            );
+            if crate::platform::netns::exists(&namespace) {
+                return Err("mm_ims_profile_probe_namespace_remaining".into());
+            }
+            if receipt.before.modem != io.bus.modem {
+                receipt = reconcile_profile_modem(&io, &store, receipt).await?;
+            }
             release_with(&io, &store, receipt).await?;
             Ok(serde_json::json!({"action":"release","original_state_verified":true}))
         }
@@ -891,6 +1217,8 @@ mod tests {
             modem: "/modem/0".into(),
             device: "/dev/wwan0qmi0".into(),
             sim_fingerprint: "sim-a".into(),
+            stable_sim_fingerprint: Some("sim-id-slot".into()),
+            control_topology: Some("physical-qmi-port".into()),
             eps_fingerprint: "eps".into(),
             profiles: BTreeMap::from([(
                 3,
@@ -940,6 +1268,8 @@ mod tests {
         calls: Mutex<Vec<String>>,
         returned: i32,
         behavior: AtomicI32,
+        snapshot_count: AtomicUsize,
+        change_snapshot_at: AtomicUsize,
     }
     impl FakeIo {
         fn new(returned: i32) -> Self {
@@ -948,12 +1278,19 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 returned,
                 behavior: AtomicI32::new(0),
+                snapshot_count: AtomicUsize::new(0),
+                change_snapshot_at: AtomicUsize::new(0),
             }
         }
     }
     impl ProfileIo for FakeIo {
         async fn snapshot(&self) -> Result<Snapshot, String> {
-            Ok(self.state.lock().unwrap().clone())
+            let count = self.snapshot_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut snapshot = self.state.lock().unwrap().clone();
+            if self.change_snapshot_at.load(Ordering::SeqCst) == count {
+                snapshot.eps_fingerprint = "changed-during-snapshot".into();
+            }
+            Ok(snapshot)
         }
         async fn create(&self, apn: &str, family: u32, tag: &str) -> Result<Profile, String> {
             self.calls.lock().unwrap().push("Set-without-id".into());
@@ -1119,6 +1456,269 @@ mod tests {
             assert!(verify_inactive_context(bad, 9).is_err());
         }
         verify_inactive_context("+CGACT: 3,0\n+CGACT: 9,0", 9).unwrap();
+    }
+
+    async fn unexpected_probe(_: Receipt) -> Result<serde_json::Value, String> {
+        panic!("unadmitted or repeated probe dispatched");
+    }
+
+    #[tokio::test]
+    async fn profile_probe_persists_one_shot_budget_on_success_and_failure() {
+        for succeeds in [true, false] {
+            let io = FakeIo::new(9);
+            let store = MemoryStore::default();
+            let receipt = acquire(&io, &store, 1).await;
+            let token = fingerprint(&("ims", 1_u32, io.snapshot().await.unwrap())).unwrap();
+            let result = probe_with(&io, &store, receipt, "ims", 1, Some(&token), |admitted| {
+                assert_eq!(admitted.phase, Phase::Probing);
+                assert_eq!(
+                    store.saved.lock().unwrap().as_ref().unwrap().phase,
+                    Phase::Probing
+                );
+                std::future::ready(if succeeds {
+                    Ok(serde_json::json!({"registered": true}))
+                } else {
+                    Err("mock-probe-failed".into())
+                })
+            })
+            .await;
+            assert_eq!(result.is_ok(), succeeds);
+            let saved = store.saved.lock().unwrap().clone().unwrap();
+            assert_eq!(saved.phase, Phase::Probed);
+            for phase in [
+                Phase::Creating,
+                Phase::Rejected,
+                Phase::Probing,
+                Phase::Probed,
+                Phase::RestoringReporting,
+                Phase::Deleting,
+            ] {
+                let mut replay = saved.clone();
+                replay.phase = phase;
+                assert!(probe_with(
+                    &io,
+                    &store,
+                    replay,
+                    "ims",
+                    1,
+                    Some(&token),
+                    unexpected_probe,
+                )
+                .await
+                .is_err());
+            }
+            release_with(&io, &store, saved).await.unwrap();
+            assert_eq!(*io.calls.lock().unwrap(), ["Set-without-id", "Delete:9"]);
+            assert!(store.saved.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_probe_rejects_stale_plan_selectors_and_inconsistent_owned_receipt() {
+        for change in 0..9 {
+            let io = FakeIo::new(9);
+            let store = MemoryStore::default();
+            let mut receipt = acquire(&io, &store, 1).await;
+            let mut apn = "ims";
+            let mut family = 1;
+            match change {
+                0 | 1 | 8 => {}
+                2 => apn = "other",
+                3 => family = 2,
+                4 => {
+                    // Even a matching selector/token must not contradict the
+                    // family of the profile that was actually acquired.
+                    receipt.requested_family = 2;
+                    family = 2;
+                }
+                5 => {
+                    receipt.apn = "other".into();
+                    apn = "other";
+                }
+                6 => {
+                    io.state
+                        .lock()
+                        .unwrap()
+                        .profiles
+                        .get_mut(&9)
+                        .unwrap()
+                        .fingerprint = "changed".into();
+                }
+                _ => io.state.lock().unwrap().owner = ":1.99".into(),
+            }
+            let token = fingerprint(&(apn, family, io.snapshot().await.unwrap())).unwrap();
+            let plan = match change {
+                0 => None,
+                1 => Some("stale"),
+                _ => Some(token.as_str()),
+            };
+            if change == 8 {
+                io.change_snapshot_at.store(
+                    io.snapshot_count.load(Ordering::SeqCst) + 2,
+                    Ordering::SeqCst,
+                );
+            }
+            assert!(
+                probe_with(&io, &store, receipt, apn, family, plan, unexpected_probe,)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.save_count.load(Ordering::SeqCst), 3);
+            assert_eq!(*io.calls.lock().unwrap(), ["Set-without-id"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_probe_cancellation_and_failed_persistence_never_replenish_budget() {
+        for failure in ["intent", "completion", "cancelled"] {
+            let io = FakeIo::new(9);
+            let store = MemoryStore::default();
+            let receipt = acquire(&io, &store, 1).await;
+            let token = fingerprint(&("ims", 1_u32, io.snapshot().await.unwrap())).unwrap();
+            if failure != "cancelled" {
+                store
+                    .fail_at
+                    .store(if failure == "intent" { 4 } else { 5 }, Ordering::SeqCst);
+            }
+            let dispatched = AtomicUsize::new(0);
+            let result = tokio::time::timeout(
+                Duration::from_millis(10),
+                probe_with(&io, &store, receipt, "ims", 1, Some(&token), |_| async {
+                    dispatched.fetch_add(1, Ordering::SeqCst);
+                    if failure == "cancelled" {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(serde_json::json!({"registered": false}))
+                }),
+            )
+            .await;
+            assert!(!matches!(result, Ok(Ok(_))));
+            assert_eq!(
+                dispatched.load(Ordering::SeqCst),
+                usize::from(failure != "intent")
+            );
+            let saved = store.saved.lock().unwrap().clone().unwrap();
+            if failure == "intent" {
+                assert_eq!(saved.phase, Phase::Owned);
+            } else {
+                assert_eq!(saved.phase, Phase::Probing);
+                assert!(
+                    probe_with(&io, &store, saved, "ims", 1, Some(&token), unexpected_probe,)
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(*io.calls.lock().unwrap(), ["Set-without-id"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_probe_rebind_preserves_phase_and_never_repeats_uncertain_reporting() {
+        for phase in [
+            Phase::Owned,
+            Phase::Probing,
+            Phase::Probed,
+            Phase::RestoringReporting,
+        ] {
+            for reporting in [[0, 0, 0], [1, 1, 1]] {
+                let io = FakeIo::new(9);
+                let store = MemoryStore::default();
+                let mut receipt = acquire(&io, &store, 1).await;
+                receipt.phase = phase.clone();
+                {
+                    let mut current = io.state.lock().unwrap();
+                    current.modem = "/modem/1".into();
+                    current.sim_fingerprint = "same-card-new-sim-path".into();
+                    current.reporting.insert(9, reporting);
+                }
+                let reconciled =
+                    rebind_profile_receipt(&receipt, &io.snapshot().await.unwrap()).unwrap();
+                assert_eq!(reconciled.phase, phase);
+                store.save(&reconciled).unwrap();
+                let result = release_with(&io, &store, reconciled).await;
+                if phase == Phase::RestoringReporting && reporting == [1, 1, 1] {
+                    assert!(result.is_err());
+                    assert_eq!(*io.calls.lock().unwrap(), ["Set-without-id"]);
+                    assert!(store.saved.lock().unwrap().is_some());
+                } else {
+                    result.unwrap();
+                    assert_eq!(io.calls.lock().unwrap().last().unwrap(), "Delete:9");
+                    assert!(store.saved.lock().unwrap().is_none());
+                    let mut restored = receipt.before;
+                    restored.modem = "/modem/1".into();
+                    restored.sim_fingerprint = "same-card-new-sim-path".into();
+                    assert_eq!(io.snapshot().await.unwrap(), restored);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn profile_probe_family_guard_never_turns_a_single_profile_into_a_different_attempt() {
+        assert!(probe_family_matches(4, &[6, 4]));
+        assert!(probe_family_matches(4, &[4, 6]));
+        assert!(probe_family_matches(1, &[4]));
+        assert!(probe_family_matches(2, &[6]));
+        for (family, requested) in [
+            (4, vec![4]),
+            (4, vec![6]),
+            (1, vec![6]),
+            (2, vec![4]),
+            (1, vec![4, 6]),
+            (4, vec![4, 4]),
+        ] {
+            assert!(!probe_family_matches(family, &requested));
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_probe_reconciliation_requires_stable_owner_sim_topology_and_exact_profile() {
+        let io = FakeIo::new(9);
+        let store = MemoryStore::default();
+        let receipt = acquire(&io, &store, 1).await;
+        let mut current = io.snapshot().await.unwrap();
+        current.modem = "/modem/1".into();
+        current.sim_fingerprint = "new-sim-object-same-card".into();
+        let reconciled = rebind_profile_receipt(&receipt, &current).unwrap();
+        assert_eq!(reconciled.before.modem, current.modem);
+        assert_eq!(
+            reconciled.before.stable_sim_fingerprint,
+            receipt.before.stable_sim_fingerprint
+        );
+        for kind in 0..12 {
+            let mut bad = current.clone();
+            match kind {
+                0 => bad.owner = ":1.43".into(),
+                1 => bad.stable_sim_fingerprint = Some("different-card".into()),
+                2 => bad.control_topology = Some("different-device".into()),
+                3 => bad.eps_fingerprint = "changed".into(),
+                4 => bad.profiles.get_mut(&9).unwrap().fingerprint = "reused-id".into(),
+                5 => bad.profiles.get_mut(&3).unwrap().fingerprint = "other-changed".into(),
+                6 => bad.bus_id = "new-boot".into(),
+                7 => bad.device = "/dev/wwan1qmi0".into(),
+                8 => bad.definitions.get_mut(&9).unwrap().fingerprint = "changed-at-row".into(),
+                9 => {
+                    bad.reporting.insert(3, [1, 1, 1]);
+                }
+                10 => bad.stable_sim_fingerprint = None,
+                _ => bad.control_topology = None,
+            }
+            assert!(rebind_profile_receipt(&receipt, &bad).is_err());
+        }
+        for phase in [Phase::Creating, Phase::Rejected, Phase::Deleting] {
+            let mut unresolved = receipt.clone();
+            unresolved.phase = phase;
+            assert!(rebind_profile_receipt(&unresolved, &current).is_err());
+        }
+        for missing_sim in [true, false] {
+            let mut legacy = receipt.clone();
+            if missing_sim {
+                legacy.before.stable_sim_fingerprint = None;
+            } else {
+                legacy.before.control_topology = None;
+            }
+            assert!(rebind_profile_receipt(&legacy, &current).is_err());
+        }
     }
 
     #[test]

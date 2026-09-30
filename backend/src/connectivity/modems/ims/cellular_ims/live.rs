@@ -1930,6 +1930,8 @@ pub async fn connect_live_for_line(
         &profile_store,
         profile_candidate,
         &sim_override,
+        #[cfg(target_os = "linux")]
+        None,
     )
     .await
     {
@@ -2002,6 +2004,133 @@ pub async fn connect_live_for_line(
     }
 }
 
+/// One explicit maintenance REGISTER. No server, scheduler, SMS/call listener,
+/// refresh loop, data bearer, device initializer or outer recovery is started.
+#[cfg(target_os = "linux")]
+pub(crate) async fn probe_owned_profile_once(
+    probe: &crate::hardware::devices::qcm410::mm_ims_profile_lease::VerifiedProfileProbe,
+) -> Result<serde_json::Value, String> {
+    use crate::platform::config::ImsProfileSource;
+    use crate::platform::netns::{self, NetnsName};
+    use crate::services::ue_worker::register_line_worker;
+    let mut binding = probe.binding().await?;
+    let access_network = ImsAccessNetworkRuntime::default();
+    match probe.serving_access(&binding).await {
+        Ok(snapshot) => access_network.publish(snapshot),
+        Err(_) => access_network.record_refresh_error("profile_probe_serving_context_unavailable"),
+    }
+    binding.line_id = format!("ims-profile-probe-{}", probe.label());
+    let device = CellularImsDeviceBinding::from_modem(&binding).map_err(|e| e.to_string())?;
+    let runtime = Arc::new(CellularImsRuntime::new());
+    runtime.observe_mm_binding(&binding);
+    let generation = runtime
+        .admitted_generation()
+        .ok_or("mm_ims_profile_probe_binding_not_ready")?;
+    let scoped = runtime.for_generation(generation);
+    let coordinator =
+        crate::connectivity::core::ims_registration_coordinator::for_line(&device.line_id);
+    let _permit = coordinator
+        .admit(crate::connectivity::core::ims_access::ImsAccess::Cellular)
+        .await
+        .map_err(str::to_string)?;
+    let _advance = scoped.advance_guard().await;
+    let family = match probe.family() {
+        1 => CellularImsIpFamily::Ipv4,
+        2 => CellularImsIpFamily::Ipv6,
+        4 => CellularImsIpFamily::Ipv4v6,
+        _ => return Err("mm_ims_profile_probe_family_invalid".into()),
+    };
+    let database = Arc::new(
+        Database::new(std::path::PathBuf::from(":memory:"))
+            .map_err(|_| "mm_ims_profile_probe_memory_database_failed")?,
+    );
+    let profile_store = ProfileStore::new(
+        Arc::new(
+            crate::connectivity::modems::ims::vowifi::carrier_catalog::CarrierCatalog::at_path(
+                std::path::PathBuf::from("/nonexistent/simadmin-profile-probe.sqlite3"),
+            ),
+        ),
+        database,
+    );
+    let namespace = NetnsName::for_line(netns::DEFAULT_NAMESPACE_PREFIX, &device.line_id);
+    if netns::exists(&namespace) {
+        return Err("mm_ims_profile_probe_namespace_exists".into());
+    }
+    // Unlike ensure(), a concurrent existing namespace must fail, not be adopted.
+    let created = tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new("ip")
+            .args(["netns", "add", namespace.as_str()])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "mm_ims_profile_probe_namespace_create_uncertain")?
+    .map_err(|_| "mm_ims_profile_probe_namespace_create_failed")?;
+    if !created.status.success() {
+        return Err("mm_ims_profile_probe_namespace_create_failed".into());
+    }
+    let worker = UeWorkerHandle::for_line(&device.line_id, namespace.clone());
+    let live = CellularImsLiveHandle::new();
+    let result: Result<serde_json::Value, String> = async {
+        netns::set_loopback_up(&namespace).await.map_err(|_|"mm_ims_profile_probe_loopback_failed")?;
+        worker.spawn().await.map_err(|_|"mm_ims_profile_probe_worker_failed")?;
+        worker.wait_ready(Duration::from_secs(10)).await.map_err(|_|"mm_ims_profile_probe_worker_failed")?;
+        register_line_worker(&device.line_id,Some(worker.clone()));
+        let connected = tokio::time::timeout(Duration::from_secs(240),connect_inner(
+            &live,&scoped,&access_network,generation,&device,Some(probe),
+            ImsConnectionPlan::from_families(&[family]),false,true,DataSlotMode::UeNativeIms,
+            &profile_store,&ImsProfileCandidate::automatic(ImsProfileSource::Derived),&SimOverride::default(),Some(probe),
+        )).await;
+        match connected {
+            Ok(Ok(session)) => {
+                // A validated REGISTER transaction, not merely a granted address.
+                let mode = if session.xfrm_plan.is_some() { "ipsec" } else { "udp" };
+                let mut report = serde_json::json!({"registered":true,"registration_mode":mode,"profile_id":session.profile.meta.profile_id,"bearer_interface":session.bearer.interface,"granted_ip_type":session.bearer.ip_type});
+                *live.session.lock().await = Some(session);
+                // No live listener is installed: no OPTIONS, refreshes or calls.
+                let unregister = tokio::time::timeout(Duration::from_secs(40),unregister_live_session(&live,&scoped)).await;
+                report["unregister_result"] = probe_unregister_outcome(unregister.ok()).into();
+                Ok(report)
+            }
+            Ok(Err(error)) => Ok(serde_json::json!({"registered":false,"error":error.to_string()})),
+            Err(_) => Ok(serde_json::json!({"registered":false,"error":"mm_ims_profile_probe_timeout"})),
+        }
+    }.await;
+    let cleanup_finished =
+        tokio::time::timeout(Duration::from_secs(60), cleanup_live_session(&live))
+            .await
+            .is_ok();
+    let drained = probe.drain_bearers().await;
+    let worker_stopped = worker.shutdown().await.is_ok();
+    register_line_worker(&device.line_id, None);
+    // Never remove a namespace still carrying a hardware link or unknown state.
+    let only_loopback = netns::links_in(&namespace)
+        .await
+        .is_ok_and(|links| links.iter().all(|name| name == "lo"));
+    let cleaned = cleanup_finished && drained.is_ok() && worker_stopped && only_loopback;
+    if cleaned {
+        netns::remove(&namespace)
+            .await
+            .map_err(|_| "mm_ims_profile_probe_namespace_cleanup_failed")?;
+    }
+    let mut report: serde_json::Value = result?;
+    report["bearer_cleanup_verified"] = cleaned.into();
+    report["profile_release_required"] = true.into();
+    Ok(report)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_unregister_outcome(result: Option<UnregisterResult>) -> &'static str {
+    match result {
+        Some(UnregisterResult::Confirmed) => "confirmed",
+        Some(UnregisterResult::AlreadyExpired) => "already_expired",
+        Some(UnregisterResult::Rejected) => "rejected",
+        Some(UnregisterResult::AccessLost) => "access_lost",
+        None => "timeout",
+    }
+}
+
 fn failure_stage(error: &CellularImsError) -> Option<CellularImsStage> {
     Some(match error.code() {
         code::MM_IMSI_MISSING | code::IMSI_MISSING => CellularImsStage::Identity,
@@ -2065,6 +2194,9 @@ async fn connect_inner(
     profile_store: &ProfileStore,
     profile_candidate: &ImsProfileCandidate,
     sim_override: &SimOverride,
+    #[cfg(target_os = "linux")] diagnostic_profile: Option<
+        &crate::hardware::devices::qcm410::mm_ims_profile_lease::VerifiedProfileProbe,
+    >,
 ) -> Result<CellularImsLiveSession, CellularImsError> {
     if !runtime.task_is_current() {
         return Err(CellularImsError::new(code::RUNTIME_NOT_RUNNING));
@@ -2077,6 +2209,12 @@ async fn connect_inner(
         .update(|state| state.stage = CellularImsStage::Radio)
         .await;
     let mut device = resolve_device_binding(device, runtime, generation).await?;
+    #[cfg(target_os = "linux")]
+    if diagnostic_profile
+        .is_some_and(|probe| !probe.accepts_endpoint(&device.modem_id, &device.qmi_device))
+    {
+        return Err(CellularImsError::new(code::BEARER_SESSION_LOST));
+    }
 
     // beta2 readiness gate: wait for the QMI auto-activate marker to settle before
     // driving the modem, so IMS setup does not race the initial UIM provisioning.
@@ -2131,24 +2269,50 @@ async fn connect_inner(
         .update(|state| state.stage = CellularImsStage::Bearer)
         .await;
     let mut ims_profile_lease: Option<ImsProfileLease> = None;
-    let ims_profile = match prepare_ims_profile_context(&device.modem_id, &plan, ims_apn).await {
-        Ok(profile) => {
-            tracing::info!(
-                cid = profile.cid,
-                created = profile.created,
-                "Prepared native IMS profile without AT activation"
-            );
-            runtime
-                .update(|state| state.at_cid = Some(profile.cid))
-                .await;
-            Some(profile)
+    #[cfg(target_os = "linux")]
+    let diagnostic_context = if let Some(probe) = diagnostic_profile {
+        if !crate::connectivity::modems::ims::vowifi::profiles::is_standard_derived_profile(
+            device_identity.profile,
+        ) || ims_apn != probe.apn()
+            || !probe.accepts_endpoint(&device.modem_id, &device.qmi_device)
+        {
+            return Err(CellularImsError::new("mm_ims_profile_probe_not_derived"));
         }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Unable to select an IMS 3GPP profile; continuing with APN-only bearer setup"
-            );
-            None
+        probe
+            .verify()
+            .await
+            .map_err(|error| CellularImsError::with_detail(code::BEARER_SESSION_LOST, error))?;
+        Some(super::pcscf::ImsProfileContext {
+            cid: probe.cid(),
+            created: false,
+        })
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let diagnostic_context: Option<super::pcscf::ImsProfileContext> = None;
+    let ims_profile = if let Some(context) = diagnostic_context {
+        Some(context)
+    } else {
+        match prepare_ims_profile_context(&device.modem_id, &plan, ims_apn).await {
+            Ok(profile) => {
+                tracing::info!(
+                    cid = profile.cid,
+                    created = profile.created,
+                    "Prepared native IMS profile without AT activation"
+                );
+                runtime
+                    .update(|state| state.at_cid = Some(profile.cid))
+                    .await;
+                Some(profile)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Unable to select an IMS 3GPP profile; continuing with APN-only bearer setup"
+                );
+                None
+            }
         }
     };
     ensure_generation(runtime, generation)?;
@@ -8139,6 +8303,20 @@ mod tests {
     use super::*;
     use crate::connectivity::core::voice::MediaDirection;
     use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn profile_probe_unregister_report_does_not_claim_timeout_or_loss_as_confirmed() {
+        for (result, expected) in [
+            (Some(UnregisterResult::Confirmed), "confirmed"),
+            (Some(UnregisterResult::AlreadyExpired), "already_expired"),
+            (Some(UnregisterResult::Rejected), "rejected"),
+            (Some(UnregisterResult::AccessLost), "access_lost"),
+            (None, "timeout"),
+        ] {
+            assert_eq!(probe_unregister_outcome(result), expected);
+        }
+    }
 
     #[test]
     fn security_server_selection_preserves_all_wire_header_values() {

@@ -17,6 +17,16 @@
 - **此入口不改变现有自动CID选择、profile来源大兜底或地址族顺序，也没有偷偷增加“无响应再新建profile”的生产流程。** 下一阶段用已通过CI的维护能力进行一次独立profile对照，再根据证据决定生产集成；当前不能声称已经注册。
 - 单元/mock及private-D-Bus测试覆盖无ID Set、非固定返回ID、MM/AT不一致、原字段/owner/SIM变化、每次持久化失败、Set取消、报告恢复和Delete不确定结果、状态回收和身份字段不进入receipt。Rust只在Actions运行。
 
+## 有界注册对照入口（续接实现，尚待 CI 与实机验证）
+
+新增显式 `--action probe --expected-plan <当前 inspect token>`，只准入 `Owned` 租约且 APN/family 与完整快照一致。发请求前持久化 `Probing`，结束后记为 `Probed`；取消或崩溃后不能再次 probe 同一租约。
+
+- 复用现有派生身份、AKA、REGISTER 核心；独立 UE namespace、内存数据库，不启动 Web 服务、调度器、通话/短信监听或生产恢复循环。
+- capability 校验实际 CID/APN/MM 端点与族，最多调用一次底层承载建立；强制单族错误不能借此对同一 profile 再激活。REGISTER 核心窗口 240 秒，注销另限 40 秒；成功报告仅表示本次注册成功，随后主动注销，不是维持在线服务。
+- 注销结果分别报告 confirmed/already_expired/rejected/access_lost/timeout，不把清理成功当作网络已确认注销。承载回收后停止 worker，仅在自有 namespace 只剩 loopback 且清理已核验时删除；profile 仍须显式 release。
+- 同一 MM owner 内对象重新枚举，只在旧 modem 确认消失、物理控制口及稳定 SIM/slot、原 profile/EPS 全匹配且两次快照一致时衔接 profile 清理；不把 bearer 清理重定向到新对象，不接受旧 receipt 缺失稳定归属证据的换代。
+- 此节描述待验证代码，不是已部署、已注册或已完成生产集成的证据。原 6a77d92 的 profile 闭环证明保持独立。
+
 ## 维护工具的验证事实（2026-09-30）
 
 - `c71bee2`：两套CI/39累计新增与更新回归+8兼容/双架构核验通过，设备inspect成功；QMI Set请求返回`Couldn't create profile: DS profile error: invalid-parameter-length`，原3项profile和完整快照token未变。

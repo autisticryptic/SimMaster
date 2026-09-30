@@ -126,49 +126,74 @@ impl ImsBearerTransport for Qcm410ImsBearer {
         expected_mm_sim: Option<(&'a str, u8)>,
     ) -> TransportFuture<'a, Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>>
     {
-        Box::pin(async move {
-            let device = primary_device.trim();
-            if !is_primary_qmi_device(device) {
-                return Err(ImsBearerError {
-                    kind: ImsBearerErrorKind::EndpointUnavailable,
-                    hint: ImsBearerFailureHint::None,
-                    detail: format!(
-                        "qca410_ims_requires_primary_qmi_proxy:{PRIMARY_QMI_DEVICE}:got={device}"
-                    ),
-                });
-            }
-            let baseband =
-                secondary_qmi::baseband_key_for_device(device).map_err(|error| ImsBearerError {
-                    kind: ImsBearerErrorKind::BasebandUnresolved,
-                    hint: ImsBearerFailureHint::None,
-                    detail: format!("native_ims_baseband_unresolved:{error}"),
-                })?;
-            let netdev = primary_netdev_for_qmi(device).ok_or_else(|| ImsBearerError {
-                kind: ImsBearerErrorKind::EndpointUnavailable,
-                hint: ImsBearerFailureHint::None,
-                detail: format!("qca410_primary_qmi_netdev_unresolved:{device}"),
-            })?;
-            establish_bearer(
-                device,
-                &netdev,
-                &baseband,
-                modem_id,
-                apn,
-                profile_id,
-                cid,
-                families,
-                allow_roaming,
-                expected_mm_sim,
-            )
-            .await
-            .map(|established| {
-                (
-                    established.info,
-                    Box::new(established.handle) as Box<dyn ImsBearerHandle + Send>,
-                )
-            })
-        })
+        Box::pin(establish_with_bus(
+            primary_device,
+            modem_id,
+            apn,
+            profile_id,
+            cid,
+            families,
+            allow_roaming,
+            expected_mm_sim,
+            None,
+        ))
     }
+}
+
+/// Maintenance may supply its already verified unique-owner bus. Ordinary
+/// production setup keeps the existing discovery path by passing None.
+pub(super) async fn establish_with_bus(
+    primary_device: &str,
+    modem_id: &str,
+    apn: &str,
+    profile_id: Option<u32>,
+    cid: u8,
+    families: &[u8],
+    allow_roaming: bool,
+    expected_mm_sim: Option<(&str, u8)>,
+    pinned_bus: Option<std::sync::Arc<super::primary_ims_lifecycle::MmBus>>,
+) -> Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError> {
+    let device = primary_device.trim();
+    if !is_primary_qmi_device(device) {
+        return Err(ImsBearerError {
+            kind: ImsBearerErrorKind::EndpointUnavailable,
+            hint: ImsBearerFailureHint::None,
+            detail: format!(
+                "qca410_ims_requires_primary_qmi_proxy:{PRIMARY_QMI_DEVICE}:got={device}"
+            ),
+        });
+    }
+    let baseband =
+        secondary_qmi::baseband_key_for_device(device).map_err(|error| ImsBearerError {
+            kind: ImsBearerErrorKind::BasebandUnresolved,
+            hint: ImsBearerFailureHint::None,
+            detail: format!("native_ims_baseband_unresolved:{error}"),
+        })?;
+    let netdev = primary_netdev_for_qmi(device).ok_or_else(|| ImsBearerError {
+        kind: ImsBearerErrorKind::EndpointUnavailable,
+        hint: ImsBearerFailureHint::None,
+        detail: format!("qca410_primary_qmi_netdev_unresolved:{device}"),
+    })?;
+    establish_bearer(
+        device,
+        &netdev,
+        &baseband,
+        modem_id,
+        apn,
+        profile_id,
+        cid,
+        families,
+        allow_roaming,
+        expected_mm_sim,
+        pinned_bus,
+    )
+    .await
+    .map(|established| {
+        (
+            established.info,
+            Box::new(established.handle) as Box<dyn ImsBearerHandle + Send>,
+        )
+    })
 }
 
 struct Established {
@@ -187,12 +212,13 @@ async fn establish_bearer(
     families: &[u8],
     allow_roaming: bool,
     expected_mm_sim: Option<(&str, u8)>,
+    pinned_bus: Option<std::sync::Arc<super::primary_ims_lifecycle::MmBus>>,
 ) -> Result<Established, ImsBearerError> {
     // A two-family request is MM's distinct IPV4V6 flag, not two independent
     // owners and not an instruction to silently start only the first family.
     let requested_family =
         MmIpFamily::from_requested(families).map_err(|detail| session_start_error(&detail))?;
-    let mut session = match PrimaryImsSession::start(PrimaryImsRequest {
+    let request = PrimaryImsRequest {
         device,
         modem: modem_id,
         interface: primary_netdev,
@@ -201,9 +227,12 @@ async fn establish_bearer(
         family: requested_family,
         allow_roaming,
         expected_sim: expected_mm_sim,
-    })
-    .await
-    {
+    };
+    let started = match pinned_bus {
+        Some(bus) => PrimaryImsSession::start_on_bus(request, Some(bus)).await,
+        None => PrimaryImsSession::start(request).await,
+    };
+    let mut session = match started {
         Ok(session) => session,
         Err(error) => {
             return Err(ImsBearerError {

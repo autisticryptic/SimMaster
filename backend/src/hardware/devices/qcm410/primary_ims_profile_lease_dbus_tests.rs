@@ -1,4 +1,5 @@
 use super::*;
+use crate::hardware::devices::transport::ImsBearerTransport;
 
 #[derive(Default)]
 struct FakeState {
@@ -7,6 +8,7 @@ struct FakeState {
     calls: Vec<String>,
     reporting: [u8; 3],
     replacement_sim: bool,
+    sim_path_changed: bool,
     active_bearer: bool,
 }
 #[derive(Clone)]
@@ -84,7 +86,12 @@ impl FakeModem {
     }
     #[zbus(property)]
     fn sim(&self) -> OwnedObjectPath {
-        OwnedObjectPath::try_from("/org/freedesktop/ModemManager1/SIM/0").unwrap()
+        OwnedObjectPath::try_from(if self.0 .0.lock().unwrap().sim_path_changed {
+            "/org/freedesktop/ModemManager1/SIM/1"
+        } else {
+            "/org/freedesktop/ModemManager1/SIM/0"
+        })
+        .unwrap()
     }
     #[zbus(property)]
     fn primary_sim_slot(&self) -> u32 {
@@ -161,6 +168,40 @@ impl FakeVoice {
     }
 }
 
+#[tokio::test]
+async fn profile_probe_pinned_bus_rejects_replacement_owner_at_session_boundary() {
+    use super::super::super::primary_ims_session::{PrimaryImsRequest, PrimaryImsSession};
+    use super::super::super::primary_ims_settings::MmIpFamily;
+    let (original, fake, io) = server().await;
+    original.release_name(SERVICE).await.unwrap();
+    let (replacement, replacement_fake, _) = server().await;
+    assert_ne!(original.unique_name(), replacement.unique_name());
+    let result = PrimaryImsSession::start_on_bus(
+        PrimaryImsRequest {
+            device: "/dev/wwan0qmi0",
+            modem: "/org/freedesktop/ModemManager1/Modem/0",
+            interface: "wwan0",
+            apn: "ims",
+            profile_id: Some(9),
+            family: MmIpFamily::Ipv4,
+            allow_roaming: true,
+            expected_sim: Some(("8900000000000000001", 1)),
+        },
+        Some(Arc::clone(&io.bus)),
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("replacement MM owner must not be adopted"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        super::super::super::primary_ims_session::OWNER_MISSING
+    );
+    assert!(fake.0.lock().unwrap().calls.is_empty());
+    assert!(replacement_fake.0.lock().unwrap().calls.is_empty());
+}
+
 async fn server() -> (Connection, Fake, MmProfileIo) {
     let session = std::env::var("DBUS_SESSION_BUS_ADDRESS").expect("private D-Bus only");
     assert_eq!(std::env::var("DBUS_SYSTEM_BUS_ADDRESS").unwrap(), session);
@@ -194,14 +235,18 @@ async fn server() -> (Connection, Fake, MmProfileIo) {
         MmProfileIo {
             bus,
             method: CreationMethod::Qmi,
+            topology: |_| Ok("fake-physical-control".into()),
         },
     )
 }
 
 #[derive(Default)]
-struct MemoryStore(Mutex<Option<Receipt>>);
+struct MemoryStore(Mutex<Option<Receipt>>, AtomicBool);
 impl Store for MemoryStore {
     fn save(&self, r: &Receipt) -> Result<(), String> {
+        if self.1.load(Ordering::SeqCst) {
+            return Err("mock-store-failed".into());
+        }
         *self.0.lock().unwrap() = Some(r.clone());
         Ok(())
     }
@@ -245,6 +290,188 @@ async fn temporary_profile_private_bus_at_path_creates_only_unused_capability_se
         fake.0.lock().unwrap().calls,
         ["AT-define-unused-9", "Delete-owned"]
     );
+}
+
+#[tokio::test]
+async fn profile_probe_private_bus_reconciles_only_retired_modem_under_same_owner() {
+    let (server, fake, io) = server().await;
+    server
+        .object_server()
+        .at("/org/freedesktop/ModemManager1", zbus::fdo::ObjectManager)
+        .await
+        .unwrap();
+    let store = MemoryStore::default();
+    let before = io.snapshot().await.unwrap();
+    let mut receipt = acquire_with(
+        &io,
+        &store,
+        "ims",
+        1,
+        &fingerprint(&("ims", 1_u32, &before)).unwrap(),
+    )
+    .await
+    .unwrap();
+    receipt.phase = Phase::Probed;
+    store.save(&receipt).unwrap();
+    fake.0.lock().unwrap().reporting = [1, 1, 1];
+    let next = "/org/freedesktop/ModemManager1/Modem/1";
+    server.object_server().at(next, fake.clone()).await.unwrap();
+    server
+        .object_server()
+        .at(next, FakeModem(fake.clone()))
+        .await
+        .unwrap();
+    server.object_server().at(next, FakeGpp).await.unwrap();
+    server.object_server().at(next, FakeVoice).await.unwrap();
+    let bus = MmBus::new("/dev/wwan0qmi0", next, "wwan0").await.unwrap();
+    bus.pin_sim_binding().await.unwrap();
+    let replacement = MmProfileIo {
+        bus,
+        method: CreationMethod::Qmi,
+        topology: |_| Ok("fake-physical-control".into()),
+    };
+    assert!(
+        reconcile_profile_modem(&replacement, &store, receipt.clone())
+            .await
+            .is_err(),
+        "old modem still present"
+    );
+    let original = receipt.before.modem.as_str();
+    server
+        .object_server()
+        .remove::<Fake, _>(original)
+        .await
+        .unwrap();
+    server
+        .object_server()
+        .remove::<FakeModem, _>(original)
+        .await
+        .unwrap();
+    server
+        .object_server()
+        .remove::<FakeGpp, _>(original)
+        .await
+        .unwrap();
+    server
+        .object_server()
+        .remove::<FakeVoice, _>(original)
+        .await
+        .unwrap();
+    // Re-enumeration can also replace the SIM object path without replacing
+    // the card. Pin a fresh adapter exactly as a new maintenance invocation does.
+    server
+        .object_server()
+        .at(
+            "/org/freedesktop/ModemManager1/SIM/1",
+            FakeSim(fake.clone()),
+        )
+        .await
+        .unwrap();
+    fake.0.lock().unwrap().sim_path_changed = true;
+    let bus = MmBus::new("/dev/wwan0qmi0", next, "wwan0").await.unwrap();
+    bus.pin_sim_binding().await.unwrap();
+    let replacement = MmProfileIo { bus, ..replacement };
+    fake.0.lock().unwrap().active_bearer = true;
+    assert!(
+        reconcile_profile_modem(&replacement, &store, receipt.clone())
+            .await
+            .is_err()
+    );
+    fake.0.lock().unwrap().active_bearer = false;
+    fake.0.lock().unwrap().replacement_sim = true;
+    assert!(
+        reconcile_profile_modem(&replacement, &store, receipt.clone())
+            .await
+            .is_err()
+    );
+    fake.0.lock().unwrap().replacement_sim = false;
+    store.1.store(true, Ordering::SeqCst);
+    assert!(
+        reconcile_profile_modem(&replacement, &store, receipt.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.0.lock().unwrap().as_ref().unwrap().before.modem,
+        receipt.before.modem
+    );
+    assert_eq!(fake.0.lock().unwrap().calls, ["Set-new"]);
+    store.1.store(false, Ordering::SeqCst);
+    let reconciled = reconcile_profile_modem(&replacement, &store, receipt.clone())
+        .await
+        .unwrap();
+    assert_eq!(reconciled.before.modem, next);
+    assert_ne!(
+        reconciled.before.sim_fingerprint,
+        receipt.before.sim_fingerprint
+    );
+    assert_eq!(
+        reconciled.before.stable_sim_fingerprint,
+        receipt.before.stable_sim_fingerprint
+    );
+    assert_eq!(reconciled.phase, Phase::Probed);
+    release_with(&replacement, &store, reconciled)
+        .await
+        .unwrap();
+    assert!(!fake.0.lock().unwrap().created);
+    assert_eq!(
+        fake.0.lock().unwrap().calls,
+        ["Set-new", "restore-reporting", "Delete-owned"]
+    );
+    assert!(store.0.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn profile_probe_private_bus_rejects_changed_or_repeated_transport_requests_before_io() {
+    let (_server, fake, io) = server().await;
+    let store = MemoryStore::default();
+    let before = io.snapshot().await.unwrap();
+    let receipt = acquire_with(
+        &io,
+        &store,
+        "ims",
+        1,
+        &fingerprint(&("ims", 1_u32, &before)).unwrap(),
+    )
+    .await
+    .unwrap();
+    for change in 0..8 {
+        let probe = VerifiedProfileProbe {
+            bus: Arc::clone(&io.bus),
+            receipt: receipt.clone(),
+            used: AtomicBool::new(change == 7),
+        };
+        let mut device = "/dev/wwan0qmi0";
+        let mut modem = "0";
+        let mut apn = "ims";
+        let mut profile = Some(9);
+        let mut cid = 9;
+        let mut families: &[u8] = &[4];
+        let mut sim = Some(("8900000000000000001", 1));
+        match change {
+            0 => device = "/dev/wwan1qmi0",
+            1 => modem = "1",
+            2 => apn = "other",
+            3 => profile = None,
+            4 => cid = 3,
+            5 => families = &[6],
+            6 => sim = None,
+            _ => {}
+        }
+        let result = ImsBearerTransport::establish_ims_bearer(
+            &probe, device, modem, apn, profile, cid, families, false, sim,
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("changed or repeated request reached the transport"),
+        };
+        assert!(error
+            .detail
+            .contains("profile_probe_request_changed_or_repeated"));
+        assert_eq!(probe.used.load(Ordering::Acquire), change == 7);
+    }
+    assert_eq!(fake.0.lock().unwrap().calls, ["Set-new"]);
 }
 
 #[tokio::test]

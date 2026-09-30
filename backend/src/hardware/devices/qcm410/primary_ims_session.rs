@@ -60,6 +60,13 @@ pub(super) struct PrimaryImsSession {
 
 impl PrimaryImsSession {
     pub async fn start(request: PrimaryImsRequest<'_>) -> Result<Self, String> {
+        Self::start_on_bus(request, None).await
+    }
+
+    pub(super) async fn start_on_bus(
+        request: PrimaryImsRequest<'_>,
+        pinned_bus: Option<Arc<MmBus>>,
+    ) -> Result<Self, String> {
         create_args(&request)?;
         if lifecycle::is_shutting_down() {
             return Err("qca410_primary_mm_shutting_down".to_string());
@@ -81,7 +88,7 @@ impl PrimaryImsSession {
         // it up; abandoning an RPC future loses ownership of its side effects.
         tokio::spawn(async move {
             let _pending = pending;
-            let result = Self::start_inner(request, cancelled).await;
+            let result = Self::start_inner(request, cancelled, pinned_bus).await;
             deliver_setup(sender, result, |mut session| async move {
                 session.stop().await;
             })
@@ -98,13 +105,28 @@ impl PrimaryImsSession {
     async fn start_inner(
         request: OwnedRequest,
         cancelled: Arc<AtomicBool>,
+        pinned_bus: Option<Arc<MmBus>>,
     ) -> Result<Self, String> {
         lifecycle::recover_owned().await?;
         if cancelled.load(Ordering::Acquire) || lifecycle::is_shutting_down() {
             return Err("qca410_primary_mm_setup_cancelled".to_string());
         }
-        let bus = MmBus::new(&request.device, &request.modem, &request.interface).await?;
-        bus.pin_sim_binding().await?;
+        let bus = match pinned_bus {
+            Some(bus) => {
+                if bus.device != request.device || bus.modem != request.modem {
+                    return Err("mm_ims_profile_probe_endpoint_changed".into());
+                }
+                // Do not reacquire a well-known owner or repin a changed SIM.
+                // Controller mutations retain this exact unique-owner bus.
+                bus.ensure_sim_binding().await?;
+                bus
+            }
+            None => {
+                let bus = MmBus::new(&request.device, &request.modem, &request.interface).await?;
+                bus.pin_sim_binding().await?;
+                bus
+            }
+        };
         if let Some((iccid, slot)) = request.expected_sim.as_ref() {
             bus.verify_expected_sim(iccid, *slot).await?;
         }
