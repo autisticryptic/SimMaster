@@ -7,7 +7,7 @@ QCM=ROOT/'backend/src/hardware/devices/qcm410'
 class OwnedIpv6ContextTests(unittest.TestCase):
     def test_extra_reads_require_owned_ipv6_profile_and_actual_mm_prefix(self):
         text=(QCM/'primary_ims_pcscf.rs').read_text()
-        for gate in ('owned_profile', 'expected.ipv4_address.is_none()', 'd.pdp_type == "IPV6"',
+        for gate in ('owned_profile', 'expected.ipv4_address.is_none()', 'rows.len() == 1', 'matches!(d.pdp_type.as_str(), "IPV6" | "IPV4V6")',
                      'pinned_ipv6_prefix(row, cid, &state, profile_id, expected)', 'expected.ipv6_prefix != Some(64)'):
             self.assertIn(''.join(gate.split()),''.join(text.split()))
         self.assertIn('discover_with_policy(expected, profile_id, apn, delay, false, read, at)',text)
@@ -17,7 +17,7 @@ class OwnedIpv6ContextTests(unittest.TestCase):
 
     def test_read_only_full_address_and_all_other_context_exclusion(self):
         text=(QCM/'primary_ims_pcscf_separated.rs').read_text()
-        for gate in ('fields.len() != 2', 'cid(fields[0])? != target', 'address != expected',
+        for gate in ('!(2..=3).contains(&fields.len())', 'cid(fields[0])? != target', 'address != expected', 'Ipv4Addr::UNSPECIFIED',
                      'state.active.iter().copied().filter', 'other_context_prefix_ambiguous',
                      'other_context_family_unverified', 'other_context_bearer_ambiguous'):
             self.assertIn(''.join(gate.split()),''.join(text.split()))

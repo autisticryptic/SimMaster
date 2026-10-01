@@ -5,9 +5,11 @@
 //! (RFC 6459, section 5.2). A shared prefix ALONE is not session ownership.
 //! The narrowly scoped exception here additionally requires a verified MM
 //! profile pin, exactly one active PDP context on the modem, that exact CID,
-//! an IPv6-capable definition, and unchanged MM and AT snapshots. An explicitly
-//! owned IPv6-only profile may additionally prove CGPADDR equality and every
-//! other active context's disjoint prefix, repeating all views before use.
+//! an IPv6-capable definition, and unchanged MM and AT snapshots.
+//! An owned IPv6-capable profile with an IPv6-only MM grant may additionally
+//! prove CGPADDR equality and every other active context's disjoint prefix,
+//! repeating all views before use. The requested PDP type may be IPV4V6:
+//! ownership depends on the actual grant, not on narrowing the request.
 //! Other providers and ordinary unowned pins retain the original rules.
 //!
 //! All IO is supplied by the retained session's unique-owner MM adapter. This
@@ -396,10 +398,11 @@ where
                         source
                     } else if owned_profile
                         && expected.ipv4_address.is_none()
+                        && rows.len() == 1
                         && state
                             .definitions
                             .get(&cid)
-                            .is_some_and(|d| d.pdp_type == "IPV6")
+                            .is_some_and(|d| matches!(d.pdp_type.as_str(), "IPV6" | "IPV4V6"))
                         && state.active.len() > 1
                         && !row.candidates.is_empty()
                         && pinned_ipv6_prefix(row, cid, &state, profile_id, expected)

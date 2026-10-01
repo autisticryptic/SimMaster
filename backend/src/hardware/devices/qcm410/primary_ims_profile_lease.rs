@@ -1101,6 +1101,8 @@ pub async fn maintain(
             | "release"
             | "inspect-retired"
             | "retire-absent"
+            | "inspect-uncreated"
+            | "retire-uncreated"
     ) {
         return Err(ERROR.into());
     }
@@ -1175,7 +1177,10 @@ pub async fn maintain(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return Err(ERROR.into()),
     };
-    if matches!(action, "inspect-retired" | "retire-absent") {
+    if matches!(
+        action,
+        "inspect-retired" | "retire-absent" | "inspect-uncreated" | "retire-uncreated"
+    ) {
         // Explicit metadata-only retirement has independent current-state
         // absence proofs. It never adopts or deletes a cross-owner profile.
         return runtime::retire_absent(

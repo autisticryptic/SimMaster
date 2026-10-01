@@ -26,8 +26,8 @@ class AbsentProfileRetirementTests(unittest.TestCase):
 
     def test_only_explicit_retirement_may_archive_after_two_current_snapshots(self):
         source = (QCM / "primary_ims_profile_retirement.rs").read_text()
-        run = source.split('pub(super) async fn run(', 1)[1]
-        self.assertEqual(run.count('observe_absence(io, &receipt).await?'), 2)
+        run = source.split('let before = observe_absence(io, &receipt).await?;', 1)[1]
+        self.assertEqual(source.count('observe_absence(io, &receipt).await?'), 2)
         self.assertLess(run.index('verify_snapshot_pair'), run.index('archive_source('))
         self.assertIn('expected_plan != Some(plan.as_str())', run)
         self.assertLess(run.index('if action == "inspect-retired"'), run.index('archive_source('))
@@ -35,6 +35,22 @@ class AbsentProfileRetirementTests(unittest.TestCase):
         production = runtime.split('pub async fn prepare(', 1)[1]
         self.assertNotIn('retirement::run', production)
         self.assertNotIn('archive_source(', production)
+
+    def test_uncreated_retirement_is_separately_explicit_and_full_inventory_bound(self):
+        source = (QCM / 'primary_ims_profile_retirement.rs').read_text()
+        predicate = part(source, 'fn validate_uncreated_profile(', 'async fn observe_uncreated(')
+        for gate in ('Phase::Creating', 'receipt.owned.is_some()', 'receipt.owned_definition.is_some()',
+                     'RuntimePhase::Profile', 'owner.bearer.is_some()', 'owner.boot_id != current_boot',
+                     'creator_alive', '&receipt.before != current'):
+            self.assertIn(gate, predicate)
+        run = part(source, 'if matches!(action, "inspect-uncreated" | "retire-uncreated")', 'let before = observe_absence(')
+        self.assertEqual(run.count('observe_uncreated(io, &receipt).await?'), 2)
+        self.assertLess(run.index('if action == "inspect-uncreated"'), run.index('archive_source('))
+        self.assertLess(run.index('require_uncreated_plan('), run.index('archive_source('))
+        self.assertIn('Duration::from_secs(120)', source)
+        runtime = (QCM / 'primary_ims_profile_runtime.rs').read_text()
+        admission = part(runtime, 'fn recovery_admitted(', 'fn valid_boot_id(')
+        self.assertIn('Phase::Creating | Phase::Probing', admission)
 
     def test_archive_preserves_exact_record_and_never_overwrites_evidence(self):
         source = (QCM / "primary_ims_profile_retirement.rs").read_text()

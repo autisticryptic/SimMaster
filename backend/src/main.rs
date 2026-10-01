@@ -321,6 +321,37 @@ fn modemmanager_debug_is_running() -> bool {
 #[cfg(test)]
 mod mm_startup_policy_tests {
     use super::*;
+
+    #[test]
+    fn uncreated_retirement_cli_is_explicit_and_accepts_only_known_actions() {
+        for action in ["inspect-uncreated", "retire-uncreated"] {
+            let cli = Cli::try_parse_from([
+                "simadmin",
+                "mm-ims-profile-lease",
+                "--action",
+                action,
+                "--modem",
+                "/org/freedesktop/ModemManager1/Modem/0",
+                "--device",
+                "/dev/wwan0qmi0",
+                "--family",
+                "ipv4v6",
+                "--apn",
+                "ims",
+            ])
+            .unwrap();
+            assert!(
+                matches!(cli.command, Some(CliCommand::MmImsProfileLease { action: parsed, .. }) if parsed == action)
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "simadmin",
+            "mm-ims-profile-lease",
+            "--action",
+            "auto-retire"
+        ])
+        .is_err());
+    }
     #[test]
     fn running_debug_with_platform_options_is_preserved() {
         assert!(modemmanager_debug_command(
@@ -498,7 +529,7 @@ enum CliCommand {
     },
     /// Explicit IMS maintenance. Only probe/probe-required activate a bearer; no server starts.
     MmImsProfileLease {
-        #[arg(long, default_value = "inspect", value_parser = ["inspect", "acquire", "acquire-at", "probe", "probe-required", "release", "inspect-retired", "retire-absent"])]
+        #[arg(long, default_value = "inspect", value_parser = ["inspect", "acquire", "acquire-at", "probe", "probe-required", "release", "inspect-retired", "retire-absent", "inspect-uncreated", "retire-uncreated"])]
         action: String,
         #[arg(long)]
         modem: String,

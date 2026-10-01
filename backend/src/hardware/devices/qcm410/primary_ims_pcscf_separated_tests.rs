@@ -130,9 +130,91 @@ async fn disjoint_context_proof_never_changes_ordinary_pin_or_exact_match_behavi
             assert_eq!(result.unwrap().source, "mm_owned_at_exact_address");
         }
     }
-    // A dual-family definition is outside this narrowly validated exception.
+}
+
+#[tokio::test]
+async fn owned_dual_request_with_ipv6_only_grant_uses_the_same_strict_proof() {
+    for address in [
+        ADDRESS.to_string(),
+        "+CGPADDR: 3,0.0.0.0,2001:db8:1::a".into(),
+    ] {
+        let expected = settings();
+        let calls = RefCell::new(Vec::new());
+        let result = super::super::discover_with_policy(
+            &expected,
+            Some(3),
+            "ims",
+            Duration::ZERO,
+            true,
+            || ready(Ok(expected.clone())),
+            |command| {
+                calls.borrow_mut().push(command.clone());
+                ready(Ok(if command == "AT+CGPADDR=3" {
+                    address.clone()
+                } else {
+                    reply(&command).replace("3,\"IPV6\"", "3,\"IPV4V6\"")
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.source, "mm_owned_at_disjoint_context_ipv6_prefix");
+        assert_eq!(
+            result.candidates,
+            vec![
+                "2001:db8:10::1".parse::<IpAddr>().unwrap(),
+                "2001:db8:10::2".parse().unwrap()
+            ]
+        );
+        for command in ["AT+CGPADDR=3", "AT+CGCONTRDP=1"] {
+            assert_eq!(
+                calls
+                    .borrow()
+                    .iter()
+                    .filter(|c| c.as_str() == command)
+                    .count(),
+                2
+            );
+        }
+        assert_eq!(expected, settings(), "AT must never replace the host grant");
+    }
+}
+
+#[tokio::test]
+async fn dual_context_proof_refuses_real_ipv4_companions_or_unowned_pins() {
+    for case in 0..4 {
+        let mut expected = settings();
+        if case == 0 {
+            expected.ipv4_address = Some("192.0.2.8".parse().unwrap());
+        }
+        let result = super::super::discover_with_policy(
+            &expected,
+            Some(3),
+            "ims",
+            Duration::ZERO,
+            case != 1,
+            || ready(Ok(expected.clone())),
+            |command| {
+                let mut text = reply(&command).replace("3,\"IPV6\"", "3,\"IPV4V6\"");
+                if case == 2 && command == "AT+CGCONTRDP=3" {
+                    text.push_str("\n+CGCONTRDP: 3,6,ims,192.0.2.8,192.0.2.1,,,192.0.2.20");
+                }
+                if case == 3 && command == "AT+CGPADDR=3" {
+                    text = "+CGPADDR: 3,192.0.2.8,2001:db8:1::a".into();
+                }
+                ready(Ok(text))
+            },
+        )
+        .await;
+        assert!(result.is_err(), "case {case}");
+    }
+}
+
+#[tokio::test]
+async fn dual_definition_change_during_proof_is_not_hidden_by_ipv6_capability() {
     let expected = settings();
-    assert!(super::super::discover_with_policy(
+    let definitions = Cell::new(0);
+    let result = super::super::discover_with_policy(
         &expected,
         Some(3),
         "ims",
@@ -140,19 +222,34 @@ async fn disjoint_context_proof_never_changes_ordinary_pin_or_exact_match_behavi
         true,
         || ready(Ok(expected.clone())),
         |command| {
-            assert!(!command.starts_with("AT+CGPADDR="));
-            ready(Ok(reply(&command).replace("3,\"IPV6\"", "3,\"IPV4V6\"")))
-        }
+            let mut text = reply(&command);
+            if command == "AT+CGDCONT?" {
+                definitions.set(definitions.get() + 1);
+                if definitions.get() == 1 {
+                    text = text.replace("3,\"IPV6\"", "3,\"IPV4V6\"");
+                }
+            }
+            ready(Ok(text))
+        },
     )
-    .await
-    .is_err());
+    .await;
+    assert!(result.is_err());
 }
 
 #[test]
 fn disjoint_context_requires_strict_cgpaddr_full_address_cid_and_complete_response() {
     let expected = "2001:db8:1::a".parse().unwrap();
     assert_eq!(assigned_address(ADDRESS, 3, expected).unwrap(), expected);
+    for valid in [
+        "+CGPADDR: 3,0.0.0.0,2001:db8:1::a",
+        "+CGPADDR: 3,2001:db8:1::a,0.0.0.0",
+    ] {
+        assert_eq!(assigned_address(valid, 3, expected).unwrap(), expected);
+    }
     for invalid in [
+        "+CGPADDR: 3,192.0.2.9,2001:db8:1::a",
+        "+CGPADDR: 3,,2001:db8:1::a",
+        "+CGPADDR: 3,::,2001:db8:1::a",
         "+CGPADDR: 2,2001:db8:1::a",
         "+CGPADDR: 3,2001:db8:1::b",
         "+CGPADDR: 3,2001:db8:1::a,2001:db8:1::a",

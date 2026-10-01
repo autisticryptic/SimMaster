@@ -46,12 +46,32 @@ fn assigned_address(output: &str, target: u8, expected: IpAddr) -> Result<IpAddr
         return Err(unavailable("assigned_address_ambiguous"));
     };
     let fields = line.split(',').map(field).collect::<Result<Vec<_>, _>>()?;
-    if fields.len() != 2 || cid(fields[0])? != target {
+    if !(2..=3).contains(&fields.len()) || cid(fields[0])? != target {
         return Err(unavailable("assigned_address_ambiguous"));
     }
-    let address = literal(fields[1])
-        .filter(|address| address.is_ipv6() && usable(*address))
+    // A dual-stack definition may report its ungranted IPv4 half as 0.0.0.0.
+    // Accept only one usable IPv6 address, optionally accompanied by that
+    // literal unspecified IPv4 placeholder. Never ignore an actual IPv4 grant,
+    // duplicate IPv6 value, empty field or unparseable companion.
+    let addresses = fields[1..]
+        .iter()
+        .map(|value| literal(value))
+        .collect::<Option<Vec<_>>>()
         .ok_or_else(|| unavailable("assigned_address_invalid"))?;
+    let mut usable_v6 = addresses
+        .iter()
+        .copied()
+        .filter(|address| address.is_ipv6() && usable(*address));
+    let address = usable_v6
+        .next()
+        .ok_or_else(|| unavailable("assigned_address_invalid"))?;
+    if usable_v6.next().is_some()
+        || addresses
+            .iter()
+            .any(|value| *value != address && *value != IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    {
+        return Err(unavailable("assigned_address_ambiguous"));
+    }
     if address != expected {
         return Err(unavailable("assigned_address_mismatch"));
     }
@@ -139,10 +159,9 @@ where
     };
     if state.active.len() < 2
         || !state.active.contains(&target)
-        || !state
-            .definitions
-            .get(&target)
-            .is_some_and(|d| d.pdp_type == "IPV6" && d.apn.eq_ignore_ascii_case(ims_apn))
+        || !state.definitions.get(&target).is_some_and(|d| {
+            matches!(d.pdp_type.as_str(), "IPV6" | "IPV4V6") && d.apn.eq_ignore_ascii_case(ims_apn)
+        })
     {
         return Err(unavailable("separated_context_not_admitted"));
     }

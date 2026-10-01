@@ -1,10 +1,107 @@
-//! Explicit metadata-only retirement after an old runtime profile has vanished.
+//! Explicit metadata-only retirement of absent or provably uncreated profiles.
 //! Never delete/modify a modem profile across a changed MM owner or SIM.
 
 use super::*;
 use std::io::{Read, Write};
+use std::time::{Duration, SystemTime};
 
 const RETIRE_ERROR: &str = "mm_ims_profile_retirement_unverified";
+const UNCREATED_SETTLE: Duration = Duration::from_secs(120);
+
+/// Explicit reconciliation only: automatic recovery must still retain Creating.
+fn validate_uncreated_profile(
+    receipt: &Receipt,
+    current: &Snapshot,
+    current_boot: &str,
+    creator_alive: bool,
+) -> Result<(), String> {
+    let owner = validate_runtime_receipt(receipt)?;
+    if receipt.phase != Phase::Creating
+        || receipt.owned.is_some()
+        || receipt.owned_definition.is_some()
+        || owner.phase != RuntimePhase::Profile
+        || owner.bearer.is_some()
+        || owner.boot_id != current_boot
+        || creator_alive
+        || &receipt.before != current
+    {
+        // Compare the COMPLETE original inventory, not just the requested APN.
+        return Err(RETIRE_ERROR.into());
+    }
+    Ok(())
+}
+
+async fn observe_uncreated(io: &MmProfileIo, receipt: &Receipt) -> Result<Snapshot, String> {
+    require_stopped()?;
+    no_bearer_work()?;
+    let owner = validate_runtime_receipt(receipt)?;
+    let boot = boot_id()?;
+    let alive = process_start(owner.process_id)? == Some(owner.process_start);
+    validate_uncreated_profile(receipt, &receipt.before, &boot, alive)?;
+    if !io.bus.owner_is_current().await? {
+        return Err(RETIRE_ERROR.into());
+    }
+    let snapshot = io.snapshot().await?;
+    let boot = boot_id()?;
+    let alive = process_start(owner.process_id)? == Some(owner.process_start);
+    validate_uncreated_profile(receipt, &snapshot, &boot, alive)?;
+    if !io.bus.owner_is_current().await? {
+        return Err(RETIRE_ERROR.into());
+    }
+    require_stopped()?;
+    no_bearer_work()?;
+    Ok(snapshot)
+}
+
+fn validate_settled_source(
+    modified: SystemTime,
+    inspection_started: SystemTime,
+) -> Result<(), String> {
+    if inspection_started
+        .duration_since(modified)
+        .map_err(|_| RETIRE_ERROR)?
+        < UNCREATED_SETTLE
+    {
+        return Err("mm_ims_profile_retirement_source_not_settled".into());
+    }
+    Ok(())
+}
+
+fn settled_source(file: &Path, source: &[u8], started: SystemTime) -> Result<SystemTime, String> {
+    let (current, metadata) = read_source_with_metadata(file)?;
+    if current != source {
+        return Err(RETIRE_ERROR.into());
+    }
+    let modified = metadata.modified().map_err(|_| RETIRE_ERROR)?;
+    validate_settled_source(modified, started)?;
+    Ok(modified)
+}
+
+fn uncreated_plan(
+    source: &[u8],
+    snapshot: &Snapshot,
+    boot: &str,
+    modified: SystemTime,
+) -> Result<String, String> {
+    let modified = modified
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| RETIRE_ERROR)?;
+    fingerprint(&(
+        "retire-uncreated-v1",
+        fingerprint(&source)?,
+        boot,
+        snapshot,
+        modified.as_secs(),
+        modified.subsec_nanos(),
+    ))
+}
+
+fn require_uncreated_plan(plan: &str, expected: Option<&str>) -> Result<(), String> {
+    if expected != Some(plan) {
+        return Err("mm_ims_profile_retirement_expected_plan_changed".into());
+    }
+    Ok(())
+}
 
 fn validate_absent_profile(
     receipt: &Receipt,
@@ -129,6 +226,10 @@ async fn observe_absence(io: &MmProfileIo, receipt: &Receipt) -> Result<Snapshot
 }
 
 fn read_source(file: &Path) -> Result<Vec<u8>, String> {
+    Ok(read_source_with_metadata(file)?.0)
+}
+
+fn read_source_with_metadata(file: &Path) -> Result<(Vec<u8>, fs::Metadata), String> {
     let input = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -151,7 +252,7 @@ fn read_source(file: &Path) -> Result<Vec<u8>, String> {
     if bytes.len() > MAX_RUNTIME_RECORD_BYTES {
         return Err(RETIRE_ERROR.into());
     }
-    Ok(bytes)
+    Ok((bytes, meta))
 }
 
 fn verify_snapshot_pair(before: &Snapshot, after: &Snapshot) -> Result<(), String> {
@@ -221,10 +322,40 @@ pub(super) async fn run(
     if receipt.apn != apn || receipt.requested_family != family {
         return Err("mm_ims_profile_retirement_selector_mismatch".into());
     }
+    let inspection_started = SystemTime::now();
     let source = read_source(&store.file)?;
     let decoded: Receipt = serde_json::from_slice(&source).map_err(|_| RETIRE_ERROR)?;
     if fingerprint(&decoded)? != fingerprint(&receipt)? {
         return Err(RETIRE_ERROR.into());
+    }
+    if matches!(action, "inspect-uncreated" | "retire-uncreated") {
+        // A newly written Creating intent could still have an AT command in
+        // flight after its creator dies. Never wait here to age it into proof.
+        let modified = settled_source(&store.file, &source, inspection_started)?;
+        let before = observe_uncreated(io, &receipt).await?;
+        let after = observe_uncreated(io, &receipt).await?;
+        verify_snapshot_pair(&before, &after)?;
+        if settled_source(&store.file, &source, inspection_started)? != modified {
+            return Err(RETIRE_ERROR.into());
+        }
+        let plan = uncreated_plan(&source, &after, &boot_id()?, modified)?;
+        if action == "inspect-uncreated" {
+            return Ok(serde_json::json!({"action":action,"plan":plan,
+                "profile_uncreated_verified":true,"metadata_only":true,
+                "mutated_modem":false,"active_receipt_retained":true}));
+        }
+        require_uncreated_plan(&plan, expected_plan)?;
+        require_stopped()?;
+        no_bearer_work()?;
+        if !io.bus.owner_is_current().await?
+            || settled_source(&store.file, &source, inspection_started)? != modified
+        {
+            return Err(RETIRE_ERROR.into());
+        }
+        let archive = archive_source(&store.file, &source)?;
+        return Ok(serde_json::json!({"action":action,"archive":archive,
+            "profile_uncreated_verified":true,"metadata_only":true,
+            "mutated_modem":false,"active_receipt_retired":true}));
     }
     let before = observe_absence(io, &receipt).await?;
     let after = observe_absence(io, &receipt).await?;
