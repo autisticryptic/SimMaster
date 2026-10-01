@@ -223,6 +223,13 @@ async fn spa_fallback(uri: Uri) -> Response {
 /// 启动后立刻通过 ExecStartPost 将日志级别降回 INFO。
 /// 这完美绕过了 Modem.Command 的 Unauthorized 限制，同时保持系统纯净。
 fn ensure_modemmanager_debug_override() {
+    // MM may already be deliberately configured with additional platform
+    // options. Do not overwrite that working owner or restart it merely to
+    // normalize this application's drop-in text.
+    if modemmanager_debug_is_running() {
+        tracing::info!("Preserving existing running ModemManager debug configuration");
+        return;
+    }
     let override_dir = "/etc/systemd/system/ModemManager.service.d";
     // `zz-` must sort after vendor drop-ins such as `mobile-tweaks.conf`, which
     // also reset ExecStart on the Qualcomm image.
@@ -261,6 +268,88 @@ ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedeskt
             .args(["restart", "ModemManager.service"])
             .output();
         tracing::info!("ModemManager debug override applied and service restarted.");
+    }
+}
+
+fn modemmanager_debug_command(executable: &std::path::Path, cmdline: &[u8]) -> bool {
+    if executable.file_name().and_then(|name| name.to_str()) != Some("ModemManager")
+        || cmdline.len() > 16384
+        || cmdline.last() != Some(&0)
+    {
+        return false;
+    }
+    let mut args = cmdline.split(|byte| *byte == 0);
+    let Some(program) = args.next().and_then(|arg| std::str::from_utf8(arg).ok()) else {
+        return false;
+    };
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("ModemManager")
+        && args
+            .take_while(|arg| *arg != b"--")
+            .any(|arg| arg == b"--debug")
+}
+
+fn modemmanager_debug_is_running() -> bool {
+    let output = match std::process::Command::new("systemctl")
+        .args(["show", "ModemManager.service", "-p", "MainPID", "--value"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+    let Some(pid) = std::str::from_utf8(&output.stdout)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return false;
+    };
+    let root = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let executable = match std::fs::read_link(root.join("exe")) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    let command = match std::fs::read(root.join("cmdline")) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    modemmanager_debug_command(&executable, &command)
+}
+
+#[cfg(test)]
+mod mm_startup_policy_tests {
+    use super::*;
+    #[test]
+    fn running_debug_with_platform_options_is_preserved() {
+        assert!(modemmanager_debug_command(
+            std::path::Path::new("/usr/sbin/ModemManager"),
+            b"/usr/sbin/ModemManager\0--debug\0--test-quick-suspend-resume\0"
+        ));
+        assert!(modemmanager_debug_command(
+            std::path::Path::new("/usr/bin/ModemManager"),
+            b"ModemManager\0--debug\0"
+        ));
+    }
+    #[test]
+    fn command_substrings_other_programs_and_invalid_records_do_not_bypass_setup() {
+        let exe = std::path::Path::new("/usr/sbin/ModemManager");
+        for command in [
+            b"/usr/sbin/ModemManager\0".as_slice(),
+            b"ModemManager\0--debug-extra\0",
+            b"ModemManager\0--\0--debug\0",
+            b"other\0--debug\0",
+            b"ModemManager\0--debug",
+            b"",
+        ] {
+            assert!(!modemmanager_debug_command(exe, command));
+        }
+        assert!(!modemmanager_debug_command(
+            std::path::Path::new("/usr/bin/other"),
+            b"ModemManager\0--debug\0"
+        ));
+        assert!(!modemmanager_debug_command(exe, &vec![0; 16385]));
     }
 }
 
