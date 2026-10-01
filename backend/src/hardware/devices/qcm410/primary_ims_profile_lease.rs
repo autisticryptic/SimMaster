@@ -794,9 +794,13 @@ pub(crate) struct VerifiedProfileProbe {
     bus: Arc<MmBus>,
     receipt: Receipt,
     used: AtomicBool,
+    require_initial_security: bool,
 }
 
 impl VerifiedProfileProbe {
+    pub(crate) fn require_initial_security(&self) -> bool {
+        self.require_initial_security
+    }
     pub(crate) fn cid(&self) -> u8 {
         self.receipt
             .owned
@@ -1093,6 +1097,7 @@ pub async fn maintain(
             | "acquire"
             | "acquire-at"
             | "probe"
+            | "probe-required"
             | "release"
             | "inspect-retired"
             | "retire-absent"
@@ -1218,7 +1223,7 @@ pub async fn maintain(
                 serde_json::json!({"action":action,"profile_id":result.owned.ok_or(ERROR)?.id,"family":family,"receipt":store.file,"existing_profiles_unchanged":true}),
             )
         }
-        "probe" => {
+        "probe" | "probe-required" => {
             let receipt = existing.ok_or("mm_ims_profile_lease_receipt_missing")?;
             probe_with(
                 &io,
@@ -1232,6 +1237,7 @@ pub async fn maintain(
                         bus: Arc::clone(&io.bus),
                         receipt,
                         used: AtomicBool::new(false),
+                        require_initial_security: action == "probe-required",
                     };
                     crate::connectivity::modems::ims::cellular_ims::live::probe_owned_profile_once(
                         &capability,

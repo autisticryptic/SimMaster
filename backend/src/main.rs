@@ -407,9 +407,9 @@ enum CliCommand {
         #[arg(long)]
         require_mm: bool,
     },
-    /// Explicit IMS profile maintenance. Only probe activates a bearer; no server starts.
+    /// Explicit IMS maintenance. Only probe/probe-required activate a bearer; no server starts.
     MmImsProfileLease {
-        #[arg(long, default_value = "inspect", value_parser = ["inspect", "acquire", "acquire-at", "probe", "release", "inspect-retired", "retire-absent"])]
+        #[arg(long, default_value = "inspect", value_parser = ["inspect", "acquire", "acquire-at", "probe", "probe-required", "release", "inspect-retired", "retire-absent"])]
         action: String,
         #[arg(long)]
         modem: String,

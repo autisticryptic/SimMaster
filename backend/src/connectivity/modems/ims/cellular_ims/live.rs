@@ -626,6 +626,7 @@ enum LiveVoiceDirection {
 }
 
 struct DeviceIdentity {
+    diagnostic_required_security: bool,
     ims: ImsIdentity,
     profile: &'static CarrierProfile,
     effective_ims: EffectiveImsProfile,
@@ -1624,6 +1625,17 @@ fn ensure_worker_binding_current_ims(binding: &UeWorkerBinding) -> Result<(), Im
     ensure_worker_binding_current(binding).map_err(to_ims_error)
 }
 
+fn ensure_required_security_before_aka(
+    profile: &CarrierProfile,
+    usable_server: bool,
+    protected_binding: bool,
+) -> Result<(), ImsError> {
+    if profile.ims.register.sec_agree_mode == "required" && !usable_server && !protected_binding {
+        return Err(ImsError::new(code::SECURITY_SERVER_MISSING));
+    }
+    Ok(())
+}
+
 impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthenticator {
     async fn prepare_authenticated_channel(
         &mut self,
@@ -1650,6 +1662,11 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
             sensitive_values = "redacted",
             "VoLTE IMS REGISTER authentication challenge metadata received"
         );
+        ensure_required_security_before_aka(
+            self.profile,
+            security_server.is_some(),
+            channel.security_verify().is_some(),
+        )?;
         let challenge = parse_digest_challenge(challenge_response).map_err(to_ims_error)?;
         let aka_challenge = digest_aka::decode_aka_nonce(&challenge.nonce).map_err(to_ims_error)?;
         let aid = self.aka_aid.clone();
@@ -1680,6 +1697,14 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         .map_err(to_ims_error)?;
 
         self.ensure_task_current()?;
+        tracing::info!(
+            res_length = aka.res.len(),
+            ck_length = aka.ck.len(),
+            ik_length = aka.ik.len(),
+            auts_length = aka.auts.as_ref().map(Vec::len),
+            sensitive_values = "redacted",
+            "VoLTE USIM AKA result metadata"
+        );
         self.prepare_aka_result(challenge, aka, security_server, channel)
             .await
     }
@@ -2118,7 +2143,26 @@ pub(crate) async fn probe_owned_profile_once(
     let mut report: serde_json::Value = result?;
     report["bearer_cleanup_verified"] = cleaned.into();
     report["profile_release_required"] = true.into();
+    report["diagnostic_required_security"] = probe.require_initial_security().into();
     Ok(report)
+}
+
+fn required_security_probe_profile(
+    profile: &CarrierProfile,
+) -> Result<CarrierProfile, CellularImsError> {
+    if !crate::connectivity::modems::ims::vowifi::profiles::is_standard_derived_profile(profile)
+        || profile.ims.register.sec_agree_mode == "disabled"
+    {
+        return Err(CellularImsError::new(
+            "mm_ims_profile_probe_security_not_admitted",
+        ));
+    }
+    let mut required = *profile;
+    required.ims.register.sec_agree_mode = "required";
+    required.ims.register.require_sec_agree_headers = true;
+    required.ims.register.proxy_require_sec_agree_headers = true;
+    required.ims.register.live_header_variant_set = "diagnostic_initial_security_required";
+    Ok(required)
 }
 
 fn runtime_profile_preparation_allowed(
@@ -2262,7 +2306,7 @@ async fn connect_inner(
         .update(|state| state.stage = CellularImsStage::Identity)
         .await;
     let expected_mm_sim = runtime.expected_mm_sim();
-    let device_identity = load_device_identity(
+    let mut device_identity = load_device_identity(
         &device,
         runtime,
         profile_store,
@@ -2271,6 +2315,14 @@ async fn connect_inner(
         expected_mm_sim.as_ref(),
     )
     .await?;
+    #[cfg(target_os = "linux")]
+    if diagnostic_profile.is_some_and(|probe| probe.require_initial_security()) {
+        let profile = required_security_probe_profile(device_identity.profile)?;
+        // CLI probe is one bounded process. Never publish this temporary policy
+        // into the shared derived-profile cache or persisted carrier config.
+        device_identity.profile = Box::leak(Box::new(profile));
+        device_identity.diagnostic_required_security = true;
+    }
     // The line's ordered family list is authoritative. Catalog `ip_stack` is
     // profile metadata and must not reorder the default dual -> IPv6 -> IPv4
     // fallback sequence; only an explicit line setting changes that order.
@@ -2878,6 +2930,11 @@ async fn connect_inner(
                     }
                     Err(error) => Err(error),
                 };
+                if device_identity.diagnostic_required_security {
+                    // This diagnostic observes only the first P-CSCF/shape;
+                    // a rejection must not silently switch test parameters.
+                    return attempt;
+                }
                 match attempt {
                     Ok(session) => {
                         runtime
@@ -3129,7 +3186,11 @@ async fn connect_family(
         cni_identity_source = cni_resolution.source.as_str(),
         "Captured serving-cell context for the VoLTE REGISTER lifecycle"
     );
-    let mut register_variants = register_variants(profile).into_iter().peekable();
+    let mut variants = register_variants(profile);
+    if device_identity.diagnostic_required_security {
+        variants.truncate(1);
+    }
+    let mut register_variants = variants.into_iter().peekable();
     let mut last_error = None;
     let mut pending_variant = None;
     let mut candidate_attempts = 0usize;
@@ -3303,6 +3364,9 @@ async fn connect_family(
                         Some(format!("register_variant={}", variant.label)),
                     )
                     .await;
+                if device_identity.diagnostic_required_security {
+                    return Err(error);
+                }
                 if has_alternate_pcscf
                     && should_handoff_pcscf(&failure, consecutive_silent_failures)
                 {
@@ -3364,6 +3428,13 @@ async fn connect_family(
                 return Err(error);
             }
         };
+        if device_identity.diagnostic_required_security
+            && (authenticator.mode != RegistrationMode::Ipsec
+                || authenticator.xfrm_plan.is_none()
+                || channel.security_verify().is_none())
+        {
+            return Err(CellularImsError::new(code::SECURITY_SERVER_MISSING));
+        }
         let artifacts = match channel
             .outbound_registered(&registration.response, authenticator.expires_seconds)
         {
@@ -7422,6 +7493,7 @@ async fn load_device_identity(
         }
     }
     Ok(DeviceIdentity {
+        diagnostic_required_security: false,
         ims: ImsIdentity {
             private_user: format!("{imsi}@{}", effective_ims.realm.value),
             public_uri: format!("sip:{imsi}@{}", effective_ims.domain.value),
@@ -8482,6 +8554,50 @@ mod tests {
     use super::*;
     use crate::connectivity::core::voice::MediaDirection;
     use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+
+    #[test]
+    fn required_security_probe_changes_only_local_security_policy_not_shared_profile() {
+        let original =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "204",
+                "08",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
+            )
+            .unwrap();
+        let before = register_variants(original)[0];
+        let required = required_security_probe_profile(original).unwrap();
+        let candidate = register_variants(&required)[0];
+        assert_eq!(required.ims.register.sec_agree_mode, "required");
+        assert!(candidate.policy.require_sec_agree && candidate.policy.proxy_require_sec_agree);
+        assert_eq!(candidate.authorization, before.authorization);
+        assert_eq!(
+            candidate.security_client_offer,
+            before.security_client_offer
+        );
+        assert_eq!(
+            required.ims.register.security_client_mechanisms,
+            original.ims.register.security_client_mechanisms
+        );
+        assert_eq!(required.ims.domain, original.ims.domain);
+        assert_eq!(required.ims.realm, original.ims.realm);
+        assert_eq!(required.meta.profile_id, original.meta.profile_id);
+        assert_eq!(register_variants(original)[0].policy, before.policy);
+        assert!(required_security_probe_profile(&GB_EE_23433).is_err());
+        let mut disabled = *original;
+        disabled.ims.register.sec_agree_mode = "disabled";
+        assert!(required_security_probe_profile(&disabled).is_err());
+    }
+
+    #[test]
+    fn required_security_missing_server_is_rejected_before_aka_but_protected_refresh_is_allowed() {
+        let mut profile = GB_EE_23433;
+        profile.ims.register.sec_agree_mode = "required";
+        assert!(ensure_required_security_before_aka(&profile, false, false).is_err());
+        assert!(ensure_required_security_before_aka(&profile, true, false).is_ok());
+        assert!(ensure_required_security_before_aka(&profile, false, true).is_ok());
+        profile.ims.register.sec_agree_mode = "supported";
+        assert!(ensure_required_security_before_aka(&profile, false, false).is_ok());
+    }
 
     #[test]
     fn production_profile_preparation_is_derived_and_ims_only() {

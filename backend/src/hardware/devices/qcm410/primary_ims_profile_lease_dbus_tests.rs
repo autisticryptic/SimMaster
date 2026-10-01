@@ -473,6 +473,7 @@ async fn profile_probe_private_bus_rejects_changed_or_repeated_transport_request
             bus: Arc::clone(&io.bus),
             receipt: receipt.clone(),
             used: AtomicBool::new(change == 7),
+            require_initial_security: false,
         };
         let mut device = "/dev/wwan0qmi0";
         let mut modem = "0";

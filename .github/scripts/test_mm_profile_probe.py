@@ -33,6 +33,18 @@ class ProfileProbeTests(unittest.TestCase):
         ordinary = between(text, "pub async fn connect_live_for_line(", "pub(crate) async fn probe_owned_profile_once(")
         self.assertNotIn("prepare_profile_probe_admission", ordinary)
 
+    def test_required_probe_is_explicit_bounded_and_stops_before_aka_without_security(self):
+        text = LIVE.read_text(encoding="utf-8")
+        auth = between(text, "async fn prepare_authenticated_channel(", "async fn authenticated_request(")
+        self.assertLess(auth.index("ensure_required_security_before_aka("), auth.index("identity::run_usim_aka("))
+        self.assertIn("variants.truncate(1)", text)
+        self.assertIn("if device_identity.diagnostic_required_security", text)
+        self.assertIn("return attempt;", text)
+        self.assertIn("require_initial_security: action == \"probe-required\"", (QCM / "primary_ims_profile_lease.rs").read_text())
+        ordinary = between(text, "pub async fn connect_live_for_line(", "pub(crate) async fn probe_owned_profile_once(")
+        self.assertNotIn("probe-required", ordinary)
+        self.assertNotIn("required_security_probe_profile", ordinary)
+
     def test_probe_strict_profile_does_not_run_apn_only_preparation(self):
         text = LIVE.read_text(encoding="utf-8")
         block = between(text, "let diagnostic_context =", "let mut request = BearerRequest::")
