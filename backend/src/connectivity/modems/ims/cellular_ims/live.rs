@@ -1096,7 +1096,12 @@ fn register_variants(profile: &CarrierProfile) -> Vec<CellularImsRegisterVariant
             include_access_network_info: profile_includes_pani,
             include_sip_instance: profile.ims.register.always_add_sip_instance,
         },
-        server_required_sec_agree: required,
+        // A standards-derived proactive declaration is not evidence of a
+        // server demand. Keep response-driven 400/403 identity hints gated on
+        // a real escalation (or an explicitly required carrier policy).
+        server_required_sec_agree: required
+            && (profile.ims.register.sec_agree_mode == "required"
+                || !crate::connectivity::modems::ims::vowifi::profiles::is_standard_derived_profile(profile)),
         security_client_offer: CellularImsSecurityClientOffer::Full,
     };
     // A database row can be syntactically valid yet disagree with a visited
@@ -9014,6 +9019,8 @@ mod tests {
             )
             .expect("legacy LTE profile fixture");
         profile.ims.register.initial_authorization = "none";
+        profile.ims.register.require_sec_agree_headers = false;
+        profile.ims.register.proxy_require_sec_agree_headers = false;
         profile
     }
 
@@ -9606,6 +9613,18 @@ mod tests {
                 profile.ims.register.sec_agree_mode, "auto",
                 "do not make every legacy fallback IPsec-only"
             );
+            assert!(
+                !first.server_required_sec_agree,
+                "a local declaration is not a server demand"
+            );
+            for status in [400, 403] {
+                let failure = RegisterFailure {
+                    error: ImsError::new("ims_register_initial_unexpected_status"),
+                    response: Some(format!("SIP/2.0 {status} Rejected\r\n\r\n").into_bytes()),
+                    auth_rounds: 0,
+                };
+                assert!(next_dynamic_register_variant(profile, first, &failure).is_none());
+            }
             assert_eq!(variants[1].label, "generic_ims_register_fallback");
             assert!(
                 !variants[1].policy.require_sec_agree
