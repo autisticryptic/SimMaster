@@ -15,7 +15,10 @@
 - **IPv6 P-CSCF修复候选 `547c15753ca213fc13553eb885beca53974a7d73` 已通过CI/实机归属验证**：Validate36816098925 / Build36816098902全success，两份下载日志95累计新增+11兼容回归均ok、双架构制品核验。严格CGPADDR完整地址、所有其他active context逐一排除前缀/EBI/APN歧义、双快照和最终MM绑定，普通pin/exact/sole行为不变，不取AT作为主机地址。
 - **新失败已到认证阶段**：`ipv6-proof-547c157`与`ipv6-auth-metadata`有界窗口均通过`mm_owned_at_disjoint_context_ipv6_prefix`取得目标CID3的2个P-CSCF并装路由，首401没有Security-Server；USIM返回可计算的AKA后发出CSeq2/3，最终仍401/auth_rounds2，未注册。每次均回收承载及临时profile，原2项/EPS/reporting恢复，未再次IPv4或复位。
 - 第一次被动auth元数据脚本未展开WWW-Authenticate折行，**响应侧“nonce/algorithm为空”是观察器缺陷，不是网络事实**。生产SIP解析早已支持折行；出向Auth可见40字节nonce、不同RAND/AUTN、qopauth、nc1、32hex response、无AUTS、用户名/realm/URI与SIM派生相符。UICC仅USIM，无ISIM。不能据此改RES编码、截短nonce、切身份或增加认证轮数。
-- 后继正在增加显式`probe-required`安全协商对照：只在独立诊断内将标准派生profile克隆为required，首包补Require/Proxy-Require，限制一个P-CSCF/一个候选；对端未提供Security-Server且无现有受保护会话时，在USIM调用前停止。可用安全协商则仍最多2次认证。普通生产fallback与共享profile缓存不修改。补AKA长度元数据，不输出RES/CK/IK/nonce。尚待CI与对照。
+- **安全协商对照成功**：`0ae80aebb4f972b372ebdad20622c90ee305235b` Validate36828711573/Build36828711574全success，97累计新增+11兼容及双架构制品核验。`ipv6-required-0ae80ae`显式`probe-required`仅一P-CSCF/一候选、首包完整Require/Proxy-Require；实际收到Security-Server，AKA材料长度RES8/CK16/IK16，07:29:41 UTC注册IPsec成功，随后注销confirmed、承载及profile回收通过，原2项库存/EPS/reporting恢复。没有增加认证轮数，未使用IPv4。
+- 此轮旁路auth观察器退出1，**不能说抓包通过**；结论来自候选程序受保护会话报告与挑战/成功元数据。之前观察器折行缺陷已修代码但没有因此改生产Digest。证据`ipv6-required-0ae80ae/{probe-required,release,inspect-after}.json`。
+- 正在将已验证行为接入标准派生LTE的首候选：Security-Client既已存在，则首包直接声明Require/Proxy-Require sec-agree；维持`sec_agree_mode=auto`及原generic候选/原候选预算，不因认证失败再自动尝试其他形状，WLAN/catalog不改。这是首包配置修复，不是把401归类成可重试。
+- 后续正式部署需为**当前新卡线路明确设置IPv6-only**，避开实证的IPv4固件崩溃；不修改全局默认族顺序/普通数据/PDP。尚未改线路配置或启动正式服务，维护hold仍在。自然续期/正式主服务注册仍待最终候选。
 - 所有本轮证据仍在`.local/evidence/new-sim-ims/`；新代码未覆盖正式48e269c。本卡IPv4引发固件fatal的历史事实保持，不以本次重启称其已修复。手机蜂窝IMS及同驻网对照未获进一步信息。
 
 ## 新卡初始排查：控制口缺失与旧租约阻断（以下为历史）

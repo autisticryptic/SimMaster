@@ -1215,8 +1215,14 @@ pub fn derive_standard_3gpp_profile(
                 strict_security_server_offer: false,
                 enable_initial_reject_fallback: false,
                 use_plain_digest_placeholder: false,
-                require_sec_agree_headers: false,
-                proxy_require_sec_agree_headers: false,
+                // The cellular first REGISTER already carries a complete
+                // Security-Client offer. Declare both RFC3329 option tags up
+                // front, before AKA: some cores otherwise challenge without
+                // Security-Server and reject unprotected authentication.
+                // Retain auto mode and the existing generic candidate ladder;
+                // do not change WLAN policy or retry after an auth rejection.
+                require_sec_agree_headers: matches!(access, Standard3gppAccess::LteEpc),
+                proxy_require_sec_agree_headers: matches!(access, Standard3gppAccess::LteEpc),
                 sec_agree_mode: "auto",
                 expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
                 access_network_info: access.access_network_info(),
@@ -1803,8 +1809,8 @@ mod tests {
         assert_eq!(lte.ims.transport, "udp");
         assert_eq!(lte.ims.register.initial_authorization, "aka_empty");
         assert_eq!(lte.ims.register.sec_agree_mode, "auto");
-        assert!(!lte.ims.register.require_sec_agree_headers);
-        assert!(!lte.ims.register.proxy_require_sec_agree_headers);
+        assert!(lte.ims.register.require_sec_agree_headers);
+        assert!(lte.ims.register.proxy_require_sec_agree_headers);
         assert!(lte.ims.register.include_pani_initial);
         assert!(lte.ims.register.include_pani_authenticated);
         assert!(!lte.ims.register.enable_cellular_network_info);

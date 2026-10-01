@@ -9580,6 +9580,52 @@ mod tests {
     }
 
     #[test]
+    fn derived_cellular_first_offer_declares_security_before_auth_and_retains_generic_fallback() {
+        use crate::connectivity::modems::ims::vowifi::profiles::{
+            derive_standard_3gpp_profile, Standard3gppAccess,
+        };
+        for (mcc, mnc) in [("204", "08"), ("515", "02"), ("460", "11")] {
+            let profile =
+                derive_standard_3gpp_profile(mcc, mnc, Standard3gppAccess::LteEpc).unwrap();
+            let variants = register_variants(profile);
+            let first = variants[0];
+            assert!(
+                first.policy.advertise_sec_agree
+                    && first.policy.require_sec_agree
+                    && first.policy.proxy_require_sec_agree
+            );
+            assert_eq!(
+                first.authorization,
+                CellularImsInitialAuthorization::UriFirstEmptyAka
+            );
+            assert_eq!(
+                first.security_client_offer,
+                CellularImsSecurityClientOffer::Full
+            );
+            assert_eq!(
+                profile.ims.register.sec_agree_mode, "auto",
+                "do not make every legacy fallback IPsec-only"
+            );
+            assert_eq!(variants[1].label, "generic_ims_register_fallback");
+            assert!(
+                !variants[1].policy.require_sec_agree
+                    && !variants[1].policy.proxy_require_sec_agree
+            );
+            assert!(!pre_authentication_variant_failure(&RegisterFailure {
+                error: ImsError::new("ims_register_auth_rejected"),
+                response: Some(b"SIP/2.0 401 Unauthorized\r\n\r\n".to_vec()),
+                auth_rounds: 1,
+            }));
+            let wifi =
+                derive_standard_3gpp_profile(mcc, mnc, Standard3gppAccess::WifiEpdg).unwrap();
+            assert!(
+                !wifi.ims.register.require_sec_agree_headers
+                    && !wifi.ims.register.proxy_require_sec_agree_headers
+            );
+        }
+    }
+
+    #[test]
     fn standard_derived_cellular_initial_register_identifies_aka_user() {
         let profile =
             crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
@@ -9637,6 +9683,14 @@ mod tests {
         }
         assert!(sip::header_value(&request, "Security-Client").is_some());
         assert!(sip::header_value(&request, "Security-Verify").is_none());
+        assert_eq!(
+            sip::header_value(&request, "Require").as_deref(),
+            Some("sec-agree")
+        );
+        assert_eq!(
+            sip::header_value(&request, "Proxy-Require").as_deref(),
+            Some("sec-agree")
+        );
         let forbidden = RegisterFailure {
             error: ImsError::new("ims_register_initial_unexpected_status"),
             response: Some(
@@ -10192,7 +10246,9 @@ Content-Length: 0\r\n\r\n";
                 crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
             )
             .unwrap();
-        let base = register_variants(profile)[0];
+        // Preserve regression coverage for the pre-auth generic fallback,
+        // whose unrequired shape can still receive this observed warning.
+        let base = register_variants(profile)[1];
         let response = b"SIP/2.0 420 Bad Extension\r\nUnsupported: SEC-AGREE\r\nWarning: 399 pcscf.example \"Without sec-agree and security is configured on\"\r\nContent-Length: 0\r\n\r\n";
         let failure = RegisterFailure {
             error: ImsError::new("ims_register_initial_unexpected_status"),
@@ -10252,7 +10308,7 @@ Content-Length: 0\r\n\r\n";
                 crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
             )
             .unwrap();
-        let base = register_variants(original)[0];
+        let base = register_variants(original)[1];
         for (status, unsupported, warning, auth_rounds, disabled) in [
             (420, "sec-agree", "", 0, false),
             (
