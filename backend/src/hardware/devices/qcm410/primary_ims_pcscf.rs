@@ -5,8 +5,10 @@
 //! (RFC 6459, section 5.2). A shared prefix ALONE is not session ownership.
 //! The narrowly scoped exception here additionally requires a verified MM
 //! profile pin, exactly one active PDP context on the modem, that exact CID,
-//! an IPv6-capable definition, and unchanged MM and AT snapshots. Other
-//! providers and unpinned/multiple contexts retain exact-address matching.
+//! an IPv6-capable definition, and unchanged MM and AT snapshots. An explicitly
+//! owned IPv6-only profile may additionally prove CGPADDR equality and every
+//! other active context's disjoint prefix, repeating all views before use.
+//! Other providers and ordinary unowned pins retain the original rules.
 //!
 //! All IO is supplied by the retained session's unique-owner MM adapter. This
 //! module never opens a QMI client, changes a profile, or activates a context.
@@ -21,6 +23,9 @@ use crate::hardware::{
         ImsBearerError, ImsBearerErrorKind, ImsBearerFailureHint, ImsPcscfDiscovery,
     },
 };
+
+#[path = "primary_ims_pcscf_separated.rs"]
+mod separated;
 
 pub(super) const BUDGET: Duration = Duration::from_secs(12);
 pub(super) const READ_DELAY: Duration = Duration::from_secs(1);
@@ -277,36 +282,66 @@ fn association(
     if row.local == local {
         return Some("mm_owned_at_exact_address");
     }
+    if state.active.as_slice() == [cid] && pinned_ipv6_prefix(row, cid, state, profile_id, expected)
+    {
+        Some("mm_owned_at_sole_pinned_ipv6_prefix")
+    } else {
+        None
+    }
+}
+
+fn pinned_ipv6_prefix(
+    row: &ContextRow,
+    cid: u8,
+    state: &ContextState,
+    profile_id: Option<u32>,
+    expected: &CgcontrdpSettings,
+) -> bool {
     if profile_id != Some(u32::from(cid))
-        || state.active.as_slice() != [cid]
         || expected.ipv6_prefix != Some(64)
         || row.prefix.is_some_and(|prefix| prefix != 64)
-        || !matches!(
-            state.definitions.get(&cid)?.pdp_type.as_str(),
-            "IPV6" | "IPV4V6"
-        )
+        || !state
+            .definitions
+            .get(&cid)
+            .is_some_and(|definition| matches!(definition.pdp_type.as_str(), "IPV6" | "IPV4V6"))
     {
-        return None;
+        return false;
     }
-    let (IpAddr::V6(at), IpAddr::V6(mm)) = (row.local, local) else {
-        return None;
+    let (IpAddr::V6(at), Some(IpAddr::V6(mm))) = (row.local, expected.ipv6_address) else {
+        return false;
     };
-    // No IPv4-subnet approximation, link-local bootstrap, mapped address, zero
-    // IID or guessed prefix. The MM snapshot is the authoritative /64 grant.
     let at = at.octets();
     let mm = mm.octets();
-    (at[..8] == mm[..8] && at[8..] != [0; 8] && mm[8..] != [0; 8])
-        .then_some("mm_owned_at_sole_pinned_ipv6_prefix")
+    at[..8] == mm[..8] && at[8..] != [0; 8] && mm[8..] != [0; 8]
 }
 
 /// The adapter must bind both callbacks to the same unique MM owner and modem;
 /// `read` additionally validates the actual bearer profile, exclusive netdev,
 /// and current endpoint. Caller holds the lease activity guard and deadline.
+#[cfg(test)]
 pub(super) async fn discover_with<Read, ReadFuture, At, AtFuture>(
     expected: &CgcontrdpSettings,
     profile_id: Option<u32>,
     apn: &str,
     delay: Duration,
+    read: Read,
+    at: At,
+) -> Result<ImsPcscfDiscovery, ImsBearerError>
+where
+    Read: FnMut() -> ReadFuture,
+    ReadFuture: Future<Output = Result<CgcontrdpSettings, ImsBearerError>>,
+    At: FnMut(String) -> AtFuture,
+    AtFuture: Future<Output = Result<String, ImsBearerError>>,
+{
+    discover_with_policy(expected, profile_id, apn, delay, false, read, at).await
+}
+
+pub(super) async fn discover_with_policy<Read, ReadFuture, At, AtFuture>(
+    expected: &CgcontrdpSettings,
+    profile_id: Option<u32>,
+    apn: &str,
+    delay: Duration,
+    owned_profile: bool,
     mut read: Read,
     mut at: At,
 ) -> Result<ImsPcscfDiscovery, ImsBearerError>
@@ -354,13 +389,29 @@ where
             let rows = context_rows(&at(command.clone()).await?, cid, apn)?;
             let mut candidates = Vec::new();
             let mut source = "mm_owned_at_exact_address";
+            let mut separated_proof = None;
             for row in &rows {
-                let Some(associated) = association(row, cid, &state, profile_id, expected) else {
-                    saw_unassociated |= !row.candidates.is_empty();
-                    continue;
-                };
-                if associated == "mm_owned_at_sole_pinned_ipv6_prefix" && !row.candidates.is_empty()
-                {
+                let associated =
+                    if let Some(source) = association(row, cid, &state, profile_id, expected) {
+                        source
+                    } else if owned_profile
+                        && expected.ipv4_address.is_none()
+                        && state
+                            .definitions
+                            .get(&cid)
+                            .is_some_and(|d| d.pdp_type == "IPV6")
+                        && state.active.len() > 1
+                        && !row.candidates.is_empty()
+                        && pinned_ipv6_prefix(row, cid, &state, profile_id, expected)
+                    {
+                        separated_proof =
+                            Some(separated::observe(cid, row, apn, &state, &mut at).await?);
+                        "mm_owned_at_disjoint_context_ipv6_prefix"
+                    } else {
+                        saw_unassociated |= !row.candidates.is_empty();
+                        continue;
+                    };
+                if associated != "mm_owned_at_exact_address" && !row.candidates.is_empty() {
                     source = associated;
                 }
                 for address in &row.candidates {
@@ -380,6 +431,20 @@ where
             )?;
             if after != state || context_rows(&at(command).await?, cid, apn)? != rows {
                 return Err(unavailable("context_changed"));
+            }
+            if let Some(proof) = separated_proof {
+                let row = rows
+                    .iter()
+                    .find(|row| row.local.is_ipv6())
+                    .ok_or_else(|| unavailable("context_changed"))?;
+                if separated::observe(cid, row, apn, &after, &mut at).await? != proof
+                    || context_state(
+                        &at("AT+CGACT?".into()).await?,
+                        &at("AT+CGDCONT?".into()).await?,
+                    )? != after
+                {
+                    return Err(unavailable("context_changed"));
+                }
             }
             if read().await? != *expected {
                 return Err(session_changed("ip_config_changed"));

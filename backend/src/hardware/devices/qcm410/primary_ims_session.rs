@@ -112,6 +112,9 @@ impl PrimaryImsSession {
         if cancelled.load(Ordering::Acquire) || lifecycle::is_shutting_down() {
             return Err("qca410_primary_mm_setup_cancelled".to_string());
         }
+        // Only verified profile lease paths supply a pinned bus. Generic
+        // APN/profile reuse keeps exact/sole-context P-CSCF association.
+        let owned_profile_context = pinned_bus.is_some() && request.profile_id.is_some();
         let bus = match pinned_bus {
             Some(bus) => {
                 if bus.device != request.device || bus.modem != request.modem {
@@ -135,6 +138,7 @@ impl PrimaryImsSession {
             bus,
             request,
             cancelled,
+            owned_profile_context,
             previous: Mutex::new(None),
             owned: Mutex::new(None),
         });
@@ -246,18 +250,32 @@ impl PrimaryImsSession {
         let _guard = lease
             .connection_will_start()
             .map_err(|_| session_changed("lease_closing"))?;
-        let result = self
-            .controller
-            .bus
-            .discover_pcscf(
-                &self.bearer,
-                &self.controller.request.apn,
-                self.controller.request.family,
-                self.controller.request.profile_id,
-                expected,
-                &_guard,
-            )
-            .await;
+        let result = if self.controller.owned_profile_context {
+            self.controller
+                .bus
+                .discover_pcscf_with_policy(
+                    &self.bearer,
+                    &self.controller.request.apn,
+                    self.controller.request.family,
+                    self.controller.request.profile_id,
+                    expected,
+                    &_guard,
+                    true,
+                )
+                .await
+        } else {
+            self.controller
+                .bus
+                .discover_pcscf(
+                    &self.bearer,
+                    &self.controller.request.apn,
+                    self.controller.request.family,
+                    self.controller.request.profile_id,
+                    expected,
+                    &_guard,
+                )
+                .await
+        };
         self.check_liveness()
             .map_err(|_| session_changed("session_not_live"))?;
         result
@@ -404,6 +422,7 @@ struct Controller {
     bus: Arc<MmBus>,
     request: OwnedRequest,
     cancelled: Arc<AtomicBool>,
+    owned_profile_context: bool,
     previous: Mutex<Option<Vec<String>>>,
     owned: Mutex<Option<Arc<OwnedLease>>>,
 }

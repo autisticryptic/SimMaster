@@ -22,7 +22,7 @@ class MmPcscfRecoveryBoundaryTests(unittest.TestCase):
         text = (DEVICE / "primary_ims_pcscf.rs").read_text()
         normal = text[text.index("pub(super) async fn discover_with"):text.index("pub(super) fn missing_reporting_context")]
         self.assertIn("profile_id.is_none_or(|profile| profile == u32::from(*cid))", normal)
-        hint = text[text.index("pub(super) fn missing_reporting_context"):text.index("#[cfg(test)]")]
+        hint = text.split("pub(super) fn missing_reporting_context", 1)[1].split("#[cfg(test)]", 1)[0]
         for guard in ("context_rows", "expected.pcscf.is_empty()", "state.active.as_slice()", "expected.ipv6_prefix != Some(64)", "!row.candidates.is_empty()"):
             self.assertIn(guard, hint)
 

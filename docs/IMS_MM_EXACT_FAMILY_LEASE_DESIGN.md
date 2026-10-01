@@ -28,7 +28,19 @@
 - 同一 MM owner 内对象重新枚举，只在旧 modem 确认消失、物理控制口及稳定 SIM/slot、原 profile/EPS 全匹配且两次快照一致时衔接 profile 清理；不把 bearer 清理重定向到新对象，不接受旧 receipt 缺失稳定归属证据的换代。
 - 83354b6已验证：临时IPv4v6 CID4（动态选择）、实际IPv4/wwan0，首420后根据精确Warning词序补齐安全声明，401/AKA后返回真实IPsec成功会话；注销结果rejected，本地承载/namespace/profile回收通过。新实例无需强制IPv4、不改原profile，完整证据与生产集成边界见[HANDOFF最新节](HANDOFF.md#先前验收临时-profile-上实际-ims-ipsec-注册成功2026-09-30-1629-utc)。原6a77d92的profile闭环证明保持独立，不能拿探针成功替代主服务持续在线验收。
 
-## 换卡后旧租约的显式缺失结案（新候选，待 CI / 实机）
+## 新卡IPv6承载的多上下文P-CSCF证明（待CI/实机）
+
+20408/50212实测：自有IPv6 profile与MM源地址共享/64但IID不同，CGPADDR与目标CGCONTRDP完整地址一致；另有默认INTERNET上下文活动，IPv6前缀不同。原sole-active保护因此拒绝了IMS自己的PCO，尚未发送REGISTER。
+
+新增分支仅在已验证自有IPv6-only profile（不是普通APN复用）的 retained MM bearer 上启用：
+
+1. 仍验证实际profile-id、APN、unique owner/SIM、独占网口、MM IP快照与/64授予，不从AT配置主机地址。
+2. 目标CGPADDR必须是严格单行、同CID、唯一IPv6完整地址，与目标AT行完全一致；错误尾部、重复、同前缀但不同地址均拒绝。
+3. 对每一个其他活动CID读取独立CGCONTRDP，核对CID、协商APN、EBI、可用地址族；IPv6-capable定义缺少有效IPv6或显式非/64、零IID均视为未知，拒绝。任何其他上下文与目标前缀重叠、同IMS APN、重复EBI都拒绝。
+4. 当前卡默认上下文的空配置APN可协商成INTERNET，仅作排除证据，不借其DNS/P-CSCF。全部行、目标地址、活动表、定义表重复核验，再检查当前MM绑定，才消费目标CID自己的PCO。
+5. 原exact-address及sole-active行为不变，普通非自有pin不获得该扩展；原12秒只读预算/串行及lease guard不变。不会借此增加IPv4激活、改变全局族顺序或绕过固件崩溃保护。
+
+## 换卡后旧租约的显式缺失结案（cc2fcc1已通过CI及实机）
 
 `--action inspect-retired` 只核验并输出plan；`--action retire-absent --expected-plan <token>` 才能归档已证明无资源的v2运行时记录。二者仍要求两程序停止、无bearer/call/未知bearer receipt，不接入自动重试。
 

@@ -529,13 +529,28 @@ impl MmBus {
         expected: &CgcontrdpSettings,
         guard: &NetworkGuard,
     ) -> Result<ImsPcscfDiscovery, ImsBearerError> {
+        self.discover_pcscf_with_policy(bearer, apn, family, profile_id, expected, guard, false)
+            .await
+    }
+
+    pub async fn discover_pcscf_with_policy(
+        self: &Arc<Self>,
+        bearer: &str,
+        apn: &str,
+        family: MmIpFamily,
+        profile_id: Option<u32>,
+        expected: &CgcontrdpSettings,
+        guard: &NetworkGuard,
+        owned_profile: bool,
+    ) -> Result<ImsPcscfDiscovery, ImsBearerError> {
         let deadline = Instant::now() + primary_ims_pcscf::BUDGET;
         tokio::time::timeout_at(deadline, async {
-            let result = primary_ims_pcscf::discover_with(
+            let result = primary_ims_pcscf::discover_with_policy(
                 expected,
                 profile_id,
                 apn,
                 primary_ims_pcscf::READ_DELAY,
+                owned_profile,
                 || self.pcscf_binding_snapshot(bearer, apn, family, profile_id),
                 |command| async move { self.pcscf_at_read(&command, guard, deadline).await },
             )
@@ -631,11 +646,13 @@ impl MmBus {
         guard: &NetworkGuard,
         deadline: Instant,
     ) -> Result<String, ImsBearerError> {
-        let context_read = command.strip_prefix("AT+CGCONTRDP=").is_some_and(|value| {
-            value
-                .parse::<u8>()
-                .ok()
-                .is_some_and(|cid| (1..=16).contains(&cid) && cid.to_string() == value)
+        let context_read = ["AT+CGCONTRDP=", "AT+CGPADDR="].iter().any(|prefix| {
+            command.strip_prefix(*prefix).is_some_and(|value| {
+                value
+                    .parse::<u8>()
+                    .ok()
+                    .is_some_and(|cid| (1..=16).contains(&cid) && cid.to_string() == value)
+            })
         });
         if !matches!(command, "AT+CGACT?" | "AT+CGDCONT?") && !context_read {
             return Err(unavailable("command_not_read_only"));
@@ -1602,6 +1619,7 @@ mod ip_config_dbus_tests {
 
     struct FakeBearer {
         interface: String,
+        ipv6_only: bool,
         connected: Arc<AtomicBool>,
         disconnect_during_read: bool,
         sim_change_during_read: Option<Arc<AtomicBool>>,
@@ -1668,9 +1686,26 @@ mod ip_config_dbus_tests {
         fn command(&self, command: &str, _timeout: u32) -> String {
             self.commands.lock().unwrap().push(command.to_string());
             match command {
-                "AT+CGACT?" => "+CGACT: 1,0\n+CGACT: 2,1".into(),
-                "AT+CGDCONT?" => {
-                    "+CGDCONT: 1,\"IPV4V6\",\"internet\"\n+CGDCONT: 2,\"IPV4V6\",\"ims\"".into()
+                "AT+CGACT?" => if self.action.starts_with("separated") {
+                    "+CGACT: 1,1\n+CGACT: 2,1"
+                } else {
+                    "+CGACT: 1,0\n+CGACT: 2,1"
+                }
+                .into(),
+                "AT+CGDCONT?" => if self.action.starts_with("separated") {
+                    "+CGDCONT: 1,\"IPV4V6\",\"\"\n+CGDCONT: 2,\"IPV6\",\"ims\""
+                } else {
+                    "+CGDCONT: 1,\"IPV4V6\",\"internet\"\n+CGDCONT: 2,\"IPV4V6\",\"ims\""
+                }
+                .into(),
+                "AT+CGPADDR=2" => {
+                    if self.action == "separated_sim" {
+                        self.sim_changed.store(true, Ordering::Release);
+                    }
+                    "+CGPADDR: 2,2001:db8::a".into()
+                }
+                "AT+CGCONTRDP=1" => {
+                    "+CGCONTRDP: 1,6,INTERNET,2001:db8:9::b,fe80::1,,,2001:db8:99::1".into()
                 }
                 "AT+CGCONTRDP=2" => {
                     match self.action {
@@ -1755,7 +1790,11 @@ mod ip_config_dbus_tests {
             if self.disconnect_during_read {
                 self.connected.store(false, Ordering::Release);
             }
-            ip_config(false)
+            if self.ipv6_only {
+                HashMap::new()
+            } else {
+                ip_config(false)
+            }
         }
         #[zbus(property)]
         fn ip6_config(&self) -> HashMap<String, OwnedValue> {
@@ -1899,6 +1938,7 @@ mod ip_config_dbus_tests {
             .serve_at(
                 PATH,
                 FakeBearer {
+                    ipv6_only: action.starts_with("separated"),
                     interface: if action == "alternate_interface" {
                         "wwan2"
                     } else {
@@ -2244,6 +2284,42 @@ mod ip_config_dbus_tests {
     }
 
     #[tokio::test]
+    async fn owned_pcscf_private_bus_verifies_disjoint_contexts_and_cgpaddr_on_original_owner() {
+        for action in ["separated", "separated_sim"] {
+            let (server, commands) = probe_server(false, action).await;
+            let bus = bus().await;
+            let expected = bus
+                .ip_settings(PATH, "ims", MmIpFamily::Ipv6)
+                .await
+                .unwrap()
+                .unwrap();
+            let result = bus
+                .discover_pcscf_with_policy(
+                    PATH,
+                    "ims",
+                    MmIpFamily::Ipv6,
+                    Some(2),
+                    &expected,
+                    &observation_guard(),
+                    true,
+                )
+                .await;
+            if action == "separated" {
+                let observed = result.unwrap();
+                assert_eq!(observed.source, "mm_owned_at_disjoint_context_ipv6_prefix");
+                assert_eq!(observed.context_id, Some(2));
+                assert!(commands.lock().unwrap().iter().any(|c| c == "AT+CGPADDR=2"));
+                assert!(!observed
+                    .candidates
+                    .contains(&"2001:db8:99::1".parse().unwrap()));
+            } else {
+                assert_eq!(result.unwrap_err().kind, ImsBearerErrorKind::SessionLost);
+            }
+            server.release_name(SERVICE).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn pcscf_adapter_rejects_mutating_commands_and_replaced_owners() {
         let (first, old_commands) = probe_server(false, "").await;
         let bus = bus().await;
@@ -2253,6 +2329,10 @@ mod ip_config_dbus_tests {
             "AT+CFUN=0",
             "AT+CGCONTRDP=2;AT+CFUN=0",
             "AT+CGCONTRDP=02",
+            "AT+CGPADDR=0",
+            "AT+CGPADDR=17",
+            "AT+CGPADDR=02",
+            "AT+CGPADDR=2;AT+CFUN=0",
         ] {
             assert!(bus
                 .pcscf_at_read(

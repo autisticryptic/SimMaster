@@ -3,7 +3,19 @@
 > 更新：2026-10-01。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 最新：新卡排查中，控制口缺失与旧租约阻断（2026-10-01）
+## 新卡最新：控制口已恢复、旧租约已结案，正在修复IPv6 P-CSCF归属（2026-10-01）
+
+用户明确允许测试设备操作后，**只执行一次整机重启**，未直接写remoteproc state。当前管理`192.168.100.13/wlan0`、MM PID472，主服务/beta8/secondary仍停止，尚未注册新卡。
+
+- 为防开机自动重放，四个相关unit加了本次专属`zz-simadmin-new-sim-maintenance.conf`，ConditionPathExists指向`/var/lib/simadmin/new-sim-maintenance/hold`。**该维护hold仍在，收尾必须只移除本次drop-in/marker并按记录恢复；不能忘记导致之后不能自启。** 原enable状态未改；配置/DB/安装程序哈希重启前后相同，旧profile元数据未删。/run预算元数据已检查，本次原目录没有预算文件（0项）。
+- 新boot `1b7022ed-0f3d-458a-a524-963fdf226700`，QMI控制口与Modem/0恢复，后来自动恢复50212漫游驻网/attached。MM加载新卡HPLMN20408；没有再触发IPv4或基带复位。证据`post-reboot-connection.json`、`post-reboot-sim-and-budgets.json`、`post-reboot-radio-state.json`。
+- **cc2fcc1安全结案已实机通过**：inspect-retired双快照证明原自有ID4在当前MM+AT均不存在、reporting000、旧owner/网络/namespace无残留；匹配token后只归档原v2记录为`retired/absent-5df955da…receipt`，未删除任何modem profile，当前原始库存2项。证据`retirement-{inspect-retired,retire-absent}.json`。
+- **两个明确有界IPv6窗口均建承载成功、未发送REGISTER**：`ipv6-probe`与`ipv6-association`自动选空闲CID3，实际IPv6/64、MTU1280，失败`context_address_unassociated`，释放后原2项profile/EPS/reporting核验恢复。不是重试IPv4，也未更改生产族顺序。
+- 第二窗口原MM owner只读快照证明：bearer profile-id3/APNims/typeIPv6，MM与AT的IPv6地址共享同/64但IID不同，CGPADDR3等于CGCONTRDP3；CGACT1、3均active。CID1默认APN定义为空、实际协商INTERNET，前缀与IMS完全不同；CID3行实际带2个IPv6 P-CSCF。**原sole-active保护因默认EPS也active而误拒绝目标自己的PCO**。这不是缺少PCO，也不是420或AKA失败。
+- 正在实现仅自有IPv6-only路径的额外证明：严格CGPADDR全地址对应、所有其他active context逐一可解释且前缀/EBI/APN无歧义、全部双快照及最终MM绑定核验；只用目标CID自己的P-CSCF。普通pin/exact/sole行为不变，不从AT配置主机IP，不放宽到未知或重叠上下文。尚待CI/新探针对照。
+- 所有本轮证据仍在`.local/evidence/new-sim-ims/`；新代码未覆盖正式48e269c。本卡IPv4引发固件fatal的历史事实保持，不以本次重启称其已修复。手机蜂窝IMS及同驻网对照未获进一步信息。
+
+## 新卡初始排查：控制口缺失与旧租约阻断（以下为历史）
 
 **用户已停止主服务并手工运行beta8测试另一张卡；手机能注册，但beta8与本项目均失败。以下旧卡51502的6次续期不代表这张新卡已通过。** 本轮到目前仅只读，未启动任何程序、重启MM/基带、写PDP或清记录。
 
@@ -14,7 +26,10 @@
 - 这证明存在重复的IPv4连接/基带fatal紧邻事件，但没有固件源码根因，也没有beta8终端完整SIP日志，不断言手机/设备相同网络或beta8唯一原因。不可继续盲重试IPv4或擅自把全局族顺序改成IPv6-only。
 - 已向用户询问一次受控基带复位，用户随后回复继续。**复位前SSH连接TimeoutError，尚未发任何复位/停服指令**；同时核对`baseband_faults.rs`及`QCM410_BAM_DMUX_MODEM_CRASH.md`发现直接remoteproc stop有整机重启风险，而QMI复位入口已缺失，因此没有绕过保护去写sysfs。02:04 UTC最后可达只读快照仍无QMI、无modem、主服务停止；设备恢复连接后先核实是否用户已自行重启。手机成功是否为关闭Wi-Fi的蜂窝IMS且同驻网仍待确认。
 - 项目侧已编写显式`inspect-retired / retire-absent`维护候选：仅原owner已不存在、旧自有ID在当前MM+AT均缺失、reporting已复原、旧网络/namespace无残留及完整双快照一致时，凭token归档原元数据。绝不删除modem profile或把同号不同定义当缺失，不自动接进重试。**尚待CI/实机验证；设备QMI未恢复时连absence证明都不能做。**
-- 证据`.local/evidence/new-sim-ims/`：`findings.json`、`initial-readonly.json`、`qmi-topology.json`、`kernel-timeline.log`、`mm-attempt-summary.log`、`mm-request-metadata.log`、`mm-ip-metadata.log`。一次宽时间范围MM日志超过输出上限而中断，之后用有界筛选重读完成；未因日志读取失败重放设备操作。
+- 用户新提供`192.168.100.13`后，已沿原SSH主机pin重连；仍同一boot/MM226233、主服务/beta8停止、无QMI/无modem，管理改为wlan0。Windows当前没有RNDIS网卡，旧192.168.68.1走WLAN默认网关，所以之前超时不是代码重启了设备。已安全更新仓库外目标地址，凭据未回显。
+- 进一步只读确认modem remoteproc为running、bam-dmux runtime_status=suspended，但DATA5/QMI仍未恢复；不是已证实的runtime-PM error锁存。正常QMI reset无法使用，又不能直接写有整机重启风险的remoteproc state，已向用户提出**受控整机重启（先暂时禁用自动注册/initializer/recovery）**的维护确认，尚未执行。
+- 候选 **`cc2fcc189ee168e862e14affff4da4936931962c`** 已推送：239 Python、定向格式/diff通过；Validate36806916655 / Build36806916679全success，两套实际日志89累计新增+11兼容均ok，双架构制品已核验。只增加显式absence证明/元数据归档入口，不改自动注册回退；尚未部署或实机结案。证明`.local/evidence/ims-route-completion/cc2fcc1/verified.json`。
+- 证据`.local/evidence/new-sim-ims/`：`findings.json`、`initial-readonly.json`（最新LAN重连快照）、`qmi-topology.json`、`kernel-timeline.log`、`mm-attempt-summary.log`、`mm-request-metadata.log`、`mm-ip-metadata.log`、`lan-reset-precheck.json`。一次宽时间范围MM日志超过输出上限而中断，之后用有界筛选重读完成；未因日志读取失败重放设备操作。
 
 ## 最新只读验收：自然续期已成功6次（2026-10-01 00:43 UTC）
 

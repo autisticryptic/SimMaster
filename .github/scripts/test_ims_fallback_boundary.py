@@ -146,7 +146,7 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         device = ROOT / "backend/src/hardware/devices/qcm410"
         text = (device / "primary_ims_pcscf.rs").read_text()
         association = text[text.index("fn association("):text.index("pub(super) async fn discover_with<")]
-        for gate in ("profile_id != Some(u32::from(cid))", "state.active.as_slice() != [cid]",
+        for gate in ("profile_id != Some(u32::from(cid))", "state.active.as_slice() == [cid]",
                      "expected.ipv6_prefix != Some(64)", "at[..8] == mm[..8]"):
             self.assertIn(gate, association)
         self.assertIn("if read().await? != *expected", text)
