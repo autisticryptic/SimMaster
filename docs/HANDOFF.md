@@ -3,7 +3,18 @@
 > 更新：2026-10-01。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 新卡最新：控制口已恢复、旧租约已结案，正在修复IPv6 P-CSCF归属（2026-10-01）
+## 新卡已部署并注册：6c6fcfd / IPv6 IPsec（2026-10-01，续期待验）
+
+**当前正式服务为1.1.5 / `6c6fcfd55c1982b52d8816b55dc7a8237dd66eca`，PID4973；新卡20408、驻50212，于09:27:07 UTC实际注册IPv6/IPsec。** 不是只运行维护探针。当前管理`192.168.100.13/wlan0`、MM PID472，保留`--debug --test-quick-suspend-resume`，部署没有再重启MM/基带。
+
+- 两套CI Validate36840587599/Build36840587632全部success；实际日志100累计新增+14兼容均ok，双架构制品完整验证，Publish skipped。包括旧Maxis421→400兼容测试、403提示边界及派生配置回归，未把39b387b早期失败说成通过。
+- 唯一有意的配置改动：该线路`cellular_ims_ip_families=[ipv6]`、`cellular_ims_ip_families_auto=false`（之前为全族自动）。用于规避本卡已实证的IPv4连接触发固件fatal，不代表固件根因已修。**这是线路级设置，换回其他卡时也会保留，需要重新评估，不能说是自动随SIM切换的策略。** 全局默认/普通数据/其他配置字段和表不改，配置更新在停止状态下事务校验，复制程序时config.yaml/data.db摘要保持。
+- 正式服务首候选`standard_3gpp_conservative`现在完整声明sec-agree，实际下发Security-Server、AKA/IPsec后注册成功；自有IPv6 profile与默认INTERNET上下文经严格分离证明关联PCO。已连续六次采样同registered_at、last_error=null、reconnect_count1、NRestarts0，未触发重试或再次复位。
+- **本次维护保护已全部撤销**：main drop-in部署前移除，其余三条和hold marker09:29移除。recovery timer active；发现历史skipped导致oneshot仍inactive后，09:43按原状态恢复recovery service，返回healthy / active-exited / MainPID0，不重启MM或DATA6。secondary保持原inactive；所有临时证据目录保留。
+- **仍待确认自然续期**：当前lease3600秒，程序安排3000秒后自然REGISTER（约10:17 UTC）。这张卡OPTIONS保活未回应、last_rx尚停在初次注册后，因此不能把页面registered当持续收发验证；继续只读等待真正续期。无活动通话，当前boot内核fatal为0。
+- 证据`.local/evidence/new-sim-ims/deploy/`：`6c6fcfd.json`、`6c6fcfd-startup.json`、`6c6fcfd-stability.json`、`6c6fcfd-stability-facts.json`、`6c6fcfd-maintenance-restored.json`、`6c6fcfd-recovery-service-restored.json`；CI证明`.local/evidence/ims-route-completion/6c6fcfd/verified.json`。正式运行SHA256 `0869403532edffcc87a8896b2c0ba4148a4bf5b6ead39063d488e77f2a5db489`、前端MD5 `01505b0195870511cc8428e1d730b53c`均匹配制品。
+
+## 新卡逐步诊断：控制口恢复、旧租约结案和IPv6归属（以下为历史）
 
 用户明确允许测试设备操作后，**只执行一次整机重启**，未直接写remoteproc state。当前管理`192.168.100.13/wlan0`、MM PID472，主服务/beta8/secondary仍停止，尚未注册新卡。
 
@@ -18,7 +29,9 @@
 - **安全协商对照成功**：`0ae80aebb4f972b372ebdad20622c90ee305235b` Validate36828711573/Build36828711574全success，97累计新增+11兼容及双架构制品核验。`ipv6-required-0ae80ae`显式`probe-required`仅一P-CSCF/一候选、首包完整Require/Proxy-Require；实际收到Security-Server，AKA材料长度RES8/CK16/IK16，07:29:41 UTC注册IPsec成功，随后注销confirmed、承载及profile回收通过，原2项库存/EPS/reporting恢复。没有增加认证轮数，未使用IPv4。
 - 此轮旁路auth观察器退出1，**不能说抓包通过**；结论来自候选程序受保护会话报告与挑战/成功元数据。之前观察器折行缺陷已修代码但没有因此改生产Digest。证据`ipv6-required-0ae80ae/{probe-required,release,inspect-after}.json`。
 - 正在将已验证行为接入标准派生LTE的首候选：Security-Client既已存在，则首包直接声明Require/Proxy-Require sec-agree；维持`sec_agree_mode=auto`及原generic候选/原候选预算，不因认证失败再自动尝试其他形状，WLAN/catalog不改。这是首包配置修复，不是把401归类成可重试。
-- 后续正式部署需为**当前新卡线路明确设置IPv6-only**，避开实证的IPv4固件崩溃；不修改全局默认族顺序/普通数据/PDP。尚未改线路配置或启动正式服务，维护hold仍在。自然续期/正式主服务注册仍待最终候选。
+- 生产首包配置初版39b387b的CI发现两项旧兼容回归失败：本地主动声明被误标为server-required会触发不该有的400/403动态身份提示。已在**bdffdef73593ed99550e0fcf1db16f9e43dd8c07**分离声明/服务端要求标记，并将legacy测试fixture明确保持旧字段；Validate36836669433/Build36836669460、98累计新增+14兼容及双架构完整核验通过，不掩盖早期失败。
+- bdffdef首次部署在**上传/覆盖/配置修改之前**被预检拒绝：实际MM启动参数含`--debug --test-quick-suspend-resume`，旧startup helper会因drop-in文本不等而覆盖并重启MM。后继 **6c6fcfd55c1982b52d8816b55dc7a8237dd66eca** 增加实际MainPID/exe/NUL argv只读检测：已运行debug则保留原平台参数/owner，不改drop-in、不重启。Validate36840587599/Build36840587632运行中，尚未宣称后继CI/部署通过。
+- 后续正式部署需为**当前新卡线路明确设置IPv6-only**，避开实证的IPv4固件崩溃；不修改全局默认族顺序/普通数据/PDP。私有脚本`.local/active/lan/deploy_new_sim_candidate.py`只改该线路族数组/auto字段（全其他表/字段指纹核验），复制程序前后保留配置DB，检查实际SIM/MM/无通话/主服务停止，并按阶段移除本次维护保护。**尚未改线路配置或启动正式服务，hold仍在**。自然续期/正式主服务注册仍待最终候选。
 - 所有本轮证据仍在`.local/evidence/new-sim-ims/`；新代码未覆盖正式48e269c。本卡IPv4引发固件fatal的历史事实保持，不以本次重启称其已修复。手机蜂窝IMS及同驻网对照未获进一步信息。
 
 ## 新卡初始排查：控制口缺失与旧租约阻断（以下为历史）

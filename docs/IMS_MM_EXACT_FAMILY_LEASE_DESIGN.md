@@ -28,9 +28,9 @@
 - 同一 MM owner 内对象重新枚举，只在旧 modem 确认消失、物理控制口及稳定 SIM/slot、原 profile/EPS 全匹配且两次快照一致时衔接 profile 清理；不把 bearer 清理重定向到新对象，不接受旧 receipt 缺失稳定归属证据的换代。
 - 83354b6已验证：临时IPv4v6 CID4（动态选择）、实际IPv4/wwan0，首420后根据精确Warning词序补齐安全声明，401/AKA后返回真实IPsec成功会话；注销结果rejected，本地承载/namespace/profile回收通过。新实例无需强制IPv4、不改原profile，完整证据与生产集成边界见[HANDOFF最新节](HANDOFF.md#先前验收临时-profile-上实际-ims-ipsec-注册成功2026-09-30-1629-utc)。原6a77d92的profile闭环证明保持独立，不能拿探针成功替代主服务持续在线验收。
 
-## 新卡IPv6承载的多上下文P-CSCF证明（待CI/实机）
+## 新卡IPv6承载的多上下文P-CSCF证明（已通过CI及实机）
 
-20408/50212实测：自有IPv6 profile与MM源地址共享/64但IID不同，CGPADDR与目标CGCONTRDP完整地址一致；另有默认INTERNET上下文活动，IPv6前缀不同。原sole-active保护因此拒绝了IMS自己的PCO，尚未发送REGISTER。
+20408/50212实测：自有IPv6 profile与MM源地址共享/64但IID不同，CGPADDR与目标CGCONTRDP完整地址一致；另有默认INTERNET上下文活动，IPv6前缀不同。原sole-active保护因此拒绝了IMS自己的PCO。547c157补强后已进入SIP，0ae80ae显式required对照IPsec注册及注销confirmed；6c6fcfd集成完整首声明并部署正式服务，于2026-10-01 09:27 UTC注册IPv6/IPsec，当前线路配置IPv6-only规避固件IPv4崩溃。自然续期仍待验收，见HANDOFF首节。
 
 新增分支仅在已验证自有IPv6-only profile（不是普通APN复用）的 retained MM bearer 上启用：
 
