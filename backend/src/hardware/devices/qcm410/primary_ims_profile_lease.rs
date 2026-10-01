@@ -1089,7 +1089,13 @@ pub async fn maintain(
     }
     if !matches!(
         action,
-        "inspect" | "acquire" | "acquire-at" | "probe" | "release"
+        "inspect"
+            | "acquire"
+            | "acquire-at"
+            | "probe"
+            | "release"
+            | "inspect-retired"
+            | "retire-absent"
     ) {
         return Err(ERROR.into());
     }
@@ -1164,6 +1170,20 @@ pub async fn maintain(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return Err(ERROR.into()),
     };
+    if matches!(action, "inspect-retired" | "retire-absent") {
+        // Explicit metadata-only retirement has independent current-state
+        // absence proofs. It never adopts or deletes a cross-owner profile.
+        return runtime::retire_absent(
+            action,
+            &io,
+            &store,
+            existing.ok_or("mm_ims_profile_lease_receipt_missing")?,
+            apn,
+            family,
+            expected_plan,
+        )
+        .await;
+    }
     // Runtime leases are never adopted by the stopped-only CLI, including
     // unknown/incomplete runtime ownership. Only runtime recovery may inspect
     // its bearer/network coupling and authorize profile-only cleanup.

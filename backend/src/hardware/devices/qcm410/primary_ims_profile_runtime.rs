@@ -14,6 +14,21 @@ use std::pin::Pin;
 use std::sync::Weak;
 use tokio::sync::{oneshot, OwnedMutexGuard};
 
+#[path = "primary_ims_profile_retirement.rs"]
+mod retirement;
+
+pub(super) async fn retire_absent(
+    action: &str,
+    io: &MmProfileIo,
+    store: &DiskStore,
+    receipt: Receipt,
+    apn: &str,
+    family: u32,
+    expected_plan: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    retirement::run(action, io, store, receipt, apn, family, expected_plan).await
+}
+
 const PRIMARY: &str = "/dev/wwan0qmi0";
 const MODEM_PREFIX: &str = "/org/freedesktop/ModemManager1/Modem/";
 const RUNTIME_ERROR: &str = "mm_ims_profile_runtime_unverified";

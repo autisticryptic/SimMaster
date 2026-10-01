@@ -28,6 +28,16 @@
 - 同一 MM owner 内对象重新枚举，只在旧 modem 确认消失、物理控制口及稳定 SIM/slot、原 profile/EPS 全匹配且两次快照一致时衔接 profile 清理；不把 bearer 清理重定向到新对象，不接受旧 receipt 缺失稳定归属证据的换代。
 - 83354b6已验证：临时IPv4v6 CID4（动态选择）、实际IPv4/wwan0，首420后根据精确Warning词序补齐安全声明，401/AKA后返回真实IPsec成功会话；注销结果rejected，本地承载/namespace/profile回收通过。新实例无需强制IPv4、不改原profile，完整证据与生产集成边界见[HANDOFF最新节](HANDOFF.md#先前验收临时-profile-上实际-ims-ipsec-注册成功2026-09-30-1629-utc)。原6a77d92的profile闭环证明保持独立，不能拿探针成功替代主服务持续在线验收。
 
+## 换卡后旧租约的显式缺失结案（新候选，待 CI / 实机）
+
+`--action inspect-retired` 只核验并输出plan；`--action retire-absent --expected-plan <token>` 才能归档已证明无资源的v2运行时记录。二者仍要求两程序停止、无bearer/call/未知bearer receipt，不接入自动重试。
+
+- 原MM unique owner必须已真正不存在（同bus用NameHasOwner确认；不是仅失去well-known名），当前MM owner/新SIM及完整快照在双次观察中一致；物理控制口必须匹配原记录。
+- 旧自有ID在**当前MM与AT两份库存中都不存在**，且其reporting已回到原000。即使同ID的APN/族不同，也视为存在而拒绝，不会删掉新卡的配置。
+- 要求原创建进程死亡，记录处于已知Owned/Probed及已知运行时阶段；Creating/Probing/BearerPending/不确定reporting或Delete均不借此结案。旧bearer镜像和地址、路由、规则须只读证明无残留；旧namespace若还存在则拒绝，不尝试清扫IPsec或网口。
+- 只把原记录原样写入`retired/absent-<digest>.receipt`，确认持久化后才移除活动记录名；不覆盖既有证据、配置或DB，不改任何modem profile，不清预算。归档失败或证据变化保持阻断。
+- 此入口不能恢复缺失QMI口、不能修复固件`dhcp_client_mgr.c:263`崩溃，也不能证明新卡IMS已注册；只有控制口恢复后才可能取得当前库存证明。
+
 ## 生产集成（48e269c已部署，IMS-only注册验收通过）
 
 - 设备 transport 显式 opt-in；仅标准派生、MM、IMS-only 路径进入 runtime adapter。数据开启、catalog或其他设备仍保留原流程；普通流程持有相同设备 flock 到承载准备结束，防止空账本检查后误复用并发新建的自有 profile。

@@ -3,6 +3,19 @@
 > 更新：2026-10-01。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
+## 最新：新卡排查中，控制口缺失与旧租约阻断（2026-10-01）
+
+**用户已停止主服务并手工运行beta8测试另一张卡；手机能注册，但beta8与本项目均失败。以下旧卡51502的6次续期不代表这张新卡已通过。** 本轮到目前仅只读，未启动任何程序、重启MM/基带、写PDP或清记录。
+
+- 当前主服务/beta8/secondary均无运行进程，主服务inactive；MM已变成PID226233（非本轮操作）。管理usb0，数据库正常，无启用任务/活动通话记录。
+- **本项目较早的新卡失败**：日志识别`derived_3gpp_lte_20408`、服务网50212，随后返回`mm_ims_profile_runtime_owner_changed`，未进入新卡SIP。旧v2 profile记录仍为ID4/IP/ims、old owner :1.25、Modem77、PID119010、runtime Cleaning/abandoned，保留bearer网络镜像。当前无/run bearer记录、无namespace，但这些尚不足以证明modem里ID4不存在；未删旧记录解锁。
+- **当前更底层阻断**：`/dev/wwan0qmi0`和sysfs QMI port均不存在，RPMSG DATA5通道不在已公告列表，仅DATA1/DATA4 AT口有驱动；MM `No modems were found`，日志明确`at least a QMI port is required`。不能在该现场开展SIP/AKA诊断，也不能伪称只是420。
+- **固件崩溃时序已核对**：beta8测试时间段MM实际请求IMS IPv6 Bearer1/4/7/10，获得IPv6地址/MTU1280，无DNS字段，保持约10–11秒、TX48/RX96；不能把这当IMS注册成功。之后每个IPv4 Bearer2/5/8/11 Connect后0.368–0.396秒均出现内核`dhcp_client_mgr.c:263` fatal，remoteproc自动恢复共4次。最后控制口再次消失而DATA5未重新出现。
+- 这证明存在重复的IPv4连接/基带fatal紧邻事件，但没有固件源码根因，也没有beta8终端完整SIP日志，不断言手机/设备相同网络或beta8唯一原因。不可继续盲重试IPv4或擅自把全局族顺序改成IPv6-only。
+- 已向用户询问一次受控基带复位，用户随后回复继续。**复位前SSH连接TimeoutError，尚未发任何复位/停服指令**；同时核对`baseband_faults.rs`及`QCM410_BAM_DMUX_MODEM_CRASH.md`发现直接remoteproc stop有整机重启风险，而QMI复位入口已缺失，因此没有绕过保护去写sysfs。02:04 UTC最后可达只读快照仍无QMI、无modem、主服务停止；设备恢复连接后先核实是否用户已自行重启。手机成功是否为关闭Wi-Fi的蜂窝IMS且同驻网仍待确认。
+- 项目侧已编写显式`inspect-retired / retire-absent`维护候选：仅原owner已不存在、旧自有ID在当前MM+AT均缺失、reporting已复原、旧网络/namespace无残留及完整双快照一致时，凭token归档原元数据。绝不删除modem profile或把同号不同定义当缺失，不自动接进重试。**尚待CI/实机验证；设备QMI未恢复时连absence证明都不能做。**
+- 证据`.local/evidence/new-sim-ims/`：`findings.json`、`initial-readonly.json`、`qmi-topology.json`、`kernel-timeline.log`、`mm-attempt-summary.log`、`mm-request-metadata.log`、`mm-ip-metadata.log`。一次宽时间范围MM日志超过输出上限而中断，之后用有界筛选重读完成；未因日志读取失败重放设备操作。
+
 ## 最新只读验收：自然续期已成功6次（2026-10-01 00:43 UTC）
 
 用户明确表示注销问题可跳过，**不再为注销返回500打断健康注册或继续主动测试**；这不是把旧rejected结果改成成功。

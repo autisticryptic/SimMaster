@@ -109,6 +109,7 @@ jobs:
             hardware::devices::qcm410::primary_ims_lifecycle::tests \
             hardware::devices::qcm410::primary_ims_lifecycle::profile_lease::tests \
             hardware::devices::qcm410::primary_ims_lifecycle::profile_lease::runtime::tests \
+            hardware::devices::qcm410::primary_ims_lifecycle::profile_lease::runtime::retirement::tests \
             hardware::devices::qcm410::primary_ims_settings::tests \
             hardware::devices::qcm410::primary_ims_pcscf::tests \
             hardware::devices::qcm410::primary_ims_lifecycle::recovery::tests \

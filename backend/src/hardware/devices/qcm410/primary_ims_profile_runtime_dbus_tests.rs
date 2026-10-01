@@ -248,6 +248,48 @@ async fn runtime_profile_private_bus_attempts_keep_owner_sim_but_reset_interface
 }
 
 #[tokio::test]
+async fn runtime_profile_private_bus_retirement_requires_unique_owner_absence_not_just_replacement()
+{
+    let (original_server, _profiles, io) = server().await;
+    let store = MemoryStore::default();
+    let before = io.snapshot().await.unwrap();
+    let plan = fingerprint(&("ims", 1_u32, &before)).unwrap();
+    let mut receipt = acquire_with(&io, &store, "ims", 1, &plan).await.unwrap();
+    original_server.release_name(SERVICE).await.unwrap();
+    let replacement = zbus::connection::Builder::system()
+        .unwrap()
+        .name(SERVICE)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let bus = MmBus::new(PRIMARY, &format!("{MODEM_PREFIX}0"), "wwan0")
+        .await
+        .unwrap();
+    let fresh = MmProfileIo {
+        bus,
+        method: CreationMethod::At,
+        topology,
+    };
+    assert_eq!(
+        super::retirement::old_owner_absent(&fresh, &receipt)
+            .await
+            .unwrap_err(),
+        "mm_ims_profile_retirement_old_owner_still_present"
+    );
+    // The original unique name remains alive despite losing the service name.
+    assert_ne!(original_server.unique_name(), replacement.unique_name());
+    receipt.before.owner = ":1.999999999".into();
+    super::retirement::old_owner_absent(&fresh, &receipt)
+        .await
+        .unwrap();
+    replacement.release_name(SERVICE).await.unwrap();
+    assert!(super::retirement::old_owner_absent(&fresh, &receipt)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn runtime_profile_private_bus_exact_family_reporting_and_cleanup() {
     let (_server, profiles, io) = server().await;
     for family in [4_u32, 2, 1] {

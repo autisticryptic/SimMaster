@@ -407,9 +407,9 @@ enum CliCommand {
         #[arg(long)]
         require_mm: bool,
     },
-    /// Explicit temporary IMS profile maintenance. Does not start a bearer or server.
+    /// Explicit IMS profile maintenance. Only probe activates a bearer; no server starts.
     MmImsProfileLease {
-        #[arg(long, default_value = "inspect", value_parser = ["inspect", "acquire", "acquire-at", "probe", "release"])]
+        #[arg(long, default_value = "inspect", value_parser = ["inspect", "acquire", "acquire-at", "probe", "release", "inspect-retired", "retire-absent"])]
         action: String,
         #[arg(long)]
         modem: String,
@@ -419,7 +419,7 @@ enum CliCommand {
         family: String,
         #[arg(long)]
         apn: String,
-        /// Token from a matching inspect result, mandatory for acquire.
+        /// Token from matching inspection, mandatory for acquire, probe or retirement.
         #[arg(long)]
         expected_plan: Option<String>,
     },
