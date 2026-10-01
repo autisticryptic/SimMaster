@@ -1,6 +1,6 @@
 # MM IMS Exact-Family Profile Lease Design
 
-> 状态：2026-09-30 19:14 UTC，生产候选48e269c已部署并在正式主服务完成当前51502 eSIM/50212漫游网IMS IPsec注册；多次采样保持同一注册和持续收发。自有exact-family IPv4 profile/v2账本在用，不能删除。两套CI/双架构完整核验通过；2026-10-01只读确认已自然续期6次，含一次挑战认证/安全关联更新。通话中续期、长通话及数据共存仍未验收；运营商注销500已按用户要求跳过。早期83354b6维护探针、6a77d92 profile闭环及QMI Set拒绝事实保留，最新状态以HANDOFF首节为准。
+> 当前：2026-10-01 10:21 UTC，6c6fcfd已部署，新卡20408/50212在正式服务注册IPv6/IPsec并完成一次自然续期，PID4973/MM472。当前线路明确IPv6-only规避已观察到的IPv4固件fatal；同一注册保持、维护保护全移除。自有CID3/v2账本在用，不能删除。旧卡51502的48e269c六次续期为历史独立验收。通话中续期、长通话、数据共存仍未验收，最新现场以HANDOFF首节为准。
 > 目标：解决 ModemManager 中有效 `profile-id` 优先于请求 `ip-type` 的约束，同时保持单一 MM owner、UE namespace 隔离和可核验恢复。
 
 ## 显式维护入口（代码/CI及 profile 生命周期已实机验证）
@@ -30,7 +30,7 @@
 
 ## 新卡IPv6承载的多上下文P-CSCF证明（已通过CI及实机）
 
-20408/50212实测：自有IPv6 profile与MM源地址共享/64但IID不同，CGPADDR与目标CGCONTRDP完整地址一致；另有默认INTERNET上下文活动，IPv6前缀不同。原sole-active保护因此拒绝了IMS自己的PCO。547c157补强后已进入SIP，0ae80ae显式required对照IPsec注册及注销confirmed；6c6fcfd集成完整首声明并部署正式服务，于2026-10-01 09:27 UTC注册IPv6/IPsec，当前线路配置IPv6-only规避固件IPv4崩溃。自然续期仍待验收，见HANDOFF首节。
+20408/50212实测：自有IPv6 profile与MM源地址共享/64但IID不同，CGPADDR与目标CGCONTRDP完整地址一致；另有默认INTERNET上下文活动，IPv6前缀不同。原sole-active保护因此拒绝了IMS自己的PCO。547c157补强后已进入SIP，0ae80ae显式required对照IPsec注册及注销confirmed；6c6fcfd集成完整首声明并部署正式服务，于2026-10-01 09:27 UTC注册IPv6/IPsec，当前线路配置IPv6-only规避固件IPv4崩溃。10:17 UTC正式服务完成一次自然续期，同注册和MM owner保持，见HANDOFF首节。
 
 新增分支仅在已验证自有IPv6-only profile（不是普通APN复用）的 retained MM bearer 上启用：
 

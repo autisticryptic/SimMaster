@@ -3,7 +3,7 @@
 > 更新：2026-10-01。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 新卡已部署并注册：6c6fcfd / IPv6 IPsec（2026-10-01，续期待验）
+## 新卡已部署、注册及自然续期通过：6c6fcfd / IPv6 IPsec（2026-10-01 10:21 UTC）
 
 **当前正式服务为1.1.5 / `6c6fcfd55c1982b52d8816b55dc7a8237dd66eca`，PID4973；新卡20408、驻50212，于09:27:07 UTC实际注册IPv6/IPsec。** 不是只运行维护探针。当前管理`192.168.100.13/wlan0`、MM PID472，保留`--debug --test-quick-suspend-resume`，部署没有再重启MM/基带。
 
@@ -11,8 +11,10 @@
 - 唯一有意的配置改动：该线路`cellular_ims_ip_families=[ipv6]`、`cellular_ims_ip_families_auto=false`（之前为全族自动）。用于规避本卡已实证的IPv4连接触发固件fatal，不代表固件根因已修。**这是线路级设置，换回其他卡时也会保留，需要重新评估，不能说是自动随SIM切换的策略。** 全局默认/普通数据/其他配置字段和表不改，配置更新在停止状态下事务校验，复制程序时config.yaml/data.db摘要保持。
 - 正式服务首候选`standard_3gpp_conservative`现在完整声明sec-agree，实际下发Security-Server、AKA/IPsec后注册成功；自有IPv6 profile与默认INTERNET上下文经严格分离证明关联PCO。已连续六次采样同registered_at、last_error=null、reconnect_count1、NRestarts0，未触发重试或再次复位。
 - **本次维护保护已全部撤销**：main drop-in部署前移除，其余三条和hold marker09:29移除。recovery timer active；发现历史skipped导致oneshot仍inactive后，09:43按原状态恢复recovery service，返回healthy / active-exited / MainPID0，不重启MM或DATA6。secondary保持原inactive；所有临时证据目录保留。
-- **仍待确认自然续期**：当前lease3600秒，程序安排3000秒后自然REGISTER（约10:17 UTC）。这张卡OPTIONS保活未回应、last_rx尚停在初次注册后，因此不能把页面registered当持续收发验证；继续只读等待真正续期。无活动通话，当前boot内核fatal为0。
-- 证据`.local/evidence/new-sim-ims/deploy/`：`6c6fcfd.json`、`6c6fcfd-startup.json`、`6c6fcfd-stability.json`、`6c6fcfd-stability-facts.json`、`6c6fcfd-maintenance-restored.json`、`6c6fcfd-recovery-service-restored.json`；CI证明`.local/evidence/ims-route-completion/6c6fcfd/verified.json`。正式运行SHA256 `0869403532edffcc87a8896b2c0ba4148a4bf5b6ead39063d488e77f2a5db489`、前端MD5 `01505b0195870511cc8428e1d730b53c`均匹配制品。
+- **自然续期已实机通过**：10:17:08 UTC实际REGISTER refresh成功，API计数1与成功日志一致；09:27:07首次registered_at未变、reconnect_count仍1、NRestarts0，10:21:22仍registered/IPsec/last_error=null，已同会话持续约54分钟。每次lease3600秒、3000秒后续期，protected=true；没有POST retry或重连冒充续期。
+- 这张卡OPTIONS保活未回应的事实仍保留，但**实际REGISTER续期已重新收到成功响应**，不能把OPTIONS超时直接当会话断开；也不能因此声称通话/音频均已验收。当前活动通话0、HTTP200、整个新boot无基带fatal；IPv4固件错误仍只是通过IPv6线路设置避开，未根治。
+- 本地246 Python及文档/格式检查通过。最终ARM64 artifact11151577416，包SHA256 `8d5aad1c70b4e946e5fecd3d0e4e4f071edb15864d2de7ad49720c38fb52ed3c`；AMD64 artifact11151657090，包SHA256 `6f8f33d9b41178666df877ba21befcad957d5faf60c74db964eac698ed391c13`。活跃v2 profile是正常资源：CID3/IPv6/ims，runtime Active、PID4973、Bearer11/Modem5/wwan0/本线路namespace；不要作为孤儿删除。
+- 证据`.local/evidence/new-sim-ims/deploy/`：`6c6fcfd.json`、`6c6fcfd-startup.json`、`6c6fcfd-stability.json`、`6c6fcfd-stability-facts.json`、`6c6fcfd-maintenance-restored.json`、`6c6fcfd-recovery-service-restored.json`、`6c6fcfd-natural-refresh.{json,log}`、`6c6fcfd-closeout{,-facts,-resources}.json`、`6c6fcfd-verified.json`；CI证明`.local/evidence/ims-route-completion/6c6fcfd/verified.json`。正式运行SHA256 `0869403532edffcc87a8896b2c0ba4148a4bf5b6ead39063d488e77f2a5db489`、前端MD5 `01505b0195870511cc8428e1d730b53c`均匹配制品。
 
 ## 新卡逐步诊断：控制口恢复、旧租约结案和IPv6归属（以下为历史）
 
