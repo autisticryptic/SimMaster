@@ -3,7 +3,20 @@
 > 更新：2026-10-01。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 当前维护：默认兜底已部署，正式注册未过；后继P-CSCF修复待验证
+## 当前正式部署：448c98a / 默认双栈策略下IMS注册成功（2026-10-01 16:20 UTC）
+
+**410正式运行1.1.5 / `448c98acddaf0f805e9162a6c51ebb5177509b07`，PID93382，16:15:58 UTC实际注册IPsec成功。** 连续五次采样及16:20:25收尾均为同一registered_at、last_error=null、reconnect_count1、NRestarts0，活动通话0。不是维护探针成功。
+
+- **多卡生产策略已恢复并固定为双栈→IPv6→IPv4**：四个新旧线路地址族字段在设备DB中均已消失；API和配置不再允许指定单族。活跃自有profile的`requested_family=4 / owned.family=4`（即MM IPv4v6，**不是IPv4**），实际网络授予IPv6。看到运行状态`bearer_ip_type=ipv6`不代表IPv6-only配置或跳过双栈。
+- 新归属证明实机通过`mm_owned_at_disjoint_context_ipv6_prefix`：自有双栈profile、实际IPv6-only grant取得目标自己的2个P-CSCF，首候选完成注册。没有改回单族、没有为注册增加无限承载循环。
+- Validate36888761168 / Build36888761291全部success；实际两套下载日志129累计新增+14兼容回归均ok；双架构制品digest/ELF/meta核验，Publish skipped。本地首轮324定向Rust、后继56定向Rust、最终254Python，21前端单测、TS及定向lint/构建通过。前端全量lint本地超时未伪称通过，Actions前端门禁通过。
+- 主服务停机复制窗口config.yaml/data.db摘要保持，旧字段由程序迁移而非替换DB；最终其余线路字段指纹一致。MM始终PID472，原boot未变、QMI在位；整个本次维护窗口内核fatal查询无记录。未重启MM/基带、未清预算。
+- 两个新动作通过完整原库存双快照证明创建未发生后，仅归档旧creating元数据；没有删除modem profile。当前CID3自有`IPV4V6/ims`、runtime Active/PID93382/Bearer25是正常使用资源，不要删除。
+- 临时600秒设备端监护在注册验收后`accepted`退出；recovery timer恢复active，recovery service为原active-exited/MainPID0，secondary保持inactive。无遗留维护hold。
+- **风险边界**：本次默认双栈申请并成功注册，没有再发生fatal；未单独强制IPv4试拨，也不等于已证明`dhcp_client_mgr.c:263`固件根因修复或所有卡均验收。OPTIONS仍可超时，注册保持；本轮自然续期、通话/音频未验收。故障保护保留原分类及冷却，不以永久禁族代替恢复。
+- ARM64 artifact11175657566，包SHA256`912b96c8ffa1288b4791505d31569bd91d14eaf9ea7d7da5549c58dc4d9edac3`，运行SHA256`a9b25e65b846bfa4288e520a6f7208c3dac271c500148de30a4e9656b9e5e7de`；AMD64 artifact11175802348、包SHA256`91f69d92e48fd5765f703f7410943096d916be3f47f102f30fc3fb521d8babc5`。证据`.local/evidence/default-family-deploy/448c98a/{stage,inspect-uncreated,retire-uncreated,install,observe,finish,closeout}.json`及`.local/evidence/ims-route-completion/448c98a/verified.json`。
+
+## 首次默认策略试验失败及后继修复（以下为历史）
 
 `f5cd715` 已通过两套CI及双架构核验，部署到410后旧四个地址族字段已由新程序迁移。首次默认计划请求IPv4v6，MM实际授予IPv6，未出现新fatal，但P-CSCF失败、未注册。600秒试验监护按时限停止主服务；**主服务和recovery timer当前均停止，MM仍PID472、原boot；不能按下方旧“注册成功”状态交接。** 停止后承载/namespace/profile清理曾全部通过。
 
@@ -17,7 +30,7 @@
 
 本地324项定向Rust回归（含私有D-Bus和真实HTTP）、253项Python、21项前端单测、TypeScript检查及前端构建通过。新旧地址族入口移除测试与存储迁移测试已加入两套CI。完整前端lint一次达到本地执行时限，后续定向契约lint通过；不将超时记成全量lint通过。
 
-**以下 `6c6fcfd / IPv6-only` 记录是设备当前旧部署事实，不是新策略。** 默认策略版本的正式IMS注册验收失败，见首节；不能把旧IPv6成功当作新默认兜底通过。固件IPv4 fatal根因仍未证明修复；没有将其改为永久禁族或新增无限重试。详细行为与验收边界见 [蜂窝IMS地址族策略](IMS_ADDRESS_FAMILY_POLICY.md)。
+**以下 `6c6fcfd / IPv6-only` 记录现已过时，不是当前部署或新策略。** 默认策略版本的正式IMS注册验收失败，见首节；不能把旧IPv6成功当作新默认兜底通过。固件IPv4 fatal根因仍未证明修复；没有将其改为永久禁族或新增无限重试。详细行为与验收边界见 [蜂窝IMS地址族策略](IMS_ADDRESS_FAMILY_POLICY.md)。
 
 ## 新卡已部署、注册及自然续期通过：6c6fcfd / IPv6 IPsec（2026-10-01 10:21 UTC）
 
