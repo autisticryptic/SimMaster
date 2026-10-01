@@ -348,9 +348,8 @@ pub async fn establish_native_ims_bearer(
 ) -> Result<NativeImsBearer, CellularImsError> {
     let cid = ims_context_cid(request);
     let families = requested_families_for(plan);
-    // Walk the plan's attempts in order. Dual-stack is an ordinary entry, so a
-    // per-line list may place it after a single family or omit it entirely — the
-    // configured order is what runs, not "dual-stack first" hardcoded here.
+    // All production lines share the complete dual-stack -> IPv6 -> IPv4 plan.
+    // Only explicit maintenance diagnostics carry a single bounded attempt.
     let mut last_error = None;
     let mut forced_single: Option<u8> = None;
     // Single-family attempts already made with this same profile pin. A
@@ -409,13 +408,15 @@ pub async fn establish_native_ims_bearer(
                     // network needs, and it is what the validated IPv4 line
                     // registration depends on. Keep it, and only skip a request
                     // that would literally repeat an attempt already made.
-                    if forced_family_needs_another_attempt(&attempted_single, forced) {
+                    if plan.allows_forced_family_retry()
+                        && forced_family_needs_another_attempt(&attempted_single, forced)
+                    {
                         forced_single = Some(forced);
                     } else {
                         tracing::warn!(
                             family = forced,
                             profile_id = ?request.profile_id,
-                            "Network-forced family was already attempted with this profile; keeping its original error"
+                            "Network-forced retry is outside the diagnostic budget or repeats a prior attempt; keeping its original error"
                         );
                     }
                     break;
@@ -582,7 +583,6 @@ pub fn to_bearer_connection(info: &ImsBearerInfo) -> Result<BearerConnection, Ce
 mod tests {
     use super::*;
     use crate::hardware::devices::transport::TransportFuture;
-    use crate::platform::config::CellularImsIpFamilyPreference;
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -627,7 +627,7 @@ mod tests {
             "/dev/wwan0qmi0",
             "0",
             &BearerRequest::ims(false),
-            &ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First),
+            &ImsConnectionPlan::default(),
             Some(&expected),
         )
         .await
@@ -635,6 +635,123 @@ mod tests {
         .unwrap();
         assert_eq!(error.code(), code::BEARER_SESSION_LOST);
         assert_eq!(transport.0.load(Ordering::Acquire), 1);
+    }
+
+    struct ScriptedTransport {
+        attempts: std::sync::Mutex<Vec<Vec<u8>>>,
+        failures: std::sync::Mutex<std::collections::VecDeque<ImsBearerFailureHint>>,
+    }
+
+    impl ImsBearerTransport for ScriptedTransport {
+        fn endpoint_available(&self, _: &str) -> bool {
+            true
+        }
+        fn establish_ims_bearer<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a str,
+            _: Option<u32>,
+            _: u8,
+            families: &'a [u8],
+            _: bool,
+            _: Option<(&'a str, u8)>,
+        ) -> TransportFuture<
+            'a,
+            Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>,
+        > {
+            Box::pin(async move {
+                self.attempts.lock().unwrap().push(families.to_vec());
+                let hint = self
+                    .failures
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("unexpected extra bearer activation");
+                Err(ImsBearerError {
+                    kind: ImsBearerErrorKind::SessionStartFailed,
+                    hint,
+                    detail: "scripted refusal".into(),
+                })
+            })
+        }
+    }
+
+    async fn attempted_families(
+        plan: ImsConnectionPlan,
+        failures: &[ImsBearerFailureHint],
+    ) -> (Vec<Vec<u8>>, CellularImsError) {
+        let transport = ScriptedTransport {
+            attempts: std::sync::Mutex::new(Vec::new()),
+            failures: std::sync::Mutex::new(failures.iter().copied().collect()),
+        };
+        let error = establish_native_ims_bearer(
+            &transport,
+            "/dev/test-qmi",
+            "0",
+            &BearerRequest::ims(false),
+            &plan,
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+        let attempts = transport.attempts.into_inner().unwrap();
+        (attempts, error)
+    }
+
+    #[tokio::test]
+    async fn production_fallback_visits_all_families_after_ordinary_refusals() {
+        let (attempts, _) = attempted_families(
+            ImsConnectionPlan::default(),
+            &[ImsBearerFailureHint::None; 3],
+        )
+        .await;
+        assert_eq!(attempts, vec![vec![6, 4], vec![6], vec![4]]);
+    }
+
+    #[tokio::test]
+    async fn production_forced_family_remains_bounded_and_deduplicated() {
+        use ImsBearerFailureHint::{NetworkForcedIpv4, NetworkForcedIpv6, None};
+        let (attempts, _) =
+            attempted_families(ImsConnectionPlan::default(), &[NetworkForcedIpv4, None]).await;
+        assert_eq!(attempts, vec![vec![6, 4], vec![4]]);
+        let (attempts, _) = attempted_families(
+            ImsConnectionPlan::default(),
+            &[None, None, NetworkForcedIpv6],
+        )
+        .await;
+        assert_eq!(attempts, vec![vec![6, 4], vec![6], vec![4]]);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_network_rejection_never_dispatches_another_family() {
+        for family in [IpType::Ipv6, IpType::Ipv4v6] {
+            let (attempts, _) = attempted_families(
+                ImsConnectionPlan::for_profile_probe(family),
+                &[ImsBearerFailureHint::NetworkForcedIpv4],
+            )
+            .await;
+            assert_eq!(attempts.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn baseband_fault_stops_activation_without_changing_the_default_plan() {
+        let (attempts, error) = attempted_families(
+            ImsConnectionPlan::default(),
+            &[
+                ImsBearerFailureHint::None,
+                ImsBearerFailureHint::BasebandWedged,
+            ],
+        )
+        .await;
+        assert_eq!(attempts, vec![vec![6, 4], vec![6]]);
+        assert_eq!(error.code(), code::RUNTIME_IMS_BASEBAND_WEDGED);
+        assert_eq!(
+            ImsConnectionPlan::default().bearer_attempts(),
+            &[IpType::Ipv4v6, IpType::Ipv6, IpType::Ipv4]
+        );
     }
 
     struct PcscfHandle {
@@ -899,13 +1016,11 @@ mod tests {
 
     #[test]
     fn families_follow_the_plan_order() {
-        let v4 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First);
-        assert_eq!(requested_families_for(&v4), vec![4, 6]);
-        let v6 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First);
+        let v6 = ImsConnectionPlan::default();
         assert_eq!(requested_families_for(&v6), vec![6, 4]);
-        let only4 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4Only);
+        let only4 = ImsConnectionPlan::for_profile_probe(IpType::Ipv4);
         assert_eq!(requested_families_for(&only4), vec![4]);
-        let only6 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6Only);
+        let only6 = ImsConnectionPlan::for_profile_probe(IpType::Ipv6);
         assert_eq!(requested_families_for(&only6), vec![6]);
         assert_eq!(
             forced_native_family(ImsBearerFailureHint::NetworkForcedIpv4),

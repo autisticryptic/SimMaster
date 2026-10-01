@@ -359,6 +359,27 @@ impl LineRuntime {
         self.bearer_operation_lock.try_lock().is_err()
     }
 
+    /// Record a physical-line fault even if the failing operation has just lost
+    /// admission due to modem disappearance. This does not publish registration
+    /// state or authorize any stale-generation modem operation.
+    pub fn observe_cellular_ims_failure(
+        &self,
+        error: &crate::connectivity::modems::ims::cellular_ims::CellularImsError,
+    ) -> Option<(bool, Option<Duration>)> {
+        use crate::connectivity::modems::ims::cellular_ims::{errors::code, plan::FailureClass};
+        if !FailureClass::from_error(error).is_unsafe_to_retry() {
+            return None;
+        }
+        let permanent = error.code() == code::BEARER_NETDEV_RUNTIME_ERROR;
+        let cooldown = if permanent {
+            self.note_baseband_wedged_permanent();
+            None
+        } else {
+            Some(self.note_baseband_wedged())
+        };
+        Some((permanent, cooldown))
+    }
+
     /// Record that an IMS activation on this line wedged the baseband, opening
     /// (or widening) the window during which it must not be retried.
     pub fn note_baseband_wedged(&self) -> Duration {
@@ -1871,6 +1892,50 @@ mod tests {
             line.baseband_wedge_remaining().is_some(),
             "re-enumeration must not clear the suppression window"
         );
+    }
+
+    #[test]
+    fn a_wedge_report_arriving_after_disappearance_still_blocks_the_line() {
+        use crate::connectivity::modems::ims::cellular_ims::{errors::code, CellularImsError};
+        let line = wedge_line("line-a");
+        let other = wedge_line("line-b");
+        line.mark_absent();
+        let error = CellularImsError::with_detail(
+            code::RUNTIME_IMS_BASEBAND_WEDGED,
+            "endpoint hangup:profile_cleanup_pending",
+        );
+        assert!(line.observe_cellular_ims_failure(&error).is_some());
+        assert!(line.baseband_wedge_remaining().is_some());
+        assert!(other.baseband_wedge_remaining().is_none());
+        assert!(
+            !line.binding().present,
+            "fault observation must not republish a disappeared modem"
+        );
+    }
+
+    #[test]
+    fn ordinary_family_refusal_does_not_latch_a_baseband_fault() {
+        use crate::connectivity::modems::ims::cellular_ims::{errors::code, CellularImsError};
+        let line = wedge_line("line-a");
+        let error =
+            CellularImsError::with_detail(code::RUNTIME_MM_BEARER_CONNECT_FAILED, "ggsn-reject");
+        assert!(line.observe_cellular_ims_failure(&error).is_none());
+        assert!(line.baseband_wedge_remaining().is_none());
+    }
+
+    #[test]
+    fn a_latched_driver_fault_remains_permanent_after_disappearance() {
+        use crate::connectivity::modems::ims::cellular_ims::{errors::code, CellularImsError};
+        let line = wedge_line("line-a");
+        line.mark_absent();
+        assert_eq!(
+            line.observe_cellular_ims_failure(&CellularImsError::new(
+                code::BEARER_NETDEV_RUNTIME_ERROR
+            )),
+            Some((true, None))
+        );
+        line.clear_baseband_wedge();
+        assert!(line.baseband_wedge_permanent());
     }
 
     #[test]

@@ -176,6 +176,32 @@ fn failure(detail: impl Into<String>) -> ImsBearerError {
     }
 }
 
+// Cleanup uncertainty must stop ordinary family fallback, but must not erase
+// a fatal bearer classification. This only combines errors; the cleanup path
+// remains responsible for retaining uncertain ownership receipts.
+fn bearer_failure_after_cleanup(
+    mut original: ImsBearerError,
+    cleanup: Result<(), String>,
+    current: impl FnOnce() -> Result<(), String>,
+) -> ImsBearerError {
+    let detail = match cleanup {
+        Err(cleanup) => format!("{}:profile_cleanup_pending:{cleanup}", original.detail),
+        Ok(()) => match current() {
+            Ok(()) => return original,
+            Err(error) if original.hint == ImsBearerFailureHint::BasebandWedged => {
+                format!("{}:{error}", original.detail)
+            }
+            Err(error) => error,
+        },
+    };
+    if original.hint == ImsBearerFailureHint::BasebandWedged {
+        original.detail = detail;
+        original
+    } else {
+        failure(detail)
+    }
+}
+
 fn check_current(current: &Current) -> Result<(), String> {
     if !current() || is_shutting_down() {
         return Err("mm_ims_profile_runtime_generation_changed".into());
@@ -875,14 +901,10 @@ async fn attempt(
         Err(original) => {
             // Recover only abandoned/dead leases, never global shutdown. A late
             // setup is still counted by PENDING and cannot authorize deletion.
-            if let Err(cleanup) = finish_after_bearer(&context, true).await {
-                return Err(failure(format!(
-                    "{}:profile_cleanup_pending:{cleanup}",
-                    original.detail
-                )));
-            }
-            check_current(&current).map_err(failure)?;
-            Err(original) // preserve forced-family hints and the existing loop order
+            let cleanup = finish_after_bearer(&context, true).await;
+            Err(bearer_failure_after_cleanup(original, cleanup, || {
+                check_current(&current)
+            }))
         }
         Ok((info, inner)) => {
             let bearer = match info.path_handle.strip_prefix("mm:") {

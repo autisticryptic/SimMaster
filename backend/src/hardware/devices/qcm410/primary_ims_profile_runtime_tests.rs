@@ -121,6 +121,104 @@ fn runtime_profile_canonical_modem_and_family_contract() {
     }
 }
 
+#[test]
+fn runtime_profile_fatal_bearer_error_survives_cleanup_failure() {
+    let original = ImsBearerError {
+        kind: ImsBearerErrorKind::NetdevUnresolved,
+        hint: ImsBearerFailureHint::BasebandWedged,
+        detail: "baseband-wedged".into(),
+    };
+    let error = bearer_failure_after_cleanup(
+        original.clone(),
+        Err("cleanup-unverified".into()),
+        || panic!("current must not be checked after cleanup fails"),
+    );
+    assert_eq!(error.kind, original.kind);
+    assert_eq!(error.hint, ImsBearerFailureHint::BasebandWedged);
+    assert_eq!(
+        error.detail,
+        "baseband-wedged:profile_cleanup_pending:cleanup-unverified"
+    );
+}
+
+#[test]
+fn runtime_profile_fatal_bearer_error_survives_current_change_after_cleanup() {
+    let original = ImsBearerError {
+        kind: ImsBearerErrorKind::NetdevUnresolved,
+        hint: ImsBearerFailureHint::BasebandWedged,
+        detail: "baseband-wedged".into(),
+    };
+    let error = bearer_failure_after_cleanup(original.clone(), Ok(()), || {
+        Err("mm_ims_profile_runtime_generation_changed".into())
+    });
+    assert_eq!(error.kind, original.kind);
+    assert_eq!(error.hint, ImsBearerFailureHint::BasebandWedged);
+    assert_eq!(
+        error.detail,
+        "baseband-wedged:mm_ims_profile_runtime_generation_changed"
+    );
+}
+
+#[test]
+fn runtime_profile_ordinary_bearer_error_blocks_fallback_on_cleanup_failure() {
+    for hint in [
+        ImsBearerFailureHint::None,
+        ImsBearerFailureHint::NetworkForcedIpv4,
+        ImsBearerFailureHint::NetworkForcedIpv6,
+        ImsBearerFailureHint::BindingChanged,
+    ] {
+        let original = ImsBearerError {
+            kind: ImsBearerErrorKind::NetdevUnresolved,
+            hint,
+            detail: "ordinary-failure".into(),
+        };
+        let error = bearer_failure_after_cleanup(
+            original,
+            Err("cleanup-unverified".into()),
+            || panic!("current must not be checked after cleanup fails"),
+        );
+        assert_eq!(error.kind, ImsBearerErrorKind::SessionStartFailed);
+        assert_eq!(error.hint, ImsBearerFailureHint::BindingChanged);
+        assert_eq!(
+            error.detail,
+            "ordinary-failure:profile_cleanup_pending:cleanup-unverified"
+        );
+    }
+}
+
+#[test]
+fn runtime_profile_successful_cleanup_preserves_original_bearer_hints() {
+    for hint in [
+        ImsBearerFailureHint::None,
+        ImsBearerFailureHint::NetworkForcedIpv4,
+        ImsBearerFailureHint::NetworkForcedIpv6,
+        ImsBearerFailureHint::BasebandWedged,
+    ] {
+        let original = ImsBearerError {
+            kind: ImsBearerErrorKind::SessionStartFailed,
+            hint,
+            detail: "original-failure".into(),
+        };
+        assert_eq!(
+            bearer_failure_after_cleanup(original.clone(), Ok(()), || Ok(())),
+            original
+        );
+    }
+}
+
+#[test]
+fn runtime_profile_ordinary_bearer_error_blocks_fallback_on_current_change() {
+    let original = ImsBearerError {
+        kind: ImsBearerErrorKind::SessionStartFailed,
+        hint: ImsBearerFailureHint::NetworkForcedIpv6,
+        detail: "forced-ipv6".into(),
+    };
+    let error = bearer_failure_after_cleanup(original, Ok(()), || {
+        Err("mm_ims_profile_runtime_generation_changed".into())
+    });
+    assert_eq!(error, failure("mm_ims_profile_runtime_generation_changed"));
+}
+
 #[derive(Default)]
 struct MemoryStore(Mutex<Option<Receipt>>);
 impl Store for MemoryStore {

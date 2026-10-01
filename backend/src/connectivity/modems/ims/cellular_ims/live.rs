@@ -53,7 +53,7 @@ use crate::{
         cellular::bindings::ModemBinding,
         devices::transport::{ImsBearerTransport, ImsPcscfDiscovery},
     },
-    platform::config::{CellularImsIpFamily, ImsProfileCandidate, TrunkIpConnectMode},
+    platform::config::{ImsProfileCandidate, TrunkIpConnectMode},
     platform::db::{Database, SmsMessage},
     services::trunk::{
         bridge::{
@@ -1881,8 +1881,6 @@ pub async fn connect_live_for_line(
     runtime: &Arc<CellularImsRuntime>,
     access_network_runtime: &ImsAccessNetworkRuntime,
     profile_candidate: &ImsProfileCandidate,
-    line_ip_families: &[CellularImsIpFamily],
-    line_ip_families_auto: bool,
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
     dedupe_enabled: bool,
@@ -1944,7 +1942,9 @@ pub async fn connect_live_for_line(
         })
         .await;
 
-    let plan = ImsConnectionPlan::from_families(line_ip_families);
+    // Production always retains the complete multi-SIM fallback policy. No
+    // per-line, per-SIM or catalog field may narrow this attempt plan.
+    let plan = ImsConnectionPlan::default();
 
     match connect_inner(
         live,
@@ -1954,7 +1954,6 @@ pub async fn connect_live_for_line(
         device,
         ims_bearer_transport,
         plan,
-        line_ip_families_auto,
         allow_roaming,
         data_slot_mode,
         &profile_store,
@@ -2066,9 +2065,9 @@ pub(crate) async fn probe_owned_profile_once(
         .map_err(str::to_string)?;
     let _advance = scoped.advance_guard().await;
     let family = match probe.family() {
-        1 => CellularImsIpFamily::Ipv4,
-        2 => CellularImsIpFamily::Ipv6,
-        4 => CellularImsIpFamily::Ipv4v6,
+        1 => super::plan::IpType::Ipv4,
+        2 => super::plan::IpType::Ipv6,
+        4 => super::plan::IpType::Ipv4v6,
         _ => return Err("mm_ims_profile_probe_family_invalid".into()),
     };
     let database = Arc::new(
@@ -2110,7 +2109,7 @@ pub(crate) async fn probe_owned_profile_once(
         register_line_worker(&device.line_id,Some(worker.clone()));
         let connected = tokio::time::timeout(Duration::from_secs(240),connect_inner(
             &live,&scoped,&access_network,generation,&device,Some(probe),
-            ImsConnectionPlan::from_families(&[family]),false,true,DataSlotMode::UeNativeIms,
+            ImsConnectionPlan::for_profile_probe(family),true,DataSlotMode::UeNativeIms,
             &profile_store,&ImsProfileCandidate::automatic(ImsProfileSource::Derived),&SimOverride::default(),Some(probe),
         )).await;
         match connected {
@@ -2265,7 +2264,6 @@ async fn connect_inner(
     device: &CellularImsDeviceBinding,
     ims_bearer_transport: Option<&dyn ImsBearerTransport>,
     plan: ImsConnectionPlan,
-    _line_ip_families_auto: bool,
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
     profile_store: &ProfileStore,
@@ -2278,10 +2276,9 @@ async fn connect_inner(
     if !runtime.task_is_current() {
         return Err(CellularImsError::new(code::RUNTIME_NOT_RUNNING));
     }
-    // The canonical connection plan is built by the caller from this line's
-    // explicit ordered families. All family-selection consumers (AT probe
-    // order, bearer fallback, IPv6 preflight hint, SIP local-address order)
-    // derive from this one object.
+    // The canonical production plan is always dual-stack -> IPv6 -> IPv4.
+    // Only the explicitly isolated maintenance probe receives a bounded plan.
+    // AT probes, bearer fallback and SIP local-address order share this object.
     runtime
         .update(|state| state.stage = CellularImsStage::Radio)
         .await;
@@ -2328,9 +2325,8 @@ async fn connect_inner(
         device_identity.profile = Box::leak(Box::new(profile));
         device_identity.diagnostic_required_security = true;
     }
-    // The line's ordered family list is authoritative. Catalog `ip_stack` is
-    // profile metadata and must not reorder the default dual -> IPv6 -> IPv4
-    // fallback sequence; only an explicit line setting changes that order.
+    // Catalog `ip_stack` remains metadata, not permission to narrow or reorder
+    // the production dual-stack -> IPv6 -> IPv4 fallback sequence.
     let ims_apn = device_identity
         .effective_ims
         .ims_apn

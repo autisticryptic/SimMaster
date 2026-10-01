@@ -20,10 +20,7 @@ use std::{
 
 use tokio::time::sleep;
 
-use crate::{
-    platform::config::CellularImsIpFamilyPreference,
-    services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle},
-};
+use crate::services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle};
 
 use super::errors::{code, CellularImsError};
 use super::pcscf_dns::{build_dns_query, parse_dns_response, DnsRecords};
@@ -1235,37 +1232,22 @@ IPv4 primary DNS: 10.0.0.53";
     }
 
     #[test]
-    fn address_order_honors_preference_and_strict_modes() {
-        use crate::connectivity::modems::ims::cellular_ims::plan::ImsConnectionPlan;
+    fn address_order_uses_default_or_explicit_diagnostic_plan() {
+        use crate::connectivity::modems::ims::cellular_ims::plan::{ImsConnectionPlan, IpType};
         let s = parse_ip_settings(SAMPLE);
         assert_eq!(
-            s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
-                CellularImsIpFamilyPreference::Ipv6First
-            )),
+            s.ordered_local_addrs(&ImsConnectionPlan::default()),
             vec![
                 IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
                 IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             ]
         );
         assert_eq!(
-            s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
-                CellularImsIpFamilyPreference::Ipv4First
-            )),
-            vec![
-                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-                IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
-            ]
-        );
-        assert_eq!(
-            s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
-                CellularImsIpFamilyPreference::Ipv6Only
-            )),
+            s.ordered_local_addrs(&ImsConnectionPlan::for_profile_probe(IpType::Ipv6)),
             vec![IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap())]
         );
         assert_eq!(
-            s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
-                CellularImsIpFamilyPreference::Ipv4Only
-            )),
+            s.ordered_local_addrs(&ImsConnectionPlan::for_profile_probe(IpType::Ipv4)),
             vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]
         );
     }
@@ -1393,24 +1375,18 @@ IPv4 primary DNS: 10.0.0.53";
     }
 
     #[test]
-    fn at_probe_family_order_matches_runtime_preference() {
-        use crate::connectivity::modems::ims::cellular_ims::plan::ImsConnectionPlan;
+    fn at_probe_family_order_matches_runtime_default() {
+        use crate::connectivity::modems::ims::cellular_ims::plan::{ImsConnectionPlan, IpType};
         assert_eq!(
-            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First)
-                .pdp_types(),
+            ImsConnectionPlan::default().pdp_types(),
             vec!["IPV4V6", "IPV6", "IP"]
         );
         assert_eq!(
-            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First)
-                .pdp_types(),
-            vec!["IPV4V6", "IP", "IPV6"]
-        );
-        assert_eq!(
-            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6Only).pdp_types(),
+            ImsConnectionPlan::for_profile_probe(IpType::Ipv6).pdp_types(),
             vec!["IPV6"]
         );
         assert_eq!(
-            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4Only).pdp_types(),
+            ImsConnectionPlan::for_profile_probe(IpType::Ipv4).pdp_types(),
             vec!["IP"]
         );
     }

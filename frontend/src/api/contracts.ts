@@ -672,13 +672,6 @@ export interface TrunkProfileResponse {
   runtime: TrunkRuntimeStatus
 }
 
-/** A single IMS bearer address family. */
-/**
- * One IMS bearer attempt: dual-stack (`ipv4v6`) or a single family. Dual-stack is
- * an ordinary orderable entry, so a line may try single families before it.
- */
-export type CellularImsIpFamily = 'ipv4v6' | 'ipv4' | 'ipv6'
-
 export interface AutoRestoreConfig {
   initial_delay_secs: number
   attempts: number
@@ -698,13 +691,6 @@ export interface LineProfileConfig {
   data_proxy: LineDataProxyConfig
   roaming_allowed: boolean
   airplane_mode_enabled: boolean
-  /**
-   * Ordered IMS address-family attempt list. Order is the attempt/fallback order; a one-element list means
-   * "only that family".
-   */
-  cellular_ims_ip_families: CellularImsIpFamily[]
-  /** Whether the carrier catalog may choose the preferred fallback order. */
-  cellular_ims_ip_families_auto: boolean
   /**
    * Per-line eSIM management override. `null`/undefined = auto (managed only
    * when the SIM reports a eUICC chip), `true` = force eSIM controls on,

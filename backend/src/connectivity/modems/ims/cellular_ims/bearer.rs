@@ -1757,9 +1757,7 @@ mod tests {
         use crate::connectivity::modems::ims::cellular_ims::plan::{
             FailureClass, ImsConnectionPlan,
         };
-        use crate::platform::config::CellularImsIpFamilyPreference;
-        let plan_v6 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First);
-        let plan_v4 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First);
+        let plan_v6 = ImsConnectionPlan::default();
         let ipv6 = "bearer.status.connection-error.name : org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv6OnlyAllowed\n";
         assert_eq!(
             FailureClass::from_details(ipv6),
@@ -1772,20 +1770,16 @@ mod tests {
         );
         let generic = "bearer.status.connection-error.name : org.example.Failed\n";
         assert_eq!(FailureClass::from_details(generic), FailureClass::Other);
-        // Forced families collapse to a single type regardless of preference.
+        // Explicit network negotiation takes precedence over the default order.
         assert_eq!(
-            plan_v4.bearer_fallbacks_after(FailureClass::from_details(ipv6)),
+            plan_v6.bearer_fallbacks_after(FailureClass::from_details(ipv6)),
             vec![super::IpType::Ipv6]
         );
         assert_eq!(
             plan_v6.bearer_fallbacks_after(FailureClass::from_details(ipv4)),
             vec![super::IpType::Ipv4]
         );
-        // Generic failure respects preference order.
-        assert_eq!(
-            plan_v4.bearer_fallbacks_after(FailureClass::from_details(generic)),
-            vec![super::IpType::Ipv4, super::IpType::Ipv6]
-        );
+        // Generic failure preserves the complete default fallback order.
         assert_eq!(
             plan_v6.bearer_fallbacks_after(FailureClass::from_details(generic)),
             vec![super::IpType::Ipv6, super::IpType::Ipv4]
@@ -1794,8 +1788,6 @@ mod tests {
 
     #[test]
     fn create_command_family_rejection_is_not_replaced_by_default_fallback() {
-        use crate::platform::config::CellularImsIpFamilyPreference;
-
         let ipv6 = BearerAttemptFailure {
             error: CellularImsError::with_detail(
                 code::RUNTIME_MM_BEARER_CONNECT_FAILED,
@@ -1812,13 +1804,11 @@ mod tests {
         };
 
         assert_eq!(
-            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First)
-                .bearer_fallbacks_after(classify_attempt_failure(&ipv6)),
+            ImsConnectionPlan::default().bearer_fallbacks_after(classify_attempt_failure(&ipv6)),
             vec![IpType::Ipv6]
         );
         assert_eq!(
-            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First)
-                .bearer_fallbacks_after(classify_attempt_failure(&ipv4)),
+            ImsConnectionPlan::default().bearer_fallbacks_after(classify_attempt_failure(&ipv4)),
             vec![IpType::Ipv4]
         );
     }

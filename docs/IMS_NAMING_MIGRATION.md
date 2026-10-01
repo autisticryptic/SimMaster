@@ -18,13 +18,15 @@
 |---|---|---|
 | HTTP | `/api/cellular-ims/*` | 保留 `/api/volte/*` 旧别名，鉴权和响应契约不能分叉 |
 | 运行态与 profile 字段 | `cellular_ims`、`cellular_ims_profiles`、`cellular_ims_ready` | serde 兼容旧字段读取 |
-| 线路配置 | `cellular_ims_connection_enabled`、`cellular_ims_auto_restore`、`cellular_ims_profile_selection`、`cellular_ims_ip_families` 等 | 旧 `volte_*` 作为 alias，保存写新名；同时给新旧拼写仍拒绝歧义 |
+| 线路配置 | `cellular_ims_connection_enabled`、`cellular_ims_auto_restore`、`cellular_ims_profile_selection` 等 | 旧 `volte_*` 作为 alias，保存写新名；同时给新旧拼写仍拒绝歧义 |
 | SIM 覆写 | `ims_cellular` / `ims.cellular_ims` | 旧 `ims_volte` / `ims.volte` 兼容读取 |
 | 接入种类 / UT access | `cellular_ims` | 读取旧编码的兼容边界保留 |
 | 环境变量 | `SIMADMIN_CELLULAR_IMS_PCSCF`、`SIMADMIN_CELLULAR_IMS_CID` | `SIMADMIN_VOLTE_*` 仍作回退 |
 | 前端/Bruno | 使用规范路由、新 JSON 字段及错误码 | 与后端同包发布，不混搭新旧资源 |
 
 模块位于 `backend/src/connectivity/modems/ims/cellular_ims/`。保留兼容路由并不是迁移未完成。
+
+例外：线路地址族覆盖能力已移除，新旧 `/ip-families` 写入口均不保留。`cellular_ims_ip_families(_auto)` 与 `volte_ip_families(_auto)` 在加载时迁移删除，不再作为有效配置；所有线路使用完整默认兜底，见 [地址族策略](IMS_ADDRESS_FAMILY_POLICY.md)。
 
 ## 3. 错误码
 

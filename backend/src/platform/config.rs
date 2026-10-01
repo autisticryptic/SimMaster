@@ -2717,78 +2717,25 @@ mod tests {
     }
 
     #[test]
-    fn line_cellular_ims_ip_families_round_trip() {
-        let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
-        assert_eq!(
-            profile.cellular_ims_ip_families,
-            default_line_cellular_ims_ip_families()
-        );
-        assert!(profile.cellular_ims_ip_families_auto);
-        profile.cellular_ims_ip_families = vec![CellularImsIpFamily::Ipv6];
-        profile.cellular_ims_ip_families_auto = false;
-        let round_trip: LineProfileConfig =
-            serde_json::from_value(serde_json::to_value(profile).unwrap()).unwrap();
-        assert_eq!(
-            round_trip.cellular_ims_ip_families,
-            vec![CellularImsIpFamily::Ipv6]
-        );
-        assert!(!round_trip.cellular_ims_ip_families_auto);
-    }
-
-    #[test]
-    fn legacy_line_profile_defaults_ip_family_selection_to_automatic() {
-        let profile: LineProfileConfig = serde_json::from_value(serde_json::json!({
-            "line_id": "line-0123456789abcdef0123456789abcdef",
-            "volte_ip_families": ["ipv4v6", "ipv4", "ipv6"]
-        }))
-        .unwrap();
-        assert!(profile.cellular_ims_ip_families_auto);
-    }
-
-    #[test]
-    fn legacy_automatic_ip_family_order_migrates_to_ipv6_first() {
-        let mut config = AppConfig::default();
-        let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
-        profile.cellular_ims_ip_families = vec![
-            CellularImsIpFamily::Ipv4v6,
-            CellularImsIpFamily::Ipv4,
-            CellularImsIpFamily::Ipv6,
-        ];
-        profile.cellular_ims_ip_families_auto = true;
-        config.line_profiles.push(profile);
-
-        assert!(migrate_legacy_cellular_ims_ip_family_defaults(&mut config));
-        assert_eq!(
-            config.line_profiles[0].cellular_ims_ip_families,
-            vec![
-                CellularImsIpFamily::Ipv4v6,
-                CellularImsIpFamily::Ipv6,
-                CellularImsIpFamily::Ipv4,
-            ]
-        );
-    }
-
-    #[test]
-    fn explicit_legacy_ip_family_order_is_not_migrated() {
-        let mut config = AppConfig::default();
-        let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
-        profile.cellular_ims_ip_families = vec![
-            CellularImsIpFamily::Ipv4v6,
-            CellularImsIpFamily::Ipv4,
-            CellularImsIpFamily::Ipv6,
-        ];
-        profile.cellular_ims_ip_families_auto = false;
-        config.line_profiles.push(profile);
-
-        assert!(!migrate_legacy_cellular_ims_ip_family_defaults(&mut config));
-        assert_eq!(
-            config.line_profiles[0].cellular_ims_ip_families,
-            vec![
-                CellularImsIpFamily::Ipv4v6,
-                CellularImsIpFamily::Ipv4,
-                CellularImsIpFamily::Ipv6,
-            ]
-        );
+    fn retired_family_overrides_are_not_part_of_the_line_contract() {
+        let expected = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
+        for prefix in ["cellular_ims", "volte"] {
+            for families in [
+                serde_json::json!(["ipv6"]),
+                serde_json::json!(["ipv4"]),
+                serde_json::json!(["ipv4v6", "ipv4", "ipv6"]),
+            ] {
+                let mut document = serde_json::to_value(&expected).unwrap();
+                document[format!("{prefix}_ip_families")] = families;
+                document[format!("{prefix}_ip_families_auto")] = serde_json::json!(false);
+                let loaded: LineProfileConfig = serde_json::from_value(document).unwrap();
+                assert_eq!(loaded, expected);
+                assert_eq!(
+                    serde_json::to_value(loaded).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+            }
+        }
     }
 
     #[test]
@@ -3559,8 +3506,6 @@ line_profiles:
             retry_delay_secs: 23,
         };
         profile.cellular_ims_profile_selection.attempts.swap(0, 2);
-        profile.cellular_ims_ip_families = vec![CellularImsIpFamily::Ipv6];
-        profile.cellular_ims_ip_families_auto = false;
         profile.ims_video.cellular_ims_enabled = true;
         // Canonical storage uses the cellular_ims_* names; documents written by
         // older releases carry volte_* and must load to the same profile.
@@ -3573,8 +3518,6 @@ line_profiles:
             ),
             ("cellular_ims_auto_restore", "volte_auto_restore"),
             ("cellular_ims_profile_selection", "volte_profile_selection"),
-            ("cellular_ims_ip_families", "volte_ip_families"),
-            ("cellular_ims_ip_families_auto", "volte_ip_families_auto"),
         ] {
             let object = legacy.as_object_mut().unwrap();
             let value = object.remove(new).expect("canonical wire key is written");
@@ -4373,101 +4316,6 @@ impl ImsProfileSelectionConfig {
     }
 }
 
-/// IMS bearer IP address-family attempt order. The runtime always asks the
-/// modem for dual-stack first; this preference decides which single family is
-/// tried first when the network does NOT force a specific one, and the order in
-/// which the bearer's local addresses are offered to SIP/REGISTER. When the
-/// network explicitly signals `Ipv6OnlyAllowed`/`Ipv4OnlyAllowed`, that forced
-/// family is honored regardless of this preference. Default is `Ipv6First`:
-/// on an unclear failure, IPv6 is tried before IPv4.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CellularImsIpFamilyPreference {
-    #[default]
-    Ipv6First,
-    Ipv4First,
-    Ipv6Only,
-    Ipv4Only,
-}
-
-impl CellularImsIpFamilyPreference {
-    /// The equivalent ordered attempt list used by per-line profiles and IMS
-    /// planning helpers.
-    /// The `*First` presets lead with dual-stack, matching the historical
-    /// "always try dual-stack first, then fall back to single families" behaviour.
-    pub fn to_families(self) -> Vec<CellularImsIpFamily> {
-        match self {
-            Self::Ipv6First => vec![
-                CellularImsIpFamily::Ipv4v6,
-                CellularImsIpFamily::Ipv6,
-                CellularImsIpFamily::Ipv4,
-            ],
-            Self::Ipv4First => vec![
-                CellularImsIpFamily::Ipv4v6,
-                CellularImsIpFamily::Ipv4,
-                CellularImsIpFamily::Ipv6,
-            ],
-            Self::Ipv6Only => vec![CellularImsIpFamily::Ipv6],
-            Self::Ipv4Only => vec![CellularImsIpFamily::Ipv4],
-        }
-    }
-}
-
-/// One IMS bearer attempt a line may enable: dual-stack or a single family. The
-/// order of a `Vec<CellularImsIpFamily>` is the attempt/fallback order, so a line can
-/// place `Ipv4v6` (dual-stack) anywhere in the sequence rather than it always
-/// being tried first. A one-element list means "only this attempt, no fallback".
-/// This is the per-line, web-editable form of the legacy
-/// [`CellularImsIpFamilyPreference`] and is a strict superset of it.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CellularImsIpFamily {
-    Ipv4v6,
-    Ipv4,
-    Ipv6,
-}
-
-impl CellularImsIpFamily {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ipv4v6 => "ipv4v6",
-            Self::Ipv4 => "ipv4",
-            Self::Ipv6 => "ipv6",
-        }
-    }
-}
-
-fn default_line_cellular_ims_ip_families() -> Vec<CellularImsIpFamily> {
-    CellularImsIpFamilyPreference::default().to_families()
-}
-
-/// Older releases used `[ipv4v6, ipv4, ipv6]` for automatic lines. Keep
-/// explicit operator choices intact, but migrate that generated default to the
-/// current dual-stack -> IPv6 -> IPv4 order when loading persisted settings.
-fn migrate_legacy_cellular_ims_ip_family_defaults(config: &mut AppConfig) -> bool {
-    let legacy = vec![
-        CellularImsIpFamily::Ipv4v6,
-        CellularImsIpFamily::Ipv4,
-        CellularImsIpFamily::Ipv6,
-    ];
-    let current = default_line_cellular_ims_ip_families();
-    if legacy == current {
-        return false;
-    }
-    let mut changed = false;
-    for profile in &mut config.line_profiles {
-        if profile.cellular_ims_ip_families_auto && profile.cellular_ims_ip_families == legacy {
-            profile.cellular_ims_ip_families = current.clone();
-            changed = true;
-        }
-    }
-    changed
-}
-
-fn default_line_cellular_ims_ip_families_auto() -> bool {
-    true
-}
-
 /// How this line's logical SIP trunk associates with the remote Asterisk/FreePBX.
 ///
 /// Both modes share the same SIP transport and RTP relay; the only difference is
@@ -4778,21 +4626,6 @@ pub struct LineProfileConfig {
     /// See `connectivity::core::ims_access` for the full reasoning.
     #[serde(default)]
     pub ims_access_preference: ImsAccessPreference,
-    /// Per-line ordered IMS IP-family attempt order. The list elements are the families to
-    /// enable, in fallback order. The default `[Ipv4v6, Ipv6, Ipv4]` tries dual-stack,
-    /// then IPv6, then IPv4; `[Ipv6]` is IPv6-only. An empty list is invalid.
-    #[serde(default = "default_line_cellular_ims_ip_families")]
-    #[serde(rename = "cellular_ims_ip_families", alias = "volte_ip_families")]
-    pub cellular_ims_ip_families: Vec<CellularImsIpFamily>,
-    /// Whether the family order is still automatic. Automatic lines may use
-    /// the carrier catalog's LTE `ip_family` as a hint; saving the order from
-    /// the UI turns this off so the user's choice always wins.
-    #[serde(default = "default_line_cellular_ims_ip_families_auto")]
-    #[serde(
-        rename = "cellular_ims_ip_families_auto",
-        alias = "volte_ip_families_auto"
-    )]
-    pub cellular_ims_ip_families_auto: bool,
     /// Per-line APN.
     #[serde(default)]
     pub apn: ApnConfig,
@@ -4913,8 +4746,6 @@ impl LineProfileConfig {
             cellular_ims_auto_restore: AutoRestoreConfig::default(),
             cellular_ims_profile_selection: ImsProfileSelectionConfig::default(),
             ims_video: ImsVideoConfig::default(),
-            cellular_ims_ip_families: default_line_cellular_ims_ip_families(),
-            cellular_ims_ip_families_auto: default_line_cellular_ims_ip_families_auto(),
             vowifi: LineVowifiConfig::default(),
             trunk: TrunkProfileConfig::default(),
             data_connection_enabled: false,
@@ -5882,8 +5713,6 @@ impl ConfigManager {
         let templates_changed = migrate_templates_to_remove_md5(&mut config);
         let github_download_proxy_changed = migrate_legacy_github_download_proxy(&mut config);
         let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
-        let cellular_ims_ip_family_defaults_changed =
-            migrate_legacy_cellular_ims_ip_family_defaults(&mut config);
 
         let manager = Self {
             config: Arc::new(RwLock::new(config)),
@@ -5897,7 +5726,6 @@ impl ConfigManager {
             || templates_changed
             || github_download_proxy_changed
             || video_gates_changed
-            || cellular_ims_ip_family_defaults_changed
         {
             manager.save()?;
         }
@@ -6517,62 +6345,6 @@ impl ConfigManager {
             profile.esim_reader = persisted;
         })?;
         Ok(reader)
-    }
-
-    /// Set this line's explicit ordered VoLTE IMS address-family list.
-    pub fn set_line_cellular_ims_ip_families(
-        &self,
-        line_id: &str,
-        families: Vec<CellularImsIpFamily>,
-    ) -> Result<LineProfileConfig, String> {
-        if !valid_line_id(line_id) {
-            return Err("invalid_line_id".to_string());
-        }
-        if families.is_empty() {
-            return Err(
-                crate::connectivity::modems::ims::cellular_ims::errors::code::IP_FAMILIES_EMPTY
-                    .to_string(),
-            );
-        }
-        let mut seen = Vec::new();
-        for family in &families {
-            if seen.contains(family) {
-                return Err(crate::connectivity::modems::ims::cellular_ims::errors::code::IP_FAMILIES_DUPLICATE.to_string());
-            }
-            seen.push(*family);
-        }
-        let next = {
-            let mut config = self.config.write().unwrap();
-            let profile = if let Some(profile) = config
-                .line_profiles
-                .iter_mut()
-                .find(|profile| profile.line_id == line_id)
-            {
-                profile
-            } else {
-                config
-                    .line_profiles
-                    .push(LineProfileConfig::for_line(line_id));
-                config.line_profiles.last_mut().expect("profile inserted")
-            };
-            profile.cellular_ims_ip_families = families;
-            profile.cellular_ims_ip_families_auto = false;
-            let next = profile.clone();
-            config
-                .line_profiles
-                .sort_by(|left, right| left.line_id.cmp(&right.line_id));
-            next
-        };
-        self.save()?;
-        Ok(next)
-    }
-
-    pub fn get_line_cellular_ims_ip_families(&self, line_id: &str) -> Vec<CellularImsIpFamily> {
-        self.get_line_profile(line_id).cellular_ims_ip_families
-    }
-
-    pub fn get_line_cellular_ims_ip_families_auto(&self, line_id: &str) -> bool {
-        self.get_line_profile(line_id).cellular_ims_ip_families_auto
     }
 
     pub fn get_line_cellular_ims_profile_selection(

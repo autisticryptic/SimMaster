@@ -2165,10 +2165,6 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
             "/api/cellular-ims/lines/{line_id}/retry",
             post(retry_cellular_ims_line_handler).options(options_handler),
         )
-        .route(
-            "/api/cellular-ims/lines/{line_id}/ip-families",
-            post(set_cellular_ims_line_ip_families_handler).options(options_handler),
-        )
         // Legacy routes remain exact aliases, including their response schema.
         // Persisted/serialized keys are migrated separately from type names.
         .route(
@@ -2192,10 +2188,6 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
         .route(
             "/api/volte/lines/{line_id}/retry",
             post(retry_cellular_ims_line_handler).options(options_handler),
-        )
-        .route(
-            "/api/volte/lines/{line_id}/ip-families",
-            post(set_cellular_ims_line_ip_families_handler).options(options_handler),
         )
         .route(
             "/api/sim/slots",
@@ -2989,11 +2981,6 @@ mod http_router_tests {
                 serde_json::json!({}),
             ),
             (
-                reqwest::Method::POST,
-                format!("{root}/ip-families"),
-                serde_json::json!({"families": ["ipv4v6"]}),
-            ),
-            (
                 reqwest::Method::GET,
                 format!("/api/modem/lines/{unknown}/volte/call/status"),
                 serde_json::json!({}),
@@ -3027,6 +3014,48 @@ mod http_router_tests {
                 responses[0], responses[1],
                 "{method} {canonical} differs from {legacy}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_family_override_routes_cannot_modify_any_line() {
+        let state = build_test_router()
+            .await
+            .expect("run with a private DBUS_SYSTEM_BUS_ADDRESS; no hardware is required");
+        let served = serve(state.router.clone()).await;
+        let line_id = format!("line-{:032x}", 0xfa1111u64);
+        state
+            .config_manager
+            .reconcile_line_profiles(&[line_id.clone()])
+            .unwrap();
+        let before = serde_json::to_value(state.config_manager.get_line_profile(&line_id)).unwrap();
+        let cookie = authenticate(&served).await;
+        for root in ["cellular-ims", "volte"] {
+            let path = format!("/api/{root}/lines/{line_id}/ip-families");
+            for families in [
+                serde_json::json!(["ipv6"]),
+                serde_json::json!(["ipv4"]),
+                serde_json::json!(["ipv4v6"]),
+            ] {
+                let (status, _, _) = post_json(
+                    &served,
+                    &path,
+                    serde_json::json!({"families": families}),
+                    Some(&cookie),
+                )
+                .await;
+                assert!(
+                    matches!(
+                        status,
+                        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+                    ),
+                    "retired endpoint {path}: {status}"
+                );
+                assert_eq!(
+                    before,
+                    serde_json::to_value(state.config_manager.get_line_profile(&line_id)).unwrap()
+                );
+            }
         }
     }
 

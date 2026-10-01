@@ -9051,73 +9051,6 @@ pub async fn set_cellular_ims_line_connection_handler(
     }
 }
 
-/// Body for `PUT /api/volte/lines/{line_id}/ip-families`.
-///
-/// `families` is this line's non-empty ordered attempt list
-/// (`["ipv4","ipv6"]`, `["ipv6"]`, …).
-#[derive(Debug, serde::Deserialize)]
-pub struct SetCellularImsIpFamiliesRequest {
-    pub families: Vec<crate::platform::config::CellularImsIpFamily>,
-}
-
-/// PUT /api/volte/lines/{line_id}/ip-families
-///
-/// Persist this line's ordered IMS address-family list. If the line is currently
-/// connected, restart it so the new order takes effect immediately.
-pub async fn set_cellular_ims_line_ip_families_handler(
-    State(app): State<AppState>,
-    Path(line_id): Path<String>,
-    Json(payload): Json<SetCellularImsIpFamiliesRequest>,
-) -> (
-    StatusCode,
-    Json<ApiResponse<CellularImsLineControlResponse>>,
-) {
-    let _ = app.line_registry.refresh().await;
-    let Some(line) = app.line_registry.get(&line_id).await else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("line_not_found")),
-        );
-    };
-    let profile = match app
-        .config_manager
-        .set_line_cellular_ims_ip_families(&line_id, payload.families)
-    {
-        Ok(profile) => profile,
-        Err(error) => {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::error(format!("Failed: {error}"))),
-            )
-        }
-    };
-    // The family order is only consulted when a session is (re)established, so an
-    // already-registered line has to be restarted for the change to take effect.
-    if profile.cellular_ims_connection_enabled && line.cellular_ims.status().await.registered {
-        {
-            let _bearer_guard = line.bearer_operation_lock.lock().await;
-            let _guard = line.cellular_ims_connect_lock.lock().await;
-            crate::connectivity::modems::ims::cellular_ims::live::disconnect_live_for_line(
-                &line.cellular_ims_live,
-                &line.cellular_ims,
-                code::IP_FAMILIES_CHANGED,
-            )
-            .await;
-        }
-        start_line_cellular_ims_restore(app.clone(), Arc::clone(&line), "ip_families_changed")
-            .await;
-    }
-    let response = CellularImsLineControlResponse {
-        modem: line.binding(),
-        profile: profile.redacted(),
-        runtime: line.cellular_ims.status().await,
-    };
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success_with_message("Success", response)),
-    )
-}
-
 /// Start a fresh three-attempt recovery batch without changing the persisted
 /// VoLTE switch.  The response is immediate; progress is returned by the normal
 /// line status endpoint and automatic polling.
@@ -10614,10 +10547,9 @@ async fn start_line_cellular_ims_restore(
             .await;
         return false;
     }
-    // An operator asking explicitly may always try; only the unattended pass is
-    // suppressed, because that is the one that loops the baseband into a crash
-    // every time its cooldown is lost to re-enumeration.
-    if source == "automatic" {
+    // Only an explicit manual retry may bypass the transient cooldown. Startup,
+    // profile changes and other automatic triggers must not reopen it indirectly.
+    if source != "manual" {
         if let Some(remaining) = line.baseband_wedge_remaining() {
             tracing::debug!(
                 line_id = %line.binding().line_id,
@@ -11305,9 +11237,6 @@ async fn run_line_cellular_ims_restore_round(
                         if line.cellular_ims.status().await.registered {
                             Ok(line.cellular_ims.status().await)
                         } else {
-                            let ip_families = app
-                                .config_manager
-                                .get_line_cellular_ims_ip_families(&binding.line_id);
                             crate::connectivity::modems::ims::cellular_ims::live::connect_live_for_line(
                                 &line.cellular_ims_live,
                                 &device,
@@ -11315,9 +11244,6 @@ async fn run_line_cellular_ims_restore_round(
                                 &runtime,
                                 &line.ims_access_network,
                                 candidate,
-                                &ip_families,
-                                app.config_manager
-                                    .get_line_cellular_ims_ip_families_auto(&binding.line_id),
                                 profile.roaming_allowed,
                                 data_slot_mode,
                                 app.config_manager
@@ -11335,6 +11261,13 @@ async fn run_line_cellular_ims_restore_round(
                 Err(error) => Err(error),
             }
         };
+        // A crash can withdraw MM admission before Connect returns. Record its
+        // physical-line safety consequence first; scoped runtime publication
+        // below must still reject old SIM/generation results.
+        let unsafe_failure = result
+            .as_ref()
+            .err()
+            .and_then(|error| line.observe_cellular_ims_failure(error));
         if !runtime.task_is_current()
             || result
                 .as_ref()
@@ -11434,17 +11367,10 @@ async fn run_line_cellular_ims_restore_round(
                 // restart and take the whole device down, so stop the batch and
                 // wait for an explicit operator retry instead.
                 if batch_action == CellularImsProfileBatchAction::AbortUnsafe {
-                    // The crash this abort guards against re-enumerates the
-                    // modem, and that hotplug resets the VoLTE snapshot. Record
-                    // the cooldown on the line instead, where it survives.
-                    let permanent = error.code()
-                        == crate::connectivity::modems::ims::cellular_ims::errors::code::BEARER_NETDEV_RUNTIME_ERROR;
-                    let cooldown = if permanent {
-                        line.note_baseband_wedged_permanent();
-                        None
-                    } else {
-                        Some(line.note_baseband_wedged())
-                    };
+                    // Recorded before the admission check, without publishing
+                    // any stale-generation status or incrementing it twice.
+                    let (permanent, cooldown) = unsafe_failure
+                        .expect("unsafe batch failure was observed before admission checks");
                     warn!(
                         line_id = %binding.line_id,
                         error = %error,

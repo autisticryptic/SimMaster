@@ -139,17 +139,44 @@ pub fn load(database: &Arc<Database>) -> Result<StoredConfig, String> {
 }
 
 fn read_all(conn: &Connection) -> Result<StoredConfig, String> {
-    Ok(StoredConfig {
-        line_profiles: read_ordered(conn, "config_line_profiles", "line_id")?,
-        modem_slots: read_ordered(conn, "config_modem_slots", "slot_key")?,
-        standalone_sim_slots: read_ordered(conn, "config_standalone_sim_slots", "slot_id")?,
-        notifications: read_document(conn, DOC_NOTIFICATIONS)?.unwrap_or_default(),
-        automation: read_document(conn, DOC_AUTOMATION)?.unwrap_or_default(),
-        esim: read_document(conn, DOC_ESIM)?.unwrap_or_default(),
-        last_notified_update_version: read_document::<VersionUpdateState>(conn, DOC_UPDATE_STATE)?
-            .unwrap_or_default()
-            .last_notified_version,
-    })
+    // Validate the complete stored configuration before migrating anything.
+    // A broken row must not cause a partially upgraded database. Retired family
+    // overrides are scrubbed on every load (including after an old-version
+    // import), independently of the SIM currently occupying a line.
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("config_store_begin_failed:{error}"))?;
+    let stored = StoredConfig {
+        line_profiles: read_ordered(&transaction, "config_line_profiles", "line_id")?,
+        modem_slots: read_ordered(&transaction, "config_modem_slots", "slot_key")?,
+        standalone_sim_slots: read_ordered(&transaction, "config_standalone_sim_slots", "slot_id")?,
+        notifications: read_document(&transaction, DOC_NOTIFICATIONS)?.unwrap_or_default(),
+        automation: read_document(&transaction, DOC_AUTOMATION)?.unwrap_or_default(),
+        esim: read_document(&transaction, DOC_ESIM)?.unwrap_or_default(),
+        last_notified_update_version: read_document::<VersionUpdateState>(
+            &transaction,
+            DOC_UPDATE_STATE,
+        )?
+        .unwrap_or_default()
+        .last_notified_version,
+    };
+    transaction
+        .execute(
+            "UPDATE config_line_profiles
+         SET document_json = json_remove(document_json,
+             '$.cellular_ims_ip_families', '$.cellular_ims_ip_families_auto',
+             '$.volte_ip_families', '$.volte_ip_families_auto'), updated_at = ?1
+         WHERE json_type(document_json, '$.cellular_ims_ip_families') IS NOT NULL
+            OR json_type(document_json, '$.cellular_ims_ip_families_auto') IS NOT NULL
+            OR json_type(document_json, '$.volte_ip_families') IS NOT NULL
+            OR json_type(document_json, '$.volte_ip_families_auto') IS NOT NULL",
+            [timestamp()],
+        )
+        .map_err(|error| format!("config_store_retire_family_overrides_failed:{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("config_store_commit_failed:{error}"))?;
+    Ok(stored)
 }
 
 fn read_ordered<T: DeserializeOwned>(
@@ -397,6 +424,119 @@ fn serialize<T: Serialize>(value: &T) -> Result<String, String> {
 
 fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn
+    }
+
+    fn insert_line(conn: &Connection, id: &str, document: Value) {
+        conn.execute(
+            "INSERT INTO config_line_profiles VALUES (?1, 0, ?2, 'before')",
+            params![id, document.to_string()],
+        )
+        .unwrap();
+    }
+
+    fn line_rows(conn: &Connection) -> Vec<(String, String, String)> {
+        conn.prepare(
+            "SELECT line_id, document_json, updated_at FROM config_line_profiles ORDER BY line_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn retires_all_line_family_overrides_without_touching_other_values() {
+        let conn = fixture();
+        let mut expected = Vec::new();
+        for (i, families) in [
+            json!(["ipv6"]),
+            json!(["ipv4"]),
+            json!(["ipv4v6", "ipv4", "ipv6"]),
+            Value::Null,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("line-{i:032x}");
+            let mut value = serde_json::to_value(LineProfileConfig::for_line(&id)).unwrap();
+            value["label"] = json!(format!("SIM slot {i}"));
+            value["future_unrelated_field"] = json!({"keep": [1, 2, 3]});
+            expected.push((id.clone(), value.clone()));
+            value["cellular_ims_ip_families"] = families;
+            value["cellular_ims_ip_families_auto"] = json!(i % 2 == 0);
+            value["volte_ip_families"] = json!(["ipv4"]);
+            value["volte_ip_families_auto"] = json!(false);
+            insert_line(&conn, &id, value);
+        }
+        let untouched = "line-ffffffffffffffffffffffffffffffff";
+        insert_line(&conn, untouched, json!({"line_id": untouched}));
+        conn.execute(
+            "INSERT INTO ims_sim_overrides VALUES ('sim-proof', 1, '{}', 'before')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read_all(&conn).unwrap().line_profiles.len(), 5);
+        let rows = line_rows(&conn);
+        for ((id, before), (actual_id, after, _)) in expected.iter().zip(&rows) {
+            assert_eq!(id, actual_id);
+            assert_eq!(*before, serde_json::from_str::<Value>(after).unwrap());
+        }
+        assert_eq!(rows.last().unwrap().2, "before");
+        assert_eq!(
+            conn.query_row("SELECT updated_at FROM ims_sim_overrides", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "before"
+        );
+        read_all(&conn).unwrap();
+        assert_eq!(rows, line_rows(&conn), "migration must be idempotent");
+    }
+
+    #[test]
+    fn malformed_configuration_does_not_partially_retire_overrides() {
+        let conn = fixture();
+        insert_line(
+            &conn,
+            "line-a",
+            json!({"line_id":"line-a", "cellular_ims_ip_families":["ipv6"]}),
+        );
+        insert_line(
+            &conn,
+            "line-b",
+            json!({"line_id":"line-b", "enabled":"invalid"}),
+        );
+        let before = line_rows(&conn);
+        assert!(read_all(&conn).is_err());
+        assert_eq!(before, line_rows(&conn));
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_every_line() {
+        let conn = fixture();
+        for id in ["line-a", "line-b"] {
+            insert_line(
+                &conn,
+                id,
+                json!({"line_id":id, "volte_ip_families":["ipv4"]}),
+            );
+        }
+        conn.execute_batch("CREATE TRIGGER deny_second BEFORE UPDATE ON config_line_profiles WHEN OLD.line_id='line-b' BEGIN SELECT RAISE(ABORT, 'blocked'); END;").unwrap();
+        let before = line_rows(&conn);
+        assert!(read_all(&conn).is_err());
+        assert_eq!(before, line_rows(&conn));
+    }
 }
 
 // A `clear()` helper used to live here. It had no callers: an import replaces
