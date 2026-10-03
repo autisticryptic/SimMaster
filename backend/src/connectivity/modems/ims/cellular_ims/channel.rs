@@ -239,14 +239,18 @@ impl CellularImsSipChannel {
         avoid_port: u16,
     ) -> Result<u16, ImsError> {
         if let Some(socket) = self.reserved_send_socket.as_ref() {
-            return match socket {
+            let port = match socket {
                 #[cfg(test)]
                 ReservedSendSocket::Host(socket) => socket_port(socket),
                 ReservedSendSocket::Worker(socket) => socket
                     .local_addr()
                     .map(|addr| addr.port())
                     .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED)),
-            };
+            }?;
+            if (requested_port != 0 && requested_port != port) || port == avoid_port {
+                return Err(ImsError::new(code::CHANNEL_SEND_PORT_MISMATCH));
+            }
+            return Ok(port);
         }
         let attempts = if requested_port == 0 { 8 } else { 1 };
         for _ in 0..attempts {
@@ -265,6 +269,7 @@ impl CellularImsSipChannel {
                 && port != 5061
                 && port != avoid_port
                 && port != self.route.local_addr.port()
+                && (requested_port == 0 || port == requested_port)
             {
                 self.reserved_send_socket = Some(ReservedSendSocket::Worker(socket));
                 return Ok(port);
@@ -292,14 +297,18 @@ impl CellularImsSipChannel {
         requested_port: u16,
     ) -> Result<u16, ImsError> {
         if let Some(socket) = self.reserved_receive_socket.as_ref() {
-            return match socket {
+            let port = match socket {
                 #[cfg(test)]
                 ReservedReceiveSocket::Host(socket) => socket_port(socket),
                 ReservedReceiveSocket::Worker(socket) => socket
                     .local_addr()
                     .map(|addr| addr.port())
                     .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED)),
-            };
+            }?;
+            if requested_port != 0 && requested_port != port {
+                return Err(ImsError::new(code::CHANNEL_RECEIVE_PORT_MISMATCH));
+            }
+            return Ok(port);
         }
         if requested_port != 0 && (requested_port == 5060 || requested_port == 5061) {
             return Err(ImsError::new(code::CHANNEL_RECEIVE_RESERVED_SIP_PORT));
@@ -317,7 +326,7 @@ impl CellularImsSipChannel {
                 .local_addr()
                 .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))?
                 .port();
-            if port != 5060 && port != 5061 {
+            if port != 5060 && port != 5061 && (requested_port == 0 || port == requested_port) {
                 self.reserved_receive_socket = Some(ReservedReceiveSocket::Worker(socket));
                 return Ok(port);
             }

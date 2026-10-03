@@ -109,6 +109,15 @@ impl DeviceDriver for Driver {
         })
     }
 
+    fn requires_pre_namespace_ims_recovery(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            mm_ims_profile_lease::runtime::requires_pre_namespace_recovery()
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     fn recover_owned_ims(&self) -> TransportFuture<'_, Result<(), String>> {
         Box::pin(async {
             #[cfg(target_os = "linux")]

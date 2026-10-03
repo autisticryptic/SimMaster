@@ -1,5 +1,10 @@
 #![allow(dead_code)]
 
+#[cfg(test)]
+pub(crate) mod offline_sim_adapter {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../offline-registration-sim/wifi_adapter.rs"));
+}
+
 use std::{
     collections::HashMap,
     env,
@@ -2874,6 +2879,14 @@ async fn wait_for_vowifi_ue_dataplane_ready(
     }
 }
 
+/// A decrypted IKE_AUTH rejection is not a UDP-path, address-family or DH
+/// mismatch. Do not replay SIM authentication across the fallback Cartesian
+/// product after the peer explicitly rejects authentication/authorization.
+fn terminal_ike_auth_rejection(error: &LiveStageError) -> bool {
+    matches!(error.reason.as_str(),
+        "ike_auth_notify_authentication_failed" | "ike_auth_notify_authorization_failed")
+}
+
 async fn run_live_ike_until_depth(
     line_id: &str,
     profile: &'static CarrierProfile,
@@ -2915,6 +2928,7 @@ async fn run_live_ike_until_depth(
                 return Ok(session);
             }
             Err(error) => {
+                if terminal_ike_auth_rejection(&error) { return Err(error); }
                 if let Some(forced_stack) = vowifi_forced_ip_stack_from_error(&error) {
                     if forced_stack != ip_stack {
                         info!(
@@ -2968,6 +2982,7 @@ where
     for address in &addresses[..count] {
         match attempt(*address).await {
             Ok(session) => return Ok(session),
+            Err(error) if terminal_ike_auth_rejection(&error) => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
@@ -3063,6 +3078,7 @@ async fn run_live_ike_until_depth_for_stack(
                                 return Ok(session);
                             }
                             Err(error) => {
+                                if terminal_ike_auth_rejection(&error) { return Err(error); }
                                 warn!(
                                     host = %selected_epdg_host,
                                     destination = ?destination,
@@ -3081,6 +3097,7 @@ async fn run_live_ike_until_depth_for_stack(
         .await;
         match result {
             Ok(session) => return Ok(session),
+            Err(error) if terminal_ike_auth_rejection(&error) => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
@@ -10442,6 +10459,10 @@ mod epdg_address_tests {
 }
 
 #[cfg(test)]
+#[path = "derived_hardening_tests.rs"]
+mod derived_hardening_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -12866,7 +12887,7 @@ mod tests {
                 "   nonce=\"{}\",\r\n",
                 "   algorithm=AKAv1-MD5,\r\n",
                 "   qop=\"auth\"\r\n",
-                "Security-Server: ipsec-3gpp; alg=hmac-sha-1-96; ealg=null\r\n",
+                "Security-Server: ipsec-3gpp; alg=hmac-sha-1-96; ealg=null; prot=esp; mod=trans; spi-c=100; spi-s=101; port-c=5064; port-s=5062\r\n",
                 "Content-Length: 0\r\n\r\n"
             ),
             GB_EE_23433.ims.realm, nonce

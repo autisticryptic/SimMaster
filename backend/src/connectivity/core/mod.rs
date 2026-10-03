@@ -16,6 +16,11 @@
 
 #![allow(dead_code)]
 
+#[cfg(test)]
+pub(crate) mod offline_sim {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../offline-registration-sim/simulator.rs"));
+}
+
 pub mod access;
 pub mod access_network;
 pub mod contact;

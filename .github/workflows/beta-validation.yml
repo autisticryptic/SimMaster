@@ -99,6 +99,8 @@ jobs:
             services::automation::scheduler::tests \
             services::automation::target::tests \
             services::line_registry::tests \
+            services::line_registry::ims_startup_gate::tests \
+            hardware::sim::esim::tests \
             services::ue_worker::tests \
             services::ue_netcfg::tests \
             connectivity::modems::ims::cellular_ims::identity::tests \
@@ -130,6 +132,8 @@ jobs:
             connectivity::modems::ims::vowifi::epdg::tests \
             connectivity::modems::ims::vowifi::profile_record::tests \
             connectivity::modems::ims::vowifi::profiles::tests \
+            connectivity::modems::ims::vowifi::ike_state::tests \
+            connectivity::modems::ims::vowifi::live::derived_hardening_tests \
             connectivity::modems::ims::vowifi::carrier_catalog::v7::tests \
             connectivity::modems::ims::vowifi::profile_store::tests \
             connectivity::modems::ims::vowifi::socks5::tests \
@@ -153,6 +157,8 @@ jobs:
             connectivity::core::ims_access::tests \
             connectivity::core::ims_registration_coordinator::tests \
             connectivity::modems::ims::vowifi::live::coexistence_lease_tests \
+            connectivity::modems::ims::cellular_ims::channel::tests \
+            connectivity::modems::ims::cellular_ims::ipsec::tests \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \
             connectivity::modems::ims::cellular_ims::security_agreement::tests \
             connectivity::modems::ims::cellular_ims::errors::tests \

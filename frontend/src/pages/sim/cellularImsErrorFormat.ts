@@ -182,6 +182,9 @@ export function cellularImsErrorMessage(error?: string | null) {
   if (codes.has('cellular_ims_usim_aka_failed')) {
     return 'SIM 身份已读取，但 USIM AKA 鉴权失败。请检查 UIM 通道、卡槽映射和运营商鉴权响应。'
   }
+  if (codes.has('cellular_ims_security_client_invalid')) {
+    return 'IMS 安全提案配置无效或包含当前协议栈不支持的机制，已停止发送；请检查运营商安全配置，不要通过关闭安全来绕过。'
+  }
   if (codes.has('cellular_ims_runtime_all_pcscf_failed')) {
     return 'IMS Bearer 已建立，但所有 P-CSCF 候选均连接失败。请检查运营商 Profile、PCO/DNS 返回和 IMS 路由。'
   }
@@ -209,6 +212,7 @@ export function cellularImsErrorStatusLabel(error?: string | null) {
   if (codes.has('cellular_ims_runtime_ims_endpoint_unavailable')) return 'IMS 数据端口不可用'
   if (codes.has('cellular_ims_runtime_ims_bearer_start_failed')) return 'IMS Bearer 建立失败'
   if (codes.has('cellular_ims_runtime_ims_family_unsupported') || codes.has('cellular_ims_pcscf_family_mismatch')) return 'IMS 地址族不兼容'
+  if (codes.has('cellular_ims_security_client_invalid')) return 'IMS 安全提案无效'
   if (codes.has('cellular_ims_runtime_all_pcscf_failed')) return 'P-CSCF 不可达'
   if (codes.has('cellular_ims_usim_aka_failed') || codes.has('cellular_ims_aka_material_invalid') || codes.has('cellular_ims_aka_res_empty')) return 'SIM AKA 鉴权失败'
   if (hasAny(codes, DIGEST_FAILURES)) return 'IMS 鉴权响应异常'

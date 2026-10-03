@@ -36,6 +36,11 @@ await test('codes are matched as whole tokens, never as substrings', () => {
   assert.equal(cellularImsErrorCodes('cellular_ims_dependency_missing:ipx').size, 0)
 })
 
+await test('invalid client security offers are not misreported as SIM or network rejection', () => {
+  assert.equal(cellularImsErrorStatusLabel('cellular_ims_security_client_invalid'), 'IMS 安全提案无效')
+  assert.match(cellularImsErrorMessage('cellular_ims_security_client_invalid') ?? '', /不要通过关闭安全/)
+})
+
 await test('former prefix families are enumerated member by member', () => {
   assert.equal(cellularImsErrorStatusLabel('cellular_ims_digest_realm_missing'), 'IMS 鉴权响应异常')
   assert.equal(cellularImsErrorStatusLabel('cellular_ims_register_nonce_not_aka'), 'IMS 鉴权响应异常')

@@ -29,7 +29,22 @@ class SecurityAgreementBoundaryTests(unittest.TestCase):
                          "let algs = agreement.algorithms;", "super::security_agreement::select("]:
             self.assertIn(expected, source)
         self.assertNotIn("ipsec::xfrm_algs_from_security_server(&verify)", source)
-        self.assertIn("server_list_fix_does_not_expand_or_change_the_client_offer", source)
+        self.assertIn("client_offer_preserves_all_explicitly_configured_mechanisms", source)
+        builder=source[source.index('impl CellularImsSecurityClientOffer'):source.index('impl CellularImsInitialAuthorization')]
+        self.assertNotIn('.first()',builder)
+        self.assertIn('super::security_agreement::client_offer(',builder)
+
+    def test_client_offer_and_null_key_boundaries_are_exercised(self):
+        for name in ('build-release.yml','beta-validation.yml'):
+            text=(ROOT/'.github/workflows'/name).read_text()
+            self.assertIn('cellular_ims::ipsec::tests',text)
+            self.assertIn('cellular_ims::live::refresh_tests',text)
+        parser=(BASE/'security_agreement.rs').read_text()
+        self.assertIn('allowed.len() > MAX_OFFERS',parser)
+        self.assertIn('fields.join(separator)',parser)
+        adapter=(ROOT/'offline-registration-sim/cellular_adapter.rs').read_text()
+        self.assertIn('security_client_offer.build(',adapter)
+        self.assertIn('select_security_server(self.profile',adapter)
 
 
 if __name__ == "__main__":

@@ -364,6 +364,14 @@ pub fn build_install_plan_with_algs(
     if algs.enc != "cipher_null" && encryption_key.is_empty() {
         return Err(CellularImsError::new(code::IPSEC_IK_INVALID));
     }
+    // AKA always returns CK, including when the selected mechanism requests
+    // cipher_null. Linux requires an empty encryption key for that algorithm;
+    // never pass CK to cipher_null or erase CK for an AES selection.
+    let encryption_key = if algs.enc == "cipher_null" {
+        &[][..]
+    } else {
+        encryption_key
+    };
     // There are two SIP UDP tuples in the UE, not four independent local
     // flows. TS 33.203 defines the protected client tuple as
     //   UE port_uc -> P-CSCF port_ps
@@ -739,6 +747,53 @@ mod tests {
         for (state, policy) in plan.states.iter().zip(&policy_text) {
             assert!(policy.contains(&format!("sport {}", state.sport)));
             assert!(policy.contains(&format!("dport {}", state.dport)));
+        }
+    }
+
+    #[test]
+    fn null_encryption_discards_aka_ck_but_keeps_integrity_and_aes_keys() {
+        let ue = SecAgree {
+            spi_c: 100,
+            spi_s: 101,
+            port_c: 5064,
+            port_s: 5062,
+        };
+        let server = SecAgree {
+            spi_c: 200,
+            spi_s: 201,
+            port_c: 6004,
+            port_s: 6002,
+        };
+        for (encryption, expected_key) in [("null", Vec::new()), ("aes-cbc", vec![2; 16])] {
+            let algs = xfrm_algs_from_security_server(&format!(
+                "ipsec-3gpp;alg=hmac-sha-1-96;ealg={encryption}"
+            ))
+            .unwrap();
+            let plan = build_install_plan_with_algs(
+                "192.0.2.2".parse().unwrap(),
+                "192.0.2.1".parse().unwrap(),
+                &ue,
+                &server,
+                &[3; 16],
+                &[2; 16],
+                algs,
+            )
+            .unwrap();
+            assert_eq!(plan.states.len(), 2);
+            for state in plan.states {
+                assert_eq!(state.auth_key, vec![3; 16]);
+                assert_eq!(state.enc_key, expected_key);
+                let args = build_xfrm_state_add(&state);
+                assert_eq!(
+                    args.last().unwrap(),
+                    &if encryption == "null" {
+                        String::new()
+                    } else {
+                        hex_key(&[2; 16])
+                    }
+                );
+                assert!(args.contains(&"hmac(sha1)".into()));
+            }
         }
     }
 
