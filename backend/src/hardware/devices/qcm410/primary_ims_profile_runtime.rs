@@ -1289,10 +1289,80 @@ where
     profile().await
 }
 
-/// Startup/new-attempt recovery hook. This can ONLY finish a runtime-owned,
-/// abandoned/dead lease from this boot and original MM owner/SIM/topology.
-/// Legacy, unknown, mid-AT and unrecorded bearer-setup states remain blocked.
-/// Callers must re-run prepare afterwards; recovery never authorizes fallback.
+fn prior_boot_receipt(receipt: Option<&Receipt>, boot: &str) -> Result<bool, String> {
+    let Some(receipt) = receipt else {
+        return Ok(false);
+    };
+    if receipt.version != 2 {
+        return Ok(false); // No change to the explicit legacy recovery contract.
+    }
+    let owner = validate_runtime_receipt(receipt)?;
+    if !valid_boot_id(boot) {
+        return Err(RUNTIME_ERROR.into());
+    }
+    Ok(owner.boot_id != boot)
+}
+
+/// This hint performs no modem or filesystem mutation. Corrupt/ambiguous
+/// metadata after a failed startup proof must not authorize new namespaces.
+pub(crate) fn requires_pre_namespace_recovery() -> bool {
+    (|| {
+        let file = ledger_file(PRIMARY)?;
+        reject_other_receipts(&file)?;
+        prior_boot_receipt(read_receipt(&file)?.as_ref(), &boot_id()?)
+    })()
+    .unwrap_or(true)
+}
+
+/// Resolve the current modem only for metadata-only prior-boot absence proof.
+/// Never use this new owner to delete/disconnect an old owner's resource.
+async fn reboot_absence_io(receipt: &Receipt) -> Result<MmProfileIo, String> {
+    require_stopped()?;
+    no_bearer_work()?;
+    let old = &receipt.before;
+    let interface = netdev::primary_netdev_for_qmi(&old.device).ok_or(RUNTIME_ERROR)?;
+    netdev::verify_mm_data_interface(&old.device, &interface)?;
+    let discovery = MmBus::new(&old.device, &old.modem, &interface).await?;
+    let objects: ManagedObjects = timed(10, async {
+        discovery
+            .proxy(
+                "/org/freedesktop/ModemManager1",
+                "org.freedesktop.DBus.ObjectManager",
+            )
+            .await?
+            .call("GetManagedObjects", &())
+            .await
+            .map_err(bus_error)
+    })
+    .await?;
+    let mut modems = objects.iter().filter_map(|(path, interfaces)| {
+        let properties = interfaces.get(MODEM)?;
+        let port = properties
+            .get("PrimaryPort")
+            .and_then(|v| <&str>::try_from(v).ok())?;
+        (Some(port) == old.device.strip_prefix("/dev/")).then(|| path.to_string())
+    });
+    let modem = modems.next().ok_or(RUNTIME_ERROR)?;
+    if modems.next().is_some() || !discovery.owner_is_current().await? {
+        return Err(RUNTIME_ERROR.into());
+    }
+    let bus = MmBus::new(&old.device, &modem, &interface).await?;
+    if bus.bus_id != discovery.bus_id || bus.owner != discovery.owner {
+        return Err(RUNTIME_ERROR.into());
+    }
+    bus.pin_sim_binding().await?;
+    Ok(MmProfileIo {
+        bus,
+        method: CreationMethod::At,
+        topology: physical_control_topology,
+    })
+}
+
+/// Startup/new-attempt recovery. Same-boot cleanup retains the original-owner
+/// contract. A prior-boot record can ONLY be archived after strict same-SIM,
+/// topology, profile/reporting, bearer, namespace and network absence proofs.
+/// Legacy, unknown, mid-AT and still-present cross-owner resources remain blocked.
+/// Callers re-run prepare afterwards; recovery does not narrow family fallback.
 pub async fn recover(device: &str) -> Result<(), String> {
     let device = device.trim().to_string();
     let (sender, receiver) = oneshot::channel();
@@ -1320,9 +1390,14 @@ async fn recover_inner(device: &str) -> Result<(), String> {
         return Err(RUNTIME_ERROR.into());
     }
     let owner = validate_runtime_receipt(&receipt)?.clone();
+    let boot = boot_id()?;
+    if owner.boot_id != boot {
+        let io = reboot_absence_io(&receipt).await?;
+        return retirement::retire_reboot_absence(&io, &DiskStore { file }, &receipt).await;
+    }
     recovery_admitted(
         &receipt,
-        &boot_id()?,
+        &boot,
         process_start(owner.process_id)? == Some(owner.process_start),
     )?;
     // Discovery is read-only and bound to the same unique owner, stable SIM

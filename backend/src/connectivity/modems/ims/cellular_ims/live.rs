@@ -11,6 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+pub(crate) mod offline_sim_adapter {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../offline-registration-sim/cellular_adapter.rs"));
+}
+
 use chrono::Utc;
 use tokio::{process::Command, sync::Mutex};
 

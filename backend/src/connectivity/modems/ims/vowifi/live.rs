@@ -1,5 +1,10 @@
 #![allow(dead_code)]
 
+#[cfg(test)]
+pub(crate) mod offline_sim_adapter {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../offline-registration-sim/wifi_adapter.rs"));
+}
+
 use std::{
     collections::HashMap,
     env,

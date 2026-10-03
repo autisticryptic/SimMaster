@@ -99,6 +99,8 @@ jobs:
             services::automation::scheduler::tests \
             services::automation::target::tests \
             services::line_registry::tests \
+            services::line_registry::ims_startup_gate::tests \
+            hardware::sim::esim::tests \
             services::ue_worker::tests \
             services::ue_netcfg::tests \
             connectivity::modems::ims::cellular_ims::identity::tests \
