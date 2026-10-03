@@ -971,6 +971,12 @@ async fn main() -> Result<()> {
             platform::netns::reclaim_all_stranded_hardware_links().await;
         } else {
             warn!("Skipping namespace sweep while owned IMS recovery is unverified");
+            if hardware::devices::requires_pre_namespace_ims_recovery() {
+                // MM/SIM can still be enumerating at boot. Keep EVERY refresh
+                // path behind the proof instead of recreating the old namespace
+                // and worker, which would itself prevent later retirement.
+                line_registry.defer_ims_startup_recovery().await;
+            }
         }
     }
     // Native ownership receipts require explicit reconciliation. A global

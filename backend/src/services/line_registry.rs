@@ -48,6 +48,9 @@ use crate::{
     },
 };
 
+#[path = "ims_startup_gate.rs"]
+mod ims_startup_gate;
+
 /// Independent recovery bookkeeping for one physical line. Keeping this on
 /// `LineRuntime` prevents a slow or unhealthy modem from consuming another
 /// line's retry counters or cooldowns.
@@ -607,6 +610,7 @@ pub struct LineRuntimeRegistry {
     /// Serializes hardware discovery passes without holding the registry write
     /// lock across worker, QMI, or namespace operations.
     refresh_lock: Mutex<()>,
+    ims_startup_gate: ims_startup_gate::ImsStartupGate,
     config_manager: Option<Arc<ConfigManager>>,
     /// Used to restore each line's cumulative proxied-traffic counters when the
     /// line is first discovered, so totals survive a restart.
@@ -632,6 +636,7 @@ impl LineRuntimeRegistry {
         Self {
             lines: AsyncRwLock::new(BTreeMap::new()),
             refresh_lock: Mutex::new(()),
+            ims_startup_gate: ims_startup_gate::ImsStartupGate::default(),
             config_manager: None,
             database: None,
             traffic_persistence_lock: Mutex::new(()),
@@ -682,6 +687,12 @@ impl LineRuntimeRegistry {
         line
     }
 
+    /// Called only before the first refresh, for unresolved prior-boot IMS
+    /// ownership. API and periodic refreshes must use the same provisioning gate.
+    pub async fn defer_ims_startup_recovery(&self) {
+        self.ims_startup_gate.defer().await;
+    }
+
     /// Refresh presence and descriptors without discarding per-line runtime
     /// state. Missing lines remain addressable as offline entries so callers
     /// can tear them down and the same SIM can safely reappear after hotplug.
@@ -690,6 +701,16 @@ impl LineRuntimeRegistry {
         // Keep discovery/reconciliation passes ordered, while the registry write
         // lock remains reserved for the short snapshot publication below.
         let _refresh_guard = self.refresh_lock.lock().await;
+        if self
+            .ims_startup_gate
+            .ensure_ready(devices::recover_owned_ims_sessions)
+            .await
+            .map_err(|reason| ObservationError::Unavailable(reason.into()))?
+        {
+            // The gate is used only by MM startup. No line/worker exists yet,
+            // and the same ownership proof required by main has now succeeded.
+            crate::platform::netns::reclaim_all_stranded_hardware_links().await;
+        }
         let mut discovery_failed = false;
         let mut discovered = match self.observations.discover().await {
             Ok(bindings) => bindings,

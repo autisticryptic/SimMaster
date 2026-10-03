@@ -85,6 +85,12 @@ pub trait DeviceDriver: Send + Sync {
         Box::pin(async {})
     }
 
+    /// A pending prior-boot proof must run before deterministic UE namespaces
+    /// are recreated. Other recovery failures retain their existing behavior.
+    fn requires_pre_namespace_ims_recovery(&self) -> bool {
+        false
+    }
+
     fn recover_owned_ims(&self) -> TransportFuture<'_, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
@@ -203,6 +209,14 @@ pub async fn recover_owned_ims_sessions() -> bool {
         }
     }
     verified
+}
+
+/// Read-only hint used only when the initial recovery pass was unverified.
+/// Keep driver-specific ownership formats below the device boundary.
+pub fn requires_pre_namespace_ims_recovery() -> bool {
+    registered_drivers()
+        .iter()
+        .any(|driver| driver.requires_pre_namespace_ims_recovery())
 }
 
 /// Return the registered driver for a detected platform.

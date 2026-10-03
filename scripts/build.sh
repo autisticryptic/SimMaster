@@ -9,8 +9,8 @@ cd "$(dirname "$0")/.."
 
 # 目标平台。默认高通 410 等 aarch64 Debian 设备（musl 静态链接，不依赖设备 glibc 版本）。
 # 借助 zig 可交叉编译到其他平台，例如：
+# Installer packages support these two targets only:
 #   TARGET=x86_64-unknown-linux-musl ./scripts/build.sh
-#   TARGET=armv7-unknown-linux-musleabihf ./scripts/build.sh
 TARGET="${TARGET:-aarch64-unknown-linux-musl}"
 
 is_macos() {
@@ -185,7 +185,7 @@ if [ "$BUILD_BACKEND" = true ]; then
     BUILD_TOOL=""
     if command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then
         BUILD_TOOL="zig"
-    elif command -v aarch64-unknown-linux-musl-gcc >/dev/null 2>&1; then
+    elif command -v "${TARGET}-gcc" >/dev/null 2>&1; then
         BUILD_TOOL="musl-gcc"
     else
         echo "❌ 错误: 未找到可用的交叉编译后端。"
@@ -194,7 +194,7 @@ if [ "$BUILD_BACKEND" = true ]; then
         echo "  1) 安装 zig:            https://ziglang.org/download/ (解压后放入 PATH)"
         echo "  2) 安装 cargo-zigbuild: cargo install cargo-zigbuild"
         echo ""
-        echo "或安装传统 musl 交叉工具链，提供 aarch64-unknown-linux-musl-gcc。"
+        echo "或安装传统 musl 交叉工具链，提供 ${TARGET}-gcc。"
         if is_windows_bash; then
             echo "Windows 原生环境不建议直接构建后端 OTA 包，推荐使用 WSL2 Ubuntu。"
         fi
@@ -212,10 +212,12 @@ if [ "$BUILD_BACKEND" = true ]; then
     else
         echo "🔧 使用 musl-gcc 工具链交叉编译"
         # 设置交叉编译环境变量
-        export CC_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-gcc
-        export CXX_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-g++
-        export AR_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-ar
-        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc
+        T_LOWER=${TARGET//-/_}
+        T_UPPER=$(printf '%s' "$T_LOWER" | tr '[:lower:]' '[:upper:]')
+        export "CC_${T_LOWER}=${TARGET}-gcc"
+        export "CXX_${T_LOWER}=${TARGET}-g++"
+        export "AR_${T_LOWER}=${TARGET}-ar"
+        export "CARGO_TARGET_${T_UPPER}_LINKER=${TARGET}-gcc"
 
         cargo build --release --target "$TARGET"
     fi
@@ -267,120 +269,10 @@ if [ "$SKIP_OTA" = false ] && [ "$BUILD_BACKEND" = true ] && [ "$BUILD_FRONTEND"
     echo "=========================================="
     echo ""
     
-    BINARY_PATH="backend/target/$TARGET/release/simadmin"
-    FRONTEND_DIR="frontend/dist"
-    
-    # 检查构建产物
-    if [ ! -f "$BINARY_PATH" ]; then
-        echo "跳过 OTA: 后端二进制不存在"
-    elif [ ! -d "$FRONTEND_DIR" ]; then
-        echo "跳过 OTA: 前端构建产物不存在"
-    else
-        # 获取 Git commit
-        if command -v git &> /dev/null && [ -d ".git" ]; then
-            COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-        else
-            COMMIT="unknown"
-        fi
-        
-        # 构建时间
-        BUILD_TIME=$(TZ=Asia/Shanghai date +"%Y-%m-%dT%H:%M:%S+08:00")
-        
-        # 目标架构
-        ARCH="$TARGET"
-        
-        # 创建临时目录
-        require_cmd mktemp "请安装 mktemp/coreutils，或在 WSL2/Linux/macOS 中运行构建脚本。"
-        require_cmd tar "请安装 tar。"
-        require_cmd find "请安装 findutils。"
-        require_cmd sort "请安装 coreutils。"
-        if ! is_macos; then
-            require_cmd md5sum "请安装 coreutils，确保 md5sum 可用。"
-        fi
-
-        OTA_TMP=$(mktemp -d)
-        trap "rm -rf $OTA_TMP" EXIT
-        
-        echo "版本: $VERSION"
-        echo "Commit: $COMMIT"
-        echo "构建时间: $BUILD_TIME"
-        echo ""
-        
-        # 复制后端二进制
-        echo "复制后端二进制..."
-        cp "$BINARY_PATH" "$OTA_TMP/simadmin"
-        chmod 755 "$OTA_TMP/simadmin"
-        
-        # 计算二进制 MD5
-        if is_macos; then
-            BINARY_MD5=$(md5 -q "$OTA_TMP/simadmin")
-        else
-            BINARY_MD5=$(md5sum "$OTA_TMP/simadmin" | cut -d' ' -f1)
-        fi
-        echo "  二进制 MD5: $BINARY_MD5"
-        
-        # 复制前端文件
-        echo "复制前端文件..."
-        mkdir -p "$OTA_TMP/www"
-        cp -r "$FRONTEND_DIR"/* "$OTA_TMP/www/"
-
-        # Preserve device-owned resources below their driver directory. The
-        # generic installer delegates their installation at runtime.
-        mkdir -p "$OTA_TMP/devices"
-        for DEVICE_DIR in deploy/devices/*; do
-            [ -d "$DEVICE_DIR/system" ] || continue
-            DEVICE_NAME=$(basename "$DEVICE_DIR")
-            mkdir -p "$OTA_TMP/devices/$DEVICE_NAME/system"
-            cp -R "$DEVICE_DIR/system/." "$OTA_TMP/devices/$DEVICE_NAME/system/"
-        done
-
-        # 计算前端 MD5
-        if is_macos; then
-            FRONTEND_MD5=$(find "$OTA_TMP/www" -type f -exec md5 -q {} \; | sort | tr '\n' '\n' | md5 -q)
-        else
-            FRONTEND_MD5=$(find "$OTA_TMP/www" -type f -exec md5sum {} \; | cut -d' ' -f1 | sort | md5sum | cut -d' ' -f1)
-        fi
-        echo "  前端 MD5: $FRONTEND_MD5"
-        
-        # 生成 meta.json
-        cat > "$OTA_TMP/meta.json" << EOF
-{
-    "version": "$VERSION",
-    "commit": "$COMMIT",
-    "build_time": "$BUILD_TIME",
-    "binary_md5": "$BINARY_MD5",
-    "frontend_md5": "$FRONTEND_MD5",
-    "arch": "$ARCH"
-}
-EOF
-        
-        # 创建输出目录
-        mkdir -p release
-        
-        # 打包
-        OTA_FILE="release/simadmin_${VERSION}.tar.gz"
-        echo "打包 OTA..."
-        cd "$OTA_TMP"
-        tar -czf - meta.json simadmin www devices > "$OLDPWD/$OTA_FILE"
-        cd "$OLDPWD"
-        
-        # 显示结果
-        echo ""
-        echo "OTA 更新包生成完成!"
-        echo "输出: $OTA_FILE"
-        ls -lh "$OTA_FILE"
-        
-        # 计算包的 MD5
-        if is_macos; then
-            OTA_MD5=$(md5 -q "$OTA_FILE")
-        else
-            OTA_MD5=$(md5sum "$OTA_FILE" | cut -d' ' -f1)
-        fi
-        echo "OTA 包 MD5: $OTA_MD5"
-    fi
+    TARGET="$TARGET" VERSION="$VERSION" sh ./scripts/pack-ota.sh
 fi
 
 echo ""
 echo "=========================================="
-echo "部署命令: ./scripts/deploy.sh"
+echo "安装指南: docs/INSTALL.md（先校验发布包，再运行包内 install.sh；默认不激活）"
 echo "=========================================="

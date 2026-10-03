@@ -25,6 +25,10 @@ use crate::connectivity::modems::ims::vowifi::profile_record::{
 };
 use crate::connectivity::modems::ims::vowifi::profiles;
 
+#[cfg(test)]
+#[path = "carrier_catalog_v7_variants_tests.rs"]
+mod variants_tests;
+
 const PROTOCOL_BASELINE: &str = "carrier-bundles-ims-v1";
 const BASELINE_IKE_PROPOSALS: &[&str] = &[
     "aes128-sha256-modp2048",

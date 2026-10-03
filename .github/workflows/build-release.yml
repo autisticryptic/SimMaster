@@ -3,8 +3,9 @@ name: Build-Release
 # 多架构构建：普通 push 只生成 Actions artifacts；仅 master 上显式手动授权发布。
 # 整合开发分支不得覆盖旧版本 Release 或标签。
 #
-# 产物结构与既有 OTA 包保持一致（meta.json + simadmin + www/），
-# 符合 deploy/install.sh 的安装约定，可直接被现有 OTA 流程消费。
+# 产物使用 scripts/pack-ota.sh 的统一契约：meta.json + simadmin + www/ +
+# devices/ + 离线安装器 + 同版本主服务单元 + 完整 SHA256SUMS。
+# 兼容既有 OTA 元数据结构，但不代表旧 Web OTA 应用流程已验收。
 #
 # 目前支持的架构：
 #   - linux/aarch64 (ARM64) -> simadmin-linux-arm64.tar.gz
@@ -71,6 +72,9 @@ jobs:
 
       - name: Test release version policy
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+
+      - name: Test installer and package safety (temporary roots only)
+        run: python3 -m unittest discover -s scripts/tests -p 'test_installer.py' -v
 
       - name: Decide publication policy
         id: publication
@@ -229,6 +233,8 @@ jobs:
             services::automation::scheduler::tests \
             services::automation::target::tests \
             services::line_registry::tests \
+            services::line_registry::ims_startup_gate::tests \
+            hardware::sim::esim::tests \
             services::ue_worker::tests \
             services::ue_netcfg::tests \
             connectivity::modems::ims::cellular_ims::identity::tests \
@@ -259,6 +265,8 @@ jobs:
             connectivity::modems::ims::vowifi::epdg::tests \
             connectivity::modems::ims::vowifi::profile_record::tests \
             connectivity::modems::ims::vowifi::profiles::tests \
+            connectivity::modems::ims::vowifi::ike_state::tests \
+            connectivity::modems::ims::vowifi::live::derived_hardening_tests \
             connectivity::modems::ims::vowifi::carrier_catalog::v7::tests \
             connectivity::modems::ims::vowifi::profile_store::tests \
             connectivity::modems::ims::vowifi::socks5::tests \
@@ -440,87 +448,15 @@ jobs:
           ARCH: ${{ matrix.arch }}
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          echo "=========================================="
-          echo "  打包 ${ARCH} (${TARGET})"
-          echo "=========================================="
-
-          COMMIT=$(git rev-parse --short HEAD)
-          BUILD_TIME=$(TZ=Asia/Shanghai date +"%Y-%m-%dT%H:%M:%S+08:00")
-
-          BINARY_PATH="backend/target/$TARGET/release/simadmin"
-          FRONTEND_DIR="frontend/dist"
-
-          if [ ! -f "$BINARY_PATH" ]; then
-            echo "❌ 错误: 后端二进制不存在"
-            exit 1
-          fi
-          if [ ! -d "$FRONTEND_DIR" ]; then
-            echo "❌ 错误: 前端构建产物不存在"
-            exit 1
-          fi
-
-          TMP=$(mktemp -d)
-
-          # ---- 后端二进制 ----
-          cp "$BINARY_PATH" "$TMP/simadmin"
-          chmod 755 "$TMP/simadmin"
-          BINARY_MD5=$(md5sum "$TMP/simadmin" | cut -d' ' -f1)
-
-          # ---- 前端 www ----
-          mkdir -p "$TMP/www"
-          cp -r "$FRONTEND_DIR"/* "$TMP/www/"
-          FRONTEND_MD5=$(find "$TMP/www" -type f -exec md5sum {} \; | cut -d' ' -f1 | sort | md5sum | cut -d' ' -f1)
-
-          # ---- Device-owned resources ----
-          # Preserve the driver directory boundary in the artifact. The generic
-          # OTA installer delegates installation to the detected device driver.
-          mkdir -p "$TMP/devices"
-          for DEVICE_DIR in deploy/devices/*; do
-            [ -d "$DEVICE_DIR/system" ] || continue
-            DEVICE_NAME=$(basename "$DEVICE_DIR")
-            mkdir -p "$TMP/devices/$DEVICE_NAME/system"
-            cp -R "$DEVICE_DIR/system/." "$TMP/devices/$DEVICE_NAME/system/"
-          done
-
-          # ---- meta.json ----
-          cat > "$TMP/meta.json" << EOF
-          {
-              "version": "$VERSION",
-              "commit": "$COMMIT",
-              "build_time": "$BUILD_TIME",
-              "binary_md5": "$BINARY_MD5",
-              "frontend_md5": "$FRONTEND_MD5",
-              "arch": "$TARGET"
-          }
-          EOF
-          cat "$TMP/meta.json"
-
-          mkdir -p release
-          OUT="release/simadmin-linux-${ARCH}.tar.gz"
-
-          ( cd "$TMP" && tar -czf - meta.json simadmin www devices ) > "$OUT"
-
-          echo ""
-          echo "✅ 打包完成: $OUT"
-          ls -lh "$OUT"
-          echo "📋 包内容:"
-          tar -tzf "$OUT" | head -20
-
-          OTA_MD5=$(md5sum "$OUT" | cut -d' ' -f1)
-          OTA_SHA256=$(sha256sum "$OUT" | cut -d' ' -f1)
-          echo "📝 MD5:    $OTA_MD5"
-          echo "📝 SHA256: $OTA_SHA256"
-
-          echo "build_time=$BUILD_TIME" >> $GITHUB_OUTPUT
-          echo "ota_md5=$OTA_MD5" >> $GITHUB_OUTPUT
-          echo "ota_sha256=$OTA_SHA256" >> $GITHUB_OUTPUT
+        run: sh scripts/pack-ota.sh
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
           name: pkg-${{ matrix.arch }}
-          path: release/simadmin-linux-${{ matrix.arch }}.tar.gz
+          path: |
+            release/simadmin-linux-${{ matrix.arch }}.tar.gz
+            release/simadmin-linux-${{ matrix.arch }}.tar.gz.sha256
           retention-days: 3
           if-no-files-found: error
 
@@ -601,14 +537,16 @@ jobs:
             | aarch64 (ARM64) | `simadmin-linux-arm64.tar.gz` | ARM64 Linux 设备 |
             | x86_64 (AMD64)  | `simadmin-linux-amd64.tar.gz` | AMD64/x86_64 Linux 设备 |
 
-            每个包内容：`meta.json` + `simadmin` 二进制 + `www/` 前端 + `devices/` 设备驱动资源。
-            校验值见 `SHA256SUMS.txt`。
+            每个包内容：`meta.json`、`simadmin`、`www/`、`devices/`、`install.sh`、
+            `installer.py`、`system/simadmin.service`、完整文件清单 `SHA256SUMS`。
+            下载包的校验值见 `SHA256SUMS.txt`（不是数字签名）。
 
             ### 安装 / 更新
-            请按本 commit 的 `docs/INSTALL.md` 手动安装，并先校验 `SHA256SUMS.txt`、
-            包内版本/commit/架构及设备实际运行版本。旧一键安装/OTA 流程仍在重构，
-            不因发布版本号变化而视为已验收。保持原配置/数据库及后端选择，
-            不自动切换 native 或执行设备重启。
+            按本 commit 的 `docs/INSTALL.md` 校验并运行包内离线安装器；在线 bootstrap
+            必须显式指定可信 REPO 和此版本，不能混用 latest 与分支资源。
+            默认只安装文件，不启动或启用主服务，不安装/激活硬件服务、不重启 MM/NM。
+            `--activate` 仅供明确授权的维护窗口。保留原配置、数据库和后端选择。
+            旧 Web OTA 应用/自动卸载未在本次修复中验收；本发布不代表实机安装已验收。
           draft: false
           prerelease: ${{ fromJSON(needs.prepare.outputs.prerelease) }}
           make_latest: ${{ needs.prepare.outputs.make_latest }}
