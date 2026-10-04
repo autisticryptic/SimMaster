@@ -79,6 +79,53 @@ fn fixture() -> (Receipt, Snapshot, String) {
 }
 
 #[test]
+fn reboot_retirement_requires_same_sim_new_boot_and_proven_absence() {
+    let (receipt, mut current, boot) = fixture();
+    let new_boot = "abcdefab-1234-1234-1234-123456789abc";
+    assert!(!prior_boot_receipt(None, new_boot).unwrap());
+    assert!(!prior_boot_receipt(Some(&receipt), &boot).unwrap());
+    assert!(prior_boot_receipt(Some(&receipt), new_boot).unwrap());
+    assert!(prior_boot_receipt(Some(&receipt), "invalid").is_err());
+    assert!(
+        validate_reboot_absence(&receipt, &current, new_boot).is_err(),
+        "different SIM must remain explicit maintenance"
+    );
+    current.stable_sim_fingerprint = receipt.before.stable_sim_fingerprint.clone();
+    assert!(validate_reboot_absence(&receipt, &current, new_boot).is_ok());
+    assert!(validate_reboot_absence(&receipt, &current, &boot).is_err());
+    assert!(validate_reboot_absence(&receipt, &current, "invalid-boot").is_err());
+    for change in 0..5 {
+        let mut bad = current.clone();
+        match change {
+            0 => {
+                bad.profiles.insert(4, receipt.owned.clone().unwrap());
+            }
+            1 => {
+                bad.definitions
+                    .insert(4, receipt.owned_definition.clone().unwrap());
+            }
+            2 => {
+                bad.reporting.insert(4, [1, 0, 0]);
+            }
+            3 => bad.control_topology = Some("different-device".into()),
+            _ => bad.stable_sim_fingerprint = None,
+        }
+        assert!(validate_reboot_absence(&receipt, &bad, new_boot).is_err());
+    }
+    for phase in [
+        Phase::Creating,
+        Phase::Probing,
+        Phase::RestoringReporting,
+        Phase::Deleting,
+        Phase::Rejected,
+    ] {
+        let mut bad = receipt.clone();
+        bad.phase = phase;
+        assert!(validate_reboot_absence(&bad, &current, new_boot).is_err());
+    }
+}
+
+#[test]
 fn runtime_retirement_accepts_absence_not_cross_owner_adoption() {
     let (receipt, current, boot) = fixture();
     assert_eq!(
@@ -360,6 +407,74 @@ fn runtime_retirement_archives_exact_metadata_before_removing_active_name() {
     assert_eq!(fs::metadata(&archive).unwrap().mode() & 0o777, 0o600);
     assert_eq!(archive.parent().unwrap(), dir.join("retired"));
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn runtime_retirement_resumes_after_durable_archive_before_active_removal() {
+    let (dir, source, bytes) = temporary_source();
+    let archive_dir = dir.join("retired");
+    ensure_directory(&archive_dir).unwrap();
+    let archive = archive_dir.join(format!("absent-{}.receipt", fingerprint(&bytes).unwrap()));
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&archive)
+        .unwrap();
+    output.write_all(&bytes).unwrap();
+    output.sync_all().unwrap();
+    let inode = output.metadata().unwrap().ino();
+    drop(output);
+    assert_eq!(archive_source(&source, &bytes).unwrap(), archive);
+    assert!(!source.exists());
+    assert_eq!(fs::read(&archive).unwrap(), bytes);
+    assert_eq!(
+        fs::metadata(&archive).unwrap().ino(),
+        inode,
+        "existing evidence must not be replaced"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn runtime_retirement_rejects_unsafe_or_partial_existing_archives() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    for case in 0..4 {
+        let (dir, source, bytes) = temporary_source();
+        let archive_dir = dir.join("retired");
+        ensure_directory(&archive_dir).unwrap();
+        let archive = archive_dir.join(format!("absent-{}.receipt", fingerprint(&bytes).unwrap()));
+        match case {
+            0 => symlink(&source, &archive).unwrap(),
+            1 => fs::hard_link(&source, &archive).unwrap(),
+            _ => {
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&archive)
+                    .unwrap();
+                output
+                    .write_all(if case == 2 {
+                        &bytes[..bytes.len() / 2]
+                    } else {
+                        &bytes
+                    })
+                    .unwrap();
+                output.sync_all().unwrap();
+                if case == 3 {
+                    fs::set_permissions(&archive, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+            }
+        }
+        assert!(archive_source(&source, &bytes).is_err(), "case={case}");
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            bytes,
+            "blocking receipt must remain"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[test]

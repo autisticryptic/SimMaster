@@ -60,13 +60,11 @@ export interface EsimEuiccInfo {
   manufacturer: string
   memory_total_kb?: number
   memory_available_kb?: number
-  memory_total_customizable?: boolean
   raw: unknown
 }
 
 export interface EsimConfig {
   lpac_path: string
-  custom_memory_total_kb?: number | null
   /** Deprecated global reader fields returned by older backends. */
   apdu_backend?: string
   http_backend?: string

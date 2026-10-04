@@ -48,6 +48,9 @@ use crate::{
     },
 };
 
+#[path = "ims_startup_gate.rs"]
+mod ims_startup_gate;
+
 /// Independent recovery bookkeeping for one physical line. Keeping this on
 /// `LineRuntime` prevents a slow or unhealthy modem from consuming another
 /// line's retry counters or cooldowns.
@@ -606,7 +609,8 @@ pub struct LineRuntimeRegistry {
     lines: AsyncRwLock<BTreeMap<String, Arc<LineRuntime>>>,
     /// Serializes hardware discovery passes without holding the registry write
     /// lock across worker, QMI, or namespace operations.
-    refresh_lock: Mutex<()>,
+    refresh_lock: Arc<Mutex<()>>,
+    ims_startup_gate: ims_startup_gate::ImsStartupGate,
     config_manager: Option<Arc<ConfigManager>>,
     /// Used to restore each line's cumulative proxied-traffic counters when the
     /// line is first discovered, so totals survive a restart.
@@ -631,7 +635,8 @@ impl LineRuntimeRegistry {
     pub fn new(device_kind: DeviceKind, observations: Arc<dyn ModemObservationProvider>) -> Self {
         Self {
             lines: AsyncRwLock::new(BTreeMap::new()),
-            refresh_lock: Mutex::new(()),
+            refresh_lock: Arc::new(Mutex::new(())),
+            ims_startup_gate: ims_startup_gate::ImsStartupGate::default(),
             config_manager: None,
             database: None,
             traffic_persistence_lock: Mutex::new(()),
@@ -682,6 +687,25 @@ impl LineRuntimeRegistry {
         line
     }
 
+    /// Reserve the inventory while a single-modem eSIM operation can restart MM.
+    /// Refresh is the only production creator/publisher of line runtimes, so
+    /// retaining this guard also prevents a newly discovered modem from being
+    /// admitted after the caller checks the inventory. Never wait behind an
+    /// in-flight refresh while holding per-line cleanup/serial locks.
+    pub fn reserve_esim_switch_inventory(
+        &self,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, &'static str> {
+        Arc::clone(&self.refresh_lock)
+            .try_lock_owned()
+            .map_err(|_| "mm_ims_switch_inventory_busy")
+    }
+
+    /// Called only before the first refresh, for unresolved prior-boot IMS
+    /// ownership. API and periodic refreshes must use the same provisioning gate.
+    pub async fn defer_ims_startup_recovery(&self) {
+        self.ims_startup_gate.defer().await;
+    }
+
     /// Refresh presence and descriptors without discarding per-line runtime
     /// state. Missing lines remain addressable as offline entries so callers
     /// can tear them down and the same SIM can safely reappear after hotplug.
@@ -690,6 +714,16 @@ impl LineRuntimeRegistry {
         // Keep discovery/reconciliation passes ordered, while the registry write
         // lock remains reserved for the short snapshot publication below.
         let _refresh_guard = self.refresh_lock.lock().await;
+        if self
+            .ims_startup_gate
+            .ensure_ready(devices::recover_owned_ims_sessions)
+            .await
+            .map_err(|reason| ObservationError::Unavailable(reason.into()))?
+        {
+            // The gate is used only by MM startup. No line/worker exists yet,
+            // and the same ownership proof required by main has now succeeded.
+            crate::platform::netns::reclaim_all_stranded_hardware_links().await;
+        }
         let mut discovery_failed = false;
         let mut discovered = match self.observations.discover().await {
             Ok(bindings) => bindings,
@@ -1609,6 +1643,50 @@ mod tests {
             VoicePathPolicy::default(),
             DeviceKind::Unknown,
         )
+    }
+
+    #[tokio::test]
+    async fn esim_switch_inventory_reservation_blocks_discovery_until_release() {
+        let provider = Arc::new(TestObservations::new(Ok(serving_snapshot())));
+        let registry = LineRuntimeRegistry::new(DeviceKind::Unknown, provider.clone());
+        let guard = registry.reserve_esim_switch_inventory().unwrap();
+        assert!(registry.reserve_esim_switch_inventory().is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(10), registry.refresh())
+            .await
+            .is_err());
+        assert_eq!(provider.discover_calls.load(Ordering::SeqCst), 0);
+        drop(guard);
+        assert_eq!(registry.refresh().await.unwrap(), 0);
+        assert_eq!(provider.discover_calls.load(Ordering::SeqCst), 1);
+        assert!(registry.reserve_esim_switch_inventory().is_ok());
+    }
+
+    #[tokio::test]
+    async fn esim_switch_inventory_rejects_inflight_refresh_and_releases_on_cancel() {
+        let registry = Arc::new(LineRuntimeRegistry::new(
+            DeviceKind::Unknown,
+            Arc::new(TestObservations::new(Ok(serving_snapshot()))),
+        ));
+        let refresh = registry.refresh_lock.lock().await;
+        assert_eq!(
+            registry.reserve_esim_switch_inventory().err().unwrap(),
+            "mm_ims_switch_inventory_busy"
+        );
+        drop(refresh);
+        let (ready, received) = tokio::sync::oneshot::channel();
+        let operation = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let _guard = registry.reserve_esim_switch_inventory().unwrap();
+                ready.send(()).unwrap();
+                std::future::pending::<()>().await;
+            })
+        };
+        received.await.unwrap();
+        assert!(registry.reserve_esim_switch_inventory().is_err());
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        assert!(registry.reserve_esim_switch_inventory().is_ok());
     }
 
     #[tokio::test]
