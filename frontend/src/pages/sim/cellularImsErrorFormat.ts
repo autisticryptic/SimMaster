@@ -4,6 +4,17 @@ const PROFILE_NOT_READY = /carrier_catalog_profile_not_ready:([^:]+):lte_epc:([^
 const PROFILE_PLMN = /(?:home_plmn|imsi_prefix):([0-9]{5,6}|unknown):access:lte_epc:no_ready_profile/
 const IMS_SERVICE_NOT_SUBSCRIBED = /ServiceOptionNotSubscribed|service-option-not-subscribed|option-unsubscribed|Requested service option not subscribed/i
 const SIP_STATUS = /sip_status=(\d{3})/i
+const RECONCILIATION_DIAGNOSTICS = [
+  'mm_ims_profile_reconcile_unverified',
+  'mm_ims_profile_reconcile_source_changed',
+  'mm_ims_profile_reconcile_journal_invalid',
+  'mm_ims_profile_reconcile_binding_changed',
+  'mm_ims_profile_reconcile_observation_changed',
+  'mm_ims_profile_reconcile_manual_required',
+  'mm_ims_profile_reconcile_store_failed',
+  'mm_ims_profile_reconcile_observation_failed',
+  'mm_ims_profile_reconcile_pending',
+] as const
 
 // `last_error` is a `code[:detail]` chain, and a detail may embed further codes.
 // Codes are matched as whole tokens, never as substrings: the backend table is
@@ -146,6 +157,9 @@ export function cellularImsErrorMessage(error?: string | null) {
   if (codes.has('cellular_ims_runtime_ims_baseband_wedged')) {
     return '设备后端报告基带状态异常，已停止本轮所有 Profile 和地址族重试。请先核对基带状态与承载归属，再安排受控恢复。'
   }
+  if (hasAny(tokensOf(error), RECONCILIATION_DIAGNOSTICS)) {
+    return '旧 IMS 资源的归属已变化或恢复结果尚未确认，已暂停本轮连接。资源确实不存在时可自动归档；仍存在的资源须在空闲维护窗口检查并确认恢复计划。不确定的删除命令不会重复执行，请勿直接删除账本或反复重试注册。'
+  }
   if (isTransientCellularImsRefreshDiagnostic(error)) return null
 
   const profileNotReady = error.match(PROFILE_NOT_READY)
@@ -182,6 +196,9 @@ export function cellularImsErrorMessage(error?: string | null) {
   if (codes.has('cellular_ims_usim_aka_failed')) {
     return 'SIM 身份已读取，但 USIM AKA 鉴权失败。请检查 UIM 通道、卡槽映射和运营商鉴权响应。'
   }
+  if (codes.has('cellular_ims_security_client_invalid')) {
+    return 'IMS 安全提案配置无效或包含当前协议栈不支持的机制，已停止发送；请检查运营商安全配置，不要通过关闭安全来绕过。'
+  }
   if (codes.has('cellular_ims_runtime_all_pcscf_failed')) {
     return 'IMS Bearer 已建立，但所有 P-CSCF 候选均连接失败。请检查运营商 Profile、PCO/DNS 返回和 IMS 路由。'
   }
@@ -198,6 +215,7 @@ export function cellularImsErrorStatusLabel(error?: string | null) {
   if (!error) return null
   const codes = cellularImsErrorCodes(error)
   if (codes.has('cellular_ims_runtime_ims_baseband_wedged')) return '基带异常，已停止重试'
+  if (hasAny(tokensOf(error), RECONCILIATION_DIAGNOSTICS)) return '旧 IMS 资源待核验恢复'
   if (isTransientCellularImsRefreshDiagnostic(error)) return null
   if (codes.has('cellular_ims_runtime_cellular_network_not_registered')) return '蜂窝网络未注册'
   const networkFailure = networkFailureStatusLabel(error, codes)
@@ -209,6 +227,7 @@ export function cellularImsErrorStatusLabel(error?: string | null) {
   if (codes.has('cellular_ims_runtime_ims_endpoint_unavailable')) return 'IMS 数据端口不可用'
   if (codes.has('cellular_ims_runtime_ims_bearer_start_failed')) return 'IMS Bearer 建立失败'
   if (codes.has('cellular_ims_runtime_ims_family_unsupported') || codes.has('cellular_ims_pcscf_family_mismatch')) return 'IMS 地址族不兼容'
+  if (codes.has('cellular_ims_security_client_invalid')) return 'IMS 安全提案无效'
   if (codes.has('cellular_ims_runtime_all_pcscf_failed')) return 'P-CSCF 不可达'
   if (codes.has('cellular_ims_usim_aka_failed') || codes.has('cellular_ims_aka_material_invalid') || codes.has('cellular_ims_aka_res_empty')) return 'SIM AKA 鉴权失败'
   if (hasAny(codes, DIGEST_FAILURES)) return 'IMS 鉴权响应异常'

@@ -1,6 +1,7 @@
 //! Bounded RFC 3329 server-offer selection. Select one installable agreement,
 //! but echo the complete, ordered Security-Server list in Security-Verify.
-//! This does not change the client offer or relax a strict profile policy.
+//! Build a bounded complete client offer and accept only compatible server
+//! selections when the profile requires strict matching.
 use std::collections::{HashMap, HashSet};
 
 use super::{
@@ -84,6 +85,79 @@ fn quality(value: &str) -> Option<u16> {
     }
 }
 
+/// Serialize every explicitly allowed, installable alternative with the SAME
+/// reserved tuple. No client q-values, inferred algorithms or silent truncation.
+/// Authenticated requests repeat this frozen list, not just the selected entry.
+pub(super) fn client_offer(
+    binding: SecAgree,
+    allowed: &[&str],
+    compact: bool,
+    spaced: bool,
+) -> Result<String, CellularImsError> {
+    let invalid = || CellularImsError::new(code::SECURITY_CLIENT_INVALID);
+    if allowed.len() > MAX_OFFERS {
+        return Err(invalid());
+    }
+    if allowed.is_empty() {
+        return Ok(String::new());
+    }
+    if binding.spi_c == 0 || binding.spi_s == 0 || binding.port_c == 0 || binding.port_s == 0 {
+        return Err(invalid());
+    }
+    let mut seen = HashSet::new();
+    let mut offers = Vec::new();
+    let separator = if spaced { "; " } else { ";" };
+    for mechanism in allowed {
+        let parts = mechanism.split('/').collect::<Vec<_>>();
+        if parts.len() != 4
+            || parts.iter().any(|part| !token(part))
+            || !parts[2].eq_ignore_ascii_case("esp")
+            || !parts[3].eq_ignore_ascii_case("trans")
+        {
+            return Err(invalid());
+        }
+        ipsec::xfrm_algs_from_security_server(&format!(
+            "ipsec-3gpp;alg={};ealg={}",
+            parts[0], parts[1]
+        ))
+        .map_err(|_| invalid())?;
+        if !seen.insert(mechanism.to_ascii_lowercase()) {
+            continue;
+        }
+        let mut fields = vec![
+            "ipsec-3gpp".to_string(),
+            format!("alg={}", parts[0]),
+            format!("ealg={}", parts[1]),
+        ];
+        if !compact {
+            fields.extend([format!("prot={}", parts[2]), format!("mod={}", parts[3])]);
+        }
+        fields.extend([
+            format!("spi-c={}", binding.spi_c),
+            format!("spi-s={}", binding.spi_s),
+            format!("port-c={}", binding.port_c),
+            format!("port-s={}", binding.port_s),
+        ]);
+        offers.push(fields.join(separator));
+    }
+    let header = offers.join(", ");
+    if header.len() > MAX_HEADER_BYTES {
+        return Err(invalid());
+    }
+    Ok(header)
+}
+
+/// The legacy spelling is already mapped to the identical HMAC-SHA1-96
+/// primitive by XFRM. Compare only this known integrity-token alias; do not
+/// weaken the encryption, transport or explicitly allowed algorithm policy.
+fn same_integrity_algorithm(actual: &str, expected: &str) -> bool {
+    let sha1 = |value: &str| {
+        value.eq_ignore_ascii_case("hmac-sha-1-96")
+            || value.eq_ignore_ascii_case("hmac-sha1-96")
+    };
+    actual.eq_ignore_ascii_case(expected) || (sha1(actual) && sha1(expected))
+}
+
 /// No header means no negotiation. A present but unusable/ambiguous list is
 /// an error, not permission to continue unprotected. Known-but-incomplete
 /// agreements also fail closed rather than silently selecting a weaker one.
@@ -165,12 +239,11 @@ pub(super) fn select(
             && !allowed.iter().any(|mechanism| {
                 let expected = mechanism.split('/').collect::<Vec<_>>();
                 expected.len() == 4
-                    && ["alg", "ealg", "prot", "mod"]
+                    && same_integrity_algorithm(alg, expected[0])
+                    && [ealg, prot, mode]
                         .into_iter()
-                        .zip(expected)
-                        .all(|(name, expected)| {
-                            get(name).is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
-                        })
+                        .zip(&expected[1..])
+                        .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
             })
         {
             continue;
@@ -220,6 +293,129 @@ mod tests {
 
     fn choose(values: &[String]) -> Agreement {
         select(values, &[], false).unwrap().unwrap()
+    }
+
+    #[test]
+    fn all_client_alternatives_share_one_tuple_and_preserve_order() {
+        let binding = SecAgree {
+            spi_c: 100,
+            spi_s: 101,
+            port_c: 5064,
+            port_s: 5062,
+        };
+        let allowed = [
+            "hmac-sha-1-96/aes-cbc/esp/trans",
+            "hmac-sha-1-96/null/esp/trans",
+        ];
+        for (compact, spaced) in [(false, false), (false, true), (true, false)] {
+            let text = client_offer(binding, &allowed, compact, spaced).unwrap();
+            let alternatives = text.split(", ").collect::<Vec<_>>();
+            assert_eq!(alternatives.len(), 2);
+            assert!(alternatives[0].contains("ealg=aes-cbc"));
+            assert!(alternatives[1].contains("ealg=null"));
+            assert!(!text.contains(";q="));
+            for part in alternatives {
+                assert_eq!(ipsec::parse_security_server(part).unwrap(), binding);
+            }
+            let chosen = select(&[offer("hmac-sha-1-96", "null", 200, "")], &allowed, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(chosen.algorithms.auth, "hmac(sha1)");
+            assert_eq!(chosen.algorithms.enc, "cipher_null");
+        }
+    }
+
+    #[test]
+    fn client_offers_reject_invalid_or_excessive_lists_instead_of_silently_truncating() {
+        let binding = SecAgree {
+            spi_c: 100,
+            spi_s: 101,
+            port_c: 5064,
+            port_s: 5062,
+        };
+        for mechanism in [
+            "",
+            "sha1/aes",
+            "hmac-sha-1-96;evil=1/aes-cbc/esp/trans",
+            "hmac-sha-1-96/null/ah/trans",
+            "hmac-sha-1-96/null/esp/tun",
+            "unknown/null/esp/trans",
+            "hmac-sha-1-96/des-cbc/esp/trans",
+        ] {
+            assert_eq!(
+                client_offer(binding, &[mechanism], false, false)
+                    .unwrap_err()
+                    .code(),
+                code::SECURITY_CLIENT_INVALID
+            );
+        }
+        let duplicate = vec!["hmac-sha-1-96/aes-cbc/esp/trans"; 17];
+        assert!(client_offer(binding, &duplicate, false, false).is_err());
+        assert!(!client_offer(binding, &duplicate[..2], false, false)
+            .unwrap()
+            .contains(','));
+        assert!(client_offer(
+            SecAgree {
+                spi_c: 0,
+                ..binding
+            },
+            &duplicate[..1],
+            false,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn strict_selection_accepts_default_transport_but_not_an_unoffered_algorithm() {
+        let allowed = [
+            "hmac-sha-1-96/aes-cbc/esp/trans",
+            "hmac-sha-1-96/null/esp/trans",
+        ];
+        let compact = offer("hmac-sha-1-96", "null", 100, "").replace(";prot=esp;mod=trans", "");
+        assert!(select(&[compact], &allowed, true).unwrap().is_some());
+        assert!(select(&[offer("hmac-md5-96", "null", 100, "")], &allowed, true).is_err());
+        assert!(select(
+            &[offer("hmac-sha-1-96", "null", 100, "")],
+            &allowed[..1],
+            true
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn strict_sha1_alias_is_the_same_algorithm_and_verify_is_not_rewritten() {
+        for (allowed_alg, wire_alg) in [
+            ("hmac-sha-1-96", "hmac-sha1-96"),
+            ("hmac-sha1-96", "hmac-sha-1-96"),
+            ("HMAC-SHA-1-96", "HMAC-SHA1-96"),
+        ] {
+            for encryption in ["aes-cbc", "null"] {
+                let allowed = format!("{allowed_alg}/{encryption}/esp/trans");
+                let wire = offer(wire_alg, encryption, 100, "");
+                let selected = select(&[wire.clone()], &[&allowed], true).unwrap().unwrap();
+                assert_eq!(selected.algorithms.auth, "hmac(sha1)");
+                assert_eq!(selected.verify, wire, "echo the original server tokens");
+            }
+        }
+    }
+
+    #[test]
+    fn sha1_alias_never_widens_encryption_or_other_algorithm_policy() {
+        let allowed = ["hmac-sha-1-96/aes-cbc/esp/trans"];
+        for (alg, enc) in [
+            ("hmac-sha1-96", "null"),
+            ("hmac-md5-96", "aes-cbc"),
+            ("hmac-sha1", "aes-cbc"),
+            ("hmac-sha-1-128", "aes-cbc"),
+        ] {
+            assert!(select(&[offer(alg, enc, 100, "")], &allowed, true).is_err());
+        }
+        assert!(select(&[offer("hmac-sha1-96", "aes-cbc", 100, "")], &[], true).is_err());
+        for change in [("prot=esp", "prot=ah"), ("mod=trans", "mod=tun")] {
+            let wire = offer("hmac-sha1-96", "aes-cbc", 100, "").replace(change.0, change.1);
+            assert!(select(&[wire], &allowed, true).is_err());
+        }
     }
 
     #[test]

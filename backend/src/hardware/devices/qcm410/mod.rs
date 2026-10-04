@@ -19,6 +19,8 @@ pub mod netdev;
 mod primary_ims_lifecycle;
 #[cfg(target_os = "linux")]
 pub use primary_ims_lifecycle::profile_lease as mm_ims_profile_lease;
+#[cfg(target_os = "linux")]
+pub use primary_ims_lifecycle::profile_lease::esim_switch_drain_guard;
 pub use primary_ims_lifecycle::recovery as mm_pcscf_recovery;
 mod primary_ims_pcscf;
 mod primary_ims_session;
@@ -107,6 +109,15 @@ impl DeviceDriver for Driver {
                 tracing::warn!("Runtime profile shutdown timed out; ownership ledger retained");
             }
         })
+    }
+
+    fn requires_pre_namespace_ims_recovery(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            mm_ims_profile_lease::runtime::requires_pre_namespace_recovery()
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
     }
 
     fn recover_owned_ims(&self) -> TransportFuture<'_, Result<(), String>> {
