@@ -320,6 +320,98 @@ pub(super) fn ordinary_profile_guard(device: &str) -> Result<fs::File, String> {
     Ok(lock)
 }
 
+/// Held from the post-cleanup proof until lpac AND the MM cycle finish. The
+/// same nonblocking flock belongs to Context, so even a receipt-free cleanup
+/// or an admission that has not written its intent yet prevents a switch.
+#[must_use = "retain the drain guard until the complete eSIM switch finishes"]
+pub struct EsimSwitchDrainGuard {
+    _lock: fs::File,
+}
+
+/// This is an absence barrier, NOT recovery and NOT a multi-line drain. The
+/// caller closes MM admission and drains its live session first, outside the
+/// serial permit. The MM restart is global: reject ALL owned/pending bearer
+/// work, including another line's work, without trying to clean it here.
+pub(super) fn esim_switch_drain_guard() -> Result<EsimSwitchDrainGuard, String> {
+    let file = ledger_file(PRIMARY)?;
+    reject_other_receipts(&file)?;
+    let lock = device_lock(&file)?;
+    switch_drain_under_lock(&file, lock, || {
+        reject_other_receipts(&file)?;
+        // A different Context may still be before its first receipt or after
+        // receipt removal. Do not mistake those intervals for a global drain.
+        if live_contexts()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|context| context.strong_count() != 0)
+        {
+            return Err("mm_ims_profile_runtime_device_busy".into());
+        }
+        switch_bearer_work_absent(
+            PENDING.load(Ordering::Acquire),
+            !leases().lock().unwrap().is_empty(),
+            Path::new(STATE_DIR),
+        )
+    })
+}
+
+fn switch_drain_under_lock(
+    file: &Path,
+    lock: fs::File,
+    no_other_work: impl FnOnce() -> Result<(), String>,
+) -> Result<EsimSwitchDrainGuard, String> {
+    // Existence, not validity/owner/phase, is the boundary. Stale, truncated,
+    // symlinked and otherwise damaged receipts must all keep lpac blocked.
+    match fs::symlink_metadata(file) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err("mm_ims_profile_runtime_receipt_pending".into()),
+        Err(_) => return Err(RUNTIME_ERROR.into()),
+    }
+    no_other_work()?;
+    Ok(EsimSwitchDrainGuard { _lock: lock })
+}
+
+fn switch_bearer_work_absent(
+    pending: usize,
+    live: bool,
+    directory: &Path,
+) -> Result<(), String> {
+    if pending != 0 || live {
+        return Err("mm_ims_profile_runtime_bearer_cleanup_pending".into());
+    }
+    // Validate the parent first: a dangling/replaced /run/simadmin symlink
+    // must not turn a hidden bearer directory into an ENOENT absence proof.
+    for path in [directory.parent().ok_or(RUNTIME_ERROR)?, directory] {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(metadata)
+                if metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.mode() & 0o022 == 0 => {}
+            _ => return Err(RUNTIME_ERROR.into()),
+        }
+    }
+    // Match the durable bearer cleanup helper's .json and pending .create
+    // markers. Do not parse them: an unreadable/damaged marker is still work.
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(RUNTIME_ERROR.into()),
+    };
+    for entry in entries {
+        let path = entry.map_err(|_| RUNTIME_ERROR)?.path();
+        if matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("json" | "create")
+        ) {
+            return Err("mm_ims_profile_lease_bearer_receipt_remaining".into());
+        }
+    }
+    Ok(())
+}
+
 fn device_lock(file: &Path) -> Result<fs::File, String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("mm_ims_profile_runtime_root_required".into());
@@ -1289,10 +1381,80 @@ where
     profile().await
 }
 
-/// Startup/new-attempt recovery hook. This can ONLY finish a runtime-owned,
-/// abandoned/dead lease from this boot and original MM owner/SIM/topology.
-/// Legacy, unknown, mid-AT and unrecorded bearer-setup states remain blocked.
-/// Callers must re-run prepare afterwards; recovery never authorizes fallback.
+fn prior_boot_receipt(receipt: Option<&Receipt>, boot: &str) -> Result<bool, String> {
+    let Some(receipt) = receipt else {
+        return Ok(false);
+    };
+    if receipt.version != 2 {
+        return Ok(false); // No change to the explicit legacy recovery contract.
+    }
+    let owner = validate_runtime_receipt(receipt)?;
+    if !valid_boot_id(boot) {
+        return Err(RUNTIME_ERROR.into());
+    }
+    Ok(owner.boot_id != boot)
+}
+
+/// This hint performs no modem or filesystem mutation. Corrupt/ambiguous
+/// metadata after a failed startup proof must not authorize new namespaces.
+pub(crate) fn requires_pre_namespace_recovery() -> bool {
+    (|| {
+        let file = ledger_file(PRIMARY)?;
+        reject_other_receipts(&file)?;
+        prior_boot_receipt(read_receipt(&file)?.as_ref(), &boot_id()?)
+    })()
+    .unwrap_or(true)
+}
+
+/// Resolve the current modem only for metadata-only prior-boot absence proof.
+/// Never use this new owner to delete/disconnect an old owner's resource.
+async fn reboot_absence_io(receipt: &Receipt) -> Result<MmProfileIo, String> {
+    require_stopped()?;
+    no_bearer_work()?;
+    let old = &receipt.before;
+    let interface = netdev::primary_netdev_for_qmi(&old.device).ok_or(RUNTIME_ERROR)?;
+    netdev::verify_mm_data_interface(&old.device, &interface)?;
+    let discovery = MmBus::new(&old.device, &old.modem, &interface).await?;
+    let objects: ManagedObjects = timed(10, async {
+        discovery
+            .proxy(
+                "/org/freedesktop/ModemManager1",
+                "org.freedesktop.DBus.ObjectManager",
+            )
+            .await?
+            .call("GetManagedObjects", &())
+            .await
+            .map_err(bus_error)
+    })
+    .await?;
+    let mut modems = objects.iter().filter_map(|(path, interfaces)| {
+        let properties = interfaces.get(MODEM)?;
+        let port = properties
+            .get("PrimaryPort")
+            .and_then(|v| <&str>::try_from(v).ok())?;
+        (Some(port) == old.device.strip_prefix("/dev/")).then(|| path.to_string())
+    });
+    let modem = modems.next().ok_or(RUNTIME_ERROR)?;
+    if modems.next().is_some() || !discovery.owner_is_current().await? {
+        return Err(RUNTIME_ERROR.into());
+    }
+    let bus = MmBus::new(&old.device, &modem, &interface).await?;
+    if bus.bus_id != discovery.bus_id || bus.owner != discovery.owner {
+        return Err(RUNTIME_ERROR.into());
+    }
+    bus.pin_sim_binding().await?;
+    Ok(MmProfileIo {
+        bus,
+        method: CreationMethod::At,
+        topology: physical_control_topology,
+    })
+}
+
+/// Startup/new-attempt recovery. Same-boot cleanup retains the original-owner
+/// contract. A prior-boot record can ONLY be archived after strict same-SIM,
+/// topology, profile/reporting, bearer, namespace and network absence proofs.
+/// Legacy, unknown, mid-AT and still-present cross-owner resources remain blocked.
+/// Callers re-run prepare afterwards; recovery does not narrow family fallback.
 pub async fn recover(device: &str) -> Result<(), String> {
     let device = device.trim().to_string();
     let (sender, receiver) = oneshot::channel();
@@ -1320,9 +1482,14 @@ async fn recover_inner(device: &str) -> Result<(), String> {
         return Err(RUNTIME_ERROR.into());
     }
     let owner = validate_runtime_receipt(&receipt)?.clone();
+    let boot = boot_id()?;
+    if owner.boot_id != boot {
+        let io = reboot_absence_io(&receipt).await?;
+        return retirement::retire_reboot_absence(&io, &DiskStore { file }, &receipt).await;
+    }
     recovery_admitted(
         &receipt,
-        &boot_id()?,
+        &boot,
         process_start(owner.process_id)? == Some(owner.process_start),
     )?;
     // Discovery is read-only and bound to the same unique owner, stable SIM
@@ -1345,6 +1512,10 @@ async fn recover_inner(device: &str) -> Result<(), String> {
 #[cfg(test)]
 #[path = "primary_ims_profile_runtime_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "primary_ims_switch_drain_tests.rs"]
+mod switch_drain_tests;
 
 #[cfg(test)]
 #[path = "primary_ims_profile_runtime_dbus_tests.rs"]

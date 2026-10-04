@@ -18,7 +18,13 @@ jobs:
   backend-tests:
     name: DNS and IMS compatibility regressions
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
+    # The binary crate has a large test graph. Keep full coverage while avoiding
+    # local builds and unnecessary debug-info memory on the hosted runner.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,9 +35,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             backend/target/
-          key: ${{ runner.os }}-checktests-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-checktests-nodebug-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-checktests-cargo-
+            ${{ runner.os }}-checktests-nodebug-cargo-v1-
       - name: Compile tests on Actions only
         working-directory: backend
         shell: bash
@@ -99,6 +105,8 @@ jobs:
             services::automation::scheduler::tests \
             services::automation::target::tests \
             services::line_registry::tests \
+            services::line_registry::ims_startup_gate::tests \
+            hardware::sim::esim::tests \
             services::ue_worker::tests \
             services::ue_netcfg::tests \
             connectivity::modems::ims::cellular_ims::identity::tests \
@@ -110,6 +118,7 @@ jobs:
             hardware::devices::qcm410::primary_ims_lifecycle::tests \
             hardware::devices::qcm410::primary_ims_lifecycle::profile_lease::tests \
             hardware::devices::qcm410::primary_ims_lifecycle::profile_lease::runtime::tests \
+            hardware::devices::qcm410::primary_ims_lifecycle::profile_lease::runtime::switch_drain_tests \
             hardware::devices::qcm410::primary_ims_lifecycle::profile_lease::runtime::retirement::tests \
             hardware::devices::qcm410::primary_ims_settings::tests \
             hardware::devices::qcm410::primary_ims_pcscf::tests \
@@ -130,6 +139,8 @@ jobs:
             connectivity::modems::ims::vowifi::epdg::tests \
             connectivity::modems::ims::vowifi::profile_record::tests \
             connectivity::modems::ims::vowifi::profiles::tests \
+            connectivity::modems::ims::vowifi::ike_state::tests \
+            connectivity::modems::ims::vowifi::live::derived_hardening_tests \
             connectivity::modems::ims::vowifi::carrier_catalog::v7::tests \
             connectivity::modems::ims::vowifi::profile_store::tests \
             connectivity::modems::ims::vowifi::socks5::tests \
@@ -153,6 +164,8 @@ jobs:
             connectivity::core::ims_access::tests \
             connectivity::core::ims_registration_coordinator::tests \
             connectivity::modems::ims::vowifi::live::coexistence_lease_tests \
+            connectivity::modems::ims::cellular_ims::channel::tests \
+            connectivity::modems::ims::cellular_ims::ipsec::tests \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \
             connectivity::modems::ims::cellular_ims::security_agreement::tests \
             connectivity::modems::ims::cellular_ims::errors::tests \
@@ -185,11 +198,21 @@ jobs:
             python3 ../.github/scripts/ci_failure_excerpt.py beta-api-tests.log "Cellular IMS API compatibility failed"
             exit 1
           fi
+      - name: Simulate standard and historical IMS registration on Actions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B offline-registration-sim/run.py \
+            --report offline-registration-sim/ci-results/standard.json
+          python3 -B offline-registration-sim/run.py --history \
+            --report offline-registration-sim/ci-results/history.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: beta-refactor-tests
-          path: backend/beta-*.log
+          path: |
+            backend/beta-*.log
+            offline-registration-sim/ci-results/
           retention-days: 7
 
   frontend:

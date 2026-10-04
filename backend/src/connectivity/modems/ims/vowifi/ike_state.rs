@@ -549,6 +549,11 @@ impl IkeStateMachine {
                 reason: "initiator_spi_mismatch",
             });
         }
+        if message.header.message_id != 0 || message.header.flags.initiator {
+            return self.fail(IkeStateError::InvalidResponse {
+                reason: "sa_init_transaction_mismatch",
+            });
+        }
         if message.header.responder_spi == 0 {
             return self.fail(IkeStateError::InvalidResponse {
                 reason: "missing_responder_spi",
@@ -582,6 +587,40 @@ impl IkeStateMachine {
             });
         };
 
+        // Reject inconsistent unauthenticated negotiation metadata before any
+        // key derivation or EAP/SIM work. A selected SA does not authorize a
+        // different KE group, duplicate mandatory payloads or an invalid nonce.
+        for kind in [
+            IkePayloadType::SecurityAssociation,
+            IkePayloadType::KeyExchange,
+            IkePayloadType::Nonce,
+        ] {
+            if message
+                .payloads
+                .iter()
+                .filter(|payload| payload.payload_type == kind)
+                .count()
+                != 1
+            {
+                return self.fail(IkeStateError::InvalidResponse {
+                    reason: "duplicate_sa_init_payload",
+                });
+            }
+        }
+        if ke_payload.body.len() != 4 + self.private.initiator_public_dh.len()
+            || u16::from_be_bytes([ke_payload.body[0], ke_payload.body[1]])
+                != self.private.initiator_dh_group
+            || ke_payload.body[2..4] != [0, 0]
+        {
+            return self.fail(IkeStateError::InvalidResponse {
+                reason: "sa_init_ke_mismatch",
+            });
+        }
+        if !(16..=256).contains(&nonce_payload.body.len()) {
+            return self.fail(IkeStateError::InvalidResponse {
+                reason: "sa_init_nonce_length_invalid",
+            });
+        }
         self.private.selected_proposal = Some(selected_proposal);
         self.private.responder_spi = Some(message.header.responder_spi);
         self.private.nat_t_supported = message.payloads.iter().any(|payload| {
@@ -591,11 +630,6 @@ impl IkeStateMachine {
                         || notify == NOTIFY_NAT_DETECTION_DESTINATION_IP
                 })
         });
-        if ke_payload.body.len() < 4 {
-            return self.fail(IkeStateError::InvalidResponse {
-                reason: "invalid_ke_payload",
-            });
-        }
         self.private.responder_public_dh = Some(ke_payload.body[4..].to_vec());
         self.private.responder_nonce = Some(nonce_payload.body.clone());
         self.private.sa_init_response_packet = Some(response.to_vec());
@@ -3473,6 +3507,87 @@ mod tests {
             IkeStateError::InvalidResponse { .. }
         ));
         assert_eq!(machine.snapshot().phase, "failed");
+    }
+
+    #[test]
+    fn sa_init_rejects_mismatched_metadata_before_recording_peer_keys() {
+        for case in 0..9 {
+            let mut state = machine(&GB_EE_23433);
+            let request = state.build_sa_init_request().unwrap();
+            let offered = state.private.selected_proposal;
+            let mut response = IkeMessage::decode(&sa_init_response(&request)).unwrap();
+            match case {
+                0 => response.header.message_id = 1,
+                1 => response.header.flags.initiator = true,
+                2 => response.payloads[1].body[1] = 2, // not offered MODP2048
+                3 => response.payloads[1].body[2] = 1,
+                4 => {
+                    response.payloads[1].body.pop();
+                }
+                5 => response.payloads[2].body = vec![0; 15],
+                6 => response.payloads[2].body = vec![0; 257],
+                7 => response.payloads.push(response.payloads[1].clone()),
+                _ => response.payloads[1].body = vec![0; 2],
+            }
+            assert!(
+                state
+                    .accept_sa_init_response(&response.encode().unwrap())
+                    .is_err(),
+                "case={case}"
+            );
+            assert!(state.private.responder_public_dh.is_none());
+            assert!(state.private.responder_nonce.is_none());
+            assert_eq!(state.private.selected_proposal, offered);
+        }
+    }
+
+    #[test]
+    fn derived_ike_accepts_source_observed_sha512_combinations_without_new_dh_attempts() {
+        use super::super::profiles::{derive_standard_3gpp_profile, Standard3gppAccess};
+        let profile =
+            derive_standard_3gpp_profile("234", "15", Standard3gppAccess::WifiEpdg).unwrap();
+        for selected in [
+            "aes256-sha512-prfsha256-modp2048",
+            "aes128-sha512-prfsha512-modp2048",
+        ] {
+            let mut state = machine(profile);
+            let request = state.build_sa_init_request().unwrap();
+            assert!(
+                request.encode().unwrap().len() < 1400,
+                "do not grow SA_INIT beyond ordinary UDP MTU"
+            );
+            let response_sa =
+                build_sa_payload(&[ike_proposal_from_profile_string(selected, 1).unwrap()])
+                    .unwrap();
+            state
+                .accept_sa_init_response(&sa_init_response_with_sa_body(&request, response_sa.body))
+                .unwrap();
+            assert_eq!(state.private.selected_proposal, Some(selected));
+            state.derive_session_keys(&[0x44; 256]).unwrap();
+            assert_eq!(state.private.initiator_dh_group, DH_MODP_2048);
+            let packet = state.build_auth_eap_start_packet().unwrap();
+            let inner = decrypt_encrypted_payload_from_message(
+                &packet,
+                state.private.secret_bundle.as_ref().unwrap(),
+                IkeSkDirection::InitiatorToResponder,
+            )
+            .unwrap();
+            assert!(inner
+                .iter()
+                .any(|p| p.payload_type == IkePayloadType::SecurityAssociation));
+            let mut corrupt = packet;
+            let last = corrupt.len() - 1;
+            corrupt[last] ^= 1;
+            assert!(
+                decrypt_encrypted_payload_from_message(
+                    &corrupt,
+                    state.private.secret_bundle.as_ref().unwrap(),
+                    IkeSkDirection::InitiatorToResponder,
+                )
+                .is_err(),
+                "negotiated integrity must reject tampered AUTH"
+            );
+        }
     }
 
     #[test]

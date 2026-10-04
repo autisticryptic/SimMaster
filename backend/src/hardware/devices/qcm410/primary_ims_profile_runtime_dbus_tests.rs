@@ -4,6 +4,7 @@ use super::*;
 #[derive(Default)]
 struct State {
     created: bool,
+    snapshots: usize,
     family: u32,
     reporting: [u8; 3],
     calls: Vec<String>,
@@ -30,7 +31,8 @@ impl Profiles {
         "profile-id"
     }
     fn list(&self) -> Vec<Properties> {
-        let state = self.0.lock().unwrap();
+        let mut state = self.0.lock().unwrap();
+        state.snapshots += 1;
         let mut values = vec![profile_properties(3, 4, "ims")];
         if state.created {
             values.push(profile_properties(7, state.family, "ims"));
@@ -279,6 +281,18 @@ async fn runtime_profile_private_bus_retirement_requires_unique_owner_absence_no
     );
     // The original unique name remains alive despite losing the service name.
     assert_ne!(original_server.unique_name(), replacement.unique_name());
+    // A genuinely different bus may reuse the same textual unique owner.
+    let original_bus = receipt.before.bus_id.clone();
+    receipt.before.bus_id = if original_bus == "a".repeat(32) {
+        "b".repeat(32)
+    } else {
+        "a".repeat(32)
+    };
+    receipt.before.owner = fresh.bus.owner.clone();
+    super::retirement::old_owner_absent(&fresh, &receipt)
+        .await
+        .unwrap();
+    receipt.before.bus_id = original_bus;
     receipt.before.owner = ":1.999999999".into();
     super::retirement::old_owner_absent(&fresh, &receipt)
         .await
@@ -287,6 +301,96 @@ async fn runtime_profile_private_bus_retirement_requires_unique_owner_absence_no
     assert!(super::retirement::old_owner_absent(&fresh, &receipt)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn runtime_profile_private_bus_reboot_archive_proves_absence_without_modem_writes() {
+    let (_server, profiles, io) = server().await;
+    let memory = MemoryStore::default();
+    let before = io.snapshot().await.unwrap();
+    let mut receipt = acquire_with(
+        &io,
+        &memory,
+        "ims",
+        4,
+        &fingerprint(&("ims", 4_u32, &before)).unwrap(),
+    )
+    .await
+    .unwrap();
+    receipt.version = 2;
+    let mut owner = RuntimeOwnership::new("synthetic-reboot-line", 0).unwrap();
+    owner.boot_id = if boot_id().unwrap() == "12345678-1234-1234-1234-123456789abc" {
+        "abcdefab-1234-1234-1234-123456789abc".into()
+    } else {
+        "12345678-1234-1234-1234-123456789abc".into()
+    };
+    receipt.runtime = Some(owner);
+    receipt.before.bus_id = if io.inner.bus.bus_id == "a".repeat(32) {
+        "b".repeat(32)
+    } else {
+        "a".repeat(32)
+    };
+    // The owner name is deliberately identical across the simulated bus reboot.
+    assert_eq!(receipt.before.owner, io.inner.bus.owner);
+    let directory = std::env::temp_dir().join(format!(
+        "simadmin-reboot-dbus-{}-{}",
+        std::process::id(),
+        profile_tag().unwrap()
+    ));
+    ensure_directory(&directory).unwrap();
+    let store = DiskStore {
+        file: directory.join("profile.json"),
+    };
+    store.save(&receipt).unwrap();
+    let source = fs::read(&store.file).unwrap();
+    for case in 0..3 {
+        {
+            let mut state = profiles.0.lock().unwrap();
+            state.calls.clear();
+            state.created = case == 0;
+            state.changed_sim = case == 1;
+            state.reporting = if case == 2 { [1, 1, 1] } else { [0, 0, 0] };
+        }
+        assert!(
+            retirement::retire_reboot_absence(&io.inner, &store, &receipt)
+                .await
+                .is_err(),
+            "case={case}"
+        );
+        assert_eq!(fs::read(&store.file).unwrap(), source);
+        assert!(profiles.0.lock().unwrap().calls.is_empty());
+    }
+    {
+        let mut state = profiles.0.lock().unwrap();
+        state.created = false;
+        state.changed_sim = false;
+        state.reporting = [0, 0, 0];
+        state.snapshots = 0;
+    }
+    retirement::retire_reboot_absence(&io.inner, &store, &receipt)
+        .await
+        .unwrap();
+    assert!(!store.file.exists());
+    assert_eq!(
+        fs::read(
+            directory
+                .join("retired")
+                .join(format!("absent-{}.receipt", fingerprint(&source).unwrap()))
+        )
+        .unwrap(),
+        source
+    );
+    let state = profiles.0.lock().unwrap();
+    assert!(
+        state.calls.is_empty(),
+        "no profile/reporting/delete mutations during retirement"
+    );
+    assert_eq!(
+        state.snapshots, 2,
+        "both complete snapshots must be observed"
+    );
+    drop(state);
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]

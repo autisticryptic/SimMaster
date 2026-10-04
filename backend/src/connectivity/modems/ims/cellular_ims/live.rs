@@ -11,6 +11,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+pub(crate) mod offline_sim_adapter {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../offline-registration-sim/cellular_adapter.rs"
+    ));
+}
+
 use chrono::Utc;
 use tokio::{process::Command, sync::Mutex};
 
@@ -782,39 +790,20 @@ enum CellularImsSecurityClientOffer {
 }
 
 impl CellularImsSecurityClientOffer {
-    fn build(self, binding: SecAgree, profile: &CarrierProfile) -> String {
-        let mechanism = profile
-            .ims
-            .register
-            .security_client_mechanisms
-            .first()
-            .copied()
-            .unwrap_or_default();
-        let mut parts = mechanism.split('/');
-        let integrity = parts.next().unwrap_or_default();
-        let encryption = parts.next().unwrap_or_default();
-        let protocol = parts.next().unwrap_or_default();
-        let mode = parts.next().unwrap_or_default();
-        let separator = if self == Self::FullSpaced { "; " } else { ";" };
-        // Field-tested against the Maxis P-CSCF: unquoted `mod=trans` (the
-        // form real Android UEs send) is accepted; the quoted RFC-ABNF form
-        // is rejected with "400 Bad header field: security-client".
-        let mut fields = vec![
-            "ipsec-3gpp".to_string(),
-            format!("alg={integrity}"),
-            format!("ealg={encryption}"),
-        ];
-        if self != Self::Compact {
-            fields.push(format!("prot={protocol}"));
-            fields.push(format!("mod={mode}"));
+    fn build(
+        self,
+        binding: SecAgree,
+        profile: &CarrierProfile,
+    ) -> Result<String, CellularImsError> {
+        if profile.ims.register.sec_agree_mode == "disabled" {
+            return Ok(String::new());
         }
-        fields.extend([
-            format!("spi-c={}", binding.spi_c),
-            format!("spi-s={}", binding.spi_s),
-            format!("port-c={}", binding.port_c),
-            format!("port-s={}", binding.port_s),
-        ]);
-        fields.join(separator)
+        super::security_agreement::client_offer(
+            binding,
+            profile.ims.register.security_client_mechanisms,
+            self == Self::Compact,
+            self == Self::FullSpaced,
+        )
     }
 }
 
@@ -1574,6 +1563,10 @@ fn select_security_server(
     profile: &CarrierProfile,
     values: &[String],
 ) -> Result<Option<super::security_agreement::Agreement>, ImsError> {
+    if profile.ims.register.sec_agree_mode == "disabled" && !values.is_empty() {
+        // An unsolicited challenge cannot override an explicit no-IPsec policy.
+        return Err(ImsError::new(code::SECURITY_SERVER_INVALID));
+    }
     let selected = super::security_agreement::select(
         values,
         profile.ims.register.security_client_mechanisms,
@@ -3260,7 +3253,7 @@ async fn connect_family(
         // strict P-CSCFs ("400 Bad header field: security-client").
         let negotiated_security = variant
             .security_client_offer
-            .build(offered_binding, profile);
+            .build(offered_binding, profile)?;
         let request_uri = sip::register_request_uri_with_target(
             profile,
             effective_register_target(&device_identity.effective_ims),
@@ -4369,11 +4362,28 @@ async fn refresh_live_registration(
         } else {
             session.security_binding
         };
-        let security_client = security_verify.as_ref().map(|_| {
-            variant
-                .security_client_offer
-                .build(pending_security_binding, session.profile)
-        });
+        let security_client = match security_verify
+            .as_ref()
+            .map(|_| {
+                variant
+                    .security_client_offer
+                    .build(pending_security_binding, session.profile)
+            })
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(error) => {
+                session.channel.discard_reserved_security_ports();
+                return CellularImsRefreshAttempt {
+                    outcome: RegistrationRefreshResult::Retry,
+                    error: Some(error),
+                    retry_after: refresh_retry_delay(
+                        &session.registration,
+                        RegistrationLossReason::SignalingTransportLost,
+                    ),
+                };
+            }
+        };
         let require_sec_agree = security_verify.is_some();
         let mut refresh_authorization = session.refresh_authorization.clone();
         let request_uri = sip::register_request_uri_with_target(
@@ -8677,7 +8687,7 @@ mod tests {
     }
 
     #[test]
-    fn server_list_fix_does_not_expand_or_change_the_client_offer() {
+    fn client_offer_preserves_all_explicitly_configured_mechanisms() {
         let mut profile = GB_EE_23433;
         profile.ims.register.security_client_mechanisms = &[
             "hmac-sha-1-96/aes-cbc/esp/trans",
@@ -8689,12 +8699,19 @@ mod tests {
             port_c: 5064,
             port_s: 5062,
         };
-        let before = CellularImsSecurityClientOffer::Full.build(binding, &profile);
+        let before = CellularImsSecurityClientOffer::Full
+            .build(binding, &profile)
+            .unwrap();
         profile.ims.register.security_client_mechanisms = &["hmac-sha-1-96/aes-cbc/esp/trans"];
-        let single = CellularImsSecurityClientOffer::Full.build(binding, &profile);
-        assert_eq!(before, single);
-        assert!(!before.contains("hmac-md5-96"));
-        assert!(!before.contains(','));
+        let single = CellularImsSecurityClientOffer::Full
+            .build(binding, &profile)
+            .unwrap();
+        assert_eq!(before.split(", ").next().unwrap(), single);
+        assert!(before.contains("hmac-md5-96"));
+        assert_eq!(before.split(", ").count(), 2);
+        for value in before.split(", ") {
+            assert_eq!(ipsec::parse_security_server(value).unwrap(), binding);
+        }
     }
 
     #[test]
@@ -9669,7 +9686,8 @@ mod tests {
             .expect("initial IMS AKA identity");
         let security_client = variant
             .security_client_offer
-            .build(offered_security(5060, 5062), profile);
+            .build(offered_security(5060, 5062), profile)
+            .unwrap();
         let request = sip::build_register_from_profile_with_target_visited_and_access(
             profile,
             sip::RegisterTarget::from_profile(profile),
@@ -9804,7 +9822,9 @@ mod tests {
             port_s: 5063,
         };
         let replacement = offered_refresh_security(old, 51731);
-        let header = CellularImsSecurityClientOffer::Full.build(replacement, profile);
+        let header = CellularImsSecurityClientOffer::Full
+            .build(replacement, profile)
+            .unwrap();
 
         assert_eq!(replacement.port_s, old.port_s);
         assert_ne!(replacement.port_c, old.port_c);
@@ -10594,7 +10614,8 @@ Content-Length: 0\r\n\r\n";
             .expect("cumulative request carries empty AKA Authorization");
         let security_client = cumulative
             .security_client_offer
-            .build(offered_security(5060, 5062), profile);
+            .build(offered_security(5060, 5062), profile)
+            .unwrap();
         let initial = sip::build_register_from_profile_with_target_visited_and_access(
             profile,
             sip::RegisterTarget::from_profile(profile),

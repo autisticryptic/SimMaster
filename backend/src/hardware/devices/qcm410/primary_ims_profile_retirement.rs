@@ -225,11 +225,62 @@ async fn observe_absence(io: &MmProfileIo, receipt: &Receipt) -> Result<Snapshot
     Ok(snapshot)
 }
 
+/// Automatic boot recovery is narrower than explicit maintenance: the card
+/// must be unchanged, and a real boot change is required. All existing absence
+/// and network proofs still apply; this never adopts or deletes a modem object.
+fn validate_reboot_absence(
+    receipt: &Receipt,
+    current: &Snapshot,
+    boot: &str,
+) -> Result<(), String> {
+    let owner = validate_runtime_receipt(receipt)?;
+    if !valid_boot_id(boot)
+        || owner.boot_id == boot
+        || receipt.before.stable_sim_fingerprint != current.stable_sim_fingerprint
+    {
+        return Err("mm_ims_profile_reboot_reconciliation_unverified".into());
+    }
+    validate_absent_profile(receipt, current, boot, false)?;
+    Ok(())
+}
+
+pub(super) async fn retire_reboot_absence(
+    io: &MmProfileIo,
+    store: &DiskStore,
+    receipt: &Receipt,
+) -> Result<(), String> {
+    let boot = boot_id()?;
+    let source = read_source(&store.file)?;
+    let decoded: Receipt = serde_json::from_slice(&source).map_err(|_| RETIRE_ERROR)?;
+    if fingerprint(&decoded)? != fingerprint(receipt)? {
+        return Err(RETIRE_ERROR.into());
+    }
+    // These require no other manager/worker, no bearer receipts, absent old
+    // namespace/network state and a stable, current MM owner. Call at startup,
+    // before line_registry creates namespaces with the same deterministic name.
+    let first = observe_absence(io, receipt).await?;
+    validate_reboot_absence(receipt, &first, &boot)?;
+    let second = observe_absence(io, receipt).await?;
+    validate_reboot_absence(receipt, &second, &boot)?;
+    verify_snapshot_pair(&first, &second)?;
+    if boot_id()? != boot {
+        return Err(RETIRE_ERROR.into());
+    }
+    require_stopped()?;
+    no_bearer_work()?;
+    old_owner_absent(io, receipt).await?;
+    archive_source(&store.file, &source)?;
+    tracing::info!(
+        "Archived prior-boot IMS ownership after same-SIM double absence proof; modem unchanged"
+    );
+    Ok(())
+}
+
 fn read_source(file: &Path) -> Result<Vec<u8>, String> {
     Ok(read_source_with_metadata(file)?.0)
 }
 
-fn read_source_with_metadata(file: &Path) -> Result<(Vec<u8>, fs::Metadata), String> {
+fn open_validated_source(file: &Path) -> Result<fs::File, String> {
     let input = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -244,6 +295,12 @@ fn read_source_with_metadata(file: &Path) -> Result<(Vec<u8>, fs::Metadata), Str
     {
         return Err(RETIRE_ERROR.into());
     }
+    Ok(input)
+}
+
+fn read_source_with_metadata(file: &Path) -> Result<(Vec<u8>, fs::Metadata), String> {
+    let input = open_validated_source(file)?;
+    let meta = input.metadata().map_err(|_| RETIRE_ERROR)?;
     let mut bytes = Vec::new();
     input
         .take(MAX_RUNTIME_RECORD_BYTES as u64 + 1)
@@ -272,18 +329,40 @@ fn archive_source(file: &Path, source: &[u8]) -> Result<PathBuf, String> {
     let archive_dir = directory.join("retired");
     ensure_directory(&archive_dir)?;
     let archive = archive_dir.join(format!("absent-{}.receipt", fingerprint(&source)?));
-    let mut output = OpenOptions::new()
+    match OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&archive)
-        .map_err(|_| "mm_ims_profile_retirement_archive_pending")?;
-    output
-        .write_all(source)
-        .and_then(|_| output.sync_all())
-        .map_err(|_| RETIRE_ERROR)?;
+    {
+        Ok(mut output) => output
+            .write_all(source)
+            .and_then(|_| output.sync_all())
+            .map_err(|_| RETIRE_ERROR)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A crash may leave the durable archive AND the active name. Resume
+            // only an exact, private, single-link copy; never overwrite evidence
+            // or accept a partial write, symlink, or unrelated file.
+            let input = open_validated_source(&archive)?;
+            let mut bytes = Vec::new();
+            (&input)
+                .take(MAX_RUNTIME_RECORD_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| RETIRE_ERROR)?;
+            if bytes != source {
+                return Err(RETIRE_ERROR.into());
+            }
+            input.sync_all().map_err(|_| RETIRE_ERROR)?;
+        }
+        Err(_) => return Err("mm_ims_profile_retirement_archive_pending".into()),
+    }
     fs::File::open(&archive_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|_| RETIRE_ERROR)?;
+    // Also persist the newly created retired/ entry in its parent BEFORE
+    // removing the only active name for the ownership record.
+    fs::File::open(directory)
         .and_then(|dir| dir.sync_all())
         .map_err(|_| RETIRE_ERROR)?;
     if read_source(file)? != source {

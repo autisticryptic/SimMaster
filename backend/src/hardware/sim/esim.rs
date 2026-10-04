@@ -314,7 +314,7 @@ impl EsimSupervisor {
             if let Some(cached) = identity_key
                 .and_then(|key| self.database.get_esim_detection_cache(key).ok().flatten())
             {
-                if let Ok(info) = serde_json::from_str::<EsimEuiccInfo>(&cached) {
+                if let Some(info) = cached_euicc_info(&cached) {
                     if !info.eid.trim().is_empty() {
                         return Ok(info);
                     }
@@ -328,16 +328,7 @@ impl EsimSupervisor {
         if !command_succeeded(&response) {
             return Err(EsimApiError::Command(response.msg));
         }
-        let mut info = normalize_euicc_info(response);
-        if info.memory_total_kb.is_none() {
-            info.memory_total_customizable = Some(true);
-            let esim_config = self.config_manager.get_esim_config();
-            if let Some(total_kb) = esim_config.custom_memory_total_kb {
-                info.memory_total_kb = Some(total_kb as f64);
-            }
-        } else {
-            info.memory_total_customizable = Some(false);
-        }
+        let info = normalize_euicc_info(response);
         if info.eid.trim().is_empty() {
             return Err(EsimApiError::Unavailable("esim_eid_missing".to_string()));
         }
@@ -1680,6 +1671,20 @@ fn eum_from_eid(eid: &str) -> Option<&'static str> {
     }
 }
 
+/// Older detection caches may contain a user-entered total rather than a chip
+/// measurement. Do not keep presenting that estimate after removing the feature.
+fn cached_euicc_info(cached: &str) -> Option<EsimEuiccInfo> {
+    let mut value: Value = serde_json::from_str(cached).ok()?;
+    if value
+        .get("memory_total_customizable")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        value.as_object_mut()?.remove("memory_total_kb");
+    }
+    serde_json::from_value(value).ok()
+}
+
 fn normalize_euicc_info(response: EsimCommandResponse) -> EsimEuiccInfo {
     let data = response.data.unwrap_or(Value::Null);
     let root = data
@@ -1747,7 +1752,6 @@ fn normalize_euicc_info(response: EsimCommandResponse) -> EsimEuiccInfo {
                 )
             })
         }),
-        memory_total_customizable: None,
         raw: data,
     }
 }
@@ -2318,6 +2322,49 @@ mod tests {
         assert_eq!(info.manufacturer, "EastcomPeace");
         assert_eq!(info.memory_available_kb, Some(405.123));
         assert_eq!(info.memory_total_kb, Some(478.9));
+    }
+
+    #[test]
+    fn retired_custom_capacity_is_not_returned_from_detection_cache() {
+        let mut cached = json!({
+            "eid": "89033023000000000000000000000123",
+            "status": "ready", "manufacturer": "Thales",
+            "memory_total_kb": 9999.0, "memory_available_kb": 192.0,
+            "memory_total_customizable": true
+        });
+        let info = cached_euicc_info(&cached.to_string()).unwrap();
+        assert_eq!(info.memory_total_kb, None);
+        assert_eq!(info.memory_available_kb, Some(192.0));
+        let output = serde_json::to_value(&info).unwrap();
+        assert!(output.get("memory_total_customizable").is_none());
+        assert!(output.get("memory_total_kb").is_none());
+        cached["memory_total_customizable"] = json!(false);
+        assert_eq!(
+            cached_euicc_info(&cached.to_string())
+                .unwrap()
+                .memory_total_kb,
+            Some(9999.0)
+        );
+        cached
+            .as_object_mut()
+            .unwrap()
+            .remove("memory_total_customizable");
+        assert_eq!(
+            cached_euicc_info(&cached.to_string())
+                .unwrap()
+                .memory_total_kb,
+            Some(9999.0)
+        );
+        assert!(cached_euicc_info("invalid").is_none());
+        let legacy_config: crate::platform::config::EsimConfig = serde_json::from_value(json!({
+            "lpac_path": "/opt/lpac", "custom_memory_total_kb": 9999
+        }))
+        .unwrap();
+        assert_eq!(legacy_config.lpac_path, "/opt/lpac");
+        assert!(serde_json::to_value(legacy_config)
+            .unwrap()
+            .get("custom_memory_total_kb")
+            .is_none());
     }
 
     #[test]
