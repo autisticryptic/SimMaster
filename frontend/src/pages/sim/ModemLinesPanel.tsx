@@ -27,6 +27,7 @@ import {
   type SmsMessage,
   type TrunkProfileResponse,
   type CellularImsLineControlResponse,
+  type PassiveModemInventory,
   type CellularImsProfileSelectionResponse,
   type VowifiLineConfigResponse,
   type VowifiRuntimeEventEntry,
@@ -271,6 +272,8 @@ const INITIAL_SUPPLEMENTAL_STATUS: Record<SupplementalSection, LoadStatus> = {
 
 export default function ModemLinesPanel({ basicInfoForLine, workbench = false, workbenchHeader, workbenchEsim, workbenchSms, workbenchUssd, workbenchAutomation, workbenchNotifications, onSelectionChange }: ModemLinesPanelProps) {
   const [lines, setLines] = useState<CellularImsLineControlResponse[]>([])
+  const [displayOnlyLines, setDisplayOnlyLines] = useState<PassiveModemInventory[]>([])
+  const [blockedReason, setBlockedReason] = useState<string | null>(null)
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
   const [vowifiEvents, setVowifiEvents] = useState<VowifiRuntimeEventEntry[]>([])
@@ -310,6 +313,29 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
       setSupplementalStatus((current) => ({ ...current, [section]: status }))
     }
 
+    // Read admission first. While blocked, do not request supplementary
+    // operational inventories or mount any SIM/IMS/network control panels.
+    try {
+      const lineResponse = await api.getCellularImsLines()
+      if (!isCurrent()) return
+      setBlockedReason(lineResponse.blocked_reason ?? null)
+      setDisplayOnlyLines(lineResponse.display_only_lines ?? [])
+      if (lineResponse.blocked_reason) {
+        setLines([])
+        setTrunkLines([])
+        setVowifiLines([])
+        setNetworkControls([])
+        setError(null)
+        return
+      }
+      setLines(stableModemSort(lineResponse.data ?? []))
+    } catch (err) {
+      if (isCurrent()) setError(err instanceof Error ? err.message : String(err))
+      return
+    } finally {
+      if (!background && isCurrent()) setLoading(false)
+    }
+
     const trunkRequest = api.getTrunkLines()
       .then((response) => {
         if (!isCurrent()) return
@@ -341,19 +367,8 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
         throw err
       })
 
-    let lineFailed = false
-    try {
-      const lineResponse = await api.getCellularImsLines()
-      if (isCurrent()) setLines(stableModemSort(lineResponse.data ?? []))
-    } catch (err) {
-      lineFailed = true
-      if (!background && isCurrent()) setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      if (!background && isCurrent()) setLoading(false)
-    }
-
     const supplementalResults = await Promise.allSettled([trunkRequest, vowifiRequest, networkRequest])
-    if (!background && !lineFailed && isCurrent()) {
+    if (!background && isCurrent()) {
       const failedSections = supplementalResults
         .map((result, index) => result.status === 'rejected' ? ['Trunk', 'VoWiFi', '网络控制'][index] : null)
         .filter((name): name is string => name !== null)
@@ -734,6 +749,33 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
 
   if (loading) {
     return <Box display="flex" justifyContent="center" alignItems="center" minHeight="35vh"><CircularProgress /></Box>
+  }
+
+  // These are physical inventory cards, not LineRuntime snapshots. In
+  // particular, do not synthesize disabled profile/toggle intent for them.
+  if (blockedReason) {
+    return <Stack spacing={2}>
+      {error && <Alert severity="error">{error}</Alert>}
+      <Alert severity="warning">
+        IMS 启动恢复尚未完成，当前仅显示硬件清单。SIM、IMS、网络与配置操作均不可用，已保存的开关设置未改变。
+        <Typography variant="caption" display="block">{blockedReason}</Typography>
+      </Alert>
+      <Button startIcon={<Refresh />} onClick={() => void load()}>刷新硬件清单</Button>
+      {displayOnlyLines.map((modem) => <Card key={modem.line_id}>
+        <CardHeader title={modem.model || modem.manufacturer || '基带'} subheader={shortLineId(modem.line_id)} />
+        <CardContent>
+          <Stack direction="row" spacing={1}>
+            <Chip label="物理硬件已发现 · 仅供查看" color="info" size="small" />
+            <Chip label={modem.sim_missing === true ? 'MM 报告无 SIM' : modem.sim_missing === false ? 'MM 缓存报告 SIM 存在' : 'SIM 状态未知'} size="small" />
+          </Stack>
+          <Typography variant="caption" display="block" sx={{ mt: 1 }}>
+            仅依据 ModemManager 缓存，未探测 SIM；缓存可能尚未更新。
+            {!modem.slot_stable && ' 物理槽标识暂不稳定。'}
+          </Typography>
+        </CardContent>
+      </Card>)}
+      {displayOnlyLines.length === 0 && <Alert severity="info">ModemManager 当前未报告物理基带；这不代表启动恢复已完成。</Alert>}
+    </Stack>
   }
 
   const renderLineList = () => (

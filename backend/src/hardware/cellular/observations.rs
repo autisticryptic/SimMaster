@@ -15,6 +15,22 @@ use crate::{
 
 use super::bindings::ModemBinding;
 
+/// Display evidence only, never an operational binding or a control selector.
+/// SIM presence is MM's cached observation, not an active card probe.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct PassiveModemInventory {
+    pub line_id: String,
+    pub manufacturer: String,
+    pub model: String,
+    pub slot_source: String,
+    pub slot_stable: bool,
+    pub uim_slot: u8,
+    pub present: bool,
+    /// None means MM did not provide an authoritative Sim property.
+    pub sim_missing: Option<bool>,
+    pub observation_source: &'static str,
+}
+
 /// A failed observation is not necessarily authoritative loss of service.
 ///
 /// Providers classify their own protocol errors. For serving-cell observations,
@@ -55,6 +71,20 @@ pub trait ModemObservationProvider: Send + Sync {
     fn name(&self) -> &'static str;
 
     fn discover(&self) -> TransportFuture<'_, Result<Vec<ModemBinding>, ObservationError>>;
+
+    /// Strictly passive display inventory. No protocol discovery, SIM/APDU/UIM
+    /// access, transports, config migration, or runtime construction is allowed.
+    /// In particular, never delegate to discover(): MM's ordinary discovery can
+    /// read USIM identity through a logical channel. Providers must opt in.
+    fn discover_passive(
+        &self,
+    ) -> TransportFuture<'_, Result<Vec<PassiveModemInventory>, ObservationError>> {
+        Box::pin(async {
+            Err(ObservationError::Unavailable(
+                "passive_inventory_unsupported".into(),
+            ))
+        })
+    }
 
     /// Fresh, positive evidence for registered non-roaming cellular voice.
     /// Unknown/unsupported providers fail closed; never infer home from an APN

@@ -16,7 +16,7 @@ use crate::{
 use super::{
     bindings::ModemBinding,
     modem_manager,
-    observations::{ModemObservationProvider, ObservationError},
+    observations::{ModemObservationProvider, ObservationError, PassiveModemInventory},
 };
 
 pub struct ModemManagerObservations {
@@ -144,6 +144,18 @@ impl ModemObservationProvider for ModemManagerObservations {
             modem_manager::discover_modem_bindings(self.connection.as_ref())
                 .await
                 .map_err(|error| ObservationError::Transient(error.to_string()))
+        })
+    }
+
+    fn discover_passive(
+        &self,
+    ) -> TransportFuture<'_, Result<Vec<PassiveModemInventory>, ObservationError>> {
+        Box::pin(async move {
+            modem_manager::discover_passive_modems(self.connection.as_ref())
+                .await
+                .map_err(|error| ObservationError::Transient(format!(
+                    "passive_inventory_unavailable: {error}"
+                )))
         })
     }
 

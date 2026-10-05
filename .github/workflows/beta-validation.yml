@@ -106,6 +106,8 @@ jobs:
             services::automation::target::tests \
             services::line_registry::tests \
             services::line_registry::ims_startup_gate::tests \
+            services::line_registry::line_inventory_tests \
+            hardware::cellular::modem_manager::passive_inventory_tests \
             hardware::sim::esim::tests \
             services::ue_worker::tests \
             services::ue_netcfg::tests \

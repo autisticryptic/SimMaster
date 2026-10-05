@@ -26,7 +26,9 @@ use crate::{
     connectivity::modems::ims::vowifi::runtime::VowifiRuntime,
     hardware::cellular::bindings::{self, ModemBinding},
     hardware::cellular::data_proxy::{DataProxyRuntime, DataProxyTraffic},
-    hardware::cellular::observations::{ModemObservationProvider, ObservationError},
+    hardware::cellular::observations::{
+        ModemObservationProvider, ObservationError, PassiveModemInventory,
+    },
     hardware::devices::{
         self,
         transport::{CellularDataTransport, ImsBearerTransport},
@@ -704,6 +706,17 @@ impl LineRuntimeRegistry {
     /// ownership. API and periodic refreshes must use the same provisioning gate.
     pub async fn defer_ims_startup_recovery(&self) {
         self.ims_startup_gate.defer().await;
+    }
+
+    /// An entirely separate display path while startup ownership is unresolved.
+    /// Do not refresh, recover, construct LineRuntime/UeContext, reconcile config,
+    /// or publish these descriptors in `lines`. Operational get/resolve remains
+    /// fail-closed even after the UI has displayed a physical modem.
+    pub async fn passive_inventory_if_blocked(
+        &self,
+    ) -> Option<Result<(&'static str, Vec<PassiveModemInventory>), ObservationError>> {
+        let reason = self.ims_startup_gate.blocked_reason().await?;
+        Some(self.observations.discover_passive().await.map(|lines| (reason, lines)))
     }
 
     /// Refresh presence and descriptors without discarding per-line runtime
@@ -1564,6 +1577,10 @@ impl LineRuntimeRegistry {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "line_inventory_tests.rs"]
+mod line_inventory_tests;
 
 #[cfg(test)]
 mod tests {

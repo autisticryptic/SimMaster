@@ -920,6 +920,16 @@ async fn resolve_physical_slot_id(
     if let Some((slot_id, source)) = udev_physical_slot_id(&udev_devices).await {
         return (slot_id, source, true);
     }
+    physical_slot_fallback(primary_port, equipment_identifier, device_identifier, modem_path)
+}
+
+/// Pure last-resort identity shared by operational and passive inventory.
+fn physical_slot_fallback(
+    primary_port: &str,
+    equipment_identifier: &str,
+    device_identifier: &str,
+    modem_path: &str,
+) -> (String, String, bool) {
     if !equipment_identifier.trim().is_empty() {
         return (
             format!("equipment:{}", equipment_identifier.trim()),
@@ -1331,6 +1341,65 @@ pub async fn list_modem_paths(conn: &Connection) -> zbus::Result<Vec<String>> {
         .collect();
     modem_paths.sort();
     Ok(modem_paths)
+}
+
+/// Read only the existing MM object/property snapshot. No per-SIM requests,
+/// identity fallback, external commands, device opens or runtime construction.
+/// A failed snapshot is an error, never an authoritative empty inventory.
+pub async fn discover_passive_modems(
+    conn: &Connection,
+) -> zbus::Result<Vec<super::observations::PassiveModemInventory>> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let proxy = Proxy::new(conn, MM_SERVICE, MM_ROOT_PATH, DBUS_OBJECT_MANAGER).await?;
+        let objects: ManagedObjects = proxy.call("GetManagedObjects", &()).await?;
+        Ok(passive_modems_from_objects(&objects))
+    }).await.map_err(|_| zbus::Error::Failure("passive_inventory_timeout".into()))?
+}
+
+fn passive_modems_from_objects(
+    objects: &ManagedObjects,
+) -> Vec<super::observations::PassiveModemInventory> {
+    let mut inventory = Vec::new();
+    for (path, interfaces) in objects {
+        let Some(props) = interfaces.get(MM_MODEM) else { continue };
+        let device = property_string(props, "Device").unwrap_or_default();
+        // Do not use resolve_physical_slot_id: its udev fallback launches a
+        // command. MM Device normally supplies the same stable physical anchor.
+        // Without it, report the shared pure fallback as explicitly unstable.
+        let (hardware_key, slot_source, slot_stable) = physical_device_slot_id(&device)
+            .map(|key| (key, "physdev".to_string(), true))
+            .unwrap_or_else(|| physical_slot_fallback(
+                &property_string(props, "PrimaryPort").unwrap_or_default(),
+                &property_string(props, "EquipmentIdentifier").unwrap_or_default(),
+                &property_string(props, "DeviceIdentifier").unwrap_or_default(),
+                path.as_str(),
+            ));
+        let uim_slot = props.get("PrimarySimSlot")
+            .map(extract_u32)
+            .filter(|slot| (1..=u8::MAX as u32).contains(slot))
+            .map(|slot| slot as u8)
+            .unwrap_or(1);
+        // Only an explicit root Sim object path means missing. A retained MM
+        // SIM object means cache-reported presence, not proof of a live card.
+        let sim_missing = props.get("Sim")
+            .and_then(|value| value.try_clone().ok())
+            .and_then(|value| OwnedObjectPath::try_from(value).ok())
+            .map(|sim| sim.as_str() == "/");
+        inventory.push(super::observations::PassiveModemInventory {
+            line_id: super::bindings::physical_line_id(&hardware_key, uim_slot),
+            manufacturer: property_string(props, "Manufacturer").unwrap_or_default(),
+            model: property_string(props, "Model").unwrap_or_default(),
+            slot_source,
+            slot_stable,
+            uim_slot,
+            present: true,
+            sim_missing,
+            observation_source: "modemmanager_cache",
+        });
+    }
+    inventory.sort_by(|left, right| left.line_id.cmp(&right.line_id));
+    inventory.dedup_by(|left, right| left.line_id == right.line_id);
+    inventory
 }
 
 /// Enumerate every ModemManager modem instead of selecting only the first one.
@@ -2993,6 +3062,10 @@ async fn get_cells_data_qmicli(
     .await?;
     Ok(parse_qmicli_cell_location_output(&output))
 }
+
+#[cfg(test)]
+#[path = "passive_inventory_tests.rs"]
+mod passive_inventory_tests;
 
 #[cfg(test)]
 mod tests {

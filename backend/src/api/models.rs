@@ -36,6 +36,37 @@ where
     }
 }
 
+/// Operational entries retain their old schema. Display-only hardware is kept
+/// outside `data`, so older clients cannot mistake it for a controllable line.
+#[derive(Debug, Serialize)]
+pub struct LineInventoryResponse<T> {
+    #[serde(flatten)]
+    pub response: ApiResponse<Vec<T>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_only_lines: Option<Vec<crate::hardware::cellular::observations::PassiveModemInventory>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+impl<T> From<ApiResponse<Vec<T>>> for LineInventoryResponse<T> {
+    fn from(response: ApiResponse<Vec<T>>) -> Self {
+        Self { response, display_only_lines: None, blocked_reason: None }
+    }
+}
+
+impl<T> LineInventoryResponse<T> {
+    pub fn blocked(
+        reason: &str,
+        inventory: Vec<crate::hardware::cellular::observations::PassiveModemInventory>,
+    ) -> Self {
+        Self {
+            response: ApiResponse::success_with_message(reason, Vec::new()),
+            display_only_lines: Some(inventory),
+            blocked_reason: Some(reason.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct EsimCommandResponse {
     #[serde(default)]

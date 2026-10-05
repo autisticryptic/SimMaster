@@ -137,6 +137,25 @@ pub async fn options_handler() -> impl IntoResponse {
     StatusCode::NO_CONTENT
 }
 
+/// Gate-blocked inventory is strictly display-only; a discovery failure stays
+/// an error rather than masquerading as no hardware or an operational line.
+async fn blocked_modem_inventory<T>(
+    registry: &crate::services::line_registry::LineRuntimeRegistry,
+) -> Option<(StatusCode, Json<LineInventoryResponse<T>>)> {
+    Some(match registry.passive_inventory_if_blocked().await? {
+        Ok((reason, inventory)) => (
+            StatusCode::OK,
+            Json(LineInventoryResponse::blocked(reason, inventory)),
+        ),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::error(format!(
+                "Failed to discover passive modems: {error}"
+            )).into()),
+        ),
+    })
+}
+
 /// Enumerate every physical modem together with its active SIM and independent
 /// VoLTE runtime. Discovery is refreshed on demand so hotplug does not require
 /// a service restart.
@@ -144,21 +163,24 @@ pub async fn get_modem_lines_handler(
     State(app): State<AppState>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<Vec<crate::services::line_registry::LineRuntimeStatus>>>,
+    Json<LineInventoryResponse<crate::services::line_registry::LineRuntimeStatus>>,
 ) {
+    if let Some(response) = blocked_modem_inventory(app.line_registry.as_ref()).await {
+        return response;
+    }
     match app.line_registry.refresh().await {
         Ok(_) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
                 "Success",
                 app.line_registry.statuses().await,
-            )),
+            ).into()),
         ),
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiResponse::error(format!(
                 "Failed to discover modems: {error}"
-            ))),
+            )).into()),
         ),
     }
 }
@@ -8698,17 +8720,20 @@ pub async fn get_cellular_ims_lines_handler(
     State(app): State<AppState>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<Vec<CellularImsLineControlResponse>>>,
+    Json<LineInventoryResponse<CellularImsLineControlResponse>>,
 ) {
+    if let Some(response) = blocked_modem_inventory(app.line_registry.as_ref()).await {
+        return response;
+    }
     if let Err(error) = app.line_registry.refresh().await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiResponse::error(format!(
                 "Failed to discover modems: {error}"
-            ))),
+            )).into()),
         );
     }
-    let lines = app
+    let lines: Vec<_> = app
         .line_registry
         .statuses()
         .await
@@ -8717,7 +8742,7 @@ pub async fn get_cellular_ims_lines_handler(
         .collect();
     (
         StatusCode::OK,
-        Json(ApiResponse::success_with_message("Success", lines)),
+        Json(ApiResponse::success_with_message("Success", lines).into()),
     )
 }
 

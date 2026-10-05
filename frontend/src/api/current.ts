@@ -49,6 +49,7 @@ import type {
   ExternalVowifiProfile,
   LoginRequest,
   LineRuntimeStatus,
+  LineInventoryResponse,
   SupplementarySnapshot,
   ManualRegisterRequest,
   TrunkProfileConfig,
@@ -671,7 +672,7 @@ class SimAdminCurrentAPI {
   }
 
   async getModemLines() {
-    return request<ApiResponse<LineRuntimeStatus[]>>('/modems')
+    return request<LineInventoryResponse<LineRuntimeStatus>>('/modems')
   }
 
   async getLineImsStatus(lineId: string) {
@@ -698,7 +699,7 @@ class SimAdminCurrentAPI {
   }
 
   async getCellularImsLines() {
-    return request<ApiResponse<CellularImsLineControlResponse[]>>('/cellular-ims/lines')
+    return request<LineInventoryResponse<CellularImsLineControlResponse>>('/cellular-ims/lines')
   }
 
   async getCellularImsLine(lineId: string) {

@@ -28,6 +28,18 @@ impl ImsStartupGate {
         *self.state.lock().await = State::Pending(None);
     }
 
+    /// Display requests observe admission without attempting recovery. Only
+    /// refresh/ensure_ready may retry the ownership proof and open this gate.
+    pub async fn blocked_reason(&self) -> Option<&'static str> {
+        // Recovery holds this mutex across bounded hardware observations.
+        // Display must not queue behind that work; busy is conservatively
+        // display-only, never permission to start a second recovery attempt.
+        match self.state.try_lock() {
+            Ok(state) if matches!(*state, State::Ready) => None,
+            _ => Some(PENDING),
+        }
+    }
+
     /// Returns true only when this call completed a previously deferred proof.
     pub async fn ensure_ready<F, Fut>(&self, recover: F) -> Result<bool, &'static str>
     where
@@ -120,6 +132,16 @@ mod tests {
                 Err(PENDING)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn display_does_not_wait_for_an_inflight_recovery_proof() {
+        let gate = ImsStartupGate::default();
+        gate.defer().await;
+        let recovery = gate.ensure_ready(|| std::future::pending::<bool>());
+        tokio::pin!(recovery);
+        assert!(futures_util::poll!(&mut recovery).is_pending());
+        assert_eq!(gate.blocked_reason().await, Some(PENDING));
     }
 
     #[tokio::test]

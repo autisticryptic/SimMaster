@@ -4,6 +4,24 @@ export interface ApiResponse<T> {
   data?: T
 }
 
+// Separate from operational data: never pass these cards to line controls.
+export interface PassiveModemInventory {
+  line_id: string
+  manufacturer: string
+  model: string
+  slot_source: string
+  slot_stable: boolean
+  uim_slot: number
+  present: boolean
+  sim_missing: boolean | null
+  observation_source: 'modemmanager_cache'
+}
+
+export interface LineInventoryResponse<T> extends ApiResponse<T[]> {
+  display_only_lines?: PassiveModemInventory[]
+  blocked_reason?: string
+}
+
 export interface AuthStatusResponse {
   configured: boolean
   authenticated: boolean
