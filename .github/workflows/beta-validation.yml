@@ -136,6 +136,7 @@ jobs:
             connectivity::modems::ims::cellular_ims::pcscf::tests \
             connectivity::modems::ims::cellular_ims::pcscf_dns::tests \
             api::handlers::tests::cellular_ims_profile_batch \
+            api::handlers::tests::blocked_line_projection_preserves_original_schema_and_saved_intents \
             api::handlers::tests::voice_home_ \
             connectivity::modems::ims::profile_override::tests \
             connectivity::modems::ims::effective_profile::tests \

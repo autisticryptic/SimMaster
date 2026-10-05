@@ -236,6 +236,12 @@ function WorkbenchOverview({ line }: { line: CellularImsLineControlResponse }) {
   useEffect(() => {
     let active = true
     const lineId = line.modem.line_id
+    if (line.read_only) {
+      setSimInfo(null)
+      setNetworkInfo(null)
+      setVowifi(null)
+      return
+    }
     // These requests deliberately settle independently: the overview can show
     // cached SIM identity immediately without waiting for slower network/IMS IO.
     void api.getSimInfo(lineId)
@@ -256,7 +262,7 @@ function WorkbenchOverview({ line }: { line: CellularImsLineControlResponse }) {
       active = false
       window.clearInterval(timer)
     }
-  }, [line.modem.line_id])
+  }, [line.modem.line_id, line.read_only])
 
   const progress = (() => {
     const showVowifi = vowifi?.runtime_registered
@@ -294,7 +300,7 @@ function WorkbenchOverview({ line }: { line: CellularImsLineControlResponse }) {
   })()
   const connectionReady = progress.current === progress.stages.length - 1
   const connectionWaiting = line.modem.present && progress.current >= 0
-  const connectionLabel = connectionReady
+  const connectionLabel = line.read_only ? '等待启动恢复 · 只读' : connectionReady
     ? `${progress.access} 已就绪`
     : progress.access === 'VoWiFi' && vowifi?.runtime_registered
       ? 'VoWiFi · IMS 已注册'
@@ -590,6 +596,14 @@ function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse
   const runLoadData = useCallback(async (background = false) => {
     const requestVersion = ++loadVersion.current
     const isCurrent = () => requestVersion === loadVersion.current
+    if (line.read_only) {
+      setSimLoading(false)
+      setDeviceLoading(false)
+      setSimInfo(null)
+      setDeviceInfo(null)
+      setError(null)
+      return
+    }
     if (!background) {
       setSimLoading(true)
       setDeviceLoading(true)
@@ -609,7 +623,7 @@ function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse
       .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
       .map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason))
     if (!background && failures.length > 0) setError(failures.join('；'))
-  }, [lineId])
+  }, [lineId, line.read_only])
 
   // Modem identity reads may outlive the polling interval while a profile is
   // switching. Serialize them and merge arrivals into one follow-up request so
@@ -635,6 +649,7 @@ function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse
   }, [runLoadData])
 
   const handleSavePhone = async () => {
+    if (line.read_only) return
     if (!phoneInput.trim()) {
       setEditingPhone(false)
       return
@@ -657,6 +672,7 @@ function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse
   }
 
   const handleSaveSmsc = async () => {
+    if (line.read_only) return
     if (!smscInput.trim()) {
       setEditingSmsc(false)
       return
@@ -691,6 +707,7 @@ function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse
   return (
     <Box>
       <ErrorSnackbar error={error} onClose={() => setError(null)} />
+      {line.read_only && <Alert severity="info" sx={{ mb: 2 }}>SIM 与设备详情暂不可用：等待启动恢复，未执行物理读取。</Alert>}
       <Grid container spacing={3} alignItems="stretch">
         <Grid size={{ xs: 12, md: controls ? 5 : 12 }} sx={{ display: 'flex', minWidth: 0 }}>
             <Card sx={{ flex: 1 }}>
@@ -766,7 +783,7 @@ function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse
                         value={simInfo?.phone_numbers?.length ? simInfo.phone_numbers.join(', ') : 'N/A'}
                         extra={
                           showSensitive && (isPhoneEmpty || simInfo?.phone_number_is_manual) && simInfo?.present && (
-                            <IconButton size="small" sx={{ p: 0.25 }} onClick={() => { setPhoneInput(simInfo?.phone_numbers?.[0] || ''); setEditingPhone(true); }}>
+                            <IconButton disabled={Boolean(line.read_only)} size="small" sx={{ p: 0.25 }} onClick={() => { if (line.read_only) return; setPhoneInput(simInfo?.phone_numbers?.[0] || ''); setEditingPhone(true); }}>
                               <Edit sx={{ fontSize: '0.9rem' }} />
                             </IconButton>
                           )
@@ -807,7 +824,7 @@ function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse
                         value={simInfo?.sms_center || '未读取到'}
                         extra={
                           showSensitive && (isSmscEmpty || simInfo?.sms_center_is_manual) && simInfo?.present && (
-                            <IconButton size="small" sx={{ p: 0.25 }} onClick={() => { setSmscInput(simInfo?.sms_center || ''); setEditingSmsc(true); }}>
+                            <IconButton disabled={Boolean(line.read_only)} size="small" sx={{ p: 0.25 }} onClick={() => { if (line.read_only) return; setSmscInput(simInfo?.sms_center || ''); setEditingSmsc(true); }}>
                               <Edit sx={{ fontSize: '0.9rem' }} />
                             </IconButton>
                           )
@@ -1045,7 +1062,7 @@ export default function SimCardPage() {
       </Box>
 
       <Box sx={{ mt: 2 }}>
-        {activeTab === 'lines' && <ModemLinesPanel workbench onSelectionChange={setSelectedLine} workbenchHeader={selectedLine ? <WorkbenchOverview key={selectedLine.modem.line_id} line={selectedLine} /> : undefined} workbenchEsim={<EsimWorkbenchPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} onControlChanged={handleEsimControlChanged} />} workbenchSms={selectedLine ? <SMSPage embeddedLineId={selectedLine.modem.line_id} /> : undefined} workbenchUssd={<SupplementaryServicesPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} />} workbenchAutomation={selectedLine ? <AutomationCenter key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} fixedTarget={lineAutomationTarget(selectedLine)} targetIsReader={selectedLine.modem.line_kind === 'reader'} embedded /> : undefined} workbenchNotifications={selectedLine ? <NotificationCenterPage key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} embedded /> : undefined} basicInfoForLine={(line, controls) => <SimBasicInfo line={line} controls={controls} />} />}
+        {activeTab === 'lines' && <ModemLinesPanel workbench onSelectionChange={setSelectedLine} workbenchHeader={selectedLine ? <WorkbenchOverview key={selectedLine.modem.line_id} line={selectedLine} /> : undefined} workbenchEsim={selectedLine?.read_only ? <Alert severity="info">eSIM 硬件读取与操作等待启动恢复。已保存管理模式：{selectedLine.profile.esim_control === true ? '启用' : selectedLine.profile.esim_control === false ? '禁用' : '自动'}。</Alert> : <EsimWorkbenchPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} onControlChanged={handleEsimControlChanged} />} workbenchSms={selectedLine?.read_only ? <Alert severity="info">短信工作台等待线路恢复；历史活动可在 IMS 与 Trunk 中查看。</Alert> : selectedLine ? <SMSPage embeddedLineId={selectedLine.modem.line_id} /> : undefined} workbenchUssd={selectedLine?.read_only ? <Alert severity="info">补充业务需要硬件访问，等待启动恢复。</Alert> : <SupplementaryServicesPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} />} workbenchAutomation={selectedLine?.read_only ? <Alert severity="info">自动化配置与执行等待线路恢复。</Alert> : selectedLine ? <AutomationCenter key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} fixedTarget={lineAutomationTarget(selectedLine)} targetIsReader={selectedLine.modem.line_kind === 'reader'} embedded /> : undefined} workbenchNotifications={selectedLine?.read_only ? <Alert severity="info">线路通知配置等待线路恢复。</Alert> : selectedLine ? <NotificationCenterPage key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} embedded /> : undefined} basicInfoForLine={(line, controls) => <SimBasicInfo key={`${line.modem.line_id}:${Boolean(line.read_only)}`} line={line} controls={controls} />} />}
         {activeTab === 'carrier-profiles' && <CarrierProfilesPanel />}
       </Box>
     </Box>

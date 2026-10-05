@@ -60,11 +60,17 @@ class PassiveInventoryTests(unittest.TestCase):
 
     def test_list_only_fallback_precedes_operational_refresh(self):
         source = read("backend/src/api/handlers.rs")
-        for name, end in (("get_modem_lines_handler", "/// GET /api/health"),
-                          ("get_cellular_ims_lines_handler", "pub async fn get_cellular_ims_line_handler")):
-            handler = between(source, "pub async fn " + name, end)
-            self.assertLess(handler.index("blocked_modem_inventory("), handler.index(".refresh().await"))
-            self.assertIn("return response;", handler)
+        handler = between(source, "pub async fn get_modem_lines_handler", "/// GET /api/health")
+        self.assertLess(handler.index("blocked_modem_inventory("), handler.index(".refresh().await"))
+        handler = between(source, "pub async fn get_cellular_ims_lines_handler", "pub async fn get_cellular_ims_line_handler")
+        self.assertLess(handler.index("blocked_cellular_ims_lines("), handler.index(".refresh().await"))
+        self.assertIn('success_with_message("Success", lines)', handler)
+        projection = between(source, "fn build_blocked_cellular_ims_line_response(", "pub async fn get_cellular_ims_lines_handler")
+        self.assertIn('get_line_profile(&item.line_id)', projection)
+        self.assertIn('profile: profile.redacted()', projection)
+        self.assertIn('read_only: Some(true)', projection)
+        for forbidden in ('LineRuntime::', 'CellularImsRuntime::new', 'UeContext::', 'set_line_'):
+            self.assertNotIn(forbidden, projection)
         helper = between(source, "async fn blocked_modem_inventory", "/// Enumerate every physical")
         self.assertIn("StatusCode::SERVICE_UNAVAILABLE", helper)
         self.assertIn("Failed to discover passive modems", helper)
@@ -75,15 +81,17 @@ class PassiveInventoryTests(unittest.TestCase):
     def test_ui_never_mounts_controls_for_display_inventory(self):
         source = read("frontend/src/pages/sim/ModemLinesPanel.tsx")
         self.assertLess(source.index("await api.getCellularImsLines()"), source.index("api.getTrunkLines()"))
-        branch = between(source, "if (lineResponse.blocked_reason)", "setLines(stableModemSort")
-        self.assertIn("setLines([])", branch)
-        self.assertIn("return", branch)
-        display = between(source, "  if (blockedReason)", "  const renderLineList")
-        self.assertIn("return <Stack", display)
-        self.assertIn("displayOnlyLines.map", display)
-        self.assertIn("MM 缓存报告 SIM 存在", display)
-        for forbidden in ("<Switch", "<TrunkProfileDialog", "workbenchEsim", "line.runtime", "line.profile"):
-            self.assertNotIn(forbidden, display)
+        self.assertNotIn('if (blockedReason)', source)
+        self.assertNotIn('displayOnlyLines.map', source)
+        self.assertIn('const renderLineList', source)
+        self.assertIn('setLines(inventory)', source)
+        self.assertIn('canMutateLine', source)
+        self.assertIn('disabled={Boolean(line.read_only)}', source)
+        self.assertIn('line.profile.cellular_ims_connection_enabled', source)
+        self.assertIn('onClick={() => setSelectedLineId(line.modem.line_id)}', source)
+        card = read('frontend/src/pages/SimCard.tsx')
+        self.assertIn('selectedLine?.read_only ?', card)
+        self.assertIn('if (line.read_only)', card)
 
 
 if __name__ == "__main__":

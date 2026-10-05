@@ -8267,6 +8267,10 @@ pub struct CellularImsLineControlResponse {
     pub modem: crate::hardware::cellular::control::ModemBinding,
     pub profile: LineProfileConfig,
     pub runtime: crate::connectivity::modems::ims::cellular_ims::CellularImsRuntimeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -8713,7 +8717,53 @@ fn build_cellular_ims_line_response(
             .redacted(),
         modem: status.modem,
         runtime: status.cellular_ims,
+        read_only: None,
+        blocked_reason: None,
     }
+}
+
+/// A serialized view in the existing line schema, not a LineRuntime and not
+/// an operational binding. Persisted configuration is read/redacted unchanged.
+fn build_blocked_cellular_ims_line_response(
+    inventory: crate::hardware::cellular::observations::PassiveModemInventory,
+    profile: LineProfileConfig,
+    reason: &str,
+) -> CellularImsLineControlResponse {
+    CellularImsLineControlResponse {
+        modem: crate::hardware::cellular::control::ModemBinding {
+            line_id: inventory.line_id,
+            manufacturer: inventory.manufacturer,
+            model: inventory.model,
+            line_kind: "baseband".into(),
+            uim_slot: inventory.uim_slot,
+            slot_source: inventory.slot_source,
+            slot_stable: inventory.slot_stable,
+            present: inventory.present,
+            state: if inventory.sim_missing == Some(true) { "no_sim" } else { "unknown" }.into(),
+            sim_type: "unknown".into(),
+            esim_status: "unknown".into(),
+            ..Default::default()
+        },
+        profile: profile.redacted(),
+        runtime: crate::connectivity::modems::ims::cellular_ims::CellularImsRuntimeStatus {
+            phase: "blocked".into(), stage: "waiting_modem".into(),
+            last_error: Some(reason.into()), recovery_state: "waiting_modem".into(),
+            voice_service: "unknown".into(), voice_service_code: "ims_voice_service_unknown".into(),
+            ..Default::default()
+        },
+        read_only: Some(true), blocked_reason: Some(reason.into()),
+    }
+}
+
+async fn blocked_cellular_ims_lines(app: &AppState)
+    -> Option<Result<Vec<CellularImsLineControlResponse>, String>> {
+    Some(match app.line_registry.passive_inventory_if_blocked().await? {
+        Ok((reason, inventory)) => Ok(inventory.into_iter().map(|item| {
+            let profile = app.config_manager.get_line_profile(&item.line_id);
+            build_blocked_cellular_ims_line_response(item, profile, reason)
+        }).collect()),
+        Err(error) => Err(format!("Failed to observe modems: {error}")),
+    })
 }
 
 pub async fn get_cellular_ims_lines_handler(
@@ -8722,8 +8772,11 @@ pub async fn get_cellular_ims_lines_handler(
     StatusCode,
     Json<LineInventoryResponse<CellularImsLineControlResponse>>,
 ) {
-    if let Some(response) = blocked_modem_inventory(app.line_registry.as_ref()).await {
-        return response;
+    if let Some(result) = blocked_cellular_ims_lines(&app).await {
+        return match result {
+            Ok(lines) => (StatusCode::OK, Json(ApiResponse::success_with_message("Success", lines).into())),
+            Err(error) => (StatusCode::SERVICE_UNAVAILABLE, Json(ApiResponse::error(error).into())),
+        };
     }
     if let Err(error) = app.line_registry.refresh().await {
         return (
@@ -8753,6 +8806,15 @@ pub async fn get_cellular_ims_line_handler(
     StatusCode,
     Json<ApiResponse<CellularImsLineControlResponse>>,
 ) {
+    if let Some(result) = blocked_cellular_ims_lines(&app).await {
+        return match result {
+            Ok(lines) => match lines.into_iter().find(|line| line.modem.line_id == line_id) {
+                Some(line) => (StatusCode::OK, Json(ApiResponse::success_with_message("Success", line))),
+                None => (StatusCode::NOT_FOUND, Json(ApiResponse::error("line_not_found"))),
+            },
+            Err(error) => (StatusCode::SERVICE_UNAVAILABLE, Json(ApiResponse::error(error))),
+        };
+    }
     let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
@@ -9123,6 +9185,7 @@ pub async fn set_cellular_ims_line_connection_handler(
                     modem: line.binding(),
                     profile: profile.redacted(),
                     runtime: line.cellular_ims.status().await,
+                    read_only: None, blocked_reason: None,
                 },
             )),
         );
@@ -9154,6 +9217,7 @@ pub async fn set_cellular_ims_line_connection_handler(
         modem: line.binding(),
         profile: profile.redacted(),
         runtime: line.cellular_ims.status().await,
+        read_only: None, blocked_reason: None,
     };
     match result {
         Ok(_) => (
@@ -14845,6 +14909,35 @@ mod tests {
     }
 
     use crate::hardware::cellular::control::SimIdentity;
+
+    #[test]
+    fn blocked_line_projection_preserves_original_schema_and_saved_intents() {
+        let mut saved = LineProfileConfig::for_line("line-display");
+        saved.cellular_ims_connection_enabled = true;
+        saved.data_connection_enabled = true;
+        saved.airplane_mode_enabled = true;
+        saved.roaming_allowed = true;
+        saved.vowifi.enabled = true;
+        let expected = serde_json::to_value(saved.redacted()).unwrap();
+        let line = build_blocked_cellular_ims_line_response(
+            crate::hardware::cellular::observations::PassiveModemInventory {
+                line_id: "line-display".into(), manufacturer: "fixture".into(), model: "modem".into(),
+                slot_source: "physdev".into(), slot_stable: true, uim_slot: 1, present: true,
+                sim_missing: Some(true), observation_source: "modemmanager_cache",
+            }, saved, "ims_startup_recovery_pending",
+        );
+        let value = serde_json::to_value(line).unwrap();
+        assert_eq!(value["profile"], expected);
+        assert_eq!(value["modem"]["line_id"], "line-display");
+        assert_eq!(value["modem"]["present"], true);
+        assert_eq!(value["modem"]["state"], "no_sim");
+        assert_eq!(value["modem"]["modem_path"], "");
+        assert_eq!(value["read_only"], true);
+        assert_eq!(value["runtime"]["phase"], "blocked");
+        assert_eq!(value["runtime"]["registered"], false);
+        assert_eq!(value["runtime"]["manual_retry_available"], false);
+        assert_eq!(value["blocked_reason"], "ims_startup_recovery_pending");
+    }
 
     #[test]
     fn coexistence_parking_preserves_exhausted_cellular_budget_for_wlan_fallback() {

@@ -27,7 +27,6 @@ import {
   type SmsMessage,
   type TrunkProfileResponse,
   type CellularImsLineControlResponse,
-  type PassiveModemInventory,
   type CellularImsProfileSelectionResponse,
   type VowifiLineConfigResponse,
   type VowifiRuntimeEventEntry,
@@ -69,6 +68,7 @@ const cellularImsStageStatusLabels: Record<string, string> = {
 }
 
 function imsConnectionSummary(line: CellularImsLineControlResponse) {
+  if (line.read_only) return '等待启动恢复 · 只读'
   if (line.runtime.registered) return 'IMS 已注册'
   if (!line.profile.cellular_ims_connection_enabled) return 'IMS 未连接'
   const errorStatus = cellularImsErrorStatusLabel(line.runtime.last_error)
@@ -272,8 +272,6 @@ const INITIAL_SUPPLEMENTAL_STATUS: Record<SupplementalSection, LoadStatus> = {
 
 export default function ModemLinesPanel({ basicInfoForLine, workbench = false, workbenchHeader, workbenchEsim, workbenchSms, workbenchUssd, workbenchAutomation, workbenchNotifications, onSelectionChange }: ModemLinesPanelProps) {
   const [lines, setLines] = useState<CellularImsLineControlResponse[]>([])
-  const [displayOnlyLines, setDisplayOnlyLines] = useState<PassiveModemInventory[]>([])
-  const [blockedReason, setBlockedReason] = useState<string | null>(null)
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
   const [vowifiEvents, setVowifiEvents] = useState<VowifiRuntimeEventEntry[]>([])
@@ -313,22 +311,25 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
       setSupplementalStatus((current) => ({ ...current, [section]: status }))
     }
 
-    // Read admission first. While blocked, do not request supplementary
-    // operational inventories or mount any SIM/IMS/network control panels.
+    // Display projections use the original list and saved profiles, but must
+    // not trigger supplementary operational inventory reads.
     try {
       const lineResponse = await api.getCellularImsLines()
       if (!isCurrent()) return
-      setBlockedReason(lineResponse.blocked_reason ?? null)
-      setDisplayOnlyLines(lineResponse.display_only_lines ?? [])
-      if (lineResponse.blocked_reason) {
-        setLines([])
+      const inventory = stableModemSort(lineResponse.data ?? [])
+      setLines(inventory)
+      if (inventory.some((line) => line.read_only)) {
         setTrunkLines([])
         setVowifiLines([])
         setNetworkControls([])
+        setSupplementalStatus(INITIAL_SUPPLEMENTAL_STATUS)
+        setEditingTrunkLine(null)
+        setEditingVowifiLine(null)
+        setEditingDataLineId(null)
+        setEditingCellularImsProfileLineId(null)
         setError(null)
         return
       }
-      setLines(stableModemSort(lineResponse.data ?? []))
     } catch (err) {
       if (isCurrent()) setError(err instanceof Error ? err.message : String(err))
       return
@@ -453,7 +454,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     let cancelled = false
     const refresh = async () => {
       const [eventResult, smsResult, callResult] = await Promise.allSettled([
-        api.getVowifiEvents(selectedLineId, { limit: 100 }),
+        selectedLine?.read_only ? Promise.resolve({ data: { events: [] } }) : api.getVowifiEvents(selectedLineId, { limit: 100 }),
         api.getSmsList({ channel_id: selectedLineId, limit: 100 }),
         api.getCallHistory({ lineId: selectedLineId, limit: 100, offset: 0 }),
       ])
@@ -464,6 +465,10 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     }
     void refresh()
     const calibrationTimer = window.setInterval(() => void refresh(), 60_000)
+    if (selectedLine?.read_only) return () => {
+      cancelled = true
+      window.clearInterval(calibrationTimer)
+    }
     const eventSource = api.openAppEventStream({ lineId: selectedLineId })
     let refreshTimer: number | undefined
     let fallbackTimer: number | undefined
@@ -506,7 +511,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
       eventSource.removeEventListener('app_event', onAppEvent)
       eventSource.close()
     }
-  }, [selectedLineId, workbench, workbenchTab])
+  }, [selectedLineId, selectedLine?.read_only, workbench, workbenchTab])
 
   const filteredLines = useMemo(() => {
     const query = lineSearch.trim().toLocaleLowerCase()
@@ -529,7 +534,10 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     lines.find((line) => line.modem.line_id === lineId)?.modem.present ?? false
   )
 
+  const canMutateLine = (lineId: string) => lines.some((line) => line.modem.line_id === lineId && !line.read_only)
+
   const toggleDataConnection = async (lineId: string, enabled: boolean) => {
+    if (!canMutateLine(lineId)) return
     setSavingKey(`data:${lineId}`)
     setError(null)
     setSuccess(null)
@@ -548,6 +556,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   }
 
   const toggleAirplaneMode = async (lineId: string, enabled: boolean) => {
+    if (!canMutateLine(lineId)) return
     setSavingKey(`airplane:${lineId}`)
     setError(null)
     setSuccess(null)
@@ -567,6 +576,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   }
 
   const resetTraffic = async (lineId: string) => {
+    if (!canMutateLine(lineId)) return
     setSavingKey(`traffic:${lineId}`)
     setError(null)
     setSuccess(null)
@@ -583,6 +593,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   }
 
   const toggleRoaming = async (lineId: string, allowed: boolean) => {
+    if (!canMutateLine(lineId)) return
     setSavingKey(`roaming:${lineId}`)
     setError(null)
     setSuccess(null)
@@ -601,6 +612,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   }
 
   const toggleLine = async (lineId: string, enabled: boolean) => {
+    if (!canMutateLine(lineId)) return
     loadVersion.current += 1
     setSavingKey(`cellular-ims:${lineId}`)
     setError(null)
@@ -626,6 +638,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   }
 
   const toggleVowifi = async (lineId: string, enabled: boolean) => {
+    if (!canMutateLine(lineId)) return
     loadVersion.current += 1
     setSavingKey(`vowifi:${lineId}`)
     setError(null)
@@ -670,6 +683,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   }
 
   const retryLine = async (lineId: string) => {
+    if (!canMutateLine(lineId)) return
     setSavingKey(`retry:${lineId}`)
     setError(null)
     setSuccess(null)
@@ -691,6 +705,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   }
 
   const toggleTrunk = async (lineId: string, enabled: boolean) => {
+    if (!canMutateLine(lineId)) return
     const currentLine = trunkLines.find((line) => line.line_id === lineId)
     if (enabled && currentLine && !trunkProfileCanEnable(currentLine)) {
       setError(null)
@@ -729,6 +744,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   }
 
   const restartBaseband = async (lineId: string) => {
+    if (!canMutateLine(lineId)) return
     const present = lineIsPresent(lineId)
     const prompt = present
       ? '确认重启这条基带线路？网络注册和数据连接会短暂中断。'
@@ -749,33 +765,6 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
 
   if (loading) {
     return <Box display="flex" justifyContent="center" alignItems="center" minHeight="35vh"><CircularProgress /></Box>
-  }
-
-  // These are physical inventory cards, not LineRuntime snapshots. In
-  // particular, do not synthesize disabled profile/toggle intent for them.
-  if (blockedReason) {
-    return <Stack spacing={2}>
-      {error && <Alert severity="error">{error}</Alert>}
-      <Alert severity="warning">
-        IMS 启动恢复尚未完成，当前仅显示硬件清单。SIM、IMS、网络与配置操作均不可用，已保存的开关设置未改变。
-        <Typography variant="caption" display="block">{blockedReason}</Typography>
-      </Alert>
-      <Button startIcon={<Refresh />} onClick={() => void load()}>刷新硬件清单</Button>
-      {displayOnlyLines.map((modem) => <Card key={modem.line_id}>
-        <CardHeader title={modem.model || modem.manufacturer || '基带'} subheader={shortLineId(modem.line_id)} />
-        <CardContent>
-          <Stack direction="row" spacing={1}>
-            <Chip label="物理硬件已发现 · 仅供查看" color="info" size="small" />
-            <Chip label={modem.sim_missing === true ? 'MM 报告无 SIM' : modem.sim_missing === false ? 'MM 缓存报告 SIM 存在' : 'SIM 状态未知'} size="small" />
-          </Stack>
-          <Typography variant="caption" display="block" sx={{ mt: 1 }}>
-            仅依据 ModemManager 缓存，未探测 SIM；缓存可能尚未更新。
-            {!modem.slot_stable && ' 物理槽标识暂不稳定。'}
-          </Typography>
-        </CardContent>
-      </Card>)}
-      {displayOnlyLines.length === 0 && <Alert severity="info">ModemManager 当前未报告物理基带；这不代表启动恢复已完成。</Alert>}
-    </Stack>
   }
 
   const renderLineList = () => (
@@ -813,7 +802,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
         <Stack spacing={0.75}>
           {filteredLines.map((line, index) => {
             const isSelected = line.modem.line_id === selectedLineId
-            const vowifi = vowifiByLineId.get(line.modem.line_id)
+            const vowifi = line.read_only ? undefined : vowifiByLineId.get(line.modem.line_id)
             const active = line.runtime.registered || Boolean(vowifi?.runtime_registered)
             return (
               <Box
@@ -841,7 +830,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                   <Typography variant="body2" fontWeight={700} noWrap>
                     {line.modem.line_kind === 'reader' ? '读卡器' : modemSlotLabel(line.modem, index)}
                   </Typography>
-                  <Chip size="small" label={line.modem.present ? (active ? '就绪' : '在线') : '离线'} color={active ? 'success' : line.modem.present ? 'info' : 'default'} sx={{ height: 19, fontSize: 10 }} />
+                  <Chip size="small" label={line.read_only ? '等待恢复 · 只读' : line.modem.present ? (active ? '就绪' : '在线') : '离线'} color={active ? 'success' : line.modem.present ? 'info' : 'default'} sx={{ height: 19, fontSize: 10 }} />
                 </Box>
                 <Typography variant="caption" color="text.secondary" display="block" noWrap>
                   {line.modem.manufacturer || line.modem.model || '未知设备'} · {shortLineId(line.modem.line_id)}
@@ -873,16 +862,16 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
             const trafficBusy = savingKey === `traffic:${line.modem.line_id}`
             const roamingBusy = savingKey === `roaming:${line.modem.line_id}`
             const airplaneBusy = savingKey === `airplane:${line.modem.line_id}`
-            const trunkLine = trunkByLineId.get(line.modem.line_id)
-            const vowifiLine = vowifiByLineId.get(line.modem.line_id)
-            const network = networkByLineId.get(line.modem.line_id)
-            const networkLoadLabel = supplementalStatus.network === 'pending'
+            const trunkLine = line.read_only ? undefined : trunkByLineId.get(line.modem.line_id)
+            const vowifiLine = line.read_only ? undefined : vowifiByLineId.get(line.modem.line_id)
+            const network = line.read_only ? undefined : networkByLineId.get(line.modem.line_id)
+            const networkLoadLabel = line.read_only ? '运行状态等待启动恢复（显示已保存配置）' : supplementalStatus.network === 'pending'
               ? '正在读取线路状态'
               : supplementalStatus.network === 'error' ? '线路状态读取失败' : null
-            const vowifiLoadLabel = supplementalStatus.vowifi === 'pending'
+            const vowifiLoadLabel = line.read_only ? '运行状态等待启动恢复（显示已保存配置）' : supplementalStatus.vowifi === 'pending'
               ? '正在读取 VoWiFi 状态'
               : supplementalStatus.vowifi === 'error' ? 'VoWiFi 状态读取失败' : null
-            const trunkLoadLabel = supplementalStatus.trunk === 'pending'
+            const trunkLoadLabel = line.read_only ? '运行状态等待启动恢复（显示已保存配置）' : supplementalStatus.trunk === 'pending'
               ? '正在读取 Trunk 状态'
               : supplementalStatus.trunk === 'error' ? 'Trunk 状态读取失败' : null
             const airplaneEnabled = network?.airplane_mode_requested ?? line.profile.airplane_mode_enabled
@@ -897,7 +886,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
             // ModemManager object are hidden.
             const isReader = line.modem.line_kind === 'reader'
             const overviewControls = !isReader ? (
-              <Card sx={{ flex: 1, height: '100%', display: 'flex', flexDirection: 'column' }}>
+              <Card component="fieldset" disabled={Boolean(line.read_only)} sx={{ m: 0, p: 0, border: 0, minWidth: 0, flex: 1, height: '100%', display: 'flex', flexDirection: 'column' }}>
                 <CardHeader
                   avatar={<Tune color="primary" />}
                   title="线路控制"
@@ -952,7 +941,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.5} sx={{ gridColumn: { xs: 2, sm: 3 }, gridRow: 1 }}>
                         {roamingBusy && <CircularProgress size={16} />}
                         <Switch
-                          checked={network?.roaming.roaming_allowed ?? true}
+                          checked={network?.roaming.roaming_allowed ?? line.profile.roaming_allowed}
                           onChange={(_, enabled) => void toggleRoaming(line.modem.line_id, enabled)}
                           disabled={!network || (line.modem.present && airplaneEnabled) || savingKey !== null}
                         />
@@ -986,10 +975,10 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Stack>
                       <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.25} sx={{ gridColumn: { xs: 2, sm: 3 }, gridRow: 1 }}>
                         {(dataBusy || trafficBusy) && <CircularProgress size={16} />}
-                        <Button size="small" onClick={() => setEditingDataLineId(line.modem.line_id)} disabled={!network || savingKey !== null}>配置</Button>
+                        <Button size="small" onClick={() => { if (canMutateLine(line.modem.line_id)) setEditingDataLineId(line.modem.line_id) }} disabled={!network || savingKey !== null}>配置</Button>
                         {network?.data.proxy.traffic_used && <Button size="small" onClick={() => void resetTraffic(line.modem.line_id)} disabled={savingKey !== null}>清零</Button>}
                         <Switch
-                          checked={network?.data.enabled ?? false}
+                          checked={network?.data.enabled ?? line.profile.data_connection_enabled}
                           onChange={(_, enabled) => void toggleDataConnection(line.modem.line_id, enabled)}
                           disabled={!network || (line.modem.present && airplaneEnabled) || savingKey !== null}
                         />
@@ -1070,6 +1059,10 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                     </Tabs>
                   )}
                   <CardContent sx={{ pt: 0 }}>
+                    {line.read_only && <Alert severity="warning" sx={{ my: 2 }}>
+                      IMS 启动恢复尚未完成；显示缓存硬件与已保存配置，未探测 SIM。硬件与配置操作暂不可用，运行状态等待恢复。
+                      <Typography variant="caption" display="block">{line.blocked_reason || 'ims_startup_recovery_pending'}</Typography>
+                    </Alert>}
                     {workbench && workbenchTab === 'esim' && <Box mt={2}>{workbenchEsim}</Box>}
                     {workbench && workbenchTab === 'sms' && <Box mt={2}>{workbenchSms}</Box>}
                     {workbench && workbenchTab === 'ussd' && <Box mt={2}>{workbenchUssd}</Box>}
@@ -1102,7 +1095,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Alert>
                     )}
 
-                    <Box display="flex" flexDirection="column">
+                    <Box component="fieldset" disabled={Boolean(line.read_only)} sx={{ m: 0, p: 0, border: 0, minWidth: 0 }} display="flex" flexDirection="column">
                     {!isReader && (!workbench || workbenchTab === 'ims') && <Box display="flex" justifyContent="space-between" alignItems={{ xs: 'flex-start', sm: 'center' }} flexDirection={{ xs: 'column', sm: 'row' }} gap={1} mt={1.5} pt={1.5} borderTop={1} borderColor="divider">
                       <Box minWidth={0}>
                         <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
@@ -1120,7 +1113,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                           // names this one so a browser test cannot pick the
                           // wrong one and act on it.
                           data-testid="cellular-ims-profile-config"
-                          onClick={() => setEditingCellularImsProfileLineId(line.modem.line_id)}
+                          onClick={() => { if (canMutateLine(line.modem.line_id)) setEditingCellularImsProfileLineId(line.modem.line_id) }}
                           disabled={savingKey !== null}
                         >
                           配置
@@ -1166,14 +1159,14 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         <Button
                           size="small"
                           variant="text"
-                          onClick={() => vowifiLine && setEditingVowifiLine(vowifiLine)}
+                          onClick={() => { if (canMutateLine(line.modem.line_id) && vowifiLine) setEditingVowifiLine(vowifiLine) }}
                           disabled={!vowifiLine || savingKey !== null}
                         >
                           配置
                         </Button>
                         {vowifiBusy && <CircularProgress size={18} />}
                         <Switch
-                          checked={vowifiLine?.config.enabled ?? false}
+                          checked={vowifiLine?.config.enabled ?? line.profile.vowifi.enabled}
                           onChange={(_, enabled) => void toggleVowifi(line.modem.line_id, enabled)}
                           disabled={!vowifiLine || savingKey !== null}
                         />
@@ -1198,6 +1191,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                           size="small"
                           variant="text"
                           onClick={() => {
+                            if (!canMutateLine(line.modem.line_id)) return
                             setEnableTrunkOnOpen(false)
                             if (trunkLine) setEditingTrunkLine(trunkLine)
                           }}
@@ -1207,7 +1201,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         </Button>
                         {trunkBusy && <CircularProgress size={18} />}
                         <Switch
-                          checked={trunkLine?.trunk.enabled ?? false}
+                          checked={trunkLine?.trunk.enabled ?? line.profile.trunk.enabled}
                           onChange={(_, enabled) => void toggleTrunk(line.modem.line_id, enabled)}
                           disabled={!trunkLine || savingKey !== null}
                         />

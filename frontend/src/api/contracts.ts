@@ -1158,6 +1158,9 @@ export interface MessageCount {
 }
 
 export interface CellularImsLineControlResponse {
+  /** Cached display projection; never an operational line admission. */
+  read_only?: boolean
+  blocked_reason?: string
   modem: ModemBinding
   profile: LineProfileConfig
   runtime: CellularImsRuntimeStatus

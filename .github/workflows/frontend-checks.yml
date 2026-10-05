@@ -49,3 +49,16 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      - name: Install isolated browser
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Verify original line workbench during blocked recovery
+        run: pnpm exec playwright test --config playwright.lines.config.ts
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: original-line-workbench-tests
+          path: frontend/test-results/
+          retention-days: 7
