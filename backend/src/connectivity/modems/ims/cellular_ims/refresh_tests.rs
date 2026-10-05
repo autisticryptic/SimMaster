@@ -29,13 +29,23 @@ async fn protected_session() -> (
     UdpSocket,
     UdpSocket,
 ) {
-    let (live, runtime, server) = super::tests::test_voice_session().await;
-    let mut session = live.session.lock().await.take().unwrap();
-    // This fixture installs MD5/null SAs. Give it a matching strict policy
-    // rather than injecting them into the voice fixture's SHA1-only profile.
+    // Legacy MD5/null fixture remains explicit, not a derived default.
     let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
     profile.ims.register.security_client_mechanisms = &["hmac-md5-96/null/esp/trans"];
-    session.profile = Box::leak(Box::new(profile));
+    protected_session_with_profile(Box::leak(Box::new(profile))).await
+}
+
+async fn protected_session_with_profile(
+    profile: &'static CarrierProfile,
+) -> (
+    CellularImsLiveSession,
+    CellularImsRuntime,
+    UdpSocket,
+    UdpSocket,
+) {
+    let (live, runtime, server) = super::tests::test_voice_session().await;
+    let mut session = live.session.lock().await.take().unwrap();
+    session.profile = profile;
     session.effective_ims = resolve_effective_ims_profile(session.profile, None);
     // Model the real USIM trace: REGISTER uses a temporary IMPU, whereas
     // P-Associated-URI selects an MSISDN identity for originating services.
@@ -59,6 +69,13 @@ async fn protected_session() -> (
         port_s: server.local_addr().unwrap().port(),
     };
     let ip = session.channel.route().local_addr.ip();
+    let server_offer = CellularImsSecurityClientOffer::Full
+        .build(pcscf, profile)
+        .unwrap();
+    let algorithms = select_security_server(profile, &[server_offer.clone()])
+        .unwrap()
+        .unwrap()
+        .algorithms;
     session
         .channel
         .activate_security_in_worker(
@@ -69,7 +86,7 @@ async fn protected_session() -> (
             },
             SocketAddr::new(ip, port_s),
             client.local_addr().unwrap(),
-            Some(pcscf.security_client_value()),
+            Some(server_offer),
             &session.xfrm_worker,
         )
         .await
@@ -80,9 +97,13 @@ async fn protected_session() -> (
         session
             .register_variant
             .security_client_offer
-            .build(ue, session.profile),
+            .build(ue, session.profile)
+            .unwrap(),
     );
-    session.xfrm_plan = Some(ipsec::build_install_plan(ip, ip, &ue, &pcscf, &[3; 16]).unwrap());
+    session.xfrm_plan = Some(
+        ipsec::build_install_plan_with_algs(ip, ip, &ue, &pcscf, &[3; 16], &[2; 16], algorithms)
+            .unwrap(),
+    );
     let mut authorization = CellularImsRefreshAuthorization::new(challenge("old-nonce"), aka());
     authorization.nonce_count = 2;
     session.refresh_authorization = Some(authorization);
@@ -94,10 +115,7 @@ fn authenticator(
     runtime: &CellularImsRuntime,
     offered: SecAgree,
 ) -> CellularImsRegisterAuthenticator {
-    let security = session
-        .register_variant
-        .security_client_offer
-        .build(offered, session.profile);
+    let security = session.register_variant.build_security_offer(offered, session.profile).unwrap();
     let mut authorization = session.refresh_authorization.clone().unwrap();
     let uri = sip::register_request_uri_with_target(
         session.profile,
@@ -130,6 +148,7 @@ fn authenticator(
         session.xfrm_worker.clone(),
     )
     .with_worker_binding(session.worker_binding.clone())
+    .with_security_mechanism(session.register_variant.security_mechanism)
 }
 
 async fn receive(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
@@ -148,6 +167,139 @@ fn response(request: &[u8], status: &str, extra: &str) -> Vec<u8> {
         sip::header_value(request, "Call-ID").unwrap(),
         sip::header_value(request, "CSeq").unwrap(),
     ).into_bytes()
+}
+
+#[tokio::test]
+async fn second_sha1_offer_registers_on_frozen_tuple_and_rolls_back_without_touching_old_sa() {
+    use crate::connectivity::modems::ims::vowifi::profiles::{
+        derive_standard_3gpp_profile, Standard3gppAccess,
+    };
+    let profile = derive_standard_3gpp_profile("234", "33", Standard3gppAccess::LteEpc).unwrap();
+    assert!(profile.ims.register.strict_security_server_offer);
+    let (mut session, runtime, server, _old_client) = protected_session_with_profile(profile).await;
+    let old_route = session.channel.send_route();
+    let old_verify = session.channel.security_verify().unwrap().to_string();
+    assert!(session
+        .xfrm_plan
+        .as_ref()
+        .unwrap()
+        .states
+        .iter()
+        .all(|s| s.algs.enc == "cbc(aes)" && s.enc_key == vec![2; 16]));
+    let (port_c, port_s) = session
+        .channel
+        .reserve_security_ports_for_test(session.security_binding.port_s);
+    let offered = offered_refresh_security(session.security_binding, port_c);
+    assert_eq!(port_s, offered.port_s);
+    let mut auth = authenticator(&session, &runtime, offered);
+    let original = auth.initial_security_client.clone().unwrap();
+    assert_eq!(original.split(", ").count(), 2);
+    assert!(original.split(", ").nth(1).unwrap().contains("ealg=null"));
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let selected = SecAgree {
+        spi_c: 0x7001,
+        spi_s: 0x7002,
+        port_c: peer.local_addr().unwrap().port(),
+        port_s: server.local_addr().unwrap().port(),
+    };
+    let server_header = selected
+        .security_client_value()
+        .replace("hmac-md5-96", "hmac-sha-1-96");
+    auth.prepare_aka_result(
+        challenge("second-offer-nonce"),
+        aka(),
+        select_security_server(profile, &[server_header.clone()]).unwrap(),
+        &mut session.channel,
+    )
+    .await
+    .unwrap();
+    let request = auth.authenticated_request(b"", 2).await.unwrap();
+    assert_eq!(
+        sip::header_value(&request, "Security-Client"),
+        Some(original)
+    );
+    assert_eq!(
+        sip::header_value(&request, "Security-Verify"),
+        Some(server_header)
+    );
+    assert_eq!(auth.offered_security_binding, offered);
+    for state in &auth.xfrm_plan.as_ref().unwrap().states {
+        assert_eq!(state.algs.auth, "hmac(sha1)");
+        assert_eq!(state.algs.enc, "cipher_null");
+        assert!(state.enc_key.is_empty());
+        assert_eq!(state.auth_key, aka().ik);
+    }
+    assert_eq!(
+        session.channel.send_route().pcscf_addr,
+        server.local_addr().unwrap()
+    );
+    session.channel.send_sip(&request).await.unwrap();
+    assert_eq!(receive(&server).await.1.port(), offered.port_c);
+    let ok = response(&request, "200 OK", "Expires: 3600\r\n");
+    peer.send_to(&ok, session.channel.route().local_addr)
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .channel
+            .recv_sip(Duration::from_secs(1))
+            .await
+            .unwrap(),
+        ok
+    );
+    auth.rollback_security(&mut session.channel).await;
+    assert_eq!(session.channel.send_route(), old_route);
+    assert_eq!(session.channel.security_verify(), Some(old_verify.as_str()));
+    assert!(session
+        .xfrm_plan
+        .as_ref()
+        .unwrap()
+        .states
+        .iter()
+        .all(|s| s.algs.enc == "cbc(aes)"));
+}
+
+#[tokio::test]
+async fn retained_security_ports_cannot_be_reused_for_a_different_frozen_offer() {
+    let (mut session, _runtime, _server, _client) = protected_session().await;
+    let (send, receive) = session
+        .channel
+        .reserve_security_ports_for_test(session.security_binding.port_s);
+    let other = |port: u16| if port == 65535 { port - 1 } else { port + 1 };
+    assert_eq!(
+        session
+            .channel
+            .reserve_security_send_port_in_worker_at(&session.xfrm_worker, other(send), receive)
+            .await
+            .unwrap_err()
+            .code(),
+        code::CHANNEL_SEND_PORT_MISMATCH
+    );
+    assert_eq!(
+        session
+            .channel
+            .reserve_security_receive_port_in_worker_at(&session.xfrm_worker, other(receive))
+            .await
+            .unwrap_err()
+            .code(),
+        code::CHANNEL_RECEIVE_PORT_MISMATCH
+    );
+    assert_eq!(
+        session
+            .channel
+            .reserve_security_send_port_in_worker_at(&session.xfrm_worker, send, receive)
+            .await
+            .unwrap(),
+        send
+    );
+    assert_eq!(
+        session
+            .channel
+            .reserve_security_receive_port_in_worker_at(&session.xfrm_worker, receive)
+            .await
+            .unwrap(),
+        receive
+    );
 }
 
 #[tokio::test]
@@ -549,6 +701,55 @@ async fn refresh_keeps_registered_aor_when_associated_default_identity_changes()
         );
     }
     assert_eq!(runtime.status().await.register_refresh_count, 2);
+}
+
+#[tokio::test]
+async fn hint_restriction_is_retained_in_real_refresh_and_423_rebuild() {
+    use crate::connectivity::modems::ims::vowifi::profiles::{derive_standard_3gpp_profile, Standard3gppAccess};
+    let profile = derive_standard_3gpp_profile("460", "02", Standard3gppAccess::LteEpc).unwrap();
+    let (mut session, runtime, server, _old_client) = protected_session_with_profile(profile).await;
+    session.register_variant = CellularImsRegisterVariant { security_mechanism: Some(0), ..register_variants(profile)[0] };
+    session.security_client = Some(session.register_variant.build_security_offer(session.security_binding, profile).unwrap());
+    let old_port = session.security_binding.port_s;
+    session.channel.reserve_security_ports_for_test(old_port);
+    let db = Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (first, source) = receive(&server).await;
+        let offer = sip::header_value(&first, "Security-Client").unwrap();
+        assert!(!offer.contains(',')); assert!(offer.contains("ealg=aes-cbc"));
+        server.send_to(&response(&first, "423 Interval Too Brief", "Min-Expires: 7200\r\n"), source).await.unwrap();
+        let (second, peer) = receive(&server).await;
+        assert_eq!(source, peer);
+        assert_eq!(sip::header_value(&second, "Security-Client"), Some(offer));
+        assert_eq!(sip::header_value(&first, "Security-Verify"), sip::header_value(&second, "Security-Verify"));
+        assert_eq!(sip::header_value(&second, "Expires").as_deref(), Some("7200"));
+        server.send_to(&response(&second, "200 OK", "Expires: 7200\r\n"), source).await.unwrap();
+    });
+    let result = refresh_live_registration(&mut session, &runtime, "hint-refresh-test", &db).await;
+    peer.await.unwrap();
+    assert!(matches!(result.outcome, RegistrationRefreshResult::Refreshed(_)));
+    assert_eq!(session.register_variant.security_mechanism, Some(0));
+}
+
+#[tokio::test]
+async fn hint_authenticator_rejects_changed_challenge_before_aka_and_keeps_auts_offer() {
+    use crate::connectivity::modems::ims::vowifi::profiles::{derive_standard_3gpp_profile, Standard3gppAccess};
+    let profile = derive_standard_3gpp_profile("460", "02", Standard3gppAccess::LteEpc).unwrap();
+    let (mut session, runtime, _server, _old_client) = protected_session_with_profile(profile).await;
+    session.register_variant = CellularImsRegisterVariant { security_mechanism: Some(0), ..register_variants(profile)[0] };
+    let mut auth = authenticator(&session, &runtime, session.security_binding);
+    let frozen = auth.offered_security.clone();
+    assert!(!frozen.contains(','));
+    // The deliberately invalid nonce would fail differently if the code went
+    // past the singleton check toward AKA. No real UIM call is possible here.
+    let outside = b"SIP/2.0 401 Unauthorized\r\nSecurity-Server: ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=50001;spi-s=50002;port-c=5068;port-s=5069\r\nWWW-Authenticate: Digest realm=\"ims.example\",nonce=\"invalid\",algorithm=AKAv1-MD5\r\n\r\n";
+    assert_eq!(auth.prepare_authenticated_channel(outside, &mut session.channel).await.unwrap_err().code(), code::SECURITY_SERVER_INVALID);
+    let mut resync = aka(); resync.auts = Some(vec![7; 14]);
+    auth.prepare_aka_result(challenge("resync-nonce"), resync, None, &mut session.channel).await.unwrap();
+    let prepared = auth.pending.as_ref().unwrap();
+    assert_eq!(prepared.security_client.as_deref(), Some(frozen.as_str()));
+    assert!(prepared.security_verify.is_some());
+    assert!(prepared.register_policy.require_sec_agree);
 }
 
 #[tokio::test]

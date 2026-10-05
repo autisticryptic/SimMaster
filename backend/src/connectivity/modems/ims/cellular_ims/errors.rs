@@ -47,6 +47,7 @@ pub mod code {
     pub const IPSEC_IK_INVALID: &str = "cellular_ims_ipsec_ik_invalid";
     pub const IPSEC_REQUIRES_IPV6: &str = "cellular_ims_ipsec_requires_ipv6";
     pub const IPSEC_UDP_BIND_FAILED: &str = "cellular_ims_ipsec_udp_bind_failed";
+    pub const SECURITY_CLIENT_INVALID: &str = "cellular_ims_security_client_invalid";
     pub const SECURITY_SERVER_INVALID: &str = "cellular_ims_security_server_invalid";
     pub const SECURITY_SERVER_MISSING: &str = "cellular_ims_security_server_missing";
 
@@ -386,6 +387,7 @@ pub mod code {
         RUNTIME_SEND_TIMEOUT,
         RUNTIME_UE_WORKER_GENERATION_CHANGED,
         RUNTIME_UE_WORKER_UNAVAILABLE,
+        SECURITY_CLIENT_INVALID,
         SECURITY_SERVER_INVALID,
         SECURITY_SERVER_MISSING,
         SIM_OVERRIDE_NOT_READY,
@@ -513,7 +515,7 @@ mod tests {
         // Keep in step with the `pub const` count in `mod code`.
         assert_eq!(
             code::ALL.len(),
-            158,
+            159,
             "code::ALL is out of sync with mod code"
         );
         let mut seen = std::collections::BTreeSet::new();

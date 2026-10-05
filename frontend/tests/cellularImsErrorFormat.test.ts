@@ -36,6 +36,20 @@ await test('codes are matched as whole tokens, never as substrings', () => {
   assert.equal(cellularImsErrorCodes('cellular_ims_dependency_missing:ipx').size, 0)
 })
 
+await test('invalid client security offers are not misreported as SIM or network rejection', () => {
+  assert.equal(cellularImsErrorStatusLabel('cellular_ims_security_client_invalid'), 'IMS 安全提案无效')
+  assert.match(cellularImsErrorMessage('cellular_ims_security_client_invalid') ?? '', /不要通过关闭安全/)
+})
+
+await test('stale resource recovery is not a network rejection or an instruction to erase ledgers', () => {
+  const error = 'cellular_ims_bearer_session_lost:mm_ims_profile_reconcile_manual_required'
+  assert.equal(cellularImsErrorStatusLabel(error), '旧 IMS 资源待核验恢复')
+  assert.match(cellularImsErrorMessage(error) ?? '', /请勿直接删除账本/)
+  assert.match(cellularImsErrorMessage(error) ?? '', /不会重复执行/)
+  assert.equal(cellularImsErrorStatusLabel('mm_ims_profile_reconcile_pending_extra'), null)
+  assert.equal(cellularImsErrorStatusLabel(`cellular_ims_runtime_ims_baseband_wedged:${error}`), '基带异常，已停止重试')
+})
+
 await test('former prefix families are enumerated member by member', () => {
   assert.equal(cellularImsErrorStatusLabel('cellular_ims_digest_realm_missing'), 'IMS 鉴权响应异常')
   assert.equal(cellularImsErrorStatusLabel('cellular_ims_register_nonce_not_aka'), 'IMS 鉴权响应异常')
