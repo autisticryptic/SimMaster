@@ -1,5 +1,17 @@
 # 单主分支维护与本次整合
 
+## 完成结果
+
+2026-10-05已整合并推送 **`ae3926e37a285770aa802f74def33c1b3d491f98`**，保留9个父提交，
+包含所有旧验证快照历史。主分支[Build37276695025](https://github.com/autisticryptic/SimMaster/actions/runs/37276695025)、
+[Validate37276695143](https://github.com/autisticryptic/SimMaster/actions/runs/37276695143)、
+[Frontend37276695033](https://github.com/autisticryptic/SimMaster/actions/runs/37276695033)全部success。
+两套实际日志68项相关回归与54个矩阵场景通过，双架构包完整校验，Publish Release skipped。
+
+07:39 UTC复核：**本地及GitHub仅保留master**，下列五条dev分支已原子删除；
+8条本地临时build-snapshot引用也在确认属于master祖先且bundle备份有效后清理。
+`v1.1.5`标签仍指向原5c378f8，旧Release未覆盖。随后文档收尾提交不改变构建输入。
+
 ## 维护方式
 
 当前项目以 **`master`** 为唯一日常开发分支，GitHub远端为 `autisticryptic/SimMaster`（本地remote名`simmaster`）。
@@ -16,7 +28,7 @@ Release标签与分支不同：`v1.1.5`保持原指向，不因主分支前进�
 旧快照不是五套独立功能分支，而是从同一5c378f8创建的累积工作树快照；冲突以已验证后继源码解决，
 不把旧版本覆盖回最新修复。通过合并提交保留原提交历史，而不是只删除分支指针丢弃独有提交。
 
-待收敛的五条临时远端分支：
+已删除且提交历史仍由master保留的五条临时远端分支：
 
 - `dev/ims-switch-20261004T120258Z-2785dbf6`
 - `dev/ims-reconcile-20261004T152003Z-395c209e`
