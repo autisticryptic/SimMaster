@@ -91,8 +91,9 @@ D-Bus 管理 modem，也提供需显式启用的实验性 native QMI/MBIM/AT 后
 - **设备运维**：短信持久化与通知转发、通知失败队列、定时/周期自动化任务、系统事件、
   单管理员认证和 SSH 密码恢复。
 
-> 一键安装、在线升级和 OTA 发布流程正在重构，当前不提供任何远程脚本安装入口。
-> 仓库中的相关脚本仅作为历史实现保留，请使用下方手动安装流程。
+> 安装器已统一为带完整校验清单的离线发布包，在线入口必须固定可信仓库与版本。
+> 默认只安装文件，不启动服务或激活硬件；旧 Release 不会自动获得新安装器。
+> Web OTA 应用与卸载流程不在本轮验收范围。使用前请阅读 [安装指南](./docs/INSTALL.md)。
 
 ## 软件结构
 
@@ -102,9 +103,9 @@ SimAdmin/
 ├── frontend/         React 19 + TypeScript + MUI 管理界面
 ├── bruno-api/        可直接执行的 Bruno REST API 集合
 ├── docs/             安装、运维、开发、变更记录与专题资料
-├── deploy/           设备安装资源、udev 规则和辅助 systemd 单元
-├── scripts/          构建、实验室测试及待重构的部署/打包脚本
-├── install_latest.sh 待重构的一键安装脚本（当前不使用）
+├── deploy/           离线安装器、设备资源、udev 和 systemd 单元
+├── scripts/          构建、统一发布打包和实验室测试
+├── install_latest.sh 固定版本的在线下载入口（默认不激活）
 └── uninstall.sh      待重构的卸载脚本（当前不使用）
 ```
 
@@ -118,28 +119,32 @@ SimAdmin/
 
 更完整的目录职责和开发流程见[开发者指南](./docs/DEVELOPER.md)。
 
-## 手动安装
+## 安装
 
-当前只支持手动部署。完成前后端构建后，将后端和前端安装到目标设备。运营商数据库是可选
-组件：SimAdmin 可以在缺少 `carrier-bundles.sqlite3` 时启动，管理员随后可在 WebUI 的
-“运营商 IMS Profile -> 数据库下载”中选择并安装兼容的 schema v7 数据库。
+从同一源码版本构建前后端后，用 `scripts/pack-ota.sh` 生成新格式发布包。Linux/systemd
+ARM64、AMD64 均受支持；目标机需要 Python 3.8+。先取得可信的包及摘要，**校验成功才解包**：
 
 ```bash
-install -d -m 0755 /opt/simadmin /opt/simadmin/www
-install -m 0755 /path/to/simadmin /opt/simadmin/simadmin
-cp -a /path/to/frontend-dist/. /opt/simadmin/www/
-install -m 0644 /path/to/simadmin.service /etc/systemd/system/simadmin.service
-systemctl daemon-reload
-systemctl enable --now simadmin.service
+sha256sum -c simadmin-linux-arm64.tar.gz.sha256
+mkdir simadmin-package
+tar --no-same-owner --no-same-permissions -xzf simadmin-linux-arm64.tar.gz -C simadmin-package
+sh /absolute/path/to/simadmin-package/install.sh --check
+sh /absolute/path/to/simadmin-package/install.sh
 ```
 
-如需随安装包预置数据库，可额外将其放到
-`/opt/simadmin/carrier-bundles.sqlite3`；否则首次启动后再从 WebUI 下载。下载会先校验数据库
-契约，再原子替换当前 catalog 并立即启用，不需要重启 SimAdmin。
+默认不启动服务、不安装/激活设备单元；运行中的服务须在维护窗口使用显式 `--activate`
+或人工部署。新安装器保留配置、数据库、catalog 和 lpac；会在停服之前拒绝不匹配的包、
+架构、配置或自定义服务设置。在线 `install_latest.sh` 需明确指定 `REPO` 与 `VERSION`，
+不会混用旧 Release 和分支上的新 unit，具体命令见 [安装指南](./docs/INSTALL.md)。
 
-以上命令需在目标设备以 `root` 执行，并将 `/path/to/...` 换成实际产物路径。完整的依赖、
-构建、文件传输、副 QMI 服务和升级步骤见[手动安装指南](./docs/INSTALL.md)。安装完成后访问
-`http://<设备 IP>:3000`，首次打开时设置管理员密码。
+运营商数据库是可选组件：缺少 `carrier-bundles.sqlite3` 不阻止程序启动，可随后在 WebUI 的
+“运营商 IMS Profile -> 数据库下载”中选择兼容的 schema v7 数据库，或预置到
+`/opt/simadmin/carrier-bundles.sqlite3`。独立数据库项目现提供完整、无图标、保守精简无图标
+三个版本；精简不代表所有运营商都可用标准派生注册，边界见 [运营商 Profile](./docs/CARRIER_PROFILES.md)。
+
+以上安装命令需在目标机以 root 执行，路径替换为真实文件位置。依赖准备、配对备份、
+升级回滚与硬件激活边界详见 [安装指南](./docs/INSTALL.md)。主服务实际启动后访问
+`http://<设备 IP>:3000`，首次打开时设置管理员密码。本轮没有在 410 上重装或重启服务。
 
 ## 文档导航
 

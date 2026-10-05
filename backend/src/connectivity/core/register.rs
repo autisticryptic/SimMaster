@@ -76,7 +76,7 @@ fn register_cseq(frame: &[u8]) -> Option<u32> {
     let mut fields = value.split_whitespace();
     let number = fields.next()?.parse::<u32>().ok()?;
     let method = fields.next()?;
-    method.eq_ignore_ascii_case("REGISTER").then_some(number)
+    (method.eq_ignore_ascii_case("REGISTER") && fields.next().is_none()).then_some(number)
 }
 
 /// Final-response statuses that can plausibly be fixed by a different
@@ -1330,6 +1330,15 @@ mod tests {
             b"REGISTER sip:ims.example SIP/2.0\r\nCall-ID: abc\r\nCSeq: 1 INVITE\r\n\r\n"
         )
         .is_none());
+    }
+
+    #[test]
+    fn register_transaction_rejects_trailing_cseq_fields() {
+        let key = RegisterTransactionKey::from_register_request(
+            b"REGISTER sip:ims.example SIP/2.0\r\nCall-ID: abc\r\nCSeq: 7 REGISTER\r\n\r\n"
+        ).unwrap();
+        assert!(!key.matches_response(b"SIP/2.0 421 X\r\nCall-ID: abc\r\nCSeq: 7 REGISTER private-sentinel\r\n\r\n"));
+        assert!(key.matches_response(b"SIP/2.0 421 X\r\nCall-ID: abc\r\nCSeq: 7 REGISTER\r\n\r\n"));
     }
 
     #[tokio::test]

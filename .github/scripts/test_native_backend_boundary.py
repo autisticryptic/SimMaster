@@ -119,9 +119,16 @@ class NativeBackendBoundaryTests(unittest.TestCase):
         for name in ("simadmin.service", "simadmin-loopback.service"):
             text = (ROOT / "scripts" / name).read_text()
             self.assertFalse(any("ModemManager.service" in line for line in text.splitlines() if line.startswith("Wants=")))
-        text = (ROOT / "install_latest.sh").read_text()
-        self.assertIn('MODEM_BACKEND="$("${INSTALL_DIR}/simadmin" modem-backend-mode)"', text)
-        self.assertIn('$mm_debian libqmi-utils', text)
+        # Online bootstrap is transport-only; package/config preflight belongs
+        # to the shared installer. Behavioral fake-service tests cover ordering.
+        bootstrap = (ROOT / "install_latest.sh").read_text()
+        self.assertNotIn('apt-get', bootstrap)
+        self.assertNotIn('systemctl', bootstrap)
+        installer = (ROOT / "deploy/installer.py").read_text()
+        self.assertIn('"modem-backend-mode", "--config", str(config)', installer)
+        self.assertIn('if backend == "modemmanager":', installer)
+        self.assertNotIn('"ModemManager.service"', installer)
+        self.assertNotIn('"install-device-resources"', installer)
 
 
 if __name__ == "__main__":

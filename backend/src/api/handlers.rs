@@ -922,6 +922,55 @@ pub async fn enable_esim_profile_handler(
         Ok((line, _)) => line,
         Err(err) => return esim_error_response::<EsimCommandResponse>(err).into_response(),
     };
+    // The QCM410 proof is deliberately independent of begin_mm_switch's
+    // applicability: a withdrawn MM binding must not hide an old receipt.
+    #[cfg(target_os = "linux")]
+    let needs_ims_drain = {
+        let binding = line.binding();
+        app.line_registry.device_kind() == crate::hardware::devices::DeviceKind::Qcm410
+            && binding.line_kind != "reader"
+            && crate::hardware::cellular::backends::active_native().is_none()
+            && !crate::hardware::cellular::backends::is_native_selector(&binding.modem_path)
+    };
+    #[cfg(target_os = "linux")]
+    let switch_inventory = if needs_ims_drain {
+        match app.line_registry.reserve_esim_switch_inventory() {
+            Ok(guard) => Some(guard),
+            Err(reason) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ApiResponse::<EsimCommandResponse>::error(reason)),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    if needs_ims_drain {
+        // The recovery below stops MM process-wide. This small barrier only
+        // closes this line's admission; do not claim it drains other modems.
+        // Refuse known multi-modem inventories, even if currently idle. A
+        // duplicate physical slot is also unsafe: registry deduplication can
+        // collapse multiple MM objects into one line with slot_conflict set.
+        // The inventory reservation prevents hotplug from publishing/admitting
+        // another line until the global MM mutation has finished.
+        for other in app.line_registry.all().await {
+            let binding = other.binding();
+            if binding.line_kind != "reader"
+                && (!Arc::ptr_eq(&other, &line) || binding.slot_conflict)
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ApiResponse::<EsimCommandResponse>::error(
+                        "mm_ims_switch_multiline_drain_unverified",
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    }
     // Close MM IMS admission before lpac can change the SIM. This guard is
     // moved into the background operation and also releases on error/cancel.
     let mm_switch = match line.cellular_ims.begin_mm_switch() {
@@ -943,6 +992,38 @@ pub async fn enable_esim_profile_handler(
             &line.cellular_ims,
         )
         .await;
+    }
+    // Cleanup returns (), and retained profile cleanup failures only warn.
+    // Prove absence under the Context flock before ANY lpac task is spawned.
+    // Never put this verification/cleanup inside the serial permit: profile
+    // snapshots acquire that same permit themselves.
+    #[cfg(target_os = "linux")]
+    let ims_switch_drain = if needs_ims_drain {
+        match crate::hardware::devices::qcm410::esim_switch_drain_guard() {
+            Ok(guard) => Some(guard),
+            Err(reason) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ApiResponse::<EsimCommandResponse>::error(reason)),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    if needs_ims_drain && mm_switch.is_none() {
+        // Absence alone does not reserve admission. A withdrawn MM binding
+        // can make begin_mm_switch return None and later become ready again.
+        // Check receipts above regardless, but never switch without the ticket.
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::<EsimCommandResponse>::error(
+                "mm_ims_switch_admission_unverified",
+            )),
+        )
+            .into_response();
     }
     let event_entity = mask_identifier(&iccid);
     let bg_line_id = line_id.clone();
@@ -1002,6 +1083,10 @@ pub async fn enable_esim_profile_handler(
         async move {
             let _guard = modem::BasebandRestartRunGuard::for_line(&bg_line_id);
             let _mm_switch = mm_switch;
+            #[cfg(target_os = "linux")]
+            let _ims_switch_drain = ims_switch_drain;
+            #[cfg(target_os = "linux")]
+            let mut switch_inventory = switch_inventory;
 
             match bg_app
                 .esim_supervisor
@@ -1061,6 +1146,12 @@ pub async fn enable_esim_profile_handler(
                                 snapshot.last_register_refresh_at = None;
                             })
                             .await;
+                        // All global MM mutations are complete. Release only
+                        // the inventory reservation before refresh reacquires
+                        // it; the line admission ticket and device flock remain
+                        // held through identity reconciliation below.
+                        #[cfg(target_os = "linux")]
+                        drop(switch_inventory.take());
                         if let Err(error) = bg_app.line_registry.refresh().await {
                             warn!(
                                 line_id = %bg_line_id,

@@ -41,6 +41,23 @@ VoLTE/VoWiFi 注册依赖运营商的 APN、ePDG、IKE/ESP proposal、IMS domain
 正式支持仍需在独立 carrier catalog 流程中完成来源审计、字段校验和封存，再由 SimAdmin 加载兼容的
 catalog release。
 
+## 2026-10-02：三种数据库版本与派生覆盖审计
+
+独立 `carrier_Bundles` 项目已增加完整、无图标、保守精简无图标三个构建变体；每种都保留
+IPSW、IPCC、Pixel、小米四种来源的独立数据库，共 12 份，未把跨固件字段混合补齐。
+本机产物在 `../carrier_Bundles/data/variants/2026-10-02/`，规则和报告说明见该项目的
+`docs/CATALOG_VARIANTS.md`。
+
+**不能证明“标准派生对全部 4G/5G/VoWiFi 完美兜底”，所以没有整行删除运营商配置。**
+当前 `CatalogAccessKind` 只有 LTE/EPC 与 Wi-Fi/ePDG 两种投影，NR 字段存在不代表 NR/5GC
+独立适配已经实现。派生还受可信 home PLMN、私网、SIM/网络开通、P-CSCF、安全协商等约束。
+旧通用接口对显式 Profile 的严格行为，与线路来源候选接口的缺失行回退，也不能混为一谈。
+
+精简版保留全部 Profile ID、匹配、readiness、必需字段、NR 配置和非默认策略，只省略九类
+经过消费回归证明相同的可选默认值；不变更生产地址族计划。对本次 5973 个 Profile 的
+23892 次实际消费者查询对比一致（包括原有不可用/错误结果），但这不是网络注册验收。
+未替换当前设备上的 catalog。详情见 [本轮交付记录](INSTALL_ESIM_CATALOG_2026-10-02.md)。
+
 ## 支持的来源
 
 ### Android

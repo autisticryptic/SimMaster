@@ -1,9 +1,253 @@
 # 当前接手与项目状态
 
-> 更新：2026-10-01。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
+> 更新：2026-10-05。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 当前正式部署：448c98a / 默认双栈策略下IMS注册成功（2026-10-01 16:20 UTC）
+## 开发分支收敛：以master统一承载最新已验证代码
+
+用户要求只保留主分支。本次整合以最终验证快照 **6ddc751** 的构建输入为准，通过合并历史保留旧验证提交，
+并把本轮技术文档纳入master；五条临时dev分支仅在主分支Actions通过、确认已合并后删除。
+不改Release标签、不操作设备、不把私有eSIM文档移动或诊断日志提交进来。
+维护规则及备份：[单主分支整合记录](BRANCH_CONSOLIDATION_2026-10-05.md)。
+整合/CI/分支删除的实际SHA和核验保存在 `.local/evidence/branch-cleanup-20261005/`。
+以下候选和部署记录保留原日期事实；“未合并master”是当时的阶段状态，不再作为当前开发方式。
+
+## 最新候选：CMCC 421→403 定向修复6ddc751通过Actions，尚未实网验证
+
+用户追加的诊断已确认 `derived_3gpp_lte_46002`，缺配置后的派生兜底生效，双栈承载获IPv6。
+第二P-CSCF标准请求421+Security-Server后，旧逻辑转generic去掉空AKA/安全声明，再收到403 Authentication Failure，
+auth_rounds始终0。实际421机制/警告正文缺失，不能归因为SIM鉴权计算错误或未订阅。
+
+新候选 **6ddc751** 在该明确形状下，只允许一次收窄至原首选AES机制的重报价，保留身份和完整声明；
+401/407、423、AUTS、续期/注销绑定实际单机制，不允许回到generic或未保护成功。
+未认证提示不能引导新增null/MD5重试，普通403/无hint旧路径、地址族/身份域/原预算不变。
+新增有界白名单机制/Warning诊断，修补未知扩展值语法及CSeq尾随字段隐私边界。
+
+Build37268498822、Validate37268498818、Frontend37268498810全部success；两套日志68相关回归及
+24标准+18历史+12hint场景通过，双架构官方digest/包SHA/源码核验完成。
+ARM64包SHA `08962fe848c97154098c8100129b0fd7751c1058ab83dee8e3f3387a2f302895`。
+代码在专用dev验证分支，用户HEAD/索引保持；未覆盖Release、未本机编译、未访问或改变410。
+**这是一版待同卡实网测试的候选，不是已证明CMCC注册成功。**详情及下载入口：
+[CMCC 421候选](CMCC_421_CANDIDATE_2026-10-05.md)。
+
+## 最近部署记录（2026-10-04）：71c970d运行410，Globe注册通过
+
+以下是前次16:40 UTC已核验状态，不代表用户新CMCC日志对应设备的实时状态。
+
+用户明确授权部署后，已将GitHub Actions验证产物 **71c970d / 1.1.5** 部署到
+**http://192.168.68.1:3000**，正式PID769258；运行SHA256
+`acf44ca39f074ea63c0d9529f933bb1b8e048a5206011913be576ca9e338fe12`与ARM64制品一致。
+
+Globe于 **16:31:57 UTC** 新注册成功，16:40:52独立收尾仍同一registered_at，
+**derived / IPsec / IPv4、last_error=null、reconnect_count1、NRestarts0**。
+本次requested/owned family4，实际IPv4，默认双栈→IPv6→IPv4未改。
+旧3169c7b会话已正常shutdown并完成profile清理；没有遗留recovery标记，也未为部署执行跨owner强制清理。
+当前新CID3是正常活跃租约，不要作为旧残留删除。
+
+- 只重启SimAdmin；MM474743、owner:1.511及原boot未变，未重启MM/基带，无新kernel fatal。
+- config.yaml、停服复制窗口data.db和运行catalog摘要保持，启动后四配置表指纹保持；没有换运营商数据库。
+- 20前端资源磁盘/HTTP摘要通过，设备侧守卫accepted，原recovery timer已恢复active；没有本次遗留hold/drop-in。
+- 备份在 `/opt/simadmin-staging/reconciliation-20261004-71c970df703f/backup/`，不要当作孤儿自动删除。
+- 新会话自然续期仍0；旧版本的2次续期不计入本次。通话/音频和跨owner故障注入本轮未验收。
+- 所有编译仍只在Actions，本机没有编译；用户HEAD/索引保持。
+
+部署证据：`.local/evidence/ims-reconciliation-20261004/deployment/` 内
+`package-verified.json`、`deploy-stage.json`、`deploy-install-accept.json`、`final-verified.json`。
+详情：[跨MM/SIM恢复补强](IMS_CROSS_OWNER_RECOVERY_2026-10-04.md)。
+
+## 部署前代码验证记录：跨MM/SIM恢复补强71c970d通过Actions
+
+新增独立reconciliation事务：旧资源确实absence时可自动归档；仍present的AT profile因没有唯一归属标签、
+存在同值重建歧义，必须先`inspect-stale`取得plan，再显式`reconcile-stale --expected-plan`确认。
+不改旧账本owner/SIM、不放宽原identity/release。命令前持久化意图，超时/取消后只读核验、不重发未知写入；
+孤立journal、归档中断、从备份恢复旧账本也不能重置命令预算。活动/未知CID或其他worker/namespace/会话均拒绝。
+同boot旧账本也进入启动前置门禁；代码不会为了恢复而自动停其他线路、删namespace或重启MM/基带。
+
+最终源码 **71c970d**：Build37214027592、Validate37214027581、Frontend37214027570全success，
+两套日志43项定向回归（24新+19既有）及24标准+18历史矩阵通过，ARM64/AMD64产物全摘要验证。
+全程无本机编译，用户HEAD/索引保持、只推送独立dev验证分支、Publish skipped。
+详情：[跨owner资源恢复补强](IMS_CROSS_OWNER_RECOVERY_2026-10-04.md)。
+
+**截至15:48 UTC尚未部署；后续正式部署见首节，未做实机故障注入。**当时只读检查：410仍为3169c7b/PID732029，
+Globe自14:00:45起同一次derived/IPsec注册，last_error=null、reconnect_count1，已自然续期2次，MM474743不变。
+此次开发没有停止健康会话，不能把3169c7b的现场成功冒充71c970d的实网恢复测试。
+
+## 最近设备部署：Globe已实网恢复，新精简数据库已公开发布（14:09 UTC收尾）
+
+用户继续要求完成后，已完成受控维护和正式部署。410访问 **http://192.168.68.1:3000**，
+当前正式程序为Actions验证快照 **3169c7b / PID732029**，14:00:45 UTC开始同一次
+**derived / IPsec / IPv4**注册；14:09:11收尾仍registered、last_error=null、reconnect_count1、NRestarts0。
+原双栈→IPv6→IPv4策略未改；本次requested/owned family4、实际IPv4，不是手工固定IPv4。
+
+旧账本属于上一张SIM，未放宽自动跨owner/SIM清理。维护停主服务和recovery timer后，确认无worker、
+无bearer/通话，双快照核验CID3 inactive、完整AT/MM定义与原记录一致、CID1/2/EPS/reporting其他项不变；
+仅恢复CID3 reporting000并删除精确CID3。原账本先完整备份，随后由已验证程序
+`inspect-retired`/`retire-absent`证明profile及旧网络absence后归档。现在的新CID3是正常活跃自有租约，
+**不要再次清理**。这是显式维护，不是把不同SIM的旧租约伪装成当前归属。
+
+仅更新正式程序/对应前端/meta；20资源HTTP+磁盘摘要通过。安装窗口config.yaml/data.db/运行catalog
+摘要保持，启动后四配置表保持；未换运行数据库。MM474743/boot保持、未重启MM/基带、无新kernel fatal，
+守卫accepted、recovery timer已恢复active。自然续期计数仍0，通话/音频/真实来回换卡本轮未验收。
+详情与实际部署证据：[换卡与历史回归](IMS_SWITCH_REGRESSION_2026-10-04.md)。
+
+数据库 **[v0.3.1-catalog-v7](https://github.com/autisticryptic/carrier_Bundles/releases/tag/v0.3.1-catalog-v7)**
+已发布：target814b057，安全dry-run37206088071/正式发布37206201366成功；20公开文件重新下载核验，
+12只读SQLite与Actions产物一致，44.24→19.60MiB（55.70%），小米380静态WFC ready保持。
+旧v0.3.0/tag/assets不变；未合并或移动两仓用户HEAD/索引。详见[数据库Actions验证](CATALOG_ACTIONS_2026-10-04.md)。
+全程没有本机编译，仍只使用GitHub Actions产物。
+
+## 本轮较早阶段：换卡屏障与历史回归通过Actions，尚未维护现场
+
+**本轮禁止且没有本机编译**。隔离验证快照 `3169c7b` 已在GitHub Actions完成Build37200807750、
+Validate37200807900、Frontend37200807803，全success。两套后端日志均核验24标准+18历史场景
+（26模拟成功、16预期拒绝），以及15个清理/flock、2个库存预留、2个SHA1别名新增测试。
+ARM64/AMD64包的官方digest、SHA清单、ELF、meta均已验证，Publish skipped。
+
+修复清理失败仍继续切卡的问题：lpac之前要求持久资源absence和同一设备flock，持锁跨MM恢复；
+新增registry库存预留阻止检查后的新线路接入。无MM admission ticket、多已知modem或slot冲突拒绝。
+已兼容SHA1同算法两种拼写，未放宽未报价算法；补上上轮CI漏选测试及非Actions拒绝执行保护。
+工作HEAD仍5c378f8、索引未变；只推送专用dev验证分支，未合并master、未部署或发布。
+
+**11:51 UTC只读现场仍未注册**：Globe51502/漫游50212；主PID348115、MM474743、旧98d0e09程序。
+旧owner:1.18的CID3 IPV4V6/ims及reporting111真实存在、账本cleaning/abandoned，不能视为absence。
+未重启MM/基带、删资源、清预算或重试注册；恢复现场仍需确认受控维护窗口，不以离线通过替代实网恢复。
+详情及产物：[换卡与历史回归](IMS_SWITCH_REGRESSION_2026-10-04.md)。
+
+carrier问题确认是发布滞后：旧v0.3.0资源实际10月3日上传，未启用runtime-minimal。
+新隔离快照814b057的artifact-only Actions **37201477372已success**，复用固定3个完整库、
+重建小米完整OTA和12变体；官方digest及全部12库只读校验通过，总计44.24→19.60MiB、减少55.70%，
+小米三版均保留380静态WFC ready。详情：[数据库Actions验证](CATALOG_ACTIONS_2026-10-04.md)。
+此处是维护/发布前记录；新tag后续已发布，见首节，旧Release保持。
+
+## 以下为历史：蜂窝IMS多机制协商已部署，实机选中第二机制注册通过
+
+410访问 **http://192.168.68.1:3000**。当前正式本地快照`98d0e09`、PID348115；MM957/boot保持。
+实际蜂窝运行时已修复Security-Client仅取首项、cipher_null错误传CK、端口冻结不一致；派生LTE
+明确提供SHA1/AES及SHA1/null并严格拒绝未提供机制，认证重复原报价，未新增承载/认证重试循环。
+
+**本次设备真实选择了第二项SHA1/null**：内核两条SA为hmac(sha1)+ecb(cipher_null)，
+derived/IPsec注册、last_error=null、reconnect_count1，同次连续180秒以上和收尾通过。
+这是IPsec完整性保护，不是AES加密或无安全。新会话续期仍0，不冒用旧版本计数。
+配置/DB/unit/默认族策略不变，前端同步新错误提示，20资源HTTP摘要通过；守卫accepted、timer恢复。
+未重启MM/基带或清预算，没有物理卸载DB；实际选择派生分支，不等于完全移除库后的验收。
+
+586定向Rust、24SIP场景（14正10负）、262项目Python、98数据库、36前端单测及8E2E通过；
+本地私有NET的真实内核对照证实旧null+CK拒绝、新null空密钥/AES+CK接受。
+数据库脚本/新证据`2966036`已推送，裁剪规则未扩大；SimAdmin仅本地build快照，用户HEAD/索引保持。
+详情：[蜂窝IMS实际补强及部署](CELLULAR_IMS_SECURITY_NEGOTIATION_2026-10-03.md)。
+
+## 派生协商前一轮已部署410（以下cc918f5为历史）
+
+访问 **http://192.168.68.1:3000**。新正式后端本地快照`cc918f5`、PID255232，MM957/boot未变。
+补齐同MODP2048组内的已支持SHA512/PRF组合及CHILD提案，强化SA_INIT元数据验证，明确IKE_AUTH
+认证/授权拒绝贯穿兜底各层止损；首选/2DH组×2传输路径预算和默认双栈→IPv6→IPv4保持。
+
+实机derived/IPsec注册、last_error=null、reconnect_count1，同次注册连续180秒以上及额外收尾通过。
+申请/自有族4，实际IPv6。仅更新后端与metadata，配置/DB/前端/unit/VoWiFi开关未改，当前Pixel库未换。
+守卫accepted、recovery timer已恢复，未重启MM/基带或清预算。**新版本续期仍0；真实VoWiFi本轮未验收。**
+
+485定向Rust、261项目Python、98数据库Python、21SIP场景通过。数据库`74bfd6c`已推送并验证：
+LTE required按已验证首包能力放行，WiFi required/disabled及未知策略继续保留；12新库189派生回退、
+12196其他投影和NR保持。实库实际删除数未增加，不以扩提案为由删掉未覆盖策略。
+SimAdmin以本地build-snapshot构建，未移动用户HEAD/索引，未推送SimAdmin或发布Release。
+详情：[派生补强与部署](DERIVED_REGISTRATION_HARDENING_2026-10-03.md)。
+
+## 小米完整固件已重建出380条VoWiFi配置，测试后推送7fab7a5（先前数据库记录）
+
+用户授权下载后，完整8.41GiB固定OTA的SHA256与旧源一致，已实际提取Android分区/APK资源，
+按DEX核实的覆盖顺序、引用及选择条件编译策略，不从MCFG字符串猜配。
+数据库仓库 **7fab7a5** 已在本地测试完成后提交推送并核验远端；97Python测试通过。
+941条Profile中380 VoWiFi静态ready（原来为0），644 LTE/655 NR ready；明确禁用560、未知1。
+实际SimAdmin逐条加载380 VoWiFi+644 LTE，858项非ready拒绝；WFC有APK证据，ePDG/IKE明确为标准派生，
+不是380条实网注册验收。初稿335条已被审查后最终380条替代。
+
+新12库在`../carrier_Bundles/data/variants/2026-10-03-xiaomi-vowifi-final/`，小米三版均保留380 ready，
+其full/no-icons约8.76MiB、minimal约2.66MiB（本地跳过图标同步）。集合189派生回退、12196其他投影、NR
+保持与所有库完整性/外键/摘要通过。**本轮未操作410、未换运行库、未发布Release**。
+详情：[完整小米VoWiFi修复](XIAOMI_VOWIFI_FULL_OTA_2026-10-03.md)。动态更新和全部MVNO/实网行为仍未保证。
+
+## 较早数据库后继：体积减半；小米提取缺陷修正（以下缺输入状态已由上节更新）
+
+数据库仓库 **3442c0b** 已推送，59测试通过。新增运行时精简在不改配置/匹配/NR/8表结构的前提下
+移除字段审计证据行（完整版保留证据）；四库37.48→18.03MiB、减少51.9%，不是额外删去同等比例注册配置。
+新12库在`../carrier_Bundles/data/variants/2026-10-03-runtime-minimal/`；实际客户端618既有派生回退、
+11326其他投影和NR保持。此轮未操作410，运行状态仍以下节设备记录为准。
+
+小米旧库721条均来自APN；修复product首匹配提前结束扫描及无关pb误收集，旧缓存不能绕过新扫描。
+**尚未重建出真实VoWiFi条目**：缺完整OTA/Android分区，本地MCFG虽含IWLAN XML但有禁用/紧急域和多版本，
+不能直接猜配。固定OTA可下载，约8.41GiB；后续需取得真实资源、重提取并实现有证据的APK/MCFG解析。
+详见[运行时精简与小米调查](CATALOG_RUNTIME_MINIMAL_2026-10-03.md)。不要把提取器修正说成小米VoWiFi已验收。
+
+## 重启恢复/EID修复已部署，数据库推送完成（2026-10-03）
+
+详细记录：[重启恢复与eSIM显示修复](IMS_REBOOT_RECOVERY_2026-10-03.md)。410访问
+**http://192.168.68.1:3000**；运行本地已验证快照`b3e96c6`，PID156230，MM957和boot保持。
+EID首6末4可见、中间掩码，仅复制；自定义容量功能已移除，20前端资源HTTP摘要通过。
+
+旧跨boot账本由新正式程序在同SIM/拓扑、双快照profile及网络absence证明后自动归档，不删除modem profile。
+新增启动前置门控防止MM/SIM未就绪时先建namespace阻断后续恢复，并支持安全续接中断的归档。
+最终IPsec registered、last_error=null；后继发生过一次数据接口变化并自动重连，**并非始终同一会话**。
+最新会话已约56分钟且自然REGISTER续期1次，reconnect_count2。没有本轮MM/基带重启或内核fatal记录。
+默认双栈→IPv6→IPv4保持，当前实际IPv6不代表单族配置。
+
+312定向Rust、259项目Python、35安装测试、35前端单测、8浏览器流程、类型/lint/前后端构建通过。
+首次收尾观察器缺陷曾触发600秒守卫按deadline停服，失败证据保留；第二窗口完整接受后timer已恢复，
+本次抑制drop-in已删除。secondary旧失效命令循环已停止并换canonical unit，但未在线运行初始化。
+SimAdmin仅创建`refs/build-snapshots/...`本地构建快照，工作HEAD/用户索引未变，未推送或发布。
+
+数据库独立仓库`c445d53`和报告修复`f9cc1d3`均已推送并验证远端。用户新增的minimal疑问已审查：
+四库仅减0.6461%，不等于其余都验证为派生失败。已修复将不存在接入/通过项计入保留的报告口径，
+48数据库测试及四源删除决策/7表逐项一致核验通过，**未扩大删库范围，也未再次换设备库**。
+详见[精简差距审查](CATALOG_PRUNING_AUDIT_2026-10-03.md)。进一步逐条注册需求建模、拆分其他业务策略、
+证据瘦身与空接入/NR覆盖仍需专门实现验证，不能声称“已砍掉一半”。通话/音频本轮未验收。
+
+## 原格式直接裁剪安装记录（以下为10月2日历史，推送与IMS状态已由上节更新）
+
+详细记录见 [派生模拟、数据库直接裁剪与410安装](IMS_SIMULATION_PRUNING_2026-10-02.md)。
+19项模拟场景及46项数据库回归通过；最终12库仍是schema v7/contract v1，不含v2格式。
+614个LTE IMS及4个VoWiFi接入直接删除（其中2整行），实库618项派生解析/11326其他投影核验通过。
+
+数据库仓库本地提交`c445d5327e721407505643d328595378e8849a2a`已创建，**GitHub认证缺失，push尚未成功**。
+410现通过 **http://192.168.68.1:3000** 访问；全部12库在`/opt/simadmin/catalogs/direct-pruned-c445d53/set/`，
+当前启用Pixel精简库，API确认usable/sealed，配置备份在同目录`backup/`。本次没有重启任何服务。
+
+**IMS尚未恢复**：安装前后均disabled，主PID527；旧跨boot lease仍指向此前PID93382/runtime active，
+导致`mm_ims_profile_runtime_recovery_unresolved`。须严格核验后恢复，不得直接删账本或声称注册成功。
+下节的同次IMS注册是早先UI部署当时的验证，已非实时状态。
+
+## 410 前端已热更新（2026-10-02，以下为先前记录）
+
+用户随后授权部署供手动查看，已将当前前端部署到 **http://192.168.100.13:3000**。
+前端标识 `ui-20261002T041821Z-531902b18dfe`，源树 SHA256
+`531902b18dfe6d96071d982ae1c45b5762090b75e46c536a2ea32c246315e234`。
+21 个新前端文件的磁盘/HTTP 摘要逐一通过；保留旧哈希 assets 兼容已打开的标签页。
+后端相对已部署 `448c98a` 只有 `cfg(test)` 新增，故保留已验证程序，不冒充新后端构建。
+主 PID93382、MM 及 boot 不变，未停止服务；前后两次 IMS 均保持同一 registered_at，
+IPsec 注册正常、last_error=null，配置表/文件和当前 catalog 不变。旧页面与 metadata
+保存在 `/opt/simadmin/.ui-stage-ui-20261002T041821Z-531902b18dfe/`，不要误作孤儿资源删除。
+证据：`.local/evidence/latest-ui-20261002/{build-start,package-ready,deployment}.json`。
+本轮仍未提交/推送/发布；数据库未装入运行设备。用户新增的派生模拟与加强精简正在继续。
+
+## 已完成本地代码：安装器、eSIM 内联管理与三种数据库变体
+
+本轮已续接 `2026-10-01T.jsonl` 最后的三项需求。SimAdmin 与相邻 `carrier_Bundles`
+仓库均有已验证的工作区变更；以下是热更新前的本地交付摘要，部署状态以上节为准。
+完整改动、产物与日志见 [本轮交付记录](INSTALL_ESIM_CATALOG_2026-10-02.md)。
+
+- 新安装包包含同版本安装器/unit/资源及完整 SHA256，停服前预检 ELF、配置和服务设置；
+  默认只安装文件，保留用户数据，拒绝覆盖关闭的设备/网络操作权限。详见 [安装指南](INSTALL.md)。
+- eSIM 完整管理已整合到动态列数卡片：详情/重命名/切换/删除；两行摘要、EID 只复制、
+  剩余存储及真实 eUICC 厂商，保留线路操作锁和写卡保护。
+- `../carrier_Bundles/data/variants/2026-10-02/` 已有四来源×三变体，共 12 份 SQLite。
+  5973 个 Profile 全保留，精简 12478 个等价默认字段；没有按“标准运营商”标签整行删库。
+- 35 安装测试、254 项目 Python、41 数据库 Python、34 前端单测、3 隔离浏览器流程通过；
+  前端/E2E 类型检查、完整 lint、构建及 25 Rust catalog 测试通过。
+  另实库 23892 次查询等价比较、12 库完整性/外键/行级覆盖/摘要全部通过。
+- 标准派生不保证所有 4G/5G/VoWiFi 注册；当前没有 NR/5GC 独立 catalog 投影。
+  本轮未进行新的实机 IMS 验收，**下节是 10 月 1 日最近一次已记录的部署状态，不是实时状态**。
+- 用户既有 ESIM_IMS_PROFILE_TEST 文档移动保持原样，不要混进本轮提交。
+
+## 最近实机部署记录：448c98a / 默认双栈策略下IMS注册成功（2026-10-01 16:20 UTC）
 
 **410正式运行1.1.5 / `448c98acddaf0f805e9162a6c51ebb5177509b07`，PID93382，16:15:58 UTC实际注册IPsec成功。** 连续五次采样及16:20:25收尾均为同一registered_at、last_error=null、reconnect_count1、NRestarts0，活动通话0。不是维护探针成功。
 

@@ -1082,9 +1082,9 @@ pub fn standard_tai_epdg_fqdn(mcc: &str, mnc: &str, tac: u32, technology: &str) 
 /// domains and a portable IMS registration envelope: stable flow identity,
 /// access-type PANI and MMTEL capability for voice. On untrusted Wi-Fi, CNI is
 /// enabled only as a capability gate and is emitted only when a real serving-cell
-/// snapshot exists. Initial empty Authorization, visited-network identity and
-/// mandatory sec-agree remain disabled until a database/catalog profile opts in
-/// or the network challenges the UE.
+/// snapshot exists. LTE identifies AKA and declares its existing security offer
+/// on the first REGISTER; WLAN keeps challenge-driven security declarations.
+/// Neither path invents a visited-network identity or private operator endpoint.
 pub fn derive_standard_3gpp_profile(
     mcc: &str,
     mnc: &str,
@@ -1159,6 +1159,11 @@ pub fn derive_standard_3gpp_profile(
                 "aes128-sha256-prfsha1-modp2048",
                 "aes128-sha256-prfsha256-modp2048",
                 "aes128-sha256-modp2048",
+                // Observed in complete Apple catalogs. These use algorithms
+                // already implemented by the stack and the SAME initial DH
+                // group: broaden negotiation, not the connection retry ladder.
+                "aes256-sha512-prfsha256-modp2048",
+                "aes128-sha512-prfsha512-modp2048",
                 "aes128-sha256-modp1024",
                 "aes128-sha1-modp1024",
                 "aes256-sha1-modp1024",
@@ -1169,6 +1174,7 @@ pub fn derive_standard_3gpp_profile(
                 "aes128-sha256",
                 "aes256-sha512",
                 "aes128-sha1",
+                "aes128-sha512",
             ],
             aka_challenge_mode: "standard",
             include_epdg_idr: true,
@@ -1212,7 +1218,10 @@ pub fn derive_standard_3gpp_profile(
                 include_p_preferred_identity: true,
                 visited_network_header: None,
                 allow_methods: None,
-                strict_security_server_offer: false,
+                // LTE now advertises its complete supported set. A challenge
+                // must select from that set, not silently introduce MD5 or an
+                // unoffered mechanism. WLAN policy is unchanged.
+                strict_security_server_offer: matches!(access, Standard3gppAccess::LteEpc),
                 enable_initial_reject_fallback: false,
                 use_plain_digest_placeholder: false,
                 // The cellular first REGISTER already carries a complete
@@ -1251,7 +1260,13 @@ pub fn derive_standard_3gpp_profile(
                 always_add_sip_instance: true,
                 enable_cellular_network_info: matches!(access, Standard3gppAccess::WifiEpdg),
                 security_client_mechanisms: match access {
-                    Standard3gppAccess::LteEpc => &["hmac-sha-1-96/aes-cbc/esp/trans"],
+                    // AES stays first. Null encryption is the explicit
+                    // integrity-only TS 33.203 alternative, not removal of
+                    // IPsec/AKA; it is used only if the peer selects it.
+                    Standard3gppAccess::LteEpc => &[
+                        "hmac-sha-1-96/aes-cbc/esp/trans",
+                        "hmac-sha-1-96/null/esp/trans",
+                    ],
                     Standard3gppAccess::WifiEpdg => STANDARD_VOWIFI_SECURITY_CLIENT_MECHANISMS,
                 },
                 live_header_variant_set: "standard_3gpp_conservative",
