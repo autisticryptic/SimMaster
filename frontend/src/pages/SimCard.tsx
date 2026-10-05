@@ -236,12 +236,7 @@ function WorkbenchOverview({ line }: { line: CellularImsLineControlResponse }) {
   useEffect(() => {
     let active = true
     const lineId = line.modem.line_id
-    if (line.read_only) {
-      setSimInfo(null)
-      setNetworkInfo(null)
-      setVowifi(null)
-      return
-    }
+    if (line.read_only) return
     // These requests deliberately settle independently: the overview can show
     // cached SIM identity immediately without waiting for slower network/IMS IO.
     void api.getSimInfo(lineId)
@@ -1062,7 +1057,7 @@ export default function SimCardPage() {
       </Box>
 
       <Box sx={{ mt: 2 }}>
-        {activeTab === 'lines' && <ModemLinesPanel workbench onSelectionChange={setSelectedLine} workbenchHeader={selectedLine ? <WorkbenchOverview key={selectedLine.modem.line_id} line={selectedLine} /> : undefined} workbenchEsim={selectedLine?.read_only ? <Alert severity="info">eSIM 硬件读取与操作等待启动恢复。已保存管理模式：{selectedLine.profile.esim_control === true ? '启用' : selectedLine.profile.esim_control === false ? '禁用' : '自动'}。</Alert> : <EsimWorkbenchPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} onControlChanged={handleEsimControlChanged} />} workbenchSms={selectedLine?.read_only ? <Alert severity="info">短信工作台等待线路恢复；历史活动可在 IMS 与 Trunk 中查看。</Alert> : selectedLine ? <SMSPage embeddedLineId={selectedLine.modem.line_id} /> : undefined} workbenchUssd={selectedLine?.read_only ? <Alert severity="info">补充业务需要硬件访问，等待启动恢复。</Alert> : <SupplementaryServicesPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} />} workbenchAutomation={selectedLine?.read_only ? <Alert severity="info">自动化配置与执行等待线路恢复。</Alert> : selectedLine ? <AutomationCenter key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} fixedTarget={lineAutomationTarget(selectedLine)} targetIsReader={selectedLine.modem.line_kind === 'reader'} embedded /> : undefined} workbenchNotifications={selectedLine?.read_only ? <Alert severity="info">线路通知配置等待线路恢复。</Alert> : selectedLine ? <NotificationCenterPage key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} embedded /> : undefined} basicInfoForLine={(line, controls) => <SimBasicInfo key={`${line.modem.line_id}:${Boolean(line.read_only)}`} line={line} controls={controls} />} />}
+        {activeTab === 'lines' && <ModemLinesPanel workbench onSelectionChange={setSelectedLine} workbenchHeader={selectedLine ? <WorkbenchOverview key={`${selectedLine.modem.line_id}:${Boolean(selectedLine.read_only)}`} line={selectedLine} /> : undefined} workbenchEsim={selectedLine?.read_only ? <Alert severity="info">eSIM 硬件读取与操作等待启动恢复。已保存管理模式：{selectedLine.profile.esim_control === true ? '启用' : selectedLine.profile.esim_control === false ? '禁用' : '自动'}。</Alert> : <EsimWorkbenchPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} onControlChanged={handleEsimControlChanged} />} workbenchSms={selectedLine?.read_only ? <Alert severity="info">短信工作台等待线路恢复；历史活动可在 IMS 与 Trunk 中查看。</Alert> : selectedLine ? <SMSPage embeddedLineId={selectedLine.modem.line_id} /> : undefined} workbenchUssd={selectedLine?.read_only ? <Alert severity="info">补充业务需要硬件访问，等待启动恢复。</Alert> : <SupplementaryServicesPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} />} workbenchAutomation={selectedLine?.read_only ? <Alert severity="info">自动化配置与执行等待线路恢复。</Alert> : selectedLine ? <AutomationCenter key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} fixedTarget={lineAutomationTarget(selectedLine)} targetIsReader={selectedLine.modem.line_kind === 'reader'} embedded /> : undefined} workbenchNotifications={selectedLine?.read_only ? <Alert severity="info">线路通知配置等待线路恢复。</Alert> : selectedLine ? <NotificationCenterPage key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} embedded /> : undefined} basicInfoForLine={(line, controls) => <SimBasicInfo key={`${line.modem.line_id}:${Boolean(line.read_only)}`} line={line} controls={controls} />} />}
         {activeTab === 'carrier-profiles' && <CarrierProfilesPanel />}
       </Box>
     </Box>
