@@ -311,7 +311,7 @@ function WorkbenchOverview({ line }: { line: CellularImsLineControlResponse }) {
         <Box display="flex" justifyContent="space-between" alignItems="flex-start" gap={2} flexWrap="wrap">
           <Box minWidth={0}>
             <Typography variant="h6" fontWeight={800} noWrap>{modemSlotLabel(line.modem)} · {simInfo?.operator_name || line.modem.operator_id || '未知运营商'}</Typography>
-            <Typography variant="caption" color="text.secondary">线路 {shortLineId(line.modem.line_id)} · {networkInfo?.signal_strength ?? 0}% 信号 · {networkInfo?.registration_status || '未注册'}</Typography>
+            <Typography variant="caption" color="text.secondary">线路 {shortLineId(line.modem.line_id)} · {line.read_only ? '信号与驻网状态待核验' : `${networkInfo?.signal_strength ?? 0}% 信号 · ${networkInfo?.registration_status || '未注册'}`}</Typography>
           </Box>
           <Chip
             icon={connectionReady ? <CheckCircle /> : <WarningAmber />}
@@ -730,8 +730,8 @@ function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse
                       loading={simLoading}
                       value={
                         <Chip
-                          label={simInfo?.present ? (simInfo.active ? '已插入并启用' : '已插入但未启用') : '未插入'}
-                          color={simInfo?.present ? (simInfo.active ? 'success' : 'warning') : 'error'}
+                          label={line.read_only ? (line.modem.state === 'no_sim' ? 'MM 报告无 SIM' : 'SIM 状态待核验') : simInfo?.present ? (simInfo.active ? '已插入并启用' : '已插入但未启用') : '未插入'}
+                          color={line.read_only ? 'default' : simInfo?.present ? (simInfo.active ? 'success' : 'warning') : 'error'}
                           size="small"
                           sx={{ height: 20, fontSize: '0.75rem' }}
                         />
