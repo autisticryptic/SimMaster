@@ -3,6 +3,23 @@
 > 更新：2026-10-05。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
+## 最新设备：db54abc已部署，恢复受阻也能显示线路；SIM尚未就绪
+
+已按用户要求修复并部署 **db54abc / 1.1.5** 到 **http://192.168.68.1:3000**，主PID34800。
+物理MM设备仍在，但启动门禁因旧跨boot账本和device-init监视进程返回pending，原线路API503导致页面空白。
+现在独立读取MM缓存显示1条只读物理线路：API200、display_only_lines1、data空、blocked_reason明确，
+不创建worker/namespace、不绕过SIM/IMS/网络写入保护。20前端HTTP/磁盘SHA通过，>180秒稳定及独立收尾通过。
+
+**当前IMS没有注册。**用户说刚拔卡；12:53 UTC `AT+CPIN?`仍为SIM failure、MM搜网u2。
+MM缓存保留46002/SIM对象不等于卡可读，不能假称已插卡/已注册。需要用户插回测试SIM，再核验资源和注册。
+本次没有主动尝试SIP、强删旧账本、重启MM/基带或辅助监视进程；配置/DB复制窗口/运行catalog及旧账本保持。
+MM550/:1.18/原boot不变，secondary347仍运行旧映像；主服务守卫accepted、recovery timer恢复active。
+
+主分支Build37309875238、Validate37309875266、Frontend37309875262全部success，76相关回归及54注册场景通过。
+双架构官方digest/文件清单核验，未本机编译、未增新分支；用户私有文档和诊断日志未提交。
+详情与后续安全恢复条件：[被动线路展示修复](PASSIVE_LINE_INVENTORY_2026-10-05.md)。
+**下面旧Globe成功是前次设备状态，不代表当前CMCC卡注册成功。**
+
 ## 开发分支收敛：以master统一承载最新已验证代码
 
 用户要求只保留主分支，现已完成：**本地和GitHub仅保留master**。
