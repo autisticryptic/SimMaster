@@ -9,7 +9,7 @@ export function Fixture() {
   return <ThemeProvider theme={createTheme()}><CssBaseline />
     <div style={{ padding: 16 }}><div data-testid="selected-line">{selected?.modem.line_id}</div>
       <ModemLinesPanel workbench onSelectionChange={setSelected}
-        basicInfoForLine={(line) => <div data-testid="original-basic-info">原基本信息 {line.modem.model}</div>}
+        basicInfoForLine={(line, controls) => <><div data-testid="original-basic-info">原基本信息 {line.modem.model}</div>{controls}</>}
         workbenchEsim={<div>原 eSIM 标签内容</div>}
         workbenchSms={<div>原短信标签内容</div>}
       />
