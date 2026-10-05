@@ -2,10 +2,11 @@ import { test, expect } from '@playwright/test'
 
 test('blocked hardware stays in the original selectable workbench with saved controls', async ({ page }, testInfo) => {
   const requests: Array<{ path: string; method: string }> = []
+  page.on('pageerror', (error) => { void testInfo.attach('browser-error', { body: error.stack ?? error.message, contentType: 'text/plain' }) })
   const lines = ['a', 'b'].map((id, index) => ({
     modem: { line_id: `line-${id}`, line_kind: 'baseband', manufacturer: `Fixture ${id}`, model: 'QCM410',
       slot_label: `测试槽${index + 1}`, slot_source: 'physdev', slot_stable: true, slot_conflict: false,
-      display_order: index, uim_slot: 1, present: true, sim_iccid: '', modem_path: '', qmi_device: null, state: 'no_sim' },
+      display_order: index + 1, uim_slot: 1, present: true, sim_iccid: '', modem_path: '', qmi_device: null, state: 'no_sim' },
     profile: { enabled: true, cellular_ims_connection_enabled: true, data_connection_enabled: true,
       airplane_mode_enabled: true, roaming_allowed: true, vowifi: { enabled: true }, trunk: { enabled: true } },
     runtime: { phase: 'blocked', stage: 'waiting_modem', registered: false, registration_mode: '',
