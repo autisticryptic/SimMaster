@@ -11,6 +11,13 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[path = "primary_ims_profile_runtime.rs"]
 pub mod runtime;
 
+pub use runtime::EsimSwitchDrainGuard;
+
+/// Reserve the drained primary IMS endpoint across an eSIM/MM switch.
+pub fn esim_switch_drain_guard() -> Result<EsimSwitchDrainGuard, String> {
+    runtime::esim_switch_drain_guard()
+}
+
 /// Read-only guard for ordinary profile paths that are not eligible for the
 /// runtime adapter. Never adopt any unresolved self-owned profile by APN.
 pub fn ensure_no_pending_profile(device: &str) -> Result<(), String> {
@@ -1103,6 +1110,8 @@ pub async fn maintain(
             | "retire-absent"
             | "inspect-uncreated"
             | "retire-uncreated"
+            | "inspect-stale"
+            | "reconcile-stale"
     ) {
         return Err(ERROR.into());
     }
@@ -1177,6 +1186,13 @@ pub async fn maintain(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return Err(ERROR.into()),
     };
+    if matches!(action, "inspect-stale" | "reconcile-stale") {
+        return runtime::reconcile_stale(action, &io, &store,
+            existing.ok_or("mm_ims_profile_lease_receipt_missing")?, apn, family, expected_plan).await;
+    }
+    // Other maintenance paths cannot clear an active one-shot journal and
+    // thereby replenish a dispatched command's budget.
+    runtime::ensure_no_pending_reconciliation(&store.file)?;
     if matches!(
         action,
         "inspect-retired" | "retire-absent" | "inspect-uncreated" | "retire-uncreated"

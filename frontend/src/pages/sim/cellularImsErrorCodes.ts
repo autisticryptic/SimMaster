@@ -123,6 +123,7 @@ export const CELLULAR_IMS_ERROR_CODES = [
   'cellular_ims_runtime_send_timeout',
   'cellular_ims_runtime_ue_worker_generation_changed',
   'cellular_ims_runtime_ue_worker_unavailable',
+  'cellular_ims_security_client_invalid',
   'cellular_ims_security_server_invalid',
   'cellular_ims_security_server_missing',
   'cellular_ims_sim_override_not_ready',

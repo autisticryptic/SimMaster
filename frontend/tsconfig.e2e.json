@@ -4,6 +4,7 @@
     "target": "ES2023",
     "lib": ["ES2023", "DOM"],
     "module": "ESNext",
+    "jsx": "react-jsx",
     "types": ["node"],
     "skipLibCheck": true,
 
@@ -22,5 +23,5 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["e2e", "tests", "playwright.config.ts"]
+  "include": ["e2e", "tests", "playwright.config.ts", "playwright.esim.config.ts"]
 }

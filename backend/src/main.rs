@@ -527,9 +527,10 @@ enum CliCommand {
         #[arg(long)]
         require_mm: bool,
     },
-    /// Explicit IMS maintenance. Only probe/probe-required activate a bearer; no server starts.
+    /// Explicit IMS maintenance. probe activates a bearer; reconcile-stale requires
+    /// a matching inspected plan before mutating an inactive cross-owner profile.
     MmImsProfileLease {
-        #[arg(long, default_value = "inspect", value_parser = ["inspect", "acquire", "acquire-at", "probe", "probe-required", "release", "inspect-retired", "retire-absent", "inspect-uncreated", "retire-uncreated"])]
+        #[arg(long, default_value = "inspect", value_parser = ["inspect", "acquire", "acquire-at", "probe", "probe-required", "release", "inspect-retired", "retire-absent", "inspect-uncreated", "retire-uncreated", "inspect-stale", "reconcile-stale"])]
         action: String,
         #[arg(long)]
         modem: String,
@@ -971,6 +972,12 @@ async fn main() -> Result<()> {
             platform::netns::reclaim_all_stranded_hardware_links().await;
         } else {
             warn!("Skipping namespace sweep while owned IMS recovery is unverified");
+            if hardware::devices::requires_pre_namespace_ims_recovery() {
+                // MM/SIM can still be enumerating at boot. Keep EVERY refresh
+                // path behind the proof instead of recreating the old namespace
+                // and worker, which would itself prevent later retirement.
+                line_registry.defer_ims_startup_recovery().await;
+            }
         }
     }
     // Native ownership receipts require explicit reconciliation. A global

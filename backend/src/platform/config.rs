@@ -4104,8 +4104,6 @@ impl Default for ApnConfig {
 pub struct EsimConfig {
     #[serde(default = "default_lpac_path")]
     pub lpac_path: String,
-    #[serde(default)]
-    pub custom_memory_total_kb: Option<u32>,
     /// Deprecated pre-multi-line reader settings. They are retained only so a
     /// single discovered line can migrate them into `LineProfileConfig`.
     #[serde(default)]
@@ -4124,7 +4122,6 @@ impl Default for EsimConfig {
     fn default() -> Self {
         Self {
             lpac_path: default_lpac_path(),
-            custom_memory_total_kb: None,
             apdu_backend: "qmi".to_string(),
             http_backend: "curl".to_string(),
             at_device: String::new(),
