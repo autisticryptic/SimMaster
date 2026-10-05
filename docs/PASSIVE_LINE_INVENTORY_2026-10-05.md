@@ -1,9 +1,43 @@
 # 无SIM／IMS恢复受阻时线路展示修复与部署
 
-## 已完成与未完成
+## 纠正：恢复原线路界面，4bc3f77已部署（18:36 UTC）
 
-最新正式版本 **db54abc / 1.1.5** 已部署到410 **http://192.168.68.1:3000**。
-本次解决“物理modem仍在，但网页整条线路消失”；**当前IMS尚未注册，不能把部署成功当成注册成功**。
+用户明确指出db54abc的独立只读清单替换了原页面，不符合要求。该UI设计已撤销，不能将先前
+“API200+有硬件清单”称为原界面问题已完全解决。
+
+- 先用部署备份热恢复原前端，没有重启服务或改配置；当时USB已断开，沿既有pin的WLAN连接核验同一台410。
+- 后继 **4bc3f774ed291409e3f3614cddb4e77a3c906411 / 1.1.5** 恢复原列表、选择、详情、概览/ESIM/IMS等7标签及线路控制布局。
+- 受阻时也按原`data/modem/profile/runtime`结构返回线路：profile来自真实保存配置且脱敏，新增read_only/blocked_reason，
+  仅是API序列化投影，不创建操作LineRuntime。详情GET同样可读，写接口仍无法从展示投影取得硬件控制权。
+- 不再有顶层替代页面。恢复提示只出现在原位置，保存的开关值保持；未知SIM/信号标为待核验，不伪装为无卡或0%信号。
+- 控件/处理函数和eSIM硬件hook保留安全门禁，既有配置不会因为“只读”被改成关闭。
+
+主分支Build37350592866、Validate37350592895、Frontend37350592884全部success，
+77项相关回归和54注册场景通过。新增实际Playwright测试证明原列表/7标签/线路选择/保存开关显示保持，
+受阻状态不发硬件请求；已下载并查看截图`original-workbench-blocked.png`。初轮lint及两次测试fixture问题
+均保留失败记录，后继通过，不用未通过的候选验收部署。
+
+## 当前设备与注册
+
+当前实际插回的是**Globe51502**，不是此前的CMCC卡。先验证旧CID3及reporting确实absent，
+受控暂停main/secondary后由`inspect-retired`/`retire-absent`双快照只归档旧账本，没有删除modem profile。
+恢复辅助服务/main后注册通过。后继升级中发现同owner清理延后，先停止安装并留证，再核验源账本确属已停进程、
+同boot/owner/SIM后交给原有启动恢复完成，未手工删除或改写归属。
+
+最终正式 **4bc3f77/PID9311**，18:26:56 UTC注册；18:36:26仍同一次derived/IPsec/IPv4、
+last_error=null、reconnect_count1。API返回1条正常线路、read_only=false，原页面可加载操作状态。
+20前端HTTP/磁盘摘要、配置表/运行catalog保持，MM538/boot未变，无新kernel fatal，守卫accepted、timer恢复。
+secondary在明确维护窗口停止/恢复，最终PID1409；本次没有重启MM/基带，也未改变默认地址族兜底。
+新会话自然续期仍0，先前CMCC421实网是否解决仍未验收。
+
+证据：`.local/evidence/original-line-ui-20261005/` 中`verified.json`、浏览器截图、`absence-recovery.json`，
+以及`deployment/{deploy-stage,deploy-install-accept-stopped-precheck,deploy-install-accept,final-verified}.json`。
+目前使用已核验的WLAN管理路径，用户刷新原访问地址即可；不要根据旧USB地址的路由猜设备身份。
+
+## 以下为db54abc的历史阶段（已被纠正）
+
+当时正式版本 **db54abc / 1.1.5** 部署到410。
+它仅证明物理清单可见，**未满足原线路布局要求，当时IMS也未注册**。
 
 ## 根因
 

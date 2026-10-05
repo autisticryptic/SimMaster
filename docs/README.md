@@ -32,7 +32,7 @@
 
 ## IMS 协议与诊断
 
-- [恢复受阻／无SIM时的物理线路展示](PASSIVE_LINE_INVENTORY_2026-10-05.md)：db54abc已部署，线路可见但操作门禁保留；当前SIM failure及注册尚未成功的边界。
+- [恢复原线路界面与线路可读性](PASSIVE_LINE_INVENTORY_2026-10-05.md)：撤销替代清单，4bc3f77恢复原布局并部署，当前Globe注册通过；包含前次误判和纠正证据。
 - [CMCC 421→403定向修复候选](CMCC_421_CANDIDATE_2026-10-05.md)：实际派生回退确认、单次安全提示重报价、54场景/68相关回归及未实网验证边界。
 - [蜂窝IMS实际协商补强](CELLULAR_IMS_SECURITY_NEGOTIATION_2026-10-03.md)：此前多机制报价、空加密安装修复及410第二机制注册证据。
 - [派生协商前一轮补强](DERIVED_REGISTRATION_HARDENING_2026-10-03.md)：此前VoWiFi提案/IKE检查及LTE验证边界。

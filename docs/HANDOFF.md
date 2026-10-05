@@ -3,7 +3,23 @@
 > 更新：2026-10-05。**本文件是唯一当前接手入口**；历史记录在 [archive](archive/README.md)，
 > 私有操作材料在本机 `.local/`。不要根据旧文档的“当前版本/下一步”重放操作。
 
-## 最新设备：db54abc已部署，恢复受阻也能显示线路；SIM尚未就绪
+## 最新纠正与部署：原线路界面恢复，Globe已注册（4bc3f77）
+
+用户否定db54abc的替代清单页面，现已撤销该设计。**原列表、详情、选择、7标签、线路控制布局恢复**；
+受阻时也使用原API数据结构和真实保存配置，只以内联提示/read_only约束危险操作，不再换页面或清空线路。
+主分支 **4bc3f77** 的Build37350592866、Validate37350592895、Frontend37350592884全部通过，
+77相关回归/54注册场景及实际浏览器原布局测试通过，截图已核验；没有本机编译或新增分支。
+
+已部署正式4bc3f77/PID9311，18:26:56 UTC开始同一次 **Globe51502 derived/IPsec/IPv4**注册，
+18:36:26收尾仍registered、last_error=null、reconnect_count1。API正常线路1/read_only=false，20HTTP资源摘要通过。
+当前SIM是重新插回的Globe，不能把此成功归给先前CMCC卡的421问题；CMCC仍待同卡验证。
+
+旧跨boot账本经双absence证明后只归档，未删modem profile。升级中同owner清理延后，停止预检留证后由
+原有启动恢复完成；未改写owner/SIM。配置/运行库保持，MM538/boot未变、无新fatal、timer恢复，守卫accepted。
+辅助monitor在维护窗口停/恢复，最终PID1409。设备当前走既有pin的WLAN管理连接，USB路由不在。
+详情及失败/纠正过程：[原线路界面恢复记录](PASSIVE_LINE_INVENTORY_2026-10-05.md)。
+
+## 历史误判阶段：db54abc只显示替代清单、SIM未就绪（不代表问题已解决）
 
 已按用户要求修复并部署 **db54abc / 1.1.5** 到 **http://192.168.68.1:3000**，主PID34800。
 物理MM设备仍在，但启动门禁因旧跨boot账本和device-init监视进程返回pending，原线路API503导致页面空白。
