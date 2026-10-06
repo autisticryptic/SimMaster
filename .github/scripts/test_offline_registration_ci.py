@@ -49,7 +49,7 @@ class OfflineRegistrationCiTests(unittest.TestCase):
         source = (ROOT / "offline-registration-sim/run.py").read_text(encoding="utf-8")
         for name in ("GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"):
             self.assertIn(name, source)
-        self.assertIn("expected_count=12 if args.security_hint else 18 if args.history else 24", source)
+        self.assertIn("expected_count=8 if args.cmcc_regression else 12 if args.security_hint else 18 if args.history else 24", source)
 
 
 if __name__ == "__main__":

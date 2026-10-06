@@ -16,7 +16,7 @@ async fn offline_historical_registration_matrix() {
         ("kpn_initial_403_stops", "204", "08", true, "403", false),
         ("kpn_authenticated_403_stops", "204", "08", true, "post_auth_403", false),
         ("sim01_45400_ipv6_udp_aka", "454", "00", true, "baseline", true),
-        ("sim02_46000_ipv6_udp_aka", "460", "00", true, "baseline", true),
+        ("sim02_46000_ipv6_udp_aka", "460", "00", true, "cmcc_legacy", true),
         ("sim03_45403_ipv4_udp_aka", "454", "03", false, "baseline", true),
         ("sim04_45507_ipv6_udp_aka", "455", "07", true, "baseline", true),
         ("sim06_46011_ipv6_sha1_aes", "460", "11", true, "first_security", true),

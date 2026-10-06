@@ -1085,6 +1085,15 @@ pub fn standard_tai_epdg_fqdn(mcc: &str, mnc: &str, tac: u32, technology: &str) 
 /// snapshot exists. LTE identifies AKA and declares its existing security offer
 /// on the first REGISTER; WLAN keeps challenge-driven security declarations.
 /// Neither path invents a visited-network identity or private operator endpoint.
+/// Restore the September declaration policy for the CMCC home identities
+/// involved in the reported regression. Match the SIM home PLMN, never the
+/// serving network or a guessed numeric MNC alias. Other LTE deployments keep
+/// their verified proactive declaration; algorithm policy is independent.
+fn proactive_derived_sec_agree(mcc: &str, mnc: &str, access: Standard3gppAccess) -> bool {
+    matches!(access, Standard3gppAccess::LteEpc)
+        && !matches!((mcc, mnc), ("460", "00" | "02"))
+}
+
 pub fn derive_standard_3gpp_profile(
     mcc: &str,
     mnc: &str,
@@ -1224,14 +1233,13 @@ pub fn derive_standard_3gpp_profile(
                 strict_security_server_offer: matches!(access, Standard3gppAccess::LteEpc),
                 enable_initial_reject_fallback: false,
                 use_plain_digest_placeholder: false,
-                // The cellular first REGISTER already carries a complete
-                // Security-Client offer. Declare both RFC3329 option tags up
-                // front, before AKA: some cores otherwise challenge without
-                // Security-Server and reject unprotected authentication.
-                // Retain auto mode and the existing generic candidate ladder;
-                // do not change WLAN policy or retry after an auth rejection.
-                require_sec_agree_headers: matches!(access, Standard3gppAccess::LteEpc),
-                proxy_require_sec_agree_headers: matches!(access, Standard3gppAccess::LteEpc),
+                // 39b387b globally changed these false September defaults to
+                // proactive true. Restore the CMCC first-request envelope only;
+                // still advertise Security-Client/Supported and empty AKA, and
+                // let the existing 421/494/timeout path request stronger headers.
+                // No new retry branch, no weaker algorithms or identity rewrite.
+                require_sec_agree_headers: proactive_derived_sec_agree(mcc, mnc, access),
+                proxy_require_sec_agree_headers: proactive_derived_sec_agree(mcc, mnc, access),
                 sec_agree_mode: "auto",
                 expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
                 access_network_info: access.access_network_info(),
@@ -1753,6 +1761,10 @@ pub fn validate_builtin_profiles() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "derived_cmcc_regression_tests.rs"]
+mod cmcc_regression_tests;
 
 #[cfg(test)]
 mod tests {

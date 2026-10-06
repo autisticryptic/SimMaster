@@ -2,7 +2,12 @@ use super::*;
 use crate::connectivity::modems::ims::vowifi::profiles::{derive_standard_3gpp_profile, Standard3gppAccess};
 
 fn profile() -> &'static CarrierProfile {
-    derive_standard_3gpp_profile("460", "02", Standard3gppAccess::LteEpc).unwrap()
+    // This suite exercises the already-proactive request from the later 421
+    // trace, independently of the restored CMCC first-request defaults.
+    let mut p = *derive_standard_3gpp_profile("460", "02", Standard3gppAccess::LteEpc).unwrap();
+    p.ims.register.require_sec_agree_headers = true;
+    p.ims.register.proxy_require_sec_agree_headers = true;
+    Box::leak(Box::new(p))
 }
 fn offer(alg: &str, enc: &str) -> String {
     format!("ipsec-3gpp;alg={alg};ealg={enc};prot=esp;mod=trans;spi-c=7001;spi-s=7002;port-c=5070;port-s=5072")
