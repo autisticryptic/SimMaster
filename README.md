@@ -155,9 +155,9 @@ sh /absolute/path/to/simadmin-package/install.sh
 | 入口 | 用途 |
 |---|---|
 | [当前接手](./docs/HANDOFF.md) | 当前版本、CI、下一主线、未验收边界及新对话提示 |
-| [安装](./docs/INSTALL.md) / [运行环境](./docs/ENVIRONMENT.md) | 部署、依赖、systemd、数据与硬件约束 |
+| [安装](./docs/INSTALL.md) / [运行环境](./docs/INSTALL.md) | 部署、依赖、systemd、数据与硬件约束 |
 | [架构](./docs/ARCHITECTURE.md) / [开发者指南](./docs/DEVELOPER.md) | 模块与开发测试流程 |
-| [开发总计划](./docs/DEVELOPMENT_PLAN.md) / [后端路线图](./docs/MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md) | 实现和真实硬件/发布门槛 |
+| [开发总计划](./docs/DEVELOPMENT_PLAN.md) / [后端路线图](./docs/DEVELOPMENT_PLAN.md) | 实现和真实硬件/发布门槛 |
 | [Bruno API](./bruno-api/README.md) / [版本记录](./docs/CHANGELOG.md) | 可执行接口与用户可见变更 |
 | [历史档案](./docs/archive/README.md) | 旧排查、接手、分支及阶段记录，不直接重放旧操作 |
 

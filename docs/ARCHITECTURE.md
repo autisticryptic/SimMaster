@@ -1,168 +1,104 @@
-# SimAdmin 架构说明
+# 架构与网络隔离
 
-> 这份文档解释 SimAdmin 怎么组织多线路、IMS 接入和网络隔离，供读代码前先建立整体印象。
->
-> 只写当前生效的设计和它背后的原因。已完成的改造过程、验收记录和历史决策都在 git 历史里，不在这里重复。待办事项见 `DEVELOPMENT_PLAN.md`。
+本页只解释当前设计，不把历史部署、候选验证或开发计划写成实时状态。
+当前工作与设备最后证据见 [HANDOFF](HANDOFF.md)，协议细节见 [IMS 注册与兜底](IMS_REGISTRATION_POLICY.md)。
 
-## 1. 核心概念：线路（line）
+## 1. 依赖方向
 
-SimAdmin 管理的最小单位不是"设备"也不是"SIM 卡"，而是**线路**。一条线路是一个可以独立注册 IMS、打电话、收短信、跑流量的实体。
+- `api`：认证、HTTP请求/响应、线路解析，不直接实现设备协议。
+- `connectivity/core`：接入无关的SIP、Digest-AKA、注册、短信和语音模型。
+- `connectivity/modems/ims/{cellular_ims,vowifi}`：各自的接入、安全通道和注册适配。
+- `hardware`：发现、SIM与设备生命周期；具体QCM410/Quectel/DJI能力在驱动边界内。
+- `services`：线路registry、UE worker、跨接入策略、自动化/通知/Trunk。
+- `platform`：配置、数据库、DNS、命名空间、路由和系统工具。
 
-线路有两类来源：
+同一物理设备必须只有一个协议owner；MM与native不能同时写同一端口。
+详见 [设备驱动](DEVICE_DRIVERS.md)、[原生后端](NATIVE_BACKEND_STATUS.md)。
 
-- **基带线路** —— 一个物理卡槽加一个 UIM slot
-- **读卡器线路** —— 一个独立的 SIM/eSIM 读卡器
+## 2. 线路身份与SIM身份分离
 
-线路 ID 的生成方式是这个设计的关键（`hardware/cellular/modem_manager.rs`）：
+管理单位是物理线路：基带卡槽加UIM slot，或独立读卡器。
+`physical_line_id`依据物理硬件锚点和slot生成，不包含ICCID；slot1保留兼容形式。
+因此同槽换卡不丢失用户的线路开关、代理、Trunk和候选顺序。
 
-```rust
-physical_line_id  = md5("physical-line" \0 hardware_key[#uimN])
-```
+SIM绑定独立使用ICCID，eSIM可使用EID+profile ICCID；按SIM的覆盖不能套到另一张卡。
+旧包含SIM的line ID通过`legacy_line_ids`迁移配置引用；短信/通话历史保留写入时的ID，不批量改写事实。
+设备对象路径、数字CID、MM profile-id、eSIM profile与逻辑通道编号不相互等价。
 
-`hardware_key` 是物理槽锚点；`uim_slot` 只在 > 1 时以 `#uimN` 追加，所以单 UIM 设备的 ID 不会因为加了这个维度而变化。
+换卡或MM对象变化先使旧任务失效，再以当前owner/SIM/代次验证资源；
+未知状态不是“没有资源”，不能复用同号对象替代原归属。
+详见 [MM租约与恢复](IMS_MM_EXACT_FAMILY_LEASE_DESIGN.md)。
 
-**注意 material 里没有 ICCID。** 同一个槽换一张卡，`line_id` 不变。这样"这个槽位的配置"（数据连接开关、代理、VoLTE profile 顺序、Trunk 端点）跟着物理位置走，换卡不丢。
+## 3. 原线路工作台
 
-旧版是 `md5(line_key \0 sim_key)`——**含 SIM**，所以换卡就变成另一条线路。这些旧 ID 由 `physical_line_identity()` 算出来放进 `legacy_line_ids`，首次发现时迁移线路配置、自动化目标、通知作用域和累计流量（流量是事务合并后删除旧行，重复刷新不会二次累加）。
+SIM页面保留左侧线路列表、右侧选中线路的概览、eSIM、IMS与Trunk、短信、补充业务、自动化、通知标签。
+读卡器是独立线路，基带专属能力按设备类型限制。
 
-反过来，跟 SIM 卡本身绑定的东西用另一个键：
+- 物理设备在而SIM缺失时仍应显示线路，不因IMS不可用清空整个页面。
+- 启动恢复阻塞时，只读MM缓存可以生成**序列化展示投影**，包括真实保存配置及`read_only`/`blocked_reason`。
+- 展示投影不加入操作registry，不创建LineRuntime、worker、namespace或SIM通道。
+- 原卡片、选择和标签仍可阅读；危险操作/自动探测不执行，未知状态明确标示。
+- 禁止另建替代清单把原工作台隐藏，也不能把保存的开启意图伪造为关闭。
+- 正常离线已登记线路的配置保存，与启动门禁下仅供展示的投影，是两种不同状态。
 
-```text
-SimBindingKey = ICCID          （普通卡）
-              = EID + profile ICCID   （eSIM）
-```
+摘要接入优先显示已注册VoWiFi、已注册蜂窝IMS、正在连接的已启用接入，最后才是CS。
+modem连接、应用运行或进度条完成不能单独证明IMS/语音/音频可用。
 
-IMS 覆写（自定义 IMSI、ePDG DNS、P-CSCF 覆盖）用这个键，所以卡换到别的槽位，这些设置跟着卡走。
+## 4. 强制per-UE网络命名空间
 
-**两套键各管一摊，是刻意的。** 混用会导致换卡后要么丢配置，要么把上一张卡的 IMS 身份套到新卡上。
+每条活动线路拥有一个Linux network namespace和UE worker；不是可关闭的部署模式。
+旧`ue_isolation`开关已移除，未知顶层字段应拒绝；配置版本4文件不能凭空视为已迁移到版本5。
 
-读卡器线路同理：`reader_line_id(reader_id, uim_slot)` 以读卡器本身为锚点，插入另一张卡不会顶掉用户已有的 VoWiFi/trunk/通知/自动化配置。
+固定布局由代码维护：namespace前缀`sa-ue`，host veth前缀`savh`，UE veth前缀`save`，veth MTU1500。
 
-短信、通话和诊断历史保留写入当时的原始 ID，作为历史审计事实，不做批量改写。
+- VoWiFi：ePDG/IKE/ESP/TUN/SIP/XFRM及运营商媒体socket在对应线路namespace。
+- 蜂窝IMS：承载网卡、SIP/XFRM及运营商媒体socket在对应线路namespace。
+- 普通数据代理和自有DATA承载使用对应UE出口。
+- host veth提供namespace出站/NAT，不是失败后偷用管理网的IMS数据面。
 
-## 2. 前端信息架构
+namespace、worker、veth、接口迁移或socket创建失败时，相关路径不可用；不得在host namespace偷偷重试。
+回收时将自有接口移回host再释放bearer属于生命周期清理，不是运行时host兜底。
 
-SIM 页面是两栏工作台：
+## 5. 路由域与socket绑定
 
-- **左栏** —— 设备列表，基带线路和读卡器线路混在一起，读卡器是一级公民
-- **右栏** —— 只显示当前选中线路，六个标签：概览 / eSIM / IMS 与 Trunk / 短信 / 通知 / 自动化
+`platform/network_routing.rs`分配路由域：
 
-读卡器不依赖基带，所以有概览、eSIM、VoWiFi、短信、通知、自动化；基带专属的 VoLTE、蜂窝数据、Trunk 控制不显示。
+| 域 | 表基址 | 规则优先级基址 | 用途 |
+|---|---:|---:|---|
+| ModemData | 12000 | 10000 | 数据代理/流量 |
+| VolteIms | 14000 | 14000 | 蜂窝P-CSCF、RTP/RTCP/视频 |
+| VowifiIms | 16000 | 18000 | VoWiFi隧道、P-CSCF和媒体 |
 
-### 接入状态只显示一个
+具体表号结合稳定接口槽位和地址族；v4/v6不覆盖彼此。动态P-CSCF和媒体路由不得写入共享主表。
+每个实际P-CSCF候选进入注册前必须有正确的承载路由，不能只配置第一个地址。
 
-线路摘要区同一时间只显示一种语音接入，按优先级选：
+源地址规则仍需配合socket绑定和namespace：同地址可能出现在不同线路，单靠`from`规则不够。
+数据代理TCP、IMS信令/媒体/P-CSCF DNS、VoWiFi TUN流量均必须保持自己的接口和运行上下文。
+外部进程或透明转发不自动继承这些socket约束；新增入口必须明确namespace/fwmark/VRF等隔离契约。
 
-1. VoWiFi 已注册
-2. VoLTE 已注册
-3. VoWiFi 已启用且正在连接
-4. VoLTE 已启用且正在连接
-5. 都没启用 → CS
+## 6. DNS
 
-进度条按接入类型分段：VoWiFi 和 VoLTE 各 6 阶段，CS 4 阶段。CS 的第 4 阶段目前用 ModemManager 的连接状态近似，后端补上真正的 CS voice capability 后应该换成那个字段——现在不能宣称 CS 音频链路已完成。
+普通系统解析统一使用`platform::dns`的Hickory Rust解析器：
 
-### 离线线路仍可配置
+1. 数字IPv4/IPv6（含方括号IPv6）不查询DNS。
+2. hosts先于resolv.conf；hosts命中不能因resolver配置不可读失败。
+3. 读取系统nameserver/search/options，A/AAAA均请求，整体网络查询预算4秒。
+4. 使用`UserProvidedOrder`保持系统服务器顺序，不能被新resolver随机初始RTT重排。
+5. 空结果/错误为失败；通用DNS不注入公共服务器。既有ePDG显式公共回退由调用点控制。
 
-线路离线后配置仍能保存。离线保存只写持久化意图，不去调用已经不存在的 ModemManager 对象；设备回来时由线路恢复器应用。
+每次查询拥有新的有界resolver，不建立跨runtime/namespace的全局socket/cache；线路ePDG缓存另行维护。
+HTTP客户端及SOCKS代理端点共享此系统解析入口，TS.43地址pin/重定向校验保留。
 
-离线基带的"重启此基带"也保留：优先用该线路保留的 QMI 控制口发 reset，并且只接受映射回同一个 QMI 设备的 ModemManager 对象。QMI reset 之后还没重新枚举，才回退到重启 ModemManager——那一步会短暂影响其他基带，所以有确认框。
+运营商DNS、P-CSCF/NAPTR、SOCKS5 UDP DNS有独立Rust传输/路由，不能以重构为由偷换成host DNS。
+该设计保持调用者已有上下文，不宣称所有父进程DNS都已经搬入worker。
 
-## 3. 网络路由隔离
+## 7. Profile与配置
 
-这是整个项目最容易出错的地方，值得单独理解。
+归属PLMN来自SIM/ISIM/USIM EF_AD等可信订阅事实及有歧义保护的catalog推断；驻网PLMN不能替换归属身份。
+三个来源槽（用户database、只读carrier_catalog、derived）按线路保存。
+候选来源缺失或不可用时可回退derived，并明确记录requested source、effective origin及fallback reason。
+旧通用显式pin接口的严格失败，与线路候选接口的来源内回退，不可混为一谈。
 
-### 问题
-
-运营商在 SIP/SDP 里给的 P-CSCF、RTP、RTCP、视频地址通常不是同一个地址。如果只把 P-CSCF 写进主路由表：
-
-- 动态媒体地址会落到管理网口（`wlan0`），媒体逃逸
-- 多卡同时跑时，后建立的线路的 `/32` 路由会覆盖先建立的
-
-### 路由域
-
-`backend/src/platform/network_routing.rs` 统一分配表号：
-
-| 域 | 表号基址 | 规则优先级基址 | 用途 |
-|---|---|---|---|
-| `ModemData` | `12000` | `10000` | 数据代理、流量任务 |
-| `VolteIms` | `14000` | `14000` | VoLTE P-CSCF、RTP、RTCP、视频 |
-| `VowifiIms` | `16000` | `18000` | VoWiFi ePDG TUN、P-CSCF、RTP、视频 |
-
-同域内的实际表号是 `table_base + 接口槽位 * 2 + (是否 IPv6)`：`wwanN` 用 `N` 作槽位，TUN/USB/MBIM 用接口名哈希。乘 2 再加地址族位，是为了让同一接口的 v4/v6 各占一个表号而不互相覆盖。
-
-**槽位必须稳定**——线路重启后表号不能变，否则旧规则会残留指向一个已经被别人用掉的表。
-
-每个承载建一条源地址规则：
-
-```text
-ip rule add priority <line-priority> from <ims-address>/32 table <line-table>
-ip route replace <remote-media>/32 dev <line-interface> table <line-table>
-```
-
-这样同一个远端 RTP 地址可以同时出现在多条线路里，内核按源地址选表，而不是按主表最后一条路由。
-
-### 源地址规则不够，还要绑接口
-
-如果两个接口拿到**完全相同**的地址（`wwan0: 10.0.0.2` 和 `wwan1: 10.0.0.2`），`ip rule from 10.0.0.2/32` 分不出接口。所以所有主动建连的 socket 还必须绑接口：
-
-- 数据代理每个出站 TCP 用 `SO_BINDTODEVICE`
-- VoLTE SIP、P-CSCF DNS、RTP/RTCP/视频 relay 绑对应 `wwan*`
-- VoWiFi SIP/RTP 绑该线路独有的 `sa_vwf...` TUN
-- QMI 承载识别探测 socket 绑当前候选 `wwan*`，否则会把另一条线路的 DNS 响应当成自己的
-
-**没有显式 socket 的第三方进程或内核透明转发流量，靠 `from` 规则区分不了。** 那种需求要上 `fwmark`/VRF/netns，并且所有入口统一继承线路标记。当前项目内的代理、流量、IMS 信令和媒体都有显式 socket，所以够用。
-
-### 新设备接入约束
-
-设备适配层只需要提供承载接口名、本地地址前缀、建立/释放钩子。
-
-**不允许**在设备或 IMS 实现里直接往主路由表写动态 P-CSCF/RTP 路由，也不允许用固定接口名（`wwan0`）代替线路绑定。新增设备复用 `RouteDomain`，并为多线路、相同远端地址、重连、释放加隔离测试。
-
-## 4. VoLTE profile 选择
-
-profile 以 **SIM 的归属 PLMN** 为准，绝不把 `modem.3gpp.operator-code` 在漫游时当归属运营商。归属 PLMN 按顺序取：
-
-1. SIM 对象属性
-2. 与 IMSI 前缀一致的已注册运营商
-3. USIM EF_AD 的 MNC 长度
-4. 最后才让 catalog 按 IMSI 推断
-
-自动匹配找不到可用 LTE profile 时，生成标准 3GPP 派生 profile（`ims.mncXXX.mccYYY.3gppnetwork.org` + `ims` APN + 通用 REGISTER 策略），并在运行状态里用 `profile_source=derived` 和 `profile_fallback_reason` 明确标记。
-
-**显式 pinned profile 严格失败，不会被默默替换成派生的。**
-
-当前注册 PLMN 与归属 PLMN 不同、且 profile 允许接入网络头时，REGISTER 动态加 `P-Visited-Network-ID`。这个头只影响漫游上下文——IMS 域名、APN、AKA、registrar 和安全策略仍来自归属 profile。
-
-每条线路还有三个有序的 profile 候选槽位（用户数据库 → 下载 catalog → 派生兜底），顺序按线路独立保存，不是全局设置。来源不可用时该槽位改用派生 profile，但不去重——三个槽位可以都解析成同一个派生 profile 并实际执行三次。
-
-## 5. 配置存储
-
-继续用版本化 JSON，没有为自动化/通知拆关系表：
-
-- 自动化用 `task.target.line_id`
-- 通知用 `rule.sim_channel_ids`（基带是 `line_id`，读卡器是 `reader:<slot_id>`）
-- lpac reader 参数在 `LineProfileConfig.esim_reader`，按线路存
-
-配置规模小的时候版本化 JSON 比拆表更容易保持向后兼容。满足下面任一条件再考虑迁移：
-
-- 单设备几百条任务/规则
-- 需要多客户端并发局部更新
-- 需要按线路做 SQL 聚合、外键、事务更新
-
-迁移时必须给线路字段建索引，并保留旧 JSON 的一次性导入。
-
-## 6. 相关文档
-
-后续版本演进已确定为：1.1.5 在统一设备接口下兼容 MM/native，1.1.6 移除 MM 后端，
-由原生 QMI/MBIM/AT 接管声明支持的设备能力。**这是待实施规划，不改变本文对当前实现的描述。**
-UE 隔离、稳定线路及 SIM 覆写边界保留，同一物理 modem 仍只有一个 owner。
-
-| 文档 | 内容 |
-|---|---|
-| `DEVELOPMENT_PLAN.md` | 待办与验收计划总入口 |
-| `MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md` | 设备后端版本分项、能力范围与 MM 移除门槛（规划） |
-| `IMS_REGISTER_TRISTATE_SCHEMA.md` | REGISTER 三态字段（`true`/`false`/`omit`）契约 |
-| `QCM410_BAM_DMUX_MODEM_CRASH.md` | 410 基带崩溃分析与恢复 |
-| `ue-network-namespaces.md` | 强制 per-UE 网络命名空间架构 |
-| `CARRIER_PROFILES.md` | carrier catalog 来源与限制 |
-| `INSTALL.md` / `ENVIRONMENT.md` / `DEVELOPER.md` | 安装、运行环境、开发构建 |
+主设置为保留注释的YAML/JSON文本；线路、SIM覆盖、自动化、通知和运行历史存SQLite。
+配置管理内存模型仍统一，只有持久化层分拆。迁移只能改声明兼容的字段，不能改写旧业务事实或清空数据。
+路径、备份和服务说明见 [安装与运行](INSTALL.md)，来源契约见 [运营商配置](CARRIER_PROFILES.md)。

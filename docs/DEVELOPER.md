@@ -1,248 +1,117 @@
-# 开发者指南
+# 开发、验证与交付
 
-本文档是前端、后端和整包构建的唯一开发入口。子目录不再分别维护容易失真的 README。
+本页是代码工作流入口；架构见[ARCHITECTURE](ARCHITECTURE.md)，安装见[INSTALL](INSTALL.md)，
+当前未完成事项只维护在[HANDOFF](HANDOFF.md)和[DEVELOPMENT_PLAN](DEVELOPMENT_PLAN.md)。
 
-主线为 `master`。普通 push（包括 master）只生成 Actions artifacts，不自动发布；
-发布必须在 master 手动选择 `publish_release=true`，且目标 tag/Release 必须尚不存在。
-分支整理不等于版本发布，默认 MM 与 native 实验性 opt-in 边界不变。参见
-[分支整理与发布保护](archive/2026-09/BRANCH_CONSOLIDATION_2026-09-24.md)、
-[原生后端审计](NATIVE_BACKEND_STATUS.md)。
+## 1. 分支与编译约束
 
-## 项目结构
+- 日常仅维护`master`，GitHub远端为`autisticryptic/SimMaster`（本地remote通常为`simmaster`）。
+- 不为每次验证长期留下分支。确需临时分支时，合并并确认提交已保留、CI通过后删除。
+- 不force-push主分支，不清理未知用户工作，不提交私有SIM材料、日志或凭据。
+- **Rust/前端构建、编译后的测试及注册模拟只在GitHub Actions运行，不在本机编译。**
+- 本机可以读/编辑代码、运行不构建的Python/静态检查、查看Git差异、下载并验证产物。
+- 不把本机旧二进制、旧HEAD的测试报告冒充当前工作树通过；报告绑定完整commit和源码摘要。
+- 运营商无关的兜底修复用协议/状态机测试，不引入MCC/MNC专属代码或专属测试掩盖全局问题。
 
-```text
-.
-├── backend/
-│   ├── src/             Rust 后端源码
-│   ├── Cargo.toml       crate 配置与依赖
-│   └── build.rs         VERSION、Git 分支和提交号注入
-├── frontend/
-│   ├── src/             React + TypeScript 前端
-│   ├── package.json     脚本和依赖
-│   └── vite.config.ts   开发代理、版本注入和生产分包
-├── bruno-api/           Bruno API 调试集合
-├── deploy/              udev 规则、辅助 systemd 单元及待重构安装资源
-├── scripts/             构建、真机测试及待重构部署/OTA 脚本
-├── docs/                项目文档
-├── VERSION              单一版本号来源
-├── install_latest.sh    待重构，当前不作为安装入口
-└── uninstall.sh         待重构，当前不作为卸载入口
-```
+## 2. 项目布局
 
-## 后端架构
+| 路径 | 职责 |
+|---|---|
+| `backend/src/api/` | HTTP、认证、请求与响应模型 |
+| `backend/src/connectivity/core/` | 接入无关SIP/AKA、注册及业务模型 |
+| `backend/src/connectivity/modems/ims/` | 蜂窝IMS、VoWiFi、profile适配 |
+| `backend/src/hardware/` | 协议后端、SIM与设备驱动 |
+| `backend/src/services/` | 线路/worker、业务路由、Trunk、自动化、通知 |
+| `backend/src/platform/` | 配置、SQLite、DNS、命名空间和系统工具 |
+| `frontend/src/api/` | API契约和封装 |
+| `frontend/src/pages/`、`components/`、`hooks/` | React工作台与组件 |
+| `bruno-api/` | API调试集合 |
+| `.github/workflows/` | 构建、回归及发布门禁 |
+| `scripts/`、`deploy/` | 统一打包、安装器和驱动资源 |
+| `offline-registration-sim/` | 无设备REGISTER协议模拟，不能当实网证据 |
+| `.local/` | 私有诊断/备份/历史材料，不提交 |
 
-`backend/src/main.rs` 负责 CLI、初始化、路由装配和 HTTP 服务；`state.rs` 保存共享的
-`AppState`。其余代码按依赖方向分为五个领域：
+## 3. 修改边界
 
-```text
-backend/src/
-├── api/                       HTTP handler、DTO、密码与会话认证
-├── connectivity/
-│   ├── core/                  共享 IMS/SIP/AKA/短信/语音核心
-│   └── modems/ims/
-│       ├── cellular_ims/      蜂窝 IMS bearer、ip xfrm、SIP、RTP 与语音
-│       └── vowifi/            IKEv2/ESP、ePDG、TUN、SIP 与运营商 Profile
-├── hardware/
-│   ├── cellular/              ModemManager、QMI、AT、数据代理和线路控制
-│   └── sim/                   lpac/eUICC 操作
-├── services/
-│   ├── line_registry.rs       每条物理线路及其运行时注册表
-│   ├── orchestrator/          SMS/语音多路径选路、接收腿选举和去重
-│   ├── trunk/                 每线路 SIP Trunk 与桥接
-│   ├── messaging/             短信监听和验证码提取
-│   ├── notify/                通知发送及失败队列
-│   ├── automation/            调度器与自动化动作
-│   ├── network/               WLAN、DDNS 和网络诊断
-│   └── system/                状态、系统事件和 OTA
-└── platform/                  持久化配置、SQLite 和通用系统工具
-```
+新接口/能力应同时核对：后端DTO和认证、路由、前端类型/封装、实际页面、Bruno请求、兼容编码和测试。
+所有线路操作显式解析line_id；禁止重引入“第一台modem”隐式全局控制。
+设备能力按driver声明，不从名称猜QMI/AT能力，不在通用层硬编码某个QCM410端点。
+同一物理端口只有一个owner；串行锁不代替SIM、MM owner、代次及资源归属验证。
 
-架构约束：
+展示投影与可操作runtime分离：恢复门禁可以阻止写入和承载，但不能把原线路页面替换或清空。
+保留原工作台的列表/详情/标签/保存意图，仅在必要位置提示未知/恢复中，并禁止对应危险操作。
 
-- `connectivity/core` 不依赖具体接入腿；蜂窝 IMS 和 VoWiFi 复用相同的 SIP、AKA 和业务模型。
-- `hardware` 只封装设备与固件操作，跨接入的策略放在 `services/orchestrator`。
-- 所有会影响线路状态的 API 都应显式解析 `line_id`，不要重新引入“取第一个 modem”的全局接口。
-- 同一物理 modem 的 D-Bus、QMI 和 AT 修改操作使用
-  `hardware::cellular::serial::with_serial_for(modem_path, ...)` 串行化；不同 modem 可并行。
-- carrier catalog 是只读基线，本地数据库只保存用户覆盖；运行时不应直接改写 catalog 文件。
+## 4. 配置与API
 
-## 前端架构
+配置文本和SQLite分层由`platform/config_file`、`config_store`及`ConfigManager`负责。
+YAML写后重解析，保留未变注释；线路映射/业务历史不因重构批量改写。
+新增字段必须有默认/迁移规则，拒绝重复别名及不支持的顶层键。
 
-```text
-frontend/src/
-├── api/
-│   ├── contracts.ts          与后端 DTO 对齐的 TypeScript 类型
-│   └── current.ts            当前 REST API 封装
-├── components/               布局和跨页面组件
-├── contexts/                 主题等 React Context
-├── hooks/                    通用 hooks
-├── lib/                      Query Client 等基础设施
-├── pages/                    路由页面及页面内组件
-└── App.tsx                   登录保护、懒加载和路由表
-```
+除明确公共的健康和认证入口外，业务API默认受会话保护。不要为了调试绕过认证、重置账号或回显密码。
+每个请求确认方法是否实际有副作用：GET命名不自动保证不会启动探测或清理旧对象。
+契约细节见[IMS协议](IMS_REGISTRATION_POLICY.md)和[原生后端](NATIVE_BACKEND_STATUS.md)。
 
-前端采用 React 19、TypeScript 5、MUI 7、React Router 7、TanStack Query 和 Vite 7。
-生产构建输出到 `frontend/dist/`，部署时复制到 `/opt/simadmin/www/`。
+## 5. Actions验证
 
-## 本地开发
+主要工作流：
 
-### 前端
+- `Validate Beta Refactor`：硬件无关Rust、配置/兼容边界、私有D-Bus/HTTP回归及前端检查。
+- `Build-Release`：前端、后端测试、ARM64/AMD64构建、同版本完整包和发布门禁。
+- `Frontend Checks`：路径匹配时运行lint/类型/构建与隔离Playwright工作台回归。
+
+新Rust测试必须加入执行过滤器；仅`cargo test --no-run`通过不表示执行过测试。
+过滤器选中0条应失败；下载日志逐名核验新增回归，避免只看绿色workflow。
+私有D-Bus和fake peer必须与真实系统总线、modem和公网隔离。
+
+注册模拟在Actions runner执行，例如：
 
 ```bash
-cd frontend
-pnpm install --frozen-lockfile
-pnpm dev
+python3 -B offline-registration-sim/run.py --report offline-registration-sim/ci-results/standard.json
+python3 -B offline-registration-sim/run.py --history --report offline-registration-sim/ci-results/history.json
+python3 -B offline-registration-sim/run.py --security-hint --report offline-registration-sim/ci-results/security-hint.json
 ```
 
-开发服务器监听 `http://127.0.0.1:5173`，并将 `/api` 代理到
-`VITE_API_PROXY_TARGET`；未设置时目标为 `http://192.168.100.13:3000`：
+历史名称只是已有fixture标签，不得将某卡特例模型当作全局兜底正确性的证明。
+增加验证应围绕请求继承、状态转换、授权/算法边界、次数/时间预算和错误分类。
+预期拒绝是通过的负例，不是网络注册成功；模拟也不能代替无线/SIM/运营商订阅/真实安全通道。
 
-```bash
-VITE_API_PROXY_TARGET=http://127.0.0.1:3000 pnpm dev
-```
+前端依赖使用锁文件安装；隔离浏览器fixture必须拦截API并禁止连接真实设备。
+真实页面调整需要验证原布局、选择保持、保存开关、blocked→ready切换及没有额外硬件请求，
+不能用另一个临时页面代替用户界面验收。
 
-常用检查：
+## 6. 产物与发布
 
-```bash
-pnpm lint
-pnpm type-check
-pnpm build
-```
+`VERSION`及三个依赖清单由`sync_release_version.py`同步。`scripts/pack-ota.sh`调用统一打包器，
+程序、www、meta、同版本安装器/unit/设备资源和SHA清单来自同一commit。
+普通push只生成artifact，`Publish Release`应skipped；正式发布需master上显式授权、新tag且完整门禁通过。
+版本号不代表代码先后，必须核对commit、ELF、程序/前端和包SHA。
 
-提交前端改动时，`.github/workflows/frontend-checks.yml` 会在前端目录使用
-`pnpm install --frozen-lockfile`，依次执行 lint、TypeScript 类型检查和 Vite 构建。CI
-通过只表示前端静态检查和打包通过，不替代真实 modem、运营商网络或多线路验收。
+验证下载时：官方artifact digest → ZIP/包外SHA → 安全解包布局 → 完整文件SHA清单 → meta/ELF架构/commit。
+校验来自可信发布方，不能把SHA当作数字签名；不执行未知下载内容以验证可信性。
 
-不要使用 `pnpm add` 代替依赖安装；依赖已经由 `package.json` 和 `pnpm-lock.yaml` 固定。
+合并docs-only收尾可以不重编译，但须证明构建输入与已验证代码提交相同，不伪装成新二进制。
+旧Release/tag不能为清理分支被移动，旧制品不自动获得新安装器安全保证。
 
-### 后端
+## 7. 设备验收
 
-```bash
-cd backend
-cargo check
-cargo test
-cargo clippy --all-targets
-```
+按[INSTALL](INSTALL.md)安排受控窗口，先看实时SIM/MM/注册/通话/管理路径，而不是重放旧脚本。
+保留配置、运行库、归属账本和未知结果；备份与回滚范围明确。停止自己的服务不等于可以重启基带或清预算。
 
-启动服务需要 system D-Bus，以及一个由 `carrier_Bundles` 生成并封存的 schema v7 SQLite
-catalog。可以显式指定路径：
+最小交付应区分：
 
-```bash
-cargo run -- serve \
-  --host :: \
-  --port 3000 \
-  --carrier-catalog /path/to/carrier-bundles.sqlite3
-```
+1. 编译通过；
+2. 自动化测试实际通过；
+3. 产物摘要/版本核验；
+4. 部署程序/HTTP/配置保持；
+5. 当前SIM的初始注册；
+6. 同会话自然续期；
+7. 通话、短信、音频及故障注入。
 
-等价环境变量为 `HOST`、`PORT` 和 `SIMADMIN_CARRIER_CATALOG`。日志级别通过 `RUST_LOG` 控制。
+上一步不能替代下一步。当前卡成功不能替代另一运营商；一次重新注册不能冒充自然续期。
+本地历史凭据、完整日志、号码和数据库不得放入公开报告。
 
-配置分两处：主程序设置在文本文件里（`SIMADMIN_CONFIG` 覆盖路径，旧变量 `SIMADMIN_CONFIG_DB`
-仍然读取但现在指向文本文件），每线路/每槽位配置和通知、自动化、按 SIM 的 IMS 覆写在 `data.db`
-里。扩展名决定格式——`.yaml` / `.yml` 推荐，因为保存时会保留注释；`.json` 可用但不支持注释；
-其他扩展名报错而不是猜测。不支持导入旧 `config.json` 或 `config.sqlite3`。
+## 8. 文档规则
 
-代码上的分工：`platform::config_file` 是唯一接触 YAML 库的地方（`serde-saphyr` 读、`yaml-edit`
-写，写完用 `serde-saphyr` 复核）；`platform::config_store` 拥有 `data.db` 里的配置表；
-`ConfigManager` 在内存里仍然是一个完整的 `AppConfig`，只有持久化知道拆分。
-`SIMADMIN_OVERRIDES_DIR` 把 IMS 覆写切到文件后端，供恢复和测试使用。
-
-普通开发机没有 ModemManager、真实 modem、QMI 端点或 `/dev/net/tun` 时，纯逻辑测试仍可
-运行，但服务启动和硬件接口可能失败。真机网络、P-CSCF、IMS 注册、RTP、eSIM 和 Trunk
-互通必须在目标设备验证。
-
-## CLI
-
-```text
-simadmin [--host HOST] [--port PORT]                  # 启动服务，兼容旧调用
-simadmin serve [选项]                                 # 显式启动服务
-simadmin auth reset-password                          # 交互式重置管理员密码
-simadmin auth clear                                   # 清除密码，恢复首次设置
-simadmin inspect-modems                               # 脱敏输出 modem/SIM 线路清单
-simadmin device-init [--dry-run]                      # 调用检测到的设备驱动初始化 native bearer
-simadmin install-device-resources [选项]              # 安装检测到的设备驱动资源
-simadmin extract-zip <archive> <target>               # 安装脚本使用的 ZIP 解压器
-```
-
-设备专属实现、上层接口边界以及新增设备的接入清单见
-[`DEVICE_DRIVERS.md`](DEVICE_DRIVERS.md)。
-
-## 前后端契约与 API
-
-后端路由集中在 `backend/src/main.rs`，处理函数和模型分别位于
-`backend/src/api/handlers.rs` 与 `backend/src/api/models.rs`；前端对应
-`frontend/src/api/current.ts` 和 `frontend/src/api/contracts.ts`。
-
-新增或修改接口时至少同步检查：
-
-1. 后端请求/响应 DTO。
-2. handler、路由方法与认证边界。
-3. 前端类型、API 封装和调用页面。
-4. `bruno-api/` 中对应 `.bru` 请求及其环境变量。
-5. 线路级接口是否始终携带并验证 `line_id`。
-6. 兼容性、错误码和真机验收项是否需要写入文档。
-
-除 `/api/health`、`/api/auth/status`、`/api/auth/setup`、`/api/auth/login` 和
-`/api/auth/logout` 外，业务 API 默认受会话认证保护。会话使用 `simadmin_session`
-HttpOnly Cookie；修改或清除管理员密码会让已有会话失效。
-
-## 手动构建可部署产物
-
-当前不要用 `scripts/build.sh` 生成发布包。前端和本机后端可以直接构建：
-
-```bash
-cd frontend
-pnpm install --frozen-lockfile
-pnpm build
-cd ../backend
-cargo build --release
-cd ..
-```
-
-交叉构建 aarch64 musl 后端：
-
-```bash
-rustup target add aarch64-unknown-linux-musl
-cargo install cargo-zigbuild
-cd backend
-SQLITE3_STATIC=1 LIBSQLITE3_SYS_USE_PKG_CONFIG=0 \
-  cargo zigbuild --release --target aarch64-unknown-linux-musl
-cd ..
-```
-
-可部署集合至少包含：
-
-- 与设备架构匹配的 `simadmin` 二进制。
-- `frontend/dist/`。
-- 经过审核、已封存且契约兼容的 `carrier-bundles.sqlite3`。
-- `scripts/simadmin.service`；设备资源按 `deploy/devices/<device>/` 原目录加入制品。
-
-文件传输、目标路径和 systemd 安装命令见[手动安装指南](./INSTALL.md)。
-
-## 自动安装与 OTA 状态
-
-以下实现仍留在源码中供后续重构，但当前不构成受支持的开发或发布流程：
-
-- `install_latest.sh`、`uninstall.sh`、`deploy/install.sh`。
-- `scripts/build.sh`、`scripts/deploy.sh`、`scripts/pack-ota.sh`。
-- Web OTA 页面以及 `/api/ota/*` 上传、下载和应用接口。
-
-恢复这些入口前，需要先确定新仓库地址、制品命名、catalog 分发、完整性/签名校验、版本
-兼容、原子替换和回滚契约。届时应重新编写脚本和文档，而不是只替换旧 URL。
-
-## ModemManager 调试
-
-```bash
-mmcli -L
-mmcli -m any
-mmcli -m any --simple-status
-mmcli -m any --location-get
-mmcli -m any --signal-get
-mmcli -m any --command='AT+CGSN'
-
-dbus-monitor --system "sender='org.freedesktop.ModemManager1'"
-busctl introspect org.freedesktop.ModemManager1 \
-  /org/freedesktop/ModemManager1/Modem/0
-```
-
-排查多线路问题时同时记录 `line_id`、ModemManager object path、主/副 QMI 设备、netdev、
-bearer path、P-CSCF 和 trace ID。发布前按[未完成开发计划](./DEVELOPMENT_PLAN.md)中的验收规则和矩阵执行回归。
+[docs/README](README.md)列出固定主题入口。新事实更新相应手册和简短HANDOFF；
+历史验证只写[历史摘要](archive/README.md)，详细原始材料留Git历史及`.local`。
+不继续新增日期命名的多份“当前交接”、重复Prompt模板或逐工具调用流水账。

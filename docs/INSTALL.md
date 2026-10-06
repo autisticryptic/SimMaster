@@ -21,11 +21,12 @@ unit 来拼接另一个版本的 Release。
   `uninstall.sh` 和 Web 在线升级/OTA 应用流程不在本次修复范围，仍不要使用。
 
 系统 D-Bus、内核驱动、QMI/MBIM 工具、MM/NM 等按设备和所选 backend 自行准备，见
-[运行环境与系统管理](./ENVIRONMENT.md)。native 部署不要为了满足旧教程而安装/启动 MM。
+本页第8节。native 部署不要为了满足旧教程而安装/启动 MM。
 
 ## 2. 构建与统一打包
 
-构建机需要 Rust/Cargo、Node.js/pnpm 和 Python 3。以 ARM64 musl 为例：
+**项目维护的编译、测试二进制和正式打包只在GitHub Actions执行，不在操作者本机编译。**
+以下构建命令只供Actions runner参考。构建环境需要Rust/Cargo、Node.js/pnpm和Python 3，以ARM64 musl为例：
 
 ```bash
 cd frontend
@@ -217,6 +218,56 @@ Python 版本、包的 SHA256 和 `meta.json`，以及是否为标准配置路�
 python3 -m unittest discover -s scripts/tests -p 'test_installer.py' -v
 ```
 
-测试使用临时 roots、只做格式验证的 ELF fixture 和假 systemctl/curl/程序输出；不运行真实
-主机安装或生产二进制，不连接设备。当前 35 项测试通过，包含关闭的安全环境变量、
-`/lib` vendor drop-in、错架构/截断 ELF 和失败回滚的回归。
+测试使用临时roots、ELF fixture和假systemctl/curl/程序输出，不执行真实安装或连接设备。
+具体测试数量以当前Actions日志为准；覆盖安全环境变量、vendor drop-in、错架构/截断ELF和失败回滚。
+
+## 8. 运行环境、配置和服务
+
+目标为Linux/systemd，内核须支持项目使用的namespace、veth、TUN及IPsec能力；设备操作需要相应权限。
+MM模式依赖系统D-Bus、ModemManager/mmcli；NM、qmicli及其他工具按设备与所选功能配置，
+不能为native模式自动启动MM。QCM410的IMS走主QMI/MM承载，DATA6用于普通数据，不是IMS专属端口。
+
+carrier catalog是**可选**的sealed schema-v7只读库，缺失可启动并在符合条件时派生回退；不是无库必然注册失败。
+默认程序目录`carrier-bundles.sqlite3`，可由`--carrier-catalog`/`SIMADMIN_CARRIER_CATALOG`指定。
+
+| 路径 | 内容 |
+|---|---|
+| `/opt/simadmin/simadmin`、`www/`、`meta.json` | 同版本程序、前端和制品元数据 |
+| `/opt/simadmin/data.db` | 账号/会话、线路配置、SIM覆盖、通知/自动化、短信/通话/事件 |
+| `/data/config.yaml` | `/data`存在时的默认主配置；否则回退`/opt/simadmin/config.yaml` |
+| `/opt/simadmin/lpac/` | 单独审核安装的lpac及可选动态库 |
+| `/var/lib/simadmin/mm-ims-profile-lease/` | 可能跨boot残留的IMS归属/恢复证据，不可当缓存删除 |
+| `/run/simadmin/` | 运行期设备映射、bearer及预算等状态，内容归属不可仅由目录名推断 |
+
+`SIMADMIN_CONFIG`可覆盖主配置路径；旧`SIMADMIN_CONFIG_DB`兼容变量现在指向文本文件。
+`.yaml/.yml`保留注释，`.json`无注释；不支持的扩展名/未知顶层字段拒绝，不猜测旧config.sqlite3格式。
+主配置和数据库是配套状态，应一起一致性备份；活跃WAL不能只复制data.db一个文件。
+配置含凭据，应限制权限，不回显密码、token、完整SIM身份或E911材料。
+
+线路配置按物理位置保存，SIM覆盖按卡身份保存。自动发现可以维护线路映射，
+不应反复改写用户的主配置注释。管理员密码修改会使旧会话失效，不靠重设密码排查普通接口故障。
+
+默认主unit在`scripts/simadmin.service`，工作目录`/opt/simadmin`，UMask0077。
+设备辅助unit由对应driver维护；QCM410的secondary service包含初始化和长期监视，
+进程仍在不等于卡已就绪，停止/重启它也不是纯显示操作。
+
+优先使用只读状态命令：
+
+```bash
+systemctl status simadmin.service --no-pager
+systemctl status simadmin-secondary-qmi.service --no-pager
+systemctl status simadmin-modem-recovery.timer --no-pager
+```
+
+日志可能包含用户身份，按[诊断说明](IMS_DIAGNOSTICS.md)脱敏。
+升级维护前记录主服务、辅助服务和恢复timer状态；收尾恢复本次暂停项，不遗留hold或套用旧PID。
+IP forwarding/NAT和线路路由由网络隔离实现管理，不能沿用旧文档“程序绝不修改网络”的笼统说法。
+
+## 9. eSIM与业务运行
+
+每线路eSIM控制为自动(null)、显式启用(true)或禁用(false)。仅按需调用lpac，按QMI设备/UIM slot
+或对应读卡器寻址；不同slot、逻辑通道和profile不是同一个编号。
+原线路工作台中的恢复待处理状态不得触发自动探测/写卡；正常状态也须遵守线路互斥与读回确认。
+
+VoWiFi与蜂窝IMS分别保有线路自己的承载/隧道、SIP和安全上下文；短信、语音与Trunk的费用限制
+独立于注册是否成功。具体策略见[IMS注册与兜底](IMS_REGISTRATION_POLICY.md)。

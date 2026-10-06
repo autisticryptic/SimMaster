@@ -1,214 +1,299 @@
-# MM IMS Exact-Family Profile Lease Design
+# MM IMS Exact-Family 租约、SIM 绑定与安全恢复
 
-> 当前：2026-10-01 10:21 UTC，6c6fcfd已部署，新卡20408/50212在正式服务注册IPv6/IPsec并完成一次自然续期，PID4973/MM472。当前线路明确IPv6-only规避已观察到的IPv4固件fatal；同一注册保持、维护保护全移除。自有CID3/v2账本在用，不能删除。旧卡51502的48e269c六次续期为历史独立验收。通话中续期、长通话、数据共存仍未验收，最新现场以HANDOFF首节为准。
-> 目标：解决 ModemManager 中有效 `profile-id` 优先于请求 `ip-type` 的约束，同时保持单一 MM owner、UE namespace 隔离和可核验恢复。
+本文定义 ModemManager（MM）IMS profile/bearer 的归属、生命周期和维护边界。
+注册与地址族策略见 [IMS 注册策略](IMS_REGISTRATION_POLICY.md)，实机状态见
+[HANDOFF](HANDOFF.md)，采证见 [IMS 诊断](IMS_DIAGNOSTICS.md)，历史过程见
+[档案索引](archive/README.md)。这里不保留历史 PID、CID、制品或设备地址作为当前值。
 
-## 显式维护入口（代码/CI及 profile 生命周期已实机验证）
+## 1. 目标与范围
 
-`simadmin mm-ims-profile-lease --modem <MM对象路径> --device <控制设备> --family <ipv4v6|ipv6|ipv4> --apn <派生IMS APN>` 默认`--action inspect`，输出与当前完整快照关联的`plan` token。
-`--action acquire --expected-plan <token>` 调用不含profile-id的ProfileManager.Set；`--action acquire-at --expected-plan <token>` 是明确选择的MM Command路径，先查询AT能力/活动与双快照，只在不存在的受支持CID上定义profile。二者不自动相互回退。
-`--action release`只处理该设备的自有receipt，要求APN/family与记录相符；只有自有配置读回一致、无承载/通话、恢复原reporting后才通过MM删除并验证。
+MM 有效 `profile-id` 的内置地址族可能优先于请求 `ip-type`；只改请求标签不能改变 profile。
+Exact-family lease 在受控路径中严格新建与本次族请求一致的 profile，并证明仅清理自身资源。
+它不制造 PCO/P-CSCF，不改变 AKA/SIP/IPsec，也不保证某张卡注册成功。
 
-- 只接受已验证QCM410 BAM-DMUX/QMI拓扑、同MM unique owner与SIM、IndexField=profile-id。要求两套主程序均已停止、无bearer/通话或未知bearer receipt；不调用Enable/Disable/Connect/CreateBearer，也不启动服务。
-- acquire前读取两次完整MM profile字段指纹、AT定义行及PDP族/APN、Initial EPS、所有CID reporting。QMI路径不传ID、核验设备返回ID及唯一短tag；MM-AT路径由同一安全能力解析器选择在MM与AT两套列表中均不存在的CID，排除CID1，验证不活动并写前重读，绝不因APN相同覆盖旧定义。两条路径均核验新profile的MM/AT族与APN一致、完整原条目未变，不写死4。
-- QMI profile可能跨重启存在，因此元数据receipt保存在`/var/lib/simadmin/mm-ims-profile-lease/`而非仅/run；写前Creating、已知返回ID、Owned、RestoringReporting、Deleting状态均持久化，使用flock/O_NOFOLLOW与目录权限/文件校验。receipt仅保存原字段哈希，不保存原profile认证口令；不是配置/数据库备份。
-- 新ID可能落入任一空闲位置，因此试验前要求所有未定义CID的reporting均为000；不假定删除能恢复非默认reporting。执行release时若该自有CID被应用设成111，先恢复其确切原值，再删除自有profile并验证原完整列表/AT/InitialEPS/reporting恢复；不写回已有普通profile。
-- Set或AT写入超时/取消/返回值不确定或存储失败保留Creating，禁止新建/猜ID删除。只有完整收到QMI Create的指定参数拒绝才记录Rejected，随后显式release必须两次证明原始快照未变，才结案且不发Delete。报告恢复与Delete超时不重复写；未知owner/SIM/字段变化仍失败关闭。
-- **此入口不改变现有自动CID选择、profile来源大兜底或地址族顺序，也没有偷偷增加“无响应再新建profile”的生产流程。** 下一阶段用已通过CI的维护能力进行一次独立profile对照，再根据证据决定生产集成；当前不能声称已经注册。
-- 单元/mock及private-D-Bus测试覆盖无ID Set、非固定返回ID、MM/AT不一致、原字段/owner/SIM变化、每次持久化失败、Set取消、报告恢复和Delete不确定结果、状态回收和身份字段不进入receipt。Rust只在Actions运行。
+- 生产固定 `IPv4v6 → IPv6 → IPv4`；双栈仅获一族仍为合法承载。
+- 在原 bearer-family 调用内准备 profile，不新增 SIP 无响应后换族重建的外层循环。
+- 不恢复旧 `profile_pin_family_conflict` 终止策略来关闭正常强制族兜底。
+- 不把过去临时 IPv6-only 避障当作当前配置；全部线路使用完整默认策略。
+- `0502395` 已完整撤回 CMCC 专用 flag 补丁与测试，不能声称该问题修复。
+  全局 fallback 回归待调查；后续修复和测试采用通用条件，不新增运营商专用逻辑。
 
-## 有界注册对照入口（83354b6已通过CI及实机注册对照）
+## 2. 不可破坏的不变量
 
-新增显式 `--action probe --expected-plan <当前 inspect token>`，只准入 `Owned` 租约且 APN/family 与完整快照一致。发请求前持久化 `Probing`，结束后记为 `Probed`；取消或崩溃后不能再次 probe 同一租约。
+1. 同一物理 modem 的 bearer 只由 MM 管理，不借 MM 内部 WDS client，不并行启动 direct-QMI owner。
+2. 不覆盖原 profile、Initial EPS、其他线路 context 或普通数据定义；不写固定 CID。
+3. SIM logical channel、eSIM profile、MM profile-id、AT PDP CID 是不同对象。
+4. owner、SIM、进程、boot、generation、profile、bearer 与网络资源均须有明确绑定。
+5. 取消、超时、未知返回、清理失败或身份变化时保留账本，不猜 ID、不盲删、不重放未知写入。
+6. profile 创建成功不等于 bearer 成功；IP 地址不等于 IMS 注册；探针不等于正式服务验收。
+7. P-CSCF 只能来自同一 retained bearer 的已验证 context、可信配置或 UE-bound DNS。
+8. 不因资源阻断清预算、重启基带、全局清 XFRM、停其他线路或偷偷改数据业务。
 
-- 复用现有派生身份、AKA、REGISTER 核心；独立 UE namespace、内存数据库，不启动 Web 服务、调度器、通话/短信监听或生产恢复循环。
-- P-CSCF reporting 在持久化 `Probing` 后经原 unique-owner bus、串行锁内 SIM/静止检查启用并读回；探针跳过生产核心的 mmcli reporting 写入。启用结果未知、读回不符、取消或结束状态无法持久化时保留 `Probing` 并阻断自动 release，不以观察到旧值就盲删记录。
-- capability 校验实际 CID/APN/MM 端点与族，最多调用一次底层承载建立；强制单族错误不能借此对同一 profile 再激活。REGISTER 核心窗口 240 秒，注销另限 40 秒；成功报告仅表示本次注册成功，随后主动注销，不是维持在线服务。
-- 注销结果分别报告 confirmed/already_expired/rejected/access_lost/timeout，不把清理成功当作网络已确认注销。承载回收后停止 worker，仅在自有 namespace 只剩 loopback 且清理已核验时删除；profile 仍须显式 release。
-- 同一 MM owner 内对象重新枚举，只在旧 modem 确认消失、物理控制口及稳定 SIM/slot、原 profile/EPS 全匹配且两次快照一致时衔接 profile 清理；不把 bearer 清理重定向到新对象，不接受旧 receipt 缺失稳定归属证据的换代。
-- 83354b6已验证：临时IPv4v6 CID4（动态选择）、实际IPv4/wwan0，首420后根据精确Warning词序补齐安全声明，401/AKA后返回真实IPsec成功会话；注销结果rejected，本地承载/namespace/profile回收通过。新实例无需强制IPv4、不改原profile，完整证据与生产集成边界见[HANDOFF最新节](HANDOFF.md#先前验收临时-profile-上实际-ims-ipsec-注册成功2026-09-30-1629-utc)。原6a77d92的profile闭环证明保持独立，不能拿探针成功替代主服务持续在线验收。
+## 3. 生产接入与隔离架构
 
-## 新卡IPv6承载的多上下文P-CSCF证明（已通过CI及实机）
+- 设备 transport 显式 opt-in；仅标准派生、MM、IMS-only 路径进入 runtime adapter。
+- 普通数据开启、catalog 或其他设备仍走原路径，不为启用 lease 自动关闭用户数据。
+- 普通路径也持有同设备 flock 至 bearer 准备结束，避免检查空账本后误复用并发创建的 profile。
+- 每次族尝试从原 unique owner、已 pin SIM 创建独立接口选择状态，不重新寻找 owner，
+  不把上次选中的 `wwan` 接口沿用到下一承载。
+- runtime 经 MM Command 的严格 AT 能力校验选择空闲 exact-family profile；
+  只有前次完整回收，才允许原计划的下一尝试。不确定结果立即阻断。
+- opaque retained handle 转发 SIM、P-CSCF、namespace 操作并携带 profile 生命周期。
+- generation/取消谓词直达 CreateBearer/Connect 分发前；已派发请求继续受保护接收结果并最终回收。
+- 不调用维护 CLI 或全局 shutdown 来完成生产清理。
+- 退出顺序为 SIP/XFRM → retained bearer/网络 → reporting/profile；
+  显式 exit 等待 profile 回收，不依赖析构，超时保留账本。
 
-20408/50212实测：自有IPv6 profile与MM源地址共享/64但IID不同，CGPADDR与目标CGCONTRDP完整地址一致；另有默认INTERNET上下文活动，IPv6前缀不同。原sole-active保护因此拒绝了IMS自己的PCO。547c157补强后已进入SIP，0ae80ae显式required对照IPsec注册及注销confirmed；6c6fcfd集成完整首声明并部署正式服务，于2026-10-01 09:27 UTC注册IPv6/IPsec，当前线路配置IPv6-only规避固件IPv4崩溃。10:17 UTC正式服务完成一次自然续期，同注册和MM owner保持，见HANDOFF首节。
+## 4. SIM 绑定校准与 generation
 
-新增分支仅在已验证自有IPv6-only profile（不是普通APN复用）的 retained MM bearer 上启用：
+### 库存观测
 
-1. 仍验证实际profile-id、APN、unique owner/SIM、独占网口、MM IP快照与/64授予，不从AT配置主机地址。
-2. 目标CGPADDR必须是严格单行、同CID、唯一IPv6完整地址，与目标AT行完全一致；错误尾部、重复、同前缀但不同地址均拒绝。
-3. 对每一个其他活动CID读取独立CGCONTRDP，核对CID、协商APN、EBI、可用地址族；IPv6-capable定义缺少有效IPv6或显式非/64、零IID均视为未知，拒绝。任何其他上下文与目标前缀重叠、同IMS APN、重复EBI都拒绝。
-4. 当前卡默认上下文的空配置APN可协商成INTERNET，仅作排除证据，不借其DNS/P-CSCF。全部行、目标地址、活动表、定义表重复核验，再检查当前MM绑定，才消费目标CID自己的PCO。
-5. 原exact-address及sole-active行为不变，普通非自有pin不获得该扩展；原12秒只读预算/串行及lease guard不变。不会借此增加IPv4激活、改变全局族顺序或绕过固件崩溃保护。
+- 稳定 `line_id` 表示物理槽位，不用 APN/运营商相同推断同 SIM。
+- 每轮 registry 在 reader/serving/UE 异步 reconcile 前同步核对全部已知 MM 线路的
+  ICCID、SIM/MM object、控制端口和 slot，不让前一线路慢查询延迟后一线路失效。
+- 确认变化后关闭新蜂窝 IMS 准入并递增 generation；旧连接、恢复批次、listener 结果不能发布到新 SIM。
+- 空 ICCID、未就绪、冲突及 discovery 失败属于未知，不抹掉最后身份或公开 presence/worker，
+  不等同于成功查到空库存，不反复清理、不记录 profile 耗尽。
+- 已有会话由 retained SIM/owner 校验，不因一次库存未知主动重新附着；
+  同卡稳定后仍可按既有策略恢复。
+- 新身份连续两轮一致才调度带 revision ticket 的清理；忙碌则下轮重试，不排长队。
+  取得 bearer/connect/advance 锁后再次核对 ticket，清理后再核对才重新开放准入。
+- 只释放旧自有会话并等待 listener 退出；不向替换 SIM 发旧 SIP 注销，
+  不按复用 modem/CID 对新 SIM 回写旧 reporting/profile。
+- 普通 MM profile/reporting 属于持久配置，不做通用选择器回滚；
+  自有 exact-family profile 只有满足本手册归属证明才可释放。native 原清理策略不变。
 
-## 换卡后旧租约的显式缺失结案（cc2fcc1已通过CI及实机）
+### retained bearer 的检查点
 
-`--action inspect-retired` 只核验并输出plan；`--action retire-absent --expected-plan <token>` 才能归档已证明无资源的v2运行时记录。二者仍要求两程序停止、无bearer/call/未知bearer receipt，不接入自动重试。
+- CreateBearer 前两次无缓存 SIM 快照绑定 unique owner、控制端口、SIM object、ICCID、PrimarySimSlot。
+- 单卡 `slot=0` 或缺失按 inventory 语义归一到逻辑槽 1；读取失败、类型错误、越界拒绝。
+- 派生身份读取前后核对 ICCID；每族请求携带调用方预期 SIM/slot，与 retained 快照比较。
+- Connect/监视、IP settings、P-CSCF、初始 SIP 和续期前后继续核对。
+- 取消后的 AKA 回调在新认证 IO 前拒绝；SIM/owner 不可验证是终止错误，不继续族轮换。
+- reporting 串行锁取得后再次检查 owner/端口/SIM/slot/策略，防止排队时换卡。
+- 校准不 Disable/Enable、不修改 Initial EPS、不清一次性恢复预算；
+  原 profile/族/P-CSCF 耗尽后仅既有 `primary_ims_recovery.rs` 决定受控重新附着。
 
-- 原MM unique owner必须已真正不存在（同bus用NameHasOwner确认；不是仅失去well-known名），当前MM owner/新SIM及完整快照在双次观察中一致；物理控制口必须匹配原记录。
-- 旧自有ID在**当前MM与AT两份库存中都不存在**，且其reporting已回到原000。即使同ID的APN/族不同，也视为存在而拒绝，不会删掉新卡的配置。
-- 要求原创建进程死亡，记录处于已知Owned/Probed及已知运行时阶段；Creating/Probing/BearerPending/不确定reporting或Delete均不借此结案。旧bearer镜像和地址、路由、规则须只读证明无残留；旧namespace若还存在则拒绝，不尝试清扫IPsec或网口。
-- 只把原记录原样写入`retired/absent-<digest>.receipt`，确认持久化后才移除活动记录名；不覆盖既有证据、配置或DB，不改任何modem profile，不清预算。归档失败或证据变化保持阻断。
-- 此入口不能恢复缺失QMI口、不能修复固件`dhcp_client_mgr.c:263`崩溃，也不能证明新卡IMS已注册；只有控制口恢复后才可能取得当前库存证明。
+## 5. 应用内 eSIM 切换屏障
 
-## 生产集成（48e269c已部署，IMS-only注册验收通过）
+应用内 enable 在 lpac 之前关闭准入并排空原 IMS；维护 guard 覆盖整个异步操作。
+失败/取消也必须等待稳定新观测，不能直接恢复旧映射；重叠切换请求返回冲突。
 
-- 设备 transport 显式 opt-in；仅标准派生、MM、IMS-only 路径进入 runtime adapter。数据开启、catalog或其他设备仍保留原流程；普通流程持有相同设备 flock 到承载准备结束，防止空账本检查后误复用并发新建的自有 profile。
-- 在原有每次 bearer-family 调用内经 MM AT 严格新建空闲 exact-family profile；没有新族循环或 SIP 超时重建循环。仅在前次完整回收后允许下一原定尝试，成功/强制族 hint 保留；不确定操作立即阻断。
-- v2 profile ledger 记录线路哈希、代次、进程开始身份、boot、阶段及自有 bearer 网络记录镜像；旧CLI拒绝v2，运行时不会采用v1维护残留。大小限制与每次原子持久化失败阻断，原 profile/EPS/reporting不被覆盖。
-- 每次尝试从**原unique owner及已pin SIM**派生独立接口选择状态，不重新找owner，也不把上次wwan选择带到下一承载。代次/取消谓词到达CreateBearer/Connect实际分发前，已发请求仍受屏蔽并最终回收。
-- opaque handle转发SIM、P-CSCF、namespace操作并携带profile生命周期。承载/network absence证明完成后才恢复reporting、删profile；原MM对象消失时只允许同owner/SIM/物理控制口及原快照一致的profile清理重绑定。短暂MM换代只在未开始reporting/Delete写入时有限等待，未知写入不重放。
-- 运行时不调用维护CLI或全局shutdown。服务退出按SIP/XFRM资源→retained bearer→profile顺序回收；显式exit前执行profile清理而不依赖对象析构，超时保留账本。启动/新尝试先进行原owner安全恢复；恢复不明时不进行全局namespace搬移。
-- 明确限制：MM owner/SIM/boot变化、未知Create/reporting、没有可核验bearer归属等仍保守阻断，需要维护，不承诺跨重启自动删除自有配置。普通数据共存不在首版准入范围，不为启用此功能停用用户数据。
-- 实机：首双栈准备校验失败、IPv6被GGSN拒绝，按原顺序新建IPv4 profile后在正式服务注册IPsec；活跃v2记录绑定PID119010/Bearer155/Modem77/wwan0。19:07注册至19:14核验保持同一registered_at，未清任何记录来解锁；后续10月1日00:43 UTC已核验6次自然续期成功，仍同一次注册，每次有效期3600秒、3000秒续期。停止/取消故障注入仍以代码/回归覆盖为准，不扩大实机验收范围。
+执行 lpac、身份清空或全局 MM 恢复前必须证明：
 
-## 维护工具的验证事实（2026-09-30）
+- 有有效 MM admission ticket，不能仅凭账本 absence 切卡。
+- 同设备持久 profile 账本不存在，旧 Context 已释放设备 flock。
+- 全局 bearer、pending-create 及其他相关账本均无残留。
+- 不可信目录、损坏文件、权限错误、symlink 或读失败不能当作 absence。
 
-- `c71bee2`：两套CI/39累计新增与更新回归+8兼容/双架构核验通过，设备inspect成功；QMI Set请求返回`Couldn't create profile: DS profile error: invalid-parameter-length`，原3项profile和完整快照token未变。
-- `b83a0f4`：tag由44字节缩至16字节、增加明确拒绝状态；两套CI/41累计回归+8兼容/双架构通过，但设备仍同样拒绝。因此**不能认定只是名称过长，也不能泛化成所有QMI Create均不支持**。
-- 首版Creating未存明确拒绝分类；现场经原MM日志唯一tag及明确错误、同owner/进程、完整快照一致验证后，将原记录归档为`.rejected`保留，未删profile/预算。新版Rejected记录由工具两次核验原状态后结案。
-- `6a77d9278e5d8fbaf4519fa0c77dfc2a6a5c7835`：新增显式MM-AT创建。Validate36722549817/Build36722549812全部success，下载两套日志核实44累计新增/更新回归+8兼容检查；ARM64/AMD64制品digest/meta/ELF/程序和前端均已核验。
-- **13:43 UTC实机闭环成功**：inspect→acquire-at，自动选空闲CID4创建`IPV4V6/ims`，MM+AT读回/原profile/EPS/reporting检查通过；随后release只删除本次自有profile，最终inspect恢复3项、无pending，token与最初完全相同。没有承载激活或REGISTER，未碰CID1/2/3定义。
-- 工具只在`/opt/simadmin-staging/ims-profile-maintenance-6a77d92/`运行，未替换正式cf13a66或启动主服务/beta8/secondary；MM PID48819未变，recovery timer恢复active。设备recovery service为`oneshot + RemainAfterExit=yes + active/exited + MainPID0 + Result=success`，是已结束检查，不误判为正在恢复；一次预检误拒绝记录保留，未发写操作。
-- 证据`.local/evidence/ims-route-completion/{c71bee2,b83a0f4,6a77d92}/`与`profile-lease-contract/`。**下一步仍是有界注册对照**，需要考虑承载清理引起MM对象换代与临时profile的安全回收；不因profile闭环成功就宣称当前eSIM已注册。
+设备 flock 跨 lpac/MM 恢复持有，成功/失败/取消均 RAII 释放；清理不放在 serial permit 内。
+全局 MM 操作先取得 registry discovery 独占预留，冻结新发现后再核对库存。
+操作结束、最终 registry refresh 前释放库存预留以免自锁；线路 ticket 和设备 flock 仍保留。
+多个已知 modem 线路或 slot 冲突保守拒绝；不是任意多 modem 热切换支持。
+不增加 eSIM 原流程之外的射频重启，不修改 native 后端控制流程。
 
-## 2026-09-30：同机 beta8 成功带来的新证据
+## 6. 快照与持久账本
 
-- 用户运行同哈希beta8/930365d成功；MM日志明确profile4先IPv6失败，再IPv4成功并有RX。停止后profile4不存在，原profile3 IPV4V6/ims保持。当前cf13a66用profile3双族配置，SIP无响应。
-- MM1.24.0的`load_settings_from_bearer`/`get_profile_ready`依旧以profile内部族驱动WDS，不是只有1.18才有该语义。当前APN匹配复用不检查每次尝试的PDP族。
-- 不把profile4视为固定答案；需要严格新建、取得实际返回ID，或复用可证明属于本功能的exact-family定义，不覆盖任何既有条目。
-- **只在原bearer族循环内补profile准备，仍可能无法修复这张卡**：dual建立取得IPv4就提前返回成功；后续SIP失败不继续该bearer循环。本次成功beta8的IPv6/IPv4是分别建立的MM承载。因此必须先对照“新profile”与“单族profile”各自作用，不以连接标签变化冒充等价测试。
-- 原地址族顺序IPv4v6→IPv6→IPv4、profile来源大兜底、安全/费用保护保持。若最终需要将SIP阶段的无响应交回按族承载重建，应单独明确授权与有限预算，不在这个准备层偷偷增加另一套重试。
-- 用户已停beta8及主服务，保持停机现场；后来已批准并执行上述临时profile新建/回收闭环，但**尚未在该profile上做SIP注册对照**。beta8测试前MM重启/secondary停止亦是混杂变量，不能据此要求复现这些操作。
-- 下方旧设计曾建议`profile_pin_family_conflict`终止，后续70dfe3d已撤回该生产行为；既有正常forced-family兜底不能因实现本方案被关闭。设计实施应以现代码/最新HANDOFF为准。
+维护 receipt 位于 `/var/lib/simadmin/mm-ims-profile-lease/`，不能仅存在 `/run`：
+QMI/AT profile 可能跨进程或重启继续存在。
 
-## 背景
+完整快照包括：
 
-beta8 的静态证据显示，IMS 承载准备同时关注 PDP/CID、地址族、APN 和 P-CSCF reporting。当前 SimAdmin 已能把请求地址族完整传给 MM，并读取实际授予的 IPv4/IPv6 配置；但当 MM profile pin 的内置族与网络 forced-family 结果冲突时，只修改请求标签不会改变 profile 本身。
+- MM bus unique owner、modem object、物理控制拓扑和稳定 SIM/slot；
+- 规范化的完整 ProfileManager 字段，不只 ID/APN/family；
+- AT 定义、PDP family/APN、活动 CID、Initial EPS、所有 CID reporting；
+- bearer/interface/IP grant 和网络归属；进程身份、boot、generation。
 
-已观察到的失败形态：
+目录/文件使用 flock、权限/归属检查、O_NOFOLLOW、大小限制及原子持久化。
+只保存原字段哈希而不保存原 profile 认证口令；receipt 不是配置或数据库备份。
+列表排序/序列化变化不算内容变化，字段值变化必须阻断。
 
-- 请求 `ipv4v6`、pin `profile 2`，MM 实际只授予 IPv6；
-- 临时 IPv4 profile 被 `pdn-ipv4-call-disallowed` 拒绝；
-- 保留该 IPv4 pin 后再请求 IPv6，仍会重复使用 IPv4 profile，不能形成有效 IPv6 重试。
+- v1 是显式维护 receipt；v2 增加线路哈希、代次、进程启动身份、boot、runtime 阶段、bearer 网络镜像。
+- 旧维护 CLI 不采用 v2；runtime 不采用 v1 维护残留。
+- 写入前持久化 `Creating`，之后记录已知返回 ID、`Owned`、`RestoringReporting`、`Deleting` 等状态。
+- runtime 可记录 bearer pending/cleaning/abandoned 等阶段；不能仅凭顶层 owned/probed 判断可清理。
+- 任何原子写入/fsync 失败均阻断后续操作。异常账本保留证据，不手工改 owner/SIM/阶段以解锁。
 
-本设计只处理 profile-family 语义，不声称能制造运营商 PCO/P-CSCF，也不改变 SIP/AKA/IPsec 策略。
+## 7. 显式创建与释放
 
-## 不变量
-
-1. 同一物理 modem 只有 MM 一个 bearer owner；不借用 MM 内部 WDS client，不同时启动 direct-QMI owner。
-2. 原有 profile、Initial EPS 设置、其他线路 context 和普通数据 profile 不被覆盖。
-3. 临时 profile 的所有属性、创建结果、MM unique owner、进程、bearer 和 generation 都进入归属账本。
-4. 任何取消、超时、owner 变化、结果不确定或清理失败都保留账本，不猜 ID、不盲删、不自动重试写操作。
-5. P-CSCF 只能来自同一个 retained MM bearer、经过归属校验的活动 context、已验证配置或 UE-bound DNS；IP 地址本身不等于 IMS 注册。
-6. 临时 profile 成功创建不等于 bearer 成功，更不等于 SIP/AKA 注册成功。
-
-## Lease 状态
+以下命令只是接口说明，必须在另行授权的空闲维护窗口执行。
 
 ```text
-Absent
-  -> SnapshotVerified
-  -> Creating
-  -> CreatedOwned
-  -> BearerAttempted
-  -> Released
-
-任何状态的 owner/generation/列表不确定或清理失败
-  -> ReconciliationRequired
+simadmin mm-ims-profile-lease --modem <当前MM对象路径> \
+  --device <物理控制设备> --family <ipv4v6|ipv6|ipv4> --apn <已验证IMS APN>
 ```
 
-`SnapshotVerified` 必须包含：
+默认 `--action inspect`，输出与完整当前快照绑定的 `plan` token。
+所有创建要求已验证 QCM410 BAM-DMUX/QMI 拓扑、同 owner/SIM、`IndexField=profile-id`，
+主/secondary manager 与 worker 停止，无 bearer/通话/未知 bearer receipt。
+创建/释放自身不调用 Enable/Disable/Connect/CreateBearer，不启动服务。
 
-- MM bus unique owner 与 modem object path；
-- 完整 ProfileManager 列表的规范化快照；
-- 目标 profile 是否存在；
-- 完整 profile 字段，不只保存 `profile-id`、APN、PDP type；
-- InitialEpsBearerSettings 快照；
-- 当前活动 bearer/context 和接口归属；
-- 当前线路 generation、进程身份和管理路由状态。
+| action | 契约 |
+|---|---|
+| `inspect` | 只读双快照与 plan |
+| `acquire --expected-plan <token>` | ProfileManager.Set 不带 profile-id，严格新建 |
+| `acquire-at --expected-plan <token>` | 显式选 MM Command 路径，不与 QMI 自动互相回退 |
+| `release` | 仅处理本设备且 APN/family 匹配的自有 receipt |
 
-## 创建策略
+创建规则：
 
-### 仅在有明确 family 冲突时创建
+- QMI 验证设备实际返回 ID、唯一短 tag 和完整读回，不假设固定 ID。
+- AT 能力解析器在 MM 与 AT 列表都不存在的受支持 CID 中选择，排除 CID1；
+  核验 inactive、写前重读，不因 APN 相同覆盖已有定义。
+- 两条路径都验证新项 MM/AT family/APN 一致、原所有字段及 EPS 未变。
+- 所有未定义 CID reporting 需为 000，避免新 ID 落到非默认 reporting 而无法证明恢复。
+- Set/AT 超时、取消、返回不明或保存失败保留 Creating，禁止再建或猜 ID 删除。
+- 只有完整收到明确 QMI 参数拒绝才标记 Rejected；release 双快照证明原状态未变后结案，不发 Delete。
 
-普通 IMS 首次连接继续使用已验证的显式 profile pin。收到结构化 `NetworkForcedIpv4`/`NetworkForcedIpv6` 后：
+释放规则：
 
-1. 如果没有 profile pin，可以按现有计划执行结构化 single-family retry。
-2. 如果存在 profile pin，先比较 pin 对应 profile 的实际 family。
-3. family 已匹配时不创建临时 profile；重新尝试必须有明确的网络/生命周期理由。
-4. family 不匹配时停止同 pin retry，生成 `profile_pin_family_conflict`。
-5. 只有在独立维护策略允许、目标 profile 能力已确认、且没有活动冲突时，才由 ProfileManager 严格新建临时 profile。
+1. 无自有 bearer/网络残留且无通话，精确读回自有 profile 未变。
+2. 恢复该 CID 保存的原 reporting（不是一律盲写 000），读回确认。
+3. 通过 MM 删除唯一自有 profile，不用空 APN 占位替代删除。
+4. 双快照核验原完整 profile/AT/EPS/reporting 恢复后才移除活动 receipt。
 
-### ProfileManager 约束
+reporting/Delete 超时不能重放；未知 owner/SIM/字段变化保守阻断。
 
-- `Set` 省略 `profile-id` 才表示严格新建；不向 `Set` 提交现有 ID，避免把现有 profile 当作可修改对象。
-- 新 profile 至少记录 APN、ip-type、认证/漫游字段及 MM 返回的完整属性。
-- 返回 ID 必须在同一 MM owner 下重新 `List` 验证，并与返回属性逐字段一致后才登记归属。
-- 列表顺序、序列化格式变化不能被误判为 profile 内容变化；字段值变化必须阻断自动清理。
-- 不自动修改 InitialEpsBearerSettings。若目标是初始 EPS 重新协商，必须是单独的维护流程。
+## 8. 有界注册探针
 
-## Bearer 尝试
+`--action probe --expected-plan <当前token>` 只准入 Owned、APN/family 与快照匹配的维护租约。
 
-临时 profile 的 bearer 请求必须携带返回的 pin，并记录：
+- 请求前持久化 `Probing`，结束记 `Probed`；取消/崩溃后不再 probe 同一租约。
+- 使用已有派生身份、AKA、共享 REGISTER 核心，独立 UE namespace 和内存数据库。
+  不启动 Web、调度器、通话/短信监听或生产恢复循环。
+- reporting 在 Probing 持久化后经原 unique-owner bus 与串行锁，核验 SIM/静止状态后启用并读回；
+  跳过生产核心 mmcli reporting 写入。未知写入/状态保存失败保留 Probing，禁止自动 release。
+- 最多一次底层 bearer 建立，强制族错误也不得扩大为第二次激活；不写生产族配置。
+- REGISTER 窗口 240 秒，注销另限 40 秒；成功后主动注销，不保持在线服务。
+- 注销分别报告 confirmed/already_expired/rejected/access_lost/timeout，
+  本地清理成功不代表网络确认注销。
+- bearer 回收后停止 worker，仅在自有 namespace 只剩 loopback 且清理确认时删除。
+  profile 仍需显式 release。
 
-- requested family；
-- MM `Properties.ip-type`；
-- actual `Ip4Config` / `Ip6Config`；
-- bearer path、unique owner、interface；
-- P-CSCF/DNS/PCO 来源；
-- worker generation 和 namespace receipt。
+## 9. P-CSCF 与实际地址族证明
 
-只有 actual family 与目标结果一致时才允许继续配置 UE 网络。单族实际授予可以作为明确的降级结果记录，但不能把请求双栈写成实际双栈。
+始终验证 profile-id、实际 APN、原 owner/SIM、独占网口和 MM IP grant；不从 AT 配置主机地址。
+不能只因 IPv6 前缀相同就借用其他 CID 的 PCO。
 
-## 清理与恢复
+原 exact-address / sole-active 证明继续保留；额外多上下文分支仅适用于已验证自有 profile 的 retained bearer：
 
-正常成功或失败清理顺序：
+- MM 实际无 IPv4且授予 IPv6；目标 AT 恰好一行，CID、APN、地址和 /64 授予一致。
+- CGPADDR 必须唯一 IPv6 完整地址与目标 CGCONTRDP 完全匹配；
+  可以带未授予占位 `0.0.0.0`，不允许真实伴随 IPv4、重复行、错误尾部或不同完整地址。
+- 既支持定义为 IPV6，也支持 IPV4V6 但实际只获 IPv6；定义变化或双行歧义拒绝。
+- 每个其他活动 CID 独立读 CGCONTRDP，核验 CID、协商 APN、EBI、可用地址族。
+  IPv6-capable 定义却无有效 IPv6、显式非 /64 或零 IID 为未知。
+- 其他上下文与目标前缀重叠、同 IMS APN、重复 EBI 均拒绝。
+  空配置 APN 协商成普通数据 APN只能作排除证据，不借其 DNS/P-CSCF。
+- 全部定义/活动表/目标与其他行双快照一致，最后重验 MM 绑定才发布目标自己的 PCO。
 
-1. 停止接受新的同线路 bearer 操作；
-2. 确认 retained bearer 仍由原 MM owner 持有；
-3. 释放/断开本次 bearer；
-4. 确认 interface、地址、路由和 namespace receipt 已归还；
-5. 删除唯一由本 lease 创建的临时 profile；
-6. 重新 `List` 并逐字段比较原 profile 快照；
-7. 只有全部验证成功才删除 lease 账本。
+普通非自有 pin 不享有此扩展；原 12 秒只读预算、串行锁及 lease guard 不变。
 
-如果 profile 原本不存在，恢复动作必须是 MM 明确支持的删除操作，而不是写入空 APN 占位 profile。不能无条件把 reporting 写成 `0,0,0`；必须保存原始值并恢复原始状态。任何一步失败都进入 `ReconciliationRequired`。
+## 10. 清理、对象换代与启动门禁
 
-进程崩溃、MM 重启或 owner 变化后：
+正常清理先停止新操作，确认 retained owner，再释放 bearer、验证 interface/地址/路由/namespace，
+最后恢复 reporting、删除 profile、验证原快照并结案。
 
-- 先核对原 bus ID/unique owner/generation；
-- 不把复用的 modem/profile/bearer 编号当作原资源；
-- 只对归属明确且 owner 仍匹配的资源执行清理；
-- 不确定时保留账本并要求维护窗口处理。
+- owner 消失或别人占用接口不等于网络已释放；带网络/namespace 的 receipt 保留。
+  只有无网络变更的纯旧 bearer receipt 才可能在 owner 消失后遗忘。
+- Create 前保存 `.create` intent；外部等待有界，但已派发 Create 在受保护任务内接收晚到对象并清理。
+  lease 保存与 Delete 均失败、RPC 不明或进程交接前退出时，intent 阻止再次分配。
+- 同 owner 下对象换代：仅向原 unique owner 的 ObjectManager 证明旧 modem/bearer 都不存在，
+  只读证明物理网口回主机、旧地址/源路由/私有表规则/namespace 状态消失，再核对对象 absence。
+- `UnknownMethod` 字符串不等于对象不存在；不向新 modem 重放旧 bearer 清理。
+- profile 清理可在同 owner、同 SIM/slot/物理口、原 profile/EPS 和双快照完全一致时有限重绑定；
+  不将 bearer 清理重定向，不接受缺稳定证据的旧 receipt。
+- 短暂 MM 换代只在尚未发 reporting/Delete 时有限等待，未知写入不重放。
 
-## 与 beta8 的关系
+启动和全部 registry refresh 入口在创建 UE worker/namespace 前处理未结案 v2/恢复事务。
+MM/SIM 未枚举时先等待；每轮至多一次只读证明，并有 5 秒冷却，不增加 REGISTER 或基带重试。
+恢复不明时不做全局 namespace 搬移，避免先创建新 worker 把空闲恢复条件堵死。
 
-可借鉴：
+## 11. 无资源旧记录的归档
 
-- profile/CID/family/APN 是一个注册前计划；
-- P-CSCF reporting 要在正确 profile 时序中准备；
-- MM 和自有 WDS 是不同 owner 路径；
-- P-CSCF 缺失时进行有界多轮观察。
+跨 boot / owner / SIM 变化不是通用自动删除授权。
+只有旧资源已不存在且完整安全证明成立，才能归档元数据；仍存在或身份未知继续阻断。
 
-不直接移植：
+| 入口/情形 | 允许动作 |
+|---|---|
+| 跨 boot 自动恢复 | 同 SIM/物理拓扑、旧 owner/进程死亡、双库存及所有旧资源 absence 后归档 |
+| 跨 owner 自动恢复 | 满足独立恢复准入且旧 profile/reporting absence，可支持同 boot 或换 SIM |
+| `inspect-retired` | 只读核验及输出 plan |
+| `retire-absent --expected-plan <token>` | 按精确 token 归档已证明无资源的已知 v2 阶段 |
+| `inspect-uncreated` / `retire-uncreated` | 显式核验完全未记录创建资源的旧创建意图，仅归档元数据 |
 
-- beta8 自有 WDS client；
-- 未证实的临时 `CGACT=1` prefetch 流程；
-- 宽泛 IPsec 错误到 plain UDP 回退；
-- 全局或未确认 namespace 的 XFRM flush；
-- 固定 profile/CID、默认三位 MNC 猜测或硬编码 P-CSCF。
+absence 要求：
 
-## 离线测试门槛
+- 原 owner 用同 bus `NameHasOwner` 确认真正退出，不只是失去 well-known name；当前绑定稳定。
+- 原自有 ID 在当前 MM、AT 都不存在；同 ID 即便 APN/family 不同仍视为存在。
+- reporting 恢复原值，旧 bearer 镜像、地址/路由/规则无残留，旧 namespace 不存在。
+- Creating/Probing/BearerPending、未知 reporting/Delete 不能借普通 absent 入口结案。
+- uncreated 专用入口须同 boot/owner/SIM、创建进程已死、原库存完整双快照未变、
+  源记录至少静置 120 秒、未记录任何已创建资源且 plan 匹配；自动恢复仍阻断 Creating。
 
-在任何设备窗口前必须有：
+原字节先写入 `retired/absent-<digest>.receipt` 并同步，才移除活动名。
+归档后崩溃仅在权限/归属/单链接/完整字节全部匹配时续接；symlink、hardlink、截断或冲突均拒绝。
+同步归档目录和父目录，不覆盖历史证据，不清恢复预算。
 
-- ProfileManager `Set` 严格新建、返回 ID、列表复核的 fake D-Bus 测试；
-- 字段完整快照和规范化比较测试；
-- profile pin/family 冲突不重复请求的测试；
-- 创建中取消、Connect 超时、owner 替换、列表变化、删除失败和未知结果测试；
-- 原 profile 不存在时删除而非空 profile 恢复的测试；
-- 双架构 Actions 编译和回归；
-- 文档明确区分代码、CI、设备 bearer、P-CSCF、SIP/AKA 和自然续期验收。
+## 12. 跨 owner 的 present profile 恢复事务
 
-## 设备窗口门槛
+AT 创建无唯一归属标签；相同 CID/字段/指纹无法排除被他人删后同值重建（ABA）。
+因此仍存在的跨 owner profile 不可自动认领或删除，只能通过显式批准的精确维护 plan。
+不放宽原 `identity_io`、`same_binding`、`release_with`。
 
-未来首次验证只允许一个变量：选择已验证的 MM 候选、固定卡/网络、保持 Wi-Fi 管理链路，确认无通话后执行一次 profile lease 对照。不得同时改变 APN、Initial EPS、backend、普通数据或 SIM 配置。窗口结束必须恢复原 profile 列表、Initial EPS、服务、配置、数据库和所有 receipt，并保存脱敏 P-CSCF/SIP 阶段结果。
+### 空闲准入
+
+- 持有设备 flock，仅一个 MM modem，无其他 manager/worker/live Context、pending bearer 或冲突账本。
+- 原 owner/创建进程退出；同进程仅允许明确 abandoned 且无 live Context。
+- 当前 owner/SIM/slot/boot/物理拓扑稳定，无 MM bearer/通话或旧网络资源。
+- 不存在 named namespace，所有进程都在主网络 namespace，排除无名称但仍被持有的 namespace。
+- 主 namespace 无 XFRM state/policy；其他租户/容器或无法检查则拒绝。
+- 非目标完整库存、EPS、reporting 与源快照一致；目标由账本指定，不固定 CID3。
+- present 目标必须有明确 `+CGACT: <cid>,0`；缺行不等于 inactive，分发前再次检查。
+
+程序不会自动停服务、清 namespace、重启 MM/基带或停其他线路来满足条件。
+
+### 命令与一次性日志
+
+```text
+simadmin mm-ims-profile-lease --action inspect-stale \
+  --modem <当前对象> --device <原物理控制口> --family <原请求族> --apn <原APN>
+simadmin mm-ims-profile-lease --action reconcile-stale \
+  --modem <同对象> --device <同控制口> --family <同族> --apn <同APN> --expected-plan <plan>
+```
+
+`inspect-stale` 不改 modem；首次 present 恢复 plan 缺失/错误，在写事务及发命令前拒绝。
+每设备唯一 `.recovery` 绑定源账本原始字节摘要，原 `.json` 不改写。
+
+`Prepared → ReportingDispatched → ReportingConfirmed → DeleteDispatched → AbsentVerified`
+
+- 每条命令前原子写入并 fsync 文件/目录；reporting 最多一次，Delete 最多一次。
+- reporting 超时只在精确读回 000 后推进；Delete 超时只在双快照 absence 后推进，present 绝不重发。
+- 已批准事务再次调用仅核验结果，不重置写预算；owner/SIM/boot/来源/库存变化使旧 plan 失效。
+- 终态才归档原字节及 `retired/reconciled-*.journal`；崩溃收尾须原档完整且摘要匹配。
+- 从备份恢复旧账本也不得获得新写预算；孤立/损坏 `.recovery` 阻断普通分配、切卡及其他维护。
+- 前端应提示“旧 IMS 资源待核验恢复”，不是运营商拒绝；基带故障优先级保留。
+
+## 13. 验证与设备窗口要求
+
+构建/Rust/注册模拟只在 GitHub Actions 执行，见 [开发指南](DEVELOPER.md)。
+本文合并未运行测试；不要把旧部署日志、测试累计数或历史网络结果当作当前 master 通过。
+
+必须覆盖：
+
+- fake/private D-Bus 严格无 ID Set、非固定返回 ID、完整规范化字段、MM/AT 不一致、EPS/reporting 保持。
+- 所有持久化失败点、Create/Set/Connect 取消和晚到结果、Delete/报告恢复未知、owner/SIM 更换。
+- 未知库存不耗尽恢复、generation/ticket 过期不能发布、slot=0/非法槽、排队 reporting 重验。
+- switch drain、flock 跨异步操作、registry 预留、无 ticket 拒绝及失败/取消释放。
+- P-CSCF 完整地址、单族授予、歧义/重叠/其他 CID 拒绝，终止错误不能被清理包装吞掉。
+- cross-owner ABA、active/缺 CGACT、plan 漂移、防重放、孤立事务、终态归档、原字节不变与备份重放。
+- 两套实际 CI 过滤器均执行上述状态机及通用 REGISTER 协议矩阵，核验日志而非只看绿色状态。
+
+设备验收另行授权，先保留管理链路、确认无通话、备份配置/数据库/原账本并制定有界恢复方案。
+一次只改变一个变量，不同时改 APN、Initial EPS、backend、普通数据或 SIM。
+核对制品 commit/哈希、正式服务注册、requested 与 actual family、P-CSCF 来源和新内核故障。
+结束核对原库存/EPS/非目标配置、服务与保护定时器；活跃新租约是正常资源，不按旧记录清除。
+探针成功、离线模拟、一次注册、自然续期、通话/音频、换卡及跨 owner 故障注入是独立验收层次。
+长通话、普通数据共存、VoWiFi 全生命周期、native 换卡和所有硬件/SIM 不属于本手册的普遍保证。
+QCM410 新 fatal 必须停止重复激活，不能盲删账本或操作 remoteproc，见
+[QCM410 故障说明](QCM410_BAM_DMUX_MODEM_CRASH.md)。

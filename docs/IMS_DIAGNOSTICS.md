@@ -87,7 +87,7 @@ SIM 作用域、backend、runtime 的 `phase/stage/last_error`、尝试记录及
 - **R**：上级目录源码 ZIP，SHA-256 为
   `7bee591d9f292ba5129114eb4c221aa77b7fac66d04bd553434155fb82d98750`。
   本地位于 `.local/reference-volte-20260926/simadmin-volte-main/`，关键文件已逐字节与 ZIP 比对。
-- **B**：归档 [beta8 对照](archive/2026-09/IMS_DERIVATION_BETA8_COMPARISON_2026-09-17.md)
+- **B**：归档 [历史对照与原文定位](archive/README.md)
   的样本 `1.1.7-beta8 / 930365d`，二进制 SHA-256
   `210c35b11f54dd240a83e90dd08d5e8a8f4f2cea227ce3a0503a9ced4140f9b7`。
   本轮 IDA `get_metadata` 返回连接拒绝（10061），**没有新的 IDA 验证**；B 的结论只引已有 B01–B09/§8.1。

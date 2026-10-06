@@ -1,243 +1,135 @@
-﻿# SimAdmin 未完成开发计划
-
-> 状态：2026-09-12 补充 1.1.5 / 1.1.6 版本路线；其余任务沿用 2026-08-30 整理基线并分别复核。本文是后续开发与验收计划总入口，只记录尚未完成、尚未通过外部验收或仍需收口的事项；版本分项维护详细执行门槛，不另建互相冲突的总清单。
->
-> 2026-08-30 合并了原先分散的四份清单（`IMS_REGISTER_FOLLOWUP_PLAN.md`、`BACKEND_REVIEW_TODO.md`、`IMS_ACCESS_REFACTOR_DEVICE_TESTS.md`、`HARDWARE_EXPANSION_TODO.md`）。已完成项和历史验收记录不再保留在文档里——那些在 git 历史中。架构设计说明移到 `ARCHITECTURE.md`。
->
-> 本文不把代码中已有的基础能力直接视为产品完成。每项能力只有在对应的自动化测试、真实硬件、运营商网络或发布流程验收通过后，才能从本计划移除。
->
-> **2026-09-26 整理**：当前状态统一见 [HANDOFF](HANDOFF.md) 和 [native 状态](NATIVE_BACKEND_STATUS.md)。
-> 下文保留按各历史日期整理的长期矩阵；部分旧代码待办已有后继实现，先核对源码和证据，不机械重做。
-> 唯一开发工作区为 `SimAdmin/master`，不再使用旧的 `SimAdmin-1.1.5`。
-
-## 已确认版本路线：1.1.5 / 1.1.6
-
-用户于 2026-09-12 确认以下方向。详细任务、设备范围、迁移与发布门槛统一维护在
-[设备后端版本规划](MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md)，本节仅维护总入口。
-
-| 版本 | 核心目标 | 状态 |
-| --- | --- | --- |
-| 1.1.4 修复线 | 现有 IMS/生命周期修复及必要多卡回归收口，保留对照和回滚基线 | 与后端大重构分开推进 |
-| 1.1.5 | 统一设备接口；兼容 MM 与原生 QMI/MBIM/AT，MM 从必要条件变成可选后端 | native 短信/受控恢复等已在 `302b70e` 通过 CI，默认 MM；native 真机、混合 owner、未知资源自动恢复等仍未完成 |
-| 1.1.6 | 删除 MM 后端、运行调用、必装依赖及专属恢复流程，由原生接管全部声明支持的设备能力 | 规划已确认，待实施；不保留隐藏回退 |
-
-- 保留 UE worker/netns、稳定物理线路和 SIM 覆写语义；同一物理 modem 同时只允许一个 backend owner。
-- QMI/MBIM/AT 均需要真实适配证据；明确设备/固件/能力支持清单，未适配硬件不伪装为已支持。
-- 原生覆盖或关键回归不足会阻止 1.1.6 发布，不能用隐式 MM fallback 或静默缩减范围替代验收。
-- 版本目标、代码候选、发布版本号与硬件验收分开记录；不因版本号修正或 CI 通过而勾选 native 实机。
-- 早期按独立 worktree 开发，现已统一到 `SimAdmin/master`。只有一名开发 agent 修改，其余只读；
-  私有交接和设备证据集中在 `.local/`，迁移机器时安全提供，不依赖 Git 分发。
-
-## 当前结论
-
-下列为 2026-08-30 的业务基线，不自动代表后续主 QMI 修复或 1.1.5/1.1.6 后端迁移已通过相同验收。
-
-SimAdmin 的单线路 VoLTE → SIP Trunk → Asterisk 普通语音路径已经完成实机验证，不属于本计划的待办范围。当前已确认：
-
-- 目标机 VoLTE IMS bearer、P-CSCF、IPsec/XFRM 和 IMS REGISTER 正常。
-- Asterisk trunk REGISTER、真实普通号码外呼、运营商 200 OK、双向 RTP、SIP INFO DTMF 和 BYE 清理通过。
-- 目标机到 WSL Asterisk 使用 mirrored 网络直连；Asterisk 使用 UDP 8060，未依赖临时 UDP relay。
-- 最终 aarch64-musl 版本已用 Zig 构建并部署到目标机；既有 Linphone 账号未被修改。
-- VoLTE 定向测试 182 项通过，trunk 定向测试 74 项通过；前端 ESLint、TypeScript 类型检查和 Vite 构建通过。
-
-当前不能称为整体完成，因为多线路真实硬件矩阵、VoWiFi 业务、视频、Ut/XCAP、MWI、E911、CS 音频适配器和正式发布流程仍不完整。
-
-## P0：回归门槛（本轮已恢复）
-
-- [x] 修复或隔离 `connectivity::modems::ims::vowifi::channel::tests::udp_channel_recv_chunk_reassembles_oversized_datagram` 长时间不结束的问题；当前单独运行与全量回归均结束。
-- [x] 完整后端回归通过。数量随开发变化，不在文档里固化——以 `cargo test --bin simadmin -- --test-threads=1` 的当次输出为准（2026-08-30 为 1400 passed / 3 ignored，其中 ignored 需要外部 Asterisk/Linphone 或超 MTU 的 WSL2 loopback）。
-- [x] 清理默认 Linux binary 的 dead-code / unused warning；未接线的 E911 provider 仍以明确待办保留，不用 warning 掩盖状态。
-- [x] 增加前端 `pnpm lint`、`pnpm type-check`、`pnpm build` 的 CI 检查，并固定非交互依赖安装方式（`.github/workflows/frontend-checks.yml`）。
-
-前端显示层已完成一轮与线路隔离契约的收口：Dashboard 分别显示设备、IMS 和 Trunk 状态；线路选择器标明读卡器、离线和槽位冲突；VoWiFi `scaffold_only` 状态明确显示为“未接线”。这些显示调整不代表对应能力已经通过真实硬件或运营商验收。
-
-## P1：VoWiFi 业务闭环
-
-### 语音
-
-- [ ] 使用真实运营商完成 VoWiFi 外呼接通、被叫接听、拒接、未接记录和挂断验收（代码路径与本地模拟已覆盖，仍缺运营商实测）。
-- [x] 代码层覆盖 VoWiFi/VoLTE early media、180 provisional、带 offer 的 answer、CANCEL、超时、媒体方向和 re-INVITE 路由；[ ] 真实运营商矩阵仍待执行。
-- [x] 本地协议测试覆盖双向 RTP、SIP INFO DTMF、telephone-event、媒体方向、hold/resume 和资源清理；[ ] 真实 VoWiFi 运营商验收仍待执行。
-- [ ] 将普通号码测试结果按线路、access、codec、SIP 状态、RTP 计数和脱敏 trace 独立记录（需要授权的真实测试号码）。
-
-2026-08-19 已完成一轮 QCM410/50212 飞行模式实测：VoWiFi IMS、trunk、7201 绑定、`100/183` 和失败资源清理通过；运营商以 `480 Release Call received from CAP` 在接通前释放，故 RTP、DTMF、hold 和视频仍未验收。代码已补齐 trunk/API 呼叫的统一 `Started` 生命周期事件和历史记录竞态测试。
-
-### 视频
-
-- [ ] 完成 VoWiFi H.264 SDP、视频 RTP relay、音频/视频 re-INVITE 的真实运营商互操作。
-- [ ] 完成 Asterisk/Linphone 与 VoWiFi 的视频矩阵，包括音频→视频、视频→音频、拒绝升级、保持/恢复和双线路并发。
-- [ ] 明确 RTCP、RTCP-mux、视频 payload type 和 codec policy 的支持范围；不支持的能力必须显示为 unsupported。
-
-## P1：多线路和 SIM 身份隔离
-
-至少需要两条真实线路，最好两张相同 PLMN 和两张不同 PLMN 的 SIM，逐项验收：
-
-**这一整节被同一个前提阻塞：410 上目前只插了一张卡，`line_profiles` 只有一条线路。** 代码侧的按线路隔离已经落地（键的设计见 `ARCHITECTURE.md`，`line_id` 只由物理槽锚点 + UIM slot 生成，SIM 覆写另用 `SimBindingKey`），并有双线路单元测试，但没有第二条真实线路就无法验收。
-
-- [ ] 两条线路同时建立 VoLTE bearer 和 IMS REGISTER，各自使用自己的 QMI、netdev、P-CSCF、路由表和 runtime。
-- [ ] 两条线路同时建立 VoWiFi TUN/ePDG/IKE/ESP/REGISTER，TUN、代理、DNS、route 和 operator session 不互相覆盖。
-- [ ] 相同 PLMN 的两张 SIM 使用不同 effective profile、IMEI、E911、UT、MWI 和 trunk 配置时不串值。
-- [ ] SIM 从 modem A 移到 modem B、eSIM profile 切换、拔卡再插回、modem 编号变化后：物理线路配置留在槽位，SIM 覆写跟随 ICCID / EID + profile ICCID。独立读卡器换卡同样按 SIM 键重选覆写，不得用 reader `line_id` 误绑旧 SIM。
-- [ ] 一条线路停止、断网、认证失败或 bearer 重建时，另一条线路的 REGISTER、通话、RTP relay 和历史记录不受影响。
-- [ ] 两条线路同时使用 Asterisk trunk，验证 AOR、auth username、local port、Call-ID、RTP socket 和 incoming/outgoing binding 不冲突。
-
-per-UE netns/veth/worker 已是强制架构，不再使用 feature flag 或分阶段开关，见 `ue-network-namespaces.md`。
-
-## P1：IMS 补充业务和运营商回读
-
-代码基础已经存在，但必须取得真实运营商响应，不能只用本地 XML 或 mock 标记完成：
-
-- [ ] Ut/XCAP 对 communication-waiting、communication-diversion、OIP/CLIP、OIR/CLIR 完成 GET → If-Match 条件 PUT → GET 权威回读。
-- [ ] 验证 VoLTE 与 VoWiFi 使用当前 access 的源地址、Service-Route 和 AKA provider，不跨线路或跨 access 复用会话材料。
-- [ ] 完成 MWI SUBSCRIBE/NOTIFY、401/407 challenge、刷新、注销、超时和 subscription 清理的运营商验收。
-- [ ] 完成运营商语音信箱号码发现、按线路拨号和 MWI 状态持久化；区分运营商语音信箱与 Asterisk 本地 voicemail。
-- [ ] 完成 Caller ID、Privacy、CLIP/CLIR/OIP/OIR 在 API、日志、Asterisk、Linphone 和 call history 中的一致性审计。
-
-## P1：E911 / TS.43
-
-E911 只能通过运营商非紧急 provisioning/validation 流程验收，不得拨打真实紧急号码：
-
-- [ ] 使用真实支持的 SIM 完成 TS.43 entitlement query、EAP-AKA challenge、状态解析和 token/config version 持久化。
-- [ ] 完成可信 catalog endpoint、provider evidence、HTTPS/host allow-list、DNS/IP/redirect/response-size 限制的实网验证。
-- [ ] 完成标准 websheet 或已验证 native provider 的地址登记流程，验证运营商回读状态。
-- [ ] 按 `SimBindingKey` 隔离 E911 状态、token、cookie 和地址意图；热插拔/eSIM 切换不得串状态。
-- [ ] UI 和 API 明确区分“运营商要求地址”“地址已保存在本机”“运营商已确认”和“紧急呼叫未验证”。
-- [ ] emergency registration、`urn:service:sos` 路由、PIDF-LO、callback 和 CS fallback 另行设计并取得合规测试授权后再做。
-
-## P2：设备抽象与 CS
-
-设备后端统一、MM 解耦与原生接管按上方版本路线推进；本节保留已有能力与设备/业务待验收项，不重复维护版本实施清单。
-
-- [x] 让 `DeviceKind` 真正参与 DATA6 / native bearer 的准入判断。
-  - `detect_device_kind()`（`hardware/devices/mod.rs`）按 remoteproc 的 `name` 识别 `4080000.remoteproc`，刻意不把邻居 `a204000.remoteproc`（WCNSS Wi-Fi/BT）当基带；认不出即返回 `Unknown`。
-  - 只有 QCM410 driver 会枚举和绑定 DATA6；`Unknown` 的 native IMS 和数据 transport 均明确不可用，不会回退宿主网络命名空间。旧的 `SIMADMIN_ENABLE_SECONDARY_QMI` 运行时开关已删除。
-- [x] 将 QCM410 `ImsBearerTransport` 与 `CellularDataTransport` 通过 driver/capability 注入 runtime；通用 IMS、线路、OTA 和安装层不依赖 QCM410 类型。
-- [x] 已删除未实现的 `DataTransport`、`VoiceTransport`、`SmsTransport`、`RegistrationTransport` stub；保留实际 `ImsBearerTransport` capability seam。
-- [ ] 为 EC20/EC25/EG25/EG600 与 USB SIM reader 完成真实设备验收；本轮只完成静态线路隔离审阅。逐型号矩阵：
-  - [ ] EC20：discovery、AT、SIM 身份、短信、通话、QMI 数据和代理流量。
-  - [ ] EC25：同上，加热插拔。
-  - [ ] EG25 家族：接口组成、QMI 数据、radio mode 控制。
-  - [ ] EG600：真实 USB/PCIe 组成、驻网、数据和支持的 radio 控制。
-  - [ ] USB 读卡器：无卡、实体 SIM、PIN 锁卡、USIM AKA、读卡器热插拔。
-  - [ ] USB eUICC 读卡器：经 PC/SC lpac 完成 profile 列出/下载/启用/停用。
-  - [ ] 用物理 eUICC 读卡器验证 lpac reader name/index 选择。
-- [ ] QCM410 按 2026-09-12 修复分支的接入契约逐项确认：主 QMI 用于 IMS，DATA6 仅用于普通数据；MM 后端下保持备用端口隔离，原生迁移后继续保证两种承载归属清晰。定时流量任务在持久化数据开关关闭时成功并恢复为关闭；定时通话能启动、自动挂机并容忍对端提前挂断。不得重新套用旧 DATA6 IMS / 主 QMI 普通数据布局。
-- [ ] 仅当 PC/SC 服务/包是 SimAdmin 自己安装的才卸载（需要 installer 状态追踪）。
-- [ ] 只有找到真实双向音频数据面后，才实现 CS trunk；仅有 ModemManager 呼叫控制不能标记为 CS trunk ready。
-- [ ] 验证 QCM410 数据与 IMS bearer 并发时的 slot allocator、baseband wedge guard、恢复和 modem 重启行为。
-
-## P2：媒体和 codec 能力
-
-- [ ] 明确 codec 支持矩阵；`trunk.codec_allow` 必须真正参与 SDP offer/answer，而不是只保存配置。
-- [ ] EVS 当前只有 SDP/model 基础；若要宣称 EVS 可用，必须提供编解码、转码、jitter buffer 或明确交由 Asterisk/外部媒体后端处理并完成实测。
-- [ ] 补齐 RTP/RTCP 配对、RTCP-mux、丢包、乱序、端口重启和长通话媒体指标验收。
-- [ ] 完成 hold/resume、双通话、媒体方向、失败 re-INVITE 保留原 relay 和资源回收的 VoLTE/VoWiFi 矩阵。
-
-## P1：eSIM MEP 预留接口
-
-代码里目前**完全没有 MEP 相关实现**（全仓库搜不到 `MEP`/`mep_` 符号），所以这是一个尚未开工的模块，逐项任务清单在 `docs/ESIM_MEP_INTERFACE_PLAN.md`，此处不重复。
-
-- [ ] 按 `docs/ESIM_MEP_INTERFACE_PLAN.md` 完成预留接口（capability、Port、Profile-to-Port、SIM 来源、可插拔 APDU/modem backend）。
-- [ ] 优先支持“一个 Port 走蜂窝 VoLTE、另一个 Port 只走 WiFi VoWiFi”的线路模型；读卡器不要求蜂窝联网。
-- [ ] 没有真实 MEP eUICC/读卡器之前，只做 Mock 与线路隔离测试，不标记真实 MEP 完成；型号本身不构成能力证明。
-## P1：IMS REGISTER 收口
-
-代码层与本地回归已完成：REGISTER 事务过滤（Call-ID + CSeq + method）、channel requeue、候选阶梯、三态 `omit` 全链路端到端断言、自定义 DNS 端口、每线路动态接入上下文。2026-08-30 已在 410 上闭环 ePDG/IKE/Child SA/ESP 和 **IMS REGISTER 200 OK**。
-
-剩下的都是实机业务矩阵和少量代码缺口。
-
-### 代码缺口
-
-- [ ] VoLTE 与 VoWiFi 对相同 profile 字段的解释完全统一（当前只做了相关路径的局部修复）。
-- [ ] 用真实运行时上下文生成 VoLTE `Cellular-Network-Info`（PANI 已用真实上下文；CNI 只有测试夹具驱动的断言）。
-- [ ] home / visited network 区分的单元测试（现有测试覆盖 FDD/TDD 和 LTE/NR，不含漫游差异）。
-- [ ] 从 QMI 读取注册 PLMN 与注册状态作为 ModemManager 不可用时的兜底。解析器（`parse_qmicli_serving_system_output`）已完成并用真实设备输出做过夹具，但接线点被撤销——它原本挂在 10 秒刷新路径上，会和 `get_cells_data_for_modem` 并发抢同一个 QMI 控制口。需要一个能串行化 QMI 的调用点。
-- [ ] 明确 QCM410 固件能稳定提供哪些字段及其刷新事件（需实机采样）。
-- [ ] 是否用 ModemManager 信号替代 10 秒轮询（纯优化，当前 10s 采集 / 30s TTL 已有界）。
-- [ ] 前端 `current.ts` 调用 `/vowifi/carrier-profiles/import`，但 `main.rs` 未注册该路由，`aosp_apns`/`aosp_carrier_config`/`ipcc` 三种导入格式后端没有实现——类型定义领先于实现。
-- [ ] 全局 `cargo fmt --all -- --check`（当前工作树有大量既有跨平台/换行差异，只做过定向格式化）。
-
-### 可观察性
-
-- [x] REGISTER 日志记录实际 PANI/CNI 来源。`volte/live.rs` 在 REGISTER 生命周期开始处输出 `pani_identity_source` 和 `cni_identity_source`，取值来自 `AccessIdentitySource`：`dynamic` / `static_profile` / `compatibility_fallback` / `omitted` / `required_dynamic_missing`。
-- [ ] refresh 降级成功时记录被移除的头（不记录敏感字段）。
-- [ ] 每条线路统计 refresh 成功率和 access rebuild 次数。失败侧已有 `live_ims_refresh_failure_count_for_line()`（按 line_id 计数，API 已读取）；缺的是成功计数、成功率和 rebuild 次数。
-
-事务键脱敏摘要、跳过帧诊断和失败原因分类已经存在（`RegisterTransactionKey::summary()` 输出 Call-ID hash，五种失败原因串，`authorization_and_nonce_never_reach_the_transaction_log` 固定安全不变量）。
-
-### 实机验收矩阵
-
-REGISTER 路径：
-
-- [ ] 401/407 AKA challenge 后成功（当前 200 OK 是 registrar 直接接受，`auth_rounds=0`，没走 AKA 挑战——和历史记录的 `401 → AKA → 200 OK` 路径不同，需要确认是运营商行为变化还是实现问题）。
-- [ ] 423 Min-Expires 协商后成功。
-- [ ] 421/494 sec-agree 升级后成功。
-- [ ] refresh 等待期间收到 MWI NOTIFY / SMS MESSAGE / INVITE，不掉注册且该帧最终被处理。
-- [ ] refresh 首候选失败、降级候选成功时不重建 bearer/ePDG；全部失败才重建并有明确诊断。
-
-Profile 兼容性（至少两个不同运营商，避免为单一 Maxis 行为过拟合）：
-
-- [ ] 完整 MMTEL feature tags + 动态 PANI/CNI；SMS-only Contact；显式 omit PANI / omit CNI；sec-agree auto / required / disabled；有 Route 与无 Route；roaming visited network identity。
-
-业务能力：
-
-- [ ] VoLTE 主叫、被叫（不进语音信箱）、双向 RTP 与静音恢复、SMS over IMS、MWI SUBSCRIBE/NOTIFY。
-- [ ] VoWiFi 主叫、被叫、切换和 refresh；长时间 refresh / 重注册。
-- [ ] ViLTE capability 与视频媒体协商（若当前版本宣称支持）。
-- [ ] 实机抓包确认 REGISTER 里的 PANI 内容与网络侧观测一致（设备上没有 `tcpdump`，需先安装）。
-
-VoLTE profile 三槽位编排：
-
-- [ ] 用户数据库 profile / 下载 catalog profile / 派生兜底各自完成注册与完整业务矩阵。
-- [ ] 切换候选时抓包确认 Call-ID、CSeq、Route、安全关联、P-CSCF 和 profile lease 不跨 profile 污染。
-- [ ] 两条不同基带线路配置不同顺序并同时运行，以及独立读卡器线路保存/恢复自己的顺序，确认互不影响。
-- [ ] 真实 bearer/QMI endpoint、AT CID、xfrm/IPsec、P-CSCF reporting 和 IMS profile lease 释放的集成测试。
-
-### VoNR / 5G SA
-
-当前只有 LTE/NR 通用数据模型基础，**不代表支持 VoNR**。
-
-- [ ] NR SA IMS PDU session/bearer 建立；5GS QoS flow、QFI 和语音媒体承载映射。
-- [ ] 从 modem/provider 获取 NR serving cell、NCI、TAC、注册域与 IMS capability。
-- [ ] 生成符合 NR 接入的 PANI/CNI，禁止仍标记为 E-UTRAN。
-- [ ] EPS fallback、RAT handover 和 registration continuity。
-- [ ] VoNR capability 探测——不能仅凭设备支持 5G 就报告 VoNR ready。
-- [ ] NR SA 注册、主叫、被叫、双向 RTP、DTMF、BYE、短信及回落场景测试，并在支持 NR IMS 的真实硬件和运营商网络上验收。
-
-## P2：配置、故障和安全验收
-
-- [ ] 做真实掉电、磁盘满、只读文件系统、SQLite 损坏、WAL 恢复和服务强制终止测试。
-- [ ] 验证配置库、运行数据、carrier catalog、E911 secret state 和备份文件的权限、符号链接拒绝和恢复边界。
-- [ ] 验证日志和诊断包不泄露完整号码、ICCID、IMSI、IMEI、EID、AKA/Digest 材料、token 或 E911 地址。
-- [ ] 验证每条线路的 API、数据库写入、通知、自动化、短信、通话记录和流量统计都拒绝空 `line_id` 或错误归属。
-
-## P2：发布工程
-
-- [ ] 定义正式版本、制品命名、catalog 分发、签名/校验、架构兼容、原子替换和回滚契约。
-- [ ] 在契约稳定前继续保持手动安装；`install_latest.sh`、`uninstall.sh`、旧 OTA 和在线升级入口不能标为可用。
-- [ ] 为 aarch64-musl Zig 构建、前端静态资源、carrier catalog、systemd unit、secondary-QMI 资源和 lpac 建立可重复发布流程。
-- [ ] 增加发布前备份/恢复演练，明确 `config.sqlite3`、`data.db`、WAL/SHM、catalog 和 E911 secret state 的独立升级策略。
-
-## 验收规则
-
-1. 普通号码实机测试只使用已授权的测试号码，记录必须脱敏。
-2. REGISTER 成功不等于语音、视频、Ut、MWI 或 E911 完成；每种 capability 单独报告。
-3. ignored、超时或仅 mock 的测试不能标记外部验收通过。
-4. 多线路项目至少需要两条真实线路；单线路结果只能证明单线路路径。
-5. E911 只能使用运营商提供的非紧急验证流程，不拨打真实紧急号码。
-
-## 相关现行说明
-
-- 1.1.5 双后端过渡与 1.1.6 完全原生接管的版本分项：`docs/MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md`
-- 架构总览（线路模型、路由隔离、profile 选择）：`docs/ARCHITECTURE.md`
-- REGISTER 三态字段契约：`docs/IMS_REGISTER_TRISTATE_SCHEMA.md`
-- 410 基带崩溃分析与现场恢复：`docs/QCM410_BAM_DMUX_MODEM_CRASH.md`
-- 强制 per-UE 网络命名空间架构：`docs/ue-network-namespaces.md`
-- eSIM MEP 预留接口设计：`docs/ESIM_MEP_INTERFACE_PLAN.md`
-- 用户入口和能力概览：项目根目录 `README.md`
-- 手动安装与升级：`docs/INSTALL.md`
-- 运行环境与 systemd：`docs/ENVIRONMENT.md`
-- 开发、构建和测试：`docs/DEVELOPER.md`
-- API 调试集合：`bruno-api/README.md`
-- carrier catalog 来源和限制：`docs/CARRIER_PROFILES.md`
-- 用户可见版本记录：`docs/CHANGELOG.md`
+# 开发计划：优先级与剩余验收
+
+> 本文只维护跨项目优先级、未闭环工作和发布条件，不保存逐日进度或已完成清单。
+> 当前交接见 [HANDOFF](HANDOFF.md)，能力边界见 [README](../README.md)；历史证据见
+> [档案索引](archive/README.md)。代码实现、CI、实机/运营商验收与发布必须分别报告。
+
+## 当前基线与工作规则
+
+- 当前代码基线为 `0502395`：已按用户要求撤销 `7bd` 的 CMCC 专用补丁及相关专用测试。
+  不能继续把被撤销候选写成现行修复，也不能将旧部署成功视为当前源码或同卡验收。
+- **当前最高优先级是以九月代码行为为对照，修复全局注册兜底回归。**
+  用户禁止按特定 MCC/MNC、运营商或某张卡增加专用补丁/测试；回归按通用协议场景与状态机组织。
+- 唯一开发工作区为 `SimAdmin/master`，不恢复旧独立 worktree/临时分支开发路线。
+  当前源码不等于当前设备二进制，现场版本、SIM 和会话须从交接证据独立确认。
+- 默认 MM、native 显式实验 opt-in；本计划不授权切 native、停止 MM、改网络/资费或操作 SIM。
+  不自动发短信/拨号；用户取消的测试窗口自动回滚机制不得擅自恢复。
+- 验证、构建、CI 与部署均按当前明确授权及 [开发者指南](DEVELOPER.md) 执行；
+  旧文档中的测试命令、设备窗口或凭据用途不能自动延续为新授权。
+
+## P0：全局注册兜底回归
+
+目标是找回有证据的通用兼容行为，不以单卡成功掩盖其他接入的回退或安全退化。
+
+1. 对照九月基线与当前生产调用链，分层核对 profile 来源、地址族、承载、P-CSCF、
+   REGISTER 候选、安全声明与响应分类；区别确定代码差异、用户历史报告和未证实网络假设。
+2. 保持全局 **双栈 → IPv6 → IPv4** 默认策略；不恢复线路单族生产覆盖、不固定 CID/APN/
+   P-CSCF/SIM 身份，不把 requested family 当 actual grant，也不增加无限承载/SIP 重试。
+3. 按协议条件覆盖正常成功、401/407 AKA、423 租期、420/421/494 安全协商、普通 403、
+   超时、候选降级及预算耗尽；不用真实或合成 MCC 白名单定义预期结果。
+4. 核对安全机制必须来自实际报价，认证/授权失败不得被宽泛分类为可降级成功；
+   不为兼容性猜测新增弱算法、无保护成功或跨 profile 复用身份/安全关联。
+5. 首候选失败、可用降级候选成功时保持允许复用的原通道；需要重建时有明确层级原因，
+   不以 reconnect/新注册冒充 refresh。事务键、异步帧回送与原有费用保护不能回退。
+6. 资源保护与兼容修复分开审查：保留 owner/SIM/代次核验、未知结果阻断、精确 profile
+   归属和清理证明；禁止删账本、清预算或重启基带来伪造修复效果。
+7. 先形成可审计的通用差异与回归证据，再申请独立设备窗口；现阶段不承诺同卡实网已修复。
+
+现行注册/资费契约见 [IMS 注册策略](IMS_REGISTRATION_POLICY.md)，MM profile 生命周期见
+[租约设计](IMS_MM_EXACT_FAMILY_LEASE_DESIGN.md)，分层失败证据见 [IMS 诊断](IMS_DIAGNOSTICS.md)。
+
+## P1：IMS 接入与可观察性收口
+
+九月及后继已有 REGISTER、AKA/IPsec、自然续期和单线路语音证据，但不能继承给新版本、
+另一张 SIM、不同 access 或 native。只补当前缺口，不机械重做旧文档中的已实现步骤。
+
+- 核对 VoLTE/VoWiFi 对 profile 字段、`omit`、动态 PANI/CNI、home/visited identity 的一致解释；
+  CNI/驻网兜底须来自有效运行时上下文，QMI 状态读取不得与其他控制口操作并发争抢。
+- 核对 carrier import 的前后端路由、格式与能力显示，不让类型定义领先于可执行接口；
+  catalog 缺项的派生行为、用户覆盖及失败诊断按统一契约处理。
+- 补 refresh 成功率、access rebuild 计数和降级删除头的脱敏诊断；不要记录头值、认证材料或完整标识。
+- 验证 refresh 等待时 MWI NOTIFY、SMS MESSAGE、INVITE 不丢失；候选切换的 Call-ID/CSeq、
+  Route、P-CSCF、IPsec 与 profile lease 不串用。
+- 对每个声明支持组合取得至少两次自然续期，保留首次 registered_at、原流与安全关联，
+  reconnect 不增长；另验长通话/续期并发、掉线、取消和恢复，不缩短租期凑数。
+- IMS REGISTER 成功只证明注册；呼入是否到达、语音、短信、视频和补充业务分别验收。
+
+## P1：多线路、SIM 隔离与运行可靠性
+
+- 至少两条真实线路验证并发 VoLTE/VoWiFi、各自 QMI/netdev/P-CSCF、TUN/ePDG、路由、
+  runtime 与 Trunk；同 PLMN 不同 SIM 和不同 PLMN 都应覆盖，缺第二线路就标阻塞。
+- 换 modem、换卡、拔插、eSIM profile 切换和端口重编号后，物理配置留槽位，SIM 覆写跟随
+  `SimBindingKey`；读卡器不能误绑上一张卡。`line_id` 与 SIM 身份职责不变。
+- 一条线路停止/失败/恢复不得影响另一条的 REGISTER、AKA、RTP、消息、通知或历史记录；
+  所有 API、配置写入、自动化和统计拒绝空 `line_id`/错误归属。
+- 验证掉电、强杀、磁盘满、只读文件系统、SQLite/WAL 恢复、备份还原与升级中断。
+  备份范围覆盖主配置、`data.db`、catalog、E911 secret state 和持久资源账本。
+- 审计权限、符号链接拒绝、日志/诊断包脱敏；完整号码、SIM/设备身份、AKA/Digest、token、
+  E911 地址不进入公开材料。每种故障保留原始失败证据，不把超时或 ignored 算通过。
+
+## P1：业务验收与媒体缺口
+
+| 领域 | 剩余闭环 |
+| --- | --- |
+| VoWiFi 语音 | 真实外呼/呼入、拒接/未接、双向 RTP、DTMF、hold/resume、early media、re-INVITE 与失败清理 |
+| VoLTE/Trunk | 复核新基线呼入、长通话、双线路并发、定时拨号与精确挂机；已有单线路普通语音不重复列为未实现 |
+| 视频 | H.264 SDP/RTP、音视频升级/降级、拒绝升级、双线路、RTCP/RTCP-mux 与 codec policy 互操作 |
+| 媒体能力 | `trunk.codec_allow` 实际约束 offer/answer；丢包/乱序、端口重启、relay 保留/回收及长时指标 |
+| EVS | 目前 SDP/model 基础不等于可用；须有实际编解码/转码或明确外部媒体后端及实测 |
+| Ut/XCAP | GET → If-Match 条件 PUT → GET 权威回读；按 access 使用正确源地址、Service-Route 和 AKA |
+| MWI/隐私 | SUBSCRIBE/NOTIFY 挑战、刷新/注销/超时、语音信箱发现及持久化；Caller ID/Privacy 全链路一致 |
+| E911/TS.43 | entitlement/EAP-AKA、可信 HTTPS endpoint 与跳转边界、地址登记及运营商回读；按 SIM 隔离秘密状态 |
+
+E911 仅走运营商非紧急 provisioning/validation；紧急注册、SOS 路由、PIDF-LO、callback 和
+CS fallback 需独立设计与合规授权，**不得拨打真实紧急号码**。软件不保证运营商计费结果。
+
+## P2：native 与设备扩展
+
+native 已实现架构、协议、AT 事件、短信、资源账本及显式维护，详细契约与未验收范围统一见
+[原生后端手册](NATIVE_BACKEND_STATUS.md)，这里不再维护重复的阶段/提交清单。
+
+- 冻结型号/固件/内核/端口组合与能力清单，补真实 QMI、MBIM、AT 接管、SIM/AKA、
+  IPv6/双栈、IMS/自然续期、短信/电话/USSD、掉线和 24 小时长稳；CI 不替代实机。
+- 补不同 modem 的 MM/native 混合 owner、交接、旧配置迁移与故障隔离；当前仍全局二选一。
+  未知孤儿资源须先设计型号专属核对证据，不提供强制清账/旧 CID 重放。
+- QCM410 保持主 QMI IMS / DATA6 普通数据；验证数据共存、slot allocator、wedge guard、
+  重枚举和恢复，不用旧反向布局。已知基带 fatal 不能因某次成功就宣布根治。
+- EC20/EC25/EG25/EG600 等按实际接口验发现、AT/SIM、数据与控制；Quectel 设置和 DJI
+  DTR/驱动维护另需窗口。AT-only PPP/ECM/NCM、厂商 RAT/band/reset 不扩称为现成能力。
+- PC/SC 验无卡/PIN/AKA/热插拔、lpac reader 选择及 eUICC profile 操作；卸载只移除项目
+  自己安装的服务/包。CS Trunk 需真实双向音频数据面，呼叫控制不算 ready。
+- 审计冷启动、射频与 MM/NM/外部 profile 副作用；应用后的飞行门不证明上电零射频。
+
+## 后续能力：MEP 与 VoNR，不列为已承诺支持
+
+- MEP 尚未交付。先设计独立 capability、Port、Profile-to-Port、SIM 来源和可插拔 APDU/
+  modem backend，区分 supported/unsupported/unknown；MEP Port 不等于 UIM slot 或 `line_id`。
+- 优先建模读卡器 WiFi-only，以及一 Port 蜂窝 VoLTE/另一 Port WiFi-only VoWiFi；
+  保持 eUICC 级 APDU/lpac 互斥与 Port/线路隔离，不靠临时切 profile 伪造 MEP。
+- 先做无能力/未知/成功/失败的模型与 Mock、只读 API/受能力门控 UI；普通 eSIM 不回退。
+  真实 eUICC、固件和读卡器到位后才能证明 Port 级 AKA/并发业务；型号名不构成能力证据。
+- VoNR 需独立 NR SA IMS PDU/QFI、真实 NR identity/PANI、EPS fallback/连续性、媒体与短信验收；
+  LTE/NR 通用模型和 5G 数据能力均不代表 VoNR ready。
+
+## 版本与发布门槛
+
+| 版本目标 | 未闭环条件 |
+| --- | --- |
+| 1.1.4 修复基线 | 保留可对照历史行为；不夹带全面后端替换，也不要求恢复旧工作分支 |
+| 1.1.5 双后端过渡 | MM 行为无回退；native 声明设备在无 MM 环境验收；混合设备、单 owner 交接和配置迁移通过 |
+| 1.1.6 原生独立接管 | 删除 MM provider/调用/必装依赖/专属恢复与选择项，所有声明能力由 native 承担，无隐藏 fallback |
+
+1.1.6 是既定版本方向，不是现有能力或发布日期保证；覆盖不足就延后，不能静默缩减支持范围。
+去 MM 不等于去 system D-Bus、libqmi/libmbim、qmi-proxy 或 PC/SC，也不授权卸载用户的外部 MM。
+
+- 补齐架构兼容、制品签名/校验、catalog 契约、原子替换与包级回滚演练；现有安装器实现
+  不等于冷启动/升级/卸载全矩阵完成，操作入口以 [安装手册](INSTALL.md) 为准。
+- 优先 1.1.4 → 1.1.5 → 1.1.6：先证明身份可迁移、旧资源释放、native 能力满足；
+  无证据阻止跨版直升。回滚是授权维护动作，不是运行时偷偷启用 MM。
+- 同设备对照保持卡、固件、网络、profile 和地址族条件；真实业务只用授权方式并脱敏。
+  N/A 需能力证据，未测试/缺硬件/模拟成功不得改记为实机通过。
+- 发布前核对支持矩阵、双架构产物、安装/依赖审计和全部承诺项；版本字符串或 CI success
+  不自动完成发布门槛。用户可见结果统一写入 [CHANGELOG](CHANGELOG.md)。
+
+相关契约：[架构](ARCHITECTURE.md)、[设备驱动](DEVICE_DRIVERS.md)、[运营商配置](CARRIER_PROFILES.md)、
+[410 基带故障](QCM410_BAM_DMUX_MODEM_CRASH.md)。详细 native 合同不在本计划重复。

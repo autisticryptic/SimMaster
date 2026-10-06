@@ -1,101 +1,96 @@
-# 运营商 Profile 来源与维护边界
+# 运营商配置、派生与数据库变体
 
-> 状态：应用侧读取、匹配和本地覆盖已落地；公开 AOSP/IPCC 事实 importer 不属于当前运行时，手机基带固件的深度逆向提取未排期。
-> 原始调研记录于 2026-07-29，本页按当前实现更新。
+## 1. 三种来源，不混淆标签
 
-## 目的
+- `database`：SimAdmin应用数据库中用户保存的profile，不是下载的carrier SQLite。
+- `carrier_catalog`：独立`carrier_Bundles`项目生成、封存的schema-v7只读catalog。
+- `derived`：缺少可用接入配置时，按可信SIM归属身份生成的标准推断；不是运营商认证配置。
 
-VoLTE/VoWiFi 注册依赖运营商的 APN、ePDG、IKE/ESP proposal、IMS domain/realm、SIP
-头字段和重试策略。仅按 MCC/MNC 推导 3GPP 默认值无法覆盖所有网络，因此 SimAdmin 将
-“可发布的运营商基线”“设备上的用户覆盖”和“明确标记的标准推断兜底”分开管理。
+线路三个来源槽独立保存。requested来源是槽位标签；实际origin/fallback_reason必须另外记录。
+database/catalog缺项或不可投影后可以在该槽内回退derived，不能把requested=database当成专属数据库参数已使用。
+旧通用pin接口的严格行为，与线路candidate接口允许的缺失行回退，须按各自API契约处理。
 
-## 当前数据模型
+归属PLMN不能拿驻网PLMN替代。标准推导只覆盖有依据的IMS域/realm、APN/ePDG等默认值；
+不猜静态P-CSCF、用户身份、开通、XCAP、E911、访问网差异或安全特例。
+注册流程见[IMS协议](IMS_REGISTRATION_POLICY.md)，资源校准见[MM生命周期](IMS_MM_EXACT_FAMILY_LEASE_DESIGN.md)。
 
-1. **只读 carrier catalog**
-   - 由独立的 `carrier_Bundles` 流程收集、规范化、审计并生成 SQLite release。
-   - SimAdmin 运行时只接受已封存、schema 与 config contract 兼容的 v7 catalog。
-   - catalog 同时包含 LTE/EPC 与 WiFi/ePDG access 配置、公共身份匹配和来源引用。
-2. **本地覆盖**
-   - 用户修改保存在 SimAdmin 自身的 `data.db`，不改写发布 catalog。
-   - 解析时本地覆盖优先；删除覆盖后恢复 catalog 基线。
-3. **旧配置迁移**
-   - 旧 `vowifi-profiles.conf` 会在存在 catalog 基线时一次性迁移到本地覆盖表，然后重命名
-     为 `.conf.migrated`。
-4. **标准自动推断**
-   - 只在未显式指定 profile 且本地覆盖、carrier catalog 都没有可用 access 配置时启用。
-   - LTE 与 VoWiFi 分别生成独立 profile，只推导 `ims` APN、3GPP IMS domain/realm 和 ePDG
-     FQDN，并采用保守的通用 IKE/ESP 基线。
-   - 不猜测静态 P-CSCF、visited-network、entitlement、XCAP 或 E911 配置。
-   - API 和页面始终标记来源为 `derived`，并保留数据库缺失、`unknown`、`partial` 或校验失败
-     的原始原因。后续 Bearer、P-CSCF、IKE 或 REGISTER 失败时，页面同时显示推断来源和实际失败阶段。
-   - 用户显式指定的 profile 保持严格模式；配置不存在或不可用时直接报错，不自动切换到推断值。
+## 2. 存储与导入边界
 
-主要实现位置：
+SimAdmin不在运行时解析Apple/AOSP/厂商固件。收集、提取、来源审计、归一化和封存属于独立catalog项目。
+运行时只读取契约兼容、sealed的SQLite，用户覆盖保存在自己的data.db，不改写发布catalog。
+旧配置迁移必须可追踪/幂等，不把未知ready状态改成支持，也不能冒用另一个MVNO条目。
 
-- `backend/src/connectivity/modems/ims/vowifi/carrier_catalog.rs`
-- `backend/src/connectivity/modems/ims/vowifi/carrier_catalog_v7.rs`
-- `backend/src/connectivity/modems/ims/vowifi/profile_store.rs`
-- `backend/src/connectivity/modems/ims/vowifi/profile_record.rs`
+主要入口：`carrier_catalog.rs`、`carrier_catalog_v7.rs`、`profile_store.rs`、`profile_record.rs`。
+LTE/EPC与Wi-Fi/ePDG分别投影；存在NR字段不等于实现了NR/5GC独立注册适配。
 
-运行时不解析 AOSP/IPCC 原始文件。标准自动推断只作为未验证的实验性兜底，不表示该运营商已受支持；
-正式支持仍需在独立 carrier catalog 流程中完成来源审计、字段校验和封存，再由 SimAdmin 加载兼容的
-catalog release。
+覆盖优先级应区分profile源选择与按SIM字段覆盖。删除用户覆盖后回归基线，不能删掉原catalog证据。
+配置未知/partial/disabled/unsupported必须保留原状态，同时报告派生回退和实际失败阶段。
 
-## 2026-10-02：三种数据库版本与派生覆盖审计
+## 3. 四来源与三种变体
 
-独立 `carrier_Bundles` 项目已增加完整、无图标、保守精简无图标三个构建变体；每种都保留
-IPSW、IPCC、Pixel、小米四种来源的独立数据库，共 12 份，未把跨固件字段混合补齐。
-本机产物在 `../carrier_Bundles/data/variants/2026-10-02/`，规则和报告说明见该项目的
-`docs/CATALOG_VARIANTS.md`。
+IPSW、在线IPCC、Pixel、小米各自产出full/no-icons/minimal-no-icons，共12份独立数据库。
+不把不同固件的字段混合拼成“全能运营商配置”，不新增私有解码格式。
 
-**不能证明“标准派生对全部 4G/5G/VoWiFi 完美兜底”，所以没有整行删除运营商配置。**
-当前 `CatalogAccessKind` 只有 LTE/EPC 与 Wi-Fi/ePDG 两种投影，NR 字段存在不代表 NR/5GC
-独立适配已经实现。派生还受可信 home PLMN、私网、SIM/网络开通、P-CSCF、安全协商等约束。
-旧通用接口对显式 Profile 的严格行为，与线路来源候选接口的缺失行回退，也不能混为一谈。
+| 变体 | 保留/删除 |
+|---|---|
+| full | 封存输入的字节等同副本，保留图标和审计证据 |
+| no-icons | 只删除视觉资源及指针，配置/匹配保留 |
+| minimal-no-icons | 只移除有明确模拟覆盖的接入配置；可选runtime-minimal再清字段审计行 |
 
-精简版保留全部 Profile ID、匹配、readiness、必需字段、NR 配置和非默认策略，只省略九类
-经过消费回归证明相同的可选默认值；不变更生产地址族计划。对本次 5973 个 Profile 的
-23892 次实际消费者查询对比一致（包括原有不可用/错误结果），但这不是网络注册验收。
-未替换当前设备上的 catalog。详情见 [本轮交付记录](INSTALL_ESIM_CATALOG_2026-10-02.md)。
+全部仍为SQLite schema v7、8表及`carrier-bundles-ims-v1`契约，schema/index不因精简被替换。
+原始证据保留在full。不能以“标准运营商”标签批量删行，不能以体积目标扩大裁剪条件。
 
-## 支持的来源
+## 4. 裁剪条件与能力边界
 
-### Android
+LTE和VoWiFi独立判定：一种可派生、另一种不可派生时只删除已覆盖的接入。
+存在其他业务/共享策略或NR时不能整行删除；全接入覆盖且无其他保护项才允许删除整行及级联引用。
 
-- AOSP `apns-conf.xml`、CarrierConfig XML 和 Apple plist 仅作为独立 catalog 流程的研究来源；SimAdmin
-  不直接解析这些文件。
-- 厂商 `/vendor` 配置、Qualcomm MBN 与专有 IMS 数据可能包含更多字段，但格式和授权边界
-  不稳定，SimAdmin 运行时不直接解析这些固件资产。
+未知/更严格策略、私有域、APN认证、单族要求、显式隐私/加密、非默认SIP头、媒体/开通/额外服务均需保留。
+父级证据只有在与原配置子树完全一致时才能裁剪；不可解释的原值保留。
+“保留”只表示没有充分等价证据，不代表派生一定失败。
 
-### Apple
+删除后的接入依赖消费者已有的derived回退，不引入隐藏重建标记。缺少同等派生能力的其他消费者应选full/no-icons。
+模拟假定订阅/承载/P-CSCF可达和有效SIM材料，不证明真实运营商、全部卡、IKE/IPsec或5G网络都能注册。
 
-- IPCC / carrier bundle 的 XML plist：可提取 APN、VoLTE/VoWiFi 开关和部分 E911 信息。
-- SimAdmin 不下载或分发 Apple bundle；导入器只处理用户依法取得的 XML plist 事实。
+证据必须绑定源文件、测试程序和日志摘要。行为修改后旧冻结证据不自动升级为新版本证明；
+新增全局兜底回归必须验证协议状态和请求继承，不能用运营商特例测试授权扩大删库。
 
-### 标准兜底
+## 5. 当前已发布集合的事实
 
-- ePDG FQDN、IMS domain/realm 等少数字段按 3GPP 规则从 MCC/MNC 推导。
-- 推断 profile 使用通用保守基线，可能在 IKE、P-CSCF 或 SIP REGISTER 阶段失败；失败不改变
-  catalog 状态，也不会被记录成已验证配置。
-- catalog 条目标记为 `partial`、`unknown` 或缺少运行时必需字段时，仍保持原状态；自动流程可以
-  尝试推断值，但页面必须同时展示“数据库没有可用配置”和实际失败原因。
+独立catalog项目已发布 [v0.3.1-catalog-v7](https://github.com/autisticryptic/carrier_Bundles/releases/tag/v0.3.1-catalog-v7)，
+目标`814b057`，构建run37201477372、发布run37206201366；20公开文件和12只读SQLite曾独立下载校验。
+这些是带日期的制品事实，不等于当前任意设备已安装该库。
 
-## 已知限制
+| 来源 | no-icons字节 | minimal字节 | 减幅 |
+|---|---:|---:|---:|
+| Pixel mustang | 8,839,168 | 4,026,368 | 54.45% |
+| iPhone16ProMax 27.0.1 | 15,826,944 | 7,360,512 | 53.49% |
+| Apple IPCC | 12,267,520 | 6,336,512 | 48.35% |
+| Xiaomi15Ultra | 9,453,568 | 2,826,240 | 70.10% |
+| 合计 | 46,387,200 | 20,549,632 | 55.70% |
 
-1. IKE/ESP proposal、AKA 细节和 SIP 变体经常只存在于 modem 固件或专有 IMS 栈中，公开
-   配置不一定足够完成注册。
-2. 手机侧字段与 `CarrierProfileRecord` 并非一一对应；导入事实必须叠加在可信 catalog
-   基线上，不能用猜测值覆盖未知字段。
-3. Android/iOS 和厂商格式会变化，独立 catalog 流程若重新引入解析器，必须配套 fixture、来源引用和 schema 契约测试。
-4. E911 元数据目前可进入 catalog，但 SimAdmin 尚未执行完整的紧急呼叫定位流程。
-5. 固件、carrier bundle 和运营商配置可能受版权、许可或设备条款约束；收集、使用和分发前
-   应分别确认授权，不应把来源不明的原始资产提交到本仓库。
+主要收益来自`field_evidence`及载荷瘦身，不是删除同等比例的注册策略。
+旧v0.3.0资源使用更早构建、未启用runtime-minimal，曾只减少约0.626%；Release创建日期与资源上传日期不同。
+旧Release/tag/assets未覆盖，不能把GitHub页面日期当成当前构建算法的证据。
 
-## 维护原则
+小米full OTA经固定SHA256验证，真实WFC策略由APK/XML和明确覆盖顺序提取，不从MCFG字符串猜配。
+三变体均保留380条**静态**VoWiFi ready；本轮跳过图标同步，不把full/no-icons相等说成图标提取完成。
+380条静态配置不代表380次实网验收，动态APEX/opconfig、carrier-ID/MVNO组合仍需验证。
 
-- 原始资料收集、标准化、去重、来源审计和 release 封存属于 `carrier_Bundles` 项目。
-- SimAdmin 只维护受支持 schema 的只读适配器、运行时校验、本地覆盖和用户导入入口。
-- catalog 更新应作为独立制品评审；不要把个人测试数据库、未封存 SQLite 或原始厂商资产
-  直接放入发布制品。
-- 新增字段时先更新 catalog contract 和 fixture，再更新 `CarrierProfileRecord`、v7 adapter、
-  运行时使用点、API/前端以及 `docs/DEVELOPMENT_PLAN.md` 中的验收项。
+## 6. Pixel/iOS对照的已知审查点
+
+曾有“Pixel可注册但呼入转语音信箱，iOS可接打”的用户反馈。必须控制同卡/同版本/同接入/同有效profile，
+不能把几份库最终都回退derived解释成各自专属配置通过。
+
+历次审查涉及：user-agent模板映射、security_agreement路径、接入专属SIP覆盖、显式Contact/MMTEL参数、
+身份/Service-Route和媒体路径。旧空Contact导致漏MMTEL的缺陷已有修正；不可重复宣称它必是新故障根因。
+这些是回归关注点，不是对当前源码的未经核验缺陷结论。
+
+## 7. 维护要求
+
+新增字段需同步catalog契约、fixture、v7投影、有效profile、运行时、API/前端和全局兼容测试。
+不将个人数据库或原始厂商资产提交到SimAdmin；收集和发布前分别确认许可/条款。
+生产换库与程序升级应尽量分开，以免无法归因。不要通过降低安全、重写realm或伪造ready状态得到绿色结果。
+
+本页合并了早期变体/裁剪审计、runtime-minimal、小米重建和Actions发布报告。
+完整旧正文在Git历史与本机文档备份；主要验证时间线见[历史摘要](archive/README.md)。

@@ -1,5 +1,29 @@
 # 版本更新记录
 
+> 本页合并版本发布说明。历史“当前/未发布”措辞只属于当时阶段，不代表设备现状或现有Release指向。
+> 当前代码/未完成项见[HANDOFF](HANDOFF.md)，实测时间线见[历史摘要](archive/README.md)。
+
+## 1.1.5 主线
+
+- 统一设备接口；MM仍为默认，native为显式实验性选择，不能混用同一物理owner。
+- 线路/SIM身份分离、namespace隔离、SMS持久化、资源/逻辑通道账本及设备专项维护。
+- 离线同版本完整发布包与校验安装器；普通push不自动发布，不覆盖旧Release。
+- IMS完整报价、续期、安全恢复事务、原线路工作台及只读显示逐步补强；验证范围须看具体commit。
+- 原生端到端业务、全设备/多流、未知资源自动恢复、全部SIM兼容并未由版本号保证。
+- `7bdc59f`运营商专属尝试已由`0502395`撤销；全局兜底回归仍待基于历史成功路径修复。
+
+## beta 发布说明摘要
+
+| 版本 | 已包含的重点 | 验证边界 |
+|---|---|---|
+| 1.1.4-beta1 | 注册/续期事务、Supported/Require规范化、单/多流准入、旧安全上下文回滚 | 原通道自然续期和单注册回退有设备证据；网络未接受多流，不声称双注册成功 |
+| 1.1.4-beta2 | cellular_ims命名兼容、纯Rust DNS、UserProvidedOrder、配置子树补全、资费门禁 | 应用DNS和受保护自然续期验证；专用运营商DNS/全部业务未统一实测 |
+| 1.1.4-beta3 | 紧凑AT双栈解析、实际WDS族、空AKA身份、初始化等待 | 初始/UDP同会话续期；四库测试可实际落到同一derived，不等于四库专属配置都通过 |
+| 1.1.5 | 统一设备接口与上述主线功能 | CI/发布/设备验收独立，不能把不同commit的同版本包混用 |
+
+早期GitHub上错误产生的1.1.7/1.1.8数字不是这条代码线比1.1.5更新的证据；始终核对commit及包摘要。
+详尽旧发布说明保留在精简前Git历史及本地文档备份，不继续维护多个互相冲突的状态页。
+
 ## v1.1.4-beta3（预发布）
 
 - 修复紧凑 IPv4v6 AT 输出的本地地址／P-CSCF 解析，并交叉核对同一 CID 的 CGPADDR。
@@ -7,12 +31,12 @@
 - 标准派生蜂窝 IMS 首条 REGISTER 按 IMS-AKA 规范携带空挑战身份信息，
   避免在进入 AKA 前因缺少私有身份被拒绝；保留认证失败后的终止边界。
 - 新实机完成初始注册、原 UDP 通道自然续期及四库派生兜底复测。
-  具体范围和未验证项目见 [beta3 发布说明](releases/1.1.4-beta3.md)。
+  具体范围和未验证项目见本页发布说明摘要及[历史验证](archive/README.md)。
 
 ## 未发布
 
 > 以下保留早期 v1.1.4 开发阶段的归纳；后续 beta 版本的独立验收范围以
-> `docs/releases/` 中对应版本说明为准。
+> 本页发布说明摘要与历史证据为准。
 
 - **实验性 native 专项维护与通道账本。** 增加 Quectel EC2x/EG25 诊断和需精确线路/revision
   确认的维护 API、默认只输出计划的 DJI `dji-prepare`；未知写入/关闭结果保留 receipt，不自动
@@ -23,11 +47,11 @@
 - **原生 AT 事务与 URC 分流。** 增加有界、无敏感正文的事件提示；修复异步呼叫结束
   误伤无关查询、USSD 文本内 `>` 被误判短信提示等情况。启用原生短信接收后，事件可触发
   存储扫描，仍保留 15 秒轮询及既有持久化/删除保护。默认 MM 不变，native 实机业务验收
-  仍待完成，详见 `docs/NATIVE_AT_EVENTS.md`。
+  仍待完成，详见 [原生后端事件契约](NATIVE_BACKEND_STATUS.md)。
 
 - **新增只读原生设备发现 `simadmin discover-native`。** 按 USB 驱动与 WWAN/MHI 拓扑
   列出物理锚点、端口和配置缺口；多控制口不任意选择，AT 角色只作提示，IMS/data 端点留空。
-  不发硬件命令、不改变 MM 默认后端、不自动接管。参见 `docs/NATIVE_MODEM_DISCOVERY.md`；
+  不发硬件命令、不改变 MM 默认后端、不自动接管。参见 [原生设备发现](NATIVE_BACKEND_STATUS.md)；
   native 注册/短信/通话的实机验收仍独立待办。
 
 - **IMS 注册相关命名从 `volte` 统一为 `cellular_ims`。** VoLTE 只是 IMS 之上的语音
@@ -37,7 +61,7 @@
   `volte_refresh_stats` 表、短信/事件的 `volte_ims` 传输标记和 `volte.*` 事件类型迁移为
   新名称，界面对旧值仍能正确显示。`/api/volte/*` 旧路由继续保留为别名；
   环境变量改为 `SIMADMIN_CELLULAR_IMS_*`，旧名仍生效。界面上的“4G/5G”“VoLTE”文案不变。
-  详见 `docs/IMS_NAMING_MIGRATION.md`。相邻 `carrier_Bundles` 保留真实语音能力
+  详见 [IMS命名与兼容契约](IMS_REGISTRATION_POLICY.md)。相邻 `carrier_Bundles` 保留真实语音能力
   `services.volte`，但不再用它否决 LTE IMS 的静态 readiness；新增 SMS-only IMS
   profile 不宣告 MMTEL 的契约回归。既有 sealed catalog 不就地修改。
 

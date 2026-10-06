@@ -356,7 +356,7 @@ lsmod | grep rpmsg                                                        # 不�
   数据面卡死时 VoWiFi 仍可正常注册、收发短信与通话。
 - 数据面恢复之后，VoLTE 的失败点会前移到 IMS 层
   （`ims_register_initial_receive_failed`、P-CSCF 可达性），那是另一个问题，
-  见 `ue-network-namespaces.md`。
+  见 [强制UE网络隔离架构](ARCHITECTURE.md)。
 
 ## 10. 第二种崩溃：`dhcp_client_mgr.c:263` —— SimAdmin 把固件打死的（2026-08-23）
 
