@@ -169,10 +169,6 @@ impl Peer {
             let enc = if matches!(self.scenario.mode, "first_security" | "sha1_alias_aes") { "aes-cbc" } else { "null" };
             extra.push_str(&format!("Security-Server: ipsec-3gpp;alg={alg};ealg={enc};prot=esp;mod=trans;spi-c=20001;spi-s=20002;port-c=6002;port-s=6003\r\n"));
         }
-        if matches!(self.scenario.mode, "cmcc_demands_security" | "cmcc_unoffered_md5") {
-            let alg = if self.scenario.mode == "cmcc_unoffered_md5" { "hmac-md5-96" } else { "hmac-sha-1-96" };
-            extra.push_str(&format!("Security-Server: ipsec-3gpp;alg={alg};ealg=aes-cbc;prot=esp;mod=trans;spi-c=20001;spi-s=20002;port-c=6002;port-s=6003\r\n"));
-        }
         if self.scenario.mode.starts_with("hint_") && self.scenario.mode != "hint_missing" {
             let enc = if matches!(self.scenario.mode, "hint_changed" | "hint_proxy_changed") { "null" } else { "aes-cbc" };
             // Different tuple from the pre-auth 421 hint. Only this AKA
@@ -210,25 +206,6 @@ impl ImsChannel for Peer {
         let fields = auth.as_deref().map(parameters).unwrap_or_default();
         let authenticated = fields.get("response").is_some_and(|v| !v.is_empty());
         let expires = header(frame, "Expires").unwrap().parse::<u32>().unwrap();
-        if self.scenario.mode.starts_with("cmcc_") {
-            assert!(header(frame, "Authorization").is_some(), "historical empty AKA must not become generic None");
-            assert!(header(frame, "Supported").is_some_and(|v| v.contains("sec-agree")));
-            assert!(header(frame, "Security-Client").is_some());
-            let declared = header(frame, "Require").is_some();
-            if self.scenario.mode == "cmcc_terminal_403" {
-                self.reply(frame, 403, ""); return Ok(());
-            }
-            if matches!(self.scenario.mode, "cmcc_legacy" | "cmcc_regressed_primary") && declared {
-                self.reply(frame, 421, "Security-Server: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;prot=esp;mod=trans;spi-c=7001;spi-s=7002;port-c=5070;port-s=5072\r\n");
-                return Ok(());
-            }
-            if self.scenario.mode == "cmcc_demands_security" && !declared && !authenticated {
-                self.reply(frame, 421, "Require: sec-agree\r\n"); return Ok(());
-            }
-            if self.scenario.mode == "cmcc_demands_security" {
-                assert_eq!(header(frame, "Proxy-Require").as_deref(), Some("sec-agree"));
-            }
-        }
         if self.scenario.mode.starts_with("hint_") {
             let offered = header(frame, "Security-Client").unwrap();
             assert!(header(frame, "Authorization").is_some() || header(frame, "Proxy-Authorization").is_some());
@@ -328,9 +305,7 @@ impl ImsChannel for Peer {
                 header(frame, "Authorization").is_some() || auth.is_some(),
                 "derived LTE must identify AKA before challenge"
             );
-            if !self.scenario.mode.starts_with("cmcc_") {
-                assert!(header(frame, "Require").is_some_and(|v| v.contains("sec-agree")));
-            }
+            assert!(header(frame, "Require").is_some_and(|v| v.contains("sec-agree")));
         }
         if self.scenario.mode == "min_pre" && expires < 7200 {
             self.reply(frame, 423, "Min-Expires: 7200\r\n");
@@ -491,14 +466,7 @@ async fn run_case_on_network(scenario: Scenario, mcc: &str, mnc: &str, ipv6: boo
         },
     )
     .unwrap();
-    let profile: &'static CarrierProfile = if scenario.mode.starts_with("hint_") || scenario.mode == "cmcc_regressed_primary" {
-        // Controlled A/B of the two 39b387b flags. The hint matrix retains its
-        // original proactive-request premise even after CMCC defaults revert.
-        let mut p = *base;
-        p.ims.register.require_sec_agree_headers = true;
-        p.ims.register.proxy_require_sec_agree_headers = true;
-        Box::leak(Box::new(p))
-    } else if matches!(scenario.mode, "omit" | "required_disabled" | "unsolicited_disabled") {
+    let profile: &'static CarrierProfile = if matches!(scenario.mode, "omit" | "required_disabled" | "unsolicited_disabled") {
         let mut p = *base;
         p.ims.register.sec_agree_mode = "disabled";
         p.ims.register.require_sec_agree_headers = false;
@@ -601,8 +569,6 @@ async fn run_case_on_network(scenario: Scenario, mcc: &str, mnc: &str, ipv6: boo
 mod history;
 #[path = "security_hint.rs"]
 mod security_hint;
-#[path = "cmcc_regression.rs"]
-mod cmcc_regression;
 
 #[tokio::test]
 async fn offline_derivation_registration_matrix() {

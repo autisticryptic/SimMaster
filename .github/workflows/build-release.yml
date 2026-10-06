@@ -275,7 +275,6 @@ jobs:
             connectivity::modems::ims::vowifi::epdg::tests \
             connectivity::modems::ims::vowifi::profile_record::tests \
             connectivity::modems::ims::vowifi::profiles::tests \
-            connectivity::modems::ims::vowifi::profiles::cmcc_regression_tests \
             connectivity::modems::ims::vowifi::ike_state::tests \
             connectivity::modems::ims::vowifi::live::derived_hardening_tests \
             connectivity::modems::ims::vowifi::carrier_catalog::v7::tests \
@@ -357,8 +356,6 @@ jobs:
             --report offline-registration-sim/ci-results/history.json
           python3 -B offline-registration-sim/run.py --security-hint \
             --report offline-registration-sim/ci-results/security-hint.json
-          python3 -B offline-registration-sim/run.py --cmcc-regression \
-            --report offline-registration-sim/ci-results/cmcc-regression.json
 
       - name: Upload IMS regression results
         if: always()

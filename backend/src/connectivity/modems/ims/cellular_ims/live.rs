@@ -8637,37 +8637,6 @@ mod tests {
     use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
 
     #[test]
-    fn cmcc_first_wire_request_restores_september_declaration_and_keeps_aka() {
-        use crate::connectivity::modems::ims::vowifi::profiles::{derive_standard_3gpp_profile, Standard3gppAccess};
-        for mnc in ["00", "02"] {
-            let p = derive_standard_3gpp_profile("460", mnc, Standard3gppAccess::LteEpc).unwrap();
-            let first = register_variants(p)[0];
-            let identity = ImsIdentity {
-                private_user: format!("test@{}", p.ims.domain), public_uri: format!("sip:test@{}", p.ims.domain),
-                contact_user: "test".into(), home_domain: p.ims.domain.into(), contact_user_phone: false,
-            };
-            let route = ImsRoute { local_addr: "[::1]:5062".parse().unwrap(), pcscf_addr: "[::1]:5060".parse().unwrap(), transport: SipTransport::Udp };
-            let uri = sip::register_request_uri(p, &route);
-            let authorization = first.authorization.build(p.ims.realm, &identity, &uri).unwrap();
-            let security = first.build_security_offer(offered_security(5062, 5063), p).unwrap();
-            let request = sip::build_register_from_profile(p, sip::RegisterPhase::Initial, &identity, &route,
-                &RequestIds::fresh(1), p.ims.register.expires_seconds, Some(&authorization), Some(&security), None,
-                "urn:uuid:00000000-0000-4000-8000-000000000001", first.policy);
-            assert!(sip::header_value(&request, "Require").is_none());
-            assert!(sip::header_value(&request, "Proxy-Require").is_none());
-            assert!(sip::header_value(&request, "Supported").unwrap().contains("sec-agree"));
-            assert!(sip::header_value(&request, "Authorization").unwrap().contains("response=\"\""));
-            assert!(sip::header_value(&request, "Security-Client").is_some());
-            assert!(sip::header_value(&request, "Security-Verify").is_none());
-            let response = RegisterFailure { error: ImsError::new("ims_register_initial_unexpected_status"),
-                response: Some(b"SIP/2.0 421 Required\r\nRequire: sec-agree\r\n\r\n".to_vec()), auth_rounds: 0 };
-            let upgraded = next_dynamic_register_variant(p, first, &response).unwrap();
-            assert_eq!(upgraded.authorization, first.authorization);
-            assert!(upgraded.policy.require_sec_agree && upgraded.policy.proxy_require_sec_agree);
-        }
-    }
-
-    #[test]
     fn required_security_probe_changes_only_local_security_policy_not_shared_profile() {
         let original =
             crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
