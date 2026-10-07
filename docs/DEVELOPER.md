@@ -69,8 +69,11 @@ YAML写后重解析，保留未变注释；线路映射/业务历史不因重构
 python3 -B offline-registration-sim/run.py --report offline-registration-sim/ci-results/standard.json
 python3 -B offline-registration-sim/run.py --history --report offline-registration-sim/ci-results/history.json
 python3 -B offline-registration-sim/run.py --security-hint --report offline-registration-sim/ci-results/security-hint.json
+python3 -B offline-registration-sim/run.py --fallback --report offline-registration-sim/ci-results/fallback.json
 ```
 
+四个矩阵分别为 24 标准、18 既有历史、12 明确安全提示、32 全局候选继承场景；精确数量和 suite ID 由运行器校验。
+新增两个协议矩阵统一使用合成 001/01，不按运营商决定行为。状态继承、去重和真实 AKA 前门禁另有实际 Rust 单元回归。
 历史名称只是已有fixture标签，不得将某卡特例模型当作全局兜底正确性的证明。
 增加验证应围绕请求继承、状态转换、授权/算法边界、次数/时间预算和错误分类。
 预期拒绝是通过的负例，不是网络注册成功；模拟也不能代替无线/SIM/运营商订阅/真实安全通道。

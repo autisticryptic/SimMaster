@@ -10,8 +10,8 @@
 - 蜂窝 IMS 是语音、短信、补充业务共享的接入；VoLTE/VoNR 是语音能力，不是注册开关。
 - 已实现接入协调、协商门禁、受保护续期和按来源解析 profile；不承诺所有网络互通。
 - `0502395` 已完整撤回 `7bd` 的 CMCC 专用 flag 补丁及测试；不能声称 CMCC 已修复。
-- 全局 fallback 回归仍待调查。后续代码和测试必须采用通用协议、能力与故障条件，
-  不新增运营商专用分支或测试；旧实网样本不是新版本验收。
+- `c174551` 已完成全局蜂窝 REGISTER 的身份/安全要求继承及候选去重，Actions 与 410 原配置初始注册已验证。
+  不新增运营商专用分支或测试；中国移动同卡、自然续期和业务验收仍独立，见 [HANDOFF](HANDOFF.md)。
 - 本文描述既有契约，不授权执行注册、呼叫、短信、换卡、重启或恢复写操作。
 
 ## 2. 启用意图与自动选择
@@ -228,6 +228,24 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 - `custom_carrier_profiles` 不在 `CONFIG_TABLES` 导出范围；二进制 restore 为整表复制。
   完整 profile 契约见 [Carrier Profiles](CARRIER_PROFILES.md)。
 
+### 全局蜂窝 REGISTER 候选与安全继承
+
+`register_fallback.rs` 保存本次 P-CSCF 尝试的状态，不修改共享 profile，也不跨 P-CSCF/SIM 继承。
+
+- 保留原 profile 首包。通用/格式候选不能丢掉已选择的空 AKA 身份和 Supported；空 AKA 不是计算后的鉴权响应。
+- 本地主动 Require/Proxy-Require 可以在非强制通用候选中撤回；profile 的明确要求及服务器已确认要求不能随候选切换消失。
+- 421 的 Require/Proxy-Require 必须只含已支持的 `sec-agree`，未知或空必需 token 停止；494 本身表示安全协商要求。
+  既有受限 420/Warning 处理保留。超时探测仍可进入原动态兼容阶梯，但不记作服务器明确要求。
+- 裸 421 的 Security-Server 只是未认证报价提示，不强制收窄算法；普通保留身份的候选仍使用原完整报价。
+  明确安全要求触发的既有一次性 AES 重报价仍受严格参数/已报价机制限制，失败不再退回宽报价。
+- 421/494 提示不生成密钥、不安装 SA，也不直接用作 Security-Verify；后续 401/407 的合法选择才绑定该值。
+- 已确认必须协商安全时，挑战缺少可用 Security-Server 且不存在受保护绑定，必须在调用 SIM AKA 前停止；无保护 200 不算成功。
+  “不可用”也可能是缺头、SPI/端口或格式错误，并不必然说明项目不支持算法。auto 且无明确要求的原路径保留。
+- 继承后按身份类型、实际请求 policy、报价格式、机制限制及确认的保护约束去重；label/随机 Call-ID、SPI、端口不是新兼容候选。
+  重复候选不消耗最多 24 次的发送预算；SIP 原报文重传另由共享驱动负责，不在这里删除。
+- 普通 403 和认证后失败不进入静态候选；既有受严格条件约束的认证前动态身份提示不扩大。
+  AKA 两轮、单交换时限、地址族/来源顺序及算法白名单/strict 均不因本修复放宽。
+
 ## 9. 命名、迁移与状态 API
 
 - 规范 HTTP `/api/cellular-ims/*`，保留 `/api/volte/*` 别名并共享鉴权/响应；已删除的族接口除外。
@@ -255,8 +273,10 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 ## 10. 验证清单与验收标准
 
 构建/Rust/注册模拟仅走 GitHub Actions，流程见 [开发指南](DEVELOPER.md)。
-本文整理不执行测试；历史通过次数不是当前提交结果。
+手册不替代测试报告；当前已核验的 commit、运行记录与实机范围见 [HANDOFF](HANDOFF.md)。
 
+- 全局候选：身份/Supported 继承、主动声明与真实要求区分、重复候选不计费、完整尾部格式可达、
+  421 提示不变成 Security-Verify、401/407 缺安全参数在 AKA 前拒绝；使用无运营商分支的合成协议场景。
 - 接入：启用组合、精确 Require 解析、独立流/keepalive、pending proof、呼叫延后、
   每线路串行化、低层 fail-closed、停放不耗预算、回退粘性、已有流轮换。
 - 报文：initial/authenticated/refresh/remove 的最终能力字段、重传字节稳定、

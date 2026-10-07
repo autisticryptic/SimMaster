@@ -3,8 +3,8 @@
 ## 执行约束
 
 本次维护按用户要求**仅通过 GitHub Actions 编译和运行注册模拟，不在本机编译**。
-`Validate Beta Refactor` 和 `Build-Release` 均执行下面两套矩阵，并上传 JSON、原始结果和日志。
-工作树快照使用独立验证分支，不能拿旧 HEAD 的 Actions 结果证明当前未提交源码通过。
+`Validate Beta Refactor` 和 `Build-Release` 均执行下面四套矩阵，并上传 JSON、原始结果和日志。
+日常在 `master` 验证，报告必须绑定实际提交；不能拿旧 HEAD 的 Actions 结果证明未提交源码通过。
 
 以下命令在 **Actions runner** 的仓库根目录执行：
 
@@ -13,6 +13,10 @@ python3 -B offline-registration-sim/run.py \
   --report offline-registration-sim/ci-results/standard.json
 python3 -B offline-registration-sim/run.py --history \
   --report offline-registration-sim/ci-results/history.json
+python3 -B offline-registration-sim/run.py --security-hint \
+  --report offline-registration-sim/ci-results/security-hint.json
+python3 -B offline-registration-sim/run.py --fallback \
+  --report offline-registration-sim/ci-results/fallback.json
 ```
 
 报告绑定源码摘要及 Actions repository/commit/run ID；同名结果已存在时拒绝覆盖。
@@ -39,6 +43,24 @@ SHA1 AES/null 及已知 SHA1 拼写别名、SIM-01/02/03/04 的 UDP 路径、SIM
 历史记录未保留选中算法的卡分别测试候选算法，不能据此声称运营商接受了这些算法。
 IPv4/IPv6 在该矩阵只影响 SIP 序列化，不测试真实 socket、MTU、MM/profile 换卡恢复或承载族回退。
 自然续期由另外的生产 `refresh_tests` 覆盖；没有足够 SIP 参数或在 SIP 前失败的历史卡不作注册结论。
+
+## 运营商无关的安全提示与全局兜底
+
+`--security-hint` 保留 12 个严格重报价正反例，统一采用合成 001/01，服务器明确要求 sec-agree；
+验证报价内首选 AES 的单次重试、SHA1 别名、401/407、未知/较弱机制拒绝及后续不得跳出单机制约束。
+它不再把裸 421 的报价提示当作强制安全要求，也不以某运营商名称定义预期行为。
+
+`--fallback` 执行 `offline_global_register_fallback_matrix`，32 场景（15 成功、17 预期拒绝）：
+
+- 裸 421 后保留空 AKA、Supported 和完整报价，分别进入 401/407；不把提示当 Security-Verify。
+- 明确 421/494 要求跨静态候选继承；后续缺少安全参数或直接无保护 200 必须停止。
+- 普通/认证后 403、未报价挑战、未知必需扩展和 disabled 策略保持拒绝。
+- 动态补充的身份不再丢失，423 保持身份/报价与 CSeq，认证及候选次数有界。
+
+适配器直接复用生产 `RegisterFallbackState`、`RegisterCandidateHistory`、候选构造和动态转换。
+另外的生产 Rust 测试覆盖“继承后的重复格式不占预算、尾部候选在 24 次内可达”、超时探测不变成服务器要求，
+以及生产 authenticator 在 nonce 解码/UIM 调用之前拒绝缺安全参数的挑战；不是仅有文本匹配检查。
+四个矩阵合计 86 场景，不能用其中 45 个模拟成功替代任何运营商实网验收。
 
 ## 数据库裁剪边界
 

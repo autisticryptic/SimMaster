@@ -1,77 +1,75 @@
 # 当前交接
 
-本页是唯一当前交接入口。只保留有效状态与下一步；历史验证见[历史摘要](archive/README.md)。
-文档不是设备实时状态，旧PID、SIM、网络和脚本均不得直接重放。
+本页是唯一当前交接入口。旧过程见[历史摘要](archive/README.md)；文档中的 PID、SIM 和脚本不是实时状态，不能直接重放维护操作。
 
-## 用户当前要求
+## 用户要求与操作边界
 
-1. **修复全局IMS兜底回归**，追查较早版本能注册、后续失败的实际代码变化。
-2. **禁止运营商/MCC/MNC专属代码和特例化测试**，不能以某卡模型代替全局兜底验证。
-3. 合并/删除重复文档，不继续新增日期流水账和多份“当前交接”。
-4. 日常只维护master；所有编译和测试二进制只在GitHub Actions运行，不在本机编译。
-5. 原SIM工作台的列表、详情和标签布局必须保留，不能用另一个只读清单替换。
+1. 修复**全局蜂窝 IMS 注册兜底**，不增加运营商/MCC/MNC 分支或特例测试。
+2. 日常只维护 `master`；**编译、Rust 测试和注册模拟仅在 GitHub Actions 执行**。
+3. 保留原线路列表、详情和标签布局；文档只更新固定入口，不新增日期流水账。
+4. 本轮已获授权部署到 SSH 410，并检查原卡、原配置的 IMS 注册；不重启 MM/基带，不盲删资源。
+5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 源码状态
+## 已完成的全局修复
 
-- 远端：`autisticryptic/SimMaster`，本地remote通常为`simmaster`；`origin`可能是历史本地路径。
-- 主线包含全局安全协商、资源恢复、原线路界面恢复及安装器等既有工作。
-- `7bdc59f`曾加入CMCC专用首包分支和专用测试，**已按用户要求由`0502395`完整撤销，未部署**。
-- **全局兜底回归尚未修复完成**。不得把撤销前的候选CI或其他卡成功当成本问题已解决。
-- 私有eSIM报告、诊断日志、JSONL和`.local`不提交，不清理未知用户数据。
+源码提交 **`c174551705bc6c0699cd2d7775e56c803e09b92b`**，远端 `autisticryptic/SimMaster`（本地 `simmaster`）。
 
-## 已查实的回归线索
+- 通用候选保留初始空 AKA 身份与 `Supported: sec-agree`，只允许撤回本地主动的非强制声明。
+- 本 P-CSCF 已明确要求的安全条件跨静态候选继承；超时探测不冒充服务器的明确要求。
+- 裸 421 的 Security-Server 仅作未认证提示，不强制单机制重报价，也不能作为 Security-Verify/SA。
+- 已确认需要安全协商时，401/407 缺少可用安全参数且没有现存受保护通道，在 AKA 前停止；无保护 200 也拒绝。
+- 继承后按请求语义去重，不因候选名称不同重复消耗 24 次预算；已有身份、算法与保护约束参与判断。
+- 首包配置、算法白名单/strict 校验、双栈→IPv6→IPv4、配置来源顺序、认证后止损及原 UI 不改。
+- `7bdc59f` 的运营商专用尝试早已由 `0502395` 撤销，未部署；本轮没有恢复它。
 
-用户提供成功版本时间线索：9月29日下午14:53之后、曾通过Cloudflare Tunnel连接410。
-原Cloudflare长交接文档已合并，原路径及检索方法见[历史摘要](archive/README.md)。
+实现及边界见[IMS 注册协议](IMS_REGISTRATION_POLICY.md)。
 
-- 该时间附近的代码族为`7c6cf86 / 09edc03`；`fd34edf`为14:49的文档提交。
-- `a6a327e`、`7c6cf86`、`09edc03`、`33d16f3`派生配置文件blob相同：
-  `cc05393f657ca36747682fe3c6291b33e374129a`。
-- 文档中明确Cloudflare成功的是46011（电信），不能冒认CMCC；另有更早SIM-02/46000成功，但日期9月9日。
-  用户所述9月29日CMCC成功是重要外部基线报告，精确运行commit/握手尚未从本地文档确认。
-- `39b387b`（10月1日16:04 UTC+8）将全局派生LTE首包Require/Proxy-Require从false改true。
-- `bdffdef`随后区分主动声明与server-required，改变部分动态候选的可达性。
-- `98d0e09`另改完整多机制报价与strict选择，收紧未报价算法接受范围；不是已证实CMCC使用MD5。
-- 后续日志明确实际derived、承载/P-CSCF已建立，标准请求421后进入丢失空AKA/声明的generic，再403。
-  421的具体Security-Server/Warning未完整记录，不能直接等同于订阅或SIM鉴权失败。
+## Actions 与产物证据
 
-**下一步只围绕全局协议路径：**比较旧/新请求状态继承、初始/认证/续期边界及候选转换；
-明确何时保留身份/安全要求、何时停止。不要再按MCC/MNC分支，不猜改realm/算法，不增加无限重试。
-修复后用运营商无关的正反例和旧新对照验证，真实同卡验收另行记录。
+- [Build-Release 37561979219](https://github.com/autisticryptic/SimMaster/actions/runs/37561979219)：success，Publish Release skipped。
+- [Validate Beta Refactor 37561979212](https://github.com/autisticryptic/SimMaster/actions/runs/37561979212)：success。
+- 两套日志均逐项核验 **29 项相关 Rust 回归＋86 个场景**：32 个全局兜底、12 个安全提示、24 个标准、18 个既有历史场景。
+- 32 个新增全局场景为 15 成功、17 预期拒绝；全部四矩阵为 45 成功、41 预期拒绝。不是运营商实网成功计数。
+- 本机仅运行 303 项 Python 静态/mock 检查、编辑和校验下载；没有本机 Rust/前端编译。
+- ARM64/AMD64 的官方 artifact digest、包 SHA、ELF、commit 和各 30 个包内文件均核验。
+- ARM64 包 SHA-256：`4a2c66cef0695bfb9146fad131aec571d77691e44615af2910a8b6c1771d50d0`。
+- 证据：`.local/evidence/global-register-fallback/verified.json`。文档收尾提交不代表另一个二进制。
 
-检索和源码对照：`.local/evidence/cmcc-regression-20261005/{history-review,code-audit,baseline-flags}.json/md`
-（实际文件名分别为`history-review.md`、`code-audit.md`、`baseline-flags.json`）。
+## 410 部署与原配置验收
 
-## 最近已核验的设备记录，不是当前实时承诺
+**2026-10-07 03:18:11 UTC 独立收尾，03:25:30 UTC 再次只读复检**，已 pin 的 WLAN SSH `192.168.100.13`：
 
-2026-10-05 18:36 UTC，用户自己的410运行 **4bc3f77 / 1.1.5 / PID9311**：
+- 正式程序 **c174551 / 1.1.5 / PID481703**；原 Globe `51502`、`derived_3gpp_lte_51502`。
+- 自 **03:13:56 UTC** 保持同一次 **derived / IPsec / IPv4** 注册，最终复检已约 12 分钟。
+- `last_error=null`、`reconnect_count=1`；新会话自然续期 **0**，没有缩短租期或冒称续期通过。
+- 与首次维护前相比，四个配置表、配置文件、运行 catalog 和 SIM 身份摘要一致；20 个前端文件磁盘/HTTP 摘要通过。
+- MM PID538、辅助进程 PID1409、boot 未变；MM 内部 modem 对象最终为 `/Modem/5`，不能说对象编号未变。
+- 恢复定时器 active、设备侧守卫 accepted，无新增内核故障；原界面保持。
 
-- 原线路列表/详情/7标签已恢复，API正常线路1，`read_only=false`；20前端HTTP资源摘要通过。
-- 当时插回的是**Globe51502**，18:26:56开始同一次derived/IPsec/IPv4注册，last_error=null、reconnect_count1。
-- MM538及boot未变；辅助monitor在维护窗口停/恢复后PID1409；恢复timer已恢复，设备侧守卫accepted。
-- 旧账本先经双absence证明只归档，未删modem profile；升级时同owner清理延后由原有启动恢复完成。
-- 配置/运行catalog保持。新会话自然续期0；未验证当时CMCC卡、通话或音频。
-- 管理当时走已pin的WLAN，USB路由不在；重新连接必须核实同一机器，不能猜IP或关闭host-key校验。
+### 部署期间的失败与恢复，不能省略
 
-证据：`.local/evidence/original-line-ui-20261005/` 的`verified.json`、浏览器截图、
-`absence-recovery.json`和`deployment/final-verified.json`。
-此记录不授权重放旧维护命令，不要把正常新CID3当成旧残留删除。
+首次停旧版 `4bc3f77` 时，清理超时，MM 对象消失，AT1 连续超时后对象被标记 invalid。安装预检在替换前停止，**当时新二进制尚未安装**。
+恢复原服务并对现有 MM 单次 ScanDevices 后，原卡重新 IPsec 注册；保持超过 3 分钟，原配置/程序一致，定时器恢复。
+随后只重试一次部署：停服后有界等待/单次扫描，重新核验同一 MM 进程、SIM、控制口及空闲资源，才安装新包。
+旧同 boot/已停止 owner 的账本保留，由正常启动恢复流程处理，**未手工 Delete profile、删账本或重启 MM/基带**。
+这证明升级前的关闭/重枚举路径有独立缺口；部署助手的有界处理不是该生产缺口已被修复。
 
-## 发布与数据库
+- 首次失败/原服务恢复：`.local/evidence/global-register-fallback/deployment/`。
+- 成功重试/备份路径：`.local/evidence/global-register-fallback/deployment-retry1/`，远端 `/opt/simadmin-staging/global-fallback-c174551705bc-retry1/backup`。
+- 汇总：`.local/evidence/global-register-fallback/deployment-final.json`，最终复检 `final-live-check.json`。备份用于明确授权的回滚，不自动恢复旧数据库或账本。
 
-- 分支已收敛为master；临时验证提交历史保留，旧Release标签未因分支整理被移动。
-- 普通push只产artifact；正式Release需要明确授权和完整门禁。
-- 独立catalog项目的v0.3.1-catalog-v7已发布并验证，四来源12库、总精简55.70%。
-  大部分收益为审计证据瘦身，不是删去同等比例运营商配置；详见[运营商配置](CARRIER_PROFILES.md)。
-- 不因本次兜底调查重建库、扩大裁剪或替换设备库；一次程序/配置/库改变要分别归因。
+## 剩余验收与历史基线
 
-## 文档及验证入口
+- **当前原配置的初始注册未发现回归，但不能代替新会话自然续期、通话/音频或中国移动同卡验收。**
+- 中国移动实际 421 的完整安全参数仍缺失；不能据此认定缺算法、放宽 strict 或新增 MD5。
+- 用户给出的九月成功时间附近为 `7c6cf86 / 09edc03`；Cloudflare 文档明确成功样本是 46011，不能冒认中国移动。
+- 已确认 `39b387b` 改全局首包 Require/Proxy-Require，`bdffdef` 区分主动声明与 server-required；旧 generic 丢身份的问题因可达路径变化暴露。
+- `98d0e09` 的完整报价/strict 变化是独立线索，本轮没有猜测回退。历史原文检索见[历史摘要](archive/README.md)。
+- 停服导致 MM 重枚举/AT 超时需单独调查；当前正常新租约不是旧残留，不得重放旧清理命令。
 
-- [开发与Actions](DEVELOPER.md)：单主分支、禁止本机编译、源码/产物绑定。
-- [IMS协议](IMS_REGISTRATION_POLICY.md)：全局注册/兜底/续期与费用策略。
-- [MM生命周期](IMS_MM_EXACT_FAMILY_LEASE_DESIGN.md)：归属、换卡、清理与显式恢复。
-- [诊断](IMS_DIAGNOSTICS.md)：只读采证和脱敏。
-- [未完成计划](DEVELOPMENT_PLAN.md)：长期事项，不以旧勾选记录当成已验收。
+## 固定入口
 
-本次精简前所有正文已保存在Git历史和 `.local/evidence/docs-consolidation-20261006/docs-before.zip`，
-摘要清单为`backup.json`；历史文档不是删除业务证据。私有报告原件仍由用户在本地保存。
+- [开发与 Actions](DEVELOPER.md)、[未完成计划](DEVELOPMENT_PLAN.md)、[诊断](IMS_DIAGNOSTICS.md)。
+- [MM 生命周期](IMS_MM_EXACT_FAMILY_LEASE_DESIGN.md)、[运营商配置](CARRIER_PROFILES.md)、[文档导航](README.md)。
+- 独立 catalog `v0.3.1-catalog-v7` 已发布；本轮未重建、裁剪或替换设备库，未发布新的程序 Release。
+- 文档保持 15 份受控主题入口；旧 72 份全文保留在 Git 历史及 `.local/evidence/docs-consolidation-20261006/docs-before.zip`。
