@@ -142,7 +142,7 @@ impl Peer {
         self.queue.push_back(response(request, status, extra));
     }
     fn challenge(&mut self, request: &[u8]) {
-        let proxy = matches!(self.scenario.mode, "proxy" | "hint_proxy" | "hint_proxy_changed");
+        let proxy = self.proxy_challenge();
         let nonce = if self.scenario.mode == "bad_nonce" {
             "abcd"
         } else {
@@ -159,6 +159,7 @@ impl Peer {
             self.algorithm()
         );
         let mut extra = extra;
+        extra.push_str(&self.fallback_challenge_headers());
         if matches!(self.scenario.mode, "second_security" | "unoffered_security" | "unsolicited_disabled"
             | "first_security" | "sha1_alias_aes" | "sha1_alias_null") {
             let alg = match self.scenario.mode {
@@ -197,7 +198,7 @@ impl ImsChannel for Peer {
         }
         let auth = header(
             frame,
-            if matches!(self.scenario.mode, "proxy" | "hint_proxy" | "hint_proxy_changed") {
+            if self.proxy_challenge() {
                 "Proxy-Authorization"
             } else {
                 "Authorization"
@@ -206,6 +207,9 @@ impl ImsChannel for Peer {
         let fields = auth.as_deref().map(parameters).unwrap_or_default();
         let authenticated = fields.get("response").is_some_and(|v| !v.is_empty());
         let expires = header(frame, "Expires").unwrap().parse::<u32>().unwrap();
+        if self.fallback_request(frame, authenticated, expires) {
+            return Ok(());
+        }
         if self.scenario.mode.starts_with("hint_") {
             let offered = header(frame, "Security-Client").unwrap();
             assert!(header(frame, "Authorization").is_some() || header(frame, "Proxy-Authorization").is_some());
@@ -216,7 +220,7 @@ impl ImsChannel for Peer {
                     "hint_alias" => "hmac-sha1-96", "hint_unknown" => "hmac-md5-96", _ => "hmac-sha-1-96",
                 };
                 let enc = if self.scenario.mode == "hint_null" { "null" } else { "aes-cbc" };
-                let extra = format!("Security-Server: ipsec-3gpp;alg={alg};ealg={enc};prot=esp;mod=trans;spi-c=7001;spi-s=7002;port-c=5070;port-s=5072\r\nWarning: 399 fixture.invalid \"Security negotiation\"\r\n");
+                let extra = format!("Require: sec-agree\r\nSecurity-Server: ipsec-3gpp;alg={alg};ealg={enc};prot=esp;mod=trans;spi-c=7001;spi-s=7002;port-c=5070;port-s=5072\r\nWarning: 399 fixture.invalid \"Security negotiation\"\r\n");
                 self.reply(frame, if self.scenario.mode == "hint_494" { 494 } else { 421 }, &extra);
                 return Ok(());
             }
@@ -229,7 +233,7 @@ impl ImsChannel for Peer {
                 assert!(verify.contains("spi-c=20001")); assert!(!verify.contains("spi-c=7001"));
             } else {
                 match self.scenario.mode {
-                    "hint_repeat" => self.reply(frame, 421, ""),
+                    "hint_repeat" => self.reply(frame, 421, "Require: sec-agree\r\n"),
                     "hint_403" => self.reply(frame, 403, "Warning: 399 fixture.invalid \"Authentication Failure\"\r\n"),
                     "hint_direct200" => self.reply(frame, 200, "Expires: 3600\r\n"),
                     _ => self.challenge(frame),
@@ -328,6 +332,9 @@ impl ImsChannel for Peer {
             assert!(nc > self.nc);
             self.nc = nc;
             self.digest_verified += 1;
+            if self.fallback_authenticated(frame, expires) {
+                return Ok(());
+            }
             if self.scenario.mode == "post_auth_403" {
                 self.reply(frame, 403, "");
                 return Ok(());
@@ -477,7 +484,7 @@ async fn run_case_on_network(scenario: Scenario, mcc: &str, mnc: &str, ipv6: boo
         p.ims.register.always_add_sip_instance = false;
         Box::leak(Box::new(p))
     } else {
-        base
+        fallback::profile(scenario, base)
     };
     let identity = ImsIdentity {
         private_user: user.clone(),
@@ -558,6 +565,7 @@ async fn run_case_on_network(scenario: Scenario, mcc: &str, mnc: &str, ipv6: boo
     if matches!(scenario.mode, "403" | "post_auth_403" | "bad_proof" | "custom_domain" | "required_disabled" | "unoffered_security" | "unsolicited_disabled") {
         assert_eq!(candidates.len(), 1);
     }
+    fallback::assert_case(&peer, &candidates, rounds);
     json!({"id":scenario.id,"access":if scenario.wifi{"vowifi"}else{"lte"},"expected_success":scenario.expected,
         "observed_success":success,"passed":success==scenario.expected,"status_trace":peer.statuses,
         "request_count":peer.sent.len(),"auth_rounds":rounds,"digest_verified_count":peer.digest_verified,
@@ -569,6 +577,8 @@ async fn run_case_on_network(scenario: Scenario, mcc: &str, mnc: &str, ipv6: boo
 mod history;
 #[path = "security_hint.rs"]
 mod security_hint;
+#[path = "fallback.rs"]
+mod fallback;
 
 #[tokio::test]
 async fn offline_derivation_registration_matrix() {

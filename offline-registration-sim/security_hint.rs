@@ -1,12 +1,13 @@
-//! Synthetic 421/494 protocol cases inspired by the CMCC trace, not carrier certification.
+//! Operator-independent 001/01 protocol fixtures: explicit 421/494 requirements.
+//! Synthetic security offers, not replay or carrier certification.
 use super::*;
 
 #[tokio::test]
 async fn offline_security_hint_registration_matrix() {
     let cases = [
-        ("cmcc_421_preferred_aes_reoffer", "hint_aes", true),
-        ("cmcc_421_sha1_alias_reoffer", "hint_alias", true),
-        ("cmcc_494_preferred_aes_reoffer", "hint_494", true),
+        ("required_421_preferred_aes_reoffer", "hint_aes", true),
+        ("required_421_sha1_alias_reoffer", "hint_alias", true),
+        ("required_494_preferred_aes_reoffer", "hint_494", true),
         ("hint_then_proxy_407", "hint_proxy", true),
         ("proxy_challenge_cannot_escape_singleton", "hint_proxy_changed", false),
         ("hint_cannot_steer_to_null", "hint_null", false),
@@ -19,7 +20,7 @@ async fn offline_security_hint_registration_matrix() {
     ];
     let mut results = Vec::new();
     for (id, mode, expected) in cases {
-        let result = run_case_on_network(Scenario { id, wifi: false, mode, expected, fallbacks: true }, "460", "02", true).await;
+        let result = run_case_on_network(Scenario { id, wifi: false, mode, expected, fallbacks: true }, "001", "01", true).await;
         let candidates = result["candidate_trace"].as_array().unwrap();
         assert_eq!(candidates[0], "standard_3gpp_conservative");
         assert!(candidates.iter().all(|v| v != "generic_ims_register_fallback"));
@@ -35,7 +36,7 @@ async fn offline_security_hint_registration_matrix() {
         "suite_id": "simadmin-offline-security-hint-v1", "evidence_kind": "offline_simulation",
         "passed": passed, "scenarios": results, "hardware_used": false, "live_network_verified": false,
         "limitations": [
-            "Real trace omitted Security-Server/Warning values; fixtures use synthetic complete AES proposals, not replayed CMCC data",
+            "All 12 cases use synthetic 001/01 identities and explicit server requirements; no operator trace is replayed",
             "No real SIM, XFRM installation, sockets, modem, or network authentication is exercised",
             "This does not authorize additional catalog pruning or certify a carrier"
         ]

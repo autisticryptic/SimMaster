@@ -51,6 +51,15 @@ pub(super) fn decide(
     {
         return Decision::Stop("security_hint_is_not_an_aka_challenge");
     }
+    // A bare 421 (without named required extensions) does not establish a
+    // mandatory security transition. Let the ordinary identity-preserving
+    // fallback try the historical request envelope before guessing a cipher.
+    if register_failure_status(failure) == Some(421)
+        && !response_has_only_extension(response, "Require", "sec-agree")
+        && !response_has_only_extension(response, "Proxy-Require", "sec-agree")
+    {
+        return Decision::NotApplicable;
+    }
     let allowed = profile.ims.register.security_client_mechanisms;
     let unique = allowed.iter().map(|s| s.to_ascii_lowercase()).collect::<std::collections::HashSet<_>>();
     if unique.len() <= 1 {

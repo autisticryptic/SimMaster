@@ -302,6 +302,7 @@ jobs:
             services::orchestrator::sms_router \
             connectivity::modems::ims::cellular_ims::live::tests \
             connectivity::modems::ims::cellular_ims::live::security_hint::tests \
+            connectivity::modems::ims::cellular_ims::live::register_fallback::tests \
             connectivity::modems::ims::cellular_ims::live::register_failure_diagnostics::tests \
             connectivity::modems::ims::vowifi::operator::tests::incoming_cost_gate \
             connectivity::modems::ims::vowifi::operator::tests::two_dialogs_keep_progress_media_dtmf_and_reinvite_state_independent \
@@ -356,6 +357,8 @@ jobs:
             --report offline-registration-sim/ci-results/history.json
           python3 -B offline-registration-sim/run.py --security-hint \
             --report offline-registration-sim/ci-results/security-hint.json
+          python3 -B offline-registration-sim/run.py --fallback \
+            --report offline-registration-sim/ci-results/fallback.json
 
       - name: Upload IMS regression results
         if: always()

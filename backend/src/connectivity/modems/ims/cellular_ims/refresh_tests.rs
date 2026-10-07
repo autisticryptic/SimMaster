@@ -787,6 +787,35 @@ async fn hint_refresh_and_unregister_reject_an_outside_singleton_challenge() {
 }
 
 #[tokio::test]
+async fn confirmed_fallback_requirement_rejects_missing_security_before_aka() {
+    use crate::connectivity::modems::ims::vowifi::profiles::{derive_standard_3gpp_profile, Standard3gppAccess};
+    let profile = derive_standard_3gpp_profile("001", "01", Standard3gppAccess::LteEpc).unwrap();
+    let (session, runtime, _server, _old_client) = protected_session_with_profile(profile).await;
+    for (status, required) in [(421, "Require: sec-agree\r\n"), (421, "Proxy-Require: sec-agree\r\n"), (494, "")] {
+        let first = register_variants(profile)[0];
+        let mut state = register_fallback::RegisterFallbackState::new(first);
+        state.observe(profile, first, &RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"), auth_rounds: 0,
+            response: Some(format!("SIP/2.0 {status} Required\r\n{required}\r\n").into_bytes()),
+        }).unwrap();
+        for (challenge_status, header) in [(401, "WWW-Authenticate"), (407, "Proxy-Authenticate")] {
+            let mut plain = CellularImsSipChannel::bind(ImsRoute {
+                local_addr: "127.0.0.1:0".parse().unwrap(), ..session.channel.route()
+            }, None, None).unwrap();
+            let mut auth = authenticator(&session, &runtime, session.security_binding)
+                .with_required_security(state.requires_protection(profile));
+            // Invalid nonce guarantees that even a broken gate cannot call UIM;
+            // the expected missing-security error must precede nonce decoding.
+            let challenge = format!("SIP/2.0 {challenge_status} Challenge\r\n{header}: Digest realm=\"fixture.invalid\",nonce=\"invalid\",algorithm=AKAv1-MD5\r\n\r\n");
+            let error = auth.prepare_authenticated_channel(challenge.as_bytes(), &mut plain).await.unwrap_err();
+            assert_eq!(error.code(), code::SECURITY_SERVER_MISSING);
+            assert!(auth.pending.is_none() && auth.xfrm_plan.is_none());
+            assert!(plain.security_verify().is_none());
+        }
+    }
+}
+
+#[tokio::test]
 async fn unregister_targets_original_binding_not_originating_default() {
     let (session, runtime, server, _old_client) = protected_session().await;
     let expected_identity = session.registration_identity.clone();

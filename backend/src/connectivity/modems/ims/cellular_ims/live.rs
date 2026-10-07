@@ -11,6 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "register_fallback.rs"]
+mod register_fallback;
 #[path = "security_hint.rs"]
 mod security_hint;
 #[path = "register_failure_diagnostics.rs"]
@@ -1125,11 +1127,17 @@ fn register_variants(profile: &CarrierProfile) -> Vec<CellularImsRegisterVariant
     // round, so it cannot mask bad credentials or USIM authentication errors.
     let fallback = CellularImsRegisterVariant {
         label: "generic_ims_register_fallback",
-        authorization: CellularImsInitialAuthorization::None,
+        // Header interoperability must not erase the already-selected AKA
+        // identity. An empty AKA header is still an unauthenticated request.
+        authorization,
         policy: sip::RegisterRequestPolicy {
-            advertise_sec_agree: false,
-            require_sec_agree: false,
-            proxy_require_sec_agree: false,
+            advertise_sec_agree: advertise || primary.server_required_sec_agree,
+            // Retract only a local proactive declaration, never an explicit
+            // configured requirement. Observed requirements are carried by
+            // RegisterFallbackState across later static candidates.
+            require_sec_agree: primary.server_required_sec_agree,
+            proxy_require_sec_agree: primary.server_required_sec_agree
+                && primary.policy.proxy_require_sec_agree,
             include_mmtel_features: profile.ims.register.include_mmtel_features,
             include_video_feature: false,
             include_route_header: profile.ims.register.include_route_header,
@@ -1137,7 +1145,7 @@ fn register_variants(profile: &CarrierProfile) -> Vec<CellularImsRegisterVariant
             include_access_network_info: profile_includes_pani,
             include_sip_instance: profile.ims.register.always_add_sip_instance,
         },
-        server_required_sec_agree: false,
+        server_required_sec_agree: primary.server_required_sec_agree,
         security_client_offer: CellularImsSecurityClientOffer::Full,
         security_mechanism: None,
     };
@@ -1162,17 +1170,10 @@ fn register_variants(profile: &CarrierProfile) -> Vec<CellularImsRegisterVariant
     if fallback.policy.include_sip_instance {
         variants.push(fallback.without_sip_instance());
     }
-    // Last resort: repeat the proven shape with an empty AKA Authorization.
-    //
-    // TS 24.229 §5.1.1.2.2 wants the first REGISTER unauthenticated, so every
-    // candidate above deliberately omits Authorization -- and the catalog and
-    // derived profiles default `initial_authorization` to `none` for that
-    // reason. But some cores answer 400/421 to every unauthenticated form and
-    // only challenge once an empty AKA Authorization is present: on Maxis
-    // (50212) the sequence that reaches 200 OK is
-    // `Security-Client -> +Require -> +Proxy-Require -> +empty AKA -> 401 -> AKA`.
-    // Without this candidate the ladder never sends step four, so `auth_rounds`
-    // stays 0 and the leg dies on a terminal 400 having never been challenged.
+    // Last resort for profiles that explicitly start without an AKA identity.
+    // Empty AKA is unauthenticated identity, not a computed challenge response;
+    // keep it on subsequent variants once supplied. Derived LTE starts with
+    // that identity already and must never lose it by entering generic.
     //
     // Appended rather than reordered: no operator loses its unauthenticated
     // first attempt, and this only runs after every other shape was rejected.
@@ -1209,6 +1210,7 @@ struct CellularImsRegisterAuthenticator {
     runtime: CellularImsRuntime,
     reuse_security: bool,
     security_mechanism: Option<usize>,
+    required_security: bool,
     aka_aid: Vec<u8>,
     register_policy: sip::RegisterRequestPolicy,
     profile: &'static CarrierProfile,
@@ -1277,6 +1279,7 @@ impl CellularImsRegisterAuthenticator {
             runtime,
             reuse_security,
             security_mechanism: None,
+            required_security: false,
             aka_aid,
             register_policy,
             profile,
@@ -1299,6 +1302,11 @@ impl CellularImsRegisterAuthenticator {
             return Err(ImsError::new(code::RUNTIME_NOT_RUNNING));
         }
         ensure_worker_binding_current_ims(&self.worker_binding)
+    }
+
+    fn with_required_security(mut self, required: bool) -> Self {
+        self.required_security = required;
+        self
     }
 
     fn with_security_mechanism(mut self, mechanism: Option<usize>) -> Self {
@@ -1699,6 +1707,9 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         self.pending = None;
         let security_server_values = sip::header_values(challenge_response, "Security-Server");
         let security_server = select_security_server_for_mechanism(self.profile, &security_server_values, self.security_mechanism)?;
+        if self.required_security && security_server.is_none() && channel.security_verify().is_none() {
+            return Err(ImsError::new(code::SECURITY_SERVER_MISSING));
+        }
         if self.security_mechanism.is_some() && security_server.is_none() && channel.security_verify().is_none() {
             return Err(ImsError::new(code::SECURITY_SERVER_MISSING));
         }
@@ -3234,6 +3245,8 @@ async fn connect_family(
     if device_identity.diagnostic_required_security {
         variants.truncate(1);
     }
+    let mut fallback_state = register_fallback::RegisterFallbackState::new(variants[0]);
+    let mut candidate_history = register_fallback::RegisterCandidateHistory::default();
     let mut register_variants = variants.into_iter().peekable();
     let mut last_error = None;
     let mut pending_variant = None;
@@ -3253,10 +3266,16 @@ async fn connect_family(
         }
         let mut variant = match pending_variant.take() {
             Some(variant) => variant,
-            None => register_variants
-                .next()
-                .expect("REGISTER variant iterator was checked before use"),
+            None => fallback_state.apply(
+                register_variants
+                    .next()
+                    .expect("REGISTER variant iterator was checked before use"),
+            ),
         };
+        variant.policy.include_video_feature = video_capability_enabled;
+        if !candidate_history.record(variant, fallback_state.requires_protection(profile)) {
+            continue;
+        }
         candidate_attempts = candidate_attempts.saturating_add(1);
         tracing::info!(
             line_id = %device.line_id,
@@ -3264,7 +3283,6 @@ async fn connect_family(
             register_variant = variant.label,
             "Trying bounded VoLTE REGISTER interoperability candidate"
         );
-        variant.policy.include_video_feature = video_capability_enabled;
         let mut channel =
             CellularImsSipChannel::bind_in_worker(route, &worker, Some(&bearer.interface), None)
                 .await
@@ -3364,6 +3382,7 @@ async fn connect_family(
             socket_worker,
         )
         .with_worker_binding(worker_binding.clone())
+        .with_required_security(fallback_state.requires_protection(profile))
         .with_security_mechanism(variant.security_mechanism);
         ensure_worker_binding_current(worker_binding)?;
         verify_mm_task_bearer(runtime, native_bearer.as_deref_mut()).await?;
@@ -3420,6 +3439,13 @@ async fn connect_family(
                     );
                     return Err(error);
                 }
+                variant = match fallback_state.observe(profile, variant, &failure) {
+                    Ok(observed) => observed,
+                    Err(reason) => {
+                        tracing::warn!(reason, "Stopping REGISTER fallback at required-security boundary");
+                        return Err(error);
+                    }
+                };
                 match security_hint::decide(profile, variant, &failure) {
                     security_hint::Decision::Retry(next) => {
                         tracing::info!(reason = "validated_preferred_security_offer", "Retrying one security-preserving REGISTER offer");
@@ -3484,7 +3510,8 @@ async fn connect_family(
                 return Err(error);
             }
         };
-        if (device_identity.diagnostic_required_security || variant.security_mechanism.is_some())
+        if (device_identity.diagnostic_required_security || variant.security_mechanism.is_some()
+            || fallback_state.requires_protection(profile))
             && (authenticator.mode != RegistrationMode::Ipsec
                 || authenticator.xfrm_plan.is_none()
                 || channel.security_verify().is_none())
@@ -8123,7 +8150,9 @@ fn sec_agree_retry_variant(
         // Escalate directly instead of dropping the response.
         return Some(variant.requiring_sec_agree());
     }
-    response_requires_only_extension(response, "sec-agree").then(|| variant.requiring_sec_agree())
+    (response_requires_only_extension(response, "sec-agree")
+        || response_has_only_extension(response, "Proxy-Require", "sec-agree"))
+        .then(|| variant.requiring_sec_agree())
 }
 
 /// Offer the security agreement once when the initial REGISTER draws no reply
@@ -9294,8 +9323,14 @@ mod tests {
     }
 
     #[test]
-    fn production_register_variants_keep_a_generic_second_attempt() {
-        let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+    fn production_register_variants_keep_identity_in_generic_second_attempt() {
+        use crate::connectivity::modems::ims::vowifi::profiles::{derive_standard_3gpp_profile, Standard3gppAccess};
+        let mut profile = *derive_standard_3gpp_profile("001", "01", Standard3gppAccess::LteEpc).unwrap();
+        profile.ims.register.require_sec_agree_headers = false;
+        profile.ims.register.proxy_require_sec_agree_headers = false;
+        profile.ims.register.include_visited_network = true;
+        profile.ims.register.include_route_header = true;
+        profile.ims.register.always_add_sip_instance = false;
         let variants = register_variants(&profile);
         assert_eq!(variants.len(), 5);
         assert_eq!(
@@ -9305,8 +9340,9 @@ mod tests {
         assert_eq!(variants[1].label, "generic_ims_register_fallback");
         assert_eq!(
             variants[1].authorization,
-            CellularImsInitialAuthorization::None
+            CellularImsInitialAuthorization::UriFirstEmptyAka
         );
+        assert!(variants[1].policy.advertise_sec_agree);
         assert!(!variants[1].policy.require_sec_agree);
         assert_eq!(
             variants[2].label,
@@ -9380,13 +9416,10 @@ mod tests {
             "no last-resort candidate is needed: {:?}",
             variants.iter().map(|v| v.label).collect::<Vec<_>>()
         );
-        // The profile's own shape carries the empty AKA. The generic fallback is
-        // deliberately unauthenticated whatever the profile says, so it is
-        // excluded here rather than asserted over.
-        assert_eq!(
-            variants[0].authorization,
-            CellularImsInitialAuthorization::UriFirstEmptyAka
-        );
+        // Empty AKA identifies the subscriber without a computed challenge
+        // response. Header compatibility fallbacks must preserve that identity.
+        assert!(variants.iter().all(|variant|
+            variant.authorization == CellularImsInitialAuthorization::UriFirstEmptyAka));
     }
 
     #[test]

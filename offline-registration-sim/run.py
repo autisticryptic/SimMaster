@@ -21,15 +21,31 @@ SOURCES=[
  'backend/src/connectivity/modems/ims/cellular_ims/sip.rs',
  'backend/src/connectivity/modems/ims/cellular_ims/security_agreement.rs',
  'backend/src/connectivity/modems/ims/cellular_ims/security_hint.rs',
+ 'backend/src/connectivity/modems/ims/cellular_ims/register_fallback.rs',
  'backend/src/connectivity/modems/ims/cellular_ims/register_failure_diagnostics.rs',
  'backend/src/connectivity/modems/ims/cellular_ims/ipsec.rs',
  'backend/src/connectivity/modems/ims/cellular_ims/channel.rs',
  'backend/src/connectivity/modems/ims/vowifi/carrier_catalog_v7.rs',
  'offline-registration-sim/simulator.rs','offline-registration-sim/cellular_adapter.rs',
  'offline-registration-sim/wifi_adapter.rs','offline-registration-sim/history.rs',
- 'offline-registration-sim/security_hint.rs',
+ 'offline-registration-sim/security_hint.rs','offline-registration-sim/fallback.rs',
  'offline-registration-sim/run.py',
 ]
+# Test filter, report variable, exact case count, suite identity, interpretation.
+MATRICES={
+ 'standard':('offline_derivation_registration_matrix','SIMADMIN_DERIVATION_REPORT',24,
+   'simadmin-offline-derived-registration-v1',
+   'Fixture evidence only. Pruning is limited to declared standard requirements covered by this model; unknown or stricter carrier policies must remain.'),
+ 'history':('offline_historical_registration_matrix','SIMADMIN_HISTORY_REPORT',18,
+   'simadmin-offline-history-registration-v1',
+   'History-inspired protocol regression only; does not authorize additional catalog pruning or certify historical carriers.'),
+ 'security_hint':('offline_security_hint_registration_matrix','SIMADMIN_SECURITY_HINT_REPORT',12,
+   'simadmin-offline-security-hint-v1',
+   'Synthetic 001/01 explicit 421/494 security-requirement regression only; does not authorize pruning or certify a carrier.'),
+ 'fallback':('offline_global_register_fallback_matrix','SIMADMIN_REGISTER_FALLBACK_REPORT',32,
+   'simadmin-offline-global-register-fallback-v1',
+   'Operator-independent 001/01 REGISTER fallback regression only; does not authorize pruning or certify a carrier.'),
+}
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 def fingerprints():return {name:sha(ROOT/name) for name in SOURCES}
 
@@ -40,7 +56,8 @@ def main():
  p.add_argument('--target-dir',type=Path)
  matrix=p.add_mutually_exclusive_group()
  matrix.add_argument('--history',action='store_true',help='run history-inspired protocol regressions instead of the pruning evidence matrix')
- matrix.add_argument('--security-hint',action='store_true',help='run CMCC-shaped synthetic 421/494 hint regressions (not pruning evidence)')
+ matrix.add_argument('--security-hint',action='store_true',help='run synthetic 001/01 explicit 421/494 requirement regressions (not pruning evidence)')
+ matrix.add_argument('--fallback',action='store_true',help='run operator-independent global REGISTER fallback wire regressions (not pruning evidence)')
  args=p.parse_args()
  # This maintenance workflow must never silently fall back to a local build.
  # Check before creating evidence files or invoking any compiler subprocess.
@@ -52,11 +69,13 @@ def main():
  raw=report.with_suffix('.raw.json');log=report.with_suffix('.log')
  if raw.exists() or log.exists():p.error('evidence sidecar already exists')
  before=fingerprints()
- env={**os.environ,('SIMADMIN_SECURITY_HINT_REPORT' if args.security_hint else 'SIMADMIN_HISTORY_REPORT' if args.history else 'SIMADMIN_DERIVATION_REPORT'):str(raw)}
+ selected='fallback' if args.fallback else 'security_hint' if args.security_hint else 'history' if args.history else 'standard'
+ test_filter,report_variable,expected_count,suite_id,interpretation=MATRICES[selected]
+ env={**os.environ,report_variable:str(raw)}
  if args.target_dir:env['CARGO_TARGET_DIR']=str(args.target_dir.resolve())
  env['PATH']=str(Path(args.cargo).parent)+os.pathsep+env.get('PATH','')
  command=[args.cargo,'test','--manifest-path',str(ROOT/'backend/Cargo.toml'),'--locked','--offline',
-          ('offline_security_hint_registration_matrix' if args.security_hint else 'offline_historical_registration_matrix' if args.history else 'offline_derivation_registration_matrix'),'--','--nocapture','--test-threads=1']
+          test_filter,'--','--nocapture','--test-threads=1']
  with log.open('w',encoding='utf-8') as out:
   result=subprocess.run(command,cwd=ROOT,env=env,stdout=out,stderr=subprocess.STDOUT,timeout=1200)
  if result.returncode or not raw.is_file():raise RuntimeError('simulation failed; inspect '+str(log))
@@ -65,8 +84,8 @@ def main():
  data=json.loads(raw.read_text())
  if data.get('passed') is not True or data.get('live_network_verified') is not False or data.get('hardware_used') is not False:
   raise RuntimeError('invalid simulation evidence flags')
+ if data.get('suite_id') != suite_id:raise RuntimeError('wrong simulation suite')
  cases=data['scenarios']
- expected_count=12 if args.security_hint else 18 if args.history else 24
  if len(cases)!=expected_count or len({c['id'] for c in cases})!=expected_count or not all(c['passed'] is True and c['expected_success']==c['observed_success'] for c in cases):
   raise RuntimeError('matrix incomplete or expectations did not hold')
  data.update(report_format=1,source_files_sha256=before,
@@ -77,7 +96,7 @@ def main():
      if os.environ.get('GITHUB_ACTIONS')=='true' else None,
    source_tree_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
    log_sha256=sha(log),test_count=1,
-   interpretation=('Synthetic 421/494 security-hint regression only; real server offer values were absent from the log, and this does not authorize pruning or certify CMCC.' if args.security_hint else 'History-inspired protocol regression only; does not authorize additional catalog pruning or certify historical carriers.' if args.history else 'Fixture evidence only. Pruning is limited to declared standard requirements covered by this model; unknown or stricter carrier policies must remain.'))
+   interpretation=interpretation)
  report.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
  print(json.dumps({'report':str(report),'scenarios':len(cases),'registered_in_fixture':sum(c['observed_success'] for c in cases),
    'expected_rejections':sum(not c['observed_success'] for c in cases),'passed':True,'live_network_verified':False},indent=2))

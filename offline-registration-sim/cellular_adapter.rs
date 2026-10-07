@@ -6,11 +6,17 @@ pub(crate) fn builder(
     identity: ImsIdentity,
     route: ImsRoute,
 ) -> Box<dyn WireBuilder> {
+    let variants = register_variants(profile);
+    let fallback = register_fallback::RegisterFallbackState::new(variants[0]);
+    let mut history = register_fallback::RegisterCandidateHistory::default();
+    history.record(variants[0], fallback.requires_protection(profile));
     Box::new(Builder {
         profile,
         identity,
         route,
-        variants: register_variants(profile),
+        variants,
+        fallback,
+        history,
         index: 0,
         security_verify: None,
     })
@@ -20,6 +26,8 @@ struct Builder {
     identity: ImsIdentity,
     route: ImsRoute,
     variants: Vec<CellularImsRegisterVariant>,
+    fallback: register_fallback::RegisterFallbackState,
+    history: register_fallback::RegisterCandidateHistory,
     index: usize,
     security_verify: Option<String>,
 }
@@ -65,13 +73,14 @@ impl WireBuilder for Builder {
         let mechanism = self.variants[self.index].security_mechanism;
         self.security_verify = select_security_server_for_mechanism(self.profile, &sip::header_values(frame,"Security-Server"), mechanism)?
             .map(|selected| selected.verify);
-        if mechanism.is_some() && self.security_verify.is_none() {
+        if (mechanism.is_some() || self.fallback.requires_protection(self.profile)) && self.security_verify.is_none() {
             return Err(ImsError::new(code::SECURITY_SERVER_MISSING));
         }
         Ok(())
     }
     fn accept_success(&self, authenticated: bool) -> Result<(), ImsError> {
-        if self.variants[self.index].security_mechanism.is_some() && (!authenticated || self.security_verify.is_none()) {
+        if (self.variants[self.index].security_mechanism.is_some() || self.fallback.requires_protection(self.profile))
+            && (!authenticated || self.security_verify.is_none()) {
             return Err(ImsError::new(code::SECURITY_SERVER_MISSING));
         }
         Ok(())
@@ -80,8 +89,15 @@ impl WireBuilder for Builder {
         if failure.auth_rounds != 0 {
             return false;
         }
-        match security_hint::decide(self.profile, self.variants[self.index], failure) {
+        let current = match self.fallback.observe(self.profile, self.variants[self.index], failure) {
+            Ok(current) => current,
+            Err(_) => return false,
+        };
+        match security_hint::decide(self.profile, current, failure) {
             security_hint::Decision::Retry(next) => {
+                if !self.history.record(next, self.fallback.requires_protection(self.profile)) {
+                    return false;
+                }
                 self.variants.insert(self.index + 1, next);
                 self.index += 1;
                 return true;
@@ -91,17 +107,24 @@ impl WireBuilder for Builder {
         }
         if let Some(next) = next_dynamic_register_variant_with_roaming(
             self.profile,
-            self.variants[self.index],
+            current,
             failure,
             false,
         ) {
-            self.variants.insert(self.index + 1, next);
-            self.index += 1;
-            return true;
+            if self.history.record(next, self.fallback.requires_protection(self.profile)) {
+                self.variants.insert(self.index + 1, next);
+                self.index += 1;
+                return true;
+            }
         }
-        if pre_authentication_variant_failure(failure) && self.index + 1 < self.variants.len() {
-            self.index += 1;
-            return true;
+        if pre_authentication_variant_failure(failure) {
+            while self.index + 1 < self.variants.len() {
+                self.index += 1;
+                self.variants[self.index] = self.fallback.apply(self.variants[self.index]);
+                if self.history.record(self.variants[self.index], self.fallback.requires_protection(self.profile)) {
+                    return true;
+                }
+            }
         }
         false
     }
