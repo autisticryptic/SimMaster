@@ -89,8 +89,8 @@ pub async fn discover_readers() -> Result<Vec<PcscReaderInfo>, String> {
 pub fn read_identity(path: &str) -> Result<PcscIdentity, &'static str> {
     let reader = resolve_reader_blocking(path)?;
     let select_usim = select_application_apdu(USIM_AID_PREFIX)?;
-    let responses = run_apdus(
-        reader.index,
+    let responses = run_apdus_named(
+        &reader.name,
         &[
             hex("00A40004023F0000")?,
             hex("00A40004022FE200")?,
@@ -385,7 +385,7 @@ pub async fn read_identity_async(path: &str) -> Result<PcscIdentity, String> {
 
 pub fn verify_usim(path: &str) -> Result<(), &'static str> {
     let reader = resolve_reader_blocking(path)?;
-    let responses = run_apdus(reader.index, &[select_application_apdu(USIM_AID_PREFIX)?])?;
+    let responses = run_apdus_named(&reader.name, &[select_application_apdu(USIM_AID_PREFIX)?])?;
     responses
         .first()
         .ok_or("pcsc_apdu_response_missing")
@@ -409,8 +409,8 @@ pub fn authenticate_with_aid(
     let reader = resolve_reader_blocking(path)?;
     let authenticate =
         build_usim_authenticate_apdu(rand, autn).map_err(|_| "pcsc_aka_apdu_build_failed")?;
-    let responses = run_apdus(
-        reader.index,
+    let responses = run_apdus_named(
+        &reader.name,
         &[select_application_apdu(aid)?, authenticate],
     )?;
     let select = responses.first().ok_or("pcsc_apdu_response_missing")?;
@@ -447,9 +447,22 @@ fn resolve_reader<'a>(readers: &'a [PcscReaderInfo], selector: &str) -> Option<&
 }
 
 fn run_apdus(reader_index: u16, apdus: &[Vec<u8>]) -> Result<Vec<ApduResponse>, &'static str> {
+    run_apdus_selector(&reader_index.to_string(), apdus)
+}
+
+fn run_apdus_named(reader_name: &str, apdus: &[Vec<u8>]) -> Result<Vec<ApduResponse>, &'static str> {
+    // OpenSC treats numeric reader IDs as indices. Do not let a numeric name
+    // silently select a different reader after enumeration changes.
+    if reader_name.is_empty() || reader_name.parse::<u64>().is_ok() {
+        return Err("pcsc_reader_name_ambiguous");
+    }
+    run_apdus_selector(reader_name, apdus)
+}
+
+fn run_apdus_selector(selector: &str, apdus: &[Vec<u8>]) -> Result<Vec<ApduResponse>, &'static str> {
     let mut args = vec![
         "--reader".to_string(),
-        reader_index.to_string(),
+        selector.to_owned(),
         "--card-driver".to_string(),
         "default".to_string(),
     ];

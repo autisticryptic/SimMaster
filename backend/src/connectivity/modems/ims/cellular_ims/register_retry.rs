@@ -72,9 +72,39 @@ pub(super) struct EndpointRetryState {
     /// Capacity/clock overflow cannot evict an unexpired entry or silently
     /// forget the newest refusal. One bounded latch stops the entire scope.
     stopped: Option<RetryStopReason>,
+    restart: Option<RetryAdmission>,
 }
 
 impl EndpointRetryState {
+    /// A fully exhausted attempt may pause the next bearer/profile batch.
+    /// Per-endpoint entries still survive a later successful alternate.
+    pub(super) fn pause_restart(&mut self, now: Instant) -> RetryAdmission {
+        self.prune(now);
+        let admission = if let Some(reason) = self.stopped {
+            RetryAdmission::Stopped(reason)
+        } else if let Some(not_before) = self.entries.iter().filter_map(|entry| match entry.admission {
+            RetryAdmission::Deferred { not_before } => Some(not_before), _ => None,
+        }).min() {
+            RetryAdmission::Deferred { not_before }
+        } else {
+            self.entries.first().map(|entry| entry.admission).unwrap_or(RetryAdmission::Allowed)
+        };
+        self.restart = Some(admission);
+        admission
+    }
+
+    pub(super) fn restart_admission(&mut self, now: Instant) -> RetryAdmission {
+        match self.restart.unwrap_or(RetryAdmission::Allowed) {
+            RetryAdmission::Deferred { not_before } if not_before <= now => {
+                self.restart = None;
+                RetryAdmission::Allowed
+            }
+            admission => admission,
+        }
+    }
+
+    pub(super) fn registered(&mut self) { self.restart = None; }
+
     fn prune(&mut self, now: Instant) {
         self.entries.retain(|entry| match entry.admission {
             RetryAdmission::Deferred { not_before } => not_before > now,

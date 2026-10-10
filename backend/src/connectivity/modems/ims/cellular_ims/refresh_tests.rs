@@ -917,6 +917,56 @@ async fn unregister_nonce_exhaustion_does_not_send_empty_digest_or_claim_success
 }
 
 #[tokio::test]
+async fn temporary_refresh_honors_retry_after_on_the_existing_protected_binding() {
+    let (mut session, runtime, server, _client) = protected_session().await;
+    let old_route = session.channel.send_route();
+    let old_binding = session.security_binding;
+    let old_verify = session.channel.security_verify().unwrap().to_owned();
+    let old_registered = session.registration.registered_at;
+    let old_lease = session.registration.lease.clone();
+    session.channel.reserve_security_ports_for_test(old_binding.port_s);
+    let db = Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (request, source) = receive(&server).await;
+        server.send_to(&response(&request, "503 Service Unavailable", "Retry-After: 120\r\n"), source).await.unwrap();
+        server
+    });
+    let attempt = refresh_live_registration(&mut session, &runtime, "temporary-refresh", &db).await;
+    assert_eq!(attempt.outcome, RegistrationRefreshResult::Retry);
+    assert!(attempt.retry_after.unwrap() >= Duration::from_secs(119));
+    let server = peer.await.unwrap();
+    let cseq = session.next_register_cseq;
+    let gated = refresh_live_registration(&mut session, &runtime, "temporary-refresh", &db).await;
+    assert_eq!(gated.outcome, RegistrationRefreshResult::Retry);
+    assert_eq!(session.next_register_cseq, cseq);
+    assert_eq!(session.channel.send_route(), old_route);
+    assert_eq!(session.security_binding, old_binding);
+    assert_eq!(session.channel.security_verify(), Some(old_verify.as_str()));
+    assert_eq!(session.registration.registered_at, old_registered);
+    assert_eq!(session.registration.lease, old_lease);
+    assert_eq!(server.try_recv_from(&mut [0u8; 8192]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[tokio::test]
+async fn deferred_refresh_expiry_never_sends_early_or_extends_the_old_lease() {
+    let (mut session, runtime, server, _client) = protected_session().await;
+    session.registration.registered_at = std::time::SystemTime::now()
+        - session.registration.lease.expires_after + Duration::from_secs(10);
+    let failure = RegisterFailure { error: ImsError::new("ims_register_initial_unexpected_status"),
+        response: Some(b"SIP/2.0 503 Service Unavailable\r\nRetry-After: 120\r\n\r\n".to_vec()), auth_rounds: 0 };
+    session.endpoint_retries.lock().await.observe_failure(session.pcscf, &failure.metadata(), Instant::now());
+    let db = Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+    let attempt = refresh_live_registration(&mut session, &runtime, "expired-refresh", &db).await;
+    assert_eq!(attempt.outcome, RegistrationRefreshResult::Retry);
+    assert!(attempt.retry_after.unwrap() <= Duration::from_secs(10));
+    session.registration.registered_at = std::time::SystemTime::now() - session.registration.lease.expires_after - Duration::from_secs(1);
+    let expired = refresh_live_registration(&mut session, &runtime, "expired-refresh", &db).await;
+    assert_eq!(expired.outcome, RegistrationRefreshResult::RebuildAccess(RegistrationLossReason::Expired));
+    assert!(!session.endpoint_retries.lock().await.restart_admission(Instant::now()).is_allowed());
+    assert_eq!(server.try_recv_from(&mut [0u8; 8192]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[tokio::test]
 async fn repeated_timeouts_never_downgrade_refresh_to_plaintext() {
     let (mut session, runtime, server, _client) = protected_session().await;
     let old_route = session.channel.send_route();

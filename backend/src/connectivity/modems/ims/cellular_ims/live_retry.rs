@@ -34,7 +34,7 @@ pub(super) fn admission_error(admission: RetryAdmission, now: Instant) -> Option
         RetryAdmission::Deferred { not_before } => Some(CellularImsError::with_detail(
             code::REGISTER_RETRY_DEFERRED,
             format!("retry_after_ms={}", not_before.saturating_duration_since(now).as_millis()),
-        )),
+        ).with_retry_not_before(not_before)),
         RetryAdmission::Stopped(_) => Some(CellularImsError::new(code::REGISTER_RETRY_STOPPED)),
     }
 }

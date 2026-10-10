@@ -10,7 +10,7 @@ use crate::connectivity::modems::ims::{
 pub fn read_ims_uicc(path: &str) -> Result<(Vec<Vec<u8>>, Option<IsimImsMaterial>), &'static str> {
     let reader = resolve_reader_blocking(path)?;
     let mut selection = Selection::default();
-    let mut run = |apdus: &[Vec<u8>]| run_apdus(reader.index, apdus);
+    let mut run = |apdus: &[Vec<u8>]| run_apdus_named(&reader.name, apdus);
     let aids = isim::read_application_aids_with(|apdu| selection.exchange(apdu, &mut run))?;
     let applications = UiccApplications::from_aids(aids.clone())?;
     let material = if let Some(aid) = applications.isim_aid {
@@ -64,8 +64,8 @@ impl Selection {
             let data: Vec<u8> = responses[prefix.len()..].iter().flat_map(|response| response.data.iter().copied()).collect();
             if data.len() > 8192 { return Err("isim_file_too_large"); }
             if select && (last.sw1, last.sw2) == (0x90, 0) {
-                if root { self.root = Some(apdu.to_vec()); self.file = None; }
-                else { self.file = Some(apdu.to_vec()); }
+                if root { self.root = Some(commands[0].clone()); self.file = None; }
+                else { self.file = Some(commands[0].clone()); }
             }
             return Ok(UimApduResponse { data, sw1: last.sw1, sw2: last.sw2 });
         }
@@ -91,6 +91,23 @@ mod tests {
         assert_eq!(batches[2], vec![app, file, read]);
         assert!(selection.exchange(&[0, 0x88, 0, 0x81, 0], &mut |_| panic!("must not run")).is_err());
     }
+    #[test]
+    fn pcsc_corrected_select_is_retained_for_the_next_process() {
+        let mut selection = Selection::default();
+        let app = select_application_apdu(isim::ISIM_AID_PREFIX).unwrap();
+        let mut calls = 0;
+        selection.exchange(&app, &mut |commands| {
+            calls += 1;
+            if calls == 1 { Ok(vec![ApduResponse { data: vec![], sw1: 0x6c, sw2: 10 }]) }
+            else { assert_eq!(commands[0].last(), Some(&10)); Ok(vec![ok()]) }
+        }).unwrap();
+        assert_eq!(selection.root.as_ref().unwrap().last(), Some(&10));
+        selection.exchange(&[0, 0xa4, 0, 4, 2, 0x6f, 2, 0], &mut |commands| {
+            assert_eq!(commands[0].last(), Some(&10));
+            Ok(vec![ok(); commands.len()])
+        }).unwrap();
+    }
+
     #[test]
     fn pcsc_read_followups_are_bounded_and_do_not_hide_reselection_failure() {
         let mut selection = Selection { root: Some(vec![0, 0xa4, 0, 4, 2, 0x3f, 0, 0]), file: Some(vec![0, 0xa4, 0, 4, 2, 0x2f, 0, 0]) };

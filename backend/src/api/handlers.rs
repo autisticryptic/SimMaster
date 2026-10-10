@@ -10877,6 +10877,8 @@ enum CellularImsProfileBatchAction {
     Continue,
     WaitForNetwork,
     WaitForNativeEndpoint,
+    WaitForRegister,
+    StopRegister,
     Exhausted,
     AbortUnsafe,
     Cancelled,
@@ -10908,6 +10910,16 @@ fn cellular_ims_profile_batch_action(
         == crate::connectivity::modems::ims::cellular_ims::plan::FailureClass::BasebandWedged
     {
         CellularImsProfileBatchAction::AbortUnsafe
+    } else if error.retry_remaining().is_some() {
+        CellularImsProfileBatchAction::WaitForRegister
+    } else if matches!(error.code(), code::REGISTER_RETRY_STOPPED | code::REGISTER_RETRY_DEFERRED)
+        || error.register_failure().is_some_and(|failure| {
+            use crate::connectivity::core::register::{RegisterFailureKind, RegisterFailureStage};
+            failure.stage != RegisterFailureStage::Initial
+                || !matches!(failure.kind, RegisterFailureKind::Negotiation | RegisterFailureKind::Transport)
+        })
+    {
+        CellularImsProfileBatchAction::StopRegister
     } else if attempt < max_attempts {
         CellularImsProfileBatchAction::Continue
     } else {
@@ -11571,6 +11583,22 @@ async fn run_line_cellular_ims_restore_round(
                         .await;
                     return;
                 }
+                if batch_action == CellularImsProfileBatchAction::WaitForRegister {
+                    // The live handle has already checked every eligible
+                    // endpoint and retained the same-SIM not-before state.
+                    let remaining = error.retry_remaining().unwrap_or(Duration::from_secs(30));
+                    let delay = remaining.as_secs().saturating_add(1);
+                    runtime.update(|state| {
+                        state.phase = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsPhase::Degraded;
+                        state.recovery_state = crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsRecoveryState::Idle;
+                        state.manual_retry_available = false;
+                        state.next_retry_at = Some(cellular_ims_next_retry_at(delay));
+                    }).await;
+                    return;
+                }
+                if batch_action == CellularImsProfileBatchAction::StopRegister {
+                    break;
+                }
                 if batch_action == CellularImsProfileBatchAction::Continue {
                     let delay = restore_policy.retry_delay_secs.clamp(5, 180);
                     runtime
@@ -11642,6 +11670,8 @@ pub fn spawn_cellular_ims_auto_restore(app: AppState) {
                 }
                 let status = line.cellular_ims.status().await;
                 if status.registered
+                    || status.next_retry_at.as_deref().and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                        .is_some_and(|deadline| deadline > chrono::Utc::now())
                     || status.manual_retry_available
                     || line.cellular_ims_retry_in_progress()
                     || (status.recovery_state == "waiting_native_endpoint"
@@ -15408,6 +15438,25 @@ mod tests {
             }
             assert!(!same_voice_binding(&expected, &observed));
         }
+    }
+
+    #[test]
+    fn cellular_ims_profile_batch_keeps_remote_wait_and_stops_authenticated_fallback() {
+        use crate::connectivity::core::register::{RegisterFailure, RegisterFailureStage};
+        use crate::connectivity::core::ImsError;
+        use crate::connectivity::modems::ims::cellular_ims::CellularImsError;
+        let failure = RegisterFailure {
+            error: ImsError::new("ims_register_authenticated_unexpected_status"),
+            response: Some(b"SIP/2.0 503 Service Unavailable\r\nRetry-After: 120\r\n\r\n".to_vec()),
+            auth_rounds: 1,
+        };
+        assert_eq!(failure.metadata().stage, RegisterFailureStage::Authenticated);
+        let error = CellularImsError::new(code::REGISTER_AUTH_UNEXPECTED_STATUS).with_register_failure(failure.metadata());
+        assert_eq!(cellular_ims_profile_batch_action(true, 1, 3, Some(&error)), CellularImsProfileBatchAction::StopRegister);
+        let error = error.with_retry_not_before(std::time::Instant::now() + Duration::from_secs(120));
+        assert_eq!(cellular_ims_profile_batch_action(true, 1, 3, Some(&error)), CellularImsProfileBatchAction::WaitForRegister);
+        let stopped = CellularImsError::new(code::REGISTER_RETRY_STOPPED);
+        assert_eq!(cellular_ims_profile_batch_action(true, 1, 3, Some(&stopped)), CellularImsProfileBatchAction::StopRegister);
     }
 
     #[test]

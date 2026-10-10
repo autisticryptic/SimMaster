@@ -448,11 +448,12 @@ pub struct CellularImsError {
     detail: Option<String>,
     // Recovery consumes typed provenance, never a formatted diagnostic suffix.
     register_failure: Option<crate::connectivity::core::register::RegisterFailureMetadata>,
+    retry_not_before: Option<std::time::Instant>,
 }
 
 impl CellularImsError {
     pub fn new(code: &'static str) -> Self {
-        Self { code, detail: None, register_failure: None }
+        Self { code, detail: None, register_failure: None, retry_not_before: None }
     }
 
     pub fn with_detail(code: &'static str, detail: impl Into<String>) -> Self {
@@ -460,6 +461,7 @@ impl CellularImsError {
             code,
             detail: Some(detail.into()),
             register_failure: None,
+            retry_not_before: None,
         }
     }
 
@@ -475,6 +477,15 @@ impl CellularImsError {
         &self,
     ) -> Option<&crate::connectivity::core::register::RegisterFailureMetadata> {
         self.register_failure.as_ref()
+    }
+
+    pub fn with_retry_not_before(mut self, deadline: std::time::Instant) -> Self {
+        self.retry_not_before = Some(deadline);
+        self
+    }
+
+    pub fn retry_remaining(&self) -> Option<std::time::Duration> {
+        self.retry_not_before.map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
     }
 
     pub fn code(&self) -> &'static str {

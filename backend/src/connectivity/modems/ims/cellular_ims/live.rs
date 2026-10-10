@@ -2409,6 +2409,10 @@ async fn connect_inner(
         device_identity.diagnostic_required_security = true;
     }
     let endpoint_retries = live.retry_scope.lock().await.for_card(&device_identity.auth_binding);
+    let retry_now = Instant::now();
+    if let Some(error) = live_retry::admission_error(endpoint_retries.lock().await.restart_admission(retry_now), retry_now) {
+        return Err(error);
+    }
     if !device_identity.profile.ims.transport.eq_ignore_ascii_case("udp") {
         return Err(CellularImsError::new(code::PCSCF_TRANSPORT_UNSUPPORTED));
     }
@@ -3026,6 +3030,11 @@ async fn connect_inner(
                     }
                     Err(error) => Err(error),
                 };
+                if let Err(error) = &attempt {
+                    if let Some(metadata) = error.register_failure() {
+                        endpoint_retries.lock().await.observe_failure(pcscf, metadata, Instant::now());
+                    }
+                }
                 if device_identity.diagnostic_required_security {
                     // This diagnostic observes only the first P-CSCF/shape;
                     // a rejection must not silently switch test parameters.
@@ -3094,6 +3103,24 @@ async fn connect_inner(
         Err(last_error.unwrap_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED)))
     }
     .await;
+    let result = match result {
+        Ok(session) => {
+            endpoint_retries.lock().await.registered();
+            Ok(session)
+        }
+        Err(error) => {
+            let now = Instant::now();
+            let admission = endpoint_retries.lock().await.pause_restart(now);
+            Err(match admission {
+                super::register_retry::RetryAdmission::Deferred { not_before } => error.with_retry_not_before(not_before),
+                super::register_retry::RetryAdmission::Stopped(_) => {
+                    let stopped = CellularImsError::with_detail(code::REGISTER_RETRY_STOPPED, error.to_string());
+                    match error.register_failure() { Some(metadata) => stopped.with_register_failure(*metadata), None => stopped }
+                }
+                super::register_retry::RetryAdmission::Allowed => error,
+            })
+        }
+    };
     if let Err(error) = &result {
         if should_retain_failed_bearer(error) {
             tracing::warn!(
@@ -3433,6 +3460,8 @@ async fn connect_family(
         .with_security_mechanism(variant.security_mechanism);
         ensure_worker_binding_current(worker_binding)?;
         verify_mm_task_bearer(runtime, native_bearer.as_deref_mut()).await?;
+        verify_ims_card_binding(device, Some(&device_identity.auth_binding)).await
+            .map_err(|error| CellularImsError::new(error.code()))?;
         let registration_result =
             run_register_observed(&mut channel, &initial, &mut authenticator).await;
         if let Err(error) = verify_mm_task_bearer(runtime, native_bearer.as_deref_mut()).await {
@@ -3444,6 +3473,10 @@ async fn connect_family(
                 authenticator.rollback_security(&mut channel).await;
                 return Err(error);
             }
+        }
+        if let Err(error) = verify_ims_card_binding(device, Some(&device_identity.auth_binding)).await {
+            authenticator.rollback_security(&mut channel).await;
+            return Err(CellularImsError::new(error.code()));
         }
         let registration = match registration_result {
             Ok(registration) => registration,
@@ -3793,6 +3826,11 @@ async fn unregister_live_session(
     if verify_mm_task_bearer(runtime, session.native_bearer.as_mut())
         .await
         .is_err()
+    {
+        return UnregisterResult::AccessLost;
+    }
+    if verify_ims_card_binding(&session.device, session.auth_binding.as_ref()).await.is_err()
+        || !session.endpoint_retries.lock().await.check(session.pcscf, Instant::now()).is_allowed()
     {
         return UnregisterResult::AccessLost;
     }
@@ -4390,6 +4428,7 @@ async fn refresh_live_registration(
     // sockets/security state before the timeout branch notices expiry.
     let remaining_lifetime = remaining_registration_lifetime(&session.registration);
     if remaining_lifetime.is_zero() {
+        session.endpoint_retries.lock().await.pause_restart(Instant::now());
         let error = CellularImsError::with_detail(
             code::REGISTER_REFRESH_RECEIVE_FAILED,
             "registration_lease_expired",
@@ -4431,6 +4470,9 @@ async fn refresh_live_registration(
             error: Some(error),
             retry_after: None,
         };
+    }
+    if let Err(error) = verify_ims_card_binding(&session.device, session.auth_binding.as_ref()).await {
+        return lost_refresh_attempt(CellularImsError::new(error.code()));
     }
     let retry_now = Instant::now();
     let admission = session.endpoint_retries.lock().await.check(session.pcscf, retry_now);
@@ -4626,6 +4668,10 @@ async fn refresh_live_registration(
         if let Err(error) = verify_mm_task_bearer(runtime, session.native_bearer.as_mut()).await {
             authenticator.rollback_security(&mut session.channel).await;
             return lost_refresh_attempt(error);
+        }
+        if let Err(error) = verify_ims_card_binding(&session.device, session.auth_binding.as_ref()).await {
+            authenticator.rollback_security(&mut session.channel).await;
+            return lost_refresh_attempt(CellularImsError::new(error.code()));
         }
         // RFC 3261 requires monotonically increasing REGISTER CSeq values for
         // one Call-ID. A timeout still consumed the emitted CSeq.
@@ -9338,6 +9384,11 @@ mod tests {
             home_domain: "ims.example".into(),
             contact_user_phone: false,
         };
+        let test_card = UiccCardBinding {
+            endpoint: "/dev/null".into(), slot: 1, owner: "test-owner".into(),
+            iccid: "synthetic-voice-card".into(), imsi: "234330000000001".into(),
+        };
+        uicc_ims::register_test_binding("test", test_card.clone());
         *live.session.lock().await = Some(CellularImsLiveSession {
             channel,
             registration_identity: identity.clone(),
@@ -9391,7 +9442,7 @@ mod tests {
                 equipment_identifier: "490154203237518".into(),
             },
             aka_aid: Vec::new(),
-            auth_binding: None,
+            auth_binding: Some(test_card),
             profile,
             effective_ims: resolve_effective_ims_profile(profile, None),
             visited_network_header: None,
@@ -11310,10 +11361,16 @@ Content-Length: 0\r\n\r\n";
             FailureClass::from_error(&CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))
                 .is_retryable_family()
         );
-        assert!(FailureClass::from_error(&CellularImsError::new(
+        // A display code alone has no transport provenance. Only typed
+        // initial transport/temporary-endpoint failures may change family.
+        assert!(!FailureClass::from_error(&CellularImsError::new(
             code::REGISTER_INITIAL_UNEXPECTED_STATUS
-        ))
-        .is_retryable_family());
+        )).is_retryable_family());
+        let transport = RegisterFailure { error: ImsError::new("ims_register_initial_receive_failed"), response: None, auth_rounds: 0 };
+        assert!(FailureClass::from_error(&map_register_failure(&transport)).is_retryable_family());
+        let temporary = RegisterFailure { error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(b"SIP/2.0 503 Service Unavailable\r\nRetry-After: 30\r\n\r\n".to_vec()), auth_rounds: 0 };
+        assert!(FailureClass::from_error(&map_register_failure(&temporary)).is_retryable_family());
         assert!(!FailureClass::from_error(&CellularImsError::new(
             code::REGISTER_AUTH_UNEXPECTED_STATUS
         ))

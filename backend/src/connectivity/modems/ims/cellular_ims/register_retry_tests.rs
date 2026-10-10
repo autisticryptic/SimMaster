@@ -136,6 +136,24 @@ fn register_retry_metadata_keeps_saved_challenge_distinct_from_send_outcome() {
 }
 
 #[test]
+fn register_retry_exhausted_batch_gates_bearer_restart_without_clearing_endpoint_waits() {
+    let now = Instant::now();
+    let mut state = EndpointRetryState::default();
+    state.observe_failure(endpoint(5060), &failure(503, "Retry-After: 60\r\n", 0).metadata(), now);
+    // During the current discovery batch, a distinct alternate is still usable.
+    assert_eq!(state.restart_admission(now), RetryAdmission::Allowed);
+    assert!(state.check(endpoint(5070), now).is_allowed());
+    assert_eq!(state.pause_restart(now), RetryAdmission::Deferred { not_before: now + Duration::from_secs(60) });
+    assert!(!state.restart_admission(now + Duration::from_secs(59)).is_allowed());
+    assert!(state.restart_admission(now + Duration::from_secs(60)).is_allowed());
+    state.observe_failure(endpoint(5060), &failure(503, "Retry-After: 60\r\n", 0).metadata(), now);
+    state.pause_restart(now);
+    state.registered();
+    assert!(state.restart_admission(now).is_allowed());
+    assert!(!state.check(endpoint(5060), now).is_allowed());
+}
+
+#[test]
 fn register_retry_endpoint_deadline_survives_profile_and_header_changes() {
     let now = Instant::now();
     let mut state = EndpointRetryState::default();

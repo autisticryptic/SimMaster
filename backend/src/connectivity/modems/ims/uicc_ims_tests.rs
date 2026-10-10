@@ -11,6 +11,17 @@ fn resolve(material: &IsimImsMaterial, explicit_domain: bool, explicit_realm: bo
         "policy.example", "realm.example", explicit_domain, explicit_realm).unwrap()
 }
 #[test]
+fn isim_mm_single_slot_normalization_rejects_wrong_types_and_overflow() {
+    use zbus::zvariant::OwnedValue;
+    assert_eq!(mm_slot(&MmProperties::new()), Ok(1));
+    for (raw, expected) in [(0u32, 1u8), (1, 1), (2, 2), (255, 255)] {
+        assert_eq!(mm_slot(&MmProperties::from([("PrimarySimSlot".into(), OwnedValue::from(raw))])), Ok(expected));
+    }
+    assert!(mm_slot(&MmProperties::from([("PrimarySimSlot".into(), OwnedValue::from(256u32))])).is_err());
+    assert!(mm_slot(&MmProperties::from([("PrimarySimSlot".into(), OwnedValue::from(1i32))])).is_err());
+}
+
+#[test]
 fn isim_complete_identity_and_aka_application_are_selected_together() {
     let selected = resolve(&configured(), false, false);
     assert_eq!(selected.source, ImsIdentitySource::Isim);
