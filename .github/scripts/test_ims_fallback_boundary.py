@@ -11,7 +11,12 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         text = (SRC / "cellular_ims/live.rs").read_text()
         load = text[text.index("async fn load_device_identity("):text.index("async fn load_uicc_applications(")]
         self.assertLess(load.index("load_uicc_applications(device)"), load.index("resolve_fallback_imsi("))
-        self.assertIn("parse_uicc_applications_for_slot(&output, device.uim_slot)", text)
+        discovery = text[text.index("async fn load_uicc_applications("):text.index("async fn resolve_fallback_imsi(")]
+        self.assertIn("let slot = device.uim_slot", discovery)
+        self.assertIn("read_uicc_application_aids_via_proxy_reason(", discovery)
+        self.assertIn("QMI_PROXY_SOCKET, &endpoint, slot", discovery)
+        uim = (SRC / "vowifi/qmi_uim.rs").read_text()
+        self.assertIn("parse_application_ids_for_slot(&response, slot)", uim)
         self.assertIn("read_uim_identity(device, &aka_aid)", load)
         self.assertIn("identity::read_mnc_length_via_at", load)
         self.assertIn("control::at_command(&device.modem_id, command)", load)
@@ -254,8 +259,10 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
         self.assertIn("pcscf: SocketAddr", family)
         self.assertIn("pcscf_addr: pcscf", family)
         self.assertNotIn("pcscf_socket(pcscf)", family)
-        discovery = (SRC / "cellular_ims/pcscf.rs").read_text()
-        self.assertIn("target.endpoint(address)", discovery)
+        discovery = (SRC / "cellular_ims/pcscf_endpoint.rs").read_text()
+        self.assertIn("&host, target.port, Some(&target)", discovery)
+        self.assertIn("SocketAddr::new(address, port)", discovery)
+        self.assertIn("endpoint.socket", text)
         self.assertNotIn('format!("_sip._tcp.', discovery)
 
     def test_ci_selects_the_fallback_and_end_to_end_batch_regressions(self):

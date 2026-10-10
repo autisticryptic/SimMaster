@@ -21,6 +21,24 @@ pub struct UiccApplications {
     pub isim_aid: Option<Vec<u8>>,
 }
 
+impl UiccApplications {
+    /// A discovered application is selected exactly, never guessed from order
+    /// or borrowed from another slot. Multiple same-type apps need an explicit
+    /// application-selection policy and are not silently collapsed.
+    pub fn from_aids(aids: Vec<Vec<u8>>) -> Result<Self, &'static str> {
+        let mut result = Self::default();
+        for aid in aids {
+            let target = if aid.starts_with(USIM_AID_PREFIX) { &mut result.usim_aid }
+                else if aid.starts_with(ISIM_AID_PREFIX) { &mut result.isim_aid }
+                else { continue; };
+            if aid.len() > 16 || target.replace(aid).is_some() {
+                return Err("isim_application_ambiguous");
+            }
+        }
+        Ok(result)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HomePlmn {
     pub mcc: String,

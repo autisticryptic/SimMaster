@@ -42,6 +42,7 @@ pub const OVERRIDE_SCHEMA_VERSION: u32 = 1;
 #[serde(rename_all = "snake_case")]
 pub enum OverrideSource {
     Catalog,
+    Isim,
     SimOverride,
     Modem,
     Network,

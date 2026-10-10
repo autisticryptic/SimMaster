@@ -88,6 +88,15 @@ jobs:
             hardware::cellular::backends::events::tests \
             hardware::cellular::backends::sim::tests \
             hardware::cellular::backends::sim_ledger::tests \
+            hardware::devices::pcsc::ims::tests \
+            hardware::devices::pcsc::tests \
+            connectivity::modems::ims::vowifi::qmi_uim::isim::tests \
+            connectivity::modems::ims::vowifi::qmi_uim::isim_binding_tests \
+            connectivity::modems::ims::uicc_ims::tests \
+            connectivity::modems::ims::vowifi::live::live_identity::tests \
+            connectivity::modems::ims::cellular_ims::register_retry::tests \
+            connectivity::modems::ims::cellular_ims::live::live_retry::tests \
+            connectivity::modems::ims::cellular_ims::pcscf::endpoint::tests \
             connectivity::modems::ims::vowifi::qmi_uim::tests \
             connectivity::modems::ims::vowifi::qmi_uim::native_ledger_tests \
             hardware::cellular::backends::management::tests \

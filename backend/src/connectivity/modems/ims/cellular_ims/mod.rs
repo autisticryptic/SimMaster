@@ -41,6 +41,7 @@ pub mod pcscf;
 mod pcscf_dns;
 pub mod plan;
 pub mod readiness;
+mod register_retry;
 pub mod rtp_relay;
 mod mm_binding;
 pub mod runtime;

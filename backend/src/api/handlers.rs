@@ -13301,6 +13301,7 @@ fn effective_vowifi_dto(profile: &EffectiveVowifiProfile) -> EffectiveVowifiDto 
 fn source_str(source: OverrideSource) -> String {
     match source {
         OverrideSource::Catalog => "catalog".to_string(),
+        OverrideSource::Isim => "isim".to_string(),
         OverrideSource::SimOverride => "sim_override".to_string(),
         OverrideSource::Modem => "modem".to_string(),
         OverrideSource::Network => "network".to_string(),
@@ -13313,7 +13314,7 @@ fn device_identity_source_str(source: OverrideSource) -> String {
     match source {
         OverrideSource::SimOverride => "custom".to_string(),
         OverrideSource::Modem => "modem".to_string(),
-        OverrideSource::Catalog | OverrideSource::Network => "unavailable".to_string(),
+        OverrideSource::Catalog | OverrideSource::Network | OverrideSource::Isim => "unavailable".to_string(),
     }
 }
 

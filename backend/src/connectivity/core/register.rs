@@ -9,6 +9,7 @@ use std::time::Duration;
 use super::{
     access::ImsChannel, context::SipTransport, registration::UnregisterResult, sip_frame, ImsError,
 };
+pub use super::ims_failure::{RetryAfter, RetryAfterInvalid};
 
 /// RFC 3261 T1. IMS REGISTER is a non-INVITE transaction and must retransmit
 /// the identical request on an unreliable UDP transport when the response is
@@ -178,6 +179,60 @@ pub struct RegisterResult {
     pub auth_rounds: u8,
 }
 
+/// Stage within the shared exchange, not the adapter's initial/refresh lifecycle.
+/// In particular, a protected refresh's first request is still `Initial` here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterFailureStage {
+    Initial,
+    /// Challenge processing/AKA/security preparation failed before the next send.
+    Authentication,
+    Authenticated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterFailureKind {
+    /// A final 408/500/502/503/504; not a REGISTER header compatibility hint.
+    TemporaryEndpoint,
+    /// No final result from this send. Any saved response is historical.
+    Transport,
+    /// The established outbound flow is positively known to be unusable.
+    FlowFailed,
+    IdentityRejected,
+    AuthenticationRejected,
+    /// Initial header/security compatibility or bounded 423 negotiation failure.
+    Negotiation,
+    TerminalResponse,
+    /// Local parsing, AKA or security setup failure; never authorizes fallback.
+    LocalFailure,
+}
+
+/// Safe to copy into access-adapter errors. Contains no identity, challenge,
+/// carrier reason, authorization or security material. `sip_status` is the last
+/// observed status, not necessarily the result of the last send: use `kind`
+/// rather than interpreting a saved 401 as an authentication rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterFailureMetadata {
+    pub sip_status: Option<u16>,
+    pub stage: RegisterFailureStage,
+    pub kind: RegisterFailureKind,
+    pub retry_after: RetryAfter,
+}
+
+impl RegisterFailureMetadata {
+    pub fn is_temporary(self) -> bool {
+        matches!(self.kind, RegisterFailureKind::TemporaryEndpoint | RegisterFailureKind::Transport)
+    }
+
+    /// This is only an eligibility gate. Existing security, identity and
+    /// candidate-budget checks must still run; it never authorizes bare UDP.
+    pub fn permits_variant_fallback(self) -> bool {
+        self.stage == RegisterFailureStage::Initial
+            && self.kind == RegisterFailureKind::Negotiation
+            && self.retry_after == RetryAfter::Absent
+            && self.sip_status.is_some_and(status_permits_register_variant_fallback)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterFailure {
     pub error: ImsError,
@@ -189,6 +244,63 @@ pub struct RegisterFailure {
 }
 
 impl RegisterFailure {
+    /// Derive structured metadata without changing the public literal shape of
+    /// RegisterFailure. Stable error codes identify provenance; display/detail
+    /// strings and carrier Warning text do not influence recovery decisions.
+    pub fn metadata(&self) -> RegisterFailureMetadata {
+        use RegisterFailureKind as Kind;
+        use RegisterFailureStage as Stage;
+        let code = self.error.code();
+        let sip_status = self.response.as_deref()
+            .and_then(|response| sip_frame::parse_status(response).ok())
+            .filter(|status| (100..=699).contains(status));
+        let retry_after = self.response.as_deref()
+            .map(super::ims_failure::parse_retry_after)
+            .unwrap_or(RetryAfter::Absent);
+        let authenticated_exchange = code.starts_with("ims_register_authenticated_")
+            || code == "ims_register_auth_rejected";
+        let stage = if authenticated_exchange {
+            Stage::Authenticated
+        } else if self.auth_rounds > 0 {
+            Stage::Authentication
+        } else {
+            Stage::Initial
+        };
+        let transport = matches!(code,
+            "ims_register_initial_send_failed" | "ims_register_initial_receive_failed"
+            | "ims_register_authenticated_send_failed" | "ims_register_authenticated_receive_failed");
+        let final_response = matches!(code,
+            "ims_register_initial_unexpected_status" | "ims_register_authenticated_unexpected_status"
+            | "ims_register_auth_rejected" | "ims_register_initial_min_expires_invalid"
+            | "ims_register_initial_min_expires_exhausted" | "ims_register_initial_min_expires_unsupported"
+            | "ims_register_authenticated_min_expires_invalid" | "ims_register_authenticated_min_expires_exhausted"
+            | "ims_register_authenticated_min_expires_unsupported");
+        let kind = if transport {
+            Kind::Transport
+        } else if matches!(code,
+            "ims_outbound_flow_failed" | "ims_outbound_keepalive_timeout"
+            | "ims_outbound_keepalive_send_failed" | "ims_outbound_stun_error"
+            | "ims_outbound_mapping_changed")
+        {
+            Kind::FlowFailed
+        } else if final_response {
+            match sip_status {
+                Some(408 | 500 | 502 | 503 | 504) => Kind::TemporaryEndpoint,
+                Some(402 | 403 | 404 | 604) => Kind::IdentityRejected,
+                Some(401 | 407) => Kind::AuthenticationRejected,
+                Some(430) => Kind::FlowFailed,
+                Some(423) => Kind::Negotiation,
+                Some(status) if stage == Stage::Initial
+                    && status_permits_register_variant_fallback(status) => Kind::Negotiation,
+                Some(300..=699) => Kind::TerminalResponse,
+                _ => Kind::LocalFailure,
+            }
+        } else {
+            Kind::LocalFailure
+        };
+        RegisterFailureMetadata { sip_status, stage, kind, retry_after }
+    }
+
     fn new(error: ImsError, response: Option<Vec<u8>>, auth_rounds: u8) -> Self {
         Self {
             error,

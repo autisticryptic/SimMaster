@@ -416,6 +416,10 @@ pub fn line_pinned_profile_id(line_id: &str) -> Option<String> {
     line_overrides(line_id).profile_id
 }
 
+#[path = "live_identity.rs"]
+mod live_identity;
+use live_identity::LiveImsSelection;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveImsTarget {
     domain: String,
@@ -1220,11 +1224,13 @@ struct LiveXcapBinding {
     profile: &'static CarrierProfile,
     local_address: IpAddr,
     username: String,
+    uicc: Arc<LiveImsSelection>,
 }
 
 struct VowifiXcapDigestProvider {
     line_id: String,
     username: String,
+    uicc: Arc<LiveImsSelection>,
 }
 
 impl XcapDigestProvider for VowifiXcapDigestProvider {
@@ -1239,6 +1245,7 @@ impl XcapDigestProvider for VowifiXcapDigestProvider {
         Box::pin(async move {
             build_line_digest_aka_authorization(
                 &self.line_id,
+                &self.uicc,
                 &self.username,
                 method,
                 uri,
@@ -4448,6 +4455,7 @@ pub async fn live_xcap_access_for_line(line_id: &str) -> Option<XcapAccessContex
         digest: Arc::new(VowifiXcapDigestProvider {
             line_id: line_id.to_string(),
             username: binding.username,
+            uicc: binding.uicc,
         }),
     })
 }
@@ -4749,12 +4757,15 @@ async fn record_live_ims_channel(
     let media_operator_creator = Arc::new(super::operator::UeWorkerOperatorSocketCreator::new(
         context.worker,
     )) as Arc<dyn OperatorSocketCreator>;
+    let uicc = register_context.uicc.clone().ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?;
+    uicc.verify(line_id).await.map_err(live_stage_error)?;
     xcap_binding_cache().lock().await.insert(
         line_id.to_string(),
         LiveXcapBinding {
             profile,
             local_address: route.local_addr.ip(),
             username: identity.private_user.clone(),
+            uicc,
         },
     );
     super::operator::install_registered_channel(
@@ -5041,6 +5052,15 @@ async fn run_register_exchange_over_tunnel(
     access_network: &ImsAccessNetworkRuntime,
     reuse_registered_shape: bool,
 ) -> Result<String, LiveStageError> {
+    let selection = if reuse_registered_shape {
+        let registered = xcap_binding_cache().lock().await.get(line_id).cloned()
+            .filter(|binding| std::ptr::eq(binding.profile, profile))
+            .ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?;
+        registered.uicc.verify(line_id).await.map_err(live_stage_error)?;
+        registered.uicc
+    } else {
+        live_identity::load(line_id, profile).await?
+    };
     let mut last_error = None;
     for pcscf_addr in register_pcscf_candidates(gateway) {
         match run_register_exchange_with_pcscf(
@@ -5048,6 +5068,7 @@ async fn run_register_exchange_over_tunnel(
             profile,
             gateway,
             pcscf_addr,
+            &selection,
             access_network,
             reuse_registered_shape,
         )
@@ -5085,6 +5106,7 @@ async fn run_register_exchange_with_pcscf(
     profile: &'static CarrierProfile,
     gateway: &TunGatewayRuntime,
     pcscf_addr: IpAddr,
+    selection: &Arc<LiveImsSelection>,
     access_network: &ImsAccessNetworkRuntime,
     reuse_registered_shape: bool,
 ) -> Result<String, LiveStageError> {
@@ -5109,6 +5131,7 @@ async fn run_register_exchange_with_pcscf(
                 profile,
                 gateway,
                 pcscf_addr,
+                selection,
                 variant,
                 access_network,
             )
@@ -5474,6 +5497,7 @@ async fn run_register_exchange_with_pcscf_variant(
     profile: &'static CarrierProfile,
     gateway: &TunGatewayRuntime,
     pcscf_addr: IpAddr,
+    selection: &Arc<LiveImsSelection>,
     variant: LiveRegisterHeaderVariant,
     access_network: &ImsAccessNetworkRuntime,
 ) -> Result<String, LiveStageError> {
@@ -5510,6 +5534,7 @@ async fn run_register_exchange_with_pcscf_variant(
         gateway,
         local_addr,
         pcscf_addr,
+        selection,
         variant,
         access_network,
     )
@@ -5558,10 +5583,11 @@ async fn run_register_exchange_on_connected_stream(
     gateway: &TunGatewayRuntime,
     local_addr: SocketAddr,
     pcscf_addr: IpAddr,
+    selection: &Arc<LiveImsSelection>,
     variant: LiveRegisterHeaderVariant,
     access_network_runtime: &ImsAccessNetworkRuntime,
 ) -> Result<(String, LiveRegisterRequestContext, u32), LiveStageError> {
-    let identity = live_ims_register_identity(line_id, profile, variant.identity_format).await?;
+    let identity = selection.for_format(line_id, variant.identity_format).await?;
     let identity_shape = identity.shape;
     let access_network = (profile.ims.register.enable_cellular_network_info
         && variant.header_profile.include_cellular_network_info)
@@ -5586,6 +5612,8 @@ async fn run_register_exchange_on_connected_stream(
     let mut context = LiveRegisterRequestContext::new_for_line(
         line_id, profile, identity, local_addr, pcscf_addr,
     )?;
+    context.target = selection.target.clone();
+    context.uicc = Some(selection.clone());
     context.access_network = access_network;
     channel.configure_outbound(
         line_id,
@@ -7720,6 +7748,7 @@ impl std::ops::Deref for LiveImsRegisterIdentity {
 #[derive(Clone)]
 struct LiveRegisterRequestContext {
     identity: LiveImsRegisterIdentity,
+    uicc: Option<Arc<LiveImsSelection>>,
     target: LiveImsTarget,
     local_addr: SocketAddr,
     route_addr: IpAddr,
@@ -7808,6 +7837,7 @@ impl LiveRegisterRequestContext {
         let instance_id = format_sip_instance_id(profile, &identity, device_imei);
         Ok(Self {
             identity,
+            uicc: None,
             target,
             local_addr,
             route_addr,
@@ -8396,7 +8426,8 @@ impl VowifiUnregisterFactory {
         let password = match challenge.nonce_kind {
             LiveDigestNonceKind::AkaChallenge => {
                 let aka =
-                    authenticate_live_sim_for_line(&self.line_id, &challenge.rand, &challenge.autn)
+                    self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?
+                        .authenticate(&self.line_id, &challenge.rand, &challenge.autn)
                         .await
                         .map_err(|_| ImsError::new("vowifi_refresh_aka_failed"))?;
                 if let Some(auts) = aka.auts.as_ref() {
@@ -8482,6 +8513,8 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
         channel: &'a mut SipChannel,
     ) -> futures_util::future::BoxFuture<'a, Result<RegisteredImsContext, ImsError>> {
         Box::pin(async move {
+            let uicc = self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?;
+            uicc.verify(&self.line_id).await.map_err(ImsError::new)?;
             let mut auth = VowifiRefreshAuthenticator {
                 factory: self,
                 authorization: self
@@ -8495,6 +8528,7 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
             };
             let initial = auth.request()?;
             let result = run_register_observed(channel, &initial, &mut auth).await;
+            uicc.verify(&self.line_id).await.map_err(ImsError::new)?;
             let result = result.map_err(|failure| {
                 if failure.error.code().starts_with("ims_outbound_")
                     || failure.error.code() == "vowifi_refresh_security_update_required"
@@ -8537,6 +8571,11 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
     }
 
     fn initial_request(&self) -> Result<Vec<u8>, ImsError> {
+        // This trait's initial deregistration hook is synchronous. Verify the
+        // retained reader mapping here; any challenged AKA additionally does
+        // fresh subscription/owner checks before and after authentication.
+        self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?
+            .verify_reader_mapping(&self.line_id).map_err(ImsError::new)?;
         let mut auth = self
             .refresh_authorization
             .lock()
@@ -8587,76 +8626,12 @@ async fn live_ims_register_identity(
     profile: &'static CarrierProfile,
     format: LiveRegisterIdentityFormat,
 ) -> Result<LiveImsRegisterIdentity, LiveStageError> {
-    let conn = zbus::Connection::system()
-        .await
-        .map_err(|_| live_stage_error("ims_identity_unavailable"))?;
-    // Register with THIS line's IMSI; the global lookup would present the first
-    // modem's subscriber for every line.
-    let sim = line_sim_identity(line_id, &conn)
-        .await
-        .ok_or_else(|| live_stage_error("ims_identity_unavailable"))?;
-    let imsi = effective_imsi_for_line(line_id, &sim.imsi);
-    let imsi = imsi.trim();
-    if imsi.is_empty()
-        || imsi.len() < 5
-        || imsi.len() > 16
-        || !imsi.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return Err(live_stage_error("ims_identity_unavailable"));
-    }
-    if !imsi.starts_with(profile.meta.plmn) {
-        return Err(live_stage_error("ims_identity_profile_mismatch"));
-    }
-    let target = live_ims_target(line_id, profile);
-
-    Ok(match format {
-        LiveRegisterIdentityFormat::ImsiHomeDomain => LiveImsRegisterIdentity {
-            shared: crate::connectivity::core::context::ImsIdentity {
-                private_user: format!("{imsi}@{}", target.realm),
-                public_uri: format!("sip:{imsi}@{}", target.domain),
-                contact_user: imsi.to_string(),
-                home_domain: target.domain.clone(),
-                contact_user_phone: false,
-            },
-            shape: "imsi_home_domain",
-        },
-        LiveRegisterIdentityFormat::PrefixedImsiHomeDomain => {
-            let prefixed = format!("0{imsi}");
-            LiveImsRegisterIdentity {
-                shared: crate::connectivity::core::context::ImsIdentity {
-                    private_user: format!("{prefixed}@{}", target.realm),
-                    public_uri: format!("sip:{prefixed}@{}", target.domain),
-                    contact_user: prefixed,
-                    home_domain: target.domain.clone(),
-                    contact_user_phone: false,
-                },
-                shape: "prefixed_imsi_home_domain",
-            }
-        }
-        LiveRegisterIdentityFormat::ImsiPhoneUri => LiveImsRegisterIdentity {
-            shared: crate::connectivity::core::context::ImsIdentity {
-                private_user: format!("{imsi}@{}", target.realm),
-                public_uri: format!("sip:{imsi}@{};user=phone", target.domain),
-                contact_user: imsi.to_string(),
-                home_domain: target.domain.clone(),
-                contact_user_phone: true,
-            },
-            shape: "imsi_phone_uri",
-        },
-        LiveRegisterIdentityFormat::MsisdnPhoneUri => {
-            let phone_number = read_live_msisdn_candidate(line_id, &conn).await?;
-            LiveImsRegisterIdentity {
-                shared: crate::connectivity::core::context::ImsIdentity {
-                    private_user: format!("{imsi}@{}", target.realm),
-                    public_uri: format!("sip:{}@{};user=phone", phone_number, target.domain),
-                    contact_user: phone_number,
-                    home_domain: target.domain.clone(),
-                    contact_user_phone: true,
-                },
-                shape: "msisdn_phone_uri",
-            }
-        }
-    })
+    // Business transactions on an existing channel must keep that channel's
+    // UICC application, not independently discover the card again.
+    let registered = xcap_binding_cache().lock().await.get(line_id).cloned()
+        .filter(|binding| std::ptr::eq(binding.profile, profile))
+        .ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?;
+    registered.uicc.for_format(line_id, format).await
 }
 
 async fn read_live_msisdn_candidate(
@@ -8753,7 +8728,8 @@ async fn build_live_register_auth_material(
         match challenge.nonce_kind {
             LiveDigestNonceKind::AkaChallenge => {
                 let aka_result =
-                    authenticate_live_sim_for_line(line_id, &challenge.rand, &challenge.autn)
+                    context.uicc.as_ref().ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?
+                        .authenticate(line_id, &challenge.rand, &challenge.autn)
                         .await
                         .map_err(live_stage_error)?;
                 if let Some(auts) = aka_result.auts {
@@ -9424,20 +9400,24 @@ pub(crate) async fn build_line_sip_aka_authorization(
         crate::connectivity::core::sip_frame::header_values(challenge_frame, "WWW-Authenticate");
     let proxy_values =
         crate::connectivity::core::sip_frame::header_values(challenge_frame, "Proxy-Authenticate");
-    // Non-REGISTER transactions on this path always authenticate through the
-    // USIM. Plain MD5 has no credential source here and must not be selected.
+    // Non-REGISTER transactions use the application's session-bound UICC
+    // credential. Plain MD5 has no credential source here and is not selected.
     let challenge = crate::connectivity::core::digest_aka::select_digest_challenge(
         &www_values,
         &proxy_values,
         false,
     )
     .map_err(map_shared_digest_error)?;
-    build_line_parsed_digest_aka_authorization(line_id, username, method, digest_uri, challenge)
+    let binding = xcap_binding_cache().lock().await.get(line_id).cloned()
+        .filter(|binding| binding.username == username)
+        .ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?;
+    build_line_parsed_digest_aka_authorization(line_id, &binding.uicc, username, method, digest_uri, challenge)
         .await
 }
 
 async fn build_line_digest_aka_authorization(
     line_id: &str,
+    uicc: &LiveImsSelection,
     username: &str,
     method: &str,
     digest_uri: &str,
@@ -9447,12 +9427,13 @@ async fn build_line_digest_aka_authorization(
     let challenge =
         crate::connectivity::core::digest_aka::parse_digest_challenge(challenge_value, proxy)
             .map_err(map_shared_digest_error)?;
-    build_line_parsed_digest_aka_authorization(line_id, username, method, digest_uri, challenge)
+    build_line_parsed_digest_aka_authorization(line_id, uicc, username, method, digest_uri, challenge)
         .await
 }
 
 async fn build_line_parsed_digest_aka_authorization(
     line_id: &str,
+    uicc: &LiveImsSelection,
     username: &str,
     method: &str,
     digest_uri: &str,
@@ -9460,7 +9441,7 @@ async fn build_line_parsed_digest_aka_authorization(
 ) -> Result<String, LiveStageError> {
     let aka_challenge = crate::connectivity::core::digest_aka::decode_aka_nonce(&challenge.nonce)
         .map_err(map_shared_digest_error)?;
-    let aka = authenticate_live_sim_for_line(line_id, &aka_challenge.rand, &aka_challenge.autn)
+    let aka = uicc.authenticate(line_id, &aka_challenge.rand, &aka_challenge.autn)
         .await
         .map_err(live_stage_error)?;
     let cnonce = live_digest_cnonce()?;
@@ -12409,13 +12390,9 @@ mod tests {
             ),
         };
 
-        let request = String::from_utf8(
-            crate::connectivity::modems::ims::vowifi::operator::RegisteredUnregister::initial_request(
-                &factory,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        // This fixture tests SIP formatting, not a live reader/owner binding.
+        assert!(crate::connectivity::modems::ims::vowifi::operator::RegisteredUnregister::initial_request(&factory).is_err());
+        let request = String::from_utf8(factory.request(0, None).unwrap()).unwrap();
         assert!(request.starts_with("REGISTER "));
         assert!(
             request.contains("From: <sip:001010123456789@ims.example>;tag=registered-from-tag\r\n")

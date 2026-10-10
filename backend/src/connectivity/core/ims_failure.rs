@@ -68,7 +68,7 @@ impl ImsFailureDiagnostic {
             sip_status,
             q850_cause: q850,
             retryable: rule.retryable,
-            retry_after_seconds: parse_retry_after(frame),
+            retry_after_seconds: parse_retry_after(frame).seconds(),
             carrier_reason: warning.or(reason_text),
             network_response: true,
             initial_invite: false,
@@ -550,12 +550,238 @@ fn parse_warning_text(frame: &[u8]) -> Option<String> {
     None
 }
 
-fn parse_retry_after(frame: &[u8]) -> Option<u32> {
-    sip_frame::header_value(frame, "Retry-After")?
-        .split(|ch: char| !ch.is_ascii_digit())
-        .find(|part| !part.is_empty())?
-        .parse()
-        .ok()
+/// Strict, bounded RFC 3261 Retry-After result. An invalid header is not an
+/// absent header and must never be turned into a zero-second retry permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAfter {
+    Absent,
+    DelaySeconds(u32),
+    Invalid(RetryAfterInvalid),
+}
+
+impl RetryAfter {
+    pub fn seconds(self) -> Option<u32> {
+        match self {
+            Self::DelaySeconds(seconds) => Some(seconds),
+            Self::Absent | Self::Invalid(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAfterInvalid {
+    HeadersTooLarge,
+    TooManyHeaders,
+    ValueTooLarge,
+    Duplicate,
+    Syntax,
+    Overflow,
+}
+
+const MAX_RETRY_AFTER_HEADERS_BYTES: usize = 32_768;
+const MAX_RETRY_AFTER_HEADERS: usize = 128;
+const MAX_RETRY_AFTER_VALUE_BYTES: usize = 1_024;
+const MAX_RETRY_AFTER_PARAMETERS: usize = 16;
+const MAX_RETRY_AFTER_COMMENT_DEPTH: usize = 4;
+
+/// Parse only a bounded header section; bodies and carrier text never supply
+/// digits. Repeated Retry-After fields (including identical values) are invalid.
+/// RFC 3261 folding is accepted, but no HTTP date or comma-list syntax is.
+pub fn parse_retry_after(frame: &[u8]) -> RetryAfter {
+    use RetryAfterInvalid as Invalid;
+    let bounded = &frame[..frame.len().min(MAX_RETRY_AFTER_HEADERS_BYTES + 1)];
+    let Some(end) = sip_frame::find_header_end(bounded) else {
+        return RetryAfter::Invalid(if frame.len() > MAX_RETRY_AFTER_HEADERS_BYTES {
+            Invalid::HeadersTooLarge
+        } else {
+            Invalid::Syntax
+        });
+    };
+    if end > MAX_RETRY_AFTER_HEADERS_BYTES {
+        return RetryAfter::Invalid(Invalid::HeadersTooLarge);
+    }
+    let Ok(headers) = std::str::from_utf8(&bounded[..end]) else {
+        return RetryAfter::Invalid(Invalid::Syntax);
+    };
+    let mut value: Option<String> = None;
+    let mut current_is_retry_after = false;
+    for (index, line) in headers.split('\n').skip(1).enumerate() {
+        if index >= MAX_RETRY_AFTER_HEADERS {
+            return RetryAfter::Invalid(Invalid::TooManyHeaders);
+        }
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.contains('\r') {
+            return RetryAfter::Invalid(Invalid::Syntax);
+        }
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with([' ', '\t']) {
+            if current_is_retry_after {
+                let continuation = line.trim_matches([' ', '\t']);
+                let value = value.as_mut().expect("Retry-After continuation has a field");
+                if value.len() + 1 + continuation.len() > MAX_RETRY_AFTER_VALUE_BYTES {
+                    return RetryAfter::Invalid(Invalid::ValueTooLarge);
+                }
+                value.push(' ');
+                value.push_str(continuation);
+            }
+            continue;
+        }
+        let Some((name, field)) = line.split_once(':') else {
+            return RetryAfter::Invalid(Invalid::Syntax);
+        };
+        current_is_retry_after = name.trim_end_matches([' ', '\t'])
+            .eq_ignore_ascii_case("Retry-After");
+        if current_is_retry_after {
+            if value.is_some() {
+                return RetryAfter::Invalid(Invalid::Duplicate);
+            }
+            let field = field.trim_matches([' ', '\t']);
+            if field.len() > MAX_RETRY_AFTER_VALUE_BYTES {
+                return RetryAfter::Invalid(Invalid::ValueTooLarge);
+            }
+            value = Some(field.to_owned());
+        }
+    }
+    match value {
+        None => RetryAfter::Absent,
+        Some(value) => match RetryAfterParser::new(&value).parse() {
+            Ok(seconds) => RetryAfter::DelaySeconds(seconds),
+            Err(reason) => RetryAfter::Invalid(reason),
+        },
+    }
+}
+
+struct RetryAfterParser<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> RetryAfterParser<'a> {
+    fn new(value: &'a str) -> Self {
+        Self { bytes: value.as_bytes(), position: 0 }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.position).copied()
+    }
+
+    fn whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t')) {
+            self.position += 1;
+        }
+    }
+
+    fn seconds(&mut self) -> Result<u32, RetryAfterInvalid> {
+        let start = self.position;
+        let mut seconds = 0u32;
+        while let Some(digit @ b'0'..=b'9') = self.peek() {
+            seconds = seconds.checked_mul(10)
+                .and_then(|value| value.checked_add(u32::from(digit - b'0')))
+                .ok_or(RetryAfterInvalid::Overflow)?;
+            self.position += 1;
+        }
+        if start == self.position {
+            return Err(RetryAfterInvalid::Syntax);
+        }
+        Ok(seconds)
+    }
+
+    fn token(&mut self) -> &'a [u8] {
+        let start = self.position;
+        while self.peek().is_some_and(|byte| byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'!' | b'%' | b'*' | b'_' | b'+' | b'`' | b'\'' | b'~'))
+        {
+            self.position += 1;
+        }
+        &self.bytes[start..self.position]
+    }
+
+    fn quoted(&mut self, comment: bool) -> Result<(), RetryAfterInvalid> {
+        self.position += 1;
+        let mut depth = 1usize;
+        while let Some(byte) = self.peek() {
+            self.position += 1;
+            match byte {
+                b'\\' => {
+                    let escaped = self.peek().ok_or(RetryAfterInvalid::Syntax)?;
+                    if !(escaped == b'\t' || (0x20..=0x7e).contains(&escaped)) {
+                        return Err(RetryAfterInvalid::Syntax);
+                    }
+                    self.position += 1;
+                }
+                b'(' if comment => {
+                    depth += 1;
+                    if depth > MAX_RETRY_AFTER_COMMENT_DEPTH {
+                        return Err(RetryAfterInvalid::Syntax);
+                    }
+                }
+                b')' if comment => {
+                    depth -= 1;
+                    if depth == 0 { return Ok(()); }
+                }
+                b'"' if !comment => return Ok(()),
+                b'\t' | 0x20..=0x7e | 0x80..=0xff => {}
+                _ => return Err(RetryAfterInvalid::Syntax),
+            }
+        }
+        Err(RetryAfterInvalid::Syntax)
+    }
+
+    fn parse(mut self) -> Result<u32, RetryAfterInvalid> {
+        let seconds = self.seconds()?;
+        self.whitespace();
+        if self.peek() == Some(b'(') {
+            self.quoted(true)?;
+            self.whitespace();
+        }
+        let mut parameters: Vec<&[u8]> = Vec::new();
+        while self.peek() == Some(b';') {
+            self.position += 1;
+            self.whitespace();
+            let name = self.token();
+            if name.is_empty() || parameters.len() >= MAX_RETRY_AFTER_PARAMETERS
+                || parameters.iter().any(|old| old.eq_ignore_ascii_case(name))
+            {
+                return Err(RetryAfterInvalid::Syntax);
+            }
+            parameters.push(name);
+            self.whitespace();
+            let duration = name.eq_ignore_ascii_case(b"duration");
+            if self.peek() == Some(b'=') {
+                self.position += 1;
+                self.whitespace();
+                if duration {
+                    self.seconds()?;
+                } else if self.peek() == Some(b'"') {
+                    self.quoted(false)?;
+                } else if self.peek() == Some(b'[') {
+                    // generic-param gen-value may be an IPv6 host reference.
+                    self.position += 1;
+                    let start = self.position;
+                    while self.peek().is_some_and(|byte| byte != b']') {
+                        self.position += 1;
+                    }
+                    let host = std::str::from_utf8(&self.bytes[start..self.position])
+                        .map_err(|_| RetryAfterInvalid::Syntax)?;
+                    if host.parse::<std::net::Ipv6Addr>().is_err() || self.peek() != Some(b']') {
+                        return Err(RetryAfterInvalid::Syntax);
+                    }
+                    self.position += 1;
+                } else if self.token().is_empty() {
+                    return Err(RetryAfterInvalid::Syntax);
+                }
+                self.whitespace();
+            } else if duration {
+                return Err(RetryAfterInvalid::Syntax);
+            }
+        }
+        if self.position != self.bytes.len() {
+            return Err(RetryAfterInvalid::Syntax);
+        }
+        Ok(seconds)
+    }
 }
 
 fn sanitize_carrier_reason(value: &str) -> Option<String> {

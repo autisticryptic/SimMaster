@@ -150,6 +150,19 @@ impl SimLease {
         })
     }
 
+    pub fn application_aids(&self) -> Result<Vec<Vec<u8>>, &'static str> {
+        self.with_channel(qmi_uim::USIM_AID_PREFIX, super::sim_ledger::Purpose::Identity, |channel| {
+            qmi_uim::isim::read_application_aids_with(|apdu| channel.exchange(apdu))
+        })
+    }
+
+    pub fn isim_material(&self, aid: &[u8]) -> Result<qmi_uim::IsimImsMaterial, &'static str> {
+        qmi_uim::isim::validate_isim_aid(aid)?;
+        self.with_channel(aid, super::sim_ledger::Purpose::Identity, |channel| {
+            qmi_uim::isim::read_isim_material_with(|apdu| channel.exchange(apdu))
+        })
+    }
+
     pub fn epdg(&self, aid: &[u8]) -> Result<UsimEpdgConfig, &'static str> {
         self.with_channel(aid, super::sim_ledger::Purpose::Epdg, |channel| {
             let home_identifiers = channel

@@ -15,6 +15,9 @@
 //! Failure signals are consolidated into [`FailureClass`].
 
 use super::errors::{code, CellularImsError};
+use crate::connectivity::core::register::{
+    RegisterFailureKind, RegisterFailureMetadata, RegisterFailureStage,
+};
 
 /// A single IP address family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,24 +192,39 @@ impl FailureClass {
     /// Classify a structured [`CellularImsError`] surfaced during the per-family SIP
     /// loop (was `live::should_try_next_family`).
     pub fn from_error(error: &CellularImsError) -> Self {
+        if let Some(failure) = error.register_failure() {
+            return Self::from_register_failure(failure);
+        }
         match error.code() {
             code::BEARER_NETDEV_RUNTIME_ERROR | code::RUNTIME_IMS_BASEBAND_WEDGED => {
                 FailureClass::BasebandWedged
             }
+            // Missing structured provenance must not reopen a rejected
+            // endpoint based on a presentation string. Producers attach the
+            // shared metadata before returning REGISTER failures.
             code::REGISTER_INITIAL_UNEXPECTED_STATUS
-                if error
-                    .detail()
-                    .is_some_and(|detail| detail.contains("sip_status=")) =>
-            {
-                FailureClass::Other
-            }
+            | code::REGISTER_AUTH_UNEXPECTED_STATUS => FailureClass::Other,
             code::RUNTIME_ALL_PCSCF_FAILED
+            | code::REGISTER_RETRY_DEFERRED
+            | code::REGISTER_RETRY_STOPPED
             | code::PCSCF_FAMILY_MISMATCH
             | code::IPSEC_UDP_BIND_FAILED
-            | code::REGISTER_INITIAL_UNEXPECTED_STATUS
             | code::COMMAND_FAILED => FailureClass::PcscfFailed,
             code::RUNTIME_IMS_FAMILY_UNSUPPORTED => FailureClass::FamilyUnsupported,
             _ => FailureClass::Other,
+        }
+    }
+
+    /// Endpoint failure is not permission to rebuild a bearer, alter the
+    /// profile, ignore not-before, or downgrade a challenged security context.
+    pub fn from_register_failure(failure: &RegisterFailureMetadata) -> Self {
+        if failure.stage == RegisterFailureStage::Initial
+            && matches!(failure.kind,
+                RegisterFailureKind::TemporaryEndpoint | RegisterFailureKind::Transport)
+        {
+            FailureClass::PcscfFailed
+        } else {
+            FailureClass::Other
         }
     }
 
@@ -608,6 +626,38 @@ mod tests {
             code::REGISTER_INITIAL_UNEXPECTED_STATUS,
             "ims_register_initial_receive_failed",
         );
-        assert!(FailureClass::from_error(&timeout).is_retryable_family());
+        // Without metadata both diagnostic suffixes fail closed. The suffix
+        // may be localized, omitted or contain arbitrary carrier prose.
+        assert_eq!(FailureClass::from_error(&timeout), FailureClass::Other);
+    }
+
+    #[test]
+    fn register_retry_plan_uses_structured_metadata_not_detail() {
+        use crate::connectivity::core::register::{RegisterFailure, RetryAfter};
+        use crate::connectivity::core::ImsError;
+        for status in [408, 500, 502, 503, 504] {
+            let failure = RegisterFailure {
+                error: ImsError::new("ims_register_initial_unexpected_status"),
+                response: Some(format!("SIP/2.0 {status} Failure\r\nRetry-After: 30\r\n\r\n").into_bytes()),
+                auth_rounds: 0,
+            }.metadata();
+            let error = CellularImsError::with_detail(code::REGISTER_INITIAL_UNEXPECTED_STATUS,
+                "sip_status=403:arbitrary presentation")
+                .with_register_failure(failure);
+            assert_eq!(FailureClass::from_error(&error), FailureClass::PcscfFailed);
+            assert_eq!(failure.retry_after, RetryAfter::DelaySeconds(30));
+        }
+        for (kind, stage) in [
+            (RegisterFailureKind::IdentityRejected, RegisterFailureStage::Initial),
+            (RegisterFailureKind::AuthenticationRejected, RegisterFailureStage::Authenticated),
+            (RegisterFailureKind::TemporaryEndpoint, RegisterFailureStage::Authenticated),
+            (RegisterFailureKind::Transport, RegisterFailureStage::Authenticated),
+            (RegisterFailureKind::LocalFailure, RegisterFailureStage::Initial),
+        ] {
+            let metadata = RegisterFailureMetadata {
+                sip_status: Some(503), stage, kind, retry_after: RetryAfter::Absent,
+            };
+            assert_eq!(FailureClass::from_register_failure(&metadata), FailureClass::Other);
+        }
     }
 }

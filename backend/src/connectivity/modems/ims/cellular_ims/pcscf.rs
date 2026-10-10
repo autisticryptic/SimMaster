@@ -26,6 +26,13 @@ use super::errors::{code, CellularImsError};
 use super::pcscf_dns::{build_dns_query, parse_dns_response, DnsRecords};
 use super::plan::{ImsConnectionPlan, IpFamily};
 
+#[path = "pcscf_endpoint.rs"]
+mod endpoint;
+pub use endpoint::{
+    parse_pcscf_endpoint, ParsedPcscfEndpoint, PcscfEndpoint, PcscfHost, PcscfSource,
+    PcscfTransport, MAX_PCSCF_ENDPOINTS,
+};
+
 const DNS_TIMEOUT: Duration = Duration::from_secs(4);
 const DNS_PORT: u16 = 53;
 const SIP_PORT: u16 = 5060;
@@ -899,6 +906,7 @@ pub fn parse_cgcontrdp_pcscf(output: &str, expected_cid: u8, apn: &str) -> Vec<I
     candidates
 }
 
+/// Compatibility wrapper returning the first fully parsed endpoint socket.
 pub async fn discover_pcscf_in_worker(
     settings: &ImsIpSettings,
     home_domain: &str,
@@ -907,21 +915,17 @@ pub async fn discover_pcscf_in_worker(
     interface: &str,
     worker: &UeWorkerHandle,
 ) -> Result<SocketAddr, CellularImsError> {
-    discover_pcscf_on_path(
-        settings,
-        home_domain,
-        configured_pcscf,
-        local,
-        interface,
-        worker,
+    discover_pcscf_candidates_in_worker(
+        settings, home_domain, configured_pcscf, local, interface, worker,
     )
-    .await
+    .await?
+    .into_iter()
+    .next()
+    .ok_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))
 }
 
-/// Discover the preferred P-CSCF candidates for bounded failover. Discovery
-/// keeps the existing priority: environment override, modem PCO, configured
-/// profile, then configured or standard IMS DNS. Explicit address lists retain
-/// every same-family candidate; DNS discovery keeps its existing single result.
+/// Legacy socket-only API. Explicit ports survive; callers needing provenance,
+/// DNS lifetimes, SRV metadata or ISIM sources should use the endpoint API.
 pub async fn discover_pcscf_candidates_in_worker(
     settings: &ImsIpSettings,
     home_domain: &str,
@@ -930,166 +934,45 @@ pub async fn discover_pcscf_candidates_in_worker(
     interface: &str,
     worker: &UeWorkerHandle,
 ) -> Result<Vec<SocketAddr>, CellularImsError> {
-    if let Ok(explicit) = ims_env_var(ENV_PCSCF, LEGACY_ENV_PCSCF) {
-        let candidates = pcscf_candidates_for_family(&parse_pcscf_override(&explicit), local);
-        if !candidates.is_empty() {
-            return Ok(candidates.into_iter().map(pcscf_socket).collect());
-        }
-    }
-    let candidates = settings.pcscf_candidates_for(local);
-    if !candidates.is_empty() {
-        return Ok(candidates.into_iter().map(pcscf_socket).collect());
-    }
-    if let Some(configured) = configured_pcscf
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let candidates = pcscf_candidates_for_family(&parse_pcscf_override(configured), local);
-        if !candidates.is_empty() {
-            return Ok(candidates.into_iter().map(pcscf_socket).collect());
-        }
-    }
-    discover_pcscf_on_path(
-        settings,
-        home_domain,
-        configured_pcscf,
-        local,
-        interface,
-        worker,
+    discover_pcscf_endpoints_in_worker(
+        settings, home_domain, configured_pcscf, &[], local, interface, worker,
     )
     .await
-    .map(|candidate| vec![candidate])
+    .map(|endpoints| endpoints.into_iter().map(|endpoint| endpoint.socket).collect())
 }
 
-async fn discover_pcscf_on_path(
+/// Resolve at most 16 endpoints from the highest configured source:
+/// environment -> bearer PCO -> profile -> ISIM -> standard DNS. An invalid,
+/// unresolved or wrong-family explicit source never falls through to a lower
+/// source. Family mismatch is left to the existing caller's family loop.
+///
+/// DNS uses only this worker's connected UDP sockets and bearer resolvers:
+/// at most 3 servers, 16 queries, 4 seconds/query and 12 seconds total, including
+/// socket creation/send. No system DNS, TCP, TLS or NAPTR fallback is performed.
+pub async fn discover_pcscf_endpoints_in_worker(
     settings: &ImsIpSettings,
     home_domain: &str,
     configured_pcscf: Option<&str>,
+    isim_pcscf: &[String],
     local: IpAddr,
     interface: &str,
     worker: &UeWorkerHandle,
-) -> Result<SocketAddr, CellularImsError> {
-    if let Ok(explicit) = ims_env_var(ENV_PCSCF, LEGACY_ENV_PCSCF) {
-        if let Some(address) = parse_pcscf_override(&explicit)
-            .into_iter()
-            .find(|candidate| same_family(local, *candidate))
-        {
-            return settings
-                .ensure_family_match(local, address)
-                .map(pcscf_socket);
-        }
-    }
-    if let Ok(address) = settings.resolve_pcscf_for(local) {
-        return settings
-            .ensure_family_match(local, address)
-            .map(pcscf_socket);
-    }
-
-    let dns_servers = if local.is_ipv6() {
-        &settings.ipv6_dns
-    } else {
-        &settings.ipv4_dns
-    };
-    if let Some(configured) = configured_pcscf
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if let Some(address) = parse_pcscf_override(configured)
-            .into_iter()
-            .find(|candidate| same_family(local, *candidate))
-        {
-            return settings
-                .ensure_family_match(local, address)
-                .map(pcscf_socket);
-        }
-        let configured_host = configured
-            .trim_start_matches("sip:")
-            .trim_start_matches("sips:")
-            .trim_matches(['[', ']'])
-            .split([';', ':'])
-            .next()
-            .unwrap_or(configured);
-        let address_type = if local.is_ipv6() { 28 } else { 1 };
-        for server in dns_servers {
-            if server.is_ipv4() == local.is_ipv4() {
-                if let Ok(records) = query_dns(
-                    local,
-                    *server,
-                    configured_host,
-                    address_type,
-                    interface,
-                    worker,
-                )
-                .await
-                {
-                    if let Some(address) = records
-                        .addresses
-                        .into_iter()
-                        .find(|item| item.is_ipv4() == local.is_ipv4())
-                    {
-                        return Ok(pcscf_socket(address));
-                    }
-                }
-            }
-        }
-    }
-    let pcscf_name = format!("pcscf.{home_domain}");
-    let srv_names = pcscf_srv_names(home_domain);
-
-    for server in dns_servers {
-        if server.is_ipv4() != local.is_ipv4() {
-            continue;
-        }
-        let address_type = if local.is_ipv6() { 28 } else { 1 };
-        match query_dns(local, *server, &pcscf_name, address_type, interface, worker).await {
-            Ok(records) => {
-                if let Some(address) = records
-                    .addresses
-                    .into_iter()
-                    .find(|item| item.is_ipv4() == local.is_ipv4())
-                {
-                    tracing::info!(dns_server = %server, name = %pcscf_name, %address, "VoLTE P-CSCF discovered by DNS address query");
-                    return Ok(pcscf_socket(address));
-                }
-                tracing::debug!(dns_server = %server, name = %pcscf_name, record_type = address_type, "VoLTE P-CSCF DNS address query returned no matching address");
-            }
-            Err(error) => {
-                tracing::debug!(dns_server = %server, name = %pcscf_name, record_type = address_type, error = %error, "VoLTE P-CSCF DNS address query failed")
-            }
-        }
-
-        for srv_name in &srv_names {
-            let records = match query_dns(local, *server, srv_name, 33, interface, worker).await {
-                Ok(records) => records,
-                Err(error) => {
-                    tracing::debug!(dns_server = %server, name = %srv_name, error = %error, "VoLTE P-CSCF DNS SRV query failed");
-                    continue;
-                }
-            };
-            for target in records.srv_targets {
-                if let Ok(target_records) = query_dns(
-                    local,
-                    *server,
-                    &target.target,
-                    address_type,
-                    interface,
-                    worker,
-                )
-                .await
-                {
-                    if let Some(address) = target_records
-                        .addresses
-                        .into_iter()
-                        .find(|item| item.is_ipv4() == local.is_ipv4())
-                    {
-                        tracing::info!(dns_server = %server, name = %srv_name, target = %target.target, port = target.port, %address, "VoLTE P-CSCF discovered by DNS SRV query");
-                        return Ok(target.endpoint(address));
-                    }
-                }
-            }
-        }
-    }
-    Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))
+) -> Result<Vec<PcscfEndpoint>, CellularImsError> {
+    let environment = endpoint::environment_override_with(|name| std::env::var(name))?;
+    let selection = endpoint::select_source(
+        environment.as_deref(), settings, configured_pcscf, isim_pcscf,
+    )?;
+    endpoint::discover_with(
+        selection,
+        settings,
+        home_domain,
+        local,
+        |server, name, kind| async move {
+            query_dns(local, server, &name, kind, interface, worker).await
+        },
+        endpoint::DiscoveryLimits::default(),
+    )
+    .await
 }
 
 fn pcscf_srv_names(home_domain: &str) -> Vec<String> {
@@ -1175,31 +1058,6 @@ fn push_optional_addr(list: &mut Vec<IpAddr>, value: Option<IpAddr>) {
 
 fn same_family(left: IpAddr, right: IpAddr) -> bool {
     left.is_ipv4() == right.is_ipv4()
-}
-
-fn pcscf_candidates_for_family(candidates: &[IpAddr], local: IpAddr) -> Vec<IpAddr> {
-    candidates
-        .iter()
-        .copied()
-        .filter(|candidate| same_family(local, *candidate))
-        .fold(Vec::new(), |mut matching, candidate| {
-            if !matching.contains(&candidate) {
-                matching.push(candidate);
-            }
-            matching
-        })
-}
-
-fn parse_pcscf_override(value: &str) -> Vec<IpAddr> {
-    value
-        .split(|character: char| character == ',' || character == ';' || character.is_whitespace())
-        .filter_map(|candidate| candidate.trim().parse::<IpAddr>().ok())
-        .fold(Vec::new(), |mut addresses, address| {
-            if !addresses.contains(&address) {
-                addresses.push(address);
-            }
-            addresses
-        })
 }
 
 #[cfg(test)]
@@ -1326,7 +1184,7 @@ IPv4 primary DNS: 10.0.0.53";
     }
 
     #[test]
-    fn explicit_pcscf_and_override_candidates_are_filtered_by_family() {
+    fn explicit_pcscf_candidates_are_filtered_by_family() {
         let mut s = parse_ip_settings(SAMPLE);
         let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
         let v6 = IpAddr::V6("2001:db8::99".parse().unwrap());
@@ -1334,10 +1192,6 @@ IPv4 primary DNS: 10.0.0.53";
 
         assert_eq!(s.resolve_pcscf_for(s.ipv4_address.unwrap()).unwrap(), v4);
         assert_eq!(s.resolve_pcscf_for(s.ipv6_address.unwrap()).unwrap(), v6);
-        assert_eq!(
-            parse_pcscf_override("2001:db8::99, 192.0.2.10;invalid 192.0.2.10"),
-            vec![v6, v4]
-        );
     }
 
     #[test]

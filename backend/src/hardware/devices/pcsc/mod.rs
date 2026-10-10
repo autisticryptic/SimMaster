@@ -5,10 +5,8 @@
 //! dependencies installed by the deployment script.
 
 use std::{
-    collections::HashMap,
     process::Command,
-    sync::{Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde::Serialize;
@@ -20,7 +18,6 @@ use crate::connectivity::modems::ims::vowifi::qmi_uim::{
 };
 
 const COMMAND_TIMEOUT_SECS: u64 = 8;
-const IDENTITY_CACHE_TTL: Duration = Duration::from_secs(5);
 const MAX_OPTIONAL_EF_BYTES: usize = 4096;
 const OPTIONAL_EF_READ_CHUNK_BYTES: usize = 255;
 const USIM_AID_PREFIX: &[u8] = &[0xa0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02];
@@ -47,11 +44,8 @@ struct ApduResponse {
     sw2: u8,
 }
 
-static IDENTITY_CACHE: OnceLock<Mutex<HashMap<String, (Instant, PcscIdentity)>>> = OnceLock::new();
-
-fn identity_cache() -> &'static Mutex<HashMap<String, (Instant, PcscIdentity)>> {
-    IDENTITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
+mod ims;
+pub use ims::read_ims_uicc;
 
 pub fn selector_from_path(path: &str) -> Option<String> {
     path.trim()
@@ -376,16 +370,8 @@ pub async fn read_identity_async(path: &str) -> Result<PcscIdentity, String> {
     if selector_from_path(&path).is_none() {
         return Err("pcsc_reader_selector_invalid".to_string());
     }
-    if let Some(identity) = identity_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&path)
-        .filter(|(captured_at, _)| captured_at.elapsed() <= IDENTITY_CACHE_TTL)
-        .map(|(_, identity)| identity.clone())
-    {
-        return Ok(identity);
-    }
-    let cache_key = path.clone();
+    // A reader path is reusable by another card. Without a card-removal
+    // generation it is not a safe identity cache key.
     let identity = tokio::time::timeout(
         Duration::from_secs(COMMAND_TIMEOUT_SECS + 2),
         tokio::task::spawn_blocking(move || read_identity(&path)),
@@ -394,10 +380,6 @@ pub async fn read_identity_async(path: &str) -> Result<PcscIdentity, String> {
     .map_err(|_| "pcsc_identity_timeout".to_string())?
     .map_err(|_| "pcsc_identity_task_failed".to_string())?
     .map_err(str::to_string)?;
-    identity_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(cache_key, (Instant::now(), identity.clone()));
     Ok(identity)
 }
 
@@ -415,12 +397,21 @@ pub fn authenticate(
     rand: &[u8],
     autn: &[u8],
 ) -> Result<UsimAkaApduResult, &'static str> {
+    authenticate_with_aid(path, USIM_AID_PREFIX, rand, autn)
+}
+
+pub fn authenticate_with_aid(
+    path: &str,
+    aid: &[u8],
+    rand: &[u8],
+    autn: &[u8],
+) -> Result<UsimAkaApduResult, &'static str> {
     let reader = resolve_reader_blocking(path)?;
     let authenticate =
         build_usim_authenticate_apdu(rand, autn).map_err(|_| "pcsc_aka_apdu_build_failed")?;
     let responses = run_apdus(
         reader.index,
-        &[select_application_apdu(USIM_AID_PREFIX)?, authenticate],
+        &[select_application_apdu(aid)?, authenticate],
     )?;
     let select = responses.first().ok_or("pcsc_apdu_response_missing")?;
     require_success(select)?;

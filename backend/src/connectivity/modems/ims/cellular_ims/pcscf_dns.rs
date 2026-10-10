@@ -4,7 +4,10 @@
 //! chain) may supply an endpoint. Authority/additional glue is never a SIP
 //! destination. This validates association and framing, not DNS authenticity.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use super::{errors::code, CellularImsError};
 
@@ -14,6 +17,9 @@ const AAAA: u16 = 28;
 const CNAME: u16 = 5;
 const SRV: u16 = 33;
 const MAX_CNAME_HOPS: usize = 8;
+const MAX_DNS_RECORDS: usize = 256;
+pub(super) const MAX_DNS_ADDRESSES: usize = 16;
+pub(super) const MAX_DNS_SRV_TARGETS: usize = 16;
 
 fn invalid(reason: &str) -> CellularImsError {
     CellularImsError::with_detail(code::RUNTIME_ALL_PCSCF_FAILED, format!("dns_{reason}"))
@@ -80,6 +86,7 @@ pub(super) struct SrvTarget {
     pub port: u16,
     pub priority: u16,
     pub weight: u16,
+    pub ttl: u32,
 }
 
 impl SrvTarget {
@@ -88,9 +95,11 @@ impl SrvTarget {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct DnsRecords {
     pub addresses: Vec<IpAddr>,
+    /// Minimum lifetime across the answer's CNAME chain and duplicate RRs.
+    pub address_ttls: BTreeMap<IpAddr, u32>,
     pub srv_targets: Vec<SrvTarget>,
 }
 
@@ -181,6 +190,7 @@ enum Data {
 struct Answer {
     owner: Name,
     kind: u16,
+    ttl: u32,
     data: Data,
 }
 
@@ -204,6 +214,12 @@ pub(super) fn parse_dns_response(
     if word(packet, 4)? != 1 {
         return Err(invalid("question_count"));
     }
+    let total_records = [6, 8, 10].into_iter().try_fold(0usize, |total, offset| {
+        word(packet, offset).map(|count| total + usize::from(count))
+    })?;
+    if total_records > MAX_DNS_RECORDS {
+        return Err(invalid("record_limit"));
+    }
     let expected = Name::host(expected_name)?;
     let (question, question_end) = read_name(packet, 12)?;
     if question != expected
@@ -221,6 +237,8 @@ pub(super) fn parse_dns_response(
             let (owner, header) = read_name(packet, offset)?;
             let kind = word(packet, header)?;
             let class = word(packet, header + 2)?;
+            let ttl = (u32::from(word(packet, header + 4)?) << 16)
+                | u32::from(word(packet, header + 6)?);
             let length = usize::from(word(packet, header + 8)?);
             let start = header + 10;
             let end = start
@@ -266,6 +284,7 @@ pub(super) fn parse_dns_response(
                             port,
                             priority: word(packet, start).unwrap(),
                             weight: word(packet, start + 2).unwrap(),
+                            ttl,
                         });
                     Data::Service(target)
                 }
@@ -279,7 +298,7 @@ pub(super) fn parse_dns_response(
                 _ => Data::Other,
             };
             if section == 0 && class == IN {
-                answers.push(Answer { owner, kind, data });
+                answers.push(Answer { owner, kind, ttl, data });
             }
             offset = end;
         }
@@ -290,6 +309,7 @@ pub(super) fn parse_dns_response(
 
     let mut terminal = expected;
     let mut visited = vec![terminal.clone()];
+    let mut chain_ttl = u32::MAX;
     for hop in 0..=MAX_CNAME_HOPS {
         let mut next: Option<&Name> = None;
         for answer in answers.iter().filter(|answer| answer.owner == terminal) {
@@ -298,6 +318,7 @@ pub(super) fn parse_dns_response(
                     return Err(invalid("cname_conflict"));
                 }
                 next = Some(target);
+                chain_ttl = chain_ttl.min(answer.ttl);
             }
         }
         let Some(target) = next else { break };
@@ -318,18 +339,36 @@ pub(super) fn parse_dns_response(
         .filter(|answer| answer.owner == terminal && answer.kind == expected_type)
     {
         match answer.data {
-            Data::Address(address) if !result.addresses.contains(&address) => {
-                result.addresses.push(address)
+            Data::Address(address) => {
+                let ttl = chain_ttl.min(answer.ttl);
+                if let Some(previous) = result.address_ttls.get_mut(&address) {
+                    *previous = (*previous).min(ttl);
+                } else if result.addresses.len() < MAX_DNS_ADDRESSES {
+                    result.addresses.push(address);
+                    result.address_ttls.insert(address, ttl);
+                }
             }
-            Data::Service(Some(target)) if !result.srv_targets.contains(&target) => {
-                result.srv_targets.push(target)
+            Data::Service(Some(mut target)) => {
+                target.ttl = target.ttl.min(chain_ttl);
+                if let Some(previous) = result.srv_targets.iter_mut().find(|previous| {
+                    previous.target == target.target
+                        && previous.port == target.port
+                        && previous.priority == target.priority
+                        && previous.weight == target.weight
+                }) {
+                    previous.ttl = previous.ttl.min(target.ttl);
+                } else {
+                    result.srv_targets.push(target);
+                }
             }
             _ => {}
         }
     }
-    // Keep response order within a priority. Full weighted SRV scheduling is
-    // separate from this bounded, single-result P-CSCF fallback.
+    // Validate the entire packet before capping output. Sort before truncating
+    // so late, lower-priority-number RRs are not lost behind early worse ones.
+    // Weighted scheduling belongs to discovery, not this deterministic parser.
     result.srv_targets.sort_by_key(|target| target.priority);
+    result.srv_targets.truncate(MAX_DNS_SRV_TARGETS);
     Ok(result)
 }
 
@@ -674,6 +713,77 @@ mod tests {
             record(&mut malformed, &[0xc0, 12], SRV, IN, &bytes);
             assert!(parse_dns_response(ID, name, SRV, &malformed).is_err());
         }
+    }
+
+    fn record_ttl(packet: &mut Vec<u8>, owner: &[u8], kind: u16, ttl: u32, bytes: &[u8]) {
+        let offset = packet.len() + owner.len() + 4;
+        record(packet, owner, kind, IN, bytes);
+        packet[offset..offset + 4].copy_from_slice(&ttl.to_be_bytes());
+    }
+
+    #[test]
+    fn address_candidates_are_bounded_and_duplicate_ttls_take_the_minimum() {
+        let mut packet = response(HOST, A, [22, 0, 0]);
+        for octet in 1..=20 {
+            record_ttl(&mut packet, &[0xc0, 12], A, 60, &[192, 0, 2, octet]);
+        }
+        record_ttl(&mut packet, &[0xc0, 12], A, 10, &[192, 0, 2, 1]);
+        record_ttl(&mut packet, &[0xc0, 12], A, 120, &[192, 0, 2, 1]);
+        let records = parse_dns_response(ID, HOST, A, &packet).unwrap();
+        assert_eq!(records.addresses.len(), MAX_DNS_ADDRESSES);
+        assert_eq!(records.address_ttls.len(), MAX_DNS_ADDRESSES);
+        assert_eq!(records.addresses[0], "192.0.2.1".parse::<IpAddr>().unwrap());
+        assert_eq!(records.address_ttls[&records.addresses[0]], 10);
+        assert_eq!(records.addresses.last().unwrap(), &"192.0.2.16".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn cname_lifetimes_bound_address_and_srv_lifetimes() {
+        let mut packet = response(HOST, AAAA, [3, 0, 0]);
+        record_ttl(&mut packet, &wire("alias.example"), AAAA, 300, &Ipv6Addr::LOCALHOST.octets());
+        record_ttl(&mut packet, &[0xc0, 12], CNAME, 20, &wire("alias.example"));
+        record_ttl(&mut packet, &[0xc0, 12], CNAME, 10, &wire("alias.example"));
+        let records = parse(&packet).unwrap();
+        assert_eq!(records.address_ttls[&IpAddr::V6(Ipv6Addr::LOCALHOST)], 10);
+
+        let name = "_sip._udp.ims.example";
+        let mut packet = response(name, SRV, [3, 0, 0]);
+        record_ttl(&mut packet, &[0xc0, 12], CNAME, 25, &wire("_sip._udp.alias.example"));
+        record_ttl(&mut packet, &wire("_sip._udp.alias.example"), SRV, 300, &srv(5078, "p.example", 10));
+        record_ttl(&mut packet, &wire("_sip._udp.alias.example"), SRV, 15, &srv(5078, "p.example", 10));
+        let records = parse_dns_response(ID, name, SRV, &packet).unwrap();
+        assert_eq!(records.srv_targets.len(), 1);
+        assert_eq!(records.srv_targets[0].ttl, 15);
+        assert_eq!(records.srv_targets[0].port, 5078);
+    }
+
+    #[test]
+    fn srv_cap_retains_best_priorities_and_preserves_weights() {
+        let name = "_sip._udp.ims.example";
+        let mut packet = response(name, SRV, [20, 0, 0]);
+        // Better priorities appear after enough RRs to fill the output cap.
+        for priority in (0..20).rev() {
+            let mut bytes = srv(5078 + priority, "p.example", priority);
+            bytes[2..4].copy_from_slice(&7u16.to_be_bytes());
+            record(&mut packet, &[0xc0, 12], SRV, IN, &bytes);
+        }
+        let records = parse_dns_response(ID, name, SRV, &packet).unwrap();
+        assert_eq!(records.srv_targets.len(), MAX_DNS_SRV_TARGETS);
+        assert_eq!(records.srv_targets.iter().map(|s| s.priority).collect::<Vec<_>>(), (0..16).collect::<Vec<u16>>());
+        assert!(records.srv_targets.iter().all(|s| s.weight == 7 && s.port == 5078 + s.priority));
+    }
+
+    #[test]
+    fn record_count_limit_and_malformed_tail_cannot_hide_behind_candidate_cap() {
+        let too_many = response(HOST, AAAA, [(MAX_DNS_RECORDS + 1) as u16, 0, 0]);
+        let error = parse(&too_many).unwrap_err();
+        assert!(error.to_string().contains("dns_record_limit"));
+        let mut packet = response(HOST, A, [(MAX_DNS_ADDRESSES + 1) as u16, 0, 0]);
+        for octet in 1..=MAX_DNS_ADDRESSES {
+            record(&mut packet, &[0xc0, 12], A, IN, &[192, 0, 2, octet as u8]);
+        }
+        record(&mut packet, &[0xc0, 12], A, IN, &[192, 0, 2]);
+        assert!(parse_dns_response(ID, HOST, A, &packet).is_err());
     }
 
     #[test]

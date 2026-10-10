@@ -16,4 +16,5 @@ pub mod access_network;
 pub mod cellular_ims;
 pub mod effective_profile;
 pub mod profile_override;
+pub mod uicc_ims;
 pub mod vowifi;

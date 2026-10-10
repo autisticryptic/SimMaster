@@ -365,6 +365,45 @@ pub fn parse_application_id_from_card_status(
     Ok(Some(application_id.to_vec()))
 }
 
+/// Decode the bounded QMI UIM card-status array for exactly one physical slot.
+/// Do not scan bytes for a prefix: that could find another slot's application.
+pub fn parse_application_ids_for_slot(
+    message: &QmiMessage,
+    slot: u8,
+) -> Result<Vec<Vec<u8>>, QmiUimError> {
+    ensure_success(message)?;
+    let data = find_tlv(message, TLV_UIM_CARD_STATUS).ok_or(QmiUimError::InvalidFrame)?;
+    if slot == 0 || data.len() > 8192 { return Err(QmiUimError::InvalidFrame); }
+    let cards = usize::from(*data.get(8).ok_or(QmiUimError::InvalidFrame)?);
+    if cards > 8 || usize::from(slot) > cards { return Err(QmiUimError::InvalidFrame); }
+    let mut offset = 9;
+    let mut result: Vec<Vec<u8>> = Vec::new();
+    for card in 1..=cards {
+        let header = data.get(offset..offset + 6).ok_or(QmiUimError::InvalidFrame)?;
+        let present = header[0] == 1;
+        let count = usize::from(header[5]);
+        if count > 32 { return Err(QmiUimError::InvalidFrame); }
+        if card == usize::from(slot) && !present { return Err(QmiUimError::InvalidFrame); }
+        offset += 6;
+        for _ in 0..count {
+            let app = data.get(offset..offset + 7).ok_or(QmiUimError::InvalidFrame)?;
+            let length = usize::from(app[6]);
+            if length > 16 { return Err(QmiUimError::InvalidFrame); }
+            offset += 7;
+            let aid = data.get(offset..offset + length).ok_or(QmiUimError::InvalidFrame)?;
+            offset += length;
+            data.get(offset..offset + 7).ok_or(QmiUimError::InvalidFrame)?;
+            offset += 7;
+            if card == usize::from(slot) && !aid.is_empty() {
+                if result.iter().any(|existing| existing.as_slice() == aid) { return Err(QmiUimError::InvalidFrame); }
+                result.push(aid.to_vec());
+            }
+        }
+    }
+    if offset != data.len() { return Err(QmiUimError::InvalidFrame); }
+    Ok(result)
+}
+
 pub fn build_send_apdu_frame(
     client_id: u8,
     transaction_id: u16,
@@ -918,6 +957,100 @@ pub(crate) fn parse_fcp_file_size(data: &[u8]) -> Option<usize> {
     }
     None
 }
+
+#[path = "qmi_uim_isim.rs"]
+pub mod isim;
+pub use isim::IsimImsMaterial;
+
+pub fn read_uicc_application_aids_via_proxy_reason(
+    proxy_socket: &str, device_path: &str, slot: u8, timeout: Duration,
+) -> Result<Vec<Vec<u8>>, &'static str> {
+    let native_lease = crate::hardware::cellular::backends::sim::SimLease::for_endpoint(device_path, slot)?;
+    if let Some(lease) = native_lease.as_ref().filter(|lease| lease.uses_at()) {
+        return lease.application_aids();
+    }
+    #[cfg(not(unix))]
+    { let _ = (proxy_socket, device_path, slot, timeout); Err("isim_platform_unsupported") }
+    #[cfg(unix)]
+    {
+        let mut conn = QmiProxyConnection::connect(proxy_socket, timeout).map_err(|_| "isim_proxy_connect_failed")?;
+        conn.proxy_open(device_path).map_err(|_| "isim_proxy_open_failed")?;
+        let client = conn.allocate_uim_cid().map_err(|_| "isim_uim_client_failed")?;
+        let result = (|| {
+            let tx = conn.take_service_transaction();
+            let frame = build_get_card_status_frame(client, tx).map_err(|_| "isim_application_discovery_failed")?;
+            let response = conn.send_and_recv(&frame).map_err(|_| "isim_application_discovery_failed")?;
+            if response.message_id != QMI_UIM_GET_CARD_STATUS { return Err("isim_application_discovery_failed"); }
+            parse_application_ids_for_slot(&response, slot).map_err(|_| "isim_application_discovery_failed")
+        })();
+        let release = conn.release_uim_cid(client).map_err(|_| "isim_uim_client_release_failed");
+        result.and_then(|aids| { release?; Ok(aids) })
+    }
+}
+
+pub fn read_isim_ims_material_via_proxy_reason(
+    proxy_socket: &str,
+    device_path: &str,
+    slot: u8,
+    aid: &[u8],
+    timeout: Duration,
+) -> Result<IsimImsMaterial, &'static str> {
+    isim::validate_isim_aid(aid)?;
+    if slot == 0 { return Err("isim_slot_invalid"); }
+    let native_lease =
+        crate::hardware::cellular::backends::sim::SimLease::for_endpoint(device_path, slot)?;
+    if let Some(lease) = native_lease.as_ref().filter(|lease| lease.uses_at()) {
+        return lease.isim_material(aid);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (proxy_socket, device_path, slot, aid, timeout);
+        Err("isim_platform_unsupported")
+    }
+    #[cfg(unix)]
+    {
+        let mut conn = QmiProxyConnection::connect(proxy_socket, timeout)
+            .map_err(|_| "isim_proxy_connect_failed")?;
+        conn.proxy_open(device_path).map_err(|_| "isim_proxy_open_failed")?;
+        let client = conn.allocate_uim_cid().map_err(|_| "isim_uim_client_failed")?;
+        // Use the existing managed channel/ledger, including ambiguous-open
+        // reconciliation. Never open or close a second, untracked channel.
+        let channel = match conn.open_logical_channel(client, slot, aid) {
+            Ok(channel) => channel,
+            Err(_) => {
+                let _ = conn.release_uim_cid(client);
+                return Err("isim_logical_channel_failed");
+            }
+        };
+        let result = isim::read_isim_material_with(|apdu| {
+            conn.send_apdu(client, slot, channel.channel_id, apdu)
+                .map_err(|_| "isim_apdu_exchange_failed")
+        });
+        finish_isim_channel_read(result, |close| {
+            if close {
+                conn.close_logical_channel(client, slot, channel.channel_id)
+                    .map_err(|_| "isim_logical_channel_close_failed")
+            } else {
+                conn.release_uim_cid(client).map_err(|_| "isim_uim_client_release_failed")
+            }
+        })
+    }
+}
+
+// Always attempt both cleanups once, even on read/close failure. A caller must
+// retain the managed owner's uncertain receipt rather than retrying a close.
+fn finish_isim_channel_read<T>(
+    result: Result<T, &'static str>,
+    mut cleanup: impl FnMut(bool) -> Result<(), &'static str>,
+) -> Result<T, &'static str> {
+    let close = cleanup(true);
+    let release = cleanup(false);
+    result.and_then(|value| { close?; release?; Ok(value) })
+}
+
+#[cfg(test)]
+#[path = "qmi_uim_binding_tests.rs"]
+mod isim_binding_tests;
 
 pub fn read_usim_identity_via_proxy_reason(
     proxy_socket: &str,
@@ -1499,6 +1632,7 @@ impl QmiProxyConnection {
     fn resolve_application_aid(
         &mut self,
         client_id: u8,
+        slot: u8,
         aid: &[u8],
     ) -> Result<Vec<u8>, QmiUimError> {
         if aid.len() > USIM_AID_PREFIX.len() {
@@ -1510,7 +1644,13 @@ impl QmiProxyConnection {
         if response.message_id != QMI_UIM_GET_CARD_STATUS {
             return Err(QmiUimError::InvalidFrame);
         }
-        Ok(parse_application_id_from_card_status(&response, aid)?.unwrap_or_else(|| aid.to_vec()))
+        let matches = parse_application_ids_for_slot(&response, slot)?
+            .into_iter().filter(|candidate| candidate.starts_with(aid)).collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(aid.to_vec()),
+            [matched] => Ok(matched.clone()),
+            _ => Err(QmiUimError::InvalidFrame),
+        }
     }
 
     fn open_logical_channel(
@@ -1523,7 +1663,7 @@ impl QmiProxyConnection {
             owned.client_id == Some(client_id) && owned.slot == slot && owned.channel_id.is_none() && !owned.channel_uncertain) {
             return Err(QmiUimError::InvalidApduResponse);
         }
-        let resolved_aid = self.resolve_application_aid(client_id, aid)?;
+        let resolved_aid = self.resolve_application_aid(client_id, slot, aid)?;
         let tx = self.take_service_transaction();
         let frame = build_open_logical_channel_frame(client_id, tx, slot, &resolved_aid)?;
         if let Some(owned) = self.native_channel.as_mut() {

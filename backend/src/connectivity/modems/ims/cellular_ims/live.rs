@@ -17,6 +17,8 @@ mod register_fallback;
 mod security_hint;
 #[path = "register_failure_diagnostics.rs"]
 mod register_failure_diagnostics;
+#[path = "live_retry.rs"]
+mod live_retry;
 
 #[cfg(test)]
 pub(crate) mod offline_sim_adapter {
@@ -109,7 +111,7 @@ use super::{
     ipsec::{self, SecAgree, XfrmInstallPlan},
     native_bearer::{self, NativeImsBearer},
     pcscf::{
-        discover_pcscf_candidates_in_worker, discover_pcscf_via_active_at_context, pcscf_socket,
+        discover_pcscf_endpoints_in_worker, discover_pcscf_via_active_at_context, pcscf_socket,
         prepare_ims_profile_context, set_pcscf_reporting, ImsProfileLease,
     },
     plan::{FailureClass, ImsConnectionPlan},
@@ -262,6 +264,7 @@ pub struct CellularImsLiveHandle {
     operator: OperatorLink,
     supplementary: Arc<StdRwLock<Option<Arc<SupplementaryRuntime>>>>,
     mt_sms: tokio::sync::broadcast::Sender<SmsMessage>,
+    retry_scope: Arc<Mutex<live_retry::RetryScope>>,
 }
 
 impl Default for CellularImsLiveHandle {
@@ -280,6 +283,7 @@ impl CellularImsLiveHandle {
             operator: OperatorLink::default(),
             supplementary: Arc::new(StdRwLock::new(None)),
             mt_sms,
+            retry_scope: Arc::new(Mutex::new(live_retry::RetryScope::default())),
         }
     }
 
@@ -315,6 +319,7 @@ impl CellularImsLiveHandle {
             digest: Arc::new(CellularImsXcapDigestProvider {
                 device: session.device.clone(),
                 aid: session.aka_aid.clone(),
+                auth_binding: session.auth_binding.clone(),
                 username: session.identity.private_user.clone(),
             }),
         })
@@ -324,6 +329,7 @@ impl CellularImsLiveHandle {
 struct CellularImsXcapDigestProvider {
     device: CellularImsDeviceBinding,
     aid: Vec<u8>,
+    auth_binding: Option<UiccCardBinding>,
     username: String,
 }
 
@@ -340,6 +346,7 @@ impl XcapDigestProvider for CellularImsXcapDigestProvider {
             build_cellular_ims_xcap_authorization(
                 self.device.clone(),
                 self.aid.clone(),
+                self.auth_binding.as_ref(),
                 &self.username,
                 challenge,
                 proxy,
@@ -355,6 +362,7 @@ impl XcapDigestProvider for CellularImsXcapDigestProvider {
 async fn build_cellular_ims_xcap_authorization(
     device: CellularImsDeviceBinding,
     aid: Vec<u8>,
+    auth_binding: Option<&UiccCardBinding>,
     username: &str,
     challenge_value: &str,
     proxy: bool,
@@ -367,6 +375,9 @@ async fn build_cellular_ims_xcap_authorization(
         .map_err(|_| UtError::new("ut_xcap_challenge_invalid"))?;
     let aka_challenge = digest_aka::decode_aka_nonce(&challenge.nonce)
         .map_err(|_| UtError::new("ut_xcap_challenge_invalid"))?;
+    verify_ims_card_binding(&device, auth_binding).await
+        .map_err(|_| UtError::new("ims_uicc_binding_changed"))?;
+    let auth_device = device.clone();
     let aka = tokio::task::spawn_blocking(move || {
         identity::run_usim_aka(
             QMI_PROXY_SOCKET,
@@ -409,6 +420,8 @@ async fn build_cellular_ims_xcap_authorization(
         "00000001",
     )
     .map_err(|_| UtError::new("ut_xcap_aka_failed"))?;
+    verify_ims_card_binding(&auth_device, auth_binding).await
+        .map_err(|_| UtError::new("ims_uicc_binding_changed"))?;
     Ok(digest_aka::build_authorization_header(
         &challenge, username, uri, &response, &cnonce, "00000001",
     ))
@@ -436,6 +449,7 @@ struct CellularImsLiveSession {
     /// beta2-style AT IMS context retained until the WDS/SIP session ends.
     ims_profile_lease: Option<ImsProfileLease>,
     pcscf: SocketAddr,
+    endpoint_retries: live_retry::SharedEndpointRetries,
     ip_family: &'static str,
     xfrm_plan: Option<XfrmInstallPlan>,
     /// Previous successful SA retained for delayed protected traffic until the
@@ -465,6 +479,7 @@ struct CellularImsLiveSession {
     register_variant: CellularImsRegisterVariant,
     device: CellularImsDeviceBinding,
     aka_aid: Vec<u8>,
+    auth_binding: Option<UiccCardBinding>,
     profile: &'static CarrierProfile,
     /// Owned access-specific values fixed when this session started. Refresh,
     /// SMS and voice must not re-read SimOverrideStore mid-session.
@@ -512,8 +527,9 @@ struct PendingOptionsPing {
 }
 
 fn remaining_registration_lifetime(registration: &RegisteredImsContext) -> Duration {
-    let elapsed = registration.registered_at.elapsed().unwrap_or_default();
-    registration.lease.expires_after.saturating_sub(elapsed)
+    registration.registered_at.elapsed()
+        .map(|elapsed| registration.lease.expires_after.saturating_sub(elapsed))
+        .unwrap_or(Duration::ZERO)
 }
 
 fn refresh_retry_delay(
@@ -640,6 +656,8 @@ enum LiveVoiceDirection {
     MobileTerminated,
 }
 
+use crate::connectivity::modems::ims::uicc_ims::{self, UiccCardBinding};
+
 struct DeviceIdentity {
     diagnostic_required_security: bool,
     ims: ImsIdentity,
@@ -651,6 +669,8 @@ struct DeviceIdentity {
     aka_aid: Vec<u8>,
     usim_aid: String,
     isim_aid: Option<String>,
+    isim_pcscf: Vec<String>,
+    auth_binding: UiccCardBinding,
     source: &'static str,
 }
 
@@ -1212,6 +1232,7 @@ struct CellularImsRegisterAuthenticator {
     security_mechanism: Option<usize>,
     required_security: bool,
     aka_aid: Vec<u8>,
+    auth_binding: Option<UiccCardBinding>,
     register_policy: sip::RegisterRequestPolicy,
     profile: &'static CarrierProfile,
     effective_ims: EffectiveImsProfile,
@@ -1281,6 +1302,7 @@ impl CellularImsRegisterAuthenticator {
             security_mechanism: None,
             required_security: false,
             aka_aid,
+            auth_binding: None,
             register_policy,
             profile,
             effective_ims,
@@ -1302,6 +1324,11 @@ impl CellularImsRegisterAuthenticator {
             return Err(ImsError::new(code::RUNTIME_NOT_RUNNING));
         }
         ensure_worker_binding_current_ims(&self.worker_binding)
+    }
+
+    fn with_auth_binding(mut self, binding: Option<UiccCardBinding>) -> Self {
+        self.auth_binding = binding;
+        self
     }
 
     fn with_required_security(mut self, required: bool) -> Self {
@@ -1735,6 +1762,7 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         let uim_slot = self.device.uim_slot;
         let aka_runtime = self.runtime.clone();
         self.ensure_task_current()?;
+        verify_ims_card_binding(&self.device, self.auth_binding.as_ref()).await?;
         let aka = tokio::task::spawn_blocking(move || {
             if !aka_runtime.task_is_current() {
                 return Err(CellularImsError::new(code::RUNTIME_NOT_RUNNING));
@@ -1755,6 +1783,7 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         .map_err(|_| ImsError::new(code::USIM_AKA_FAILED))?
         .map_err(to_ims_error)?;
 
+        verify_ims_card_binding(&self.device, self.auth_binding.as_ref()).await?;
         self.ensure_task_current()?;
         tracing::info!(
             res_length = aka.res.len(),
@@ -2379,6 +2408,10 @@ async fn connect_inner(
         device_identity.profile = Box::leak(Box::new(profile));
         device_identity.diagnostic_required_security = true;
     }
+    let endpoint_retries = live.retry_scope.lock().await.for_card(&device_identity.auth_binding);
+    if !device_identity.profile.ims.transport.eq_ignore_ascii_case("udp") {
+        return Err(CellularImsError::new(code::PCSCF_TRANSPORT_UNSUPPORTED));
+    }
     // Catalog `ip_stack` remains metadata, not permission to narrow or reorder
     // the production dual-stack -> IPv6 -> IPv4 fallback sequence.
     let ims_apn = device_identity
@@ -2885,10 +2918,11 @@ async fn connect_inner(
                 .pcscf
                 .as_ref()
                 .map(|field| field.value.as_str());
-            let pcscf_candidates = match discover_pcscf_candidates_in_worker(
+            let pcscf_endpoints = match discover_pcscf_endpoints_in_worker(
                 &bearer.settings,
                 &device_identity.ims.home_domain,
                 configured_pcscf,
+                &device_identity.isim_pcscf,
                 local_addr,
                 &bearer.interface,
                 &worker,
@@ -2925,6 +2959,12 @@ async fn connect_inner(
                     return Err(error);
                 }
             };
+            for endpoint in &pcscf_endpoints {
+                tracing::debug!(source = ?endpoint.source, transport = ?endpoint.transport,
+                    port = endpoint.socket.port(), ttl = ?endpoint.ttl,
+                    "Selected P-CSCF endpoint provenance");
+            }
+            let pcscf_candidates: Vec<SocketAddr> = pcscf_endpoints.iter().map(|endpoint| endpoint.socket).collect();
             // Route the whole accepted bearer list and the selected discovery
             // result before the first SIP candidate. This does not merge or
             // reorder discovery sources, profiles, or address-family fallbacks.
@@ -2975,6 +3015,7 @@ async fn connect_inner(
                             local_addr,
                             pcscf,
                             has_next_pcscf,
+                            &endpoint_retries,
                             &device,
                             live.operator.video_enabled(),
                             access_network_runtime,
@@ -3136,6 +3177,7 @@ async fn connect_family(
     local_addr: IpAddr,
     pcscf: SocketAddr,
     has_alternate_pcscf: bool,
+    endpoint_retries: &live_retry::SharedEndpointRetries,
     device: &CellularImsDeviceBinding,
     video_capability_enabled: bool,
     access_network_runtime: &ImsAccessNetworkRuntime,
@@ -3253,6 +3295,10 @@ async fn connect_family(
     let mut candidate_attempts = 0usize;
     let mut consecutive_silent_failures = 0usize;
     while pending_variant.is_some() || register_variants.peek().is_some() {
+        let now = Instant::now();
+        if let Some(error) = live_retry::admission_error(endpoint_retries.lock().await.check(pcscf, now), now) {
+            return Err(error);
+        }
         if let Some(native) = native_bearer.as_deref_mut() {
             native.check_liveness()?;
         }
@@ -3381,6 +3427,7 @@ async fn connect_family(
             None,
             socket_worker,
         )
+        .with_auth_binding(Some(device_identity.auth_binding.clone()))
         .with_worker_binding(worker_binding.clone())
         .with_required_security(fallback_state.requires_protection(profile))
         .with_security_mechanism(variant.security_mechanism);
@@ -3427,6 +3474,16 @@ async fn connect_family(
                     )
                     .await;
                 if device_identity.diagnostic_required_security {
+                    return Err(error);
+                }
+                let metadata = failure.metadata();
+                if metadata.kind == crate::connectivity::core::register::RegisterFailureKind::TemporaryEndpoint
+                    || (metadata.kind != crate::connectivity::core::register::RegisterFailureKind::Transport
+                        && metadata.retry_after != crate::connectivity::core::register::RetryAfter::Absent)
+                {
+                    endpoint_retries.lock().await.observe_failure(pcscf, &metadata, Instant::now());
+                    // A server wait is not a header/profile compatibility hint.
+                    // Only the outer loop may consider an eligible other endpoint.
                     return Err(error);
                 }
                 if has_alternate_pcscf
@@ -3622,6 +3679,7 @@ async fn connect_family(
             registration: registered,
             bearer: bearer.clone(),
             pcscf,
+            endpoint_retries: endpoint_retries.clone(),
             ip_family: ip_family_name(local_addr),
             xfrm_plan: authenticator.xfrm_plan,
             retired_xfrm_plan: None,
@@ -3643,6 +3701,7 @@ async fn connect_family(
             register_variant: variant,
             device: device.clone(),
             aka_aid: device_identity.aka_aid.clone(),
+            auth_binding: Some(device_identity.auth_binding.clone()),
             profile,
             effective_ims: device_identity.effective_ims.clone(),
             visited_network_header: device_identity.visited_network_header.clone(),
@@ -3801,6 +3860,7 @@ async fn unregister_live_session(
         security_verify,
         session.xfrm_worker.clone(),
     )
+    .with_auth_binding(session.auth_binding.clone())
     .with_worker_binding(session.worker_binding.clone())
     .with_security_mechanism(session.register_variant.security_mechanism)
     .with_expires_seconds(0);
@@ -4372,6 +4432,13 @@ async fn refresh_live_registration(
             retry_after: None,
         };
     }
+    let retry_now = Instant::now();
+    let admission = session.endpoint_retries.lock().await.check(session.pcscf, retry_now);
+    if let Some(decision) = super::register_retry::refresh_wait_decision(admission, retry_now, remaining_lifetime) {
+        let error = live_retry::admission_error(admission, retry_now)
+            .unwrap_or_else(|| CellularImsError::new(code::REGISTER_RETRY_DEFERRED));
+        return live_retry::refresh_attempt(decision, error);
+    }
     // The live session owns the negotiated protected channel. Before every
     // refresh, restore the header advertisement from the session's original
     // client binding. This is a SIP-route repair only: do not tear down the
@@ -4547,6 +4614,7 @@ async fn refresh_live_registration(
             security_verify,
             session.xfrm_worker.clone(),
         )
+        .with_auth_binding(session.auth_binding.clone())
         .with_worker_binding(session.worker_binding.clone())
         .with_security_mechanism(variant.security_mechanism)
         .with_expires_seconds(refresh_expires);
@@ -4589,6 +4657,23 @@ async fn refresh_live_registration(
                         error: Some(error),
                         retry_after: None,
                     };
+                }
+                let metadata = failure.metadata();
+                if metadata.kind == crate::connectivity::core::register::RegisterFailureKind::TemporaryEndpoint {
+                    let decision = session.endpoint_retries.lock().await.observe_refresh_failure(
+                        session.pcscf, &metadata, Instant::now(),
+                        remaining_registration_lifetime(&session.registration),
+                    );
+                    runtime.record_attempt(CellularImsStage::RegisterRefresh, Some(session.ip_family),
+                        "failed", Some(&error), Some("temporary_endpoint_existing_binding".into())).await;
+                    return live_retry::refresh_attempt(decision, error);
+                }
+                if metadata.kind != crate::connectivity::core::register::RegisterFailureKind::Transport
+                    && metadata.retry_after != crate::connectivity::core::register::RetryAfter::Absent
+                {
+                    session.endpoint_retries.lock().await.observe_failure(session.pcscf, &metadata, Instant::now());
+                    last_failure = Some((variant, failure));
+                    break;
                 }
                 if is_refresh_transport_failure(&failure) || invalid_security_offer {
                     let remaining_lifetime = remaining_registration_lifetime(&session.registration);
@@ -7099,7 +7184,7 @@ async fn retry_cellular_ims_mwi_subscription_with_aka(
     live: &CellularImsLiveHandle,
     challenge_frame: &[u8],
 ) -> Result<(), CellularImsError> {
-    let (device, aid, identity, route, registration, profile, security_verify) = {
+    let (device, aid, auth_binding, identity, route, registration, profile, security_verify) = {
         let sessions = live.session.lock().await;
         let session = sessions
             .as_ref()
@@ -7116,6 +7201,7 @@ async fn retry_cellular_ims_mwi_subscription_with_aka(
         (
             session.device.clone(),
             session.aka_aid.clone(),
+            session.auth_binding.clone(),
             session.identity.clone(),
             session.channel.route(),
             session.registration.clone(),
@@ -7125,6 +7211,9 @@ async fn retry_cellular_ims_mwi_subscription_with_aka(
     };
     let challenge = parse_digest_challenge(challenge_frame)?;
     let aka_challenge = digest_aka::decode_aka_nonce(&challenge.nonce)?;
+    verify_ims_card_binding(&device, auth_binding.as_ref()).await
+        .map_err(|_| CellularImsError::new("ims_uicc_binding_changed"))?;
+    let auth_device = device.clone();
     let aka = tokio::task::spawn_blocking(move || {
         identity::run_usim_aka(
             QMI_PROXY_SOCKET,
@@ -7140,6 +7229,8 @@ async fn retry_cellular_ims_mwi_subscription_with_aka(
     })
     .await
     .map_err(|_| CellularImsError::new(code::USIM_AKA_FAILED))??;
+    verify_ims_card_binding(&auth_device, auth_binding.as_ref()).await
+        .map_err(|_| CellularImsError::new("ims_uicc_binding_changed"))?;
     let cnonce = sip::hex_token(8);
     let digest_uri = identity.public_uri.as_str();
     let authorization = if let Some(auts) = aka.auts.as_deref() {
@@ -7368,6 +7459,8 @@ async fn load_device_identity(
     sim_override: &SimOverride,
     expected_mm_sim: Option<&(String, u8)>,
 ) -> Result<DeviceIdentity, CellularImsError> {
+    let auth_binding = uicc_ims::capture_card_binding(&device.qmi_device, device.uim_slot, &device.modem_id)
+        .await.map_err(CellularImsError::new)?;
     let modem = command_output(
         "mmcli",
         &["-m", device.modem_id.as_str(), "--output-keyvalue"],
@@ -7406,7 +7499,7 @@ async fn load_device_identity(
         .filter(|value| value.len() >= 5 && value.bytes().all(|byte| byte.is_ascii_digit()));
     // Resolve the full AID for this slot before a UIM identity fallback needs
     // to open the USIM application. Never borrow an AID from another slot.
-    let applications = load_uicc_applications(device).await;
+    let applications = load_uicc_applications(device).await?;
     let aka_aid = identity::resolve_usim_aid(applications.usim_aid.as_deref());
     let usim_aid = identity::aid_hex(&aka_aid);
     let isim_aid = applications.isim_aid.as_deref().map(identity::aid_hex);
@@ -7544,7 +7637,37 @@ async fn load_device_identity(
             state.profile_fallback_reason = resolved.fallback_reason.clone();
         })
         .await;
-    let effective_ims = resolve_effective_ims_profile(profile, Some(sim_override));
+    let mut effective_ims = resolve_effective_ims_profile(profile, Some(sim_override));
+    let material = if let Some(aid) = applications.isim_aid.as_ref() {
+        let endpoint = device.qmi_device.clone();
+        let slot = device.uim_slot;
+        let aid = aid.clone();
+        Some(tokio::task::spawn_blocking(move || {
+            crate::connectivity::modems::ims::vowifi::qmi_uim::read_isim_ims_material_via_proxy_reason(
+                QMI_PROXY_SOCKET, &endpoint, slot, &aid, Duration::from_secs(3),
+            )
+        }).await.map_err(|_| CellularImsError::new("isim_read_task_failed"))?
+          .map_err(CellularImsError::new)?)
+    } else { None };
+    let selected = uicc_ims::resolve_ims_identity(
+        &imsi, &aka_aid,
+        applications.isim_aid.as_deref().zip(material.as_ref()),
+        &effective_ims.domain.value, &effective_ims.realm.value,
+        resolved.origin != ProfileOrigin::Derived || sim_override.ims_cellular.domain.is_some(),
+        resolved.origin != ProfileOrigin::Derived || sim_override.ims_cellular.realm.is_some(),
+    ).map_err(CellularImsError::new)?;
+    if selected.source == uicc_ims::ImsIdentitySource::Isim && resolved.origin == ProfileOrigin::Derived {
+        if sim_override.ims_cellular.domain.is_none() {
+            effective_ims.domain.source = crate::connectivity::modems::ims::profile_override::OverrideSource::Isim;
+        }
+        if sim_override.ims_cellular.realm.is_none() {
+            effective_ims.realm.source = crate::connectivity::modems::ims::profile_override::OverrideSource::Isim;
+        }
+    }
+    effective_ims.domain.value = selected.identity.home_domain.clone();
+    effective_ims.realm.value = selected.realm;
+    let identity_source = if selected.source == uicc_ims::ImsIdentitySource::Isim { "isim" } else { identity_source };
+    runtime.update(|state| state.identity_source = Some(identity_source.to_owned())).await;
     let derived_visited_network_candidate = resolved.origin == ProfileOrigin::Derived;
     let visited_network_header = visited_network_header(
         &imsi,
@@ -7592,45 +7715,47 @@ async fn load_device_identity(
             ));
         }
     }
+    let current = uicc_ims::capture_card_binding(&device.qmi_device, device.uim_slot, &device.modem_id)
+        .await.map_err(CellularImsError::new)?;
+    auth_binding.verify(&current).map_err(CellularImsError::new)?;
+    if auth_binding.imsi != imsi { return Err(CellularImsError::new("ims_uicc_binding_changed")); }
     Ok(DeviceIdentity {
         diagnostic_required_security: false,
-        ims: ImsIdentity {
-            private_user: format!("{imsi}@{}", effective_ims.realm.value),
-            public_uri: format!("sip:{imsi}@{}", effective_ims.domain.value),
-            contact_user: imsi.clone(),
-            home_domain: effective_ims.domain.value.clone(),
-            contact_user_phone: false,
-        },
+        ims: selected.identity,
         profile,
         effective_ims,
         effective_device_identity,
         visited_network_header,
         dynamic_visited_network_fallback,
-        aka_aid,
+        aka_aid: selected.auth_aid,
         usim_aid,
         source: identity_source,
         isim_aid,
+        isim_pcscf: selected.isim_pcscf,
+        auth_binding,
     })
 }
 
-async fn load_uicc_applications(device: &CellularImsDeviceBinding) -> identity::UiccApplications {
-    match command_output(
-        "qmicli",
-        &[
-            "-d",
-            device.qmi_device.as_str(),
-            "--device-open-proxy",
-            "--uim-get-card-status",
-        ],
-    )
-    .await
-    {
-        Ok(output) => identity::parse_uicc_applications_for_slot(&output, device.uim_slot),
-        Err(error) => {
-            tracing::warn!(error = %error, "VoLTE UICC application discovery failed; using USIM AID fallback");
-            identity::UiccApplications::default()
-        }
-    }
+async fn verify_ims_card_binding(
+    device: &CellularImsDeviceBinding,
+    binding: Option<&UiccCardBinding>,
+) -> Result<(), ImsError> {
+    let expected = binding.ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?;
+    let current = uicc_ims::capture_card_binding(&device.qmi_device, device.uim_slot, &device.modem_id)
+        .await.map_err(ImsError::new)?;
+    expected.verify(&current).map_err(ImsError::new)
+}
+
+async fn load_uicc_applications(device: &CellularImsDeviceBinding) -> Result<identity::UiccApplications, CellularImsError> {
+    let endpoint = device.qmi_device.clone();
+    let slot = device.uim_slot;
+    let aids = tokio::task::spawn_blocking(move || {
+        crate::connectivity::modems::ims::vowifi::qmi_uim::read_uicc_application_aids_via_proxy_reason(
+            QMI_PROXY_SOCKET, &endpoint, slot, Duration::from_secs(3),
+        )
+    }).await.map_err(|_| CellularImsError::new("isim_read_task_failed"))?
+      .map_err(CellularImsError::new)?;
+    identity::UiccApplications::from_aids(aids).map_err(CellularImsError::new)
 }
 
 async fn resolve_fallback_imsi(
@@ -8082,13 +8207,14 @@ fn map_refresh_register_error(error: ImsError) -> CellularImsError {
 
 fn map_refresh_register_failure(failure: &RegisterFailure) -> CellularImsError {
     let mapped = map_refresh_register_error(failure.error);
-    match register_failure_status(failure) {
+    let mapped = match register_failure_status(failure) {
         Some(status) => CellularImsError::with_detail(
             mapped.code(),
             format!("{}:sip_status={status}", failure.error.code()),
         ),
         None => mapped,
-    }
+    };
+    mapped.with_register_failure(failure.metadata())
 }
 
 fn register_failure_status(failure: &RegisterFailure) -> Option<u16> {
@@ -8462,13 +8588,14 @@ fn terminal_register_failure_status(failure: &RegisterFailure) -> Option<u16> {
 
 fn map_register_failure(failure: &RegisterFailure) -> CellularImsError {
     let mapped = map_register_error(failure.error);
-    match terminal_register_failure_status(failure) {
+    let mapped = match terminal_register_failure_status(failure) {
         Some(status) => CellularImsError::with_detail(
             mapped.code(),
             format!("{}:sip_status={status}", failure.error.code()),
         ),
         None => mapped,
-    }
+    };
+    mapped.with_register_failure(failure.metadata())
 }
 
 fn should_retain_failed_bearer(error: &CellularImsError) -> bool {
@@ -9237,6 +9364,7 @@ mod tests {
             pcscf_reporting_cid: None,
             ims_profile_lease: None,
             pcscf: pcscf_addr,
+            endpoint_retries: Arc::new(Mutex::new(super::super::register_retry::EndpointRetryState::default())),
             ip_family: "ipv4",
             xfrm_plan: None,
             retired_xfrm_plan: None,
@@ -9263,6 +9391,7 @@ mod tests {
                 equipment_identifier: "490154203237518".into(),
             },
             aka_aid: Vec::new(),
+            auth_binding: None,
             profile,
             effective_ims: resolve_effective_ims_profile(profile, None),
             visited_network_header: None,

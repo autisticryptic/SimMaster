@@ -103,6 +103,10 @@ pub mod code {
     pub const BEARER_ADDRESS_CHANGED: &str = "cellular_ims_bearer_address_changed";
     pub const BEARER_SESSION_LOST: &str = "cellular_ims_bearer_session_lost";
     pub const PCSCF_FAMILY_MISMATCH: &str = "cellular_ims_pcscf_family_mismatch";
+    /// An explicit endpoint must not silently lose its URI, port or parameters.
+    pub const PCSCF_ENDPOINT_INVALID: &str = "cellular_ims_pcscf_endpoint_invalid";
+    /// The cellular transport currently supports UDP; never downgrade TCP/TLS.
+    pub const PCSCF_TRANSPORT_UNSUPPORTED: &str = "cellular_ims_pcscf_transport_unsupported";
 
     // UE-only native bearer allocation.
     /// This line has no prepared native endpoint whose interface can be moved
@@ -110,6 +114,8 @@ pub mod code {
     pub const DATA_SLOT_MODE_MISSING: &str = "cellular_ims_data_slot_mode_missing";
 
     // Registration.
+    pub const REGISTER_RETRY_DEFERRED: &str = "cellular_ims_register_retry_deferred";
+    pub const REGISTER_RETRY_STOPPED: &str = "cellular_ims_register_retry_stopped";
     pub const REGISTER_SEND_FAILED: &str = "cellular_ims_register_send_failed";
     pub const REGISTER_AUTH_SEND_FAILED: &str = "cellular_ims_register_auth_send_failed";
     pub const REGISTER_AUTH_UNEXPECTED_STATUS: &str =
@@ -343,7 +349,9 @@ pub mod code {
         MODEM_REFRESH_FAILED,
         MT_RP_DATA_INVALID,
         PANI_REQUIRED_DYNAMIC_UNAVAILABLE,
+        PCSCF_ENDPOINT_INVALID,
         PCSCF_FAMILY_MISMATCH,
+        PCSCF_TRANSPORT_UNSUPPORTED,
         PHONE_URI_INVALID,
         PROFILE_ATTEMPTS_EXHAUSTED,
         PROFILE_ATTEMPT_COUNT_INVALID,
@@ -363,6 +371,8 @@ pub mod code {
         REGISTER_REFRESH_RECEIVE_FAILED,
         REGISTER_REFRESH_SEND_FAILED,
         REGISTER_REFRESH_UNEXPECTED_STATUS,
+        REGISTER_RETRY_DEFERRED,
+        REGISTER_RETRY_STOPPED,
         REGISTER_SEND_FAILED,
         RETRY_ALREADY_RUNNING,
         ROUTE_FAMILY_MISMATCH,
@@ -436,18 +446,35 @@ pub mod code {
 pub struct CellularImsError {
     code: &'static str,
     detail: Option<String>,
+    // Recovery consumes typed provenance, never a formatted diagnostic suffix.
+    register_failure: Option<crate::connectivity::core::register::RegisterFailureMetadata>,
 }
 
 impl CellularImsError {
     pub fn new(code: &'static str) -> Self {
-        Self { code, detail: None }
+        Self { code, detail: None, register_failure: None }
     }
 
     pub fn with_detail(code: &'static str, detail: impl Into<String>) -> Self {
         Self {
             code,
             detail: Some(detail.into()),
+            register_failure: None,
         }
+    }
+
+    pub fn with_register_failure(
+        mut self,
+        failure: crate::connectivity::core::register::RegisterFailureMetadata,
+    ) -> Self {
+        self.register_failure = Some(failure);
+        self
+    }
+
+    pub fn register_failure(
+        &self,
+    ) -> Option<&crate::connectivity::core::register::RegisterFailureMetadata> {
+        self.register_failure.as_ref()
     }
 
     pub fn code(&self) -> &'static str {
@@ -515,7 +542,7 @@ mod tests {
         // Keep in step with the `pub const` count in `mod code`.
         assert_eq!(
             code::ALL.len(),
-            159,
+            163,
             "code::ALL is out of sync with mod code"
         );
         let mut seen = std::collections::BTreeSet::new();
