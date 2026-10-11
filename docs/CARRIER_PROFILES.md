@@ -18,6 +18,9 @@ database/catalog缺项或不可投影后可以在该槽内回退derived，不能
 
 SimAdmin不在运行时解析Apple/AOSP/厂商固件。收集、提取、来源审计、归一化和封存属于独立catalog项目。
 运行时只读取契约兼容、sealed的SQLite，用户覆盖保存在自己的data.db，不改写发布catalog。
+ISIM 是当前卡提供的运行态材料，不是第四种 profile 源：完整身份/AID 一起选用，只有未显式覆盖的 derived 域可由卡内 DOMAIN 替换，字段来源可标 `isim`。
+卡内 P-CSCF 在显式 profile 之后、标准 DNS 之前；完整来源/传输/错误边界见 [IMS 协议](IMS_REGISTRATION_POLICY.md)。
+EC20 固件审查没有改变 catalog 发布集合，也没有将提取的 MCFG 默认值直接写进运行配置。
 旧配置迁移必须可追踪/幂等，不把未知ready状态改成支持，也不能冒用另一个MVNO条目。
 
 主要入口：`carrier_catalog.rs`、`carrier_catalog_v7.rs`、`profile_store.rs`、`profile_record.rs`。

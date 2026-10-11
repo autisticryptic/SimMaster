@@ -61,6 +61,10 @@ YAML写后重解析，保留未变注释；线路映射/业务历史不因重构
 
 新Rust测试必须加入执行过滤器；仅`cargo test --no-run`通过不表示执行过测试。
 过滤器选中0条应失败；下载日志逐名核验新增回归，避免只看绿色workflow。
+ISIM/端点/恢复第一批另包含 `qmi_uim::isim::tests`、`isim_binding_tests`、`uicc_ims::tests`、
+`vowifi::live::live_identity::tests`、`pcsc::ims::tests`、`cellular_ims::pcscf::endpoint::tests`、
+`register_retry::tests` 和 `live::live_retry::tests`；实际刷新和 profile batch 的新增测试纳入原过滤器。
+GitHub artifact 下载需要认证时，用户可直接提供未解压 ZIP；先对比官方 artifact SHA-256，再只读检查日志/JSON，不要求用户提供 token。
 私有D-Bus和fake peer必须与真实系统总线、modem和公网隔离。
 
 注册模拟在Actions runner执行，例如：

@@ -7,10 +7,31 @@
 1. 修复**全局蜂窝 IMS 注册兜底**，不增加运营商/MCC/MNC 分支或特例测试。
 2. 日常只维护 `master`；**编译、Rust 测试和注册模拟仅在 GitHub Actions 执行**。
 3. 保留原线路列表、详情和标签布局；文档只更新固定入口，不新增日期流水账。
-4. 本轮已获授权部署到 SSH 410，并检查原卡、原配置的 IMS 注册；不重启 MM/基带，不盲删资源。
+4. 2026-10-07 的 410 部署属于已结束的历史授权；本轮只实施 IMS 补全和 Actions 验证，**未部署、未访问设备，也不主动连接 IDA**。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 已完成的全局修复
+## 当前：ISIM、P-CSCF 与临时拒绝补全
+
+代码基线 **`5aaf3eab6515aba9f5f5eb43553ea00a1cec3264`**（前一实现提交 `e702cef`），已推送 `simmaster/master`。
+
+- 共享读取 ISIM 的 IMPI/DOMAIN/IMPU/P-CSCF；完整身份与认证 AID 一起选用，合法未配置时保留 USIM 派生；读取错误、损坏、换卡不假装缺省。VoWiFi 的 EAP 仍使用 USIM。
+- QMI 按 slot 发现应用，native AT 通过自有通道读取 EF_DIR；PC/SC 每个进程重选完整 AID/文件，并用稳定 reader 名称防止索引重排。卡/slot/owner 检查是分阶段观察，不冒称可原子排除所有物理热插拔竞态。
+- P-CSCF 保留端口、UDP 传输和来源，采用有界承载内 DNS 多候选。显式 TCP/TLS/sips 或不支持的 URI 参数明确失败，不再静默降为 UDP/5060。
+- 结构化 REGISTER 失败驱动端点等待/切换；同 SIM 的 profile、普通重连或 worker 变化不清空 not-before。候选耗尽后的下一批承载也受等待门禁；临时刷新拒绝只保留到旧租期截止，不延长租期或改成明文。
+- 原地址族顺序、安全报价/白名单、24 个静态候选预算和原 UI 布局保持；未加入运营商分支、未改现有设备配置或库。
+
+### 验证与尚需用户操作
+
+- [Build-Release 38052500633](https://github.com/autisticryptic/SimMaster/actions/runs/38052500633)：success；ARM64/AMD64 构建成功，Publish Release skipped。
+- [Validate Beta Refactor 38052500773](https://github.com/autisticryptic/SimMaster/actions/runs/38052500773)：success。两套均包含新增非零过滤器门禁及既有四个注册模拟矩阵。
+- 首轮 `e702cef` 编译成功，但旧 family-fallback 断言失败；已按结构化失败契约修正并在上述第二轮通过，不能省略首次失败。
+- 本机 303 项 Python 静态/mock 检查通过；没有本机 Rust/前端编译或注册模拟。
+- **逐名日志、测试计数、测试 artifact 摘要核验尚未完成**：匿名下载返回 401，非交互 GitHub credential helper 无可用凭据。已请用户下载两个 workflow 的 `ims-refresh-tests`、`beta-refactor-tests` ZIP，放到 `.local/evidence/isim-endpoint-retry/`；不需要密码/令牌，也不用解压。
+- 官方测试 artifact 摘要：`ims-refresh-tests`（11670501045）为 `a945fbecc99aec037aaafc64967c1055c35e7d07a04a086e7f4ee1e677b2f3c0`；`beta-refactor-tests`（11670590696）为 `0bb4998139467e4ef668bb7a9a9e808490720431f0cf7d75e709f3ce5d0d8547`。
+- API 状态、artifact 元数据和本机静态检查暂存 `.local/session-recovery/20261010-resume/`。只读校验器已准备为 `.local/evidence/isim-endpoint-retry/verify_artifacts.py`，只校验 ZIP/日志/JSON，不执行解压内容或注册模拟。仅获取元数据不等于下载校验了程序包。
+- **未部署、未做新版本初始注册/自然续期/业务/热插拔实机验收**。第二批 reg-event、rspauth、AUTS/stale 与跨候选 423 预算另列于[开发计划](DEVELOPMENT_PLAN.md)。
+
+## 已完成的全局修复（上轮）
 
 源码提交 **`c174551705bc6c0699cd2d7775e56c803e09b92b`**，远端 `autisticryptic/SimMaster`（本地 `simmaster`）。
 
@@ -24,7 +45,7 @@
 
 实现及边界见[IMS 注册协议](IMS_REGISTRATION_POLICY.md)。
 
-## Actions 与产物证据
+## 上轮 Actions 与产物证据
 
 - [Build-Release 37561979219](https://github.com/autisticryptic/SimMaster/actions/runs/37561979219)：success，Publish Release skipped。
 - [Validate Beta Refactor 37561979212](https://github.com/autisticryptic/SimMaster/actions/runs/37561979212)：success。
@@ -35,7 +56,7 @@
 - ARM64 包 SHA-256：`4a2c66cef0695bfb9146fad131aec571d77691e44615af2910a8b6c1771d50d0`。
 - 证据：`.local/evidence/global-register-fallback/verified.json`。文档收尾提交不代表另一个二进制。
 
-## 410 部署与原配置验收
+## 上轮 410 部署与原配置验收
 
 **2026-10-07 03:18:11 UTC 独立收尾，03:25:30 UTC 再次只读复检**，已 pin 的 WLAN SSH `192.168.100.13`：
 

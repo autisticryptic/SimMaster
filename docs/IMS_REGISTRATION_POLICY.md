@@ -12,6 +12,7 @@
 - `0502395` 已完整撤回 `7bd` 的 CMCC 专用 flag 补丁及测试；不能声称 CMCC 已修复。
 - `c174551` 已完成全局蜂窝 REGISTER 的身份/安全要求继承及候选去重，Actions 与 410 原配置初始注册已验证。
   不新增运营商专用分支或测试；中国移动同卡、自然续期和业务验收仍独立，见 [HANDOFF](HANDOFF.md)。
+- `5aaf3ea` 补全共享 ISIM 身份、蜂窝 P-CSCF 端点和临时拒绝恢复；Actions 成功但未部署，详细验证边界见 [HANDOFF](HANDOFF.md)。
 - 本文描述既有契约，不授权执行注册、呼叫、短信、换卡、重启或恢复写操作。
 
 ## 2. 启用意图与自动选择
@@ -117,6 +118,17 @@
 `hmac-sha1-96` 与 `hmac-sha-1-96` 可按同一完整性算法比较，但保留原始 Security-Verify；
 不因此接受 MD5、未报价加密或放宽 AES-only 限制。XFRM 清理仅限自有 UE worker，禁止全局 flush。
 
+### 临时拒绝与 Retry-After
+
+- `RegisterFailure::metadata()` 区分初始/认证阶段、端点临时拒绝、传输故障、身份/认证拒绝和本地错误；不得从 `detail` 文本或上一次保存的 401 猜当前发送结果。
+- 初始完整 408/500/502/503/504 可尝试同承载内另一合格 P-CSCF；普通身份拒绝、认证后失败不借静态头型/profile 更换重开当前鉴权。
+- Retry-After 严格解析秒数、注释/参数和折行。重复、溢出、非法值不是零秒；合法零秒也有最小非零间隔。
+- 端点等待以逻辑 P-CSCF 的地址/端口为键，保存在本线路同 SIM 的 live handle 外层，普通清理、profile/worker/同卡 MM owner 更换不重置；新 SIM 不继承旧卡等待。
+- 最多保存 32 个端点，有限 deadline 最长 24 小时；更长/非法等待锁存停止端点，容量溢出停止该 scope，不驱逐未到期项或截短服务器等待。当前是进程内状态，不声称重启后持久保存。
+- 所有可用端点失败后，在下一批 bearer/profile 分配前检查 not-before；恢复调度使用结构化剩余时间，而不是用换 profile/重建 PDN 绕过等待。
+- 临时刷新拒绝先回滚暂存 SA/socket/auth，再保留仍有效的原保护绑定。等待越过旧 expiry 时只保留到原截止；到期唤醒做失效处理，不提前 REGISTER，也不把请求中的新 Expires 当成新租期。
+- 已死亡 outbound flow、SIM/owner 失效和身份/认证拒绝不据此保留。注销仍检查绑定与端点等待，不向可能换卡后的订阅发送旧身份。
+
 ## 6. 资费保护与业务路由
 
 注册可用性不等于业务许可；双注册可接收蜂窝短信，但不能绕过费用门禁。
@@ -186,6 +198,23 @@
 - IKE 使用 UDP/500，协商 NAT-T 后 UDP/4500；超时、认证/提案失败或一般 Notify 不证明地址族要求。
 - 保留完整 REGISTER，在外层 IP 分片；重组检查 offset、ID、连续性、重叠和非末片对齐，
   不用裁剪 REGISTER 掩盖 MTU 问题。
+
+### UICC 身份与应用
+
+- `uicc_ims.rs` 统一选用 IMPI、IMPU、DOMAIN 和认证 AID。完整合法 ISIM 身份优先；合法缺文件/FF/部分未配置保留 USIM 派生，坏 TLV/FCP、读失败或归属变化显式失败。
+- IMPI/DOMAIN 为透明 EF，IMPU/P-CSCF 按 FCP 的记录布局读取；每 EF 最多 4096 字节、32 条记录，不猜记录长度，不输出材料到 Debug 日志。
+- 显式 database/catalog/用户 domain/realm 保持；只有 derived 的未覆盖默认域可由 ISIM 替换，实际字段来源标为 `isim`。ISIM 身份不被 IMSI/号码格式候选覆盖。
+- QMI 按 slot 获取完整 AID；native AT 在既有自有逻辑通道读取 MF/EF_DIR；PC/SC 的每个进程重选相同 AID/文件，并固定 reader 名称而非可重排索引。
+- 读取前后、AKA 前后及蜂窝 REGISTER 发布/刷新/注销检查卡/slot/端口/owner；MM 缺失或零值 PrimarySimSlot 只规范为单卡槽 1，缺 IMSI 仍允许受归属约束的只读 AT/UIM 回退。
+- VoWiFi IMS 使用捕获的身份/AID，EAP-AKA 仍使用 USIM，不把 IMS 私有域改写到 EAP。分阶段观察不是完整物理热插拔原子保证，实机竞态验收仍独立。
+
+### 蜂窝 P-CSCF 端点
+
+- 按来源存在性选择：显式环境值 → bearer PCO → 显式 profile → ISIM P-CSCF → 标准 DNS。显式值无效/解析失败/不支持时不静默跳到其他来源；不同族仍走原实际授予族计划。
+- `PcscfEndpoint` 保留 socket、UDP transport、source、原主机名和可用的 TTL/SRV priority/weight；当前不缓存 TTL，不由 metadata 推断可复用承载。
+- IPv4、裸 IPv6、`[IPv6]:port`、`host:port` 和 `sip:host:port;transport=udp` 保端口。蜂窝尚无 TCP/TLS 通道，profile transport 或显式 URI 请求非 UDP 时明确失败，`sips:` 不再悄悄变成 UDP/5060。
+- 只经 UE worker/当前 bearer DNS 查询；直接 A/AAAA 的完整有界集合优先，其次 UDP SRV，保留端口/优先级和加权顺序。没有全局 resolver、NAPTR 或 TCP DNS 兜底。
+- 最多 16 个端点、16 次 DNS 查询、3 个同族 bearer resolver；每次查询最多 4 秒、整个发现最多 12 秒。重复查询与端点去重，DNS 长度/owner/CNAME/截断边界继续严格校验。
 
 ## 8. REGISTER 三态与写入契约
 
