@@ -9,7 +9,7 @@
   接入 QMI、native AT 和 PC/SC 读取，保留明确读取错误与卡/owner 复核；不是热插拔实机验收声明。
 - 蜂窝 P-CSCF 保留端口、UDP 传输和来源，承载内 DNS 返回有界多候选；显式 TCP/TLS/sips 不再被静默降级。
 - REGISTER 临时拒绝和 Retry-After 贯通端点/跨 profile 等待；刷新保留仍有效的旧保护绑定但不延长租期。
-  两套 Actions 及双架构构建成功，测试日志逐名/摘要核验尚待下载；**未部署、未发布新 Release**，见[交接](HANDOFF.md)。
+  两套 Actions 及双架构构建成功，测试产物官方摘要、各 87 项相关回归及四矩阵均已核验；**未部署、未发布新 Release**，见[交接](HANDOFF.md)。
 
 - 统一设备接口；MM仍为默认，native为显式实验性选择，不能混用同一物理owner。
 - 线路/SIM身份分离、namespace隔离、SMS持久化、资源/逻辑通道账本及设备专项维护。

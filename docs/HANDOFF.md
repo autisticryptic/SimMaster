@@ -20,15 +20,16 @@
 - 结构化 REGISTER 失败驱动端点等待/切换；同 SIM 的 profile、普通重连或 worker 变化不清空 not-before。候选耗尽后的下一批承载也受等待门禁；临时刷新拒绝只保留到旧租期截止，不延长租期或改成明文。
 - 原地址族顺序、安全报价/白名单、24 个静态候选预算和原 UI 布局保持；未加入运营商分支、未改现有设备配置或库。
 
-### 验证与尚需用户操作
+### 已核验的 Actions 与剩余验收
 
 - [Build-Release 38052500633](https://github.com/autisticryptic/SimMaster/actions/runs/38052500633)：success；ARM64/AMD64 构建成功，Publish Release skipped。
 - [Validate Beta Refactor 38052500773](https://github.com/autisticryptic/SimMaster/actions/runs/38052500773)：success。两套均包含新增非零过滤器门禁及既有四个注册模拟矩阵。
 - 首轮 `e702cef` 编译成功，但旧 family-fallback 断言失败；已按结构化失败契约修正并在上述第二轮通过，不能省略首次失败。
 - 本机 303 项 Python 静态/mock 检查通过；没有本机 Rust/前端编译或注册模拟。
-- **逐名日志、测试计数、测试 artifact 摘要核验尚未完成**：匿名下载返回 401，非交互 GitHub credential helper 无可用凭据。已请用户下载两个 workflow 的 `ims-refresh-tests`、`beta-refactor-tests` ZIP，放到 `.local/evidence/isim-endpoint-retry/`；不需要密码/令牌，也不用解压。
+- **两份测试 ZIP 已自动下载并与 GitHub 官方摘要核验一致，用户无需手工下载或提供凭据。** 最初 API 匿名下载为 401，随后通过公开 artifact 下载入口取得文件；以官方 SHA-256 而非第三方入口作为内容校验依据。
+- 两套日志各逐名确认 **87 项相关回归**；四矩阵各为 24 标准、18 历史、12 安全提示、32 全局兜底场景，共 86 场景（45 个 fixture 成功、41 个预期拒绝）。每个矩阵的 suite ID、commit/run、源码文件指纹及日志 SHA 均核验，不代表实网成功次数。
 - 官方测试 artifact 摘要：`ims-refresh-tests`（11670501045）为 `a945fbecc99aec037aaafc64967c1055c35e7d07a04a086e7f4ee1e677b2f3c0`；`beta-refactor-tests`（11670590696）为 `0bb4998139467e4ef668bb7a9a9e808490720431f0cf7d75e709f3ce5d0d8547`。
-- API 状态、artifact 元数据和本机静态检查暂存 `.local/session-recovery/20261010-resume/`。只读校验器已准备为 `.local/evidence/isim-endpoint-retry/verify_artifacts.py`，只校验 ZIP/日志/JSON，不执行解压内容或注册模拟。仅获取元数据不等于下载校验了程序包。
+- 完整核验报告：`.local/evidence/isim-endpoint-retry/verified.json`；同目录保存原始测试 ZIP 和只读校验器 `verify_artifacts.py`，未执行解压内容或本机注册模拟。API/静态检查原始材料另存 `.local/session-recovery/20261010-resume/`。此次下载校验的是测试产物，不是已部署程序包。
 - **未部署、未做新版本初始注册/自然续期/业务/热插拔实机验收**。第二批 reg-event、rspauth、AUTS/stale 与跨候选 423 预算另列于[开发计划](DEVELOPMENT_PLAN.md)。
 
 ## 已完成的全局修复（上轮）
