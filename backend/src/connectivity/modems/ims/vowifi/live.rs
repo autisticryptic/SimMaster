@@ -11982,7 +11982,16 @@ mod tests {
         assert_eq!(sip_frame::header_value(request.as_bytes(), "Security-Verify").as_deref(), Some(verify));
         let unregister = context.build_unregister_request(profile, variant, 4, Some(authorization), Some(verify));
         assert_eq!(sip_frame::header_value(unregister.as_bytes(), "Expires").as_deref(), Some("0"));
-        assert!(unregister.contains("expires=0"));
+        // Expires: 0 applies when Contact has no per-binding expires parameter.
+        // If a contact policy does emit one, it must not retain the raised floor.
+        let contact = sip_frame::header_value(unregister.as_bytes(), "Contact").unwrap();
+        for parameter in contact.split(';').map(str::trim) {
+            if let Some(value) = parameter.strip_prefix("expires=") {
+                assert_eq!(value.trim_matches('"'), "0");
+            }
+        }
+        assert_eq!(sip_frame::header_value(unregister.as_bytes(), "Security-Verify").as_deref(), Some(verify));
+        assert_eq!(sip_frame::header_value(unregister.as_bytes(), "CSeq").as_deref(), Some("4 REGISTER"));
     }
 
     #[test]
