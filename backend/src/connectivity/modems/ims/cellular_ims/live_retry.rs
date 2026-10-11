@@ -78,6 +78,7 @@ mod tests {
         let endpoint = "192.0.2.1:5060".parse().unwrap();
         let now = Instant::now();
         first.lock().await.observe_failure(endpoint, &RegisterFailureMetadata {
+            min_expires: None,
             sip_status: Some(503), stage: RegisterFailureStage::Initial,
             kind: RegisterFailureKind::TemporaryEndpoint, retry_after: RetryAfter::DelaySeconds(120),
         }, now);

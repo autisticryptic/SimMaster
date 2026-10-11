@@ -222,6 +222,8 @@ pub(crate) async fn refresh_registered_for_line(
 }
 
 pub(crate) trait RegisteredUnregister: Send + Sync {
+    fn validate_success(&self, _response: &[u8]) -> Result<(), crate::connectivity::core::ImsError> { Ok(()) }
+
     fn refresh<'a>(
         &'a self,
         _channel: &'a mut SipChannel,
@@ -250,6 +252,10 @@ struct RegisteredUnregisterAdapter {
 }
 
 impl RegisterAuthenticator<SipChannel> for RegisteredUnregisterAdapter {
+    fn validate_success(&self, response: &[u8]) -> Result<(), crate::connectivity::core::ImsError> {
+        self.factory.validate_success(response)
+    }
+
     async fn authenticated_request(
         &mut self,
         challenge_response: &[u8],

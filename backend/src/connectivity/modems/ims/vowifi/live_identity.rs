@@ -143,5 +143,19 @@ pub(super) async fn load(line_id: &str, profile: &'static CarrierProfile)
 }
 
 #[cfg(test)]
+pub(super) fn selection_for_test(
+    line_id: &str, identity: LiveImsRegisterIdentity, target: LiveImsTarget,
+    card: UiccCardBinding,
+) -> Arc<LiveImsSelection> {
+    let device = LiveSimDevice {
+        qmi_device: card.endpoint.clone(), uim_slot: card.slot,
+        modem_path: format!("synthetic-modem-{line_id}"), pcsc_reader: String::new(),
+    };
+    register_line_sim_device(line_id, &device.qmi_device, device.uim_slot, &device.modem_path);
+    uicc_ims::register_test_binding(&device.modem_path, card.clone());
+    Arc::new(LiveImsSelection { identity, target, device, card, aid: USIM_AID_PREFIX.to_vec(), isim: false })
+}
+
+#[cfg(test)]
 #[path = "live_identity_tests.rs"]
 mod tests;

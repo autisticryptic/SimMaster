@@ -1,4 +1,6 @@
 //! Hardware-free regressions for the protected REGISTER refresh procedure.
+#[path = "auth_hardening_tests.rs"]
+mod auth_hardening_tests;
 use super::*;
 use crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult;
 use tokio::net::UdpSocket;
@@ -20,6 +22,7 @@ fn challenge(nonce: &str) -> digest_aka::DigestChallenge {
         qop: Some("auth".into()),
         opaque: None,
         proxy: false,
+        stale: false,
     }
 }
 
@@ -147,6 +150,7 @@ fn authenticator(
         session.channel.security_verify().map(str::to_string),
         session.xfrm_worker.clone(),
     )
+    .with_auth_binding(session.auth_binding.clone())
     .with_worker_binding(session.worker_binding.clone())
     .with_security_mechanism(session.register_variant.security_mechanism)
 }

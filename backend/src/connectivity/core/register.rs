@@ -30,10 +30,72 @@ pub(crate) const MAX_REGISTER_IGNORED_FRAMES: u8 = 32;
 /// Two rounds cover a core that raises the floor twice (for example after a
 /// profile change) without letting a hostile registrar spin the loop forever.
 pub(crate) const MAX_MIN_EXPIRES_ROUNDS: u8 = 2;
-/// Upper bound applied to any advertised `Min-Expires`. Absurd floors (days,
-/// years, or a malformed huge integer) are clamped so a single response cannot
-/// pin the session lease to an unusable value.
+/// Upper supported `Min-Expires` floor. Values above it are unsupported, not
+/// clamped: a retry below the server's floor cannot satisfy RFC 3261.
 pub(crate) const MIN_EXPIRES_CAP: u32 = 86_400;
+
+/// Safe lease-negotiation provenance, independent of the final SIP status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterMinExpiresFailure {
+    Invalid,
+    Unsupported,
+    Exhausted,
+    /// A valid floor was negotiated before a later status/transport/auth error.
+    Negotiated,
+}
+
+impl RegisterMinExpiresFailure {
+    pub fn error(self, authenticated: bool) -> ImsError {
+        let code = match (authenticated, self) {
+            (false, Self::Invalid) => "ims_register_initial_min_expires_invalid",
+            (false, Self::Unsupported) => "ims_register_initial_min_expires_unsupported",
+            (false, Self::Exhausted | Self::Negotiated) => "ims_register_initial_min_expires_exhausted",
+            (true, Self::Invalid) => "ims_register_authenticated_min_expires_invalid",
+            (true, Self::Unsupported) => "ims_register_authenticated_min_expires_unsupported",
+            (true, Self::Exhausted | Self::Negotiated) => "ims_register_authenticated_min_expires_exhausted",
+        };
+        ImsError::new(code)
+    }
+}
+
+/// Attempt-scoped, never global. Once a registrar negotiates a lease, callers
+/// must not restart the header/profile/ESP candidate ladder, even if the next
+/// response is 400 or the next send loses transport. Retries within the current
+/// exchange retain the channel, request shape and authentication budget.
+#[derive(Debug, Default)]
+pub struct RegisterNegotiationBudget {
+    observed: bool,
+    rounds: u8,
+    minimum: Option<u32>,
+}
+
+impl RegisterNegotiationBudget {
+    pub fn permits_candidate_expansion(&self) -> bool {
+        !self.observed
+    }
+
+    pub fn failure_metadata(&self, failure: &RegisterFailure) -> RegisterFailureMetadata {
+        let mut metadata = failure.metadata();
+        if self.observed && metadata.min_expires.is_none() {
+            metadata.min_expires = Some(RegisterMinExpiresFailure::Negotiated);
+        }
+        metadata
+    }
+
+    fn negotiate(&mut self, response: &[u8]) -> Result<u32, RegisterMinExpiresFailure> {
+        self.observed = true;
+        if self.rounds >= MAX_MIN_EXPIRES_ROUNDS {
+            return Err(RegisterMinExpiresFailure::Exhausted);
+        }
+        let minimum = parse_min_expires(response)?;
+        if self.minimum.is_some_and(|previous| minimum <= previous) {
+            return Err(RegisterMinExpiresFailure::Invalid);
+        }
+        self.minimum = Some(minimum);
+        self.rounds += 1;
+        Ok(minimum)
+    }
+}
 pub(crate) const MAX_REGISTER_PROVISIONAL_RESPONSES: u8 = 4;
 
 /// Identity of one SIP REGISTER client transaction.
@@ -108,6 +170,11 @@ pub trait RegisterAuthenticator<C>: Send
 where
     C: ImsChannel,
 {
+    /// Validate a final success before the driver exposes it as a registered
+    /// binding. AUTS-only responses and response-authentication failures must
+    /// not commit a lease/security state merely because the SIP status is 2xx.
+    fn validate_success(&self, _response: &[u8]) -> Result<(), ImsError> { Ok(()) }
+
     /// Let an access leg own one challenged REGISTER exchange when its security
     /// transport cannot be represented as a single in-place channel update.
     ///
@@ -148,27 +215,18 @@ where
 
     /// Rebuild REGISTER after a `423 Interval Too Brief` rejection.
     ///
-    /// The shared driver owns the retry loop and enforces the round bound; an
-    /// authenticator only has to produce the next request honoring
-    /// `min_expires`. The default rebuilds an authenticated request through
-    /// `authenticated_request`, which is correct for legs whose authenticator
-    /// already owns every request shape. Legs that build the unauthenticated
-    /// request themselves (VoLTE/VoWiFi) override the `authenticated == false`
-    /// arm so the initial shape is reconstructed with the new lease.
+    /// The shared driver owns the retry loop and enforces the round bound.
+    /// Adapters must explicitly rebuild the same request shape and, if needed,
+    /// a fresh Digest proof. Passing a 423 to the challenge parser or replaying
+    /// Authorization with the old nonce-count is not a valid implementation.
     async fn rebuild_register_with_min_expires(
         &mut self,
-        challenge_response: &[u8],
-        cseq: u32,
+        _challenge_response: &[u8],
+        _cseq: u32,
         _min_expires: u32,
         authenticated: bool,
     ) -> Result<Vec<u8>, ImsError> {
-        if authenticated {
-            self.authenticated_request(challenge_response, cseq).await
-        } else {
-            Err(ImsError::new(
-                "ims_register_initial_min_expires_unsupported",
-            ))
-        }
+        Err(RegisterMinExpiresFailure::Unsupported.error(authenticated))
     }
 }
 
@@ -216,6 +274,8 @@ pub struct RegisterFailureMetadata {
     pub stage: RegisterFailureStage,
     pub kind: RegisterFailureKind,
     pub retry_after: RetryAfter,
+    /// Any 423 closes compatibility expansion, including a later 400/timeout.
+    pub min_expires: Option<RegisterMinExpiresFailure>,
 }
 
 impl RegisterFailureMetadata {
@@ -226,7 +286,8 @@ impl RegisterFailureMetadata {
     /// This is only an eligibility gate. Existing security, identity and
     /// candidate-budget checks must still run; it never authorizes bare UDP.
     pub fn permits_variant_fallback(self) -> bool {
-        self.stage == RegisterFailureStage::Initial
+        self.min_expires.is_none()
+            && self.stage == RegisterFailureStage::Initial
             && self.kind == RegisterFailureKind::Negotiation
             && self.retry_after == RetryAfter::Absent
             && self.sip_status.is_some_and(status_permits_register_variant_fallback)
@@ -298,7 +359,22 @@ impl RegisterFailure {
         } else {
             Kind::LocalFailure
         };
-        RegisterFailureMetadata { sip_status, stage, kind, retry_after }
+        let min_expires = if code.contains("_min_expires_") {
+            if code.ends_with("_invalid") {
+                Some(RegisterMinExpiresFailure::Invalid)
+            } else if code.ends_with("_unsupported") {
+                Some(RegisterMinExpiresFailure::Unsupported)
+            } else if code.ends_with("_exhausted") {
+                Some(RegisterMinExpiresFailure::Exhausted)
+            } else {
+                None
+            }
+        } else if sip_status == Some(423) {
+            Some(RegisterMinExpiresFailure::Negotiated)
+        } else {
+            None
+        };
+        RegisterFailureMetadata { sip_status, stage, kind, retry_after, min_expires }
     }
 
     fn new(error: ImsError, response: Option<Vec<u8>>, auth_rounds: u8) -> Self {
@@ -338,7 +414,33 @@ where
     C: ImsChannel,
     A: RegisterAuthenticator<C>,
 {
-    run_register_exchange(channel, initial_request, authenticator, true).await
+    run_register_observed_with_budget(
+        channel, initial_request, authenticator, &mut RegisterNegotiationBudget::default(),
+    ).await
+}
+
+/// Candidate-aware wrapper. Keep this budget outside the compatibility loop,
+/// and propagate `budget.failure_metadata(&failure)` on failure. Re-entering
+/// with an already negotiated budget fails before another request is sent.
+pub async fn run_register_observed_with_budget<C, A>(
+    channel: &mut C,
+    initial_request: &[u8],
+    authenticator: &mut A,
+    budget: &mut RegisterNegotiationBudget,
+) -> Result<RegisterResult, RegisterFailure>
+where
+    C: ImsChannel,
+    A: RegisterAuthenticator<C>,
+{
+    if !budget.permits_candidate_expansion() {
+        return Err(RegisterFailure::new(
+            RegisterMinExpiresFailure::Exhausted.error(false), None, 0,
+        ));
+    }
+    // Guard even callers that accidentally route Expires: 0 through REGISTER.
+    let unregister = sip_frame::header_values(initial_request, "Expires")
+        .iter().any(|value| value.trim() == "0");
+    run_register_exchange(channel, initial_request, authenticator, !unregister, budget).await
 }
 
 // Deregistration must never negotiate a positive lease in response to 423.
@@ -347,11 +449,14 @@ async fn run_register_exchange<C, A>(
     initial_request: &[u8],
     authenticator: &mut A,
     allow_min_expires: bool,
+    budget: &mut RegisterNegotiationBudget,
 ) -> Result<RegisterResult, RegisterFailure>
 where
     C: ImsChannel,
     A: RegisterAuthenticator<C>,
 {
+    budget.minimum = sip_frame::header_value(initial_request, "Expires")
+        .and_then(|value| value.trim().parse::<u32>().ok());
     let mut response = send_register_and_receive(
         channel,
         initial_request,
@@ -362,13 +467,14 @@ where
     .await
     .map_err(|error| RegisterFailure::new(error, None, 0))?;
     let mut auth_rounds = 0u8;
-    let mut min_expires_rounds = 0u8;
 
     loop {
         let status = sip_frame::parse_status(&response)
             .map_err(|error| RegisterFailure::new(error, Some(response.clone()), auth_rounds))?;
         match status {
             200..=299 => {
+                authenticator.validate_success(&response)
+                    .map_err(|error| RegisterFailure::new(error, Some(response.clone()), auth_rounds))?;
                 return Ok(RegisterResult {
                     response,
                     authenticated: auth_rounds > 0,
@@ -377,7 +483,7 @@ where
             }
             401 | 407 if auth_rounds < MAX_AUTH_ROUNDS => {
                 auth_rounds += 1;
-                let cseq = u32::from(auth_rounds) + u32::from(min_expires_rounds) + 1;
+                let cseq = u32::from(auth_rounds) + u32::from(budget.rounds) + 1;
                 if let Some(access_response) = authenticator
                     .exchange_authenticated(&response, cseq, channel)
                     .await
@@ -419,32 +525,17 @@ where
                     auth_rounds,
                 ))
             }
-            423 if allow_min_expires && min_expires_rounds < MAX_MIN_EXPIRES_ROUNDS => {
-                // RFC 3261 21.4.4: the registrar requires a longer lease.
-                // Rebuild the current request shape (initial or authenticated)
-                // with Expires >= Min-Expires and keep the same binding.
-                let Some(min_expires) = parse_min_expires(&response) else {
-                    let error = if auth_rounds == 0 {
-                        "ims_register_initial_min_expires_invalid"
-                    } else {
-                        "ims_register_authenticated_min_expires_invalid"
-                    };
-                    tracing::warn!(
-                        sip_status = status,
-                        auth_rounds,
-                        "IMS REGISTER 423 without a usable Min-Expires"
-                    );
-                    return Err(RegisterFailure::new(
-                        ImsError::new(error),
-                        Some(response),
-                        auth_rounds,
-                    ));
-                };
-                // The caller's initial REGISTER already consumed CSeq 1, so a
-                // 423 retry starts at 2; each later round (auth or Min-Expires)
-                // advances the sequence by one.
-                let cseq = u32::from(auth_rounds) + u32::from(min_expires_rounds) + 2;
-                min_expires_rounds += 1;
+            423 => {
+                // Never let a rejected lease reopen compatibility discovery.
+                budget.observed = true;
+                let min_expires = if allow_min_expires {
+                    budget.negotiate(&response)
+                } else {
+                    Err(RegisterMinExpiresFailure::Unsupported)
+                }.map_err(|reason| RegisterFailure::new(
+                    reason.error(auth_rounds > 0), Some(response.clone()), auth_rounds,
+                ))?;
+                let cseq = u32::from(auth_rounds) + u32::from(budget.rounds) + 1;
                 let request = authenticator
                     .rebuild_register_with_min_expires(
                         &response,
@@ -480,24 +571,6 @@ where
                 .map_err(|error| {
                     RegisterFailure::new(error, Some(response.clone()), auth_rounds)
                 })?;
-            }
-            423 if allow_min_expires => {
-                let error = if auth_rounds == 0 {
-                    "ims_register_initial_min_expires_exhausted"
-                } else {
-                    "ims_register_authenticated_min_expires_exhausted"
-                };
-                tracing::warn!(
-                    sip_status = status,
-                    auth_rounds,
-                    min_expires_rounds,
-                    "IMS REGISTER Min-Expires negotiation exhausted"
-                );
-                return Err(RegisterFailure::new(
-                    ImsError::new(error),
-                    Some(response),
-                    auth_rounds,
-                ));
             }
             _ if auth_rounds == 0 => {
                 tracing::warn!(
@@ -539,7 +612,9 @@ where
     C: ImsChannel,
     A: RegisterAuthenticator<C>,
 {
-    match run_register_exchange(channel, initial_request, authenticator, false).await {
+    match run_register_exchange(
+        channel, initial_request, authenticator, false, &mut RegisterNegotiationBudget::default(),
+    ).await {
         Ok(_) => UnregisterResult::Confirmed,
         Err(failure) if failure.response.is_some() => UnregisterResult::Rejected,
         Err(_) => UnregisterResult::AccessLost,
@@ -773,13 +848,26 @@ fn is_register_read_retryable(error: &ImsError) -> bool {
 
 /// Parse the `Min-Expires` header from a `423 Interval Too Brief` response.
 ///
-/// RFC 3261 21.4.4 requires the registrar to include the minimum lease it will
-/// accept. Missing, malformed, or absurd values are clamped defensively so the
-/// retry always carries a positive, bounded lease.
-fn parse_min_expires(response: &[u8]) -> Option<u32> {
-    let value = sip_frame::header_value(response, "Min-Expires")?;
-    let parsed = value.trim().parse::<u32>().ok()?;
-    Some(parsed.min(MIN_EXPIRES_CAP).max(1))
+/// Read exactly one positive decimal floor. Duplicates (even identical), zero,
+/// signed/comma values and integer overflow are invalid. A representable value
+/// above the supported cap is explicitly unsupported; never round it down.
+pub(crate) fn parse_min_expires(response: &[u8]) -> Result<u32, RegisterMinExpiresFailure> {
+    let values = sip_frame::header_values(response, "Min-Expires");
+    if values.len() != 1 {
+        return Err(RegisterMinExpiresFailure::Invalid);
+    }
+    let value = values[0].trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(RegisterMinExpiresFailure::Invalid);
+    }
+    let parsed = value.parse::<u32>().map_err(|_| RegisterMinExpiresFailure::Invalid)?;
+    if parsed == 0 {
+        Err(RegisterMinExpiresFailure::Invalid)
+    } else if parsed > MIN_EXPIRES_CAP {
+        Err(RegisterMinExpiresFailure::Unsupported)
+    } else {
+        Ok(parsed)
+    }
 }
 
 #[cfg(test)]
@@ -793,6 +881,37 @@ mod tests {
         collections::VecDeque,
         net::{Ipv4Addr, SocketAddr},
     };
+
+    struct ResyncGuardAuthenticator { resync: bool }
+
+    impl RegisterAuthenticator<FakeChannel> for ResyncGuardAuthenticator {
+        fn validate_success(&self, _response: &[u8]) -> Result<(), ImsError> {
+            if self.resync { Err(ImsError::new("ims_aka_resync_unexpected_status")) } else { Ok(()) }
+        }
+        async fn authenticated_request(&mut self, _response: &[u8], _cseq: u32) -> Result<Vec<u8>, ImsError> {
+            self.resync = true;
+            Ok(b"REGISTER AUTS proof-is-empty".to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn final_success_validation_precedes_register_and_unregister_commit() {
+        for unregister in [false, true] {
+            let mut channel = FakeChannel {
+                responses: VecDeque::from([response(401, "Unauthorized"), response(200, "OK")]),
+                requeued: VecDeque::new(), sends: Vec::new(), transport: SipTransport::Tcp,
+            };
+            let mut auth = ResyncGuardAuthenticator { resync: false };
+            if unregister {
+                assert_eq!(run_unregister(&mut channel, b"REGISTER Expires 0", &mut auth).await, UnregisterResult::Rejected);
+            } else {
+                let failure = run_register_observed(&mut channel, b"REGISTER initial", &mut auth).await.unwrap_err();
+                assert_eq!(failure.error.code(), "ims_aka_resync_unexpected_status");
+                assert_eq!(failure.auth_rounds, 1);
+            }
+            assert_eq!(channel.sends.len(), 2);
+        }
+    }
 
     struct FakeChannel {
         responses: VecDeque<Vec<u8>>,
@@ -1619,6 +1738,207 @@ mod tests {
 
         assert_eq!(error.code(), "ims_register_authenticated_receive_failed");
         assert_eq!(channel.sends.len(), 2);
+    }
+
+    #[test]
+    fn min_expires_parser_rejects_missing_duplicate_zero_overflow_and_cap() {
+        for headers in [
+            "", "Min-Expires: 0\r\n", "Min-Expires: +600\r\n",
+            "Min-Expires: -1\r\n", "Min-Expires: 600, 1200\r\n",
+            "Min-Expires: 4294967296\r\n", "Min-Expires: \r\n",
+            "Min-Expires: 600\r\nMin-Expires: 600\r\n",
+            "Min-Expires: 600\r\nmIn-eXpIrEs: 1200\r\n",
+        ] {
+            assert_eq!(parse_min_expires(&response_with_header(423, "Interval Too Brief", headers)),
+                Err(RegisterMinExpiresFailure::Invalid), "{headers:?}");
+        }
+        for floor in [MIN_EXPIRES_CAP + 1, u32::MAX] {
+            assert_eq!(parse_min_expires(&response_with_header(423, "Interval Too Brief",
+                &format!("Min-Expires: {floor}\r\n"))), Err(RegisterMinExpiresFailure::Unsupported));
+        }
+        assert_eq!(parse_min_expires(&response_with_header(423, "Interval Too Brief",
+            "Min-Expires: 86400\r\n")), Ok(MIN_EXPIRES_CAP));
+    }
+
+    #[tokio::test]
+    async fn min_expires_invalid_and_unsupported_stop_without_retry() {
+        for (headers, reason) in [
+            ("", RegisterMinExpiresFailure::Invalid),
+            ("Min-Expires: 0\r\n", RegisterMinExpiresFailure::Invalid),
+            ("Min-Expires: 4294967296\r\n", RegisterMinExpiresFailure::Invalid),
+            ("Min-Expires: 600\r\nMin-Expires: 600\r\n", RegisterMinExpiresFailure::Invalid),
+            ("Min-Expires: 86401\r\n", RegisterMinExpiresFailure::Unsupported),
+        ] {
+            let mut channel = FakeChannel {
+                responses: VecDeque::from([response_with_header(423, "Interval Too Brief", headers)]),
+                sends: Vec::new(), requeued: VecDeque::new(), transport: SipTransport::Tcp,
+            };
+            let mut auth = MinExpiresAuthenticator { rebuilds: Vec::new() };
+            let mut budget = RegisterNegotiationBudget::default();
+            let failure = run_register_observed_with_budget(&mut channel, b"REGISTER initial", &mut auth, &mut budget)
+                .await.unwrap_err();
+            assert_eq!(failure.error, reason.error(false));
+            assert_eq!(budget.failure_metadata(&failure).min_expires, Some(reason));
+            assert!(!budget.permits_candidate_expansion());
+            assert_eq!(channel.sends.len(), 1);
+            assert!(auth.rebuilds.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn min_expires_exhaustion_closes_cross_candidate_budget_before_send() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([
+                response_with_header(423, "Interval Too Brief", "Min-Expires: 600\r\n"),
+                response_with_header(423, "Interval Too Brief", "Min-Expires: 1200\r\n"),
+                response_with_header(423, "Interval Too Brief", "Min-Expires: 1800\r\n"),
+                response(200, "OK"),
+            ]),
+            sends: Vec::new(), requeued: VecDeque::new(), transport: SipTransport::Tcp,
+        };
+        let mut auth = MinExpiresAuthenticator { rebuilds: Vec::new() };
+        let mut budget = RegisterNegotiationBudget::default();
+        for _candidate in 0..3 {
+            let failure = run_register_observed_with_budget(&mut channel, b"REGISTER shape", &mut auth, &mut budget)
+                .await.unwrap_err();
+            assert_eq!(failure.error.code(), "ims_register_initial_min_expires_exhausted");
+            assert_eq!(budget.failure_metadata(&failure).min_expires, Some(RegisterMinExpiresFailure::Exhausted));
+            assert_eq!(channel.sends.len(), 3);
+        }
+        assert_eq!(auth.rebuilds, [(600, false), (1200, false)]);
+        assert_eq!(channel.responses.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn min_expires_then_400_or_transport_cannot_reopen_candidates() {
+        for next_status in [Some(400), None] {
+            let mut responses = VecDeque::from([
+                response_with_header(423, "Interval Too Brief", "Min-Expires: 600\r\n"),
+            ]);
+            if let Some(status) = next_status {
+                responses.push_back(response(status, "Bad Request"));
+            }
+            let mut channel = FakeChannel {
+                responses, sends: Vec::new(), requeued: VecDeque::new(), transport: SipTransport::Tcp,
+            };
+            let mut auth = MinExpiresAuthenticator { rebuilds: Vec::new() };
+            let mut budget = RegisterNegotiationBudget::default();
+            let failure = run_register_observed_with_budget(&mut channel, b"REGISTER shape", &mut auth, &mut budget)
+                .await.unwrap_err();
+            let metadata = budget.failure_metadata(&failure);
+            assert_eq!(metadata.stage, RegisterFailureStage::Initial);
+            assert_eq!(metadata.min_expires, Some(RegisterMinExpiresFailure::Negotiated));
+            assert_eq!(metadata.kind, if next_status.is_some() {
+                RegisterFailureKind::Negotiation
+            } else { RegisterFailureKind::Transport });
+            assert_eq!(metadata.sip_status, next_status.or(Some(423)));
+            assert!(!metadata.permits_variant_fallback());
+            assert!(!budget.permits_candidate_expansion());
+            assert!(run_register_observed_with_budget(&mut channel, b"REGISTER another shape", &mut auth, &mut budget)
+                .await.is_err());
+            assert_eq!(channel.sends.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn min_expires_budget_spans_authentication_without_resetting_auth_limit() {
+        for exhausted_auth in [false, true] {
+            let mut channel = FakeChannel {
+                responses: if exhausted_auth {
+                    VecDeque::from([
+                        response(401, "Unauthorized"),
+                        response_with_header(423, "Interval Too Brief", "Min-Expires: 600\r\n"),
+                        response(401, "Unauthorized"), response(407, "Proxy Authentication Required"),
+                    ])
+                } else {
+                    VecDeque::from([
+                        response_with_header(423, "Interval Too Brief", "Min-Expires: 600\r\n"),
+                        response(401, "Unauthorized"),
+                        response_with_header(423, "Interval Too Brief", "Min-Expires: 1200\r\n"),
+                        response(200, "OK"),
+                    ])
+                },
+                sends: Vec::new(), requeued: VecDeque::new(), transport: SipTransport::Tcp,
+            };
+            let mut auth = MinExpiresAuthenticator { rebuilds: Vec::new() };
+            let mut budget = RegisterNegotiationBudget::default();
+            let result = run_register_observed_with_budget(&mut channel, b"REGISTER initial", &mut auth, &mut budget).await;
+            if exhausted_auth {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.auth_rounds, 2);
+                assert_eq!(failure.error.code(), "ims_register_auth_rejected");
+                assert_eq!(budget.failure_metadata(&failure).stage, RegisterFailureStage::Authenticated);
+            } else {
+                let success = result.unwrap();
+                assert!(success.authenticated);
+                assert_eq!(success.auth_rounds, 1);
+                assert_eq!(auth.rebuilds, [(600, false), (1200, true)]);
+                assert_eq!(channel.sends[3], b"REGISTER 4 Expires 1200");
+            }
+            assert_eq!(channel.sends.len(), 4);
+            assert!(!budget.permits_candidate_expansion());
+        }
+    }
+
+    #[tokio::test]
+    async fn min_expires_repeated_floor_is_invalid_not_a_fresh_budget() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([
+                response_with_header(423, "Interval Too Brief", "Min-Expires: 600\r\n"),
+                response_with_header(423, "Interval Too Brief", "Min-Expires: 600\r\n"),
+            ]),
+            sends: Vec::new(), requeued: VecDeque::new(), transport: SipTransport::Tcp,
+        };
+        let failure = run_register_observed(&mut channel, b"REGISTER initial",
+            &mut MinExpiresAuthenticator { rebuilds: Vec::new() }).await.unwrap_err();
+        assert_eq!(failure.error.code(), "ims_register_initial_min_expires_invalid");
+        assert_eq!(channel.sends.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn zero_expiry_register_api_also_refuses_positive_lease() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([response_with_header(423, "Interval Too Brief", "Min-Expires: 600\r\n")]),
+            sends: Vec::new(), requeued: VecDeque::new(), transport: SipTransport::Tcp,
+        };
+        let mut auth = MinExpiresAuthenticator { rebuilds: Vec::new() };
+        let failure = run_register_observed(&mut channel,
+            b"REGISTER sip:ims.example SIP/2.0\r\nExpires: 0\r\n\r\n", &mut auth).await.unwrap_err();
+        assert_eq!(failure.error.code(), "ims_register_initial_min_expires_unsupported");
+        assert!(auth.rebuilds.is_empty());
+        assert_eq!(channel.sends.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn min_expires_default_rebuilder_is_explicitly_unsupported() {
+        for authenticated in [false, true] {
+            let mut responses = VecDeque::new();
+            if authenticated {
+                responses.push_back(response(401, "Unauthorized"));
+            }
+            responses.push_back(response_with_header(423, "Interval Too Brief", "Min-Expires: 600\r\n"));
+            let mut channel = FakeChannel {
+                responses, sends: Vec::new(), requeued: VecDeque::new(), transport: SipTransport::Tcp,
+            };
+            let failure = run_register_observed(&mut channel, b"REGISTER initial", &mut FakeAuthenticator)
+                .await.unwrap_err();
+            assert_eq!(failure.error, RegisterMinExpiresFailure::Unsupported.error(authenticated));
+            assert_eq!(channel.sends.len(), if authenticated { 2 } else { 1 });
+        }
+    }
+
+    #[tokio::test]
+    async fn min_expires_must_increase_the_current_requested_expiry() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([response_with_header(423, "Interval Too Brief", "Min-Expires: 600\r\n")]),
+            sends: Vec::new(), requeued: VecDeque::new(), transport: SipTransport::Tcp,
+        };
+        let mut auth = MinExpiresAuthenticator { rebuilds: Vec::new() };
+        let failure = run_register_observed(&mut channel,
+            b"REGISTER sip:ims.example SIP/2.0\r\nExpires: 1200\r\n\r\n", &mut auth).await.unwrap_err();
+        assert_eq!(failure.error.code(), "ims_register_initial_min_expires_invalid");
+        assert!(auth.rebuilds.is_empty());
+        assert_eq!(channel.sends.len(), 1);
     }
 
     #[tokio::test]

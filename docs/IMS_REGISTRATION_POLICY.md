@@ -84,8 +84,8 @@
 ### 通用租期
 
 - 响应 Contact 的 `expires` 优先，其次响应 `Expires`，最后 profile 默认值。
-- 共享 lease 模型按协商寿命安排主动续期（通用调度为寿命的十二分之十一，即 `11/12`）。
-  以实际 lease/scheduler 为准；主动续期截止不等于注册到期。
+- 共享 lease 模型按协商寿命安排主动续期：租期大于 1200 秒时提前 600 秒，否则在半租期处，最小延迟为 1 秒（`RegistrationLease::from_expires`）。
+  以实际 lease/scheduler 为准；主动续期截止不等于注册到期，旧 `11/12` 文档描述已过时。
 - 在完整租期仍有效时，受保护重试仍可使用原绑定；OPTIONS 超时仅为建议性证据。
 - 423/Min-Expires 由共享 REGISTER 核心做有界重试。
 - VoWiFi 续期失败使 IMS readiness 失效，不立即拆 ePDG/IKE/Child-SA/ESP/TUN；

@@ -694,6 +694,8 @@ pub struct CellularImsSmsSendResult {
 struct CellularImsRefreshAuthorization {
     challenge: digest_aka::DigestChallenge,
     aka: crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult,
+    /// Immutable provenance of the retained AKA keys; nextnonce is not AKA.
+    aka_origin: Option<digest_aka::AkaChallenge>,
     cnonce: String,
     nonce_count: u32,
 }
@@ -703,9 +705,11 @@ impl CellularImsRefreshAuthorization {
         challenge: digest_aka::DigestChallenge,
         aka: crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult,
     ) -> Self {
+        let aka_origin = crate::connectivity::core::digest_aka::decode_aka_nonce(&challenge.nonce).ok();
         Self {
             challenge,
             aka,
+            aka_origin,
             cnonce: sip::hex_token(8),
             nonce_count: 0,
         }
@@ -1229,6 +1233,7 @@ struct CellularImsRegisterAuthenticator {
     device: CellularImsDeviceBinding,
     runtime: CellularImsRuntime,
     reuse_security: bool,
+    resync_sent: bool,
     security_mechanism: Option<usize>,
     required_security: bool,
     aka_aid: Vec<u8>,
@@ -1299,6 +1304,7 @@ impl CellularImsRegisterAuthenticator {
             device,
             runtime,
             reuse_security,
+            resync_sent: false,
             security_mechanism: None,
             required_security: false,
             aka_aid,
@@ -1396,6 +1402,8 @@ impl CellularImsRegisterAuthenticator {
         channel: &mut CellularImsSipChannel,
     ) -> Result<(), ImsError> {
         if let Some(auts) = aka.auts.as_deref() {
+            if auts.len() != 14 { return Err(ImsError::new(code::AKA_MATERIAL_INVALID)); }
+            if self.resync_sent { return Err(ImsError::new("ims_aka_resync_repeated")); }
             // AUTS is an authentication message, not permission to downgrade a
             // protected refresh. Keep SM1's offer and the active Security-Verify.
             self.route = channel.advertised_route();
@@ -1416,12 +1424,16 @@ impl CellularImsRegisterAuthenticator {
             if security_verify.is_some() {
                 register_policy.require_sec_agree = true;
             }
+            let cnonce = challenge.qop.as_ref().map(|_| sip::hex_token(8));
+            self.resync_sent = true;
             self.pending = Some(PreparedAuth {
-                authorization: digest_aka::build_resync_authorization_header(
+                authorization: digest_aka::build_resync_authorization_header_with_digest(
                     &challenge,
                     &self.identity.private_user,
                     &request_uri,
                     auts,
+                    cnonce.as_deref(),
+                    Some("00000001"),
                 ),
                 security_client,
                 security_verify,
@@ -1597,6 +1609,7 @@ impl CellularImsRegisterAuthenticator {
         let refresh_authorization = CellularImsRefreshAuthorization {
             challenge: challenge.clone(),
             aka: aka.clone(),
+            aka_origin: crate::connectivity::core::digest_aka::decode_aka_nonce(&challenge.nonce).ok(),
             cnonce,
             nonce_count: 0,
         };
@@ -1717,6 +1730,13 @@ fn ensure_required_security_before_aka(
 }
 
 impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthenticator {
+    fn validate_success(&self, _response: &[u8]) -> Result<(), ImsError> {
+        if self.resync_sent && self.pending.as_ref().and_then(|pending| pending.refresh_authorization.as_ref()).is_none_or(|state| state.nonce_count == 0) {
+            return Err(ImsError::new("ims_aka_resync_unexpected_status"));
+        }
+        Ok(())
+    }
+
     async fn prepare_authenticated_channel(
         &mut self,
         challenge_response: &[u8],
@@ -1726,14 +1746,44 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         self.runtime
             .update(|state| state.stage = CellularImsStage::IdentityAka)
             .await;
-        // A second challenge replaces only this procedure's tentative SA. Keep
-        // the original live channel and the offer already seen by the P-CSCF.
+        let security_server_values = sip::header_values(challenge_response, "Security-Server");
+        let security_server = select_security_server_for_mechanism(self.profile, &security_server_values, self.security_mechanism)?;
+        let challenge = parse_digest_challenge(challenge_response).map_err(to_ims_error)?;
+        // Only credentials used by the preceding request are reusable. AUTS
+        // deliberately has no proof state and cannot fall through to an older
+        // session's credentials just because those are still retained for rollback.
+        let previous = match &self.pending {
+            Some(pending) => pending.refresh_authorization.clone(),
+            None => self.refresh_authorization.clone(),
+        }.filter(|state| state.nonce_count > 0);
+        let action = crate::connectivity::core::digest_aka::challenge_action(
+            &challenge, previous.as_ref().map(|state| &state.challenge),
+            previous.as_ref().and_then(|state| state.aka_origin.as_ref()),
+        )?;
+        if action == crate::connectivity::core::digest_aka::ChallengeAction::ReuseCredentials {
+            let current_verify = channel.security_verify();
+            if security_server.as_ref().is_some_and(|offer| current_verify != Some(offer.verify.as_str())) {
+                return Err(ImsError::new("digest_stale_security_changed"));
+            }
+            if (self.required_security || self.security_mechanism.is_some()) && current_verify.is_none() {
+                return Err(ImsError::new(code::SECURITY_SERVER_MISSING));
+            }
+            ensure_required_security_before_aka(self.profile, false, current_verify.is_some())?;
+            verify_ims_card_binding(&self.device, self.auth_binding.as_ref()).await?;
+            self.ensure_task_current()?;
+            let previous = previous.expect("stale reuse requires sent credential context");
+            let reuse_security = self.reuse_security;
+            self.reuse_security = true;
+            let result = self.prepare_aka_result(challenge, previous.aka, None, channel).await;
+            self.reuse_security = reuse_security;
+            return result;
+        }
+        // A genuinely fresh AKA vector replaces only this procedure's tentative
+        // SA. Stale renewal above keeps the protected flow and never replays UICC.
         if self.xfrm_plan.is_some() {
             self.rollback_security(channel).await;
         }
         self.pending = None;
-        let security_server_values = sip::header_values(challenge_response, "Security-Server");
-        let security_server = select_security_server_for_mechanism(self.profile, &security_server_values, self.security_mechanism)?;
         if self.required_security && security_server.is_none() && channel.security_verify().is_none() {
             return Err(ImsError::new(code::SECURITY_SERVER_MISSING));
         }
@@ -1753,7 +1803,6 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
             security_server.is_some(),
             channel.security_verify().is_some(),
         )?;
-        let challenge = parse_digest_challenge(challenge_response).map_err(to_ims_error)?;
         let aka_challenge = digest_aka::decode_aka_nonce(&challenge.nonce).map_err(to_ims_error)?;
         let aid = self.aka_aid.clone();
         let rand = aka_challenge.rand;
@@ -3321,6 +3370,7 @@ async fn connect_family(
     let mut pending_variant = None;
     let mut candidate_attempts = 0usize;
     let mut consecutive_silent_failures = 0usize;
+    let mut lease_budget = crate::connectivity::core::register::RegisterNegotiationBudget::default();
     while pending_variant.is_some() || register_variants.peek().is_some() {
         let now = Instant::now();
         if let Some(error) = live_retry::admission_error(endpoint_retries.lock().await.check(pcscf, now), now) {
@@ -3463,7 +3513,9 @@ async fn connect_family(
         verify_ims_card_binding(device, Some(&device_identity.auth_binding)).await
             .map_err(|error| CellularImsError::new(error.code()))?;
         let registration_result =
-            run_register_observed(&mut channel, &initial, &mut authenticator).await;
+            crate::connectivity::core::register::run_register_observed_with_budget(
+                &mut channel, &initial, &mut authenticator, &mut lease_budget,
+            ).await;
         if let Err(error) = verify_mm_task_bearer(runtime, native_bearer.as_deref_mut()).await {
             authenticator.rollback_security(&mut channel).await;
             return Err(error);
@@ -3491,7 +3543,8 @@ async fn connect_family(
                         );
                     }
                 }
-                let error = map_register_failure(&failure);
+                let metadata = lease_budget.failure_metadata(&failure);
+                let error = map_register_failure(&failure).with_register_failure(metadata);
                 if silent_pcscf_failure(&failure) {
                     consecutive_silent_failures = consecutive_silent_failures.saturating_add(1);
                 } else {
@@ -3509,7 +3562,6 @@ async fn connect_family(
                 if device_identity.diagnostic_required_security {
                     return Err(error);
                 }
-                let metadata = failure.metadata();
                 if metadata.kind == crate::connectivity::core::register::RegisterFailureKind::TemporaryEndpoint
                     || (metadata.kind != crate::connectivity::core::register::RegisterFailureKind::Transport
                         && metadata.retry_after != crate::connectivity::core::register::RetryAfter::Absent)
@@ -3517,6 +3569,12 @@ async fn connect_family(
                     endpoint_retries.lock().await.observe_failure(pcscf, &metadata, Instant::now());
                     // A server wait is not a header/profile compatibility hint.
                     // Only the outer loop may consider an eligible other endpoint.
+                    return Err(error);
+                }
+                // 423 commits this attempt to its current request/security
+                // shape. Even a later 400/timeout cannot reopen any dynamic,
+                // static or security-hint candidate (nor an outer profile).
+                if !lease_budget.permits_candidate_expansion() {
                     return Err(error);
                 }
                 if has_alternate_pcscf
@@ -8287,20 +8345,11 @@ fn pre_authentication_variant_failure(failure: &RegisterFailure) -> bool {
     if failure.auth_rounds != 0 {
         return false;
     }
-    // Format, lease, extension and transient server rejections may all be
-    // cleared by a differently shaped REGISTER candidate. 423 itself is
-    // negotiated inside the shared driver; the exhausted/min-expires errors
-    // below are what escape after the bounded retry loop.
-    matches!(
-        register_failure_status(failure),
-        Some(status) if status_permits_register_variant_fallback(status),
-    ) || matches!(
-        failure.error.code(),
-        "ims_register_initial_min_expires_invalid"
-            | "ims_register_initial_min_expires_exhausted"
-            | "ims_register_initial_min_expires_unsupported"
-    ) || (failure.response.is_none()
-        && failure.error.code() == "ims_register_initial_receive_failed")
+    // Lease failures are never formatting hints. The attempt-level budget also
+    // guards the outer loop against a later 400/timeout after a valid 423.
+    failure.metadata().permits_variant_fallback()
+        || (failure.response.is_none()
+            && failure.error.code() == "ims_register_initial_receive_failed")
 }
 
 fn sec_agree_retry_variant(
@@ -9138,6 +9187,7 @@ mod tests {
             qop: Some("auth".to_string()),
             opaque: None,
             proxy: false,
+            stale: false,
         };
         let aka = crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult {
             res: b"Circle Of Life".to_vec(),
@@ -9183,6 +9233,7 @@ mod tests {
             qop: Some("auth".to_string()),
             opaque: None,
             proxy: true,
+            stale: false,
         };
         let aka = crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult {
             res: b"Circle Of Life".to_vec(),
@@ -10113,6 +10164,31 @@ mod tests {
         assert_ne!(replacement.port_c, old.port_c);
         assert!(header.contains("port-c=51731"));
         assert!(header.contains("port-s=5063"));
+    }
+
+    #[test]
+    fn min_expires_failures_stop_cellular_header_candidates() {
+        use crate::connectivity::core::register::{RegisterFailureStage, RegisterMinExpiresFailure};
+        for authenticated in [false, true] {
+            for reason in [RegisterMinExpiresFailure::Invalid, RegisterMinExpiresFailure::Unsupported,
+                RegisterMinExpiresFailure::Exhausted] {
+                let failure = RegisterFailure {
+                    error: reason.error(authenticated),
+                    response: Some(b"SIP/2.0 423 Interval Too Brief\r\n\r\n".to_vec()),
+                    auth_rounds: u8::from(authenticated),
+                };
+                assert!(!pre_authentication_variant_failure(&failure));
+                let mapped = map_register_failure(&failure);
+                let metadata = mapped.register_failure().unwrap();
+                assert_eq!(metadata.min_expires, Some(reason));
+                assert_eq!(metadata.sip_status, Some(423));
+                assert_eq!(metadata.stage, if authenticated {
+                    RegisterFailureStage::Authenticated
+                } else { RegisterFailureStage::Initial });
+                assert!(mapped.to_string().contains(failure.error.code()));
+            }
+        }
+        assert_eq!(CELLULAR_IMS_REGISTER_CANDIDATE_LIMIT, 24);
     }
 
     #[test]

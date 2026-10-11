@@ -225,6 +225,8 @@ jobs:
             connectivity::modems::ims::vowifi::qmi_uim::isim::tests \
             connectivity::modems::ims::vowifi::qmi_uim::isim_binding_tests \
             connectivity::modems::ims::uicc_ims::tests \
+            connectivity::modems::ims::vowifi::live::stale_tests \
+            connectivity::modems::ims::vowifi::eap_aka::tests \
             connectivity::modems::ims::vowifi::live::live_identity::tests \
             connectivity::modems::ims::cellular_ims::register_retry::tests \
             connectivity::modems::ims::cellular_ims::live::live_retry::tests \
@@ -276,6 +278,7 @@ jobs:
             connectivity::modems::ims::cellular_ims::mm_binding::tests \
             connectivity::modems::ims::cellular_ims::pcscf::tests \
             connectivity::modems::ims::cellular_ims::pcscf_dns::tests \
+            api::handlers::tests::vowifi_profile_batch_min_expires_stops_before_selecting_another_profile \
             api::handlers::tests::cellular_ims_profile_batch \
             api::handlers::tests::blocked_line_projection_preserves_original_schema_and_saved_intents \
             api::handlers::tests::voice_home_ \
@@ -291,12 +294,15 @@ jobs:
             connectivity::modems::ims::vowifi::socks5::tests \
             connectivity::modems::ims::vowifi::transport::tests \
             connectivity::modems::ims::vowifi::live::epdg_address_tests \
+            connectivity::modems::ims::vowifi::live::tests \
             connectivity::modems::ims::vowifi::live::tests::full_handshake_keeps_proposal_and_transport_limits \
             services::trunk::transport::tests \
             services::e911::ssrf::tests \
             services::e911::ts43::tests \
             connectivity::core::device_identity::tests \
             mm_startup_policy_tests \
+            connectivity::core::digest_aka::tests \
+            connectivity::core::digest_aka::challenge_tests \
             connectivity::core::register::tests \
             connectivity::core::registration::tests \
             connectivity::core::register_response::tests \

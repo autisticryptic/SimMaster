@@ -218,7 +218,8 @@ impl FailureClass {
     /// Endpoint failure is not permission to rebuild a bearer, alter the
     /// profile, ignore not-before, or downgrade a challenged security context.
     pub fn from_register_failure(failure: &RegisterFailureMetadata) -> Self {
-        if failure.stage == RegisterFailureStage::Initial
+        if failure.min_expires.is_none()
+            && failure.stage == RegisterFailureStage::Initial
             && matches!(failure.kind,
                 RegisterFailureKind::TemporaryEndpoint | RegisterFailureKind::Transport)
         {
@@ -632,6 +633,20 @@ mod tests {
     }
 
     #[test]
+    fn min_expires_provenance_stops_endpoint_and_family_reexpansion() {
+        use crate::connectivity::core::register::{RegisterMinExpiresFailure, RetryAfter};
+        for kind in [RegisterFailureKind::Transport, RegisterFailureKind::TemporaryEndpoint] {
+            let metadata = RegisterFailureMetadata {
+                sip_status: Some(503), stage: RegisterFailureStage::Initial, kind,
+                retry_after: RetryAfter::Absent, min_expires: Some(RegisterMinExpiresFailure::Negotiated),
+            };
+            assert_eq!(FailureClass::from_register_failure(&metadata), FailureClass::Other);
+            let error = CellularImsError::new(code::REGISTER_INITIAL_UNEXPECTED_STATUS).with_register_failure(metadata);
+            assert!(!FailureClass::from_error(&error).is_retryable_family());
+        }
+    }
+
+    #[test]
     fn register_retry_plan_uses_structured_metadata_not_detail() {
         use crate::connectivity::core::register::{RegisterFailure, RetryAfter};
         use crate::connectivity::core::ImsError;
@@ -655,6 +670,7 @@ mod tests {
             (RegisterFailureKind::LocalFailure, RegisterFailureStage::Initial),
         ] {
             let metadata = RegisterFailureMetadata {
+                min_expires: None,
                 sip_status: Some(503), stage, kind, retry_after: RetryAfter::Absent,
             };
             assert_eq!(FailureClass::from_register_failure(&metadata), FailureClass::Other);

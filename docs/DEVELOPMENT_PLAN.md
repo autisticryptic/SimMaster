@@ -9,7 +9,7 @@
 - 当前源码基线为 `5aaf3ea`：ISIM 身份/P-CSCF 端点/Retry-After 第一批补全已通过两套 Actions；两份测试 ZIP 的官方摘要、各 87 项回归与四矩阵均已核验，**未部署**，见 [HANDOFF](HANDOFF.md)。
 - 设备历史基线仍为全局兜底修复 `c174551`，已通过 Actions 和 410 原 Globe 配置的初始注册验收。
   `7bd` 的运营商专用补丁及测试仍保持由 `0502395` 撤销的状态；当前成功不能替代中国移动同卡验收。
-- **当前优先级是安排明确授权的同卡/自然续期验收，并单独调查停服时的 MM 重枚举/AT 超时。**
+- **当前优先级是继续原 EC20 审查中的第二批协议补强，而不是把第一批当作整个委托结束。** 同卡/自然续期验收与停服时的 MM 重枚举/AT 超时调查独立保留，设备操作另需明确授权。
   用户禁止按特定 MCC/MNC、运营商或某张卡增加专用补丁/测试；回归按通用协议场景与状态机组织。
 - 唯一开发工作区为 `SimAdmin/master`，不恢复旧独立 worktree/临时分支开发路线。
   当前源码不等于当前设备二进制，现场版本、SIM 和会话须从交接证据独立确认。
@@ -32,7 +32,18 @@
 - Digest `rspauth`：绑定请求上下文验证 Authentication-Info，不能只接收 nextnonce。
 - AUTS/stale：同步恢复路径保留 qop/opaque，区分 stale，同时保持鉴权预算。
 - 423：避免交换内 Min-Expires 协商耗尽后换静态候选重新开放预算。
-- 独立 catalog 的 EC20 来源归一化及原生 IMS provider 观测属于另行扩展；不把固件字符串/MCFG 默认值当成实网调用图或运行态参数。
+- 实施顺序先 AUTS/stale 与 423 预算，再 rspauth，随后 reg-event；前两者优先复用现有核心能力，不能把“已有算法/helper”当成生产路径已经接通。
+
+## P1：原报告的传输与功能扩展（部分基础已具备）
+
+- **P-CSCF 传输未全部补齐。** 第一批已完成端点/端口/来源、多 A/AAAA/SRV、SRV 权重及明确 unsupported；蜂窝 SIP TCP/TLS、SIP NAPTR 和 DNS 截断后的 TCP 查询仍未实施。ePDG 的其他 NAPTR 用途不等于 SIP NAPTR 已支持。
+- **来源诊断只完成基础字段。** 继续核对 actual profile origin、ISIM/USIM 身份、P-CSCF 来源、请求/实际地址族、报价/协商算法、失败作用域和 not-before 的 API/UI 统一投影。配置中的 identity source/template 标签不能冒充实际执行规则。
+- **承载能力门禁尚需补齐。** 显式 APN PAP/CHAP、通用 PCO request policy、PCO FQDN 和 DHCP adapter 需按设备能力报告 supported/unsupported/unknown；不能借普通数据 APN 激活或猜测凭据。协议支持和真实驱动验收分别完成。
+- **EC20 离线 catalog 来源尚未接入。** 在独立 `carrier_Bundles` 侧维护版本绑定的 MCFG extractor、选择器及字段证据；未知 `qp_ims_*` raw bytes 不得猜为 ready。跨项目实施范围另行明确。
+- **EC20 原生 IMS 只读观测 provider 尚未接入。** IMSA/注册/业务状态观测需明确与主机软 IMS 的 owner/互斥；可能写 NV 的 URC 开关不归入只读采证。
+- **固件函数级确认尚未进行。** 原报告已有解包/容器/载荷证据和字符串锚点，但配置优先级、结构版本、算法与失败回退的实际分支仍待证实；需要 IDA 时必须由用户手动启动并选定分析文件。
+
+以上是原 EC20 审查范围的后续，不把项目所有 MEP/VoNR/E911 愿景都混称成本轮已承诺功能。QoS/precondition/UT 等已有业务基础也不能重报成完全缺失，仍需按配置与实测分开验收。
 
 ## P0：全局注册兜底的剩余验收
 

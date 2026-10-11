@@ -7838,6 +7838,12 @@ async fn restore_cellular_data_after_vowifi(app: &AppState, scope: &VowifiScope)
     }
 }
 
+fn vowifi_profile_batch_stops_register_negotiation(reason: Option<&str>) -> bool {
+    reason.is_some_and(
+        crate::connectivity::modems::ims::vowifi::live::register_reason_blocks_profile_fallback,
+    )
+}
+
 async fn attempt_vowifi_connect_once(
     app: &AppState,
     scope: &VowifiScope,
@@ -8140,6 +8146,11 @@ async fn connect_vowifi_on_line(
         last_status = attempt_vowifi_connect_once(app, scope, false).await;
         if last_status.readiness.sms_ready {
             return last_status;
+        }
+        if vowifi_profile_batch_stops_register_negotiation(last_status.degraded_reason.as_deref()) {
+            // Neither another profile nor a fresh ESP/header ladder may reset
+            // a lease budget, even when the last result was 400/transport loss.
+            break;
         }
         if attempt < attempts {
             tokio::time::sleep(retry_delay).await;
@@ -10915,7 +10926,8 @@ fn cellular_ims_profile_batch_action(
     } else if matches!(error.code(), code::REGISTER_RETRY_STOPPED | code::REGISTER_RETRY_DEFERRED)
         || error.register_failure().is_some_and(|failure| {
             use crate::connectivity::core::register::{RegisterFailureKind, RegisterFailureStage};
-            failure.stage != RegisterFailureStage::Initial
+            failure.min_expires.is_some()
+                || failure.stage != RegisterFailureStage::Initial
                 || !matches!(failure.kind, RegisterFailureKind::Negotiation | RegisterFailureKind::Transport)
         })
     {
@@ -15460,6 +15472,44 @@ mod tests {
     }
 
     #[test]
+    fn cellular_ims_profile_batch_min_expires_failure_never_reopens_profiles() {
+        use crate::connectivity::core::register::{RegisterFailure, RegisterMinExpiresFailure};
+        use crate::connectivity::core::ImsError;
+        use crate::connectivity::modems::ims::cellular_ims::CellularImsError;
+        for reason in ["invalid", "unsupported", "exhausted"] {
+            let code = match reason {
+                "invalid" => "ims_register_initial_min_expires_invalid",
+                "unsupported" => "ims_register_initial_min_expires_unsupported",
+                _ => "ims_register_initial_min_expires_exhausted",
+            };
+            let failure = RegisterFailure {
+                error: ImsError::new(code),
+                response: Some(b"SIP/2.0 423 Interval Too Brief\r\n\r\n".to_vec()),
+                auth_rounds: 0,
+            };
+            let error = CellularImsError::new(code::REGISTER_INITIAL_UNEXPECTED_STATUS)
+                .with_register_failure(failure.metadata());
+            assert_eq!(cellular_ims_profile_batch_action(true, 1, 3, Some(&error)),
+                CellularImsProfileBatchAction::StopRegister);
+        }
+        // The adapter carries the negotiated provenance even if the final
+        // response/transport error is not itself 423. Do not throw it away.
+        for code in ["ims_register_initial_unexpected_status", "ims_register_initial_receive_failed"] {
+            let failure = RegisterFailure {
+                error: ImsError::new(code),
+                response: Some(b"SIP/2.0 400 Bad Request\r\n\r\n".to_vec()),
+                auth_rounds: 0,
+            };
+            let mut metadata = failure.metadata();
+            metadata.min_expires = Some(RegisterMinExpiresFailure::Negotiated);
+            let error = CellularImsError::new(code::REGISTER_INITIAL_UNEXPECTED_STATUS)
+                .with_register_failure(metadata);
+            assert_eq!(cellular_ims_profile_batch_action(true, 1, 3, Some(&error)),
+                CellularImsProfileBatchAction::StopRegister);
+        }
+    }
+
+    #[test]
     fn cellular_ims_profile_batch_advances_in_order_until_success_or_exhaustion() {
         assert_eq!(
             simulate_cellular_ims_profile_batch(&[
@@ -15669,6 +15719,27 @@ mod tests {
         )));
         assert!(!vowifi_auto_restore_is_exhausted(Some("vowifi_dns_failed")));
         assert!(!vowifi_auto_restore_is_exhausted(None));
+    }
+
+    #[test]
+    fn vowifi_profile_batch_min_expires_stops_before_selecting_another_profile() {
+        for reason in [
+            "ims_register_initial_min_expires_invalid:sip_status=423",
+            "ims_register_initial_min_expires_unsupported:sip_status=423",
+            "ims_register_initial_min_expires_exhausted:sip_status=423",
+            "ims_register_authenticated_min_expires_invalid:sip_status=423",
+            "ims_register_authenticated_min_expires_unsupported:sip_status=423",
+            "ims_register_authenticated_min_expires_exhausted:sip_status=423",
+            "ims_register_min_expires_negotiated:ims_register_initial_unexpected_status:sip_status=400",
+            "ims_register_min_expires_negotiated:ims_register_read_failed:sip_status=423",
+            "ims_register_min_expires_negotiated:ims_register_write_failed",
+        ] {
+            assert!(vowifi_profile_batch_stops_register_negotiation(Some(reason)), "{reason}");
+        }
+        for reason in [None, Some("ims_register_initial_unexpected_status:sip_status=400"),
+            Some("ims_register_read_failed"), Some("carrier warning about Min-Expires")] {
+            assert!(!vowifi_profile_batch_stops_register_negotiation(reason));
+        }
     }
 
     #[test]

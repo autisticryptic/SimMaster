@@ -34,6 +34,9 @@ pub struct DigestChallenge {
     pub opaque: Option<String>,
     /// True when the challenge arrived in Proxy-Authenticate.
     pub proxy: bool,
+    /// RFC Digest stale flag. Absence means false; it is not a new identity
+    /// or permission to reset the exchange's authentication budget.
+    pub stale: bool,
 }
 
 impl DigestChallenge {
@@ -43,6 +46,46 @@ impl DigestChallenge {
         } else {
             "Authorization"
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeAction {
+    Authenticate,
+    ReuseCredentials,
+}
+
+/// Decide stale handling against the credentials of the request actually sent.
+/// Reuse of AKA-derived credentials is permitted only when RAND/AUTN match
+/// the vector that produced those credentials, not a mutable Digest nextnonce.
+/// A genuinely new AKA challenge still goes to the bound UICC.
+/// Callers retain all security/owner checks and their existing round budget.
+pub fn challenge_action(
+    incoming: &DigestChallenge,
+    previous: Option<&DigestChallenge>,
+    authenticated_aka: Option<&AkaChallenge>,
+) -> Result<ChallengeAction, ImsError> {
+    if !incoming.stale { return Ok(ChallengeAction::Authenticate); }
+    let previous = previous.ok_or_else(|| ImsError::new("digest_stale_without_context"))?;
+    if incoming.realm != previous.realm || incoming.proxy != previous.proxy
+        || !incoming.algorithm.eq_ignore_ascii_case(&previous.algorithm)
+        || incoming.qop != previous.qop
+    {
+        return Err(ImsError::new("digest_stale_scope_changed"));
+    }
+    if incoming.nonce == previous.nonce {
+        return Err(ImsError::new("digest_stale_nonce_unchanged"));
+    }
+    if incoming.algorithm.eq_ignore_ascii_case("MD5") {
+        return Ok(ChallengeAction::ReuseCredentials);
+    }
+    let fresh = decode_aka_nonce(&incoming.nonce)?;
+    // Authentication-Info may have changed the digest nonce without invoking
+    // UICC. Its RAND/AUTN-looking bytes are not evidence of authenticated keys.
+    if authenticated_aka.is_some_and(|origin| *origin == fresh) {
+        Ok(ChallengeAction::ReuseCredentials)
+    } else {
+        Ok(ChallengeAction::Authenticate)
     }
 }
 
@@ -430,7 +473,7 @@ pub fn select_digest_challenge(
 /// Parse a digest challenge from a header value (text after `WWW-Authenticate:`).
 pub fn parse_digest_challenge(value: &str, proxy: bool) -> Result<DigestChallenge, ImsError> {
     let params = strip_digest_scheme(value).ok_or(ImsError::new("digest_challenge_missing"))?;
-    let map = parse_digest_params(params);
+    let map = parse_digest_params(params)?;
     let realm = map
         .iter()
         .find(|(k, _)| k == "realm")
@@ -451,6 +494,14 @@ pub fn parse_digest_challenge(value: &str, proxy: bool) -> Result<DigestChalleng
         .iter()
         .find(|(k, _)| k == "opaque")
         .map(|(_, v)| v.clone());
+    let stale = match map.iter().find(|(key, _)| key == "stale").map(|(_, value)| value.as_str()) {
+        None => false,
+        Some(value) if value.eq_ignore_ascii_case("true") => true,
+        Some(value) if value.eq_ignore_ascii_case("false") => false,
+        Some(_) => return Err(ImsError::new("digest_stale_invalid")),
+    };
+    if realm.is_empty() { return Err(ImsError::new("digest_realm_missing")); }
+    if nonce.is_empty() { return Err(ImsError::new("digest_nonce_missing")); }
     Ok(DigestChallenge {
         realm,
         nonce,
@@ -458,6 +509,7 @@ pub fn parse_digest_challenge(value: &str, proxy: bool) -> Result<DigestChalleng
         qop,
         opaque,
         proxy,
+        stale,
     })
 }
 
@@ -518,52 +570,62 @@ fn select_qop(params: &[(String, String)]) -> Option<String> {
         .or_else(|| Some(raw.trim().to_string()))
 }
 
-/// Parse `key=value` / `key="value"` pairs, honoring commas inside quotes.
-fn parse_digest_params(input: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+/// Bounded auth-param parser. Ambiguous duplicate fields, broken quoting and
+/// control-character injection must never be interpreted as stale=false or as
+/// a different nonce/realm than the one later serialized into Authorization.
+fn parse_digest_params(input: &str) -> Result<Vec<(String, String)>, ImsError> {
+    let invalid = || ImsError::new("digest_challenge_invalid");
+    if input.len() > 16 * 1024 || input.bytes().any(|b| b == 0x7f || (b < 0x20 && b != b'\t')) {
+        return Err(invalid());
+    }
+    let token = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
     let bytes = input.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        while i < bytes.len() && (bytes[i] == b',' || bytes[i].is_ascii_whitespace()) {
-            i += 1;
-        }
-        let key_start = i;
-        while i < bytes.len() && bytes[i] != b'=' {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let key = input[key_start..i].trim().to_ascii_lowercase();
+    let mut out: Vec<(String, String)> = Vec::new();
+    loop {
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') { i += 1; }
+        if i == bytes.len() { break; }
+        if out.len() >= 64 { return Err(invalid()); }
+        let start = i;
+        while i < bytes.len() && token(bytes[i]) { i += 1; }
+        if i == start { return Err(invalid()); }
+        let key = input[start..i].to_ascii_lowercase();
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') { i += 1; }
+        if bytes.get(i) != Some(&b'=') { return Err(invalid()); }
         i += 1;
-        let value = if i < bytes.len() && bytes[i] == b'"' {
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') { i += 1; }
+        let value = if bytes.get(i) == Some(&b'"') {
             i += 1;
-            let mut buf = String::new();
-            while i < bytes.len() && bytes[i] != b'"' {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    buf.push(bytes[i + 1] as char);
-                    i += 2;
-                    continue;
-                }
-                buf.push(bytes[i] as char);
-                i += 1;
+            let mut value = String::new();
+            loop {
+                let byte = *bytes.get(i).ok_or_else(invalid)?;
+                if byte == b'"' { i += 1; break; }
+                if byte == b'\\' { i += 1; }
+                let ch = input.get(i..).and_then(|value| value.chars().next()).ok_or_else(invalid)?;
+                value.push(ch);
+                i += ch.len_utf8();
             }
-            if i < bytes.len() {
-                i += 1;
-            }
-            buf
+            value
         } else {
-            let val_start = i;
-            while i < bytes.len() && bytes[i] != b',' {
+            let start = i;
+            while i < bytes.len() && !matches!(bytes[i], b',' | b' ' | b'\t') {
+                if !(0x21..=0x7e).contains(&bytes[i]) || matches!(bytes[i], b'"' | b'\\') { return Err(invalid()); }
                 i += 1;
             }
-            input[val_start..i].trim().to_string()
+            if i == start { return Err(invalid()); }
+            input[start..i].to_owned()
         };
-        if !key.is_empty() {
-            out.push((key, value));
+        if out.iter().any(|(seen, _)| seen == &key) {
+            return Err(ImsError::new("digest_parameter_duplicate"));
         }
+        out.push((key, value));
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') { i += 1; }
+        if i == bytes.len() { break; }
+        if bytes[i] != b',' { return Err(invalid()); }
+        i += 1;
+        if bytes[i..].iter().all(|b| matches!(b, b' ' | b'\t')) { return Err(invalid()); }
     }
-    out
+    Ok(out)
 }
 
 fn quote(value: &str) -> String {
@@ -637,6 +699,10 @@ pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
     outer.extend_from_slice(&inner_digest.0);
     md5::compute(&outer).0
 }
+
+#[cfg(test)]
+#[path = "digest_challenge_tests.rs"]
+mod challenge_tests;
 
 #[cfg(test)]
 mod tests {
@@ -878,6 +944,7 @@ mod tests {
             qop: Some("auth".to_string()),
             opaque: Some("op".to_string()),
             proxy: false,
+            stale: false,
         };
         let h =
             build_authorization_header(&challenge, "user", "sip:r", "abc123", "cnon", "00000001");
@@ -895,6 +962,7 @@ mod tests {
             qop: Some("auth".to_string()),
             opaque: Some("op".to_string()),
             proxy: true,
+            stale: false,
         };
         let header = build_resync_authorization_header_with_digest(
             &challenge,

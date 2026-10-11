@@ -62,9 +62,11 @@ use crate::connectivity::core::{
     contact::{complete_contact_parameters, ContactCompletion},
     media::OperatorSocketCreator,
     register::{
-        run_register_observed, status_is_terminal_register_failure, RegisterAuthenticator,
-        RegisterFailure, RegisterTransactionKey, MAX_MIN_EXPIRES_ROUNDS,
-        MAX_REGISTER_IGNORED_FRAMES, MAX_REGISTER_PROVISIONAL_RESPONSES, MIN_EXPIRES_CAP,
+        run_register_observed, run_register_observed_with_budget,
+        status_is_terminal_register_failure, RegisterAuthenticator,
+        RegisterFailure, RegisterFailureMetadata, RegisterMinExpiresFailure,
+        RegisterNegotiationBudget, RegisterTransactionKey,
+        MAX_REGISTER_IGNORED_FRAMES, MAX_REGISTER_PROVISIONAL_RESPONSES,
     },
     register_response::RegisterArtifacts,
     registration::{
@@ -2505,6 +2507,8 @@ pub struct LiveStageError {
     /// Authentication rounds completed before the shared REGISTER engine gave
     /// up. Dynamic request-shape changes are forbidden once AKA has started.
     register_auth_rounds: u8,
+    /// Redacted stage/status and lease provenance survive adapter-owned sends.
+    register_failure: Option<RegisterFailureMetadata>,
 }
 
 pub trait LiveStageAdapter: Send + Sync {
@@ -4793,6 +4797,8 @@ async fn record_live_ims_channel(
                 refresh_authorization: std::sync::Mutex::new(
                     register_context.refresh_authorization.clone(),
                 ),
+                unregister_authorization: std::sync::Mutex::new(None),
+                unregister_resync_sent: std::sync::atomic::AtomicBool::new(false),
                 security_verify: security_verify.clone(),
             })),
             media_route_installer,
@@ -5148,6 +5154,11 @@ async fn run_register_exchange_with_pcscf(
                         reason = err.reason.as_str(),
                         "IMS REGISTER header variant failed"
                     );
+                    // A prior lease negotiation is not a new formatting hint,
+                    // even if its retry ended in 400/421 or lost transport.
+                    if live_register_lease_negotiation_stopped(&err) {
+                        return Err(err);
+                    }
                     // Response-driven variants are cumulative. In particular,
                     // once 421/494 has required sec-agree, a following pre-auth
                     // 400/403 is retried with the same declaration plus an empty
@@ -5200,6 +5211,9 @@ fn next_dynamic_live_register_variant(
     variant: LiveRegisterHeaderVariant,
     error: &LiveStageError,
 ) -> Option<LiveRegisterHeaderVariant> {
+    if live_register_lease_negotiation_stopped(error) {
+        return None;
+    }
     sec_agree_retry_variant(profile, variant, error)
         .or_else(|| sec_agree_empty_aka_retry_variant(profile, variant, error))
         .or_else(|| sec_agree_compact_security_retry_variant(profile, variant, error))
@@ -5543,7 +5557,7 @@ async fn run_register_exchange_with_pcscf_variant(
         Ok((response, mut context, next_cseq)) => {
             if !context.channel_transferred {
                 let artifacts = channel
-                    .outbound_registered(response.as_bytes(), profile.ims.register.expires_seconds)
+                    .outbound_registered(response.as_bytes(), context.register_expires(profile))
                     .map_err(|error| live_stage_error(error.code()))?;
                 if artifacts.expires_seconds == Some(0) {
                     return Err(live_stage_error("ims_register_binding_removed"));
@@ -5554,14 +5568,16 @@ async fn run_register_exchange_with_pcscf_variant(
                 let registered = RegisteredImsContext::from_artifacts(
                     ImsRegistrationAccess::Vowifi,
                     artifacts,
-                    profile.ims.register.expires_seconds,
+                    context.register_expires(profile),
                 );
                 let mut identity = context.identity.shared.clone();
                 if let Some(uri) = registered.default_associated_uri() {
                     identity.public_uri = uri.to_string();
                 }
+                let security_verify = channel.security_verify().map(str::to_owned);
+                record_live_ims_security_verify(line_id, profile, security_verify.as_deref()).await;
                 record_live_ims_channel(
-                    line_id, profile, identity, channel, None, registered, context, variant,
+                    line_id, profile, identity, channel, security_verify, registered, context, variant,
                     next_cseq,
                 )
                 .await?;
@@ -5669,14 +5685,23 @@ async fn run_register_exchange_on_connected_stream(
         resync_sent: false,
         last_error: None,
     };
+    let mut lease_budget = RegisterNegotiationBudget::default();
     let registration =
-        match run_register_observed(channel, request.as_bytes(), &mut authenticator).await {
+        match run_register_observed_with_budget(
+            channel, request.as_bytes(), &mut authenticator, &mut lease_budget,
+        ).await {
             Ok(registration) => registration,
             Err(failure) => {
-                return Err(authenticator
-                    .last_error
-                    .take()
-                    .unwrap_or_else(|| map_shared_register_failure(&failure)))
+                let mut error = authenticator.last_error.take()
+                    .unwrap_or_else(|| map_shared_register_failure(&failure));
+                let metadata = lease_budget.failure_metadata(&failure);
+                let retained = error.register_failure.get_or_insert(metadata);
+                if retained.min_expires.is_none() {
+                    retained.min_expires = metadata.min_expires;
+                }
+                error.register_auth_rounds = failure.auth_rounds;
+                preserve_min_expires_profile_stop(&mut error);
+                return Err(error);
             }
         };
     drop(authenticator);
@@ -5810,6 +5835,7 @@ impl RegisterAuthenticator<SipChannel> for VowifiRegisterAuthenticator<'_> {
         let initial_authorization = self
             .context
             .build_initial_authorization_header(self.profile, self.variant);
+        self.context.min_expires = Some(min_expires);
         let request = self.context.build_register_request_with_expires(
             self.profile,
             self.variant,
@@ -5833,17 +5859,14 @@ fn map_shared_register_failure(failure: &RegisterFailure) -> LiveStageError {
         "ims_register_authenticated_unexpected_status" => "ims_register_unexpected_status",
         "ims_register_auth_rejected" => "ims_register_auth_rejected",
         "ims_register_initial_unexpected_status" => "ims_register_initial_unexpected_status",
-        // 423 is negotiated inside the shared engine; these escape only after
-        // the bounded retry loop, so treat them as the unexpected-status
-        // family rather than inventing a new terminal reason.
+        // Keep exact initial/authenticated lease failure reason, not a generic
+        // status code that could reopen header or ESP compatibility probing.
         "ims_register_initial_min_expires_invalid"
         | "ims_register_initial_min_expires_exhausted"
-        | "ims_register_initial_min_expires_unsupported" => {
-            "ims_register_initial_unexpected_status"
-        }
-        "ims_register_authenticated_min_expires_invalid"
+        | "ims_register_initial_min_expires_unsupported"
+        | "ims_register_authenticated_min_expires_invalid"
         | "ims_register_authenticated_min_expires_exhausted"
-        | "ims_register_authenticated_min_expires_unsupported" => "ims_register_unexpected_status",
+        | "ims_register_authenticated_min_expires_unsupported" => failure.error.code(),
         "sip_status_line_missing" | "sip_status_code_invalid" => {
             "ims_register_response_parse_failed"
         }
@@ -5855,6 +5878,7 @@ fn map_shared_register_failure(failure: &RegisterFailure) -> LiveStageError {
     );
     error.server_required_sec_agree = register_failure_demands_sec_agree(failure);
     error.register_auth_rounds = failure.auth_rounds;
+    error.register_failure = Some(failure.metadata());
     // Preserve the final SIP status in the reason so the candidate loops can
     // classify terminal rejections without touching the secret-bearing
     // response buffer.
@@ -5865,7 +5889,44 @@ fn map_shared_register_failure(failure: &RegisterFailure) -> LiveStageError {
     {
         error.reason = format!("{}:sip_status={status}", error.reason);
     }
+    preserve_min_expires_profile_stop(&mut error);
     error
+}
+
+/// The generic stage runner publishes only the safe reason string. Carry one
+/// fixed provenance token through it so the API's outer profile batch cannot
+/// reset a negotiated budget after a subsequent 400/transport failure. Preserve
+/// the original stage-specific reason and trailing SIP status verbatim.
+fn preserve_min_expires_profile_stop(error: &mut LiveStageError) {
+    if error.register_failure.is_some_and(|metadata| metadata.min_expires.is_some())
+        && !register_reason_blocks_profile_fallback(&error.reason)
+    {
+        error.reason = format!("ims_register_min_expires_negotiated:{}", error.reason);
+    }
+    if error.register_auth_rounds > 0 && !register_reason_blocks_profile_fallback(&error.reason) {
+        error.reason = format!("ims_register_authenticated_stop:{}", error.reason);
+    }
+}
+
+pub(crate) fn register_reason_blocks_profile_fallback(reason: &str) -> bool {
+    reason.split(':').any(|code| matches!(code,
+        "ims_register_min_expires_negotiated"
+        | "ims_register_authenticated_stop"
+        | "ims_register_initial_min_expires_invalid"
+        | "ims_register_initial_min_expires_unsupported"
+        | "ims_register_initial_min_expires_exhausted"
+        | "ims_register_authenticated_min_expires_invalid"
+        | "ims_register_authenticated_min_expires_unsupported"
+        | "ims_register_authenticated_min_expires_exhausted"
+        | "ims_register_protected_challenge_requires_recovery"
+        | "ims_digest_stale_security_changed"
+        | "ims_digest_stale_scope_changed"
+        | "ims_digest_stale_nonce_unchanged"
+        | "ims_digest_stale_without_context"
+        | "ims_digest_stale_credentials_missing"
+        | "ims_aka_resync_unexpected_status"
+        | "ims_aka_resync_repeated"
+    ))
 }
 
 /// Recover the final SIP status embedded by `map_shared_register_failure`.
@@ -5880,7 +5941,17 @@ fn live_register_error_status(error: &LiveStageError) -> Option<u16> {
 /// rejected the identity, refused the request on policy, or sent a redirect
 /// this project does not follow. No other header shape or P-CSCF can change
 /// the answer, so abort the candidate ladder instead of burning attempts.
+fn live_register_lease_negotiation_stopped(error: &LiveStageError) -> bool {
+    error.register_failure.is_some_and(|metadata| metadata.min_expires.is_some())
+        || live_register_error_status(error) == Some(423)
+        || register_reason_blocks_profile_fallback(&error.reason)
+}
+
 fn live_register_error_is_terminal(error: &LiveStageError) -> bool {
+    if error.register_auth_rounds > 0 { return true; }
+    if live_register_lease_negotiation_stopped(error) {
+        return true;
+    }
     if error.reason.starts_with("ims_outbound_") {
         return true;
     }
@@ -5915,15 +5986,23 @@ fn register_failure_demands_sec_agree(failure: &RegisterFailure) -> bool {
         .any(|extension| extension.trim().eq_ignore_ascii_case("sec-agree"))
 }
 
-/// Read the `Min-Expires` floor from a `423 Interval Too Brief` response.
-///
-/// RFC 3261 §21.4.4: the registrar refuses a lease below this value. The
-/// value is capped so a misconfigured floor cannot pin the registration open
-/// forever.
-fn parse_register_min_expires(response: &str) -> Option<u32> {
-    let value = sip_frame::header_value(response.as_bytes(), "Min-Expires")?;
-    let parsed = value.trim().parse::<u32>().ok()?;
-    Some(parsed.min(MIN_EXPIRES_CAP).max(1))
+/// One strict parser across both access legs; never clamp the server's floor.
+fn parse_register_min_expires(response: &str) -> Result<u32, RegisterMinExpiresFailure> {
+    crate::connectivity::core::register::parse_min_expires(response.as_bytes())
+}
+
+/// Initial authenticated/ESP exchanges currently own a captured Authorization,
+/// not a mutable Digest request-proof context. Refuse 423 explicitly instead
+/// of sending that same nc with a new CSeq, or changing the protected channel.
+/// The registered refresh adapter does own credentials and rebuilds its proof.
+fn authenticated_min_expires_failure(response: &str) -> LiveStageError {
+    let reason = parse_register_min_expires(response)
+        .err().unwrap_or(RegisterMinExpiresFailure::Unsupported);
+    map_shared_register_failure(&RegisterFailure {
+        error: reason.error(true),
+        response: Some(response.as_bytes().to_vec()),
+        auth_rounds: 1,
+    })
 }
 
 fn classify_vowifi_register_error(reason: &str) -> RegistrationLossReason {
@@ -5949,6 +6028,53 @@ fn classify_vowifi_register_error(reason: &str) -> RegistrationLossReason {
     }
 }
 
+fn retain_protected_register_channel(initial: &mut SipChannel, protected: SipChannel) {
+    // Move the socket and its receive/flow state; do not construct another
+    // channel or touch the gateway's ESP policy, sequence or replay window.
+    let old = std::mem::replace(initial, protected);
+    old.abort();
+}
+
+async fn run_retained_stale_register_exchange(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+    channel: &mut SipChannel,
+    context: &mut LiveRegisterRequestContext,
+    challenge: &LiveDigestChallenge,
+    variant: LiveRegisterHeaderVariant,
+    cseq: u32,
+) -> Result<String, LiveStageError> {
+    let verify = channel.security_verify().map(str::to_owned)
+        .ok_or_else(|| live_stage_error("ims_register_protected_challenge_requires_recovery"))?;
+    let previous = context.refresh_authorization.as_ref();
+    if live_digest_challenge_action(challenge, previous).map_err(map_shared_digest_error)?
+        != crate::connectivity::core::digest_aka::ChallengeAction::ReuseCredentials
+    {
+        // A new vector/key or security negotiation cannot reuse this tentative
+        // association, and must never reinstall identical SAs with sequence=1.
+        return Err(live_stage_error("ims_register_protected_challenge_requires_recovery"));
+    }
+    if !challenge.security_server_values.is_empty() {
+        let selected = select_live_security_server_offer(profile, challenge)?
+            .ok_or_else(|| live_stage_error("ims_digest_stale_security_changed"))?;
+        if selected.raw != verify {
+            return Err(live_stage_error("ims_digest_stale_security_changed"));
+        }
+    }
+    context.uicc.as_ref().ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?
+        .verify(line_id).await.map_err(live_stage_error)?;
+    let mut authorization = previous.ok_or_else(|| live_stage_error("ims_digest_stale_without_context"))?
+        .renewed(challenge).map_err(map_shared_digest_error)?;
+    let header = authorization.authorization(&context.identity.private_user, &context.request_uri(profile, variant))
+        .map_err(map_shared_digest_error)?;
+    let request = context.build_register_request_with_expires(
+        profile, variant, cseq, Some(&header), Some(&verify), context.register_expires(profile),
+    );
+    write_sip_request(channel, &request).await?;
+    context.refresh_authorization = Some(authorization);
+    read_final_register_response(channel, &request).await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_authenticated_register_exchange(
     line_id: &str,
@@ -5961,6 +6087,9 @@ async fn run_authenticated_register_exchange(
     authenticated_cseq: u32,
     resync_sent: &mut bool,
 ) -> Result<String, LiveStageError> {
+    if initial_channel.security_verify().is_some() {
+        return run_retained_stale_register_exchange(line_id, profile, initial_channel, context, challenge, variant, authenticated_cseq).await;
+    }
     let mut auth_material =
         build_live_register_auth_material(line_id, profile, context, challenge, variant).await?;
     if let Some(auts) = auth_material.auts.take() {
@@ -6015,41 +6144,18 @@ async fn run_authenticated_register_exchange(
         )
         .await
     } else {
-        let mut retry_cseq = authenticated_cseq;
-        let mut expires = profile.ims.register.expires_seconds;
-        let mut min_expires_rounds = 0u8;
-        loop {
-            let authenticated = context.build_register_request_with_expires(
-                profile,
-                variant,
-                retry_cseq,
-                Some(auth_material.authorization.as_str()),
-                security_verify.as_deref(),
-                expires,
-            );
-            write_sip_request(initial_channel, &authenticated).await?;
-            let response = read_final_register_response(initial_channel, &authenticated).await?;
-            let summary = ims::parse_sip_response(&response, &context.target.realm)
-                .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
-            if summary.status_code == 423 && min_expires_rounds < MAX_MIN_EXPIRES_ROUNDS {
-                let Some(min_expires) = parse_register_min_expires(&response) else {
-                    return Err(live_stage_error(
-                        "ims_register_authenticated_min_expires_invalid",
-                    ));
-                };
-                expires = expires.max(min_expires);
-                retry_cseq = retry_cseq.saturating_add(1);
-                min_expires_rounds += 1;
-                info!(
-                    sip_status = 423,
-                    min_expires,
-                    retry_cseq,
-                    "VoWiFi authenticated REGISTER negotiating a longer lease"
-                );
-                continue;
-            }
-            return Ok(response);
+        let authenticated = context.build_authorized_request(
+            profile, variant, authenticated_cseq,
+            auth_material.authorization.as_str(), security_verify.as_deref(),
+        );
+        write_sip_request(initial_channel, &authenticated).await?;
+        let response = read_final_register_response(initial_channel, &authenticated).await?;
+        let summary = ims::parse_sip_response(&response, &context.target.realm)
+            .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
+        if summary.status_code == 423 {
+            return Err(authenticated_min_expires_failure(&response));
         }
+        Ok(response)
     }
 }
 
@@ -6059,7 +6165,7 @@ async fn run_authenticated_register_exchange(
 async fn run_protected_authenticated_register_candidates(
     line_id: &str,
     profile: &'static CarrierProfile,
-    initial_channel: &SipChannel,
+    initial_channel: &mut SipChannel,
     gateway: &TunGatewayRuntime,
     context: &mut LiveRegisterRequestContext,
     offer: &LiveSecurityServerOffer,
@@ -6401,7 +6507,7 @@ async fn run_protected_authenticated_register_candidates(
                 } else {
                     LIVE_IMS_REGISTER_CANDIDATE_READ_TIMEOUT
                 };
-                let mut response = match read_final_register_response_with_timeout(
+                let response = match read_final_register_response_with_timeout(
                     &mut protected_channel,
                     &authenticated,
                     candidate_timeout,
@@ -6417,120 +6523,78 @@ async fn run_protected_authenticated_register_candidates(
                             reason = err.reason.as_str(),
                             "IMS protected SIP candidate failed"
                         );
-                        if err.reason.starts_with("ims_outbound_") {
+                        if context.min_expires.is_some() || err.reason.starts_with("ims_outbound_") {
                             return Err(err);
                         }
                         last_error = Some(err);
                         continue;
                     }
                 };
-                let mut summary = ims::parse_sip_response(&response, &context.target.realm)
+                let summary = ims::parse_sip_response(&response, &context.target.realm)
                     .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
-                let mut retry_cseq = authenticated_cseq;
-                let mut expires = profile.ims.register.expires_seconds;
-                let mut min_expires_rounds = 0u8;
-                loop {
-                    if summary.status_code == 200 {
-                        if let Some(auth) = context.refresh_authorization.as_mut() {
-                            auth.apply_success(response.as_bytes());
-                        }
-                        let artifacts = protected_channel
-                            .outbound_registered(response.as_bytes(), expires)
-                            .map_err(|error| live_stage_error(error.code()))?;
-                        let registered = RegisteredImsContext::from_artifacts(
-                            ImsRegistrationAccess::Vowifi,
-                            artifacts,
-                            expires,
-                        );
-                        let mut registered_identity = context.identity.shared.clone();
-                        if let Some(uri) = registered.default_associated_uri() {
-                            registered_identity.public_uri = uri.to_string();
-                        }
-                        // The registrar's P-Associated-URI set is the only place a
-                        // data-only line's own MSISDN is observable, and this leg
-                        // previously only logged how many URIs arrived. Publish the
-                        // telephone identities so the API layer can surface the
-                        // number instead of reporting N/A.
-                        crate::connectivity::core::own_numbers::record(
-                            line_id,
-                            crate::connectivity::core::ims_failure::telephone_numbers_from_register_success(
-                                response.as_bytes(),
-                            ),
-                        );
-                        record_live_ims_security_verify(line_id, profile, security_verify).await;
-                        record_live_ims_channel(
-                            line_id,
-                            profile,
-                            registered_identity,
-                            protected_channel,
-                            security_verify.map(str::to_string),
-                            registered,
-                            context.clone(),
-                            variant,
-                            retry_cseq.saturating_add(1),
-                        )
-                        .await?;
-                        context.channel_transferred = true;
-                        return Ok(response);
+                let expires = context.register_expires(profile);
+                if summary.status_code == 200 {
+                    if let Some(auth) = context.refresh_authorization.as_mut() {
+                        auth.apply_success(response.as_bytes());
                     }
-                    if summary.status_code != 423 || min_expires_rounds >= MAX_MIN_EXPIRES_ROUNDS {
-                        protected_channel.abort();
-                        return Ok(response);
-                    }
-                    let Some(min_expires) = parse_register_min_expires(&response) else {
-                        protected_channel.abort();
-                        last_error = Some(live_stage_error(
-                            "ims_register_authenticated_min_expires_invalid",
-                        ));
-                        break;
-                    };
-                    expires = expires.max(min_expires);
-                    retry_cseq = retry_cseq.saturating_add(1);
-                    min_expires_rounds += 1;
-                    info!(
-                        policy_candidate = candidate.label,
-                        sip_status = 423,
-                        min_expires,
-                        retry_cseq,
-                        "IMS REGISTER protected 423 negotiation"
-                    );
-                    let authenticated = context.build_register_request_with_expires(
-                        profile,
-                        variant,
-                        retry_cseq,
-                        Some(auth_material.authorization.as_str()),
-                        security_verify,
+                    let artifacts = protected_channel
+                        .outbound_registered(response.as_bytes(), expires)
+                        .map_err(|error| live_stage_error(error.code()))?;
+                    let registered = RegisteredImsContext::from_artifacts(
+                        ImsRegistrationAccess::Vowifi,
+                        artifacts,
                         expires,
                     );
-                    write_sip_request(&mut protected_channel, &authenticated).await?;
-                    response = match read_final_register_response_with_timeout(
-                        &mut protected_channel,
-                        &authenticated,
-                        candidate_timeout,
+                    let mut registered_identity = context.identity.shared.clone();
+                    if let Some(uri) = registered.default_associated_uri() {
+                        registered_identity.public_uri = uri.to_string();
+                    }
+                    // The registrar's P-Associated-URI set is the only place a
+                    // data-only line's own MSISDN is observable, and this leg
+                    // previously only logged how many URIs arrived. Publish the
+                    // telephone identities so the API layer can surface the
+                    // number instead of reporting N/A.
+                    crate::connectivity::core::own_numbers::record(
+                        line_id,
+                        crate::connectivity::core::ims_failure::telephone_numbers_from_register_success(
+                            response.as_bytes(),
+                        ),
+                    );
+                    record_live_ims_security_verify(line_id, profile, security_verify).await;
+                    record_live_ims_channel(
+                        line_id,
+                        profile,
+                        registered_identity,
+                        protected_channel,
+                        security_verify.map(str::to_string),
+                        registered,
+                        context.clone(),
+                        variant,
+                        authenticated_cseq.saturating_add(1),
                     )
-                    .await
-                    {
-                        Ok(response) => response,
-                        Err(err) => {
-                            protected_channel.abort();
-                            if err.reason.starts_with("ims_outbound_") {
-                                return Err(err);
-                            }
-                            warn!(
-                                policy_candidate = candidate.label,
-                                candidate_index,
-                                reason = err.reason.as_str(),
-                                "IMS protected 423 retry timed out; trying next policy"
-                            );
-                            last_error = Some(err);
-                            break;
-                        }
-                    };
-                    summary = ims::parse_sip_response(&response, &context.target.realm)
-                        .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
+                    .await?;
+                    context.channel_transferred = true;
+                    return Ok(response);
                 }
+                if matches!(summary.status_code, 401 | 407) {
+                    // Hand the exact protected channel back to the shared
+                    // engine for its next bounded auth round. Keep the gateway
+                    // policy, ESP sequence and anti-replay state untouched.
+                    retain_protected_register_channel(initial_channel, protected_channel);
+                    return Ok(response);
+                }
+                protected_channel.abort();
+                if summary.status_code == 423 {
+                    // No retry on another ESP mapping or replay of the captured
+                    // Authorization with a new CSeq/old nc.
+                    return Err(authenticated_min_expires_failure(&response));
+                }
+                return Ok(response);
             }
             Err(err) => {
+                if context.min_expires.is_some() {
+                    return Err(err);
+                }
                 warn!(
                     policy_candidate = candidate.label,
                     candidate_index,
@@ -7758,6 +7822,8 @@ struct LiveRegisterRequestContext {
     instance_id: String,
     refresh_authorization: Option<LiveRefreshAuthorization>,
     channel_transferred: bool,
+    /// Initial 423 floor survives the subsequent authenticated/protected send.
+    min_expires: Option<u32>,
     security_client_state: LiveSecurityClientState,
     security_client_full_spaced: String,
     security_client_full_compact: String,
@@ -7847,6 +7913,7 @@ impl LiveRegisterRequestContext {
             instance_id,
             refresh_authorization: None,
             channel_transferred: false,
+            min_expires: None,
             security_client_state,
             security_client_full_spaced: build_security_client_header(
                 profile,
@@ -7898,6 +7965,10 @@ impl LiveRegisterRequestContext {
         self.build_register_request(profile, variant, cseq, Some(authorization), security_verify)
     }
 
+    fn register_expires(&self, profile: &CarrierProfile) -> u32 {
+        profile.ims.register.expires_seconds.max(self.min_expires.unwrap_or(0))
+    }
+
     fn build_register_request(
         &self,
         profile: &'static CarrierProfile,
@@ -7912,7 +7983,7 @@ impl LiveRegisterRequestContext {
             cseq,
             authorization,
             security_verify,
-            profile.ims.register.expires_seconds,
+            self.register_expires(profile),
         )
     }
 
@@ -8284,6 +8355,10 @@ impl LiveRegisterRequestContext {
 struct LiveRefreshAuthorization {
     challenge: crate::connectivity::core::digest_aka::DigestChallenge,
     password: Vec<u8>,
+    // Retained only by this IMS socket/session, never by the EAP AKA path.
+    // Initial stale retries may need CK/IK again for the same security offer.
+    aka: Option<super::qmi_uim::UsimAkaApduResult>,
+    aka_origin: Option<crate::connectivity::core::digest_aka::AkaChallenge>,
     cnonce: String,
     nonce_count: u32,
 }
@@ -8325,6 +8400,22 @@ impl LiveRefreshAuthorization {
         Ok(header)
     }
 
+    fn sent_challenge(&self) -> Option<&crate::connectivity::core::digest_aka::DigestChallenge> {
+        (self.nonce_count > 0).then_some(&self.challenge)
+    }
+
+    fn renewed(&self, challenge: &LiveDigestChallenge) -> Result<Self, ImsError> {
+        Ok(Self {
+            challenge: challenge.shared(),
+            password: self.password.clone(),
+            aka: self.aka.clone(),
+            aka_origin: self.aka_origin.clone(),
+            cnonce: live_digest_cnonce()
+                .map_err(|_| ImsError::new("vowifi_refresh_random_failed"))?,
+            nonce_count: 0,
+        })
+    }
+
     fn apply_success(&mut self, response: &[u8]) {
         let name = if self.challenge.proxy {
             "Proxy-Authentication-Info"
@@ -8352,6 +8443,10 @@ struct VowifiUnregisterFactory {
     next_cseq: std::sync::atomic::AtomicU32,
     expires_seconds: std::sync::atomic::AtomicU32,
     refresh_authorization: std::sync::Mutex<Option<LiveRefreshAuthorization>>,
+    // A deregistration may have two challenge rounds. Keep its last emitted
+    // proof separate from committed refresh credentials, including after AUTS.
+    unregister_authorization: std::sync::Mutex<Option<LiveRefreshAuthorization>>,
+    unregister_resync_sent: std::sync::atomic::AtomicBool,
     security_verify: Option<String>,
 }
 
@@ -8410,6 +8505,7 @@ impl VowifiUnregisterFactory {
     async fn challenged_authorization(
         &self,
         response: &[u8],
+        previous: Option<&LiveRefreshAuthorization>,
     ) -> Result<(Option<LiveRefreshAuthorization>, Option<String>), ImsError> {
         let text = std::str::from_utf8(response)
             .map_err(|_| ImsError::new("vowifi_refresh_response_not_utf8"))?;
@@ -8417,12 +8513,22 @@ impl VowifiUnregisterFactory {
             .map_err(|_| ImsError::new("vowifi_refresh_challenge_invalid"))?;
         reject_plain_digest_when_disabled(self.profile, &challenge)
             .map_err(|_| ImsError::new("vowifi_refresh_digest_rejected"))?;
+        let action = live_digest_challenge_action(&challenge, previous)?;
         // This is an explicit new SA offer, not an unanswered refresh. The
         // access owner must perform security recovery; never install keys here
         // while the registered socket still owns the previous selectors.
-        if !challenge.security_server_offers.is_empty() {
+        if !challenge.security_server_values.is_empty() {
             return Err(ImsError::new("vowifi_refresh_security_update_required"));
         }
+        if action == crate::connectivity::core::digest_aka::ChallengeAction::ReuseCredentials {
+            // No AUTHENTICATE replay for unchanged RAND/AUTN, but card/owner
+            // binding must still be current (also for synchronous unregister).
+            self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?
+                .verify(&self.line_id).await.map_err(ImsError::new)?;
+            let previous = previous.ok_or_else(|| ImsError::new("digest_stale_without_context"))?;
+            return Ok((Some(previous.renewed(&challenge)?), None));
+        }
+        let mut retained_aka = None;
         let password = match challenge.nonce_kind {
             LiveDigestNonceKind::AkaChallenge => {
                 let aka =
@@ -8440,14 +8546,16 @@ impl VowifiUnregisterFactory {
                     .map_err(|_| ImsError::new("vowifi_refresh_resync_failed"))?;
                     return Ok((None, Some(header)));
                 }
-                crate::connectivity::core::digest_aka::aka_digest_password(
+                let password = crate::connectivity::core::digest_aka::aka_digest_password(
                     &challenge.algorithm,
                     &crate::connectivity::core::digest_aka::AkaMaterial {
                         res: &aka.res,
                         ck: &aka.ck,
                         ik: &aka.ik,
                     },
-                )?
+                )?;
+                retained_aka = Some(aka);
+                password
             }
             LiveDigestNonceKind::PlainDigest => Vec::new(),
         };
@@ -8455,6 +8563,8 @@ impl VowifiUnregisterFactory {
             Some(LiveRefreshAuthorization {
                 challenge: challenge.shared(),
                 password,
+                aka: retained_aka,
+                aka_origin: (challenge.nonce_kind == LiveDigestNonceKind::AkaChallenge).then(|| crate::connectivity::core::digest_aka::AkaChallenge { rand: challenge.rand.clone(), autn: challenge.autn.clone() }),
                 cnonce: live_digest_cnonce()
                     .map_err(|_| ImsError::new("vowifi_refresh_random_failed"))?,
                 nonce_count: 0,
@@ -8467,6 +8577,7 @@ impl VowifiUnregisterFactory {
 struct VowifiRefreshAuthenticator<'a> {
     factory: &'a VowifiUnregisterFactory,
     authorization: Option<LiveRefreshAuthorization>,
+    resync_sent: bool,
     expires: u32,
 }
 
@@ -8481,14 +8592,24 @@ impl VowifiRefreshAuthenticator<'_> {
 }
 
 impl RegisterAuthenticator<SipChannel> for VowifiRefreshAuthenticator<'_> {
+    fn validate_success(&self, _response: &[u8]) -> Result<(), ImsError> {
+        if self.resync_sent && self.authorization.as_ref().is_none_or(|state| state.nonce_count == 0) {
+            return Err(ImsError::new("ims_aka_resync_unexpected_status"));
+        }
+        Ok(())
+    }
+
     async fn authenticated_request(
         &mut self,
         response: &[u8],
         _cseq: u32,
     ) -> Result<Vec<u8>, ImsError> {
-        let (auth, resync) = self.factory.challenged_authorization(response).await?;
+        let (auth, resync) = self.factory
+            .challenged_authorization(response, self.authorization.as_ref()).await?;
         self.authorization = auth;
         if let Some(resync) = resync {
+            if self.resync_sent { return Err(ImsError::new("ims_aka_resync_repeated")); }
+            self.resync_sent = true;
             self.factory.request(self.expires, Some(&resync))
         } else {
             self.request()
@@ -8508,6 +8629,15 @@ impl RegisterAuthenticator<SipChannel> for VowifiRefreshAuthenticator<'_> {
 }
 
 impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
+    fn validate_success(&self, _response: &[u8]) -> Result<(), ImsError> {
+        if self.unregister_resync_sent.load(std::sync::atomic::Ordering::Relaxed)
+            && self.unregister_authorization.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_none_or(|state| state.nonce_count == 0)
+        {
+            return Err(ImsError::new("ims_aka_resync_unexpected_status"));
+        }
+        Ok(())
+    }
+
     fn refresh<'a>(
         &'a self,
         channel: &'a mut SipChannel,
@@ -8517,6 +8647,7 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
             uicc.verify(&self.line_id).await.map_err(ImsError::new)?;
             let mut auth = VowifiRefreshAuthenticator {
                 factory: self,
+                resync_sent: false,
                 authorization: self
                     .refresh_authorization
                     .lock()
@@ -8579,8 +8710,13 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
         let mut auth = self
             .refresh_authorization
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        self.authorized_request(0, &mut auth)
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let request = self.authorized_request(0, &mut auth)?;
+        self.remember_emitted(&auth);
+        self.unregister_resync_sent.store(false, std::sync::atomic::Ordering::Relaxed);
+        *self.unregister_authorization.lock().unwrap_or_else(|e| e.into_inner()) = auth;
+        Ok(request)
     }
 
     fn authenticated_request<'a>(
@@ -8589,12 +8725,20 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
         _cseq: u32,
     ) -> futures_util::future::BoxFuture<'a, Result<Vec<u8>, ImsError>> {
         Box::pin(async move {
-            let (mut auth, resync) = self.challenged_authorization(response).await?;
-            if let Some(resync) = resync {
-                self.request(0, Some(&resync))
+            let previous = self.unregister_authorization.lock()
+                .unwrap_or_else(|e| e.into_inner()).clone();
+            let (mut auth, resync) = self.challenged_authorization(response, previous.as_ref()).await?;
+            let request = if let Some(resync) = resync {
+                if self.unregister_resync_sent.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    return Err(ImsError::new("ims_aka_resync_repeated"));
+                }
+                self.request(0, Some(&resync))?
             } else {
-                self.authorized_request(0, &mut auth)
-            }
+                self.authorized_request(0, &mut auth)?
+            };
+            self.remember_emitted(&auth);
+            *self.unregister_authorization.lock().unwrap_or_else(|e| e.into_inner()) = auth;
+            Ok(request)
         })
     }
 }
@@ -8669,6 +8813,7 @@ struct LiveDigestChallenge {
     rand: Vec<u8>,
     autn: Vec<u8>,
     nonce_kind: LiveDigestNonceKind,
+    stale: bool,
     security_server_values: Vec<String>,
     security_server_offers: Vec<LiveSecurityServerOffer>,
 }
@@ -8715,24 +8860,86 @@ struct LiveRegisterAuthMaterial {
     auts: Option<Vec<u8>>,
 }
 
+fn live_digest_challenge_action(
+    challenge: &LiveDigestChallenge,
+    previous: Option<&LiveRefreshAuthorization>,
+) -> Result<crate::connectivity::core::digest_aka::ChallengeAction, ImsError> {
+    let action = crate::connectivity::core::digest_aka::challenge_action(
+        &challenge.shared(),
+        previous.and_then(LiveRefreshAuthorization::sent_challenge),
+        previous.and_then(|state| state.aka_origin.as_ref()),
+    )?;
+    // Existing WiFi MD5-with-RES support also accepts a full AKA vector. Core
+    // plain-MD5 reuse must not skip UICC authentication if that vector changed.
+    if action == crate::connectivity::core::digest_aka::ChallengeAction::ReuseCredentials
+        && challenge.nonce_kind == LiveDigestNonceKind::AkaChallenge
+        && challenge.algorithm.eq_ignore_ascii_case("MD5")
+        && !previous.is_some_and(|previous| {
+            previous.aka_origin.as_ref()
+                .is_some_and(|old| old.rand == challenge.rand && old.autn == challenge.autn)
+        })
+    {
+        return Ok(crate::connectivity::core::digest_aka::ChallengeAction::Authenticate);
+    }
+    Ok(action)
+}
+
+// The closure is invoked only for a fresh AKA vector. Keeping this decision at
+// the production UICC boundary makes stale handling testable without a card.
+async fn live_register_aka_result<F, Fut>(
+    action: crate::connectivity::core::digest_aka::ChallengeAction,
+    previous: Option<&LiveRefreshAuthorization>,
+    authenticate: F,
+) -> Result<super::qmi_uim::UsimAkaApduResult, LiveStageError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<super::qmi_uim::UsimAkaApduResult, LiveStageError>>,
+{
+    if action == crate::connectivity::core::digest_aka::ChallengeAction::ReuseCredentials {
+        return previous
+            .filter(|state| state.nonce_count > 0)
+            .and_then(|state| state.aka.as_ref())
+            .filter(|aka| aka.auts.is_none() && !aka.res.is_empty())
+            .cloned()
+            .ok_or_else(|| live_stage_error("ims_digest_stale_credentials_missing"));
+    }
+    authenticate().await
+}
+
 async fn build_live_register_auth_material(
     line_id: &str,
     profile: &'static CarrierProfile,
-    context: &LiveRegisterRequestContext,
+    context: &mut LiveRegisterRequestContext,
     challenge: &LiveDigestChallenge,
     variant: LiveRegisterHeaderVariant,
 ) -> Result<LiveRegisterAuthMaterial, LiveStageError> {
+    reject_plain_digest_when_disabled(profile, challenge)?;
+    let previous = context.refresh_authorization.as_ref();
+    let action = live_digest_challenge_action(challenge, previous)
+        .map_err(map_shared_digest_error)?;
+    if action == crate::connectivity::core::digest_aka::ChallengeAction::ReuseCredentials {
+        // Cached keys avoid a repeated AUTHENTICATE, not subscription/reader
+        // ownership checks. No stale proof may migrate to a newly inserted SIM.
+        context.uicc.as_ref().ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?
+            .verify(line_id).await.map_err(live_stage_error)?;
+    }
     let digest_uri = context.request_uri(profile, variant);
     let cnonce = live_digest_cnonce()?;
+    let mut retained_aka = None;
     let (response, password, ims_esp_secrets, ims_esp_alt_secrets, ims_esp_null_secrets) =
         match challenge.nonce_kind {
             LiveDigestNonceKind::AkaChallenge => {
-                let aka_result =
+                let aka_result = live_register_aka_result(action, previous, || async {
                     context.uicc.as_ref().ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?
                         .authenticate(line_id, &challenge.rand, &challenge.autn)
                         .await
-                        .map_err(live_stage_error)?;
+                        .map_err(live_stage_error)
+                }).await?;
                 if let Some(auts) = aka_result.auts {
+                    // The next response will answer AUTS, not the previously
+                    // authenticated request. Do not offer old credentials as
+                    // stale context, even if this attempt later exhausts.
+                    context.refresh_authorization = None;
                     return Ok(LiveRegisterAuthMaterial {
                         authorization: String::new(),
                         refresh_authorization: None,
@@ -8775,21 +8982,36 @@ async fn build_live_register_auth_material(
                     },
                 )
                 .map_err(map_shared_digest_error)?;
+                retained_aka = Some(aka_result);
                 (response, password, secrets, alt_secrets, null_secrets)
             }
             LiveDigestNonceKind::PlainDigest => {
-                let response = compute_plain_md5_response(
-                    &context.identity.private_user,
-                    &challenge.realm,
-                    "REGISTER",
-                    &digest_uri,
-                    &challenge.nonce,
-                    challenge.qop,
-                    &cnonce,
-                )?;
+                let password = if action == crate::connectivity::core::digest_aka::ChallengeAction::ReuseCredentials {
+                    previous.ok_or_else(|| live_stage_error("ims_digest_stale_without_context"))?
+                        .password.clone()
+                } else {
+                    Vec::new()
+                };
+                let response = if password.is_empty() {
+                    compute_plain_md5_response(
+                        &context.identity.private_user,
+                        &challenge.realm,
+                        "REGISTER",
+                        &digest_uri,
+                        &challenge.nonce,
+                        challenge.qop,
+                        &cnonce,
+                    )?
+                } else {
+                    crate::connectivity::core::digest_aka::compute_digest_response(
+                        &context.identity.private_user, &challenge.realm, &password,
+                        &challenge.algorithm, "REGISTER", &digest_uri, &challenge.nonce,
+                        challenge.qop, &cnonce, "00000001",
+                    ).map_err(map_shared_digest_error)?
+                };
                 (
                     response,
-                    Vec::new(),
+                    password,
                     placeholder_ims_esp_secrets(),
                     Vec::new(),
                     None,
@@ -8809,7 +9031,12 @@ async fn build_live_register_auth_material(
         refresh_authorization: Some(LiveRefreshAuthorization {
             challenge: challenge.shared(),
             password,
+            aka: retained_aka,
+            aka_origin: (challenge.nonce_kind == LiveDigestNonceKind::AkaChallenge).then(|| crate::connectivity::core::digest_aka::AkaChallenge { rand: challenge.rand.clone(), autn: challenge.autn.clone() }),
             cnonce,
+            // Matches the precomputed Authorization bytes. The caller only
+            // processes another challenge after their successful write/read;
+            // failed sends discard this tentative registration context.
             nonce_count: 1,
         }),
         ims_esp_secrets,
@@ -8921,14 +9148,11 @@ fn parse_live_digest_challenge_value(
     header_kind: &'static str,
     value: &str,
 ) -> Result<LiveDigestChallenge, LiveStageError> {
-    let params = parse_live_digest_params(value);
-    let param = |name: &str| {
-        params
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-    };
-    let algorithm = param("algorithm").unwrap_or("AKAv1-MD5").to_string();
+    let shared = crate::connectivity::core::digest_aka::parse_digest_challenge(
+        value,
+        header_kind == "proxy_authenticate",
+    ).map_err(map_shared_digest_error)?;
+    let algorithm = shared.algorithm;
     if !algorithm.eq_ignore_ascii_case("AKAv1-MD5")
         && !algorithm.eq_ignore_ascii_case("AKAv2-MD5")
         && !algorithm.eq_ignore_ascii_case("AKAv2-SHA-256")
@@ -8940,9 +9164,7 @@ fn parse_live_digest_challenge_value(
         );
         return Err(live_stage_error("ims_digest_algorithm_unsupported"));
     }
-    let realm = param("realm")
-        .ok_or_else(|| live_stage_error("ims_digest_realm_missing"))?
-        .to_string();
+    let realm = shared.realm;
     let realm_profile_match = realm == expected_realm;
     let realm_plmn = parse_realm_plmn(&realm);
     let realm_mcc = realm_plmn
@@ -8969,9 +9191,7 @@ fn parse_live_digest_challenge_value(
     if realm != expected_realm {
         warn!("IMS REGISTER digest realm differs from profile realm");
     }
-    let nonce = param("nonce")
-        .ok_or_else(|| live_stage_error("ims_digest_nonce_missing"))?
-        .to_string();
+    let nonce = shared.nonce;
     let nonce_shape = digest_nonce_shape(&nonce);
     let nonce_bytes = decode_digest_nonce(&nonce)?;
     let nonce_kind = if nonce_bytes.len() >= 32 {
@@ -8999,14 +9219,8 @@ fn parse_live_digest_challenge_value(
         );
         return Err(live_stage_error("ims_digest_nonce_too_short"));
     };
-    let qop = match param("qop") {
-        Some(value)
-            if value
-                .split(',')
-                .any(|item| item.trim().eq_ignore_ascii_case("auth")) =>
-        {
-            Some("auth")
-        }
+    let qop = match shared.qop.as_deref() {
+        Some("auth") => Some("auth"),
         Some(_) => return Err(live_stage_error("ims_digest_qop_unsupported")),
         None => None,
     };
@@ -9024,7 +9238,7 @@ fn parse_live_digest_challenge_value(
         nonce,
         algorithm,
         qop,
-        opaque: param("opaque").map(ToOwned::to_owned),
+        opaque: shared.opaque,
         rand: match nonce_kind {
             LiveDigestNonceKind::AkaChallenge => nonce_bytes[..16].to_vec(),
             LiveDigestNonceKind::PlainDigest => Vec::new(),
@@ -9034,6 +9248,7 @@ fn parse_live_digest_challenge_value(
             LiveDigestNonceKind::PlainDigest => Vec::new(),
         },
         nonce_kind,
+        stale: shared.stale,
         security_server_values,
         security_server_offers,
     })
@@ -9200,6 +9415,7 @@ impl LiveDigestChallenge {
             qop: self.qop.map(str::to_string),
             opaque: self.opaque.clone(),
             proxy: self.header_kind == "proxy_authenticate",
+            stale: self.stale,
         }
     }
 }
@@ -9501,6 +9717,15 @@ fn map_shared_digest_error(error: ImsError) -> LiveStageError {
         "digest_algorithm_unsupported" => "ims_digest_algorithm_unsupported",
         "digest_qop_unsupported" => "ims_digest_qop_unsupported",
         "digest_nonce_decode_failed" | "hex_invalid" => "ims_digest_nonce_decode_failed",
+        "digest_realm_missing" => "ims_digest_realm_missing",
+        "digest_nonce_missing" => "ims_digest_nonce_missing",
+        "digest_challenge_missing" => "ims_digest_challenge_missing",
+        "digest_challenge_invalid" => "ims_digest_challenge_invalid",
+        "digest_parameter_duplicate" => "ims_digest_parameter_duplicate",
+        "digest_stale_invalid" => "ims_digest_stale_invalid",
+        "digest_stale_without_context" => "ims_digest_stale_without_context",
+        "digest_stale_scope_changed" => "ims_digest_stale_scope_changed",
+        "digest_stale_nonce_unchanged" => "ims_digest_stale_nonce_unchanged",
         other => other,
     };
     live_stage_error(reason)
@@ -10057,6 +10282,7 @@ fn live_stage_error(reason: impl Into<String>) -> LiveStageError {
         registration_loss: None,
         server_required_sec_agree: false,
         register_auth_rounds: 0,
+        register_failure: None,
     }
 }
 
@@ -10069,6 +10295,7 @@ fn live_registration_error(
         registration_loss: Some(registration_loss),
         server_required_sec_agree: false,
         register_auth_rounds: 0,
+        register_failure: None,
     }
 }
 
@@ -10438,6 +10665,10 @@ mod epdg_address_tests {
         assert!(checked_live_ike_proxy(None, ProxyKind::UdpRelay).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "stale_tests.rs"]
+mod stale_tests;
 
 #[cfg(test)]
 #[path = "derived_hardening_tests.rs"]
@@ -11651,9 +11882,113 @@ mod tests {
     }
 
     #[test]
+    fn min_expires_authenticated_rejection_preserves_reason_and_stops_all_candidates() {
+        use crate::connectivity::core::register::RegisterFailureStage;
+        for (headers, reason) in [
+            ("", RegisterMinExpiresFailure::Invalid),
+            ("Min-Expires: 0\r\n", RegisterMinExpiresFailure::Invalid),
+            ("Min-Expires: 4294967296\r\n", RegisterMinExpiresFailure::Invalid),
+            ("Min-Expires: 600\r\nMin-Expires: 600\r\n", RegisterMinExpiresFailure::Invalid),
+            ("Min-Expires: 86401\r\n", RegisterMinExpiresFailure::Unsupported),
+            // A valid floor still needs a fresh Digest proof. The initial
+            // authenticated/ESP path explicitly refuses, never replays nc.
+            ("Min-Expires: 600\r\n", RegisterMinExpiresFailure::Unsupported),
+        ] {
+            let response = format!("SIP/2.0 423 Interval Too Brief\r\n{headers}\r\n");
+            let error = authenticated_min_expires_failure(&response);
+            assert_eq!(error.reason, format!("{}:sip_status=423", reason.error(true).code()));
+            assert_eq!(live_register_error_status(&error), Some(423));
+            let metadata = error.register_failure.unwrap();
+            assert_eq!(metadata.stage, RegisterFailureStage::Authenticated);
+            assert_eq!(metadata.min_expires, Some(reason));
+            assert!(live_register_error_is_terminal(&error));
+            assert!(live_register_lease_negotiation_stopped(&error));
+        }
+    }
+
+    #[test]
+    fn min_expires_mapping_keeps_stage_and_exact_failure_reason() {
+        use crate::connectivity::core::register::RegisterFailureStage;
+        for authenticated in [false, true] {
+            for reason in [RegisterMinExpiresFailure::Invalid, RegisterMinExpiresFailure::Unsupported,
+                RegisterMinExpiresFailure::Exhausted] {
+                let failure = RegisterFailure {
+                    error: reason.error(authenticated),
+                    response: Some(b"SIP/2.0 423 Interval Too Brief\r\n\r\n".to_vec()),
+                    auth_rounds: u8::from(authenticated),
+                };
+                let error = map_shared_register_failure(&failure);
+                assert_eq!(error.reason, format!("{}:sip_status=423", failure.error.code()));
+                assert_eq!(error.register_failure.unwrap().stage, if authenticated {
+                    RegisterFailureStage::Authenticated
+                } else { RegisterFailureStage::Initial });
+                assert!(live_register_error_is_terminal(&error));
+            }
+        }
+    }
+
+    #[test]
+    fn min_expires_then_400_or_transport_stops_dynamic_wifi_variants() {
+        let profile = crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+            "001", "01", crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::WifiEpdg,
+        ).unwrap();
+        let mut variant = live_register_header_variants(profile)[0];
+        variant.server_required_sec_agree = true;
+        variant.force_sec_agree_headers = true;
+        variant.include_security_client = true;
+        variant.initial_authorization = LiveInitialAuthorizationFormat::None;
+        for code in ["ims_register_initial_unexpected_status", "ims_register_initial_receive_failed"] {
+            let failure = RegisterFailure {
+                error: ImsError::new(code),
+                response: Some(b"SIP/2.0 400 Bad Request\r\n\r\n".to_vec()),
+                auth_rounds: 0,
+            };
+            let mut error = map_shared_register_failure(&failure);
+            error.register_failure.as_mut().unwrap().min_expires = Some(RegisterMinExpiresFailure::Negotiated);
+            preserve_min_expires_profile_stop(&mut error);
+            assert!(register_reason_blocks_profile_fallback(&error.reason));
+            assert!(error.reason.contains(code) || error.reason.contains("ims_register_read_failed"));
+            assert_eq!(live_register_error_status(&error), Some(400));
+            assert!(live_register_error_is_terminal(&error));
+            assert!(next_dynamic_live_register_variant(profile, variant, &error).is_none());
+        }
+    }
+
+    #[test]
+    fn min_expires_floor_survives_wifi_authentication_but_not_unregister() {
+        let profile = crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+            "001", "01", crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::WifiEpdg,
+        ).unwrap();
+        let mut context = LiveRegisterRequestContext::new(
+            profile,
+            LiveImsRegisterIdentity {
+                shared: crate::connectivity::core::context::ImsIdentity {
+                    private_user: "user@ims.example".to_string(),
+                    public_uri: "sip:user@ims.example".to_string(),
+                    contact_user: "user".to_string(),
+                    home_domain: "ims.example".to_string(),
+                    contact_user_phone: false,
+                },
+                shape: "fixture",
+            },
+            "192.0.2.2:5060".parse().unwrap(), "192.0.2.1".parse().unwrap(),
+        ).unwrap();
+        context.min_expires = Some(86400);
+        let variant = live_register_header_variants(profile)[0];
+        let authorization = "Authorization: Digest username=\"user\", nc=00000002";
+        let verify = "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;prot=esp;mod=trans";
+        let request = context.build_authorized_request(profile, variant, 3, authorization, Some(verify));
+        assert_eq!(sip_frame::header_value(request.as_bytes(), "Expires").as_deref(), Some("86400"));
+        assert_eq!(sip_frame::header_value(request.as_bytes(), "Security-Verify").as_deref(), Some(verify));
+        let unregister = context.build_unregister_request(profile, variant, 4, Some(authorization), Some(verify));
+        assert_eq!(sip_frame::header_value(unregister.as_bytes(), "Expires").as_deref(), Some("0"));
+        assert!(unregister.contains("expires=0"));
+    }
+
+    #[test]
     fn terminal_register_status_stops_the_candidate_ladder() {
         let terminal = [
-            300, 302, 403, 405, 406, 409, 413, 414, 416, 422, 432, 433, 436, 437, 438, 481, 482,
+            300, 302, 403, 405, 406, 409, 413, 414, 416, 422, 423, 432, 433, 436, 437, 438, 481, 482,
             483, 484, 485, 486, 487, 488, 489, 493, 505, 513, 580, 600, 603,
         ];
         for status in terminal {
@@ -11672,7 +12007,7 @@ mod tests {
     #[test]
     fn retryable_register_status_keeps_the_candidate_ladder_alive() {
         let retryable = [
-            400, 404, 408, 410, 415, 420, 421, 423, 430, 480, 491, 494, 500, 501, 502, 503, 504,
+            400, 404, 408, 410, 415, 420, 421, 430, 480, 491, 494, 500, 501, 502, 503, 504,
         ];
         for status in retryable {
             let failure = register_failure_with(
@@ -12385,6 +12720,8 @@ mod tests {
             next_cseq: std::sync::atomic::AtomicU32::new(4),
             expires_seconds: std::sync::atomic::AtomicU32::new(3600),
             refresh_authorization: std::sync::Mutex::new(None),
+            unregister_authorization: std::sync::Mutex::new(None),
+            unregister_resync_sent: std::sync::atomic::AtomicBool::new(false),
             security_verify: Some(
                 "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;prot=esp;mod=trans".into(),
             ),
