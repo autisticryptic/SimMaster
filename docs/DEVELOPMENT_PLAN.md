@@ -6,7 +6,7 @@
 
 ## 当前基线与工作规则
 
-- 当前已验证源码基线为 `344308c`：AUTS/stale/跨候选 423 已通过两套 Actions、各 46 项相关回归和四矩阵；更早的 ISIM/P-CSCF/Retry-After 第一批 `5aaf3ea` 也已核验。**当前 rspauth 实现仍在推进，未部署**，见 [HANDOFF](HANDOFF.md)。
+- 当前已验证源码基线为 `3509e15`：REGISTER rspauth 已通过两套 Actions、各 76 项相关回归、四矩阵及双架构构建。更早的 AUTS/stale/423（`344308c`）及 ISIM/P-CSCF/Retry-After（`5aaf3ea`）也已核验。**下一项为 reg-event，未部署**，见 [HANDOFF](HANDOFF.md)。
 - 设备历史基线仍为全局兜底修复 `c174551`，已通过 Actions 和 410 原 Globe 配置的初始注册验收。
   `7bd` 的运营商专用补丁及测试仍保持由 `0502395` 撤销的状态；当前成功不能替代中国移动同卡验收。
 - **当前优先级是继续原 EC20 审查中的第二批协议补强，而不是把第一批当作整个委托结束。** 同卡/自然续期验收与停服时的 MM 重枚举/AT 超时调查独立保留，设备操作另需明确授权。
@@ -28,10 +28,10 @@
 
 ## P1：第二批协议补强（剩余项）
 
-- Digest `rspauth`（进行中）：绑定最终发送的 Request-URI、Authorization scope、qop/nc/cnonce 校验 Authentication-Info。适用初次/刷新/注销；校验失败不提交 nonce/租期/安全状态或进入兼容候选，可选 rspauth 缺失不一律拒绝。尚待新代码 Actions 证据。
-- reg-event（待开始）：合法订阅与 `application/reginfo+xml` 的绑定终止通知，不能把 MWI/REFER NOTIFY 当成已支持。
+- reg-event（下一项，待开始）：合法订阅与 `application/reginfo+xml` 的绑定终止通知，不能把 MWI/REFER NOTIFY 当成已支持。关联 AoR/Contact/instance、dialog 和 XML full/partial/version，错误通知不得触发重注册。
+- REGISTER rspauth 已验证；后续互通须单独验证真实服务器响应。现有范围仅 qop=auth/无 qop 和单一 Authorization scope，不宣称 auth-int、多重 origin/proxy 鉴权或非 REGISTER 业务已经支持。
 - 已验证 AUTS/stale 与 423 的剩余限制：WiFi 初次认证后的 423 明确 unsupported；需要新安全上下文的受保护 stale 不重装旧 ESP；非 REGISTER 业务的响应认证/恢复需单独核对。
-- 实施顺序继续 rspauth，再 reg-event，随后独立交付传输/诊断/承载；不能把“已有算法/helper”当成生产路径已经接通。
+- 实施顺序继续 reg-event，随后独立交付传输/诊断/承载；不能把“已有算法/helper”当成生产路径已经接通。
 
 ## P1：原报告的传输与功能扩展（部分基础已具备）
 

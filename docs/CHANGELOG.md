@@ -5,6 +5,10 @@
 
 ## 1.1.5 主线
 
+- `3509e15` 完成双接入 REGISTER 响应认证：最终 Request-URI/Authorization/opaque 与 rspauth、qop/nc/cnonce 关联验证，先验后提交 nonce、租期和安全状态；无效 2xx 不借 profile/头型降级，可选 rspauth 缺失保留兼容。
+  两套 Actions、双架构构建和前端通过；测试 ZIP 官方摘要、各 76 项相关回归及 86 模拟场景已核验。两轮新 fixture 失败与修正留在[交接](HANDOFF.md)，**未部署、未发布新 Release**，reg-event 等剩余项未混称完成。
+- `344308c` 已补强 AUTS 的 qop/opaque 保留、stale/nextnonce 的独立 AKA 来源与原 ESP 通道复用，以及跨候选 423 预算；WiFi 初次认证后 423 仍明确 unsupported，不假装支持或重发旧 nonce-count。
+
 - `5aaf3ea` 增加共享 ISIM 材料/身份与认证应用绑定，保留无配置时的 USIM 派生，VoWiFi EAP 仍用 USIM。
   接入 QMI、native AT 和 PC/SC 读取，保留明确读取错误与卡/owner 复核；不是热插拔实机验收声明。
 - 蜂窝 P-CSCF 保留端口、UDP 传输和来源，承载内 DNS 返回有界多候选；显式 TCP/TLS/sips 不再被静默降级。

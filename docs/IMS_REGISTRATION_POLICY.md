@@ -13,6 +13,7 @@
 - `c174551` 已完成全局蜂窝 REGISTER 的身份/安全要求继承及候选去重，Actions 与 410 原配置初始注册已验证。
   不新增运营商专用分支或测试；中国移动同卡、自然续期和业务验收仍独立，见 [HANDOFF](HANDOFF.md)。
 - `5aaf3ea` 补全共享 ISIM 身份、蜂窝 P-CSCF 端点和临时拒绝恢复；Actions 成功但未部署，详细验证边界见 [HANDOFF](HANDOFF.md)。
+- `3509e15` 已验证双接入 REGISTER rspauth 的请求关联与状态提交门禁；`344308c` 已验证 AUTS/stale/423 补强。下一项 reg-event，当前新代码均未部署。
 - 本文描述既有契约，不授权执行注册、呼叫、短信、换卡、重启或恢复写操作。
 
 ## 2. 启用意图与自动选择
@@ -123,7 +124,7 @@
 - AUTS 保留选定 qop/opaque，但不是有效鉴权证明；非法/重复 AUTS 或仅 AUTS 后直接 2xx 不能形成注册或确认注销。
 - stale 必须关联上一条已发送的同 scope 请求；同 RAND/AUTN 才复用绑定凭据，独立 `aka_origin` 不被 nextnonce 覆盖。已保护通道不因 stale 重装同 SPI/key 或退明文；需新安全上下文时明确恢复。
 - 423 协商一旦开始，就关闭本次静态头型/profile/端点兼容扩张；无效/过大/不增长/耗尽的 floor 不能重开预算。零租期注销不协商正租期；WiFi 初次认证后 423 尚不支持，注册后 credential-aware 刷新仍支持。
-- rspauth 接线正在补全、尚待本轮 Actions：仅对实际生成的非空 Digest 证明捕获不可变请求上下文，发送前检查最终 URI/Authorization，2xx 发布前验证响应对应的 qop/nc/cnonce 和 rspauth。Authentication-Info/Proxy-Authentication-Info 不串用，重复/畸形/不匹配明确失败；缺少可选 rspauth 仍兼容，不把 nextnonce-only 冒充服务器证明已验。
+- `3509e15` 已接通并验证 rspauth：仅对实际生成的非空 Digest 证明捕获不可变请求上下文，发送前检查最终 URI/Authorization/opaque，2xx 发布前验证响应对应的 qop/nc/cnonce 和 rspauth。Authentication-Info/Proxy-Authentication-Info 不串用，重复/畸形/不匹配明确失败；缺少可选 rspauth 仍兼容，不把 nextnonce-only 冒充服务器证明已验。当前支持范围为既有 REGISTER 算法、qop=auth/无 qop 和单一鉴权 scope。
 - 响应认证失败不是传输失败或可换头型的协商提示；不能提交新的 nextnonce、租期、业务身份或安全上下文。失败保留已发送的原 nonce-count、回滚暂存状态；不放宽 AKA/ESP 算法门禁。本轮范围为 REGISTER，非 REGISTER 业务不自动宣称已支持。
 
 ### 临时拒绝与 Retry-After

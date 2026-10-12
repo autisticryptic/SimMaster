@@ -10,15 +10,21 @@
 4. 2026-10-07 的 410 部署属于已结束的历史授权；本轮只实施 IMS 补全和 Actions 验证，**未部署、未访问设备，也不主动连接 IDA**。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：REGISTER 响应认证补全（进行中）
+## 当前：REGISTER 响应认证已验证，下一项 reg-event
 
-已验证代码基线 **`344308c84748352b9e985e3d1182b6817beb7f3c`**。AUTS 参数保留、stale/nonce 语义、跨候选 423 预算已通过两套 Actions（[38138978950](https://github.com/autisticryptic/SimMaster/actions/runs/38138978950)、[38138978978](https://github.com/autisticryptic/SimMaster/actions/runs/38138978978)），各逐名核验 46 项相关回归及四矩阵 86 场景；双架构构建成功、Release skipped。首轮新零租期测试断言失败已修正，未改变合法 `Expires: 0` 语义。证据 `.local/evidence/ims-auth-hardening/verified-344308c.json`。
+已验证代码 **`3509e15474592f001fffde35f302fd3b45719c5a`**，已推送 `simmaster/master`；生产改动来自 `7054111`，后两次提交仅修正新测试 fixture。
 
-下一项 **Digest rspauth** 正在补全：关联最终发送的 URI/Authorization 与服务器响应，覆盖蜂窝/VoWiFi 的初次、刷新和注销，先验证后提交 nextnonce、租期与安全状态。新代码尚待 Actions 验证；旧绿灯不代表当前工作树，未部署。
+- 蜂窝/VoWiFi 的首次 REGISTER、受保护刷新和注销捕获不可变 Digest 请求上下文，发送前校验最终 URI/Authorization/opaque，成功响应先校验 rspauth 与 qop/nc/cnonce，再提交 nextnonce、租期、身份或安全状态。
+- 重复/畸形/错 scope/错误证明明确失败，不作为头型/profile/P-CSCF 降级提示；原 nonce-count 不回退，暂存状态回滚。可选 rspauth 缺失兼容，nextnonce-only 不冒充服务器认证证明。未扩大既有算法策略。
+- [Build-Release 38197911130](https://github.com/autisticryptic/SimMaster/actions/runs/38197911130)、[Validate Beta 38197911116](https://github.com/autisticryptic/SimMaster/actions/runs/38197911116) 均成功；ARM64/AMD64 和前端检查通过，Publish Release skipped。
+- 两套测试 ZIP 各逐名核验 **76 项相关回归**；四矩阵共 86 场景（45 个 fixture 成功、41 个预期拒绝），commit/run/源码/日志摘要一致。报告 `.local/evidence/ims-rspauth/verified-3509e15.json`，用户无需手工下载。
+- 官方测试 artifact：`ims-refresh-tests` 11724212981，SHA-256 `f414bfb2ccf051d2ce7754e095ce443c2190e68f99b3150d4fa54864dd8ec4bb`；`beta-refactor-tests` 11723783190，SHA-256 `29ed1c4a9b90258a65774f890ca51dabaa9707043382d6cf170089a92a8258c2`。
+- 首轮 `7054111` 编译通过，但新 plain-MD5 fixture 使用非法 nonce；`4240d8e` 修正后，共享/WiFi 新回归通过，5 项蜂窝 fixture 又因缺少合成 worker 的端口预留超时；`3509e15` 补齐现有 mock 适配后全部通过。失败 annotations/ZIP 及修复核验保留，没有放宽生产策略或删除测试。
+- 本机只执行 Python 静态/mock 检查与只读产物校验，303 项检查通过；**未部署、未验收新程序包或实网，未发布 Release**。范围为现有 REGISTER 算法、qop=auth/无 qop、单一 Authorization scope，非 REGISTER 和多重鉴权不自动算已支持。
 
-- N1/N2 保持独立的 AKA 凭据来源；nextnonce 不是新 UICC 向量。AUTS 不是有效证明；合法 stale 不重置旧 ESP 状态或重放同向量 AKA。
-- N3 让 423 的尝试级预算跨头型/profile 保持；WiFi 初次认证后 423 仍明确 unsupported，不能重发旧 nonce-count 冒充支持。
-- reg-event、TCP/TLS/SIP NAPTR/DNS TCP、完整来源诊断与承载能力仍未完成。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界。
+上一阶段 AUTS/stale/跨候选 423 在 `344308c` 已验证；两套 Actions（[38138978950](https://github.com/autisticryptic/SimMaster/actions/runs/38138978950)、[38138978978](https://github.com/autisticryptic/SimMaster/actions/runs/38138978978)）各核验 46 项相关回归和四矩阵。独立 AKA 来源、受保护 stale 不重装旧 ESP、AUTS 不冒充证明、423 尝试级预算均保持；WiFi 初次认证后 423 仍明确 unsupported。
+
+**完整补全任务尚未完成。** 下一项 N5 reg-event；TCP/TLS/SIP NAPTR/DNS TCP、完整来源诊断与承载能力 N6～N8 仍待补齐。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界，见[开发计划](DEVELOPMENT_PLAN.md)。
 
 ## 第一批：ISIM、P-CSCF 与临时拒绝补全
 
