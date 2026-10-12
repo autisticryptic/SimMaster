@@ -20,14 +20,18 @@ use std::{
 
 use tokio::time::sleep;
 
-use crate::services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle};
+use crate::services::ue_worker::UeWorkerHandle;
 
 use super::errors::{code, CellularImsError};
-use super::pcscf_dns::{build_dns_query, parse_dns_response, DnsRecords};
+use super::pcscf_dns::DnsRecords;
+#[cfg(test)]
+use super::pcscf_dns::{build_dns_query, parse_dns_response};
 use super::plan::{ImsConnectionPlan, IpFamily};
 
 #[path = "pcscf_endpoint.rs"]
 mod endpoint;
+#[path = "pcscf_dns_transport.rs"]
+mod dns_transport;
 pub use endpoint::{
     parse_pcscf_endpoint, ParsedPcscfEndpoint, PcscfEndpoint, PcscfHost, PcscfSource,
     PcscfTransport, MAX_PCSCF_ENDPOINTS,
@@ -946,9 +950,9 @@ pub async fn discover_pcscf_candidates_in_worker(
 /// unresolved or wrong-family explicit source never falls through to a lower
 /// source. Family mismatch is left to the existing caller's family loop.
 ///
-/// DNS uses only this worker's connected UDP sockets and bearer resolvers:
-/// at most 3 servers, 16 queries, 4 seconds/query and 12 seconds total, including
-/// socket creation/send. No system DNS, TCP, TLS or NAPTR fallback is performed.
+/// DNS uses only this worker and bearer resolvers: at most 3 servers,
+/// 16 logical queries, 4 seconds/query and 12 seconds total. A matched TC
+/// response permits one TCP retry inside the same deadline. Never system DNS.
 pub async fn discover_pcscf_endpoints_in_worker(
     settings: &ImsIpSettings,
     home_domain: &str,
@@ -996,36 +1000,8 @@ async fn query_dns(
     interface: &str,
     worker: &UeWorkerHandle,
 ) -> Result<DnsRecords, CellularImsError> {
-    let query_id = dns_query_id(name, record_type);
-    let query = build_dns_query(query_id, name, record_type)?;
-    let remote = SocketAddr::new(server, DNS_PORT);
-    let spec = UeSocketSpec::udp_connected(
-        SocketAddr::new(local, 0),
-        remote,
-        Some(interface.to_string()),
-    );
-    let socket = match worker.create_socket(spec).await {
-        Ok(UeSocket::Udp(socket)) => socket,
-        _ => return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED)),
-    };
-    socket
-        .send(&query)
-        .await
-        .map_err(|_| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-    let mut response = [0u8; 4096];
-    let read = tokio::time::timeout(DNS_TIMEOUT, socket.recv(&mut response))
-        .await
-        .map_err(|_| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
-        .map_err(|_| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-    parse_dns_response(query_id, name, record_type, &response[..read])
-}
-
-fn dns_query_id(name: &str, record_type: u16) -> u16 {
-    let mut hash = 0x5a17u16 ^ record_type;
-    for byte in name.bytes() {
-        hash = hash.rotate_left(5) ^ u16::from(byte);
-    }
-    hash
+    dns_transport::query(local, SocketAddr::new(server, DNS_PORT), name, record_type,
+        interface, worker, DNS_TIMEOUT).await
 }
 
 /// Strip a possible prefix length / netmask suffix and parse an IP.

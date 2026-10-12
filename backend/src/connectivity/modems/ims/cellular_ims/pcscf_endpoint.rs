@@ -1,5 +1,6 @@
-//! Strict configured endpoints and bounded, bearer-local UDP DNS discovery.
-//! No system resolver, search suffixes, NAPTR, TCP or TLS fallback is used.
+//! Strict configured endpoints and bounded bearer-local DNS discovery.
+//! Preserve legacy direct/SRV preference; terminal SIP NAPTR is an additional
+//! discovery fallback, not permission to reinterpret an unsupported transport.
 
 use std::{
     future::Future,
@@ -455,6 +456,30 @@ where
                             add_addresses(&mut endpoints, records, local, PcscfSource::StandardDns,
                                 &host, target.port, Some(&target), limits.candidates);
                         }
+                    }
+                    if !endpoints.is_empty() { break; }
+                }
+                if !endpoints.is_empty() { break; }
+                // Retain the existing direct/UDP SRV paths before adding RFC
+                // 3263 NAPTR discovery. No explicit source or explicit port is
+                // bypassed. One shared query/time budget covers the full chain.
+                for naptr_name in [&name, &domain] {
+                    let Some(records) = resolver.records(*server, naptr_name, 35).await else { continue };
+                    for naptr in records.naptr_targets {
+                        // UDP is the currently executable cellular transport;
+                        // D2T/SIPS are never silently used with UDP/5060.
+                        if naptr.service != "SIP+D2U" { continue; }
+                        let Some(records) = resolver.records(*server, &naptr.replacement, 33).await else { continue };
+                        for mut target in order_srv_targets_with(records.srv_targets, srv_draw)? {
+                            if endpoints.len() >= limits.candidates { break; }
+                            target.ttl = target.ttl.min(naptr.ttl);
+                            let host = hostname(&target.target)?;
+                            if let Some(records) = resolver.records(*server, &host, kind).await {
+                                add_addresses(&mut endpoints, records, local, PcscfSource::StandardDns,
+                                    &host, target.port, Some(&target), limits.candidates);
+                            }
+                        }
+                        if !endpoints.is_empty() { break; }
                     }
                     if !endpoints.is_empty() { break; }
                 }

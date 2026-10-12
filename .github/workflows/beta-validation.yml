@@ -100,6 +100,7 @@ jobs:
             connectivity::modems::ims::cellular_ims::register_retry::tests \
             connectivity::modems::ims::cellular_ims::live::live_retry::tests \
             connectivity::modems::ims::cellular_ims::pcscf::endpoint::tests \
+            connectivity::modems::ims::cellular_ims::pcscf::dns_transport::tests \
             connectivity::modems::ims::vowifi::qmi_uim::tests \
             connectivity::modems::ims::vowifi::qmi_uim::native_ledger_tests \
             hardware::cellular::backends::management::tests \

@@ -16,6 +16,7 @@ const A: u16 = 1;
 const AAAA: u16 = 28;
 const CNAME: u16 = 5;
 const SRV: u16 = 33;
+const NAPTR: u16 = 35;
 const MAX_CNAME_HOPS: usize = 8;
 const MAX_DNS_RECORDS: usize = 256;
 pub(super) const MAX_DNS_ADDRESSES: usize = 16;
@@ -95,12 +96,22 @@ impl SrvTarget {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NaptrTarget {
+    pub order: u16,
+    pub preference: u16,
+    pub service: String,
+    pub replacement: String,
+    pub ttl: u32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct DnsRecords {
     pub addresses: Vec<IpAddr>,
     /// Minimum lifetime across the answer's CNAME chain and duplicate RRs.
     pub address_ttls: BTreeMap<IpAddr, u32>,
     pub srv_targets: Vec<SrvTarget>,
+    pub naptr_targets: Vec<NaptrTarget>,
 }
 
 pub(super) fn build_dns_query(
@@ -108,7 +119,7 @@ pub(super) fn build_dns_query(
     name: &str,
     record_type: u16,
 ) -> Result<Vec<u8>, CellularImsError> {
-    if !matches!(record_type, A | AAAA | SRV) {
+    if !matches!(record_type, A | AAAA | SRV | NAPTR) {
         return Err(invalid("query_type"));
     }
     let name = Name::host(name)?;
@@ -120,6 +131,22 @@ pub(super) fn build_dns_query(
     query.extend_from_slice(&record_type.to_be_bytes());
     query.extend_from_slice(&IN.to_be_bytes());
     Ok(query)
+}
+
+/// TC is permission for one TCP retry only when the question and response
+/// envelope match exactly. Partial/missing RDATA in a TC packet is expected;
+/// malformed/mismatched headers/questions are not a reason to open TCP.
+pub(super) fn response_is_truncated(id: u16, name: &str, kind: u16, packet: &[u8]) -> Result<bool, CellularImsError> {
+    if packet.len() < 12 || packet.len() > 65_535 || word(packet, 0)? != id { return Err(invalid("header")); }
+    let flags = word(packet, 2)?;
+    if flags & 0x8000 == 0 || flags & (0x7800 | 0x0040 | 0x000f) != 0 || word(packet, 4)? != 1 {
+        return Err(invalid("response_flags"));
+    }
+    let (question, end) = read_name(packet, 12)?;
+    if question != Name::host(name)? || word(packet, end)? != kind || word(packet, end + 2)? != IN {
+        return Err(invalid("question_mismatch"));
+    }
+    Ok(flags & 0x0200 != 0)
 }
 
 fn word(packet: &[u8], offset: usize) -> Result<u16, CellularImsError> {
@@ -184,6 +211,7 @@ enum Data {
     Address(IpAddr),
     Alias(Name),
     Service(Option<SrvTarget>),
+    Naptr(Option<NaptrTarget>),
     Other,
 }
 
@@ -203,7 +231,7 @@ pub(super) fn parse_dns_response(
     if packet.len() < 12 || packet.len() > 65535 || word(packet, 0)? != id {
         return Err(invalid("header"));
     }
-    if !matches!(expected_type, A | AAAA | SRV) {
+    if !matches!(expected_type, A | AAAA | SRV | NAPTR) {
         return Err(invalid("query_type"));
     }
     let flags = word(packet, 2)?;
@@ -288,6 +316,32 @@ pub(super) fn parse_dns_response(
                         });
                     Data::Service(target)
                 }
+                NAPTR => {
+                    if length < 8 { return Err(invalid("naptr_length")); }
+                    let mut cursor = start + 4;
+                    let mut text = || -> Result<&[u8], CellularImsError> {
+                        let len = usize::from(*packet.get(cursor).filter(|_| cursor < end).ok_or_else(|| invalid("naptr_string"))?);
+                        cursor += 1;
+                        let last = cursor.checked_add(len).filter(|last| *last <= end).ok_or_else(|| invalid("naptr_string"))?;
+                        let result = &packet[cursor..last]; cursor = last;
+                        Ok(result)
+                    };
+                    let flags = text()?;
+                    let service = text()?;
+                    let regexp = text()?;
+                    let (replacement, consumed) = read_name(packet, cursor)?;
+                    if consumed != end { return Err(invalid("naptr_rdata")); }
+                    // RFC 3263 terminal SRV rules only. Never interpret regexp,
+                    // URI/DNS services or unsupported transports as UDP.
+                    let supported = flags.eq_ignore_ascii_case(b"s") && regexp.is_empty()
+                        && [b"SIP+D2U".as_slice(), b"SIP+D2T".as_slice(), b"SIPS+D2T".as_slice()]
+                            .iter().any(|known| service.eq_ignore_ascii_case(known));
+                    let entry = replacement.host_text().filter(|_| supported).map(|replacement| NaptrTarget {
+                        order: word(packet, start).unwrap(), preference: word(packet, start + 2).unwrap(),
+                        service: String::from_utf8_lossy(service).to_ascii_uppercase(), replacement, ttl,
+                    });
+                    Data::Naptr(entry)
+                }
                 41 => {
                     if section != 2 || seen_opt || !owner.0.is_empty() || packet[header + 4] != 0 {
                         return Err(invalid("opt_extended_rcode"));
@@ -326,7 +380,7 @@ pub(super) fn parse_dns_response(
             return Err(invalid("cname_chain_limit"));
         }
         if answers.iter().any(|answer| {
-            answer.owner == terminal && matches!(&answer.data, Data::Address(_) | Data::Service(_))
+            answer.owner == terminal && matches!(&answer.data, Data::Address(_) | Data::Service(_) | Data::Naptr(_))
         }) {
             return Err(invalid("cname_data_conflict"));
         }
@@ -347,6 +401,13 @@ pub(super) fn parse_dns_response(
                     result.addresses.push(address);
                     result.address_ttls.insert(address, ttl);
                 }
+            }
+            Data::Naptr(Some(mut target)) => {
+                target.ttl = target.ttl.min(chain_ttl);
+                if let Some(old) = result.naptr_targets.iter_mut().find(|old| old.order == target.order
+                    && old.preference == target.preference && old.service == target.service && old.replacement == target.replacement)
+                { old.ttl = old.ttl.min(target.ttl); }
+                else { result.naptr_targets.push(target); }
             }
             Data::Service(Some(mut target)) => {
                 target.ttl = target.ttl.min(chain_ttl);
@@ -369,6 +430,8 @@ pub(super) fn parse_dns_response(
     // Weighted scheduling belongs to discovery, not this deterministic parser.
     result.srv_targets.sort_by_key(|target| target.priority);
     result.srv_targets.truncate(MAX_DNS_SRV_TARGETS);
+    result.naptr_targets.sort_by_key(|target| (target.order, target.preference));
+    result.naptr_targets.truncate(MAX_DNS_SRV_TARGETS);
     Ok(result)
 }
 
@@ -409,6 +472,55 @@ mod tests {
 
     fn parse(packet: &[u8]) -> Result<DnsRecords, CellularImsError> {
         parse_dns_response(ID, HOST, AAAA, packet)
+    }
+
+    fn naptr(order: u16, preference: u16, flags: &str, service: &str, regexp: &str, replacement: &str) -> Vec<u8> {
+        let mut data = order.to_be_bytes().to_vec(); data.extend(preference.to_be_bytes());
+        for value in [flags, service, regexp] { data.push(value.len() as u8); data.extend(value.as_bytes()); }
+        data.extend(wire(replacement)); data
+    }
+
+    #[test]
+    fn naptr_preserves_order_preference_service_and_ttl_only_for_exact_owner() {
+        let mut packet = response(HOST, NAPTR, [4, 0, 0]);
+        record(&mut packet, &wire(HOST), NAPTR, IN, &naptr(20, 5, "S", "SIP+D2U", "", "_sip._udp.second.example"));
+        record(&mut packet, &wire(HOST), NAPTR, IN, &naptr(10, 8, "s", "sips+d2t", "", "_sips._tcp.first.example"));
+        record(&mut packet, &wire(HOST), NAPTR, IN, &naptr(10, 1, "S", "SIP+D2T", "", "_sip._tcp.first.example"));
+        record(&mut packet, &wire("other.example"), NAPTR, IN, &naptr(0, 0, "S", "SIP+D2U", "", "_sip._udp.other.example"));
+        let parsed = parse_dns_response(ID, HOST, NAPTR, &packet).unwrap();
+        assert_eq!(parsed.naptr_targets.iter().map(|target| (target.order, target.preference, target.service.as_str(), target.ttl)).collect::<Vec<_>>(),
+            [(10, 1, "SIP+D2T", 60), (10, 8, "SIPS+D2T", 60), (20, 5, "SIP+D2U", 60)]);
+        assert!(parsed.addresses.is_empty() && parsed.srv_targets.is_empty());
+    }
+
+    #[test]
+    fn naptr_unsupported_services_regex_flags_and_root_are_not_udp_fallbacks() {
+        for (flags, service, regexp, replacement) in [
+            ("U", "SIP+D2U", "", "_sip._udp.example"), ("S", "E2U+sip", "", "_sip._udp.example"),
+            ("S", "SIP+D2U", "!.*!sip:other@example!", "_sip._udp.example"), ("S", "SIP+D2U", "", "."),
+        ] {
+            let mut packet = response(HOST, NAPTR, [1, 0, 0]);
+            record(&mut packet, &wire(HOST), NAPTR, IN, &naptr(0, 0, flags, service, regexp, replacement));
+            assert!(parse_dns_response(ID, HOST, NAPTR, &packet).unwrap().naptr_targets.is_empty());
+        }
+    }
+
+    #[test]
+    fn naptr_rdata_bounds_and_tc_question_association_are_strict() {
+        let good = naptr(0, 0, "S", "SIP+D2U", "", "_sip._udp.example");
+        for end in 0..good.len() {
+            let mut packet = response(HOST, NAPTR, [1, 0, 0]);
+            record(&mut packet, &wire(HOST), NAPTR, IN, &good[..end]);
+            assert!(parse_dns_response(ID, HOST, NAPTR, &packet).is_err());
+        }
+        let mut tc = response(HOST, A, [5, 0, 0]); tc[2..4].copy_from_slice(&0x8380u16.to_be_bytes());
+        assert!(response_is_truncated(ID, HOST, A, &tc).unwrap());
+        assert!(parse_dns_response(ID, HOST, A, &tc).is_err());
+        assert!(response_is_truncated(ID+1, HOST, A, &tc).is_err());
+        assert!(response_is_truncated(ID, "unrelated.example", A, &tc).is_err());
+        assert!(response_is_truncated(ID, HOST, AAAA, &tc).is_err());
+        tc[2..4].copy_from_slice(&0x0380u16.to_be_bytes());
+        assert!(response_is_truncated(ID, HOST, A, &tc).is_err());
     }
 
     #[test]

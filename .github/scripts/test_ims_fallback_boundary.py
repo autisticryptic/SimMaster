@@ -57,10 +57,17 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
 
     def test_pcscf_dns_validation_remains_on_the_ue_socket_path(self):
         text = (SRC / "cellular_ims/pcscf.rs").read_text()
-        query = text[text.index("async fn query_dns("):text.index("fn dns_query_id(")]
-        self.assertIn("worker.create_socket(spec)", query)
-        self.assertIn("parse_dns_response(query_id, name, record_type, &response[..read])", query)
-        self.assertNotIn("lookup_host", query)
+        query = text[text.index("async fn query_dns("):text.index("fn parse_addr(")]
+        self.assertIn("dns_transport::query(local, SocketAddr::new(server, DNS_PORT)", query)
+        transport = (SRC / "cellular_ims/pcscf_dns_transport.rs").read_text()
+        self.assertIn("worker.create_socket(spec)", transport)
+        self.assertIn("UeSocketSpec::udp_connected", transport)
+        self.assertIn("UeSocketSpec::tcp_connected", transport)
+        self.assertIn("response_is_truncated(id, name, kind, response)?", transport)
+        self.assertIn("parse_dns_response(id, name, kind, &response)", transport)
+        self.assertIn("tokio::time::timeout_at(deadline, operation)", transport)
+        self.assertGreaterEqual(transport.count("binding.is_current()"), 4)
+        self.assertNotIn("lookup_host", query + transport)
         parser = (SRC / "cellular_ims/pcscf_dns.rs").read_text()
         self.assertIn("section == 0 && class == IN", parser)
         self.assertIn("answer.owner == terminal", parser)

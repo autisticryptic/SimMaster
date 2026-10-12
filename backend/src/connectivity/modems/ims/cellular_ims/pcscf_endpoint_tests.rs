@@ -256,6 +256,39 @@ async fn srv_discovery_preserves_all_targets_ports_priorities_weights_and_min_tt
     ]);
 }
 
+#[tokio::test]
+async fn sip_naptr_fallback_preserves_srv_port_and_all_chain_ttls_after_legacy_paths() {
+    use super::super::super::pcscf_dns::NaptrTarget;
+    let mut queries = Vec::new();
+    let endpoints = discover_with(Selection::StandardDns, &settings(), "ims.example", local(), |_, name, kind| {
+        queries.push((name.clone(), kind));
+        ready(Ok(match (name.as_str(), kind) {
+            ("pcscf.ims.example", 35) => DnsRecords { naptr_targets: vec![NaptrTarget {
+                order: 10, preference: 1, service: "SIP+D2U".into(), replacement: "_sip._udp.naptr.example".into(), ttl: 15,
+            }], ..Default::default() },
+            ("_sip._udp.naptr.example", 33) => DnsRecords { srv_targets: vec![service("node.example", 5098, 7, 2, 30)], ..Default::default() },
+            ("node.example", 1) => addresses(&["192.0.2.17", "192.0.2.18"], 60),
+            _ => DnsRecords::default(),
+        }))
+    }, DiscoveryLimits::default()).await.unwrap();
+    assert_eq!(&queries[..3], &[("pcscf.ims.example".into(), 1), ("_sip._udp.pcscf.ims.example".into(), 33), ("_sip._udp.ims.example".into(), 33)]);
+    assert_eq!(endpoints.len(), 2);
+    assert!(endpoints.iter().all(|endpoint| endpoint.socket.port() == 5098 && endpoint.ttl == Some(15)
+        && endpoint.srv_priority == Some(7) && endpoint.source == PcscfSource::StandardDns));
+}
+
+#[tokio::test]
+async fn naptr_stream_only_service_is_never_misinterpreted_as_udp() {
+    use super::super::super::pcscf_dns::NaptrTarget;
+    let result = discover_with(Selection::StandardDns, &settings(), "ims.example", local(), |_, name, kind| {
+        assert_ne!(name, "_sips._tcp.not-udp.example");
+        ready(Ok(if kind == 35 { DnsRecords { naptr_targets: vec![NaptrTarget {
+            order: 0, preference: 0, service: "SIPS+D2T".into(), replacement: "_sips._tcp.not-udp.example".into(), ttl: 60,
+        }], ..Default::default() } } else { DnsRecords::default() }))
+    }, DiscoveryLimits::default()).await;
+    assert!(result.is_err());
+}
+
 #[test]
 fn srv_weighted_order_is_deterministic_with_injected_draw_and_never_crosses_priority() {
     let targets = vec![
