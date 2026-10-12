@@ -13,7 +13,7 @@
 - `c174551` 已完成全局蜂窝 REGISTER 的身份/安全要求继承及候选去重，Actions 与 410 原配置初始注册已验证。
   不新增运营商专用分支或测试；中国移动同卡、自然续期和业务验收仍独立，见 [HANDOFF](HANDOFF.md)。
 - `5aaf3ea` 补全共享 ISIM 身份、蜂窝 P-CSCF 端点和临时拒绝恢复；Actions 成功但未部署，详细验证边界见 [HANDOFF](HANDOFF.md)。
-- `3509e15` 已验证双接入 REGISTER rspauth 的请求关联与状态提交门禁；`344308c` 已验证 AUTS/stale/423 补强。下一项 reg-event，当前新代码均未部署。
+- `3509e15` 已验证双接入 REGISTER rspauth 的请求关联与状态提交门禁；`344308c` 已验证 AUTS/stale/423 补强。reg-event 已在后继 `3d54aa8` 验证，当前新代码均未部署。
 - 本文描述既有契约，不授权执行注册、呼叫、短信、换卡、重启或恢复写操作。
 
 ## 2. 启用意图与自动选择
@@ -127,6 +127,14 @@
 - `3509e15` 已接通并验证 rspauth：仅对实际生成的非空 Digest 证明捕获不可变请求上下文，发送前检查最终 URI/Authorization/opaque，2xx 发布前验证响应对应的 qop/nc/cnonce 和 rspauth。Authentication-Info/Proxy-Authentication-Info 不串用，重复/畸形/不匹配明确失败；缺少可选 rspauth 仍兼容，不把 nextnonce-only 冒充服务器证明已验。当前支持范围为既有 REGISTER 算法、qop=auth/无 qop 和单一鉴权 scope。
 - 响应认证失败不是传输失败或可换头型的协商提示；不能提交新的 nextnonce、租期、业务身份或安全上下文。失败保留已发送的原 nonce-count、回滚暂存状态；不放宽 AKA/ESP 算法门禁。本轮范围为 REGISTER，非 REGISTER 业务不自动宣称已支持。
 
+### reg-event 观察与注册撤销
+
+- 只从已验证成功的最终 REGISTER 绑定构造观察器，不从业务默认身份或 profile 猜 AoR/Contact；同接入 owner/通道订阅 `Event: reg`。
+- 严格关联 Call-ID/tags/CSeq、当前 AoR/Contact/instance/reg-id 及 reginfo XML namespace/full/partial/version；重复通知只 ACK 一次效果，缺 baseline/版本跳变有界请求 full，不回滚快照或恢复 readiness。
+- 只有相关绑定终止才使该接入 readiness 和 flow 证明失效。订阅 4xx/超时/单纯 Subscription-State termination 不等同于 REGISTER 被撤销。
+- 撤销等待绑定同 SIM，profile/worker/控制端口重编号不清空；超过支持的 24h 等待 fail-closed。活动对话允许排空，禁止原 session 重新刷新或新业务冒充已恢复；新接入成功才建立新观察器。
+- 现有 MWI/REFER 不合并进 reg-event；未知或不可表示的自定义绑定报告观察不可用，不为了该可选观察打断原 REGISTER。
+
 ### 临时拒绝与 Retry-After
 
 - `RegisterFailure::metadata()` 区分初始/认证阶段、端点临时拒绝、传输故障、身份/认证拒绝和本地错误；不得从 `detail` 文本或上一次保存的 401 猜当前发送结果。
@@ -222,7 +230,7 @@
 - 按来源存在性选择：显式环境值 → bearer PCO → 显式 profile → ISIM P-CSCF → 标准 DNS。显式值无效/解析失败/不支持时不静默跳到其他来源；不同族仍走原实际授予族计划。
 - `PcscfEndpoint` 保留 socket、UDP transport、source、原主机名和可用的 TTL/SRV priority/weight；当前不缓存 TTL，不由 metadata 推断可复用承载。
 - IPv4、裸 IPv6、`[IPv6]:port`、`host:port` 和 `sip:host:port;transport=udp` 保端口。蜂窝尚无 TCP/TLS 通道，profile transport 或显式 URI 请求非 UDP 时明确失败，`sips:` 不再悄悄变成 UDP/5060。
-- 只经 UE worker/当前 bearer DNS 查询；直接 A/AAAA 的完整有界集合优先，其次 UDP SRV，保留端口/优先级和加权顺序。没有全局 resolver、NAPTR 或 TCP DNS 兜底。
+- 只经 UE worker/当前 bearer DNS 查询；直接 A/AAAA 的完整有界集合优先，其次 UDP SRV，保留端口/优先级和加权顺序。没有全局 resolver。`0c1fff8` 已验证：匹配 TC question/ID 才允许同 resolver 的一次 TCP 重试；旧 direct/SRV 耗尽后增加终端 SIP NAPTR→UDP SRV，明确不把 D2T 当 UDP。蜂窝 SIP TCP/TLS 仍待后续接线。
 - 最多 16 个端点、16 次 DNS 查询、3 个同族 bearer resolver；每次查询最多 4 秒、整个发现最多 12 秒。重复查询与端点去重，DNS 长度/owner/CNAME/截断边界继续严格校验。
 
 ## 8. REGISTER 三态与写入契约

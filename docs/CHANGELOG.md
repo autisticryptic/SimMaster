@@ -5,6 +5,9 @@
 
 ## 1.1.5 主线
 
+- `3d54aa8` 接入同 owner 的 reg-event 订阅与注册状态通知，严格匹配实际 REGISTER 绑定和版本/dialog；无关或坏通知不影响 readiness。合法撤销保留同卡恢复等待与活动对话排空，MWI/REFER 不变；两套 Actions、双架构与相关制品证据通过，未部署。
+- `0c1fff8` 增加 bearer/worker 内 DNS TC→TCP 的同问题有界重试及 SIP NAPTR→UDP SRV 发现，保留旧 direct/SRV 优先路径与显式来源；两套日志各 186 项相关回归及四矩阵通过。**这不是蜂窝 SIP TCP/TLS 实现**，完整兜底目标仍在推进。
+
 - `3509e15` 完成双接入 REGISTER 响应认证：最终 Request-URI/Authorization/opaque 与 rspauth、qop/nc/cnonce 关联验证，先验后提交 nonce、租期和安全状态；无效 2xx 不借 profile/头型降级，可选 rspauth 缺失保留兼容。
   两套 Actions、双架构构建和前端通过；测试 ZIP 官方摘要、各 76 项相关回归及 86 模拟场景已核验。两轮新 fixture 失败与修正留在[交接](HANDOFF.md)，**未部署、未发布新 Release**，reg-event 等剩余项未混称完成。
 - `344308c` 已补强 AUTS 的 qop/opaque 保留、stale/nextnonce 的独立 AKA 来源与原 ESP 通道复用，以及跨候选 423 预算；WiFi 初次认证后 423 仍明确 unsupported，不假装支持或重发旧 nonce-count。

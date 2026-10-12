@@ -10,7 +10,16 @@
 4. 2026-10-07 的 410 部署属于已结束的历史授权；本轮只实施 IMS 补全和 Actions 验证，**未部署、未访问设备，也不主动连接 IDA**。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：REGISTER 响应认证已验证，下一项 reg-event
+## 当前：reg-event 已验证，继续传输与 DNS 兜底
+
+N5 代码 **`3d54aa87b1cc0ae5f2294991a46ad2ce43984e6a`** 已通过 [Build-Release 38204249021](https://github.com/autisticryptic/SimMaster/actions/runs/38204249021) 与 [Validate Beta 38204249122](https://github.com/autisticryptic/SimMaster/actions/runs/38204249122)、ARM64/AMD64 构建；Publish Release skipped。两套测试 ZIP 官方摘要、各 143 项相关回归和 86 矩阵场景已核验，报告 `.local/evidence/ims-reg-event/verified-3d54aa8.json`。
+
+- 订阅使用成功 REGISTER 的实际 AoR/Contact/instance/reg-id，同一 owner 上处理 Event: reg 的 dialog/CSeq/full/partial/version；无关通知、订阅失败与版本缺口不使注册失效。
+- 相关绑定被撤销时先 ACK，再降低本接入 readiness；保留活动对话排空，恢复等待不因同卡 profile/worker/端口重编号而清除，新 SIM 不继承旧等待。MWI/REFER 原路径保持。
+- 初轮 Send/XML 编译问题、第二轮测试夹具缺命令消费者均已修复，失败记录保留；未部署或访问设备。
+- **N6 进行中**：`0c1fff8` 接入同 bearer/worker 的 DNS TC→TCP 和有界 SIP NAPTR UDP 发现，保持既有 direct/SRV 首选；本子阶段已通过 Build `38206548479`、Beta `38206548465`、双架构构建；两套官方日志各核验 186 项相关回归和 86 模拟场景，证据 `.local/evidence/ims-dns-transport/verified-0c1fff8.json`。蜂窝 SIP TCP/TLS 与 NAPTR D2T 仍未接通，N7/N8 和最终固件查漏尚未完成，不将 DNS TCP 冒称 SIP TCP。
+
+## 已验证：REGISTER 响应认证
 
 已验证代码 **`3509e15474592f001fffde35f302fd3b45719c5a`**，已推送 `simmaster/master`；生产改动来自 `7054111`，后两次提交仅修正新测试 fixture。
 
@@ -24,13 +33,13 @@
 
 上一阶段 AUTS/stale/跨候选 423 在 `344308c` 已验证；两套 Actions（[38138978950](https://github.com/autisticryptic/SimMaster/actions/runs/38138978950)、[38138978978](https://github.com/autisticryptic/SimMaster/actions/runs/38138978978)）各核验 46 项相关回归和四矩阵。独立 AKA 来源、受保护 stale 不重装旧 ESP、AUTS 不冒充证明、423 尝试级预算均保持；WiFi 初次认证后 423 仍明确 unsupported。
 
-**完整补全任务尚未完成。** 下一项 N5 reg-event；TCP/TLS/SIP NAPTR/DNS TCP、完整来源诊断与承载能力 N6～N8 仍待补齐。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界，见[开发计划](DEVELOPMENT_PLAN.md)。
+**完整补全任务尚未完成。** reg-event 已在后继 N5 验证；传输/DNS、完整来源诊断与承载能力 N6～N8 继续补齐。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界，见[开发计划](DEVELOPMENT_PLAN.md)。
 
 ## 第一批：ISIM、P-CSCF 与临时拒绝补全
 
 代码基线 **`5aaf3eab6515aba9f5f5eb43553ea00a1cec3264`**（前一实现提交 `e702cef`），已推送 `simmaster/master`。
 
-**这是第一批实现及验证闭环，不是原 EC20 审查全部建议已完成。** AUTS/stale 与跨候选 423 后续已验证；当前继续 rspauth、reg-event，以及尚未实现的传输、诊断与承载能力；完整范围和跨项目/IDA 边界见[开发计划](DEVELOPMENT_PLAN.md)。
+**这是第一批实现及验证闭环，不是原 EC20 审查全部建议已完成。** AUTS/stale 与跨候选 423 后续已验证；rspauth、reg-event 后续已验证，当前继续尚未完成的传输、诊断与承载能力；完整范围和跨项目/IDA 边界见[开发计划](DEVELOPMENT_PLAN.md)。
 
 - 共享读取 ISIM 的 IMPI/DOMAIN/IMPU/P-CSCF；完整身份与认证 AID 一起选用，合法未配置时保留 USIM 派生；读取错误、损坏、换卡不假装缺省。VoWiFi 的 EAP 仍使用 USIM。
 - QMI 按 slot 发现应用，native AT 通过自有通道读取 EF_DIR；PC/SC 每个进程重选完整 AID/文件，并用稳定 reader 名称防止索引重排。卡/slot/owner 检查是分阶段观察，不冒称可原子排除所有物理热插拔竞态。
