@@ -20,7 +20,7 @@ fn response(request: &[u8], status: u16, extra: &str) -> Vec<u8> {
         sip::header_value(request, "To").unwrap().split(";tag=").next().unwrap(),
         sip::header_value(request, "Call-ID").unwrap(), sip::header_value(request, "CSeq").unwrap()).into_bytes()
 }
-async fn fixture() -> (CellularImsLiveHandle, Arc<CellularImsRuntime>, UdpSocket, Vec<u8>) {
+async fn fixture() -> (CellularImsLiveHandle, Arc<CellularImsRuntime>, UdpSocket, Vec<u8>, tokio::sync::broadcast::Receiver<OperatorCommand>) {
     static IDS: AtomicUsize = AtomicUsize::new(0);
     let (live, runtime, peer) = super::super::tests::test_voice_session().await;
     let line = format!("n5-cellular-{}", IDS.fetch_add(1, Ordering::Relaxed));
@@ -44,9 +44,11 @@ async fn fixture() -> (CellularImsLiveHandle, Arc<CellularImsRuntime>, UdpSocket
     session.registration = RegisteredImsContext::from_artifacts(ImsRegistrationAccess::CellularIms, artifacts, 600);
     assert!(session.channel.reg_event_binding().is_some());
     runtime.update(|state| { state.phase = CellularImsPhase::Registered; state.stage = CellularImsStage::Registered; }).await;
+    let commands = live.operator.subscribe_commands();
     live.operator.set_ready(true);
+    assert!(live.operator.is_available());
     drop(sessions);
-    (live, runtime, peer, wire)
+    (live, runtime, peer, wire, commands)
 }
 async fn establish(live: &CellularImsLiveHandle, runtime: &Arc<CellularImsRuntime>, peer: &UdpSocket) -> Vec<u8> {
     poll(live, runtime).await;
@@ -74,7 +76,7 @@ async fn deliver(live: &CellularImsLiveHandle, runtime: &Arc<CellularImsRuntime>
 
 #[tokio::test]
 async fn cellular_reg_subscribe_uses_accepted_wire_binding_not_business_alias() {
-    let (live, runtime, peer, _) = fixture().await;
+    let (live, runtime, peer, _, _commands) = fixture().await;
     let sub = establish(&live, &runtime, &peer).await;
     assert!(sub.starts_with(format!("SUBSCRIBE {AOR} SIP/2.0").as_bytes()));
     assert!(!String::from_utf8_lossy(&sub).contains(ALIAS));
@@ -89,7 +91,7 @@ async fn cellular_reg_subscribe_uses_accepted_wire_binding_not_business_alias() 
 
 #[tokio::test]
 async fn cellular_reg_own_termination_latches_runtime_and_scope_wait_without_downgrade() {
-    let (live, runtime, peer, wire) = fixture().await;
+    let (live, runtime, peer, wire, _commands) = fixture().await;
     let sub = establish(&live, &runtime, &peer).await;
     let removal = notify(&sub, 1, &xml(&wire, 0, false, "terminated", "probation", "retry-after=\"300\""), "active;expires=600");
     deliver(&live, &runtime, &peer, &removal, 200).await;
@@ -115,7 +117,7 @@ async fn cellular_reg_own_termination_latches_runtime_and_scope_wait_without_dow
 
 #[tokio::test]
 async fn cellular_reg_full_partial_and_version_gap_are_transactional() {
-    let (live, runtime, peer, wire) = fixture().await;
+    let (live, runtime, peer, wire, _commands) = fixture().await;
     let sub = establish(&live, &runtime, &peer).await;
     deliver(&live, &runtime, &peer, &notify(&sub, 1, &xml(&wire, 0, false, "active", "registered", ""), "active;expires=600"), 200).await;
     deliver(&live, &runtime, &peer, &notify(&sub, 2, &xml(&wire, 2, true, "terminated", "expired", ""), "active;expires=600"), 200).await;
@@ -130,7 +132,7 @@ async fn cellular_reg_full_partial_and_version_gap_are_transactional() {
 
 #[tokio::test]
 async fn cellular_reg_wrong_dialog_identity_and_subscription_termination_do_not_revoke() {
-    let (live, runtime, peer, wire) = fixture().await;
+    let (live, runtime, peer, wire, _commands) = fixture().await;
     let sub = establish(&live, &runtime, &peer).await;
     let body = xml(&wire, 0, false, "terminated", "expired", "");
     let wrong = String::from_utf8(notify(&sub, 1, &body, "active;expires=600")).unwrap().replace(";tag=notifier", ";tag=wrong");
@@ -146,7 +148,7 @@ async fn cellular_reg_wrong_dialog_identity_and_subscription_termination_do_not_
 
 #[tokio::test]
 async fn cellular_reg_unsupported_subscription_and_ownership_failures_only_disable_observation() {
-    let (live, runtime, peer, wire) = fixture().await;
+    let (live, runtime, peer, wire, _commands) = fixture().await;
     poll(&live, &runtime).await;
     let sub = receive(&peer).await;
     assert!(on_frame(&live, &runtime, &response(&sub, 489, "")).await.unwrap());
@@ -160,7 +162,7 @@ async fn cellular_reg_unsupported_subscription_and_ownership_failures_only_disab
 
 #[tokio::test]
 async fn cellular_reg_unrelated_mwi_refer_and_no_binding_are_not_silently_accepted() {
-    let (live, runtime, peer, wire) = fixture().await;
+    let (live, runtime, peer, wire, _commands) = fixture().await;
     let sub = establish(&live, &runtime, &peer).await;
     let frame = notify(&sub, 1, &xml(&wire, 0, false, "active", "registered", ""), "active;expires=600");
     for event in ["message-summary", "refer;id=5"] {
