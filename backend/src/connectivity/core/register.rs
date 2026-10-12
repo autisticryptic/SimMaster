@@ -637,7 +637,12 @@ where
 }
 
 fn preserve_flow_error(error: ImsError, fallback: &'static str) -> ImsError {
-    if error.code().starts_with("ims_outbound_") {
+    if error.code().starts_with("ims_outbound_")
+        || error.code().starts_with("cellular_ims_tls_")
+        || matches!(error.code(), "cellular_ims_channel_stream_frame_invalid"
+            | "cellular_ims_channel_stream_response_owner_missing"
+            | "cellular_ims_channel_stream_budget_exhausted")
+    {
         error
     } else {
         ImsError::new(fallback)
@@ -925,6 +930,20 @@ mod tests {
                 assert_eq!(failure.auth_rounds, 1);
             }
             assert_eq!(channel.sends.len(), 2);
+        }
+    }
+
+    #[test]
+    fn stream_security_and_framing_errors_are_not_silent_transport_hints() {
+        for reason in ["cellular_ims_tls_handshake_failed", "cellular_ims_tls_authority_invalid",
+            "cellular_ims_channel_stream_frame_invalid", "cellular_ims_channel_stream_response_owner_missing",
+            "cellular_ims_channel_stream_budget_exhausted"]
+        {
+            let error = preserve_flow_error(ImsError::new(reason), "ims_register_initial_receive_failed");
+            assert_eq!(error.code(), reason);
+            let failure = RegisterFailure { error, response: None, auth_rounds: 0 };
+            assert!(!failure.metadata().is_temporary());
+            assert!(!failure.metadata().permits_variant_fallback());
         }
     }
 

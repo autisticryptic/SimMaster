@@ -70,14 +70,41 @@ fn rejects_invalid_ports_brackets_hosts_and_uri_components() {
 }
 
 #[test]
-fn rejects_sips_tcp_tls_and_other_transports_explicitly() {
+fn rejects_sips_udp_and_other_unsupported_transports_explicitly() {
     for text in [
-        "sips:pcscf.example", "SIPS:[2001:db8::10]:5061;transport=udp",
-        "sip:pcscf.example;transport=tcp", "sip:192.0.2.10:5061;transport=TLS",
+        "SIPS:[2001:db8::10]:5061;transport=udp",
         "sip:host;transport=sctp", "sip:host;transport=ws",
     ] {
         assert_eq!(parse_pcscf_endpoint(text).unwrap_err().code(), code::PCSCF_TRANSPORT_UNSUPPORTED, "{text}");
     }
+}
+
+#[test]
+fn stream_endpoint_schemes_ports_and_explicit_transport_are_preserved() {
+    for (value, transport, port) in [
+        ("sip:pcscf.example;transport=tcp", PcscfTransport::Tcp, 5060),
+        ("sips:pcscf.example", PcscfTransport::Tls, 5061),
+        ("sips:pcscf.example:5198;transport=tcp", PcscfTransport::Tls, 5198),
+        ("sip:192.0.2.10:5099;transport=TLS", PcscfTransport::Tls, 5099),
+    ] {
+        let parsed = parse_pcscf_endpoint(value).unwrap();
+        assert_eq!(parsed.transport, transport); assert_eq!(parsed.port, port); assert!(parsed.transport_explicit);
+    }
+}
+
+#[tokio::test]
+async fn profile_transport_supplies_only_missing_defaults_and_preserves_explicit_ports() {
+    for (transport, port) in [(PcscfTransport::Tcp, 5060), (PcscfTransport::Tls, 5061)] {
+        let endpoints = discover_with(explicit("192.0.2.10,192.0.2.11:5089"), &settings(), "ims.example", local(),
+            |_,_,_| ready(Ok(DnsRecords::default())), DiscoveryLimits { requested_transport: transport, ..Default::default() }).await.unwrap();
+        assert_eq!(endpoints[0].transport, transport); assert_eq!(endpoints[0].socket.port(), port);
+        assert_eq!(endpoints[1].socket.port(), 5089);
+        if transport == PcscfTransport::Tls { assert_eq!(endpoints[0].tls_authority.as_deref(), Some("192.0.2.10")); }
+    }
+    let error = discover_with(explicit("sip:host.example;transport=udp"), &settings(), "ims.example", local(),
+        |_,_,_| { panic!("TLS conflict must fail before DNS"); #[allow(unreachable_code)] ready(Ok(DnsRecords::default())) },
+        DiscoveryLimits { requested_transport: PcscfTransport::Tls, ..Default::default() }).await.unwrap_err();
+    assert_eq!(error.code(), code::PCSCF_ENDPOINT_INVALID);
 }
 
 #[test]
@@ -87,7 +114,7 @@ fn endpoint_lists_validate_every_entry_before_io_and_are_bounded() {
     for text in [
         "", " ", ",192.0.2.10", "192.0.2.10,", "host,,other",
         "192.0.2.10;192.0.2.11", "host, sip:other;lr", "host\nother", "host\tother",
-        "192.0.2.10,host:0", "host, sips:other",
+        "192.0.2.10,host:0", "host, sips:other;transport=udp",
     ] {
         assert!(parse_list(text).is_err(), "{text:?}");
     }
@@ -111,7 +138,7 @@ fn source_priority_is_presence_based_including_isim_before_standard_dns() {
     assert!(matches!(select_source(None, &settings, Some("192.0.2.12"), &isim).unwrap(), Selection::Explicit(PcscfSource::Profile, _)));
     assert!(matches!(select_source(None, &settings, None, &isim).unwrap(), Selection::Explicit(PcscfSource::Isim, _)));
     assert!(matches!(select_source(None, &settings, None, &[]).unwrap(), Selection::StandardDns));
-    for invalid in ["", "host:0", "sips:host"] {
+    for invalid in ["", "host:0", "sips:host;transport=udp"] {
         assert!(select_source(Some(invalid), &settings, Some("192.0.2.12"), &isim).is_err());
         assert!(select_source(None, &settings, Some(invalid), &isim).is_err());
         assert!(select_source(None, &settings, None, &[invalid.to_string()]).is_err());
@@ -128,7 +155,7 @@ fn environment_legacy_alias_is_used_only_when_new_name_is_absent() {
     }).unwrap();
     assert_eq!(value.as_deref(), Some("host:5078"));
     assert_eq!(names, [ENV_PCSCF, LEGACY_ENV_PCSCF]);
-    for value in ["", "sips:host", "host:0"] {
+    for value in ["", "sips:host;transport=udp", "host:0"] {
         let result = environment_override_with(|name| {
             assert_eq!(name, ENV_PCSCF, "configured new name must not try legacy");
             Ok(value.to_string())
@@ -281,12 +308,19 @@ async fn sip_naptr_fallback_preserves_srv_port_and_all_chain_ttls_after_legacy_p
 async fn naptr_stream_only_service_is_never_misinterpreted_as_udp() {
     use super::super::super::pcscf_dns::NaptrTarget;
     let result = discover_with(Selection::StandardDns, &settings(), "ims.example", local(), |_, name, kind| {
-        assert_ne!(name, "_sips._tcp.not-udp.example");
-        ready(Ok(if kind == 35 { DnsRecords { naptr_targets: vec![NaptrTarget {
-            order: 0, preference: 0, service: "SIPS+D2T".into(), replacement: "_sips._tcp.not-udp.example".into(), ttl: 60,
-        }], ..Default::default() } } else { DnsRecords::default() }))
-    }, DiscoveryLimits::default()).await;
-    assert!(result.is_err());
+        ready(Ok(match (name.as_str(), kind) {
+            ("pcscf.ims.example", 35) => DnsRecords { naptr_targets: vec![NaptrTarget {
+                order: 0, preference: 0, service: "SIPS+D2T".into(), replacement: "_sips._tcp.not-udp.example".into(), ttl: 60,
+            }], ..Default::default() },
+            ("_sips._tcp.not-udp.example", 33) => DnsRecords { srv_targets: vec![service("tls-node.example", 5198, 0, 0, 60)], ..Default::default() },
+            ("tls-node.example", 1) => addresses(&["192.0.2.19"], 60),
+            _ => DnsRecords::default(),
+        }))
+    }, DiscoveryLimits::default()).await.unwrap();
+    assert_eq!(result[0].transport, PcscfTransport::Tls);
+    assert_eq!(result[0].socket.port(), 5198);
+    assert_eq!(result[0].host.as_deref(), Some("tls-node.example"));
+    assert_eq!(result[0].tls_authority.as_deref(), Some("pcscf.ims.example"));
 }
 
 #[test]

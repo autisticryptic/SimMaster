@@ -6527,7 +6527,8 @@ async fn run_protected_authenticated_register_candidates(
                     crate::connectivity::core::context::SipTransport::Udp => {
                         Some(local_security.port_s)
                     }
-                    crate::connectivity::core::context::SipTransport::Tcp => None,
+                    crate::connectivity::core::context::SipTransport::Tcp
+                    | crate::connectivity::core::context::SipTransport::Tls => None,
                 };
                 context.protected_header_port = protected_header_port;
                 // Each alternate flow emits a new request, not a retransmit of
@@ -7610,6 +7611,9 @@ async fn connect_sip_socket(
     let local = SocketAddr::new(inner_addr, preferred_local_port);
     let device = interface.map(str::to_string);
     match transport {
+        // A new shared TLS discriminant must never make this legacy WiFi
+        // socket factory silently create unencrypted TCP.
+        crate::connectivity::core::context::SipTransport::Tls => Err(live_stage_error("ims_tls_socket_factory_unavailable")),
         crate::connectivity::core::context::SipTransport::Tcp => {
             let spec = UeSocketSpec::tcp_connected(
                 local,
@@ -7670,6 +7674,11 @@ async fn connect_sip_socket(
 fn ims_transport(
     profile: &'static CarrierProfile,
 ) -> crate::connectivity::core::context::SipTransport {
+    if profile.ims.transport.eq_ignore_ascii_case("tls") {
+        // Cellular-only TLS profiles must not inherit the legacy WiFi UDP
+        // default, including model-specific policies below.
+        return crate::connectivity::core::context::SipTransport::Tls;
+    }
     if is_vodafone_germany_profile(profile) {
         return crate::connectivity::core::context::SipTransport::Udp;
     }

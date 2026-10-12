@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 pub enum SipTransport {
     Udp,
     Tcp,
+    Tls,
 }
 
 impl SipTransport {
@@ -18,6 +19,7 @@ impl SipTransport {
         match self {
             Self::Udp => "SIP/2.0/UDP",
             Self::Tcp => "SIP/2.0/TCP",
+            Self::Tls => "SIP/2.0/TLS",
         }
     }
 
@@ -25,6 +27,7 @@ impl SipTransport {
         match self {
             Self::Udp => "udp",
             Self::Tcp => "tcp",
+            Self::Tls => "tls",
         }
     }
 }

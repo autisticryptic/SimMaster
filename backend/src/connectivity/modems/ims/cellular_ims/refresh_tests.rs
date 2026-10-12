@@ -3,6 +3,8 @@
 mod auth_hardening_tests;
 #[path = "response_auth_tests.rs"]
 mod response_auth_tests;
+#[path = "stream_registration_tests.rs"]
+mod stream_registration_tests;
 use super::*;
 use crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult;
 use tokio::net::UdpSocket;

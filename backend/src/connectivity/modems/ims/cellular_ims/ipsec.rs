@@ -153,6 +153,12 @@ impl Default for XfrmAlgs {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XfrmTransport { Udp, Tcp }
+impl XfrmTransport {
+    fn as_str(self) -> &'static str { match self { Self::Udp => "udp", Self::Tcp => "tcp" } }
+}
+
 /// One SA direction descriptor.
 #[derive(Debug, Clone)]
 pub struct XfrmSa {
@@ -165,6 +171,7 @@ pub struct XfrmSa {
     pub algs: XfrmAlgs,
     pub sport: u16,
     pub dport: u16,
+    pub transport: XfrmTransport,
 }
 
 /// `ip` binary discovery order, mirroring the reference search path.
@@ -230,7 +237,7 @@ pub fn build_xfrm_state_add(sa: &XfrmSa) -> Vec<String> {
         "transport".into(),
         "sel".into(),
         "proto".into(),
-        "udp".into(),
+        sa.transport.as_str().into(),
         "sport".into(),
         sa.sport.to_string(),
         "dport".into(),
@@ -274,6 +281,12 @@ pub fn build_xfrm_policy_add(
     dport: u16,
     dir: PolicyDir,
 ) -> Vec<String> {
+    build_xfrm_policy_for_transport(src, dst, sport, dport, dir, XfrmTransport::Udp)
+}
+
+fn build_xfrm_policy_for_transport(
+    src: IpAddr, dst: IpAddr, sport: u16, dport: u16, dir: PolicyDir, transport: XfrmTransport,
+) -> Vec<String> {
     vec![
         "xfrm".into(),
         "policy".into(),
@@ -283,7 +296,7 @@ pub fn build_xfrm_policy_add(
         "dst".into(),
         ip_str(dst),
         "proto".into(),
-        "udp".into(),
+        transport.as_str().into(),
         "sport".into(),
         sport.to_string(),
         "dport".into(),
@@ -350,6 +363,14 @@ pub fn build_install_plan_with_algs(
     encryption_key: &[u8],
     algs: XfrmAlgs,
 ) -> Result<XfrmInstallPlan, CellularImsError> {
+    build_install_plan_for_transport(ue, pcscf, ue_sec, pcscf_sec, auth_key, encryption_key, algs, XfrmTransport::Udp)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_install_plan_for_transport(
+    ue: IpAddr, pcscf: IpAddr, ue_sec: &SecAgree, pcscf_sec: &SecAgree,
+    auth_key: &[u8], encryption_key: &[u8], algs: XfrmAlgs, transport: XfrmTransport,
+) -> Result<XfrmInstallPlan, CellularImsError> {
     validate_binding(ue_sec)?;
     validate_binding(pcscf_sec)?;
     // IMS IPsec requires IPv6 in most deployments (observed
@@ -390,7 +411,7 @@ pub fn build_install_plan_with_algs(
     // four-entry plan can make Linux select an SA that does not match the
     // actual refresh response, causing ESP to be discarded before it reaches
     // the protected socket.
-    let states = vec![
+    let mut states = vec![
         // UE-originated REGISTER/request or response: port_uc -> port_ps.
         XfrmSa {
             src: ue,
@@ -401,6 +422,7 @@ pub fn build_install_plan_with_algs(
             algs,
             sport: ue_sec.port_c,
             dport: pcscf_sec.port_s,
+            transport,
         },
         // P-CSCF-originated response/request: port_pc -> port_us.
         XfrmSa {
@@ -412,12 +434,28 @@ pub fn build_install_plan_with_algs(
             algs,
             sport: pcscf_sec.port_c,
             dport: ue_sec.port_s,
+            transport,
         },
     ];
-    let policies = vec![
-        build_xfrm_policy_add(ue, pcscf, ue_sec.port_c, pcscf_sec.port_s, PolicyDir::Out),
-        build_xfrm_policy_add(pcscf, ue, pcscf_sec.port_c, ue_sec.port_s, PolicyDir::In),
+    let mut policies = vec![
+        build_xfrm_policy_for_transport(ue, pcscf, ue_sec.port_c, pcscf_sec.port_s, PolicyDir::Out, transport),
+        build_xfrm_policy_for_transport(pcscf, ue, pcscf_sec.port_c, ue_sec.port_s, PolicyDir::In, transport),
     ];
+    if transport == XfrmTransport::Tcp {
+        // Unlike the existing UDP two-direction path, TCP ACKs/responses MUST
+        // return on their original connection. Install each TCP tuple's reverse
+        // SA with the corresponding client SPI; never add these to UDP plans.
+        states.extend([
+            XfrmSa { src: pcscf, dst: ue, spi: ue_sec.spi_c, auth_key: auth_key.to_vec(),
+                enc_key: encryption_key.to_vec(), algs, sport: pcscf_sec.port_s, dport: ue_sec.port_c, transport },
+            XfrmSa { src: ue, dst: pcscf, spi: pcscf_sec.spi_c, auth_key: auth_key.to_vec(),
+                enc_key: encryption_key.to_vec(), algs, sport: ue_sec.port_s, dport: pcscf_sec.port_c, transport },
+        ]);
+        policies.extend([
+            build_xfrm_policy_for_transport(pcscf, ue, pcscf_sec.port_s, ue_sec.port_c, PolicyDir::In, transport),
+            build_xfrm_policy_for_transport(ue, pcscf, ue_sec.port_s, pcscf_sec.port_c, PolicyDir::Out, transport),
+        ]);
+    }
     Ok(XfrmInstallPlan { states, policies })
 }
 
@@ -666,6 +704,7 @@ mod tests {
             algs: XfrmAlgs::default(),
             sport: 6000,
             dport: 6001,
+            transport: XfrmTransport::Udp,
         };
         let argv = build_xfrm_state_add(&sa);
         let joined = argv.join(" ");
@@ -700,9 +739,38 @@ mod tests {
             algs: XfrmAlgs::default(),
             sport: 5064,
             dport: 5063,
+            transport: XfrmTransport::Udp,
         };
         let command = build_xfrm_state_add(&sa);
         assert!(!command.iter().any(|part| part == "limit"));
+    }
+
+    #[test]
+    fn tcp_plan_has_four_exact_spi_port_directions_without_changing_udp_plan() {
+        let ue = SecAgree { spi_c: 0x1111, spi_s: 0x2222, port_c: 6000, port_s: 6001 };
+        let pcscf = SecAgree { spi_c: 0x3333, spi_s: 0x4444, port_c: 7000, port_s: 7001 };
+        let udp = build_install_plan_with_algs(v6(2), v6(1), &ue, &pcscf, &[1;16], &[], XfrmAlgs::default()).unwrap();
+        let tcp = build_install_plan_for_transport(v6(2), v6(1), &ue, &pcscf, &[1;16], &[], XfrmAlgs::default(), XfrmTransport::Tcp).unwrap();
+        assert_eq!((udp.states.len(), udp.policies.len()), (2, 2));
+        assert!(udp.states.iter().all(|state| build_xfrm_state_add(state).join(" ").contains("sel proto udp")));
+        assert_eq!((tcp.states.len(), tcp.policies.len()), (4, 4));
+        assert_eq!(tcp.states.iter().map(|state| (state.spi, state.sport, state.dport)).collect::<Vec<_>>(),
+            [(0x4444,6000,7001), (0x2222,7000,6001), (0x1111,7001,6000), (0x3333,6001,7000)]);
+        assert!(tcp.states.iter().all(|state| build_xfrm_state_add(state).join(" ").contains("sel proto tcp")));
+        assert!(tcp.policies.iter().all(|policy| policy.join(" ").contains("proto tcp")));
+        assert!(tcp.states.iter().all(|state| state.auth_key == vec![1;16] && state.enc_key.is_empty()));
+    }
+
+    #[test]
+    fn tcp_plan_keeps_same_algorithm_keys_and_invalid_binding_rejections() {
+        let ue = SecAgree { spi_c: 0x1111, spi_s: 0x2222, port_c: 6000, port_s: 6001 };
+        let pcscf = SecAgree { spi_c: 0x3333, spi_s: 0x4444, port_c: 7000, port_s: 7001 };
+        let algs = XfrmAlgs { auth: "hmac(sha1)", auth_trunc_bits: 96, enc: "cbc(aes)" };
+        let tcp = build_install_plan_for_transport(v6(2), v6(1), &ue, &pcscf, &[2;16], &[3;16], algs, XfrmTransport::Tcp).unwrap();
+        assert!(tcp.states.iter().all(|state| state.algs == algs && state.auth_key == vec![2;16] && state.enc_key == vec![3;16]));
+        assert!(build_install_plan_for_transport(v6(2), v6(1), &ue, &pcscf, &[2;16], &[], algs, XfrmTransport::Tcp).is_err());
+        let mut invalid = pcscf; invalid.spi_c = 0;
+        assert!(build_install_plan_for_transport(v6(2), v6(1), &ue, &invalid, &[2;16], &[3;16], algs, XfrmTransport::Tcp).is_err());
     }
 
     #[test]

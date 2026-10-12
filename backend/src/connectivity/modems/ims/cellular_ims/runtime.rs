@@ -193,14 +193,22 @@ pub enum RegistrationMode {
     None,
     Ipsec,
     Udp,
+    Tcp,
+    Tls,
 }
 
 impl RegistrationMode {
+    pub fn from_transport(transport: crate::connectivity::core::context::SipTransport) -> Self {
+        use crate::connectivity::core::context::SipTransport;
+        match transport { SipTransport::Udp => Self::Udp, SipTransport::Tcp => Self::Tcp, SipTransport::Tls => Self::Tls }
+    }
     pub fn as_str(self) -> &'static str {
         match self {
             RegistrationMode::None => "",
             RegistrationMode::Ipsec => "ipsec",
             RegistrationMode::Udp => "udp",
+            RegistrationMode::Tcp => "tcp",
+            RegistrationMode::Tls => "tls",
         }
     }
 }

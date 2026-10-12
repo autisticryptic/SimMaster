@@ -209,6 +209,8 @@ impl FailureClass {
             | code::REGISTER_RETRY_STOPPED
             | code::PCSCF_FAMILY_MISMATCH
             | code::IPSEC_UDP_BIND_FAILED
+            | code::CHANNEL_STREAM_CONNECT_FAILED
+            | code::TLS_ENDPOINT_FAILED
             | code::COMMAND_FAILED => FailureClass::PcscfFailed,
             code::RUNTIME_IMS_FAMILY_UNSUPPORTED => FailureClass::FamilyUnsupported,
             _ => FailureClass::Other,

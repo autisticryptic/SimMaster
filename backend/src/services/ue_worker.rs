@@ -219,6 +219,10 @@ pub struct NetConfigOutcome {
 pub enum UeSocketKind {
     Udp,
     Tcp,
+    /// Bind now; connect only after the exact IMS SA has been installed.
+    TcpBound,
+    /// Bound, nonblocking listener; peer admission remains the socket owner's.
+    TcpListener,
 }
 
 /// Address family for the worker-created socket.
@@ -275,6 +279,15 @@ impl UeSocketSpec {
         spec
     }
 
+    pub fn tcp_bound(local: SocketAddr, bind_to_device: Option<String>) -> Self {
+        Self { kind: UeSocketKind::TcpBound, family: socket_family(local), bind: Some(local),
+            connect: None, bind_to_device, reuse_address: true, connect_timeout_secs: None }
+    }
+
+    pub fn tcp_listener(local: SocketAddr, bind_to_device: Option<String>) -> Self {
+        Self { kind: UeSocketKind::TcpListener, ..Self::tcp_bound(local, bind_to_device) }
+    }
+
     pub fn tcp_connected(
         local: SocketAddr,
         remote: SocketAddr,
@@ -305,6 +318,8 @@ fn socket_family(addr: SocketAddr) -> UeSocketFamily {
 pub enum UeSocket {
     Udp(tokio::net::UdpSocket),
     Tcp(tokio::net::TcpStream),
+    TcpBound(tokio::net::TcpSocket),
+    TcpListener(tokio::net::TcpListener),
 }
 
 /// Platform-neutral fd carrier used by the parent-side pending map.
@@ -844,6 +859,16 @@ impl UeWorkerHandle {
                 let std_stream = std::net::TcpStream::from(fd);
                 std_stream.set_nonblocking(true)?;
                 Ok(UeSocket::Tcp(tokio::net::TcpStream::from_std(std_stream)?))
+            }
+            UeSocketKind::TcpBound => {
+                let socket = std::net::TcpStream::from(fd);
+                socket.set_nonblocking(true)?;
+                Ok(UeSocket::TcpBound(tokio::net::TcpSocket::from_std_stream(socket)))
+            }
+            UeSocketKind::TcpListener => {
+                let listener = std::net::TcpListener::from(fd);
+                listener.set_nonblocking(true)?;
+                Ok(UeSocket::TcpListener(tokio::net::TcpListener::from_std(listener)?))
             }
         }
     }
@@ -1680,6 +1705,11 @@ fn send_frame_std(
 /// TCP connect-with-timeout. The returned fd is owned by the caller.
 #[cfg(unix)]
 fn create_socket_fd(spec: &UeSocketSpec) -> std::io::Result<std::os::fd::OwnedFd> {
+    if matches!(spec.kind, UeSocketKind::TcpBound | UeSocketKind::TcpListener)
+        && (spec.bind.is_none() || spec.connect.is_some())
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "reserved TCP socket requires only an explicit bind"));
+    }
     let preferred_addr = spec.connect.or(spec.bind);
     let domain = match preferred_addr {
         Some(addr) => socket2::Domain::for_address(addr),
@@ -1690,11 +1720,11 @@ fn create_socket_fd(spec: &UeSocketSpec) -> std::io::Result<std::os::fd::OwnedFd
     };
     let ty = match spec.kind {
         UeSocketKind::Udp => socket2::Type::DGRAM,
-        UeSocketKind::Tcp => socket2::Type::STREAM,
+        UeSocketKind::Tcp | UeSocketKind::TcpBound | UeSocketKind::TcpListener => socket2::Type::STREAM,
     };
     let protocol = match spec.kind {
         UeSocketKind::Udp => socket2::Protocol::UDP,
-        UeSocketKind::Tcp => socket2::Protocol::TCP,
+        UeSocketKind::Tcp | UeSocketKind::TcpBound | UeSocketKind::TcpListener => socket2::Protocol::TCP,
     };
     let socket = socket2::Socket::new(domain, ty, Some(protocol))?;
     if spec.reuse_address {
@@ -1721,7 +1751,9 @@ fn create_socket_fd(spec: &UeSocketSpec) -> std::io::Result<std::os::fd::OwnedFd
                 socket.connect_timeout(&socket2::SockAddr::from(*connect), timeout)?;
             }
         }
+        UeSocketKind::TcpBound | UeSocketKind::TcpListener => {}
     }
+    if spec.kind == UeSocketKind::TcpListener { socket.listen(8)?; }
     // O_NONBLOCK must be set before this fd crosses SCM_RIGHTS: the flag lives on
     // the open file description, so the parent inherits whatever we leave here,
     // and the parent hands the fd straight to `tokio::net::*::from_std`, which
@@ -2974,6 +3006,51 @@ mod tests {
             fd_is_nonblocking(fd.as_raw_fd()),
             "a blocking UDP fd would starve a tokio worker thread"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reserved_tcp_socket_retains_bound_port_without_listening_or_connecting() {
+        use std::os::fd::AsRawFd;
+        let spec = UeSocketSpec::tcp_bound("127.0.0.1:0".parse().unwrap(), None);
+        let fd = create_socket_fd(&spec).unwrap();
+        assert!(fd_is_nonblocking(fd.as_raw_fd()));
+        let stream = std::net::TcpStream::from(fd);
+        let local = stream.local_addr().unwrap();
+        assert_ne!(local.port(), 0);
+        assert!(stream.peer_addr().is_err());
+        assert!(std::net::TcpStream::connect_timeout(&local, Duration::from_millis(100)).is_err());
+        let decoded: UeSocketSpec = serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
+        assert_eq!(decoded.kind, UeSocketKind::TcpBound);
+        assert_eq!(decoded.bind, spec.bind);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn reserved_worker_tcp_fd_can_connect_after_adoption_without_rebinding() {
+        let spec = UeSocketSpec::tcp_bound("127.0.0.1:0".parse().unwrap(), None);
+        let fd = create_socket_fd(&spec).unwrap();
+        let stream = std::net::TcpStream::from(fd);
+        let original = stream.local_addr().unwrap();
+        let socket = tokio::net::TcpSocket::from_std_stream(stream);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = socket.connect(listener.local_addr().unwrap()).await.unwrap();
+        let (_, peer) = listener.accept().await.unwrap();
+        assert_eq!(peer, original);
+        assert_eq!(client.local_addr().unwrap(), original);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bound_and_listener_kinds_reject_unbound_or_preconnected_specs() {
+        for kind in [UeSocketKind::TcpBound, UeSocketKind::TcpListener] {
+            let mut spec = UeSocketSpec::tcp_bound("127.0.0.1:0".parse().unwrap(), None);
+            spec.kind = kind;
+            spec.connect = Some("127.0.0.1:9".parse().unwrap());
+            assert!(create_socket_fd(&spec).is_err());
+            spec.connect = None; spec.bind = None;
+            assert!(create_socket_fd(&spec).is_err());
+        }
     }
 
     /// The TCP path needs its own case: `socket2::connect_timeout` toggles

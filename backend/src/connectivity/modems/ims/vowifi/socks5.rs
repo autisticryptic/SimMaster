@@ -558,6 +558,9 @@ async fn host_socket(spec: UeSocketSpec) -> Result<UeSocket, Socks5Error> {
         .bind
         .ok_or_else(|| Socks5Error::Protocol("missing socket bind".into()))?;
     match spec.kind {
+        UeSocketKind::TcpBound | UeSocketKind::TcpListener => {
+            Err(Socks5Error::Protocol("reserved worker TCP sockets cannot use the host factory".into()))
+        }
         UeSocketKind::Tcp => TcpStream::connect(remote)
             .await
             .map(UeSocket::Tcp)

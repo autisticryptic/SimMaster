@@ -397,6 +397,7 @@ impl OutboundFlow {
     pub fn active(&self) -> bool {
         self.next_probe.is_some() || self.pending.is_some()
     }
+    pub fn awaiting_tcp_pong(&self) -> bool { self.tcp && self.pending.is_some() }
     pub fn deadline(&self) -> Option<Instant> {
         self.pending
             .as_ref()

@@ -193,6 +193,19 @@ pub mod code {
     pub const RUNTIME_SEND_TIMEOUT: &str = "cellular_ims_runtime_send_timeout";
     pub const RANDOM_FAILED: &str = "cellular_ims_random_failed";
 
+    // Reliable SIP transport / TLS. These never authorize plaintext fallback.
+    pub const CHANNEL_STREAM_CONNECT_FAILED: &str = "cellular_ims_channel_stream_connect_failed";
+    pub const CHANNEL_STREAM_BUDGET_EXHAUSTED: &str = "cellular_ims_channel_stream_budget_exhausted";
+    pub const CHANNEL_STREAM_CLOSED: &str = "cellular_ims_channel_stream_closed";
+    pub const CHANNEL_STREAM_WRITE_FAILED: &str = "cellular_ims_channel_stream_write_failed";
+    pub const CHANNEL_STREAM_FRAME_INVALID: &str = "cellular_ims_channel_stream_frame_invalid";
+    pub const CHANNEL_STREAM_RESPONSE_OWNER_MISSING: &str = "cellular_ims_channel_stream_response_owner_missing";
+    pub const TLS_ENDPOINT_FAILED: &str = "cellular_ims_tls_endpoint_failed";
+    pub const TLS_AUTHORITY_INVALID: &str = "cellular_ims_tls_authority_invalid";
+    pub const TLS_HANDSHAKE_FAILED: &str = "cellular_ims_tls_handshake_failed";
+    pub const TLS_HANDSHAKE_TIMEOUT: &str = "cellular_ims_tls_handshake_timeout";
+    pub const TLS_IPSEC_UNSUPPORTED: &str = "cellular_ims_tls_ipsec_unsupported";
+
     // SIP channel: socket binding, port reservation and UE-worker transfer.
     // `CHANNEL_READ_TIMEOUT` and `CHANNEL_READ_RETRYABLE` are matched by the
     // register loop to tell a benign read gap from a real failure, so they must
@@ -286,6 +299,17 @@ pub mod code {
         CARRIER_IMS_APN_MISSING,
         CARRIER_PROFILE_MISSING,
         CARRIER_PROFILE_NOT_RESOLVED,
+        CHANNEL_STREAM_CONNECT_FAILED,
+        CHANNEL_STREAM_BUDGET_EXHAUSTED,
+        CHANNEL_STREAM_CLOSED,
+        CHANNEL_STREAM_WRITE_FAILED,
+        CHANNEL_STREAM_FRAME_INVALID,
+        CHANNEL_STREAM_RESPONSE_OWNER_MISSING,
+        TLS_ENDPOINT_FAILED,
+        TLS_AUTHORITY_INVALID,
+        TLS_HANDSHAKE_FAILED,
+        TLS_HANDSHAKE_TIMEOUT,
+        TLS_IPSEC_UNSUPPORTED,
         CHANNEL_BIND_FAILED,
         CHANNEL_LOCAL_ADDR_FAILED,
         CHANNEL_READ_FAILED,
@@ -561,7 +585,7 @@ mod tests {
         // Keep in step with the `pub const` count in `mod code`.
         assert_eq!(
             code::ALL.len(),
-            166,
+            177,
             "code::ALL is out of sync with mod code"
         );
         let mut seen = std::collections::BTreeSet::new();

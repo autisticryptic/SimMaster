@@ -434,7 +434,7 @@ impl RegEventSubscription {
         if frame.one("require").map_err(map)?.is_some() { return Err(420); }
         let via = frame.headers.iter().find(|(name, _)| name == "via").map(|(_, v)| v.as_str()).ok_or(400u16)?;
         let (sent_by, via_params) = parameters(via.split(',').next().ok_or(400u16)?).map_err(map)?;
-        if !(sent_by.starts_with("SIP/2.0/UDP ") || sent_by.starts_with("SIP/2.0/TCP "))
+        if !(sent_by.starts_with("SIP/2.0/UDP ") || sent_by.starts_with("SIP/2.0/TCP ") || sent_by.starts_with("SIP/2.0/TLS "))
             || !via_params.iter().any(|(name, value)| name == "branch" && value.as_deref().is_some_and(token))
         { return Err(400); }
         let document = if frame.body.is_empty() && subscription.terminated {

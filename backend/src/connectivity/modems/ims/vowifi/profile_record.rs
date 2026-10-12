@@ -914,6 +914,13 @@ impl CarrierProfileRecord {
     /// anything is written to the database or handed to the runtime.
     pub fn validate(&self) -> Result<(), String> {
         self.validate_ims_only()?;
+        if self.ims.transport == "tls" {
+            if self.voice.vowifi_enabled {
+                return Err("ims_tls_requires_cellular_only_profile".to_string());
+            }
+            // A cellular TLS profile does not acquire an ePDG/IKE dependency.
+            return Ok(());
+        }
         if self.epdg.host.trim().is_empty() {
             return Err("epdg_host_required".to_string());
         }
@@ -1022,8 +1029,8 @@ impl CarrierProfileRecord {
                 validate_single_line_wire_value("voice.codec_policies.fmtp", fmtp)?;
             }
         }
-        if !matches!(self.ims.transport.as_str(), "tcp" | "udp") {
-            return Err("ims_transport_must_be_tcp_or_udp".to_string());
+        if !matches!(self.ims.transport.as_str(), "tcp" | "udp" | "tls") {
+            return Err("ims_transport_must_be_tcp_udp_or_tls".to_string());
         }
         if !matches!(
             self.ims.register.sec_agree_mode.as_str(),
@@ -1584,6 +1591,24 @@ mod tests {
     }
 
     #[test]
+    fn tls_cellular_profile_round_trips_without_enabling_wifi_or_requiring_epdg() {
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.ims.transport = "tls".into();
+        record.voice.vowifi_enabled = false;
+        record.epdg.host.clear();
+        assert!(record.validate().is_ok());
+        let value = serde_json::to_value(&record).unwrap();
+        let copied: CarrierProfileRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(copied.ims.transport, "tls");
+        assert!(copied.validate().is_ok());
+        record.voice.vowifi_enabled = true;
+        assert_eq!(record.validate().unwrap_err(), "ims_tls_requires_cellular_only_profile");
+        // LTE catalog projection has its own access gate and validates the
+        // shared IMS portion without claiming WiFi transport support.
+        assert!(record.validate_ims_only().is_ok());
+    }
+
+    #[test]
     fn validation_rejects_inconsistent_plmn_and_bad_fields() {
         let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
         record.meta.plmn = "99999".to_string();
@@ -1597,7 +1622,7 @@ mod tests {
         record.ims.transport = "sctp".to_string();
         assert_eq!(
             record.validate().unwrap_err(),
-            "ims_transport_must_be_tcp_or_udp"
+            "ims_transport_must_be_tcp_udp_or_tls"
         );
 
         let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);

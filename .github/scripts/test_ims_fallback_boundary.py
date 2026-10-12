@@ -260,17 +260,22 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
             for module in ("ims_bearer", "netdev", "primary_ims_session", "primary_ims_lifecycle", "primary_ims_settings"):
                 self.assertIn("hardware::devices::qcm410::" + module + "::tests", text)
 
-    def test_srv_ports_survive_into_the_live_udp_channel(self):
+    def test_srv_ports_and_transport_survive_into_the_live_channel(self):
         text = (SRC / "cellular_ims/live.rs").read_text()
         family = text[text.index("async fn connect_family("):text.index("async fn", text.index("async fn connect_family(") + 10)]
-        self.assertIn("pcscf: SocketAddr", family)
+        self.assertIn("endpoint: &PcscfEndpoint", family)
+        self.assertIn("let pcscf = endpoint.socket", family)
+        self.assertIn("transport: endpoint.transport.sip_transport()", family)
+        self.assertIn("endpoint.tls_authority.as_deref()", family)
         self.assertIn("pcscf_addr: pcscf", family)
         self.assertNotIn("pcscf_socket(pcscf)", family)
         discovery = (SRC / "cellular_ims/pcscf_endpoint.rs").read_text()
-        self.assertIn("&host, target.port, Some(&target)", discovery)
+        self.assertIn("&host, target.port, requested_transport", discovery)
+        self.assertIn("&host, target.port, transport, naptr_name", discovery)
         self.assertIn("SocketAddr::new(address, port)", discovery)
         self.assertIn("endpoint.socket", text)
-        self.assertNotIn('format!("_sip._tcp.', discovery)
+        self.assertIn('"SIPS+D2T" => PcscfTransport::Tls', discovery)
+        self.assertIn('"SIP+D2T" => PcscfTransport::Tcp', discovery)
 
     def test_ci_selects_the_fallback_and_end_to_end_batch_regressions(self):
         for name in ("beta-validation.yml", "build-release.yml"):

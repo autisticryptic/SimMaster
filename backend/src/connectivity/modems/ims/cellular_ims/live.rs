@@ -113,7 +113,8 @@ use super::{
     ipsec::{self, SecAgree, XfrmInstallPlan},
     native_bearer::{self, NativeImsBearer},
     pcscf::{
-        discover_pcscf_endpoints_in_worker, discover_pcscf_via_active_at_context, pcscf_socket,
+        discover_pcscf_endpoints_with_transport_in_worker, discover_pcscf_via_active_at_context, pcscf_socket,
+        PcscfEndpoint, PcscfTransport,
         prepare_ims_profile_context, set_pcscf_reporting, ImsProfileLease,
     },
     plan::{FailureClass, ImsConnectionPlan},
@@ -141,6 +142,10 @@ const CELLULAR_IMS_REGISTER_CANDIDATE_LIMIT: usize = 24;
 /// REGISTER.  The negotiated ipsec-3gpp client/server ports replace this
 /// endpoint after the P-CSCF sends its Security-Server challenge.
 const CELLULAR_IMS_SIP_PORT: u16 = 5060;
+// Shared across the new stream connection/candidate ladder on one discovered
+// bearer. Never cancel an installed SA/REGISTER in flight to enforce this:
+// only pre-security connection creation is wrapped in the remaining budget.
+const CELLULAR_IMS_STREAM_CONNECT_BUDGET: Duration = Duration::from_secs(120);
 const MWI_SUBSCRIBE_EXPIRES_SECONDS: u32 = 3600;
 const REINVITE_TIMEOUT: Duration = Duration::from_secs(32);
 const REFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(32);
@@ -1464,7 +1469,7 @@ impl CellularImsRegisterAuthenticator {
             self.mode = if security_verify.is_some() {
                 RegistrationMode::Ipsec
             } else {
-                RegistrationMode::Udp
+                RegistrationMode::from_transport(channel.route().transport)
             };
             let mut register_policy = self.register_policy;
             register_policy.require_sec_agree = security_verify.is_some();
@@ -1534,7 +1539,7 @@ impl CellularImsRegisterAuthenticator {
                 .update(|state| state.stage = CellularImsStage::Ipsec)
                 .await;
             let route = channel.route();
-            let plan = ipsec::build_install_plan_with_algs(
+            let plan = ipsec::build_install_plan_for_transport(
                 route.local_addr.ip(),
                 route.pcscf_addr.ip(),
                 &self.offered_security_binding,
@@ -1542,6 +1547,7 @@ impl CellularImsRegisterAuthenticator {
                 &aka.ik,
                 &aka.ck,
                 algs,
+                if route.transport == SipTransport::Udp { ipsec::XfrmTransport::Udp } else { ipsec::XfrmTransport::Tcp },
             )
             .map_err(to_ims_error)?;
             ipsec::install_plan_in_worker(&plan, &self.worker)
@@ -1553,7 +1559,7 @@ impl CellularImsRegisterAuthenticator {
                     self.offered_security_binding.port_c,
                 ),
                 pcscf_addr: SocketAddr::new(route.pcscf_addr.ip(), selected.port_s),
-                transport: SipTransport::Udp,
+                transport: route.transport,
             };
             let receive_local =
                 SocketAddr::new(route.local_addr.ip(), self.offered_security_binding.port_s);
@@ -1589,7 +1595,7 @@ impl CellularImsRegisterAuthenticator {
         } else if self.profile.ims.register.sec_agree_mode == "required" || self.security_mechanism.is_some() {
             return Err(ImsError::new(code::SECURITY_SERVER_MISSING));
         } else {
-            self.mode = RegistrationMode::Udp;
+            self.mode = RegistrationMode::from_transport(channel.route().transport);
             unnegotiated_authenticated_security(
                 self.initial_security_client.as_deref(),
                 self.register_policy,
@@ -1778,6 +1784,9 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         let security_server_values = sip::header_values(challenge_response, "Security-Server");
         let security_server = select_security_server_for_mechanism(self.profile, &security_server_values, self.security_mechanism)?;
         let challenge = parse_digest_challenge(challenge_response).map_err(to_ims_error)?;
+        if channel.route().transport == SipTransport::Tls && security_server.is_some() {
+            return Err(ImsError::new(code::TLS_IPSEC_UNSUPPORTED));
+        }
         // Only credentials used by the preceding request are reusable. AUTS
         // deliberately has no proof state and cannot fall through to an older
         // session's credentials just because those are still retained for rollback.
@@ -2129,7 +2138,7 @@ pub async fn connect_live_for_line(
             let mode = if session.xfrm_plan.is_some() {
                 RegistrationMode::Ipsec
             } else {
-                RegistrationMode::Udp
+                RegistrationMode::from_transport(session.channel.route().transport)
             };
             let pcscf = session.pcscf.to_string();
             let data_path_mode = session.data_slot_mode.as_str().to_string();
@@ -2491,9 +2500,7 @@ async fn connect_inner(
     if let Some(error) = live_retry::admission_error(endpoint_retries.lock().await.restart_admission(retry_now), retry_now) {
         return Err(error);
     }
-    if !device_identity.profile.ims.transport.eq_ignore_ascii_case("udp") {
-        return Err(CellularImsError::new(code::PCSCF_TRANSPORT_UNSUPPORTED));
-    }
+    PcscfTransport::from_profile(device_identity.profile.ims.transport)?;
     // Catalog `ip_stack` remains metadata, not permission to narrow or reorder
     // the production dual-stack -> IPv6 -> IPv4 fallback sequence.
     let ims_apn = device_identity
@@ -2938,6 +2945,7 @@ async fn connect_inner(
             }
         }
     }
+    let mut tls_required = device_identity.profile.ims.transport.eq_ignore_ascii_case("tls");
     let result = async {
         runtime
             .update(|state| {
@@ -2988,6 +2996,7 @@ async fn connect_inner(
             return Err(CellularImsError::new(code));
         }
         let mut last_error = None;
+        let stream_connect_deadline = tokio::time::Instant::now() + CELLULAR_IMS_STREAM_CONNECT_BUDGET;
         for (index, local_addr) in local_addrs.iter().copied().enumerate() {
             ensure_generation(runtime, generation)?;
             let family = ip_family_name(local_addr);
@@ -3000,7 +3009,7 @@ async fn connect_inner(
                 .pcscf
                 .as_ref()
                 .map(|field| field.value.as_str());
-            let pcscf_endpoints = match discover_pcscf_endpoints_in_worker(
+            let pcscf_endpoints = match discover_pcscf_endpoints_with_transport_in_worker(
                 &bearer.settings,
                 &device_identity.ims.home_domain,
                 configured_pcscf,
@@ -3008,8 +3017,13 @@ async fn connect_inner(
                 local_addr,
                 &bearer.interface,
                 &worker,
+                if tls_required { PcscfTransport::Tls } else { PcscfTransport::from_profile(device_identity.profile.ims.transport)? },
             )
             .await
+            .map_err(|error| {
+                if error.code() == code::TLS_ENDPOINT_FAILED { tls_required = true; }
+                error
+            })
             {
                 Ok(candidates) => candidates,
                 Err(error)
@@ -3065,8 +3079,12 @@ async fn connect_inner(
                 pcscf_count = pcscf_candidates.len(),
                 "VoLTE will try every discovered P-CSCF candidate"
             );
-            for (pcscf_index, pcscf) in pcscf_candidates.iter().copied().enumerate() {
-                let has_next_pcscf = pcscf_index + 1 < pcscf_candidates.len();
+            for (pcscf_index, endpoint) in pcscf_endpoints.iter().enumerate() {
+                if tls_required && endpoint.transport != PcscfTransport::Tls { continue; }
+                tls_required |= endpoint.transport == PcscfTransport::Tls;
+                let pcscf = endpoint.socket;
+                let has_next_pcscf = pcscf_endpoints[pcscf_index + 1..].iter()
+                    .any(|next| !tls_required || next.transport == PcscfTransport::Tls);
                 runtime
                     .record_attempt(
                         CellularImsStage::Pcscf,
@@ -3095,7 +3113,8 @@ async fn connect_inner(
                             &bearer,
                             &device_identity,
                             local_addr,
-                            pcscf,
+                            endpoint,
+                            stream_connect_deadline,
                             has_next_pcscf,
                             &endpoint_retries,
                             &device,
@@ -3181,6 +3200,7 @@ async fn connect_inner(
         Err(last_error.unwrap_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED)))
     }
     .await;
+    let result = result.map_err(|error| if tls_required { preserve_tls_requirement(error) } else { error });
     let result = match result {
         Ok(session) => {
             endpoint_retries.lock().await.registered();
@@ -3258,6 +3278,21 @@ async fn connect_inner(
     })
 }
 
+/// Once a TLS endpoint is selected, an outer profile change must not turn its
+/// connection/DNS/SIP failure into a plaintext retry. Keep the actual REGISTER
+/// metadata, and preserve critical owner/baseband error codes unchanged.
+fn preserve_tls_requirement(error: CellularImsError) -> CellularImsError {
+    if error.code().starts_with("cellular_ims_tls_")
+        || matches!(error.code(), code::RUNTIME_NOT_RUNNING | code::RUNTIME_UE_WORKER_GENERATION_CHANGED | code::BEARER_SESSION_LOST)
+        || FailureClass::from_error(&error).is_unsafe_to_retry()
+    { return error; }
+    let wrapped = CellularImsError::with_detail(code::TLS_ENDPOINT_FAILED, error.code());
+    match error.register_failure() {
+        Some(metadata) => wrapped.with_register_failure(*metadata),
+        None => wrapped,
+    }
+}
+
 async fn verify_mm_task_bearer(
     runtime: &CellularImsRuntime,
     bearer: Option<&mut NativeImsBearer>,
@@ -3280,7 +3315,8 @@ async fn connect_family(
     bearer: &BearerConnection,
     device_identity: &DeviceIdentity,
     local_addr: IpAddr,
-    pcscf: SocketAddr,
+    endpoint: &PcscfEndpoint,
+    stream_connect_deadline: tokio::time::Instant,
     has_alternate_pcscf: bool,
     endpoint_retries: &live_retry::SharedEndpointRetries,
     device: &CellularImsDeviceBinding,
@@ -3289,6 +3325,13 @@ async fn connect_family(
     worker_binding: &UeWorkerBinding,
     mut native_bearer: Option<&mut NativeImsBearer>,
 ) -> Result<CellularImsLiveSession, CellularImsError> {
+    let pcscf = endpoint.socket;
+    if endpoint.transport == PcscfTransport::Tls && device_identity.profile.ims.register.sec_agree_mode == "required" {
+        // Authored required IMS-IPsec is not waived by TLS. Auto/supported
+        // profiles may register over authenticated TLS when no IPsec selection
+        // is made; an actual IPsec challenge still fails explicitly below.
+        return Err(CellularImsError::new(code::TLS_IPSEC_UNSUPPORTED));
+    }
     if let Some(native) = native_bearer.as_deref_mut() {
         native.check_liveness()?;
     }
@@ -3335,7 +3378,7 @@ async fn connect_family(
     let route = ImsRoute {
         local_addr: SocketAddr::new(local_addr, CELLULAR_IMS_SIP_PORT),
         pcscf_addr: pcscf,
-        transport: SipTransport::Udp,
+        transport: endpoint.transport.sip_transport(),
     };
     let profile = device_identity.profile;
     let network_worker = worker.clone();
@@ -3435,10 +3478,18 @@ async fn connect_family(
             register_variant = variant.label,
             "Trying bounded VoLTE REGISTER interoperability candidate"
         );
-        let mut channel =
-            CellularImsSipChannel::bind_in_worker(route, &worker, Some(&bearer.interface), None)
-                .await
-                .map_err(map_channel_error)?;
+        let bind = CellularImsSipChannel::bind_endpoint_in_worker(route, &worker,
+            Some(&bearer.interface), None, endpoint.tls_authority.as_deref());
+        let mut channel = if endpoint.transport == PcscfTransport::Udp {
+            bind.await.map_err(map_channel_error)?
+        } else {
+            if tokio::time::Instant::now() >= stream_connect_deadline {
+                return Err(CellularImsError::new(code::CHANNEL_STREAM_BUDGET_EXHAUSTED));
+            }
+            tokio::time::timeout_at(stream_connect_deadline, bind).await
+                .map_err(|_| CellularImsError::new(code::CHANNEL_STREAM_BUDGET_EXHAUSTED))?
+                .map_err(map_channel_error)?
+        };
         ensure_worker_binding_current(worker_binding)?;
         let socket_worker = worker.clone();
         let receive_port = channel
@@ -8329,6 +8380,9 @@ fn to_ims_error(error: CellularImsError) -> ImsError {
 }
 
 fn map_channel_error(error: ImsError) -> CellularImsError {
+    if error.code().starts_with("cellular_ims_channel_stream_") || error.code().starts_with("cellular_ims_tls_") {
+        return CellularImsError::new(error.code());
+    }
     if error.code().starts_with("ims_outbound_") {
         return CellularImsError::new(error.code());
     }
@@ -8990,6 +9044,23 @@ mod tests {
     use super::*;
     use crate::connectivity::core::voice::MediaDirection;
     use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+
+    #[test]
+    fn tls_requirement_survives_outer_profile_failure_mapping_without_hiding_owner_faults() {
+        use crate::connectivity::core::register::RegisterFailureKind;
+        let dns = preserve_tls_requirement(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED));
+        assert_eq!(dns.code(), code::TLS_ENDPOINT_FAILED);
+        let failure = RegisterFailure { error: ImsError::new("ims_register_initial_receive_failed"), response: None, auth_rounds: 0 };
+        let mapped = preserve_tls_requirement(map_register_failure(&failure));
+        assert_eq!(mapped.code(), code::TLS_ENDPOINT_FAILED);
+        assert_eq!(mapped.register_failure().unwrap().kind, RegisterFailureKind::Transport);
+        for reason in [code::RUNTIME_NOT_RUNNING, code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+            code::BEARER_SESSION_LOST, code::RUNTIME_IMS_BASEBAND_WEDGED]
+        {
+            assert_eq!(preserve_tls_requirement(CellularImsError::new(reason)).code(), reason);
+        }
+        assert_eq!(preserve_tls_requirement(CellularImsError::new(code::TLS_HANDSHAKE_FAILED)).code(), code::TLS_HANDSHAKE_FAILED);
+    }
 
     #[test]
     fn required_security_probe_changes_only_local_security_policy_not_shared_profile() {

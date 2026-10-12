@@ -962,6 +962,15 @@ pub async fn discover_pcscf_endpoints_in_worker(
     interface: &str,
     worker: &UeWorkerHandle,
 ) -> Result<Vec<PcscfEndpoint>, CellularImsError> {
+    discover_pcscf_endpoints_with_transport_in_worker(settings, home_domain, configured_pcscf, isim_pcscf,
+        local, interface, worker, PcscfTransport::Udp).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn discover_pcscf_endpoints_with_transport_in_worker(
+    settings: &ImsIpSettings, home_domain: &str, configured_pcscf: Option<&str>, isim_pcscf: &[String],
+    local: IpAddr, interface: &str, worker: &UeWorkerHandle, requested_transport: PcscfTransport,
+) -> Result<Vec<PcscfEndpoint>, CellularImsError> {
     let environment = endpoint::environment_override_with(|name| std::env::var(name))?;
     let selection = endpoint::select_source(
         environment.as_deref(), settings, configured_pcscf, isim_pcscf,
@@ -974,7 +983,7 @@ pub async fn discover_pcscf_endpoints_in_worker(
         |server, name, kind| async move {
             query_dns(local, server, &name, kind, interface, worker).await
         },
-        endpoint::DiscoveryLimits::default(),
+        endpoint::DiscoveryLimits { requested_transport, ..endpoint::DiscoveryLimits::default() },
     )
     .await
 }

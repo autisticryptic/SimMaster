@@ -26,8 +26,13 @@ use crate::connectivity::core::{
 use crate::services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle};
 
 const MAX_SIP_DATAGRAM: usize = 65_535;
+#[path = "sip_stream.rs"]
+mod sip_stream;
+#[path = "stream_channel.rs"]
+mod stream_channel;
 
 pub struct CellularImsSipChannel {
+    stream: Option<stream_channel::CellularStreamTransport>,
     send_socket: Option<UdpSocket>,
     receive_socket: Option<UdpSocket>,
     /// Protected UE-originated traffic uses a separately reserved port_c.
@@ -92,6 +97,7 @@ impl CellularImsSipChannel {
             .local_addr()
             .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))?;
         Ok(Self {
+            stream: None,
             send_socket: Some(socket),
             receive_socket: None,
             reserved_send_socket: None,
@@ -105,6 +111,20 @@ impl CellularImsSipChannel {
             staged_security: None,
             retired_security: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_tcp_for_test(socket: tokio::net::TcpStream, route: ImsRoute, worker: crate::services::ue_worker::UeWorkerBinding) -> Result<Self, ImsError> {
+        let stream = stream_channel::CellularStreamTransport::from_tcp(socket, route, worker)?;
+        Ok(Self { stream: Some(stream), send_socket: None, receive_socket: None,
+            reserved_send_socket: None, reserved_receive_socket: None, requeued: ImsRequeue::default(),
+            outbound: OutboundFlow::default(), route, advertised_local_port: None, interface: Some("lo".into()),
+            security_verify: None, staged_security: None, retired_security: None })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn reserve_stream_ports_for_test(&mut self) -> (u16, u16) {
+        self.stream.as_mut().expect("test TCP channel").reserve_for_test().await
     }
 
     #[cfg(test)]
@@ -164,6 +184,22 @@ impl CellularImsSipChannel {
         interface: Option<&str>,
         security_verify: Option<String>,
     ) -> Result<Self, ImsError> {
+        Self::bind_endpoint_in_worker(route, worker, interface, security_verify, None).await
+    }
+
+    pub async fn bind_endpoint_in_worker(
+        route: ImsRoute, worker: &UeWorkerHandle, interface: Option<&str>,
+        security_verify: Option<String>, tls_authority: Option<&str>,
+    ) -> Result<Self, ImsError> {
+        if route.transport != crate::connectivity::core::context::SipTransport::Udp {
+            if security_verify.is_some() { return Err(ImsError::new(code::CHANNEL_SECURITY_UPDATE_PENDING)); }
+            let interface = interface.ok_or_else(|| ImsError::new(code::CHANNEL_WORKER_SOCKET_FAILED))?;
+            let stream = stream_channel::CellularStreamTransport::bind(route, tls_authority, interface, worker).await?;
+            return Ok(Self { stream: Some(stream), send_socket: None, receive_socket: None,
+                reserved_send_socket: None, reserved_receive_socket: None, requeued: ImsRequeue::default(),
+                outbound: OutboundFlow::default(), route, advertised_local_port: None, interface: Some(interface.into()),
+                security_verify: None, staged_security: None, retired_security: None });
+        }
         let spec = UeSocketSpec::udp_connected(
             route.local_addr,
             route.pcscf_addr,
@@ -179,6 +215,7 @@ impl CellularImsSipChannel {
             .local_addr()
             .map_err(|_| ImsError::new(code::CHANNEL_LOCAL_ADDR_FAILED))?;
         Ok(Self {
+            stream: None,
             send_socket: Some(socket),
             receive_socket: None,
             reserved_send_socket: None,
@@ -238,6 +275,7 @@ impl CellularImsSipChannel {
         requested_port: u16,
         avoid_port: u16,
     ) -> Result<u16, ImsError> {
+        if let Some(stream) = self.stream.as_mut() { return stream.reserve_send(requested_port, avoid_port).await; }
         if let Some(socket) = self.reserved_send_socket.as_ref() {
             let port = match socket {
                 #[cfg(test)]
@@ -296,6 +334,7 @@ impl CellularImsSipChannel {
         worker: &UeWorkerHandle,
         requested_port: u16,
     ) -> Result<u16, ImsError> {
+        if let Some(stream) = self.stream.as_mut() { return stream.reserve_receive(requested_port).await; }
         if let Some(socket) = self.reserved_receive_socket.as_ref() {
             let port = match socket {
                 #[cfg(test)]
@@ -397,6 +436,9 @@ impl CellularImsSipChannel {
         security_verify: Option<String>,
         _worker: &UeWorkerHandle,
     ) -> Result<(), ImsError> {
+        if let Some(stream) = self.stream.as_mut() {
+            return stream.activate(send_route, receive_local, receive_remote, security_verify).await;
+        }
         let reserved_send = self
             .reserved_send_socket
             .take()
@@ -488,6 +530,7 @@ impl CellularImsSipChannel {
     /// channel readable: the P-CSCF may still use it until it sees further
     /// traffic on the new SA. Its XFRM plan has the same retirement lifetime.
     pub fn commit_security(&mut self) {
+        if let Some(stream) = self.stream.as_mut() { stream.commit(); return; }
         if let Some(mut previous) = self.staged_security.take() {
             previous.outbound.disable();
             self.retired_security = previous.security_verify.is_some().then_some(previous);
@@ -498,6 +541,7 @@ impl CellularImsSipChannel {
     /// Restore sockets AND headers together after a failed tentative exchange.
     /// The caller removes only the tentative XFRM plan, never the active plan.
     pub fn rollback_security(&mut self) {
+        if let Some(stream) = self.stream.as_mut() { stream.rollback(); return; }
         if let Some(previous) = self.staged_security.take() {
             self.outbound.disable();
             self.outbound = previous.outbound;
@@ -511,6 +555,7 @@ impl CellularImsSipChannel {
     }
 
     pub fn discard_retired_security(&mut self) {
+        if let Some(stream) = self.stream.as_mut() { stream.discard_retired(); return; }
         self.retired_security = None;
     }
 
@@ -522,6 +567,7 @@ impl CellularImsSipChannel {
     /// outside this module uses the route to build headers or to read the local
     /// IP -- sending goes through `send_socket`, which is already connected.
     pub fn advertised_route(&self) -> ImsRoute {
+        if let Some(stream) = self.stream.as_ref() { return stream.route(); }
         let mut route = self.route;
         if let Some(port) = self.advertised_local_port {
             route.local_addr.set_port(port);
@@ -538,6 +584,7 @@ impl CellularImsSipChannel {
     /// advertised-port marker. This does not touch the bearer, sockets, or
     /// XFRM state; it only repairs the SIP header route used by this channel.
     pub fn sync_protected_advertised_port(&mut self, port: u16) {
+        if let Some(stream) = self.stream.as_mut() { stream.sync_advertised_port(port); return; }
         let observed = self.advertised_route().local_addr.port();
         if observed != port {
             tracing::warn!(
@@ -552,10 +599,12 @@ impl CellularImsSipChannel {
     /// The route packets are actually sourced from: after sec-agree the
     /// protected client port (port_uc). Only the security offer needs this.
     pub fn send_route(&self) -> ImsRoute {
+        if let Some(stream) = self.stream.as_ref() { return stream.send_route(); }
         self.route
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, ImsError> {
+        if let Some(stream) = self.stream.as_ref() { return Ok(stream.send_route().local_addr); }
         self.send_socket
             .as_ref()
             .ok_or_else(|| ImsError::new(code::CHANNEL_SEND_SOCKET_MISSING))?
@@ -567,6 +616,7 @@ impl CellularImsSipChannel {
     /// completed without an AKA challenge. In that case the existing SA stays
     /// active and the new Security-Client offer is discarded.
     pub fn discard_reserved_security_ports(&mut self) {
+        if let Some(stream) = self.stream.as_mut() { stream.discard_reserved(); return; }
         self.reserved_send_socket = None;
         self.reserved_receive_socket = None;
     }
@@ -576,17 +626,20 @@ impl CellularImsSipChannel {
     }
 
     pub fn configure_outbound(&mut self, line_id: &str, instance: &str, enabled: bool) {
+        if let Some(stream) = self.stream.as_mut() { stream.configure_outbound(line_id, instance, enabled); return; }
         self.outbound
             .configure(line_id, ImsAccess::Cellular, instance, enabled);
     }
 
     pub fn reg_event_binding(&self) -> Option<crate::connectivity::core::reg_event::RegEventBinding> {
+        if let Some(stream) = self.stream.as_ref() { return stream.reg_event_binding(); }
         self.outbound.reg_event_binding()
     }
 
     /// Network removal invalidates only this registration's published proof;
     /// retain sockets long enough to acknowledge NOTIFY and drain old dialogs.
     pub fn invalidate_registration(&mut self) {
+        if let Some(stream) = self.stream.as_mut() { stream.invalidate_registration(); return; }
         self.outbound.disable();
     }
 
@@ -595,6 +648,7 @@ impl CellularImsSipChannel {
         response: &[u8],
         expires: u32,
     ) -> Result<RegisterArtifacts, ImsError> {
+        if let Some(stream) = self.stream.as_mut() { return stream.registered(response, expires); }
         self.outbound.registered(response, false, expires)
     }
 
@@ -853,6 +907,7 @@ fn header_parameter_port(frame: &[u8], header_name: &str, parameter_name: &str) 
 
 impl ImsChannel for CellularImsSipChannel {
     async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+        if let Some(stream) = self.stream.as_mut() { return stream.send(frame).await; }
         let prepared = self.outbound.prepare(frame)?;
         let frame = prepared.as_slice();
         // Log the actual REGISTER transmit tuple, not only the route used to
@@ -898,6 +953,7 @@ impl ImsChannel for CellularImsSipChannel {
     }
 
     async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        if let Some(stream) = self.stream.as_mut() { return stream.receive(timeout, false).await; }
         self.maintain_outbound().await?;
         if let Some(frame) = self.requeued.pop_front() {
             return Ok(frame);
@@ -906,10 +962,12 @@ impl ImsChannel for CellularImsSipChannel {
     }
 
     async fn recv_sip_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        if let Some(stream) = self.stream.as_mut() { return stream.receive(timeout, true).await; }
         self.recv_fresh(timeout).await
     }
 
     fn requeue(&mut self, frame: Vec<u8>) {
+        if let Some(stream) = self.stream.as_mut() { stream.requeue(frame); return; }
         let frame_bytes = frame.len();
         if !self.requeued.push_back(frame) {
             tracing::warn!(
@@ -926,6 +984,7 @@ impl ImsChannel for CellularImsSipChannel {
     }
 
     fn security_verify(&self) -> Option<&str> {
+        if let Some(stream) = self.stream.as_ref() { return stream.security_verify(); }
         self.security_verify.as_deref()
     }
 }

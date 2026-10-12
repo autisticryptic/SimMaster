@@ -10935,7 +10935,10 @@ fn cellular_ims_profile_batch_action(
         CellularImsProfileBatchAction::AbortUnsafe
     } else if error.retry_remaining().is_some() {
         CellularImsProfileBatchAction::WaitForRegister
-    } else if matches!(error.code(), code::REGISTER_RETRY_STOPPED | code::REGISTER_RETRY_DEFERRED)
+    } else if matches!(error.code(), code::REGISTER_RETRY_STOPPED | code::REGISTER_RETRY_DEFERRED
+        | code::TLS_ENDPOINT_FAILED | code::TLS_AUTHORITY_INVALID | code::TLS_HANDSHAKE_FAILED | code::TLS_HANDSHAKE_TIMEOUT
+        | code::TLS_IPSEC_UNSUPPORTED | code::CHANNEL_STREAM_BUDGET_EXHAUSTED
+        | code::CHANNEL_STREAM_FRAME_INVALID | code::CHANNEL_STREAM_RESPONSE_OWNER_MISSING)
         || error.register_failure().is_some_and(|failure| {
             use crate::connectivity::core::register::{RegisterFailureKind, RegisterFailureStage};
             failure.min_expires.is_some()
@@ -15461,6 +15464,19 @@ mod tests {
                 _ => observed.slot_conflict = true,
             }
             assert!(!same_voice_binding(&expected, &observed));
+        }
+    }
+
+    #[test]
+    fn cellular_ims_profile_batch_tls_and_stream_validation_failures_cannot_downgrade() {
+        use crate::connectivity::modems::ims::cellular_ims::CellularImsError;
+        for reason in [code::TLS_ENDPOINT_FAILED, code::TLS_AUTHORITY_INVALID, code::TLS_HANDSHAKE_FAILED, code::TLS_HANDSHAKE_TIMEOUT,
+            code::TLS_IPSEC_UNSUPPORTED, code::CHANNEL_STREAM_FRAME_INVALID,
+            code::CHANNEL_STREAM_RESPONSE_OWNER_MISSING, code::CHANNEL_STREAM_BUDGET_EXHAUSTED]
+        {
+            let error = CellularImsError::new(reason);
+            assert_eq!(cellular_ims_profile_batch_action(true, 1, 24, Some(&error)), CellularImsProfileBatchAction::StopRegister);
+            assert_eq!(cellular_ims_profile_batch_action(false, 1, 24, Some(&error)), CellularImsProfileBatchAction::Cancelled);
         }
     }
 

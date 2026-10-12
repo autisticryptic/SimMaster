@@ -767,6 +767,7 @@ fn project_config(
     {
         "udp" | "auto" => "udp".to_string(),
         "tcp" => "tcp".to_string(),
+        "tls" if access == CatalogAccessKind::LteEpc => "tls".to_string(),
         unsupported => {
             return Err(format!(
                 "carrier_catalog_ims_transport_unsupported:{profile_id}:{}:{unsupported}",

@@ -196,6 +196,8 @@ jobs:
             connectivity::core::ims_registration_coordinator::tests \
             connectivity::modems::ims::vowifi::live::coexistence_lease_tests \
             connectivity::modems::ims::cellular_ims::channel::tests \
+            connectivity::modems::ims::cellular_ims::channel::sip_stream \
+            connectivity::modems::ims::cellular_ims::channel::stream_channel::tests \
             connectivity::modems::ims::cellular_ims::ipsec::tests \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \
             connectivity::modems::ims::cellular_ims::security_agreement::tests \

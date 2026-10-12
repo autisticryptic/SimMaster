@@ -31,8 +31,20 @@ pub enum PcscfSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PcscfTransport {
-    Udp,
+pub enum PcscfTransport { Udp, Tcp, Tls }
+impl PcscfTransport {
+    pub fn from_profile(value: &str) -> Result<Self, CellularImsError> {
+        match value.to_ascii_lowercase().as_str() {
+            "udp" => Ok(Self::Udp), "tcp" => Ok(Self::Tcp), "tls" => Ok(Self::Tls),
+            _ => Err(unsupported()),
+        }
+    }
+    pub fn sip_transport(self) -> crate::connectivity::core::context::SipTransport {
+        use crate::connectivity::core::context::SipTransport;
+        match self { Self::Udp => SipTransport::Udp, Self::Tcp => SipTransport::Tcp, Self::Tls => SipTransport::Tls }
+    }
+    fn default_port(self) -> u16 { if self == Self::Tls { 5061 } else { SIP_PORT } }
+    fn naptr_service(self) -> &'static str { match self { Self::Udp => "SIP+D2U", Self::Tcp => "SIP+D2T", Self::Tls => "SIPS+D2T" } }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +54,9 @@ pub struct PcscfEndpoint {
     /// Canonical configured hostname or SRV target; absent for IP literals.
     pub host: Option<String>,
     pub transport: PcscfTransport,
+    /// Original endpoint/service authority for TLS certificate verification,
+    /// never replaced by a DNS SRV/CNAME target.
+    pub tls_authority: Option<String>,
     /// DNS TTL in seconds, limited by CNAME and (where present) SRV TTLs.
     /// This is metadata, not a cache or an authorization to reuse a bearer.
     pub ttl: Option<u32>,
@@ -60,6 +75,8 @@ pub struct ParsedPcscfEndpoint {
     pub host: PcscfHost,
     pub port: u16,
     pub transport: PcscfTransport,
+    pub port_explicit: bool,
+    pub transport_explicit: bool,
 }
 
 fn invalid(reason: &'static str) -> CellularImsError {
@@ -108,11 +125,10 @@ pub fn parse_pcscf_endpoint(value: &str) -> Result<ParsedPcscfEndpoint, Cellular
     {
         return Err(invalid("endpoint_text_invalid"));
     }
-    if value.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("sips:")) {
-        return Err(unsupported());
-    }
-    let sip = value.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("sip:"));
-    let value = if sip { &value[4..] } else { value };
+    let sips = value.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("sips:"));
+    let sip = sips || value.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("sip:"));
+    let value = if sips { &value[5..] } else if sip { &value[4..] } else { value };
+    let mut transport = if sips { PcscfTransport::Tls } else { PcscfTransport::Udp };
     if value.bytes().any(|b| matches!(b, b'@' | b'?' | b'#' | b'/' | b'\\' | b'%' | b'<' | b'>' | b'"' | b'\'')) {
         return Err(invalid("uri_component_unsupported"));
     }
@@ -130,16 +146,21 @@ pub fn parse_pcscf_endpoint(value: &str) -> Result<ParsedPcscfEndpoint, Cellular
         {
             return Err(invalid("uri_parameter_invalid"));
         }
-        if !value.eq_ignore_ascii_case("udp") {
-            return Err(unsupported());
+        transport = PcscfTransport::from_profile(value)?;
+        if sips {
+            if transport == PcscfTransport::Udp { return Err(unsupported()); }
+            transport = PcscfTransport::Tls;
         }
         seen_transport = true;
     }
+    let default_port = transport.default_port();
+    let mut port_explicit = false;
     let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
         let (address, suffix) = bracketed.split_once(']')
             .ok_or_else(|| invalid("ipv6_brackets_invalid"))?;
         let address = address.parse::<Ipv6Addr>().map_err(|_| invalid("ipv6_invalid"))?;
-        let port = if suffix.is_empty() { SIP_PORT } else {
+        let port = if suffix.is_empty() { default_port } else {
+            port_explicit = true;
             port(suffix.strip_prefix(':').ok_or_else(|| invalid("ipv6_suffix_invalid"))?)?
         };
         (PcscfHost::Address(IpAddr::V6(address)), port)
@@ -147,11 +168,11 @@ pub fn parse_pcscf_endpoint(value: &str) -> Result<ParsedPcscfEndpoint, Cellular
         if sip && address.is_ipv6() {
             return Err(invalid("sip_ipv6_brackets_required"));
         }
-        (PcscfHost::Address(address), SIP_PORT)
+        (PcscfHost::Address(address), default_port)
     } else {
         let (host, port) = match authority.split_once(':') {
-            Some((host, value)) => (host, port(value)?),
-            None => (authority, SIP_PORT),
+            Some((host, value)) => { port_explicit = true; (host, port(value)?) },
+            None => (authority, default_port),
         };
         let host = match host.parse::<IpAddr>() {
             Ok(address) => PcscfHost::Address(address),
@@ -159,7 +180,7 @@ pub fn parse_pcscf_endpoint(value: &str) -> Result<ParsedPcscfEndpoint, Cellular
         };
         (host, port)
     };
-    Ok(ParsedPcscfEndpoint { host, port, transport: PcscfTransport::Udp })
+    Ok(ParsedPcscfEndpoint { host, port, transport, port_explicit, transport_explicit: sips || seen_transport })
 }
 
 fn parse_list(value: &str) -> Result<Vec<ParsedPcscfEndpoint>, CellularImsError> {
@@ -224,6 +245,7 @@ pub(super) fn select_source(
         return Ok(Selection::Explicit(PcscfSource::BearerPco,
             settings.pcscf.iter().map(|address| ParsedPcscfEndpoint {
                 host: PcscfHost::Address(*address), port: SIP_PORT, transport: PcscfTransport::Udp,
+                port_explicit: false, transport_explicit: false,
             }).collect()));
     }
     if let Some(value) = configured {
@@ -246,13 +268,14 @@ pub(super) struct DiscoveryLimits {
     queries: usize,
     total: Duration,
     per_query: Duration,
+    pub(super) requested_transport: PcscfTransport,
 }
 
 impl Default for DiscoveryLimits {
     fn default() -> Self {
         Self {
             candidates: MAX_PCSCF_ENDPOINTS, queries: MAX_DNS_QUERIES,
-            total: DNS_TOTAL_TIMEOUT, per_query: super::DNS_TIMEOUT,
+            total: DNS_TOTAL_TIMEOUT, per_query: super::DNS_TIMEOUT, requested_transport: PcscfTransport::Udp,
         }
     }
 }
@@ -298,7 +321,7 @@ impl<Query> Resolver<Query> {
 
 fn add_endpoint(endpoints: &mut Vec<PcscfEndpoint>, candidate: PcscfEndpoint, limit: usize) {
     if let Some(existing) = endpoints.iter_mut().find(|entry| {
-        entry.socket == candidate.socket && entry.transport == candidate.transport
+        entry.socket == candidate.socket && entry.transport == candidate.transport && entry.tls_authority == candidate.tls_authority
     }) {
         // Keep the first source/priority/order, but never extend its TTL when
         // another alias or RR supplies the same socket with a shorter lifetime.
@@ -312,7 +335,8 @@ fn add_endpoint(endpoints: &mut Vec<PcscfEndpoint>, candidate: PcscfEndpoint, li
 
 fn add_addresses(
     endpoints: &mut Vec<PcscfEndpoint>, records: DnsRecords, local: IpAddr,
-    source: PcscfSource, host: &str, port: u16, srv: Option<&SrvTarget>, limit: usize,
+    source: PcscfSource, host: &str, port: u16, transport: PcscfTransport, authority: &str,
+    srv: Option<&SrvTarget>, limit: usize,
 ) {
     for address in records.addresses {
         if !same_family(local, address) { continue; }
@@ -323,7 +347,7 @@ fn add_addresses(
         };
         add_endpoint(endpoints, PcscfEndpoint {
             socket: SocketAddr::new(address, port), source, host: Some(host.to_string()),
-            transport: PcscfTransport::Udp, ttl,
+            transport, tls_authority: (transport == PcscfTransport::Tls).then(|| authority.to_owned()), ttl,
             srv_priority: srv.map(|s| s.priority), srv_weight: srv.map(|s| s.weight),
         }, limit);
     }
@@ -391,6 +415,9 @@ where
     Query: FnMut(IpAddr, String, u16) -> Fut,
     Fut: Future<Output = Result<DnsRecords, CellularImsError>>,
 {
+    let requested_transport = limits.requested_transport;
+    let requires_tls = requested_transport == PcscfTransport::Tls || matches!(&selection,
+        Selection::Explicit(_, targets) if targets.iter().any(|target| target.transport == PcscfTransport::Tls));
     let deadline = tokio::time::Instant::now() + limits.total;
     let mut resolver = Resolver { query, cache: Vec::new(), deadline, limits };
     let dns = if local.is_ipv6() { &settings.ipv6_dns } else { &settings.ipv4_dns };
@@ -404,7 +431,14 @@ where
     let kind = if local.is_ipv6() { 28 } else { 1 };
     let mut endpoints = Vec::new();
     match selection {
-        Selection::Explicit(source, targets) => {
+        Selection::Explicit(source, mut targets) => {
+            for target in &mut targets {
+                if target.transport_explicit && requested_transport != PcscfTransport::Udp && target.transport != requested_transport {
+                    return Err(invalid("transport_conflict"));
+                }
+                if !target.transport_explicit { target.transport = requested_transport; }
+                if !target.port_explicit { target.port = target.transport.default_port(); }
+            }
             let mut eligible = false;
             for target in targets {
                 match target.host {
@@ -412,7 +446,9 @@ where
                         eligible = true;
                         add_endpoint(&mut endpoints, PcscfEndpoint {
                             socket: SocketAddr::new(address, target.port), source, host: None,
-                            transport: target.transport, ttl: None, srv_priority: None, srv_weight: None,
+                            transport: target.transport,
+                            tls_authority: (target.transport == PcscfTransport::Tls).then(|| address.to_string()),
+                            ttl: None, srv_priority: None, srv_weight: None,
                         }, limits.candidates);
                     }
                     PcscfHost::Name(host) => {
@@ -421,7 +457,7 @@ where
                         for server in &servers {
                             if let Some(records) = resolver.records(*server, &host, kind).await {
                                 let has_addresses = records.addresses.iter().any(|address| same_family(local, *address));
-                                add_addresses(&mut endpoints, records, local, source, &host, target.port, None, limits.candidates);
+                                add_addresses(&mut endpoints, records, local, source, &host, target.port, target.transport, &host, None, limits.candidates);
                                 if has_addresses { break; }
                             }
                         }
@@ -430,19 +466,22 @@ where
                 }
             }
             if !eligible {
-                return Err(CellularImsError::new(code::PCSCF_FAMILY_MISMATCH));
+                return Err(CellularImsError::new(if requires_tls { code::TLS_ENDPOINT_FAILED } else { code::PCSCF_FAMILY_MISMATCH }));
             }
         }
         Selection::StandardDns => {
             let domain = hostname(home_domain)?;
             let name = format!("pcscf.{domain}");
-            let srv_names = super::pcscf_srv_names(&domain);
+            let prefix = if requested_transport == PcscfTransport::Tls { "_sips._tcp" }
+                else if requested_transport == PcscfTransport::Tcp { "_sip._tcp" } else { "_sip._udp" };
+            let srv_names = [format!("{prefix}.pcscf.{domain}"), format!("{prefix}.{domain}")];
             // Preserve the existing direct-name then UDP-SRV fallback. Use a
             // whole bounded RRset, not a first IP/target; do not union unrelated
             // service names or conflicting responses from different resolvers.
             for server in &servers {
                 if let Some(records) = resolver.records(*server, &name, kind).await {
-                    add_addresses(&mut endpoints, records, local, PcscfSource::StandardDns, &name, SIP_PORT, None, limits.candidates);
+                    add_addresses(&mut endpoints, records, local, PcscfSource::StandardDns, &name,
+                        requested_transport.default_port(), requested_transport, &name, None, limits.candidates);
                     if !endpoints.is_empty() { break; }
                 }
                 for srv_name in &srv_names {
@@ -454,7 +493,8 @@ where
                         let host = hostname(&target.target)?;
                         if let Some(records) = resolver.records(*server, &host, kind).await {
                             add_addresses(&mut endpoints, records, local, PcscfSource::StandardDns,
-                                &host, target.port, Some(&target), limits.candidates);
+                                &host, target.port, requested_transport, srv_name.strip_prefix(&format!("{prefix}.")).unwrap_or(&domain),
+                                Some(&target), limits.candidates);
                         }
                     }
                     if !endpoints.is_empty() { break; }
@@ -466,9 +506,11 @@ where
                 for naptr_name in [&name, &domain] {
                     let Some(records) = resolver.records(*server, naptr_name, 35).await else { continue };
                     for naptr in records.naptr_targets {
-                        // UDP is the currently executable cellular transport;
-                        // D2T/SIPS are never silently used with UDP/5060.
-                        if naptr.service != "SIP+D2U" { continue; }
+                        let transport = match naptr.service.as_str() {
+                            "SIP+D2U" => PcscfTransport::Udp, "SIP+D2T" => PcscfTransport::Tcp, "SIPS+D2T" => PcscfTransport::Tls,
+                            _ => continue,
+                        };
+                        if requested_transport != PcscfTransport::Udp && naptr.service != requested_transport.naptr_service() { continue; }
                         let Some(records) = resolver.records(*server, &naptr.replacement, 33).await else { continue };
                         for mut target in order_srv_targets_with(records.srv_targets, srv_draw)? {
                             if endpoints.len() >= limits.candidates { break; }
@@ -476,7 +518,7 @@ where
                             let host = hostname(&target.target)?;
                             if let Some(records) = resolver.records(*server, &host, kind).await {
                                 add_addresses(&mut endpoints, records, local, PcscfSource::StandardDns,
-                                    &host, target.port, Some(&target), limits.candidates);
+                                    &host, target.port, transport, naptr_name, Some(&target), limits.candidates);
                             }
                         }
                         if !endpoints.is_empty() { break; }
@@ -487,7 +529,9 @@ where
             }
         }
     }
-    if endpoints.is_empty() { Err(unavailable()) } else { Ok(endpoints) }
+    if endpoints.is_empty() {
+        Err(if requires_tls { CellularImsError::new(code::TLS_ENDPOINT_FAILED) } else { unavailable() })
+    } else { Ok(endpoints) }
 }
 
 #[cfg(test)]

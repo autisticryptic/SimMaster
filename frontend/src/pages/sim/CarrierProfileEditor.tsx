@@ -562,6 +562,9 @@ export default function CarrierProfileEditor({
                 >
                   <MenuItem value="tcp">TCP</MenuItem>
                   <MenuItem value="udp">UDP</MenuItem>
+                  <MenuItem value="tls" disabled={draft.voice.vowifi_enabled}>
+                    TLS（仅蜂窝 IMS，需关闭 VoWiFi 能力）
+                  </MenuItem>
                 </Select>
               </FormControl>
               <TextField
