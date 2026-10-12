@@ -272,8 +272,10 @@ async fn enabled_plain_md5_placeholder_retains_nonempty_request_proof() {
     let mut configured = *factory.profile;
     configured.ims.register.use_plain_digest_placeholder = true;
     let profile = Box::leak(Box::new(configured));
+    // Keep this fixture within the existing nonce decoder contract: base64
+    // of a short value, not a full RAND/AUTN and not malformed opaque text.
     let incoming = parse_live_digest_challenge(&format!(
-        "SIP/2.0 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"{REALM}\", nonce=\"plain-nonce\", algorithm=MD5\r\n\r\n"), REALM).unwrap();
+        "SIP/2.0 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"{REALM}\", nonce=\"cGxhaW4=\", algorithm=MD5\r\n\r\n"), REALM).unwrap();
     let mut context = factory.context.clone();
     let variant = live_register_header_variants(profile)[0];
     let material = build_live_register_auth_material(&factory.line_id, profile, &mut context, &incoming, variant).await.unwrap();
