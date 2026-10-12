@@ -10,6 +10,17 @@ fn profile() -> &'static CarrierProfile {
     ).unwrap()
 }
 
+// The synthetic UE worker deliberately cannot create real namespace sockets.
+// Pre-reserve the next SM1 offer using the existing test-only socket adapter,
+// just as the other real-refresh regressions do. Production reservation and
+// activation still check those exact descriptors/ports; no gate is bypassed.
+async fn refresh_session() -> (CellularImsLiveSession, CellularImsRuntime, UdpSocket, UdpSocket) {
+    let (mut session, runtime, server, client) = protected_session_with_profile(profile()).await;
+    let server_port = session.security_binding.port_s;
+    session.channel.reserve_security_ports_for_test(server_port);
+    (session, runtime, server, client)
+}
+
 // Only the locally generated synthetic headers below are parsed here. The
 // production parser's escaping, duplicate and size limits have separate tests.
 fn sent_params(request: &[u8]) -> (bool, HashMap<String, String>) {
@@ -62,7 +73,7 @@ async fn rspauth_direct_refresh_accepts_supported_algorithms_and_proxy_scopes() 
         ("AKAv1-MD5", false, true), ("AKAv1-MD5", true, false),
         ("AKAv2-MD5", true, true), ("AKAv2-SHA-256", false, true),
     ] {
-        let (mut session, runtime, server, _client) = protected_session_with_profile(profile()).await;
+        let (mut session, runtime, server, _client) = refresh_session().await;
         let state = session.refresh_authorization.as_mut().unwrap();
         state.challenge.algorithm = algorithm.into();
         state.challenge.proxy = proxy;
@@ -95,7 +106,7 @@ async fn rspauth_direct_refresh_accepts_supported_algorithms_and_proxy_scopes() 
 
 #[tokio::test]
 async fn rspauth_invalid_direct_refresh_preserves_nonce_lease_identity_and_sa() {
-    let (mut session, runtime, server, _client) = protected_session_with_profile(profile()).await;
+    let (mut session, runtime, server, _client) = refresh_session().await;
     let old_registration = session.registration.clone();
     let old_identity = session.identity.clone();
     let old_route = session.channel.send_route();
@@ -136,7 +147,7 @@ async fn stale_refresh(tamper: bool) {
     let old_nonce = STANDARD.encode(&vector);
     *vector.last_mut().unwrap() = 2;
     let new_nonce = STANDARD.encode(&vector);
-    let (mut session, runtime, server, _client) = protected_session_with_profile(profile()).await;
+    let (mut session, runtime, server, _client) = refresh_session().await;
     let state = session.refresh_authorization.as_mut().unwrap();
     state.challenge.nonce = old_nonce.clone();
     state.aka_origin = Some(shared_digest::decode_aka_nonce(&old_nonce).unwrap());
@@ -186,7 +197,7 @@ async fn rspauth_failed_stale_refresh_does_not_commit_tentative_credentials() { 
 #[tokio::test]
 async fn rspauth_423_refresh_uses_incremented_nc_and_rejects_prior_request_proof() {
     for stale_response in [false, true] {
-        let (mut session, runtime, server, _client) = protected_session_with_profile(profile()).await;
+        let (mut session, runtime, server, _client) = refresh_session().await;
         let old_registration = session.registration.clone();
         let db = Database::new(std::path::PathBuf::from(":memory:")).unwrap();
         let peer = tokio::spawn(async move {
