@@ -103,8 +103,9 @@ async fn stale_same_vector_recomputes_proof_without_uicc_or_sa_replacement() {
 fn stale_nextnonce_does_not_authenticate_a_new_aka_vector() {
     let mut auth = CellularImsRefreshAuthorization::new(challenge(&nonce(1, 1)), aka());
     let origin = auth.aka_origin.clone();
-    auth.apply_success_authentication_info(format!("SIP/2.0 200 OK\r\nAuthentication-Info: nextnonce=\"{}\"\r\n\r\n", nonce(2, 1)).as_bytes());
     let identity = ImsIdentity { private_user: "user@ims.example".into(), public_uri: "sip:user@ims.example".into(), contact_user: "user".into(), home_domain: "ims.example".into(), contact_user_phone: false };
+    auth.authorization_for(&identity, "sip:ims.example").unwrap();
+    auth.apply_success_authentication_info(format!("SIP/2.0 200 OK\r\nAuthentication-Info: nextnonce=\"{}\"\r\n\r\n", nonce(2, 1)).as_bytes()).unwrap();
     auth.authorization_for(&identity, "sip:ims.example").unwrap();
     assert_eq!(auth.aka_origin, origin);
     let mut incoming = challenge(&nonce(2, 2)); incoming.stale = true;

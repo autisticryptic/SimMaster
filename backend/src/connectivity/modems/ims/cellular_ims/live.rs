@@ -698,6 +698,9 @@ struct CellularImsRefreshAuthorization {
     aka_origin: Option<digest_aka::AkaChallenge>,
     cnonce: String,
     nonce_count: u32,
+    /// Immutable context for the most recently serialized credential-bearing
+    /// request. It is independent of a subsequently committed nextnonce.
+    request_proof: Option<crate::connectivity::core::digest_aka::DigestRequestProof>,
 }
 
 impl CellularImsRefreshAuthorization {
@@ -712,6 +715,7 @@ impl CellularImsRefreshAuthorization {
             aka_origin,
             cnonce: sip::hex_token(8),
             nonce_count: 0,
+            request_proof: None,
         }
     }
 
@@ -753,32 +757,31 @@ impl CellularImsRefreshAuthorization {
             &self.cnonce,
             &nc,
         );
+        let password = digest_aka::aka_digest_password(&self.challenge.algorithm, &self.aka)?;
+        let request_proof = crate::connectivity::core::digest_aka::DigestRequestProof::new(
+            &self.challenge, &identity.private_user, &password, request_uri, &self.cnonce, &nc,
+        ).map_err(|error| CellularImsError::with_detail(code::DIGEST_REQUEST_CONTEXT_INVALID, error.code()))?;
         self.nonce_count = nonce_count;
+        self.request_proof = Some(request_proof);
         Ok(authorization)
     }
 
-    /// Commit the nonce advertised by Authentication-Info only after the
-    /// REGISTER received a successful final response. A nextnonce starts a new
-    /// digest nonce sequence, so its nonce-count is reset; the next request will
-    /// calculate a new response rather than reusing the old response field.
-    fn apply_success_authentication_info(&mut self, response: &[u8]) -> bool {
-        let header_name = if self.challenge.proxy {
-            "Proxy-Authentication-Info"
-        } else {
-            "Authentication-Info"
-        };
-        let nextnonce = sip::header_values(response, header_name)
-            .into_iter()
-            .find_map(|value| digest_aka::parse_authentication_info_nextnonce(&value));
-        let Some(nextnonce) = nextnonce.filter(|value| !value.is_empty()) else {
-            return false;
+    /// Validate server authentication before committing nextnonce. A final 2xx
+    /// alone is not evidence that the server knows this request's credentials.
+    /// Keep the immutable proof even when nextnonce resets the mutable counter.
+    fn apply_success_authentication_info(&mut self, response: &[u8]) -> Result<bool, ImsError> {
+        let verified = crate::connectivity::core::digest_aka::validate_response_authentication(
+            self.request_proof.as_ref(), response,
+        )?;
+        let Some(nextnonce) = verified.nextnonce() else {
+            return Ok(false);
         };
         if self.challenge.nonce == nextnonce {
-            return false;
+            return Ok(false);
         }
-        self.challenge.nonce = nextnonce;
+        self.challenge.nonce = nextnonce.to_owned();
         self.nonce_count = 0;
-        true
+        Ok(true)
     }
 }
 
@@ -1356,11 +1359,17 @@ impl CellularImsRegisterAuthenticator {
     /// authenticator. It is intentionally copied only after a successful
     /// REGISTER; a failed challenge must never poison the live session's
     /// reregistration credentials.
+    fn emitted_authorization(&self) -> Option<&CellularImsRefreshAuthorization> {
+        // A pending AUTS replaces the last emitted request, even though older
+        // credentials remain retained for rollback. Never borrow their proof.
+        match self.pending.as_ref() {
+            Some(prepared) => prepared.refresh_authorization.as_ref(),
+            None => self.refresh_authorization.as_ref(),
+        }
+    }
+
     fn refresh_authorization(&self) -> Option<CellularImsRefreshAuthorization> {
-        self.pending
-            .as_ref()
-            .and_then(|prepared| prepared.refresh_authorization.clone())
-            .or_else(|| self.refresh_authorization.clone())
+        self.emitted_authorization().cloned()
     }
 
     /// Return the authenticator state emitted by the successful REGISTER and
@@ -1371,10 +1380,13 @@ impl CellularImsRegisterAuthenticator {
     fn refresh_authorization_after_success(
         &self,
         response: &[u8],
-    ) -> Option<CellularImsRefreshAuthorization> {
-        let mut authorization = self.refresh_authorization()?;
-        authorization.apply_success_authentication_info(response);
-        Some(authorization)
+    ) -> Result<Option<CellularImsRefreshAuthorization>, ImsError> {
+        self.validate_success(response)?;
+        let Some(mut authorization) = self.refresh_authorization() else {
+            return Ok(None);
+        };
+        authorization.apply_success_authentication_info(response)?;
+        Ok(Some(authorization))
     }
 
     fn refresh_authorization_after_failure(&self) -> Option<CellularImsRefreshAuthorization> {
@@ -1612,6 +1624,7 @@ impl CellularImsRegisterAuthenticator {
             aka_origin: crate::connectivity::core::digest_aka::decode_aka_nonce(&challenge.nonce).ok(),
             cnonce,
             nonce_count: 0,
+            request_proof: None,
         };
         // Validate the state once here, but defer consuming nonce-count 1 to
         // authenticated_request(), which is the point at which the request is
@@ -1730,10 +1743,22 @@ fn ensure_required_security_before_aka(
 }
 
 impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthenticator {
-    fn validate_success(&self, _response: &[u8]) -> Result<(), ImsError> {
-        if self.resync_sent && self.pending.as_ref().and_then(|pending| pending.refresh_authorization.as_ref()).is_none_or(|state| state.nonce_count == 0) {
+    fn validate_request(&self, request: &[u8]) -> Result<(), ImsError> {
+        if let Some(state) = self.emitted_authorization() {
+            state.request_proof.as_ref()
+                .ok_or_else(|| ImsError::new("digest_request_auth_context_missing"))?
+                .validate_request(request)?;
+        }
+        Ok(())
+    }
+
+    fn validate_success(&self, response: &[u8]) -> Result<(), ImsError> {
+        if self.resync_sent && self.pending.as_ref().and_then(|pending| pending.refresh_authorization.as_ref()).is_none_or(|state| state.request_proof.is_none()) {
             return Err(ImsError::new("ims_aka_resync_unexpected_status"));
         }
+        crate::connectivity::core::digest_aka::validate_response_authentication(
+            self.emitted_authorization().and_then(|state| state.request_proof.as_ref()), response,
+        )?;
         Ok(())
     }
 
@@ -3666,6 +3691,15 @@ async fn connect_family(
         {
             return Err(CellularImsError::new(code::SECURITY_SERVER_MISSING));
         }
+        let refresh_authorization = match authenticator
+            .refresh_authorization_after_success(&registration.response)
+        {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                authenticator.rollback_security(&mut channel).await;
+                return Err(map_register_error(error));
+            }
+        };
         let artifacts = match channel
             .outbound_registered(&registration.response, authenticator.expires_seconds)
         {
@@ -3692,8 +3726,6 @@ async fn connect_family(
                 Some(format!("register_variant={}", variant.label)),
             )
             .await;
-        let refresh_authorization =
-            authenticator.refresh_authorization_after_success(&registration.response);
         log_cellular_ims_register_success_metadata("initial", variant, &artifacts);
         crate::connectivity::core::ims_registration_coordinator::for_line(&device.line_id)
             .observe_response(
@@ -4844,6 +4876,24 @@ async fn refresh_live_registration(
                 break;
             }
         };
+        // Server proof and nextnonce remain tentative until all response and
+        // outbound checks pass. No new lease, SA or readiness is visible yet.
+        let accepted_authorization = match authenticator
+            .refresh_authorization_after_success(&registration.response)
+        {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                authenticator.rollback_security(&mut session.channel).await;
+                session.refresh_authorization = authenticator.refresh_authorization_after_failure();
+                return CellularImsRefreshAttempt {
+                    outcome: RegistrationRefreshResult::RebuildAccess(
+                        RegistrationLossReason::AuthenticationRejected,
+                    ),
+                    error: Some(map_refresh_register_error(error)),
+                    retry_after: None,
+                };
+            }
+        };
         // Validate and publish the new flow BEFORE retiring its predecessor.
         // A 200 alone is not successful refresh if its own binding/negotiation
         // is missing. Never commit tentative security on that error path.
@@ -4890,9 +4940,7 @@ async fn refresh_live_registration(
             );
         }
         session.register_variant = variant;
-        if let Some(authorization) =
-            authenticator.refresh_authorization_after_success(&registration.response)
-        {
+        if let Some(authorization) = accepted_authorization {
             session.refresh_authorization = Some(authorization);
         }
         log_cellular_ims_register_success_metadata("refresh", variant, &artifacts);
@@ -8244,6 +8292,12 @@ fn map_channel_error(error: ImsError) -> CellularImsError {
 }
 
 fn map_register_error(error: ImsError) -> CellularImsError {
+    if error.code().starts_with("digest_request_auth_") {
+        return CellularImsError::with_detail(code::DIGEST_REQUEST_CONTEXT_INVALID, error.code());
+    }
+    if error.code().starts_with("digest_response_auth_") {
+        return CellularImsError::with_detail(code::DIGEST_RESPONSE_AUTH_FAILED, error.code());
+    }
     if error.code().starts_with("ims_outbound_") {
         return CellularImsError::new(error.code());
     }
@@ -8283,6 +8337,12 @@ fn is_refresh_transport_failure(failure: &RegisterFailure) -> bool {
 }
 
 fn map_refresh_register_error(error: ImsError) -> CellularImsError {
+    if error.code().starts_with("digest_request_auth_") {
+        return CellularImsError::with_detail(code::DIGEST_REQUEST_CONTEXT_INVALID, error.code());
+    }
+    if error.code().starts_with("digest_response_auth_") {
+        return CellularImsError::with_detail(code::DIGEST_RESPONSE_AUTH_FAILED, error.code());
+    }
     if error.code().starts_with("ims_outbound_") {
         return CellularImsError::new(error.code());
     }
@@ -9216,7 +9276,7 @@ mod tests {
 
         assert!(authorization.apply_success_authentication_info(
             b"SIP/2.0 200 OK\r\nAuthentication-Info: nextnonce=\"nonce-b\"\r\n\r\n"
-        ));
+        ).unwrap());
         let after_nextnonce = authorization
             .authorization_for(&identity, "sip:ims.example")
             .unwrap();
@@ -9242,9 +9302,17 @@ mod tests {
             auts: None,
         };
         let mut authorization = CellularImsRefreshAuthorization::new(challenge, aka);
+        let identity = ImsIdentity {
+            private_user: "user@ims.example".into(),
+            public_uri: "sip:user@ims.example".into(),
+            contact_user: "user".into(),
+            home_domain: "ims.example".into(),
+            contact_user_phone: false,
+        };
+        authorization.authorization_for(&identity, "sip:ims.example").unwrap();
         assert!(authorization.apply_success_authentication_info(
             b"SIP/2.0 200 OK\r\nProxy-Authentication-Info: nextnonce=\"nonce-proxy\"\r\n\r\n"
-        ));
+        ).unwrap());
         assert_eq!(authorization.challenge.nonce, "nonce-proxy");
         assert_eq!(authorization.nonce_count, 0);
     }

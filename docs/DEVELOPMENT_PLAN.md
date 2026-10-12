@@ -6,7 +6,7 @@
 
 ## 当前基线与工作规则
 
-- 当前源码基线为 `5aaf3ea`：ISIM 身份/P-CSCF 端点/Retry-After 第一批补全已通过两套 Actions；两份测试 ZIP 的官方摘要、各 87 项回归与四矩阵均已核验，**未部署**，见 [HANDOFF](HANDOFF.md)。
+- 当前已验证源码基线为 `344308c`：AUTS/stale/跨候选 423 已通过两套 Actions、各 46 项相关回归和四矩阵；更早的 ISIM/P-CSCF/Retry-After 第一批 `5aaf3ea` 也已核验。**当前 rspauth 实现仍在推进，未部署**，见 [HANDOFF](HANDOFF.md)。
 - 设备历史基线仍为全局兜底修复 `c174551`，已通过 Actions 和 410 原 Globe 配置的初始注册验收。
   `7bd` 的运营商专用补丁及测试仍保持由 `0502395` 撤销的状态；当前成功不能替代中国移动同卡验收。
 - **当前优先级是继续原 EC20 审查中的第二批协议补强，而不是把第一批当作整个委托结束。** 同卡/自然续期验收与停服时的 MM 重枚举/AT 超时调查独立保留，设备操作另需明确授权。
@@ -26,13 +26,12 @@
 4. 验证同卡多 P-CSCF、完整 503/Retry-After、旧绑定到期及自然续期；等待状态目前在进程内按线路/SIM 保存，不是跨进程持久化的网络熔断器。
 5. 当前工作不授权部署、刷机、打开 IDA、换卡、MM/基带重启或 NV 改写；下一阶段设备操作需要新的明确授权。
 
-## P1：第二批协议补强（尚未实施）
+## P1：第二批协议补强（剩余项）
 
-- reg-event：合法订阅与 `application/reginfo+xml` 的绑定终止通知，不能把 MWI/REFER NOTIFY 当成已支持。
-- Digest `rspauth`：绑定请求上下文验证 Authentication-Info，不能只接收 nextnonce。
-- AUTS/stale：同步恢复路径保留 qop/opaque，区分 stale，同时保持鉴权预算。
-- 423：避免交换内 Min-Expires 协商耗尽后换静态候选重新开放预算。
-- 实施顺序先 AUTS/stale 与 423 预算，再 rspauth，随后 reg-event；前两者优先复用现有核心能力，不能把“已有算法/helper”当成生产路径已经接通。
+- Digest `rspauth`（进行中）：绑定最终发送的 Request-URI、Authorization scope、qop/nc/cnonce 校验 Authentication-Info。适用初次/刷新/注销；校验失败不提交 nonce/租期/安全状态或进入兼容候选，可选 rspauth 缺失不一律拒绝。尚待新代码 Actions 证据。
+- reg-event（待开始）：合法订阅与 `application/reginfo+xml` 的绑定终止通知，不能把 MWI/REFER NOTIFY 当成已支持。
+- 已验证 AUTS/stale 与 423 的剩余限制：WiFi 初次认证后的 423 明确 unsupported；需要新安全上下文的受保护 stale 不重装旧 ESP；非 REGISTER 业务的响应认证/恢复需单独核对。
+- 实施顺序继续 rspauth，再 reg-event，随后独立交付传输/诊断/承载；不能把“已有算法/helper”当成生产路径已经接通。
 
 ## P1：原报告的传输与功能扩展（部分基础已具备）
 

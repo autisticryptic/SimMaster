@@ -10,11 +10,21 @@
 4. 2026-10-07 的 410 部署属于已结束的历史授权；本轮只实施 IMS 补全和 Actions 验证，**未部署、未访问设备，也不主动连接 IDA**。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：ISIM、P-CSCF 与临时拒绝补全
+## 当前：REGISTER 响应认证补全（进行中）
+
+已验证代码基线 **`344308c84748352b9e985e3d1182b6817beb7f3c`**。AUTS 参数保留、stale/nonce 语义、跨候选 423 预算已通过两套 Actions（[38138978950](https://github.com/autisticryptic/SimMaster/actions/runs/38138978950)、[38138978978](https://github.com/autisticryptic/SimMaster/actions/runs/38138978978)），各逐名核验 46 项相关回归及四矩阵 86 场景；双架构构建成功、Release skipped。首轮新零租期测试断言失败已修正，未改变合法 `Expires: 0` 语义。证据 `.local/evidence/ims-auth-hardening/verified-344308c.json`。
+
+下一项 **Digest rspauth** 正在补全：关联最终发送的 URI/Authorization 与服务器响应，覆盖蜂窝/VoWiFi 的初次、刷新和注销，先验证后提交 nextnonce、租期与安全状态。新代码尚待 Actions 验证；旧绿灯不代表当前工作树，未部署。
+
+- N1/N2 保持独立的 AKA 凭据来源；nextnonce 不是新 UICC 向量。AUTS 不是有效证明；合法 stale 不重置旧 ESP 状态或重放同向量 AKA。
+- N3 让 423 的尝试级预算跨头型/profile 保持；WiFi 初次认证后 423 仍明确 unsupported，不能重发旧 nonce-count 冒充支持。
+- reg-event、TCP/TLS/SIP NAPTR/DNS TCP、完整来源诊断与承载能力仍未完成。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界。
+
+## 第一批：ISIM、P-CSCF 与临时拒绝补全
 
 代码基线 **`5aaf3eab6515aba9f5f5eb43553ea00a1cec3264`**（前一实现提交 `e702cef`），已推送 `simmaster/master`。
 
-**这是第一批实现及验证闭环，不是原 EC20 审查全部建议已完成。** 后续继续 AUTS/stale、跨候选 423 预算、rspauth、reg-event，以及尚未实现的传输、诊断与承载能力；完整范围和跨项目/IDA 边界见[开发计划](DEVELOPMENT_PLAN.md)。
+**这是第一批实现及验证闭环，不是原 EC20 审查全部建议已完成。** AUTS/stale 与跨候选 423 后续已验证；当前继续 rspauth、reg-event，以及尚未实现的传输、诊断与承载能力；完整范围和跨项目/IDA 边界见[开发计划](DEVELOPMENT_PLAN.md)。
 
 - 共享读取 ISIM 的 IMPI/DOMAIN/IMPU/P-CSCF；完整身份与认证 AID 一起选用，合法未配置时保留 USIM 派生；读取错误、损坏、换卡不假装缺省。VoWiFi 的 EAP 仍使用 USIM。
 - QMI 按 slot 发现应用，native AT 通过自有通道读取 EF_DIR；PC/SC 每个进程重选完整 AID/文件，并用稳定 reader 名称防止索引重排。卡/slot/owner 检查是分阶段观察，不冒称可原子排除所有物理热插拔竞态。
@@ -32,7 +42,7 @@
 - 两套日志各逐名确认 **87 项相关回归**；四矩阵各为 24 标准、18 历史、12 安全提示、32 全局兜底场景，共 86 场景（45 个 fixture 成功、41 个预期拒绝）。每个矩阵的 suite ID、commit/run、源码文件指纹及日志 SHA 均核验，不代表实网成功次数。
 - 官方测试 artifact 摘要：`ims-refresh-tests`（11670501045）为 `a945fbecc99aec037aaafc64967c1055c35e7d07a04a086e7f4ee1e677b2f3c0`；`beta-refactor-tests`（11670590696）为 `0bb4998139467e4ef668bb7a9a9e808490720431f0cf7d75e709f3ce5d0d8547`。
 - 完整核验报告：`.local/evidence/isim-endpoint-retry/verified.json`；同目录保存原始测试 ZIP 和只读校验器 `verify_artifacts.py`，未执行解压内容或本机注册模拟。API/静态检查原始材料另存 `.local/session-recovery/20261010-resume/`。此次下载校验的是测试产物，不是已部署程序包。
-- **未部署、未做新版本初始注册/自然续期/业务/热插拔实机验收**。第二批 reg-event、rspauth、AUTS/stale 与跨候选 423 预算另列于[开发计划](DEVELOPMENT_PLAN.md)。
+- **未部署、未做新版本初始注册/自然续期/业务/热插拔实机验收**。第二批 rspauth、reg-event 和传输/诊断/承载缺口另列于[开发计划](DEVELOPMENT_PLAN.md)。
 
 ## 已完成的全局修复（上轮）
 

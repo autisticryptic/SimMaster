@@ -1,6 +1,8 @@
 //! Hardware-free regressions for the protected REGISTER refresh procedure.
 #[path = "auth_hardening_tests.rs"]
 mod auth_hardening_tests;
+#[path = "response_auth_tests.rs"]
+mod response_auth_tests;
 use super::*;
 use crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult;
 use tokio::net::UdpSocket;
@@ -503,7 +505,7 @@ async fn successful_rollover_keeps_old_inbound_path_until_next_procedure() {
         .recv_sip(Duration::from_secs(1))
         .await
         .unwrap();
-    let next_auth = auth.refresh_authorization_after_success(&ok).unwrap();
+    let next_auth = auth.refresh_authorization_after_success(&ok).unwrap().unwrap();
     assert_eq!(next_auth.challenge.nonce, "new-nonce");
     assert_eq!(next_auth.nonce_count, 1);
     session.channel.commit_security();

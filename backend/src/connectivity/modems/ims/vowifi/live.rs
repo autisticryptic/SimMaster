@@ -5556,14 +5556,16 @@ async fn run_register_exchange_with_pcscf_variant(
     {
         Ok((response, mut context, next_cseq)) => {
             if !context.channel_transferred {
+                validate_live_register_success(context.refresh_authorization.as_ref(), false, response.as_bytes())
+                    .map_err(map_shared_digest_error)?;
+                if let Some(auth) = context.refresh_authorization.as_mut() {
+                    auth.apply_success(response.as_bytes()).map_err(map_shared_digest_error)?;
+                }
                 let artifacts = channel
                     .outbound_registered(response.as_bytes(), context.register_expires(profile))
                     .map_err(|error| live_stage_error(error.code()))?;
                 if artifacts.expires_seconds == Some(0) {
                     return Err(live_stage_error("ims_register_binding_removed"));
-                }
-                if let Some(auth) = context.refresh_authorization.as_mut() {
-                    auth.apply_success(response.as_bytes());
                 }
                 let registered = RegisteredImsContext::from_artifacts(
                     ImsRegistrationAccess::Vowifi,
@@ -5747,6 +5749,14 @@ struct VowifiRegisterAuthenticator<'a> {
 }
 
 impl RegisterAuthenticator<SipChannel> for VowifiRegisterAuthenticator<'_> {
+    fn validate_request(&self, request: &[u8]) -> Result<(), ImsError> {
+        validate_live_register_request(self.context.refresh_authorization.as_ref(), request)
+    }
+
+    fn validate_success(&self, response: &[u8]) -> Result<(), ImsError> {
+        validate_live_register_success(self.context.refresh_authorization.as_ref(), self.resync_sent, response)
+    }
+
     async fn exchange_authenticated(
         &mut self,
         challenge_response: &[u8],
@@ -5797,10 +5807,12 @@ impl RegisterAuthenticator<SipChannel> for VowifiRegisterAuthenticator<'_> {
             Ok(response) => Ok(Some(response.into_bytes())),
             Err(error) => {
                 let registration_loss = classify_vowifi_register_error(error.reason.as_str());
+                let shared_code = live_digest_error_code(&error.reason)
+                    .unwrap_or("vowifi_register_authenticated_exchange_failed");
                 self.last_error = Some(error.with_registration_loss(registration_loss));
-                Err(ImsError::new(
-                    "vowifi_register_authenticated_exchange_failed",
-                ))
+                // Do not erase an owned exchange's response-authentication
+                // failure into a generic local error in the shared metadata.
+                Err(ImsError::new(shared_code))
             }
         }
     }
@@ -5909,7 +5921,7 @@ fn preserve_min_expires_profile_stop(error: &mut LiveStageError) {
 }
 
 pub(crate) fn register_reason_blocks_profile_fallback(reason: &str) -> bool {
-    reason.split(':').any(|code| matches!(code,
+    is_live_digest_authentication_failure(reason) || reason.split(':').any(|code| matches!(code,
         "ims_register_min_expires_negotiated"
         | "ims_register_authenticated_stop"
         | "ims_register_initial_min_expires_invalid"
@@ -6005,11 +6017,27 @@ fn authenticated_min_expires_failure(response: &str) -> LiveStageError {
     })
 }
 
+fn live_digest_error_code(reason: &str) -> Option<&'static str> {
+    const CODES: &[&str] = &[
+        "digest_response_auth_invalid", "digest_response_auth_mismatch",
+        "digest_response_auth_context_missing", "digest_response_auth_scope_mismatch",
+        "digest_request_auth_mismatch", "digest_request_auth_context_missing",
+    ];
+    reason.split(':').find_map(|part| CODES.iter().copied().find(|code| *code == part))
+}
+
+fn is_live_digest_authentication_failure(reason: &str) -> bool {
+    reason.split(':').any(|code| {
+        code.starts_with("digest_response_auth_") || code.starts_with("digest_request_auth_")
+    })
+}
+
 fn classify_vowifi_register_error(reason: &str) -> RegistrationLossReason {
     if reason.starts_with("ims_outbound_") || reason == "vowifi_refresh_security_update_required" {
         return RegistrationLossReason::AccessTransportLost;
     }
-    if reason.starts_with("ims_aka_")
+    if is_live_digest_authentication_failure(reason)
+        || reason.starts_with("ims_aka_")
         || reason.starts_with("ims_digest_")
         || reason.starts_with("eap_aka_")
         || reason.starts_with("sim_auth_")
@@ -6070,9 +6098,15 @@ async fn run_retained_stale_register_exchange(
     let request = context.build_register_request_with_expires(
         profile, variant, cseq, Some(&header), Some(&verify), context.register_expires(profile),
     );
+    validate_live_register_request(Some(&authorization), request.as_bytes()).map_err(map_shared_digest_error)?;
     write_sip_request(channel, &request).await?;
     context.refresh_authorization = Some(authorization);
-    read_final_register_response(channel, &request).await
+    let response = read_final_register_response(channel, &request).await?;
+    if sip_frame::parse_status(response.as_bytes()).ok().is_some_and(|status| (200..300).contains(&status)) {
+        validate_live_register_success(context.refresh_authorization.as_ref(), false, response.as_bytes())
+            .map_err(map_shared_digest_error)?;
+    }
+    Ok(response)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6111,6 +6145,8 @@ async fn run_authenticated_register_exchange(
             None,
         );
         info!("IMS REGISTER AKA resync request ready");
+        validate_live_register_request(context.refresh_authorization.as_ref(), resync_request.as_bytes())
+            .map_err(map_shared_digest_error)?;
         write_sip_request(initial_channel, &resync_request).await?;
         let response = read_final_register_response(initial_channel, &resync_request).await?;
         let summary = ims::parse_sip_response(&response, &context.target.realm)
@@ -6148,12 +6184,18 @@ async fn run_authenticated_register_exchange(
             profile, variant, authenticated_cseq,
             auth_material.authorization.as_str(), security_verify.as_deref(),
         );
+        validate_live_register_request(context.refresh_authorization.as_ref(), authenticated.as_bytes())
+            .map_err(map_shared_digest_error)?;
         write_sip_request(initial_channel, &authenticated).await?;
         let response = read_final_register_response(initial_channel, &authenticated).await?;
         let summary = ims::parse_sip_response(&response, &context.target.realm)
             .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
         if summary.status_code == 423 {
             return Err(authenticated_min_expires_failure(&response));
+        }
+        if (200..300).contains(&summary.status_code) {
+            validate_live_register_success(context.refresh_authorization.as_ref(), *resync_sent, response.as_bytes())
+                .map_err(map_shared_digest_error)?;
         }
         Ok(response)
     }
@@ -6477,11 +6519,23 @@ async fn run_protected_authenticated_register_candidates(
                     crate::connectivity::core::context::SipTransport::Tcp => None,
                 };
                 context.protected_header_port = protected_header_port;
+                // Each alternate flow emits a new request, not a retransmit of
+                // the previous bytes. Preserve the first builder's nc=1 proof;
+                // allocate a fresh proof/nc for every subsequent candidate.
+                let authorization = if candidate_index == 0 {
+                    auth_material.authorization.clone()
+                } else {
+                    let uri = context.request_uri(profile, variant);
+                    context.refresh_authorization.as_mut()
+                        .ok_or_else(|| live_stage_error("digest_request_auth_context_missing"))?
+                        .authorization(&context.identity.private_user, &uri)
+                        .map_err(map_shared_digest_error)?
+                };
                 let authenticated = context.build_authorized_request(
                     profile,
                     variant,
                     authenticated_cseq,
-                    &auth_material.authorization,
+                    &authorization,
                     security_verify,
                 );
                 info!(
@@ -6497,6 +6551,8 @@ async fn run_protected_authenticated_register_candidates(
                     transport = transport.as_via(),
                     "IMS REGISTER protected request headers prepared"
                 );
+                validate_live_register_request(context.refresh_authorization.as_ref(), authenticated.as_bytes())
+                    .map_err(map_shared_digest_error)?;
                 write_sip_request(&mut protected_channel, &authenticated).await?;
                 // The primary candidate gets the full transaction budget; an
                 // unanswered alternate candidate is likely the same silent
@@ -6534,8 +6590,10 @@ async fn run_protected_authenticated_register_candidates(
                     .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
                 let expires = context.register_expires(profile);
                 if summary.status_code == 200 {
+                    validate_live_register_success(context.refresh_authorization.as_ref(), false, response.as_bytes())
+                        .map_err(map_shared_digest_error)?;
                     if let Some(auth) = context.refresh_authorization.as_mut() {
-                        auth.apply_success(response.as_bytes());
+                        auth.apply_success(response.as_bytes()).map_err(map_shared_digest_error)?;
                     }
                     let artifacts = protected_channel
                         .outbound_registered(response.as_bytes(), expires)
@@ -8361,6 +8419,9 @@ struct LiveRefreshAuthorization {
     aka_origin: Option<crate::connectivity::core::digest_aka::AkaChallenge>,
     cnonce: String,
     nonce_count: u32,
+    // Immutable context for the last actual Authorization. Keep it even when
+    // validated nextnonce resets nc: the shared driver may revalidate success.
+    request_proof: Option<crate::connectivity::core::digest_aka::DigestRequestProof>,
 }
 
 impl std::fmt::Debug for LiveRefreshAuthorization {
@@ -8396,12 +8457,16 @@ impl LiveRefreshAuthorization {
             &self.cnonce,
             &nc,
         );
+        let request_proof = crate::connectivity::core::digest_aka::DigestRequestProof::new(
+            &self.challenge, username, &self.password, uri, &self.cnonce, &nc,
+        )?;
         self.nonce_count = next;
+        self.request_proof = Some(request_proof);
         Ok(header)
     }
 
     fn sent_challenge(&self) -> Option<&crate::connectivity::core::digest_aka::DigestChallenge> {
-        (self.nonce_count > 0).then_some(&self.challenge)
+        (self.nonce_count > 0 && self.request_proof.is_some()).then_some(&self.challenge)
     }
 
     fn renewed(&self, challenge: &LiveDigestChallenge) -> Result<Self, ImsError> {
@@ -8413,26 +8478,45 @@ impl LiveRefreshAuthorization {
             cnonce: live_digest_cnonce()
                 .map_err(|_| ImsError::new("vowifi_refresh_random_failed"))?,
             nonce_count: 0,
+            request_proof: None,
         })
     }
 
-    fn apply_success(&mut self, response: &[u8]) {
-        let name = if self.challenge.proxy {
-            "Proxy-Authentication-Info"
-        } else {
-            "Authentication-Info"
-        };
-        if let Some(nonce) = sip_frame::header_values(response, name)
-            .iter()
-            .find_map(|value| {
-                crate::connectivity::core::digest_aka::parse_authentication_info_nextnonce(value)
-            })
-            .filter(|nonce| !nonce.is_empty() && nonce != &self.challenge.nonce)
-        {
-            self.challenge.nonce = nonce;
+    fn apply_success(&mut self, response: &[u8]) -> Result<(), ImsError> {
+        let verified = crate::connectivity::core::digest_aka::validate_response_authentication(
+            self.request_proof.as_ref(), response,
+        )?;
+        if let Some(nonce) = verified.nextnonce().filter(|nonce| *nonce != self.challenge.nonce.as_str()) {
+            self.challenge.nonce = nonce.to_owned();
             self.nonce_count = 0;
         }
+        Ok(())
     }
+}
+
+fn validate_live_register_request(
+    authorization: Option<&LiveRefreshAuthorization>,
+    request: &[u8],
+) -> Result<(), ImsError> {
+    if let Some(state) = authorization {
+        state.request_proof.as_ref()
+            .ok_or_else(|| ImsError::new("digest_request_auth_context_missing"))?
+            .validate_request(request)?;
+    }
+    Ok(())
+}
+
+fn validate_live_register_success(
+    authorization: Option<&LiveRefreshAuthorization>,
+    resync_sent: bool,
+    response: &[u8],
+) -> Result<(), ImsError> {
+    let proof = authorization.and_then(|state| state.request_proof.as_ref());
+    if resync_sent && proof.is_none() {
+        return Err(ImsError::new("ims_aka_resync_unexpected_status"));
+    }
+    crate::connectivity::core::digest_aka::validate_response_authentication(proof, response)?;
+    Ok(())
 }
 
 struct VowifiUnregisterFactory {
@@ -8496,8 +8580,11 @@ impl VowifiUnregisterFactory {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let (Some(original), Some(emitted)) = (original.as_mut(), emitted.as_ref()) {
-            if original.challenge == emitted.challenge && original.cnonce == emitted.cnonce {
-                original.nonce_count = original.nonce_count.max(emitted.nonce_count);
+            if original.challenge == emitted.challenge && original.cnonce == emitted.cnonce
+                && emitted.nonce_count >= original.nonce_count
+            {
+                original.nonce_count = emitted.nonce_count;
+                original.request_proof = emitted.request_proof.clone();
             }
         }
     }
@@ -8568,6 +8655,7 @@ impl VowifiUnregisterFactory {
                 cnonce: live_digest_cnonce()
                     .map_err(|_| ImsError::new("vowifi_refresh_random_failed"))?,
                 nonce_count: 0,
+                request_proof: None,
             }),
             None,
         ))
@@ -8592,11 +8680,12 @@ impl VowifiRefreshAuthenticator<'_> {
 }
 
 impl RegisterAuthenticator<SipChannel> for VowifiRefreshAuthenticator<'_> {
-    fn validate_success(&self, _response: &[u8]) -> Result<(), ImsError> {
-        if self.resync_sent && self.authorization.as_ref().is_none_or(|state| state.nonce_count == 0) {
-            return Err(ImsError::new("ims_aka_resync_unexpected_status"));
-        }
-        Ok(())
+    fn validate_request(&self, request: &[u8]) -> Result<(), ImsError> {
+        validate_live_register_request(self.authorization.as_ref(), request)
+    }
+
+    fn validate_success(&self, response: &[u8]) -> Result<(), ImsError> {
+        validate_live_register_success(self.authorization.as_ref(), self.resync_sent, response)
     }
 
     async fn authenticated_request(
@@ -8629,13 +8718,16 @@ impl RegisterAuthenticator<SipChannel> for VowifiRefreshAuthenticator<'_> {
 }
 
 impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
-    fn validate_success(&self, _response: &[u8]) -> Result<(), ImsError> {
-        if self.unregister_resync_sent.load(std::sync::atomic::Ordering::Relaxed)
-            && self.unregister_authorization.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_none_or(|state| state.nonce_count == 0)
-        {
-            return Err(ImsError::new("ims_aka_resync_unexpected_status"));
-        }
-        Ok(())
+    fn validate_request(&self, request: &[u8]) -> Result<(), ImsError> {
+        let auth = self.unregister_authorization.lock().unwrap_or_else(|e| e.into_inner());
+        validate_live_register_request(auth.as_ref(), request)
+    }
+
+    fn validate_success(&self, response: &[u8]) -> Result<(), ImsError> {
+        let auth = self.unregister_authorization.lock().unwrap_or_else(|e| e.into_inner());
+        validate_live_register_success(
+            auth.as_ref(), self.unregister_resync_sent.load(std::sync::atomic::Ordering::Relaxed), response,
+        )
     }
 
     fn refresh<'a>(
@@ -8661,7 +8753,8 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
             let result = run_register_observed(channel, &initial, &mut auth).await;
             uicc.verify(&self.line_id).await.map_err(ImsError::new)?;
             let result = result.map_err(|failure| {
-                if failure.error.code().starts_with("ims_outbound_")
+                if is_live_digest_authentication_failure(failure.error.code())
+                    || failure.error.code().starts_with("ims_outbound_")
                     || failure.error.code() == "vowifi_refresh_security_update_required"
                 {
                     return failure.error;
@@ -8677,12 +8770,13 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
                     _ => failure.error,
                 }
             })?;
+            auth.validate_success(&result.response)?;
+            if let Some(state) = auth.authorization.as_mut() {
+                state.apply_success(&result.response)?;
+            }
             let artifacts = channel.outbound_registered(&result.response, auth.expires)?;
             if artifacts.expires_seconds == Some(0) {
                 return Err(ImsError::new("vowifi_refresh_rejected"));
-            }
-            if let Some(state) = auth.authorization.as_mut() {
-                state.apply_success(&result.response);
             }
             *self
                 .refresh_authorization
@@ -9026,6 +9120,10 @@ async fn build_live_register_auth_material(
         nonce_kind = challenge.nonce_kind.label(),
         "IMS REGISTER authenticated request ready"
     );
+    let request_proof = crate::connectivity::core::digest_aka::DigestRequestProof::new(
+        &challenge.shared(), &context.identity.private_user, &password,
+        &digest_uri, &cnonce, "00000001",
+    ).map_err(map_shared_digest_error)?;
     Ok(LiveRegisterAuthMaterial {
         authorization,
         refresh_authorization: Some(LiveRefreshAuthorization {
@@ -9038,6 +9136,7 @@ async fn build_live_register_auth_material(
             // processes another challenge after their successful write/read;
             // failed sends discard this tentative registration context.
             nonce_count: 1,
+            request_proof: Some(request_proof),
         }),
         ims_esp_secrets,
         ims_esp_alt_secrets,
@@ -10669,6 +10768,10 @@ mod epdg_address_tests {
 #[cfg(test)]
 #[path = "stale_tests.rs"]
 mod stale_tests;
+
+#[cfg(test)]
+#[path = "response_auth_tests.rs"]
+mod response_auth_tests;
 
 #[cfg(test)]
 #[path = "derived_hardening_tests.rs"]

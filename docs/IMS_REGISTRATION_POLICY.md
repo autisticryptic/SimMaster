@@ -118,6 +118,14 @@
 `hmac-sha1-96` 与 `hmac-sha-1-96` 可按同一完整性算法比较，但保留原始 Security-Verify；
 不因此接受 MD5、未报价加密或放宽 AES-only 限制。XFRM 清理仅限自有 UE worker，禁止全局 flush。
 
+### REGISTER 鉴权、响应认证与重试边界
+
+- AUTS 保留选定 qop/opaque，但不是有效鉴权证明；非法/重复 AUTS 或仅 AUTS 后直接 2xx 不能形成注册或确认注销。
+- stale 必须关联上一条已发送的同 scope 请求；同 RAND/AUTN 才复用绑定凭据，独立 `aka_origin` 不被 nextnonce 覆盖。已保护通道不因 stale 重装同 SPI/key 或退明文；需新安全上下文时明确恢复。
+- 423 协商一旦开始，就关闭本次静态头型/profile/端点兼容扩张；无效/过大/不增长/耗尽的 floor 不能重开预算。零租期注销不协商正租期；WiFi 初次认证后 423 尚不支持，注册后 credential-aware 刷新仍支持。
+- rspauth 接线正在补全、尚待本轮 Actions：仅对实际生成的非空 Digest 证明捕获不可变请求上下文，发送前检查最终 URI/Authorization，2xx 发布前验证响应对应的 qop/nc/cnonce 和 rspauth。Authentication-Info/Proxy-Authentication-Info 不串用，重复/畸形/不匹配明确失败；缺少可选 rspauth 仍兼容，不把 nextnonce-only 冒充服务器证明已验。
+- 响应认证失败不是传输失败或可换头型的协商提示；不能提交新的 nextnonce、租期、业务身份或安全上下文。失败保留已发送的原 nonce-count、回滚暂存状态；不放宽 AKA/ESP 算法门禁。本轮范围为 REGISTER，非 REGISTER 业务不自动宣称已支持。
+
 ### 临时拒绝与 Retry-After
 
 - `RegisterFailure::metadata()` 区分初始/认证阶段、端点临时拒绝、传输故障、身份/认证拒绝和本地错误；不得从 `detail` 文本或上一次保存的 401 猜当前发送结果。

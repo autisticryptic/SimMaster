@@ -94,6 +94,7 @@ jobs:
             connectivity::modems::ims::vowifi::qmi_uim::isim_binding_tests \
             connectivity::modems::ims::uicc_ims::tests \
             connectivity::modems::ims::vowifi::live::stale_tests \
+            connectivity::modems::ims::vowifi::live::response_auth_tests \
             connectivity::modems::ims::vowifi::eap_aka::tests \
             connectivity::modems::ims::vowifi::live::live_identity::tests \
             connectivity::modems::ims::cellular_ims::register_retry::tests \
@@ -182,7 +183,9 @@ jobs:
             mm_startup_policy_tests \
             connectivity::core::digest_aka::tests \
             connectivity::core::digest_aka::challenge_tests \
+            connectivity::core::digest_aka::response_auth::tests \
             connectivity::core::register::tests \
+            connectivity::core::registration::tests \
             connectivity::core::outbound::tests \
             connectivity::core::ims_access::tests \
             connectivity::core::ims_registration_coordinator::tests \

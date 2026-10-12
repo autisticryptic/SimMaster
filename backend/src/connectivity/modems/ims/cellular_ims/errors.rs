@@ -41,6 +41,10 @@ pub mod code {
     pub const DIGEST_NONCE_DECODE_FAILED: &str = "cellular_ims_digest_nonce_decode_failed";
     pub const DIGEST_QOP_UNSUPPORTED: &str = "cellular_ims_digest_qop_unsupported";
     pub const DIGEST_ALGORITHM_UNSUPPORTED: &str = "cellular_ims_digest_algorithm_unsupported";
+    /// Server rspauth/Authentication-Info did not validate against the sent request.
+    pub const DIGEST_RESPONSE_AUTH_FAILED: &str = "cellular_ims_digest_response_auth_failed";
+    /// A serialized request did not have a usable, matching local proof context.
+    pub const DIGEST_REQUEST_CONTEXT_INVALID: &str = "cellular_ims_digest_request_context_invalid";
     pub const REGISTER_NONCE_NOT_AKA: &str = "cellular_ims_register_nonce_not_aka";
 
     // IPsec (ip xfrm).
@@ -324,6 +328,8 @@ pub mod code {
         DIGEST_NONCE_MISSING,
         DIGEST_QOP_UNSUPPORTED,
         DIGEST_REALM_MISSING,
+        DIGEST_REQUEST_CONTEXT_INVALID,
+        DIGEST_RESPONSE_AUTH_FAILED,
         DTMF_DIGIT_INVALID,
         DTMF_DURATION_INVALID,
         HEX_INVALID,
@@ -553,7 +559,7 @@ mod tests {
         // Keep in step with the `pub const` count in `mod code`.
         assert_eq!(
             code::ALL.len(),
-            163,
+            165,
             "code::ALL is out of sync with mod code"
         );
         let mut seen = std::collections::BTreeSet::new();

@@ -222,6 +222,8 @@ pub(crate) async fn refresh_registered_for_line(
 }
 
 pub(crate) trait RegisteredUnregister: Send + Sync {
+    fn validate_request(&self, _request: &[u8]) -> Result<(), crate::connectivity::core::ImsError> { Ok(()) }
+
     fn validate_success(&self, _response: &[u8]) -> Result<(), crate::connectivity::core::ImsError> { Ok(()) }
 
     fn refresh<'a>(
@@ -247,11 +249,15 @@ pub(crate) trait RegisteredUnregister: Send + Sync {
     ) -> futures_util::future::BoxFuture<'a, Result<Vec<u8>, crate::connectivity::core::ImsError>>;
 }
 
-struct RegisteredUnregisterAdapter {
-    factory: Arc<dyn RegisteredUnregister>,
+pub(super) struct RegisteredUnregisterAdapter {
+    pub(super) factory: Arc<dyn RegisteredUnregister>,
 }
 
 impl RegisterAuthenticator<SipChannel> for RegisteredUnregisterAdapter {
+    fn validate_request(&self, request: &[u8]) -> Result<(), crate::connectivity::core::ImsError> {
+        self.factory.validate_request(request)
+    }
+
     fn validate_success(&self, response: &[u8]) -> Result<(), crate::connectivity::core::ImsError> {
         self.factory.validate_success(response)
     }

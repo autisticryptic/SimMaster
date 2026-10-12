@@ -55,6 +55,8 @@ export const CELLULAR_IMS_ERROR_CODES = [
   'cellular_ims_digest_nonce_missing',
   'cellular_ims_digest_qop_unsupported',
   'cellular_ims_digest_realm_missing',
+  'cellular_ims_digest_request_context_invalid',
+  'cellular_ims_digest_response_auth_failed',
   'cellular_ims_dtmf_digit_invalid',
   'cellular_ims_dtmf_duration_invalid',
   'cellular_ims_hex_invalid',

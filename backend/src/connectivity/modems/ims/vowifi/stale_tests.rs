@@ -46,13 +46,19 @@ fn aka() -> UsimAkaApduResult {
 }
 
 fn state(nc: u32) -> LiveRefreshAuthorization {
+    let challenge = challenge(0x11, 1, false).shared();
+    let request_proof = (nc > 0).then(|| digest_aka::DigestRequestProof::new(
+        &challenge, "user", &aka().res, "sip:ims.invalid",
+        "fixture-original-cnonce", &format!("{nc:08x}"),
+    ).unwrap());
     LiveRefreshAuthorization {
-        challenge: challenge(0x11, 1, false).shared(),
+        challenge,
         password: aka().res.clone(),
         aka: Some(aka()),
         aka_origin: Some(digest_aka::decode_aka_nonce(&nonce(0x11, 1)).unwrap()),
         cnonce: "fixture-original-cnonce".into(),
         nonce_count: nc,
+        request_proof,
     }
 }
 
@@ -183,7 +189,7 @@ fn stale_refresh_new_nc_one_preserves_consumed_original_nc_and_security() {
 fn stale_nextnonce_preserves_aka_provenance_instead_of_borrowing_new_vector() {
     let mut original = state(8);
     let origin = original.aka_origin.clone();
-    original.apply_success(format!("SIP/2.0 200 OK\r\nAuthentication-Info: nextnonce=\"{}\"\r\n\r\n", nonce(0x12, 1)).as_bytes());
+    original.apply_success(format!("SIP/2.0 200 OK\r\nAuthentication-Info: nextnonce=\"{}\"\r\n\r\n", nonce(0x12, 1)).as_bytes()).unwrap();
     original.authorization("user", "sip:ims.invalid").unwrap();
     assert_eq!(original.aka_origin, origin);
     assert_eq!(live_digest_challenge_action(&challenge(0x12, 2, true), Some(&original)).unwrap(), ChallengeAction::Authenticate);
@@ -196,7 +202,7 @@ fn stale_nonce_count_never_wraps_and_nextnonce_is_not_yet_sent() {
     assert_eq!(original.authorization("user", "sip:ims.invalid").unwrap_err().code(), "vowifi_refresh_nonce_count_exhausted");
     assert_eq!(original.nonce_count, u32::MAX);
     let mut original = state(8);
-    original.apply_success(format!("SIP/2.0 200 OK\r\nAuthentication-Info: nextnonce=\"{}\"\r\n\r\n", nonce(0x11, 2)).as_bytes());
+    original.apply_success(format!("SIP/2.0 200 OK\r\nAuthentication-Info: nextnonce=\"{}\"\r\n\r\n", nonce(0x11, 2)).as_bytes()).unwrap();
     assert_eq!(original.nonce_count, 0);
     assert_eq!(live_digest_challenge_action(&challenge(0x11, 3, true), Some(&original)).unwrap_err().code(), "digest_stale_without_context");
     assert!(original.authorization("user", "sip:ims.invalid").unwrap().contains("nc=00000001"));

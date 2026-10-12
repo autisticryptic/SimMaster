@@ -170,6 +170,11 @@ pub trait RegisterAuthenticator<C>: Send
 where
     C: ImsChannel,
 {
+    /// Bind retained proof context to the final serialized request before any
+    /// send. Access-owned exchanges must call this (or their equivalent) before
+    /// sending too; a builder's intended URI is not the actual wire request.
+    fn validate_request(&self, _request: &[u8]) -> Result<(), ImsError> { Ok(()) }
+
     /// Validate a final success before the driver exposes it as a registered
     /// binding. AUTS-only responses and response-authentication failures must
     /// not commit a lease/security state merely because the SIP status is 2xx.
@@ -336,7 +341,11 @@ impl RegisterFailure {
             | "ims_register_initial_min_expires_exhausted" | "ims_register_initial_min_expires_unsupported"
             | "ims_register_authenticated_min_expires_invalid" | "ims_register_authenticated_min_expires_exhausted"
             | "ims_register_authenticated_min_expires_unsupported");
-        let kind = if transport {
+        let kind = if code.starts_with("digest_response_auth_") {
+            // A 2xx with invalid server authentication is not a successful
+            // registration, transport loss or a header-compatibility hint.
+            Kind::AuthenticationRejected
+        } else if transport {
             Kind::Transport
         } else if matches!(code,
             "ims_outbound_flow_failed" | "ims_outbound_keepalive_timeout"
@@ -457,6 +466,8 @@ where
 {
     budget.minimum = sip_frame::header_value(initial_request, "Expires")
         .and_then(|value| value.trim().parse::<u32>().ok());
+    authenticator.validate_request(initial_request)
+        .map_err(|error| RegisterFailure::new(error, None, 0))?;
     let mut response = send_register_and_receive(
         channel,
         initial_request,
@@ -505,6 +516,8 @@ where
                         .map_err(|error| {
                             RegisterFailure::new(error, Some(response.clone()), auth_rounds)
                         })?;
+                    authenticator.validate_request(&request)
+                        .map_err(|error| RegisterFailure::new(error, Some(response.clone()), auth_rounds))?;
                     response = send_register_and_receive(
                         channel,
                         &request,
@@ -560,6 +573,8 @@ where
                         "ims_register_authenticated_unexpected_status",
                     )
                 };
+                authenticator.validate_request(&request)
+                    .map_err(|error| RegisterFailure::new(error, Some(response.clone()), auth_rounds))?;
                 response = send_register_and_receive(
                     channel,
                     &request,
@@ -910,6 +925,85 @@ mod tests {
                 assert_eq!(failure.auth_rounds, 1);
             }
             assert_eq!(channel.sends.len(), 2);
+        }
+    }
+
+    struct RequestContextGuard;
+
+    impl RegisterAuthenticator<FakeChannel> for RequestContextGuard {
+        fn validate_request(&self, request: &[u8]) -> Result<(), ImsError> {
+            if request.ends_with(b"invalid-context") {
+                Err(ImsError::new("digest_request_auth_mismatch"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn authenticated_request(&mut self, _: &[u8], _: u32) -> Result<Vec<u8>, ImsError> {
+            Ok(b"REGISTER invalid-context".to_vec())
+        }
+
+        async fn rebuild_register_with_min_expires(
+            &mut self, _: &[u8], _: u32, _: u32, _: bool,
+        ) -> Result<Vec<u8>, ImsError> {
+            Ok(b"REGISTER invalid-context".to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn request_context_is_checked_before_initial_auth_and_423_sends() {
+        for status in [200, 401, 423] {
+            let mut channel = FakeChannel {
+                responses: VecDeque::from([response_with_header(status, "Test", "Min-Expires: 3600\r\n")]),
+                requeued: VecDeque::new(), sends: Vec::new(), transport: SipTransport::Tcp,
+            };
+            let initial: &[u8] = if status == 200 { b"REGISTER invalid-context" } else { b"REGISTER initial" };
+            let failure = run_register_observed(&mut channel, initial, &mut RequestContextGuard)
+                .await.unwrap_err();
+            assert_eq!(failure.error.code(), "digest_request_auth_mismatch");
+            assert_eq!(channel.sends.len(), usize::from(status != 200));
+            assert_eq!(failure.auth_rounds, u8::from(status == 401));
+            assert!(!failure.metadata().permits_variant_fallback());
+        }
+    }
+
+    struct ResponseProofGuard;
+
+    impl RegisterAuthenticator<FakeChannel> for ResponseProofGuard {
+        fn validate_success(&self, _: &[u8]) -> Result<(), ImsError> {
+            Err(ImsError::new("digest_response_auth_mismatch"))
+        }
+
+        async fn authenticated_request(&mut self, _: &[u8], _: u32) -> Result<Vec<u8>, ImsError> {
+            Ok(b"REGISTER authenticated".to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_rspauth_is_authentication_failure_not_success_or_fallback() {
+        for challenged in [false, true] {
+            for unregister in [false, true] {
+                let mut responses = VecDeque::new();
+                if challenged { responses.push_back(response(401, "Unauthorized")); }
+                responses.push_back(response(200, "OK"));
+                let mut channel = FakeChannel {
+                    responses, requeued: VecDeque::new(), sends: Vec::new(), transport: SipTransport::Tcp,
+                };
+                if unregister {
+                    assert_eq!(run_unregister(&mut channel, b"REGISTER removal", &mut ResponseProofGuard).await,
+                        UnregisterResult::Rejected);
+                } else {
+                    let failure = run_register_observed(&mut channel, b"REGISTER initial", &mut ResponseProofGuard)
+                        .await.unwrap_err();
+                    let metadata = failure.metadata();
+                    assert_eq!(metadata.sip_status, Some(200));
+                    assert_eq!(metadata.kind, RegisterFailureKind::AuthenticationRejected);
+                    assert!(!metadata.is_temporary() && !metadata.permits_variant_fallback());
+                    assert_eq!(super::super::registration::RegistrationLossReason::from_register_failure(&failure),
+                        super::super::registration::RegistrationLossReason::AuthenticationRejected);
+                }
+                assert_eq!(channel.sends.len(), if challenged { 2 } else { 1 });
+            }
         }
     }
 

@@ -13,6 +13,12 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
 use super::ImsError;
 
+#[path = "digest_response_auth.rs"]
+pub mod response_auth;
+pub use response_auth::{
+    validate_response_authentication, DigestRequestProof, VerifiedAuthenticationInfo,
+};
+
 /// AKA key material produced by a USIM AUTHENTICATE run. Mirrors
 /// `vowifi::qmi_uim::UsimAkaApduResult` structurally so either leg can pass its
 /// own result in by value/ref via `AkaMaterial`.
@@ -256,9 +262,13 @@ pub fn build_authorization_header(
 
 /// Extract the `nextnonce` value from one `Authentication-Info` field.
 ///
+/// Legacy extraction helper, **not** a response authentication validator.
+/// Production success paths must use [`validate_response_authentication`] before
+/// applying nextnonce or any registration/security state. This helper neither
+/// binds a request/scope nor detects malformed/duplicate fields or rspauth.
+///
 /// Authentication-Info is a comma-separated auth-param list and values may be
-/// quoted. We intentionally return only `nextnonce`; callers must recompute the
-/// digest response with it instead of editing an old Authorization header.
+/// quoted. Kept for compatibility tests only.
 pub fn parse_authentication_info_nextnonce(value: &str) -> Option<String> {
     let mut in_quote = false;
     let mut escaped = false;

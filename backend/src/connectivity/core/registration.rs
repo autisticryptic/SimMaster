@@ -128,7 +128,9 @@ impl RegistrationLossReason {
     /// failure. Authentication challenges are kept separate so callers can
     /// avoid retrying a rejected SIM credential indefinitely.
     pub fn from_register_failure(failure: &RegisterFailure) -> Self {
-        if failure.error.code() == "ims_register_auth_rejected" {
+        if failure.error.code() == "ims_register_auth_rejected"
+            || failure.metadata().kind == super::register::RegisterFailureKind::AuthenticationRejected
+        {
             return Self::AuthenticationRejected;
         }
 
