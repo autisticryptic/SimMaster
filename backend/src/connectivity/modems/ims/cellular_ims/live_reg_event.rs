@@ -79,7 +79,9 @@ pub(super) async fn poll(live: &CellularImsLiveHandle, runtime: &CellularImsRunt
 }
 
 async fn authorize(
-    session: &CellularImsLiveSession,
+    device: CellularImsDeviceBinding,
+    aid: Vec<u8>,
+    username: String,
     challenge: &crate::connectivity::core::digest_aka::DigestChallenge,
     uri: &str,
 ) -> Result<String, ImsError> {
@@ -87,8 +89,6 @@ async fn authorize(
     // a UICC vector or borrow REGISTER's credentials. Observation may stop.
     if challenge.stale { return Err(ImsError::new("ims_reg_event_auth_unavailable")); }
     let vector = digest_aka::decode_aka_nonce(&challenge.nonce).map_err(to_ims_error)?;
-    let device = session.device.clone();
-    let aid = session.aka_aid.clone();
     let aka = tokio::task::spawn_blocking(move || identity::run_usim_aka(
         QMI_PROXY_SOCKET, &device.qmi_device, device.uim_slot, &aid, &vector.rand, &vector.autn,
         2, Duration::from_secs(5), Duration::from_millis(300),
@@ -97,11 +97,11 @@ async fn authorize(
     if aka.auts.is_some() { return Err(ImsError::new("ims_reg_event_auth_unavailable")); }
     let cnonce = sip::hex_token(8);
     let proof = digest_aka::compute_aka_response(
-        &session.registration_identity.private_user, &challenge.realm, &aka,
+        &username, &challenge.realm, &aka,
         &challenge.algorithm, "SUBSCRIBE", uri, &challenge.nonce,
         challenge.qop.as_deref(), &cnonce, "00000001",
     ).map_err(to_ims_error)?;
-    Ok(digest_aka::build_authorization_header(challenge, &session.registration_identity.private_user,
+    Ok(digest_aka::build_authorization_header(challenge, &username,
         uri, &proof, &cnonce, "00000001"))
 }
 
@@ -135,7 +135,9 @@ pub(super) async fn on_frame(
             if session.reg_event.revoked { return Ok(true); }
             let uri = session.reg_event.subscription.as_ref().expect("challenge subscription")
                 .request_uri().to_owned();
-            let authorization = tokio::time::timeout(Duration::from_secs(12), authorize(session, &challenge, &uri))
+            let authorization = tokio::time::timeout(Duration::from_secs(12), authorize(
+                session.device.clone(), session.aka_aid.clone(), session.registration_identity.private_user.clone(),
+                &challenge, &uri))
                 .await.ok().and_then(Result::ok);
             if authorization.is_none() || !tokio::time::timeout(Duration::from_secs(8), owner_valid(session, runtime))
                 .await.is_ok_and(|result| result.is_ok())

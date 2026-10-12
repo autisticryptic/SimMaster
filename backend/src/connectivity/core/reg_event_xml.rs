@@ -233,7 +233,7 @@ fn tree(body: &[u8]) -> Result<Node, ImsError> {
                 append(node, &mut stack, &mut root)?;
             }
             Event::Text(text) => {
-                if text.as_ref().windows(3).any(|w| w == b"]]>") { return Err(invalid()); }
+                if text.windows(3).any(|w| w == b"]]>") { return Err(invalid()); }
                 if stack.is_empty() { prolog_content = true; }
                 let text = text.unescape().map_err(|_| invalid())?;
                 if text.chars().any(|c| !xml_char(c)) { return Err(invalid()); }
@@ -259,7 +259,7 @@ fn tree(body: &[u8]) -> Result<Node, ImsError> {
             }
             Event::Comment(comment) => {
                 if stack.is_empty() { prolog_content = true; }
-                if comment.as_ref().windows(2).any(|w| w == b"--") { return Err(invalid()); }
+                if comment.windows(2).any(|w| w == b"--") { return Err(invalid()); }
             }
             Event::Eof => break,
             Event::DocType(_) | Event::PI(_) => return Err(invalid()),
