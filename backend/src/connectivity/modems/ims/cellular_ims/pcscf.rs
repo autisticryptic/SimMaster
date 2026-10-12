@@ -983,7 +983,7 @@ pub async fn discover_pcscf_endpoints_with_transport_in_worker(
         |server, name, kind| async move {
             query_dns(local, server, &name, kind, interface, worker).await
         },
-        endpoint::DiscoveryLimits { requested_transport, ..endpoint::DiscoveryLimits::default() },
+        endpoint::DiscoveryLimits::for_transport(requested_transport),
     )
     .await
 }

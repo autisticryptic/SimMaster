@@ -271,6 +271,12 @@ pub(super) struct DiscoveryLimits {
     pub(super) requested_transport: PcscfTransport,
 }
 
+impl DiscoveryLimits {
+    pub(super) fn for_transport(requested_transport: PcscfTransport) -> Self {
+        Self { requested_transport, ..Self::default() }
+    }
+}
+
 impl Default for DiscoveryLimits {
     fn default() -> Self {
         Self {
