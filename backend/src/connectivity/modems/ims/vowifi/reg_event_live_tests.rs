@@ -95,6 +95,20 @@ async fn reg_event_long_wait_is_stopped_and_new_sim_does_not_inherit_it() {
 }
 
 #[tokio::test]
+async fn reg_event_same_sim_reenumeration_does_not_clear_network_wait() {
+    let (line, factory, _) = fixture().await;
+    factory.reg_event_loss(Some(300)).await;
+    let context = &factory.context;
+    let new_card = crate::connectivity::modems::ims::uicc_ims::UiccCardBinding {
+        endpoint: format!("/renumbered/{line}"), slot: 1, owner: "new-modem-owner".into(),
+        iccid: "test-card".into(), imsi: "001010000000001".into(),
+    };
+    let selected = live_identity::selection_for_test(&line, context.identity.clone(), context.target.clone(), new_card);
+    assert!(live_reg_event_retry_remaining_for_line(&line).await.unwrap() > Duration::from_secs(290));
+    assert!(accepted_owner(&line, &selected).await.is_err());
+}
+
+#[tokio::test]
 async fn reg_event_stale_factory_cannot_clear_replacement_runtime_or_bindings() {
     let (line, old, runtime) = fixture().await;
     let (new, profile, context) = owner(&line, "test-card");

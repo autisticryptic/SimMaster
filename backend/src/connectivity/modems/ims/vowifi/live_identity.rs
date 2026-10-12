@@ -16,15 +16,15 @@ impl LiveImsSelection {
     /// Network retry scope follows the physical subscription, not an MM owner
     /// generation or a freshly allocated selection Arc.
     pub(super) fn same_subscription(&self, other: &Self) -> bool {
-        self.card.endpoint == other.card.endpoint && self.card.slot == other.card.slot
-            && self.card.iccid == other.card.iccid && self.card.imsi == other.card.imsi
+        self.card.slot == other.card.slot && self.card.iccid == other.card.iccid && self.card.imsi == other.card.imsi
     }
 
     pub(super) async fn subscription_is_current(&self, line_id: &str) -> Result<bool, &'static str> {
-        if sim_device_for_line(line_id) != self.device { return Ok(false); }
-        let observed = self.observe(line_id).await?;
-        Ok(self.card.endpoint == observed.endpoint && self.card.slot == observed.slot
-            && self.card.iccid == observed.iccid && self.card.imsi == observed.imsi)
+        let device = sim_device_for_line(line_id);
+        let endpoint = if device.pcsc_reader.is_empty() { &device.qmi_device } else { &device.pcsc_reader };
+        let observed = uicc_ims::capture_card_binding(endpoint, device.uim_slot, &device.modem_path).await?;
+        // Renumbered control ports or MM objects are not evidence of a new SIM.
+        Ok(self.card.slot == observed.slot && self.card.iccid == observed.iccid && self.card.imsi == observed.imsi)
     }
 
     pub fn verify_reader_mapping(&self, line_id: &str) -> Result<(), &'static str> {
