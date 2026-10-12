@@ -175,6 +175,10 @@ static LIVE_TUN_GATEWAY: OnceLock<Mutex<HashMap<String, Arc<TunGatewayRuntime>>>
 // it holds a live TCP socket, so line B's REGISTER could reuse or close line A's
 // connection. The `profile_id` check inside each entry is retained as a staleness
 // guard for when a line switches carriers.
+#[path = "reg_event_live.rs"]
+mod reg_event_live;
+pub(crate) use reg_event_live::{bind_reg_event_runtime, live_reg_event_retry_remaining_for_line};
+
 static LIVE_IMS_REGISTER_READY: OnceLock<Mutex<HashMap<String, LiveImsRegisterReady>>> =
     OnceLock::new();
 static LIVE_IMS_SECURITY_VERIFY: OnceLock<Mutex<HashMap<String, LiveImsSecurityVerify>>> =
@@ -2606,6 +2610,7 @@ impl LiveDatagramAdapter for SystemLiveDatagramAdapter {
         profile: &'static CarrierProfile,
     ) -> Pin<Box<dyn Future<Output = Result<(), LiveStageError>> + Send + 'a>> {
         Box::pin(async move {
+            reg_event_live::check_retry_gate(&self.line_id).await?;
             match stage {
                 ExecutorStage::Ike => run_live_ike_until(
                     &self.line_id,
@@ -3816,6 +3821,8 @@ async fn run_live_ims_register_until(
     profile: &'static CarrierProfile,
     access_network: &ImsAccessNetworkRuntime,
 ) -> Result<(), LiveStageError> {
+    // No reconnect/profile/worker may bypass a reginfo probation/rejected wait.
+    reg_event_live::check_retry_gate(line_id).await?;
     // Every REGISTER path (restore, SMS, voice and stage diagnostics) shares
     // admission with LTE. Hold it through the exchange to serialize a policy
     // switch against an already-running registration.
@@ -4545,6 +4552,7 @@ async fn record_live_ims_register_ready(
     sms_capability_advertised: bool,
     registration: RegisteredImsContext,
 ) {
+    if reg_event_live::registration_revoked(line_id).await { return; }
     let ttl = registration.lease.refresh_after;
     let expires_seconds = registration.lease.expires_seconds;
     ims_register_ready_cache().lock().await.insert(
@@ -4571,6 +4579,7 @@ async fn record_live_ims_register_ready(
 }
 
 async fn cached_live_ims_register_ready(line_id: &str, profile: &'static CarrierProfile) -> bool {
+    if reg_event_live::registration_revoked(line_id).await { return false; }
     ims_register_ready_cache()
         .lock()
         .await
@@ -4596,6 +4605,7 @@ pub(crate) async fn live_ims_registration_refresh_due_for_line(line_id: &str) ->
 /// A refresh becoming due does not release the registered access. Use the
 /// full lease on the monotonic clock, not cached_live_ims_register_ready.
 pub(crate) async fn live_ims_registration_valid_for_line(line_id: &str) -> bool {
+    if reg_event_live::registration_revoked(line_id).await { return false; }
     ims_register_ready_cache()
         .lock()
         .await
@@ -4763,6 +4773,7 @@ async fn record_live_ims_channel(
     )) as Arc<dyn OperatorSocketCreator>;
     let uicc = register_context.uicc.clone().ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?;
     uicc.verify(line_id).await.map_err(live_stage_error)?;
+    reg_event_live::accepted_owner(line_id, &uicc).await?;
     xcap_binding_cache().lock().await.insert(
         line_id.to_string(),
         LiveXcapBinding {
@@ -8718,6 +8729,20 @@ impl RegisterAuthenticator<SipChannel> for VowifiRefreshAuthenticator<'_> {
 }
 
 impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
+    fn reg_event_owner_valid<'a>(&'a self) -> futures_util::future::BoxFuture<'a, Result<(), ImsError>> {
+        Box::pin(self.reg_event_check_owner())
+    }
+
+    fn reg_event_authorize<'a>(&'a self,
+        challenge: &'a crate::connectivity::core::digest_aka::DigestChallenge, uri: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Result<String, ImsError>> {
+        Box::pin(self.reg_event_proof(challenge, uri))
+    }
+
+    fn reg_event_terminated<'a>(&'a self, retry_after: Option<u32>) -> futures_util::future::BoxFuture<'a, ()> {
+        Box::pin(self.reg_event_loss(retry_after))
+    }
+
     fn validate_request(&self, request: &[u8]) -> Result<(), ImsError> {
         let auth = self.unregister_authorization.lock().unwrap_or_else(|e| e.into_inner());
         validate_live_register_request(auth.as_ref(), request)

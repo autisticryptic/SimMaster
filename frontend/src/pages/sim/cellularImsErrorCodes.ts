@@ -93,6 +93,7 @@ export const CELLULAR_IMS_ERROR_CODES = [
   'cellular_ims_profile_source_unsupported',
   'cellular_ims_qmi_device_missing',
   'cellular_ims_random_failed',
+  'cellular_ims_reg_event_binding_terminated',
   'cellular_ims_register_auth_not_prepared',
   'cellular_ims_register_auth_send_failed',
   'cellular_ims_register_auth_unexpected_status',

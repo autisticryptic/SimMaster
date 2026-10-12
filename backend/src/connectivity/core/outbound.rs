@@ -13,6 +13,7 @@ use super::{
     ims_access::ImsAccess,
     ims_registration_coordinator::{self, ImsRegistrationCoordinator},
     register::RegisterTransactionKey,
+    reg_event::RegEventBinding,
     register_response::{name_addr_range, split_sip_list, split_sip_parameters, RegisterArtifacts},
     sip_frame, ImsError,
 };
@@ -127,6 +128,9 @@ pub struct OutboundFlow {
     offer: Option<Offer>,
     last_request: Option<Vec<u8>>,
     last_source: Option<Vec<u8>>,
+    /// Only the sanitized identity of an accepted FINAL wire REGISTER. The
+    /// subscription must not infer its Contact from a business alias/template.
+    reg_event_binding: Option<RegEventBinding>,
     lease: Option<Arc<FlowLease>>,
     tcp: bool,
     timer: Option<u32>,
@@ -364,6 +368,10 @@ impl OutboundFlow {
             self.next_probe = None;
             self.pending = None;
         }
+        // Observation is optional for a legacy/custom Contact the reg-event
+        // parser cannot represent. Never fail a valid REGISTER just to enable
+        // this extra feature, nor retain an older binding on parse ambiguity.
+        self.reg_event_binding = RegEventBinding::from_register_request(request).ok();
         tracing::info!(
             access = offer.access.as_str(),
             offered,
@@ -381,6 +389,11 @@ impl OutboundFlow {
         Ok(artifacts)
     }
 
+    pub fn reg_event_binding(&self) -> Option<RegEventBinding> {
+        self.lease.as_ref().filter(|lease| lease.live())
+            .and(self.reg_event_binding.as_ref()).cloned()
+    }
+
     pub fn active(&self) -> bool {
         self.next_probe.is_some() || self.pending.is_some()
     }
@@ -391,6 +404,7 @@ impl OutboundFlow {
             .or(self.next_probe)
     }
     pub fn disable(&mut self) {
+        self.reg_event_binding = None;
         if let Some(lease) = self.lease.take() {
             lease.invalidate();
         }

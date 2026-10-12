@@ -7142,6 +7142,7 @@ fn spawn_pending_vowifi_rebuild(app: &AppState, line_id: &str) {
         tokio::task::yield_now().await;
         if !live_ims_refresh_rebuild_pending_for_line(&line_id).await
             || line_has_protected_active_call(&app, &line_id).await
+            || crate::connectivity::modems::ims::vowifi::live::live_reg_event_retry_remaining_for_line(&line_id).await.is_some()
         {
             return;
         }
@@ -7156,6 +7157,7 @@ fn spawn_pending_vowifi_rebuild(app: &AppState, line_id: &str) {
         {
             let _transition = scope.line.ims_registration.transition_lock.lock().await;
             if line_has_call_blocking_ims_switch(&app, &line_id).await
+                || crate::connectivity::modems::ims::vowifi::live::live_reg_event_retry_remaining_for_line(&line_id).await.is_some()
                 || !apply_line_ims_access_policy_locked(
                     &app,
                     scope.line(),
@@ -7937,6 +7939,16 @@ async fn connect_vowifi_on_line(
 ) -> VowifiStatusResponse {
     if !scope.is_present() {
         return disabled_vowifi_status("vowifi_line_not_present");
+    }
+    if let Some(wait) = crate::connectivity::modems::ims::vowifi::live::live_reg_event_retry_remaining_for_line(scope.line_id()).await {
+        let mut status = scope.status().await;
+        status.degraded_reason = Some(if wait == std::time::Duration::MAX {
+            "ims_reg_event_recovery_stopped".to_string()
+        } else {
+            format!("ims_reg_event_recovery_wait:retry_after_seconds={}", wait.as_secs().saturating_add(1))
+        });
+        persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
+        return status;
     }
     let Ok(_transition_guard) = scope.line.ims_registration.transition_lock.try_lock() else {
         let mut status = scope.status().await;

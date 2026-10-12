@@ -19,6 +19,8 @@ mod security_hint;
 mod register_failure_diagnostics;
 #[path = "live_retry.rs"]
 mod live_retry;
+#[path = "live_reg_event.rs"]
+mod live_reg_event;
 
 #[cfg(test)]
 pub(crate) mod offline_sim_adapter {
@@ -312,6 +314,7 @@ impl CellularImsLiveHandle {
     pub async fn live_xcap_access(&self) -> Option<XcapAccessContext> {
         let session = self.session.lock().await;
         let session = session.as_ref()?;
+        if session.reg_event.revoked { return None; }
         Some(XcapAccessContext {
             access: ImsRegistrationAccess::CellularIms,
             profile: session.profile,
@@ -497,6 +500,7 @@ struct CellularImsLiveSession {
     media_operator_creator: Arc<dyn OperatorSocketCreator>,
     voice_calls: HashMap<String, LiveVoiceCall>,
     mwi_subscription: Option<MwiSubscription>,
+    reg_event: live_reg_event::Observer,
 }
 
 async fn bind_cellular_ims_operator_relay(
@@ -3832,6 +3836,7 @@ async fn connect_family(
             media_operator_creator,
             voice_calls: HashMap::new(),
             mwi_subscription: None,
+            reg_event: live_reg_event::Observer::default(),
         });
     }
     Err(last_error
@@ -3904,6 +3909,7 @@ async fn unregister_live_session(
     let Some(session) = sessions.as_mut() else {
         return UnregisterResult::AlreadyExpired;
     };
+    if session.reg_event.revoked { return UnregisterResult::AlreadyExpired; }
     if session
         .registration
         .registered_at
@@ -4024,6 +4030,7 @@ async fn start_live_listener(
 }
 
 async fn start_cellular_ims_mwi_subscription(live: &CellularImsLiveHandle) {
+    if live.session.lock().await.as_ref().is_some_and(|session| session.reg_event.revoked) { return; }
     let Some(runtime) = live.supplementary_runtime() else {
         return;
     };
@@ -4120,6 +4127,7 @@ async fn live_receive_loop(
 ) {
     let mut reassembler = MtReassembler::new();
     let mut operator_commands = live.operator.subscribe_commands();
+    live_reg_event::poll(&live, &runtime).await;
     start_cellular_ims_mwi_subscription(&live).await;
     let mut options_cseq = 1u32;
     let mut options_due = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -4177,6 +4185,20 @@ async fn live_receive_loop(
             cleanup_live_session_with_binding(&live, legacy_cleanup).await;
             break;
         }
+        let (reg_event_revoked, calls_drained) = {
+            let sessions = live.session.lock().await;
+            let Some(session) = sessions.as_ref() else { break; };
+            (session.reg_event.revoked, session.voice_calls.is_empty())
+        };
+        if reg_event_revoked {
+            pending_options = None;
+            if calls_drained {
+                cleanup_live_session(&live).await;
+                break;
+            }
+        } else {
+            live_reg_event::poll(&live, &runtime).await;
+        }
         if let Some(pending) = pending_options.as_ref() {
             if tokio::time::Instant::now() >= pending.deadline {
                 pending_options = None;
@@ -4199,7 +4221,7 @@ async fn live_receive_loop(
                 }
             }
         }
-        if pending_options.is_none() && tokio::time::Instant::now() >= options_due {
+        if !reg_event_revoked && pending_options.is_none() && tokio::time::Instant::now() >= options_due {
             let (call_id, cseq, send_result) = {
                 let mut sessions = live.session.lock().await;
                 let Some(session) = sessions.as_mut() else {
@@ -4256,7 +4278,7 @@ async fn live_receive_loop(
             start_cellular_ims_mwi_subscription(&live).await;
             continue;
         }
-        if tokio::time::Instant::now() >= refresh_at {
+        if !reg_event_revoked && tokio::time::Instant::now() >= refresh_at {
             let refresh_result = {
                 let mut sessions = live.session.lock().await;
                 match sessions.as_mut() {
@@ -4509,6 +4531,12 @@ async fn refresh_live_registration(
     line_id: &str,
     database: &Database,
 ) -> CellularImsRefreshAttempt {
+    if session.reg_event.revoked {
+        return CellularImsRefreshAttempt {
+            outcome: RegistrationRefreshResult::RebuildAccess(RegistrationLossReason::NetworkRejected),
+            error: Some(CellularImsError::new(code::REG_EVENT_BINDING_TERMINATED)), retry_after: None,
+        };
+    }
     if let Err(error) = verify_mm_task_bearer(runtime, session.native_bearer.as_mut()).await {
         return lost_refresh_attempt(error);
     }
@@ -5290,6 +5318,9 @@ async fn handle_operator_command_inner(
     let session = sessions
         .as_mut()
         .ok_or_else(|| CellularImsError::new(code::RUNTIME_NOT_REGISTERED))?;
+    if session.reg_event.revoked && matches!(command, OperatorCommand::StartCall { .. }) {
+        return Err(CellularImsError::new(code::REG_EVENT_BINDING_TERMINATED));
+    }
     let frame = match command {
         OperatorCommand::StartCall {
             call_id,
@@ -7109,6 +7140,18 @@ async fn handle_live_frame(
         notification_sender,
         dedupe_enabled,
     } = context;
+    if live_reg_event::on_frame(live, runtime, frame).await? { return Ok(()); }
+    let reject_new = {
+        let sessions = live.session.lock().await;
+        sessions.as_ref().is_some_and(|session| session.reg_event.revoked &&
+            (sip::is_request(frame, "MESSAGE") || (sip::is_request(frame, "INVITE") &&
+                !sip::header_value(frame, "Call-ID").is_some_and(|id| session.voice_calls.contains_key(&id)))))
+    };
+    if reject_new {
+        let response = sip::build_response(frame, 480, "Temporarily Unavailable", None, None, None);
+        send_live_frame(live, runtime, &response).await?;
+        return Ok(());
+    }
     if handle_cellular_ims_mwi_frame(live, runtime, frame).await? {
         return Ok(());
     }
@@ -7510,6 +7553,7 @@ pub async fn send_live_sms_for_line(
         let session = sessions
             .as_mut()
             .ok_or_else(|| CellularImsError::new(code::RUNTIME_NOT_REGISTERED))?;
+        if session.reg_event.revoked { return Err(CellularImsError::new(code::REG_EVENT_BINDING_TERMINATED)); }
         let (service_center_uri, recipient_uri) =
             mo_sms_uris(recipient, service_center, &session.identity.home_domain)?;
         let frame = sip::build_sms_message(
@@ -9570,6 +9614,7 @@ mod tests {
             ),
             voice_calls: HashMap::new(),
             mwi_subscription: None,
+            reg_event: live_reg_event::Observer::default(),
         });
         (live, Arc::new(CellularImsRuntime::new()), pcscf)
     }

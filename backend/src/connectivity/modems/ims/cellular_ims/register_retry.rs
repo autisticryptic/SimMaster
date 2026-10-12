@@ -73,6 +73,9 @@ pub(super) struct EndpointRetryState {
     /// forget the newest refusal. One bounded latch stops the entire scope.
     stopped: Option<RetryStopReason>,
     restart: Option<RetryAdmission>,
+    /// Subscription-scope reg-event wait cannot be cleared by an endpoint
+    /// handoff, an exhausted candidate batch, or a late success on an old flow.
+    registration_event_wait: Option<RetryAdmission>,
 }
 
 impl EndpointRetryState {
@@ -90,17 +93,19 @@ impl EndpointRetryState {
             self.entries.first().map(|entry| entry.admission).unwrap_or(RetryAdmission::Allowed)
         };
         self.restart = Some(admission);
-        admission
+        self.restart_admission(now)
     }
 
     pub(super) fn restart_admission(&mut self, now: Instant) -> RetryAdmission {
-        match self.restart.unwrap_or(RetryAdmission::Allowed) {
-            RetryAdmission::Deferred { not_before } if not_before <= now => {
-                self.restart = None;
-                RetryAdmission::Allowed
+        for slot in [&mut self.restart, &mut self.registration_event_wait] {
+            if slot.is_some_and(|admission| matches!(admission,
+                RetryAdmission::Deferred { not_before } if not_before <= now))
+            {
+                *slot = None;
             }
-            admission => admission,
         }
+        merge_admission(self.restart.unwrap_or(RetryAdmission::Allowed),
+            self.registration_event_wait.unwrap_or(RetryAdmission::Allowed))
     }
 
     pub(super) fn registered(&mut self) { self.restart = None; }
@@ -159,6 +164,32 @@ impl EndpointRetryState {
                 _ => return current,
             },
         };
+        self.defer_delay(endpoint, delay, now)
+    }
+
+    /// A validated reg-event removes our binding, not a transport endpoint.
+    /// Preserve its wait across the entire next bearer/profile batch so moving
+    /// to another P-CSCF or worker cannot bypass S-CSCF probation/retry-after.
+    pub(super) fn observe_registration_event(
+        &mut self,
+        endpoint: SocketAddr,
+        retry_after_seconds: Option<u32>,
+        now: Instant,
+    ) -> RetryAdmission {
+        let endpoint = canonical_endpoint(endpoint);
+        let admission = self.defer_delay(endpoint,
+            retry_after_seconds.map(|seconds| Duration::from_secs(u64::from(seconds)))
+                .unwrap_or(TEMPORARY_ENDPOINT_DELAY), now);
+        self.restart_admission(now); // discard only genuinely expired waits
+        self.registration_event_wait = Some(merge_admission(
+            self.registration_event_wait.unwrap_or(RetryAdmission::Allowed), admission,
+        ));
+        self.restart_admission(now)
+    }
+
+    fn defer_delay(&mut self, endpoint: SocketAddr, delay: Duration, now: Instant) -> RetryAdmission {
+        let current = self.check(endpoint, now);
+        if matches!(current, RetryAdmission::Stopped(_)) { return current; }
         if delay > MAX_ENDPOINT_RETRY_DELAY {
             return self.record(endpoint, RetryAdmission::Stopped(RetryStopReason::RetryAfterTooLong), now);
         }
@@ -210,6 +241,16 @@ impl EndpointRetryState {
         }
         refresh_wait_decision(admission, now, remaining_old_lifetime)
             .unwrap_or(RefreshRetryDecision::RetainUntilExpiry(remaining_old_lifetime))
+    }
+}
+
+fn merge_admission(first: RetryAdmission, second: RetryAdmission) -> RetryAdmission {
+    match (first, second) {
+        (stopped @ RetryAdmission::Stopped(_), _) | (_, stopped @ RetryAdmission::Stopped(_)) => stopped,
+        (RetryAdmission::Deferred { not_before: old }, RetryAdmission::Deferred { not_before: new }) =>
+            RetryAdmission::Deferred { not_before: old.max(new) },
+        (deferred @ RetryAdmission::Deferred { .. }, _) | (_, deferred @ RetryAdmission::Deferred { .. }) => deferred,
+        _ => RetryAdmission::Allowed,
     }
 }
 

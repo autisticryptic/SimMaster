@@ -221,6 +221,7 @@ impl LineRuntime {
             &binding.line_id,
             ims_access_network.clone(),
         ));
+        crate::connectivity::modems::ims::vowifi::live::bind_reg_event_runtime(&binding.line_id, &vowifi);
         let supplementary = Arc::new(SupplementaryRuntime::for_line(&binding.line_id));
         cellular_ims_live.bind_supplementary(Arc::clone(&supplementary));
         crate::connectivity::modems::ims::vowifi::operator::bind_supplementary_for_line(

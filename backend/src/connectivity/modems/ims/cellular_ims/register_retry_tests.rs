@@ -29,6 +29,34 @@ fn parsed(value: &str) -> RetryAfter {
 }
 
 #[test]
+fn reg_event_wait_survives_other_endpoints_batch_restarts_and_late_success() {
+    let now = Instant::now();
+    let mut state = EndpointRetryState::default();
+    let expected = RetryAdmission::Deferred { not_before: now + Duration::from_secs(300) };
+    assert_eq!(state.observe_registration_event(endpoint(5060), Some(300), now), expected);
+    state.observe_failure(endpoint(5070), &failure(503, "Retry-After: 5\r\n", 0).metadata(), now);
+    assert_eq!(state.pause_restart(now), expected);
+    state.registered(); // a late result must not erase the event's scope wait
+    assert_eq!(state.restart_admission(now + Duration::from_secs(299)), expected);
+    assert_eq!(state.observe_registration_event(endpoint(5060), Some(1), now), expected);
+    assert_eq!(state.restart_admission(now + Duration::from_secs(300)), RetryAdmission::Allowed);
+}
+
+#[test]
+fn reg_event_wait_bounds_never_truncate_network_probation() {
+    let now = Instant::now();
+    let mut ordinary = EndpointRetryState::default();
+    assert_eq!(ordinary.observe_registration_event(endpoint(5060), None, now),
+        RetryAdmission::Deferred { not_before: now + Duration::from_secs(30) });
+    let mut stopped = EndpointRetryState::default();
+    let expected = RetryAdmission::Stopped(RetryStopReason::RetryAfterTooLong);
+    assert_eq!(stopped.observe_registration_event(endpoint(5060), Some(u32::MAX), now), expected);
+    stopped.registered();
+    assert_eq!(stopped.pause_restart(now), expected);
+    assert_eq!(stopped.restart_admission(now + Duration::from_secs(86_401)), expected);
+}
+
+#[test]
 fn register_retry_parser_accepts_seconds_comment_parameters_and_folding() {
     for value in [
         "30", " 30\t", "00030", "30 (maintenance)",

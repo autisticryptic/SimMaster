@@ -274,6 +274,16 @@ impl VowifiRuntime {
         self.snapshot.read().await.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn seed_registered_for_reg_event_test(&self) {
+        let mut snapshot = self.snapshot.write().await;
+        snapshot.profile.matched = true;
+        snapshot.live_readiness.ims_registered = true;
+        snapshot.live_readiness.sms_ready = true;
+        snapshot.live_readiness.voice_ready = true;
+        snapshot.live_readiness.normalize_protocol_prerequisites();
+    }
+
     pub async fn reset_runtime(&self, reason: impl Into<String>) -> RuntimeSnapshot {
         self.live_generation.fetch_add(1, Ordering::SeqCst);
         let mut snapshot = RuntimeSnapshot::default();

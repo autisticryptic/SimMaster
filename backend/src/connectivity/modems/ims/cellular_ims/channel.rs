@@ -580,6 +580,16 @@ impl CellularImsSipChannel {
             .configure(line_id, ImsAccess::Cellular, instance, enabled);
     }
 
+    pub fn reg_event_binding(&self) -> Option<crate::connectivity::core::reg_event::RegEventBinding> {
+        self.outbound.reg_event_binding()
+    }
+
+    /// Network removal invalidates only this registration's published proof;
+    /// retain sockets long enough to acknowledge NOTIFY and drain old dialogs.
+    pub fn invalidate_registration(&mut self) {
+        self.outbound.disable();
+    }
+
     pub fn outbound_registered(
         &mut self,
         response: &[u8],

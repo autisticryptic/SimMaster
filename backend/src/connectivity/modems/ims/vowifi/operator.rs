@@ -57,6 +57,12 @@ use crate::{
 use super::channel::EpdgSipChannel;
 use super::channel::SipChannel;
 
+#[path = "reg_event.rs"]
+mod reg_event;
+#[cfg(test)]
+#[path = "reg_event_tests.rs"]
+mod reg_event_tests;
+
 const CHANNEL_POLL: Duration = Duration::from_millis(500);
 const MWI_SUBSCRIBE_EXPIRES_SECONDS: u32 = 3600;
 const REINVITE_TIMEOUT: Duration = Duration::from_secs(32);
@@ -222,6 +228,23 @@ pub(crate) async fn refresh_registered_for_line(
 }
 
 pub(crate) trait RegisteredUnregister: Send + Sync {
+    /// Optional observer hooks default safely for legacy/mock registrations.
+    fn reg_event_owner_valid<'a>(&'a self) -> futures_util::future::BoxFuture<'a, Result<(), crate::connectivity::core::ImsError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn reg_event_authorize<'a>(
+        &'a self,
+        _challenge: &'a crate::connectivity::core::digest_aka::DigestChallenge,
+        _uri: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Result<String, crate::connectivity::core::ImsError>> {
+        Box::pin(async { Err(crate::connectivity::core::ImsError::new("ims_reg_event_auth_unavailable")) })
+    }
+
+    fn reg_event_terminated<'a>(&'a self, _retry_after: Option<u32>) -> futures_util::future::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
     fn validate_request(&self, _request: &[u8]) -> Result<(), crate::connectivity::core::ImsError> { Ok(()) }
 
     fn validate_success(&self, _response: &[u8]) -> Result<(), crate::connectivity::core::ImsError> { Ok(()) }
@@ -343,6 +366,9 @@ pub async fn install_registered_channel(context: RegisteredVoiceContext, channel
     let (replacement_tx, replacement_rx) = mpsc::unbounded_channel();
     let (unregister_tx, unregister_rx) = mpsc::unbounded_channel();
     let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
+    // Publish before spawning: an immediate reg NOTIFY must not be overwritten
+    // by a late optimistic set_ready(true) from the installer.
+    handle.link.set_ready(true);
     let task = tokio::spawn(async move {
         let line_id = registration.context.line_id.clone();
         let cleanup_supplementary = supplementary.clone();
@@ -382,7 +408,6 @@ pub async fn install_registered_channel(context: RegisteredVoiceContext, channel
         refresh_tx,
         task,
     });
-    handle.link.set_ready(true);
 }
 
 pub async fn disconnect_line(line_id: &str) -> UnregisterResult {
@@ -473,6 +498,7 @@ struct VoiceSession {
     next_options_cseq: u32,
     supplementary: Option<Arc<SupplementaryRuntime>>,
     mwi_subscription: Option<MwiSubscription>,
+    reg_event: reg_event::Observer,
 }
 
 struct MwiSubscription {
@@ -609,7 +635,9 @@ async fn run_session_with_initial_mwi_subscription(
         calls: HashMap::new(),
         supplementary,
         mwi_subscription: initial_mwi_subscription,
+        reg_event: reg_event::Observer::default(),
     };
+    reg_event::poll(&mut session).await;
     if session.mwi_subscription.is_none() {
         start_mwi_subscription(&mut session).await;
     }
@@ -632,6 +660,10 @@ async fn run_session_with_initial_mwi_subscription(
         }
         tokio::select! {
             Some(reply) = refresh_requests.recv() => {
+                if session.reg_event.revoked {
+                    let _ = reply.send(Err(crate::connectivity::core::ImsError::new(reg_event::LOSS_REASON)));
+                    continue;
+                }
                 let result = match session.context.unregister.clone() {
                     Some(factory) => factory.refresh(&mut session.channel).await,
                     None => Err(crate::connectivity::core::ImsError::new("vowifi_refresh_not_supported")),
@@ -706,6 +738,7 @@ async fn run_session_with_initial_mwi_subscription(
                 start_mwi_subscription(&mut session).await;
             },
             _ = maintenance.tick() => {
+                reg_event::poll(&mut session).await;
                 expire_renegotiations(&mut session, &link).await?;
             }
         }
@@ -714,7 +747,7 @@ async fn run_session_with_initial_mwi_subscription(
 }
 
 async fn unregister_registration(session: &mut VoiceSession) -> UnregisterResult {
-    if Instant::now() >= session.context.expires_at {
+    if session.reg_event.revoked || Instant::now() >= session.context.expires_at {
         return UnregisterResult::AlreadyExpired;
     }
     let Some(factory) = session.context.unregister.as_ref().cloned() else {
@@ -746,9 +779,12 @@ fn activate_registration(session: &mut VoiceSession, replacement: RegisteredChan
     session.next_options_ping = next_interval(session.context.options_ping_interval);
     session.next_options_cseq = 1;
     session.mwi_subscription = None;
+    // A replacement channel is a new owner even when Contact text is identical.
+    session.reg_event = reg_event::Observer::default();
 }
 
 async fn start_mwi_subscription(session: &mut VoiceSession) {
+    if session.reg_event.revoked { return; }
     let Some(runtime) = session.supplementary.as_ref().cloned() else {
         return;
     };
@@ -949,6 +985,7 @@ async fn handle_command_inner(
             offer,
             ..
         } => {
+            if session.reg_event.revoked { return Err(reg_event::LOSS_REASON.into()); }
             if offer.video.is_some() && !link.video_enabled() {
                 return Err("vowifi_video_feature_disabled".into());
             }
@@ -1374,6 +1411,7 @@ async fn handle_frame_inner(
     mt_sms: &broadcast::Sender<crate::connectivity::core::sms_codec::MtSmsDeliver>,
     frame: &[u8],
 ) -> Result<(), String> {
+    if reg_event::on_frame(session, link, frame).await? { return Ok(()); }
     let active_call_id = session
         .mwi_subscription
         .as_ref()
@@ -1522,6 +1560,15 @@ async fn handle_frame_inner(
                 notification: parsed.expect("accepted REFER notification must be parsed"),
             });
         }
+        return Ok(());
+    }
+
+    if session.reg_event.revoked && (sip_frame::is_request(frame, "MESSAGE")
+        || (sip_frame::is_request(frame, "INVITE") && trunk_call_id.is_none()))
+    {
+        let response = sip::build_response_for_access(frame, 480, "Temporarily Unavailable",
+            None, None, None, &session.context.user_agent);
+        session.channel.send_sip(&response).await.map_err(|error| error.code().to_string())?;
         return Ok(());
     }
 

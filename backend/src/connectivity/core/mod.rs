@@ -35,6 +35,7 @@ pub mod ims_video;
 pub mod media;
 pub mod outbound;
 pub mod own_numbers;
+pub mod reg_event;
 pub mod register;
 pub mod register_message;
 pub mod register_response;

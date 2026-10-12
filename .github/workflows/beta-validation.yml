@@ -184,6 +184,10 @@ jobs:
             connectivity::core::digest_aka::tests \
             connectivity::core::digest_aka::challenge_tests \
             connectivity::core::digest_aka::response_auth::tests \
+            connectivity::core::reg_event::tests \
+            connectivity::modems::ims::cellular_ims::live::live_reg_event::tests \
+            connectivity::modems::ims::vowifi::operator::reg_event_tests \
+            connectivity::modems::ims::vowifi::live::reg_event_live::tests \
             connectivity::core::register::tests \
             connectivity::core::registration::tests \
             connectivity::core::outbound::tests \

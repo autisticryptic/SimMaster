@@ -118,6 +118,7 @@ pub mod code {
     pub const DATA_SLOT_MODE_MISSING: &str = "cellular_ims_data_slot_mode_missing";
 
     // Registration.
+    pub const REG_EVENT_BINDING_TERMINATED: &str = "cellular_ims_reg_event_binding_terminated";
     pub const REGISTER_RETRY_DEFERRED: &str = "cellular_ims_register_retry_deferred";
     pub const REGISTER_RETRY_STOPPED: &str = "cellular_ims_register_retry_stopped";
     pub const REGISTER_SEND_FAILED: &str = "cellular_ims_register_send_failed";
@@ -367,6 +368,7 @@ pub mod code {
         PROFILE_SOURCE_UNSUPPORTED,
         QMI_DEVICE_MISSING,
         RANDOM_FAILED,
+        REG_EVENT_BINDING_TERMINATED,
         REGISTER_AUTH_NOT_PREPARED,
         REGISTER_AUTH_SEND_FAILED,
         REGISTER_AUTH_UNEXPECTED_STATUS,
@@ -559,7 +561,7 @@ mod tests {
         // Keep in step with the `pub const` count in `mod code`.
         assert_eq!(
             code::ALL.len(),
-            165,
+            166,
             "code::ALL is out of sync with mod code"
         );
         let mut seen = std::collections::BTreeSet::new();

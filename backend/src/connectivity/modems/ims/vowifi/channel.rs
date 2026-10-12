@@ -536,6 +536,22 @@ impl SipChannel {
         }
     }
 
+    /// The accepted FINAL wire REGISTER binding; never a business alias.
+    pub fn reg_event_binding(&self) -> Option<crate::connectivity::core::reg_event::RegEventBinding> {
+        match self {
+            Self::Tcp(c) => c.outbound.reg_event_binding(),
+            Self::Udp(c) => c.outbound.reg_event_binding(),
+        }
+    }
+
+    /// Revoke only this channel's registration proof, retaining dialog/media transport.
+    pub fn invalidate_registration(&mut self) {
+        match self {
+            Self::Tcp(c) => c.outbound.disable(),
+            Self::Udp(c) => c.outbound.disable(),
+        }
+    }
+
     pub fn outbound_active(&self) -> bool {
         match self {
             Self::Tcp(c) => c.outbound.active(),
