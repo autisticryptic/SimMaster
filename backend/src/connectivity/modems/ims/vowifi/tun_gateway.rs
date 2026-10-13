@@ -185,6 +185,9 @@ pub(crate) struct TunGatewayConfig {
     pub inner_prefix_len: Option<u8>,
     pub pcscf_addr: IpAddr,
     pub pcscf_addrs: Vec<IpAddr>,
+    pub diagnostic_requested_family: crate::connectivity::core::registration_diagnostics::IpFamily,
+    pub diagnostic_granted_family: crate::connectivity::core::registration_diagnostics::IpFamily,
+    pub diagnostic_pcscf_sources: Vec<(IpAddr, crate::connectivity::core::registration_diagnostics::FactSource)>,
     pub inbound_sa_identifier: u32,
     pub outbound_sa_identifier: u32,
     pub secrets: ChildSaSecretPair,
@@ -202,6 +205,9 @@ pub(crate) struct TunGatewayRuntime {
     inner_addr: IpAddr,
     pcscf_addr: IpAddr,
     pcscf_addrs: Vec<IpAddr>,
+    diagnostic_requested_family: crate::connectivity::core::registration_diagnostics::IpFamily,
+    diagnostic_granted_family: crate::connectivity::core::registration_diagnostics::IpFamily,
+    diagnostic_pcscf_sources: Vec<(IpAddr, crate::connectivity::core::registration_diagnostics::FactSource)>,
     started_at: Instant,
     ims_esp_policy: Arc<StdMutex<Option<ImsEspRuntimePolicy>>>,
     shutdown: Arc<AtomicBool>,
@@ -265,6 +271,16 @@ impl TunGatewayRuntime {
 
     pub fn pcscf_addrs(&self) -> &[IpAddr] {
         &self.pcscf_addrs
+    }
+
+    pub fn diagnostic_families_and_source(&self, address: IpAddr) -> (
+        crate::connectivity::core::registration_diagnostics::IpFamily,
+        crate::connectivity::core::registration_diagnostics::IpFamily,
+        crate::connectivity::core::registration_diagnostics::FactSource,
+    ) {
+        (self.diagnostic_requested_family, self.diagnostic_granted_family,
+            self.diagnostic_pcscf_sources.iter().find(|(candidate, _)| *candidate == address).map(|(_, source)| *source)
+                .unwrap_or_default())
     }
 
     pub fn age_ms(&self) -> u128 {
@@ -1114,6 +1130,9 @@ mod imp {
             inner_addr: config.inner_addr,
             pcscf_addr: config.pcscf_addr,
             pcscf_addrs: config.pcscf_addrs,
+            diagnostic_requested_family: config.diagnostic_requested_family,
+            diagnostic_granted_family: config.diagnostic_granted_family,
+            diagnostic_pcscf_sources: config.diagnostic_pcscf_sources,
             started_at: Instant::now(),
             ims_esp_policy,
             shutdown,

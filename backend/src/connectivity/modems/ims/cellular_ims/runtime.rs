@@ -220,6 +220,7 @@ pub struct CellularImsSnapshot {
     pub phase: CellularImsPhase,
     pub stage: CellularImsStage,
     pub registration_mode: RegistrationMode,
+    pub diagnostics: crate::connectivity::core::registration_diagnostics::DiagnosticsState,
     pub pcscf: Option<String>,
     pub session_started_at: Option<String>,
     pub registered_at: Option<String>,
@@ -300,6 +301,7 @@ impl Default for CellularImsSnapshot {
             phase: CellularImsPhase::Disabled,
             stage: CellularImsStage::Disabled,
             registration_mode: RegistrationMode::None,
+            diagnostics: Default::default(),
             pcscf: None,
             session_started_at: None,
             registered_at: None,
@@ -391,6 +393,7 @@ pub struct CellularImsRuntimeStatus {
     pub phase: String,
     pub stage: String,
     pub registration_mode: String,
+    pub diagnostics: crate::connectivity::core::registration_diagnostics::RegistrationDiagnostics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pcscf: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -482,6 +485,7 @@ impl From<&CellularImsSnapshot> for CellularImsRuntimeStatus {
             phase: s.phase.as_str().to_string(),
             stage: s.stage.as_str().to_string(),
             registration_mode: s.registration_mode.as_str().to_string(),
+            diagnostics: s.diagnostics.report(),
             pcscf: s.pcscf.clone(),
             session_started_at: s.session_started_at.clone(),
             registered_at: s.registered_at.clone(),
@@ -544,6 +548,8 @@ pub struct CellularImsRuntime {
     /// Optional token carried by MM connection/listener clones. Nested async
     /// helpers must not publish into a replacement SIM's runtime snapshot.
     publication_generation: Option<u64>,
+    diagnostic_serial: Arc<AtomicU64>,
+    diagnostic_scope: Option<crate::connectivity::core::registration_diagnostics::DiagnosticsToken>,
     require_admission: bool,
 }
 
@@ -578,18 +584,43 @@ impl CellularImsRuntime {
             generation: Arc::new(AtomicU64::new(0)),
             mm_binding: Arc::new(std::sync::Mutex::new(Default::default())),
             publication_generation: None,
+            diagnostic_serial: Arc::new(AtomicU64::new(0)),
+            diagnostic_scope: None,
             require_admission: false,
         }
     }
 
     /// Read-lock clone of the current snapshot.
     pub async fn snapshot(&self) -> CellularImsSnapshot {
-        self.snapshot.read().await.clone()
+        let mut snapshot = self.snapshot.read().await.clone();
+        snapshot.diagnostics.discard_stale(self.generation());
+        snapshot
     }
 
-    /// Serializable projection for the API.
+    /// Serializable projection for the API. Does not perform hardware reads.
     pub async fn status(&self) -> CellularImsRuntimeStatus {
-        CellularImsRuntimeStatus::from(&*self.snapshot.read().await)
+        CellularImsRuntimeStatus::from(&self.snapshot().await)
+    }
+
+    pub(crate) async fn begin_diagnostics(&self) -> Option<crate::connectivity::core::registration_diagnostics::DiagnosticsToken> {
+        let serial = self.diagnostic_serial.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1)).ok()?;
+        let token = crate::connectivity::core::registration_diagnostics::DiagnosticsToken { generation: self.generation(), serial };
+        let mut accepted = false;
+        self.update(|snapshot| {
+            if token.generation == self.generation() { accepted = snapshot.diagnostics.begin(token); }
+        }).await;
+        accepted.then_some(token)
+    }
+
+    pub(crate) fn diagnostics_token(&self) -> Option<crate::connectivity::core::registration_diagnostics::DiagnosticsToken> { self.diagnostic_scope }
+
+    pub(crate) fn with_diagnostics(&self, token: Option<crate::connectivity::core::registration_diagnostics::DiagnosticsToken>) -> Self {
+        Self { diagnostic_scope: token, ..self.clone() }
+    }
+
+    pub(crate) async fn observe_diagnostics(&self, change: impl FnOnce(&mut crate::connectivity::core::registration_diagnostics::DiagnosticsState)) {
+        let Some(token) = self.diagnostic_scope else { return; };
+        self.update(|snapshot| { snapshot.diagnostics.apply(token, self.generation(), change); }).await;
     }
 
     /// Current generation token; a driver captures this before a long advance
@@ -714,6 +745,18 @@ impl CellularImsRuntime {
         detail: Option<String>,
     ) {
         self.update(|snapshot| {
+            if let (Some(token), Some(error)) = (self.diagnostic_scope, error) {
+                snapshot.diagnostics.apply(token, self.generation(), |diagnostics| {
+                    use crate::connectivity::core::registration_diagnostics::FailureScope;
+                    let scope = match stage {
+                        CellularImsStage::Bearer | CellularImsStage::BearerDual | CellularImsStage::BearerIpv4
+                            | CellularImsStage::BearerIpv6 | CellularImsStage::IpConfig => FailureScope::Bearer,
+                        CellularImsStage::Pcscf => FailureScope::Endpoint,
+                        _ => FailureScope::Local,
+                    };
+                    observe_diagnostic_failure(diagnostics, error, scope);
+                });
+            }
             let sequence = snapshot
                 .connection_attempts
                 .last()
@@ -884,6 +927,30 @@ impl CellularImsRuntime {
         .await
     }
 }
+
+/// Adapter-owned classification uses the canonical cellular error constants;
+/// the shared diagnostic schema has no dependency on modem error tables.
+pub(super) fn observe_diagnostic_failure(
+    diagnostics: &mut crate::connectivity::core::registration_diagnostics::DiagnosticsState,
+    error: &CellularImsError,
+    fallback: crate::connectivity::core::registration_diagnostics::FailureScope,
+) {
+    use crate::connectivity::core::registration_diagnostics::{FailureScope, TlsVerification};
+    use super::errors::code;
+    diagnostics.failure_in_scope(error.code(), error.register_failure().copied(), fallback);
+    if matches!(error.code(), code::RUNTIME_NOT_RUNNING | code::RUNTIME_UE_WORKER_GENERATION_CHANGED) {
+        if let Some(failure) = diagnostics.facts.failure.as_mut() { failure.scope = FailureScope::Ownership; }
+    }
+    if matches!(error.code(), code::TLS_HANDSHAKE_FAILED | code::TLS_AUTHORITY_INVALID | code::TLS_HANDSHAKE_TIMEOUT) {
+        diagnostics.facts.tls_verification = TlsVerification::Failed;
+    }
+    if let Some(deadline) = error.retry_deadline() { diagnostics.wait_until(deadline); }
+    if error.code() == code::REGISTER_RETRY_STOPPED { diagnostics.wait_stopped(); }
+}
+
+#[cfg(test)]
+#[path = "runtime_diagnostics_tests.rs"]
+mod diagnostics_tests;
 
 #[cfg(test)]
 mod tests {

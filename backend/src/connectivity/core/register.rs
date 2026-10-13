@@ -627,13 +627,20 @@ where
     C: ImsChannel,
     A: RegisterAuthenticator<C>,
 {
-    match run_register_exchange(
-        channel, initial_request, authenticator, false, &mut RegisterNegotiationBudget::default(),
-    ).await {
+    match run_unregister_observed(channel, initial_request, authenticator).await {
         Ok(_) => UnregisterResult::Confirmed,
         Err(failure) if failure.response.is_some() => UnregisterResult::Rejected,
         Err(_) => UnregisterResult::AccessLost,
     }
+}
+
+/// Same removal exchange, retaining structured evidence for passive runtime
+/// diagnostics. Callers must not serialize the response or authentication data.
+pub async fn run_unregister_observed<C, A>(
+    channel: &mut C, initial_request: &[u8], authenticator: &mut A,
+) -> Result<RegisterResult, RegisterFailure>
+where C: ImsChannel, A: RegisterAuthenticator<C> {
+    run_register_exchange(channel, initial_request, authenticator, false, &mut RegisterNegotiationBudget::default()).await
 }
 
 fn preserve_flow_error(error: ImsError, fallback: &'static str) -> ImsError {

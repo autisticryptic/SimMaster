@@ -3098,6 +3098,47 @@ mod http_router_tests {
     }
 
     #[tokio::test]
+    async fn ims_execution_diagnostics_api_is_same_runtime_projection_without_changing_intents() {
+        use crate::connectivity::core::registration_diagnostics as facts;
+        let state = build_test_router().await.expect("private test D-Bus only; no hardware");
+        let binding = radio_test_binding(0xd1a610, false);
+        let line_id = binding.line_id.clone();
+        let line = state.app.line_registry.insert_control_test_line(binding).await;
+        state.config_manager.reconcile_line_profiles(&[line_id.clone()]).unwrap();
+        let before = serde_json::to_value(state.config_manager.get_line_profile(&line_id)).unwrap();
+        let cellular = line.cellular_ims.with_diagnostics(line.cellular_ims.begin_diagnostics().await);
+        cellular.observe_diagnostics(|state| {
+            state.profile("observed-cellular", facts::FactSource::Database, "carrier_device_model");
+            state.identity(facts::IdentityOrigin::Isim, facts::FactSource::Isim, facts::FactSource::SimOverride);
+            state.facts.requested_family = facts::IpFamily::Ipv4v6;
+            state.facts.granted_family = facts::IpFamily::Ipv6;
+            state.facts.negotiated_from_success = true;
+        }).await;
+        let wifi_token = line.vowifi.begin_ims_diagnostics().await.unwrap();
+        line.vowifi.observe_ims_diagnostics(wifi_token, |state| {
+            state.profile("observed-wifi", facts::FactSource::Derived, "isim");
+            state.identity(facts::IdentityOrigin::UsimDerived, facts::FactSource::Derived, facts::FactSource::Derived);
+            state.facts.requested_family = facts::IpFamily::Ipv4v6;
+            state.facts.granted_family = facts::IpFamily::Ipv4;
+        }).await;
+        let expected_cell = serde_json::to_value(line.cellular_ims.status().await.diagnostics).unwrap();
+        let expected_wifi = serde_json::to_value(line.vowifi.snapshot().await.status_response().diagnostics).unwrap();
+        let served = serve(state.router.clone()).await;
+        let path = format!("/api/modem/lines/{line_id}/ims/status");
+        assert_eq!(send(&served, reqwest::Method::GET, &path).await.0, StatusCode::UNAUTHORIZED);
+        let cookie = authenticate(&served).await;
+        for _ in 0..2 {
+            let (status, body) = get_with_cookie(&served, &path, &cookie).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(response["data"]["three_gpp"]["diagnostics"], expected_cell);
+            assert_eq!(response["data"]["non_three_gpp"]["diagnostics"], expected_wifi);
+            assert_eq!(response["data"]["registration"]["registered_over"], serde_json::json!([]), "historical negotiation is not current readiness");
+            assert_eq!(serde_json::to_value(state.config_manager.get_line_profile(&line_id)).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
     async fn ims_registration_preference_api_preserves_cost_and_enable_settings() {
         let state = build_test_router()
             .await

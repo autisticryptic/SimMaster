@@ -243,6 +243,7 @@ pub struct ThreeGppAccess {
     pub radio_available: bool,
     pub bearer_up: bool,
     pub registration_mode: Option<String>,
+    pub diagnostics: crate::connectivity::core::registration_diagnostics::RegistrationDiagnostics,
     pub rat: ThreeGppRat,
     pub bearer_domain: BearerDomain,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,6 +259,7 @@ pub struct ThreeGppAccess {
 pub struct NonThreeGppAccess {
     #[serde(flatten)]
     pub path: ImsAccessPath,
+    pub diagnostics: crate::connectivity::core::registration_diagnostics::RegistrationDiagnostics,
     pub epdg_host: Option<String>,
     pub epdg_ready: bool,
     pub ike_ready: bool,
@@ -385,6 +387,7 @@ impl ImsSubsystemState {
                 radio_available: three_gpp.radio_available,
                 bearer_up: three_gpp.bearer_up,
                 registration_mode: three_gpp.registration_mode.clone(),
+                diagnostics: Default::default(),
                 rat: three_gpp.rat,
                 bearer_domain: three_gpp.bearer_domain,
                 pdu_session: three_gpp.pdu_session.clone(),
@@ -393,6 +396,7 @@ impl ImsSubsystemState {
             },
             non_three_gpp: NonThreeGppAccess {
                 path: non_three_gpp_path,
+                diagnostics: Default::default(),
                 epdg_host: non_three_gpp.epdg_host.clone(),
                 epdg_ready: non_three_gpp.epdg_ready,
                 ike_ready: non_three_gpp.ike_ready,

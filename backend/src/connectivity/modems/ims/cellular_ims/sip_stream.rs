@@ -23,6 +23,7 @@ pub(super) struct SipStream {
     local: SocketAddr,
     buffer: Vec<u8>,
     poisoned: bool,
+    tls_algorithms: Option<crate::connectivity::core::registration_diagnostics::TlsAlgorithms>,
 }
 
 pub(super) enum StreamFrame { Sip(Vec<u8>), Ping, Pong }
@@ -60,12 +61,19 @@ impl SipStream {
         if !tls_identity::has_exact_identity(peer.as_ref(), authority) {
             return Err(ImsError::new(code::TLS_HANDSHAKE_FAILED));
         }
-        Ok(Self::new(Box::new(tls), local))
+        let algorithms = crate::connectivity::core::registration_diagnostics::TlsAlgorithms {
+            version: tls.get_ref().1.protocol_version().map(|version| format!("{version:?}")),
+            cipher_suite: tls.get_ref().1.negotiated_cipher_suite().map(|suite| format!("{:?}", suite.suite())),
+        };
+        let mut stream = Self::new(Box::new(tls), local);
+        stream.tls_algorithms = Some(algorithms);
+        Ok(stream)
     }
 
     fn new(io: Box<dyn SipIo>, local: SocketAddr) -> Self {
-        Self { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), io, local, buffer: Vec::new(), poisoned: false }
+        Self { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), io, local, buffer: Vec::new(), poisoned: false, tls_algorithms: None }
     }
+    pub(super) fn tls_algorithms(&self) -> Option<crate::connectivity::core::registration_diagnostics::TlsAlgorithms> { self.tls_algorithms.clone() }
     pub(super) fn id(&self) -> u64 { self.id }
     pub(super) fn local_addr(&self) -> SocketAddr { self.local }
     pub(super) fn is_usable(&self) -> bool { !self.poisoned }

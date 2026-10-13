@@ -23,6 +23,11 @@ pub(crate) fn bind_reg_event_runtime(line_id: &str, runtime: &Arc<VowifiRuntime>
         .unwrap_or_else(|error| error.into_inner()).insert(line_id.to_string(), Arc::downgrade(runtime));
 }
 
+pub(super) fn runtime_for_line(line_id: &str) -> Option<Arc<VowifiRuntime>> {
+    RUNTIMES.get().and_then(|runtimes| runtimes.read().unwrap_or_else(|error| error.into_inner())
+        .get(line_id).and_then(Weak::upgrade))
+}
+
 pub(crate) async fn live_reg_event_retry_remaining_for_line(line_id: &str) -> Option<Duration> {
     let owner = revoked().lock().await.get(line_id).map(|state| state.owner.clone());
     let owner = owner?;
@@ -48,6 +53,8 @@ pub(super) async fn registration_revoked(line_id: &str) -> bool {
 
 pub(super) async fn check_retry_gate(line_id: &str) -> Result<(), LiveStageError> {
     if live_reg_event_retry_remaining_for_line(line_id).await.is_some() {
+        let deadline = revoked().lock().await.get(line_id).map(|state| state.not_before);
+        if let Some(deadline) = deadline { super::diagnostics_live::network_wait(line_id, deadline).await; }
         return Err(live_stage_error(LOSS_REASON));
     }
     Ok(())
@@ -140,8 +147,9 @@ impl VowifiUnregisterFactory {
             last_failure_reason: LOSS_REASON.to_string(),
             rebuild_pending: true,
         });
-        let runtime = RUNTIMES.get().and_then(|runtimes| runtimes.read()
-            .unwrap_or_else(|error| error.into_inner()).get(&self.line_id).and_then(Weak::upgrade));
+        let observed_deadline = revoked().lock().await.get(&self.line_id).and_then(|state| state.not_before);
+        super::diagnostics_live::network_wait(&self.line_id, observed_deadline).await;
+        let runtime = runtime_for_line(&self.line_id);
         if let Some(runtime) = runtime {
             runtime.prepare_live_ims_registration_refresh(LOSS_REASON).await;
         }

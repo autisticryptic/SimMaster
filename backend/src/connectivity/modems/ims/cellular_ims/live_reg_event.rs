@@ -169,6 +169,11 @@ pub(super) async fn on_frame(
                     let admission = session.endpoint_retries.lock().await.observe_registration_event(
                         session.pcscf, retry_after, Instant::now(),
                     );
+                    observe_retry_diagnostics(runtime, admission).await;
+                    runtime.observe_diagnostics(|diagnostics| {
+                        diagnostics.facts.procedure = reg_diag::RegistrationProcedure::RegistrationEvent;
+                        diagnostics.failure_in_scope(code::REG_EVENT_BINDING_TERMINATED, None, reg_diag::FailureScope::Binding);
+                    }).await;
                     let wait = live_retry::admission_error(admission, Instant::now());
                     let failure = CellularImsError::with_detail(code::REG_EVENT_BINDING_TERMINATED, reason.as_str());
                     runtime.update(|state| {

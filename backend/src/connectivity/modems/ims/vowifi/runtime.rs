@@ -50,6 +50,7 @@ pub struct RuntimeSnapshot {
     pub live_readiness: RuntimeLiveReadiness,
     pub degraded_reason: Option<String>,
     pub restore: RestoreProgress,
+    pub diagnostics: crate::connectivity::core::registration_diagnostics::DiagnosticsState,
 }
 
 impl Default for RuntimeSnapshot {
@@ -61,6 +62,7 @@ impl Default for RuntimeSnapshot {
             live_readiness: RuntimeLiveReadiness::default(),
             degraded_reason: None,
             restore: RestoreProgress::default(),
+            diagnostics: Default::default(),
         }
     }
 }
@@ -115,6 +117,7 @@ pub struct VowifiRuntime {
     snapshot: Arc<RwLock<RuntimeSnapshot>>,
     live_refresh: Arc<Mutex<LiveRefreshState>>,
     live_generation: Arc<AtomicU64>,
+    diagnostic_serial: Arc<AtomicU64>,
     /// Which line this runtime serves. Threaded into every executor stage so the
     /// stage picks up this line's ePDG/DNS/proxy overrides — two SIMs on different
     /// operators (and different proxies) can therefore run concurrently without
@@ -178,6 +181,7 @@ impl VowifiRuntime {
                 last_finished: None,
             })),
             live_generation: Arc::new(AtomicU64::new(0)),
+            diagnostic_serial: Arc::new(AtomicU64::new(0)),
             line_id: Arc::from(line_id),
             access_network,
         }
@@ -243,6 +247,7 @@ impl VowifiRuntime {
                     } else {
                         None
                     },
+                    diagnostics: if same_profile { previous.diagnostics.clone() } else { Default::default() },
                     restore: previous.restore,
                 }
             }
@@ -271,7 +276,37 @@ impl VowifiRuntime {
     }
 
     pub async fn snapshot(&self) -> RuntimeSnapshot {
-        self.snapshot.read().await.clone()
+        let mut snapshot = self.snapshot.read().await.clone();
+        snapshot.diagnostics.discard_stale(self.live_generation.load(Ordering::SeqCst));
+        snapshot
+    }
+
+    pub(crate) fn same_diagnostics_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.live_generation, &other.live_generation)
+    }
+
+    pub(crate) async fn begin_ims_diagnostics(&self) -> Option<crate::connectivity::core::registration_diagnostics::DiagnosticsToken> {
+        self.begin_ims_diagnostics_at(self.live_generation.load(Ordering::SeqCst)).await
+    }
+
+    pub(crate) async fn begin_ims_diagnostics_at(&self, generation: u64) -> Option<crate::connectivity::core::registration_diagnostics::DiagnosticsToken> {
+        if self.live_generation.load(Ordering::SeqCst) != generation { return None; }
+        let serial = self.diagnostic_serial.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1)).ok()?;
+        let token = crate::connectivity::core::registration_diagnostics::DiagnosticsToken { generation, serial };
+        let mut snapshot = self.snapshot.write().await;
+        if self.live_generation.load(Ordering::SeqCst) != token.generation { return None; }
+        snapshot.diagnostics.begin(token).then_some(token)
+    }
+
+    pub(crate) async fn current_ims_diagnostics_token(&self) -> Option<crate::connectivity::core::registration_diagnostics::DiagnosticsToken> {
+        self.snapshot.read().await.diagnostics.token(self.live_generation.load(Ordering::SeqCst))
+    }
+
+    pub(crate) async fn observe_ims_diagnostics(&self,
+        token: crate::connectivity::core::registration_diagnostics::DiagnosticsToken,
+        change: impl FnOnce(&mut crate::connectivity::core::registration_diagnostics::DiagnosticsState),
+    ) {
+        self.snapshot.write().await.diagnostics.apply(token, self.live_generation.load(Ordering::SeqCst), change);
     }
 
     #[cfg(test)]
@@ -491,7 +526,9 @@ impl VowifiRuntime {
             }
 
             let result =
-                match tokio::time::timeout(stage_timeout, executor.run_stage(request)).await {
+                match tokio::time::timeout(stage_timeout, super::live::with_registration_diagnostics(
+                    self, generation, executor.run_stage(request),
+                )).await {
                     Ok(result) => result,
                     Err(_) => ExecutorStageResult {
                         stage: stage.as_str(),
@@ -591,7 +628,12 @@ impl VowifiRuntime {
             super::live::clear_live_runtime_for_line(self.line_id()).await;
             return self.snapshot().await;
         }
-        *self.snapshot.write().await = next.clone();
+        let mut current = self.snapshot.write().await;
+        if self.live_generation.load(Ordering::SeqCst) != generation { return current.clone(); }
+        // The live adapters publish observations while run_stage awaits. Do
+        // not overwrite their actual facts with the pre-stage snapshot clone.
+        next.diagnostics = current.diagnostics.clone();
+        *current = next.clone();
         next
     }
 }
@@ -677,6 +719,7 @@ fn reset_identity_preserving_runtime(previous: RuntimeSnapshot) -> RuntimeSnapsh
         live_readiness: RuntimeLiveReadiness::default(),
         degraded_reason: previous.degraded_reason,
         restore: previous.restore,
+        diagnostics: Default::default(),
     }
 }
 
@@ -821,6 +864,7 @@ impl RuntimeSnapshot {
             switch_identity_ready: restore.identity_ready,
             switch_sim_auth_ready: restore.sim_auth_ready,
             switch_retry_count: restore.retry_count,
+            diagnostics: self.diagnostics.report(),
         }
     }
 }
@@ -886,6 +930,7 @@ mod tests {
             live_readiness: RuntimeLiveReadiness::default(),
             degraded_reason: None,
             restore: RestoreProgress::default(),
+            diagnostics: Default::default(),
         };
 
         let status = snapshot.status_response();
@@ -974,6 +1019,7 @@ mod tests {
             },
             degraded_reason: Some("transient_modem_unavailable".to_string()),
             restore: RestoreProgress::default(),
+            diagnostics: Default::default(),
         };
 
         let reset = reset_identity_preserving_runtime(snapshot);
@@ -1016,6 +1062,7 @@ mod tests {
             live_readiness: RuntimeLiveReadiness::default(),
             degraded_reason: None,
             restore: RestoreProgress::default(),
+            diagnostics: Default::default(),
         };
 
         snapshot.apply_stage_result(
@@ -1114,6 +1161,7 @@ mod tests {
             },
             degraded_reason: Some("previous_failure".to_string()),
             restore: RestoreProgress::default(),
+            diagnostics: Default::default(),
         };
 
         snapshot.apply_stage_result(
@@ -1166,6 +1214,7 @@ mod tests {
             },
             degraded_reason: None,
             restore: RestoreProgress::default(),
+            diagnostics: Default::default(),
         };
 
         let readiness = snapshot.status_response().readiness;

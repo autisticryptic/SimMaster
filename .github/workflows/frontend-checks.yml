@@ -35,6 +35,22 @@ jobs:
         with:
           version: 11
 
+      - name: Record UI regression source identity
+        run: |
+          mkdir -p .ci-reports
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          files = ['package.json', 'pnpm-lock.yaml', 'playwright.lines.config.ts',
+                   'src/api/contracts.ts', 'src/pages/sim/LineRuntimeDetails.tsx',
+                   'src/pages/sim/ImsExecutionDetails.tsx', 'src/pages/sim/imsDiagnosticsFormat.ts',
+                   'tests/imsDiagnosticsFormat.test.ts', 'e2e/ims-execution-diagnostics.spec.ts',
+                   'e2e/blocked-lines.spec.ts', 'e2e/fixtures/lines.tsx']
+          report = {'schema': 'ims-execution-ui-v1', 'commit': os.environ['GITHUB_SHA'],
+                    'run_id': os.environ['GITHUB_RUN_ID'],
+                    'files': {name: hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest() for name in files}}
+          pathlib.Path('.ci-reports/source.json').write_text(json.dumps(report, indent=2) + '\n')
+          PY
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -44,8 +60,10 @@ jobs:
       - name: Type-check
         run: pnpm type-check
 
-      - name: Policy unit tests
-        run: pnpm test:unit
+      - name: Policy and execution-fact unit tests
+        run: |
+          set -o pipefail
+          pnpm test:unit 2>&1 | tee .ci-reports/unit-contracts.log
 
       - name: Build
         run: pnpm build
@@ -53,12 +71,15 @@ jobs:
       - name: Install isolated browser
         run: pnpm exec playwright install --with-deps chromium
 
-      - name: Verify original line workbench during blocked recovery
+      - name: Verify original workbench recovery and execution diagnostics
         run: pnpm exec playwright test --config playwright.lines.config.ts
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: original-line-workbench-tests
-          path: frontend/test-results/
+          include-hidden-files: true
+          path: |
+            frontend/test-results/
+            frontend/.ci-reports/
           retention-days: 7

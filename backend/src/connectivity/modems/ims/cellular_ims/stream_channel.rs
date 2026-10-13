@@ -111,6 +111,9 @@ impl CellularStreamTransport {
     }
     pub(super) fn send_route(&self) -> ImsRoute { self.current.route }
     pub(super) fn security_verify(&self) -> Option<&str> { self.current.verify.as_deref() }
+    pub(super) fn tls_algorithms(&self) -> Option<crate::connectivity::core::registration_diagnostics::TlsAlgorithms> {
+        self.current.streams.client.tls_algorithms()
+    }
     pub(super) fn sync_advertised_port(&mut self, port: u16) { self.current.advertised_port = Some(port); }
     pub(super) fn configure_outbound(&mut self, line: &str, instance: &str, enabled: bool) {
         self.current.outbound.configure(line, ImsAccess::Cellular, instance, enabled);

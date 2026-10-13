@@ -234,6 +234,7 @@ pub struct VowifiStatusResponse {
     pub switch_identity_ready: bool,
     pub switch_sim_auth_ready: bool,
     pub switch_retry_count: u8,
+    pub diagnostics: crate::connectivity::core::registration_diagnostics::RegistrationDiagnostics,
 }
 
 impl Default for VowifiStatusResponse {
@@ -253,6 +254,7 @@ impl Default for VowifiStatusResponse {
             switch_identity_ready: false,
             switch_sim_auth_ready: false,
             switch_retry_count: 0,
+            diagnostics: Default::default(),
         }
     }
 }

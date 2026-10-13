@@ -6,7 +6,7 @@
 
 ## 当前基线与工作规则
 
-- 当前已验证源码基线为 `3d54aa8`：reg-event 已通过两套 Actions、各 143 项相关回归、四矩阵及双架构构建。更早的 rspauth（`3509e15`）、AUTS/stale/423（`344308c`）及 ISIM/P-CSCF/Retry-After（`5aaf3ea`）也已核验。**继续 N6～N8，未部署**，见 [HANDOFF](HANDOFF.md)。
+- 当前已验证源码基线为 `6c0c140`：TCP/TLS、TCP/IPsec、DNS TC→TCP/NAPTR D2T 已通过两套 Actions、各 219 项相关回归、四矩阵及双架构；更早 N4/N5/AUTS/stale/初始 423 也已核验。**N7 执行诊断已接入待 CI；继续刷新预算/WiFi 等待补漏和 N8，未部署**，见 [HANDOFF](HANDOFF.md)。
 - 设备历史基线仍为全局兜底修复 `c174551`，已通过 Actions 和 410 原 Globe 配置的初始注册验收。
   `7bd` 的运营商专用补丁及测试仍保持由 `0502395` 撤销的状态；当前成功不能替代中国移动同卡验收。
 - **当前优先级是继续原 EC20 审查中的第二批协议补强，而不是把第一批当作整个委托结束。** 同卡/自然续期验收与停服时的 MM 重枚举/AT 超时调查独立保留，设备操作另需明确授权。
@@ -22,7 +22,7 @@
 
 1. 第一批代码和日志核验已闭环，用户无需补交测试 ZIP。若后续授权部署，再独立下载并核验同提交程序包的官方 digest、包 SHA、meta/ELF 和包内清单；测试 ZIP 不能替代程序包验收。
 2. 新版的 QMI/native AT/PC/SC 卡材料读取、SIM 换卡/owner 更换、应用多义和部分配置必须有独立硬件窗口；分阶段身份复核不等于原子热插拔保证。
-3. 明确需要 TCP/TLS 的蜂窝 profile 现在会拒绝而非静默改成 UDP；真实 TCP/TLS、NAPTR 仍未实现，不能通过改配置掩盖。
+3. TCP/IPsec 与独立 TLS 已有 N6 软件验证；TLS 不替代 required-IPsec，私有 CA/mTLS/新反向 TLS-IPsec 未声明支持，互通仍需独立硬件窗口。
 4. 验证同卡多 P-CSCF、完整 503/Retry-After、旧绑定到期及自然续期；等待状态目前在进程内按线路/SIM 保存，不是跨进程持久化的网络熔断器。
 5. 当前工作不授权部署、刷机、打开 IDA、换卡、MM/基带重启或 NV 改写；下一阶段设备操作需要新的明确授权。
 
@@ -31,12 +31,14 @@
 - reg-event 已实现并验证；仍需真实网络互通/设备验收。自定义或歧义 Contact 不猜绑定；不支持的订阅挑战、超时或 XML 缺口只停止/重同步观察，不伪造 REGISTER 丢失。
 - REGISTER rspauth 已验证；后续互通须单独验证真实服务器响应。现有范围仅 qop=auth/无 qop 和单一 Authorization scope，不宣称 auth-int、多重 origin/proxy 鉴权或非 REGISTER 业务已经支持。
 - 已验证 AUTS/stale 与 423 的剩余限制：WiFi 初次认证后的 423 明确 unsupported；需要新安全上下文的受保护 stale 不重装旧 ESP；非 REGISTER 业务的响应认证/恢复需单独核对。
-- 实施顺序继续传输/DNS、诊断、承载，之后按用户目标重新离线复审 EC20 固件查漏；不能把“已有算法/helper”当成生产路径已经接通。
+- 新发现 **蜂窝刷新 423→400 预算缺口**：刷新三候选仍需共用尝试级 `RegisterNegotiationBudget` 和结构化止损；不能拿已验证的初始 REGISTER 预算替代。
+- 新发现 **WiFi 普通 REGISTER 等待缺口**：503/Retry-After 还须贯通同 SIM/端点/profile/worker 的实际 not-before 和有效旧租期保护；reg-event 等待与诊断展示都不是控制逻辑实现。
+- 实施顺序为 N7 诊断 CI/制品闭环 → 上述两项恢复补漏 → N8 承载能力/相关扩展 → 完整离线 EC20 复审；不能把“已有算法/helper”当成生产路径接通。
 
 ## P1：原报告的传输与功能扩展（部分基础已具备）
 
-- **P-CSCF 传输未全部补齐。** 第一批已完成端点/端口/来源、多 A/AAAA/SRV、SRV 权重及明确 unsupported；蜂窝 SIP TCP/TLS 仍未实施；`0c1fff8` 的 SIP NAPTR UDP 发现与 DNS 截断 TCP 查询已通过 Actions 与相关回归/制品核验，尚不支持 NAPTR D2T 的 SIP 通道。ePDG 的其他 NAPTR 用途不等于 SIP NAPTR 已支持。
-- **来源诊断只完成基础字段。** 继续核对 actual profile origin、ISIM/USIM 身份、P-CSCF 来源、请求/实际地址族、报价/协商算法、失败作用域和 not-before 的 API/UI 统一投影。配置中的 identity source/template 标签不能冒充实际执行规则。
+- **P-CSCF 传输已由 N6 验证。** worker 内 TCP/TLS、TCP/IPsec 四向选择器、原 authority 精确 TLS 身份、有界 DNS TCP/NAPTR D2T 接通；旧 UDP、来源/预算/跨 profile 防降级保持。TLS/IPsec 组合边界和实机验收仍须明确，不能把字段存在当作全组合支持。
+- **来源诊断实现待验证。** 实际 profile/身份/domain/realm/端点、请求/授予族、报价/协商/响应认证、失败作用域和真实门禁已进入同源 API/原 GUI；epoch/serial 与弱 runtime 保护晚到写入。新增编译测试/浏览器/HTTP 回归待 Actions；声明模板和最近成功都不授予当前 readiness。
 - **承载能力门禁尚需补齐。** 显式 APN PAP/CHAP、通用 PCO request policy、PCO FQDN 和 DHCP adapter 需按设备能力报告 supported/unsupported/unknown；不能借普通数据 APN 激活或猜测凭据。协议支持和真实驱动验收分别完成。
 - **EC20 离线 catalog 来源尚未接入。** 在独立 `carrier_Bundles` 侧维护版本绑定的 MCFG extractor、选择器及字段证据；未知 `qp_ims_*` raw bytes 不得猜为 ready。跨项目实施范围另行明确。
 - **EC20 原生 IMS 只读观测 provider 尚未接入。** IMSA/注册/业务状态观测需明确与主机软 IMS 的 owner/互斥；可能写 NV 的 URC 开关不归入只读采证。

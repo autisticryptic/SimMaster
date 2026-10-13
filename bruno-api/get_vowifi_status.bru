@@ -13,3 +13,9 @@ get {
 settings {
   encodeUrl: true
 }
+
+docs {
+  This existing request deliberately retains live=true and may run the bounded live probe.
+  For passive execution facts without requesting a probe, use get_ims_status instead.
+  data.diagnostics is execution evidence, not the profile declaration or current readiness.
+}

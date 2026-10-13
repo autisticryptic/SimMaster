@@ -621,6 +621,10 @@ impl CellularImsSipChannel {
         self.reserved_receive_socket = None;
     }
 
+    pub fn tls_algorithms(&self) -> Option<crate::connectivity::core::registration_diagnostics::TlsAlgorithms> {
+        self.stream.as_ref().and_then(|stream| stream.tls_algorithms())
+    }
+
     pub fn interface(&self) -> Option<&str> {
         self.interface.as_deref()
     }

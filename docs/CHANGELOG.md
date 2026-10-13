@@ -5,6 +5,9 @@
 
 ## 1.1.5 主线
 
+- N7 执行诊断已接入 shared schema、cellular/WiFi 实际观察、统一 API 与原工作台只读折叠区，新增 runtime/协议适配/HTTP/格式化/浏览器回归，**本轮仍待 CI 和制品核验**。未知值不估计；声明模板、报价/协商、收到等待/真实门禁、历史成功/当前 readiness 分开。发现的刷新 423 连续预算与 WiFi 普通等待缺口仍独立待修，不以诊断页面算完成。
+- `6c0c140` 完成 worker 内 SIP TCP/TLS、四向 TCP/IPsec、原 authority 精确 TLS DNS/IP SAN、有界 DNS TC→TCP/NAPTR D2T，保留 UDP 和防降级；两套 Actions、双架构、各 219 项相关回归及四矩阵/官方测试摘要通过，未部署。TLS 不绕过 required-IPsec，私有 CA/mTLS/新的反向 TLS-IPsec 未冒称支持；首次 E0451 已修复并留证。
+
 - `3d54aa8` 接入同 owner 的 reg-event 订阅与注册状态通知，严格匹配实际 REGISTER 绑定和版本/dialog；无关或坏通知不影响 readiness。合法撤销保留同卡恢复等待与活动对话排空，MWI/REFER 不变；两套 Actions、双架构与相关制品证据通过，未部署。
 - `0c1fff8` 增加 bearer/worker 内 DNS TC→TCP 的同问题有界重试及 SIP NAPTR→UDP SRV 发现，保留旧 direct/SRV 优先路径与显式来源；两套日志各 186 项相关回归及四矩阵通过。**这不是蜂窝 SIP TCP/TLS 实现**，完整兜底目标仍在推进。
 
@@ -15,7 +18,7 @@
 - `5aaf3ea` 增加共享 ISIM 材料/身份与认证应用绑定，保留无配置时的 USIM 派生，VoWiFi EAP 仍用 USIM。
   接入 QMI、native AT 和 PC/SC 读取，保留明确读取错误与卡/owner 复核；不是热插拔实机验收声明。
 - 蜂窝 P-CSCF 保留端口、UDP 传输和来源，承载内 DNS 返回有界多候选；显式 TCP/TLS/sips 不再被静默降级。
-- REGISTER 临时拒绝和 Retry-After 贯通端点/跨 profile 等待；刷新保留仍有效的旧保护绑定但不延长租期。
+- 蜂窝 REGISTER 临时拒绝和 Retry-After 贯通端点/跨 profile 等待；刷新保留仍有效的旧保护绑定但不延长租期。
   两套 Actions 及双架构构建成功，测试产物官方摘要、各 87 项相关回归及四矩阵均已核验；**未部署、未发布新 Release**，见[交接](HANDOFF.md)。
 
 - 统一设备接口；MM仍为默认，native为显式实验性选择，不能混用同一物理owner。

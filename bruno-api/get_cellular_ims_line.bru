@@ -13,3 +13,11 @@ get {
 settings {
   encodeUrl: true
 }
+
+docs {
+  data.runtime.diagnostics is the same execution-facts projection as three_gpp.diagnostics
+  in GET /api/modem/lines/{line_id}/ims/status. It records actual profile/identity sources,
+  requested/granted family, endpoint transport, offered/accepted security and real waiting.
+  Negotiation history never grants current readiness; no identity or authentication values
+  are included in diagnostics. Reading diagnostics does not request a reconnect.
+}

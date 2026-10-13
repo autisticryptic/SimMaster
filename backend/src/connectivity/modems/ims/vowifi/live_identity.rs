@@ -10,9 +10,18 @@ pub(super) struct LiveImsSelection {
     card: UiccCardBinding,
     aid: Vec<u8>,
     isim: bool,
+    diagnostic_identity: crate::connectivity::core::registration_diagnostics::IdentityOrigin,
+    diagnostic_domain: crate::connectivity::core::registration_diagnostics::FactSource,
+    diagnostic_realm: crate::connectivity::core::registration_diagnostics::FactSource,
 }
 
 impl LiveImsSelection {
+    pub(super) fn diagnostic_sources(&self) -> (
+        crate::connectivity::core::registration_diagnostics::IdentityOrigin,
+        crate::connectivity::core::registration_diagnostics::FactSource,
+        crate::connectivity::core::registration_diagnostics::FactSource,
+    ) { (self.diagnostic_identity, self.diagnostic_domain, self.diagnostic_realm) }
+
     /// Network retry scope follows the physical subscription, not an MM owner
     /// generation or a freshly allocated selection Arc.
     pub(super) fn same_subscription(&self, other: &Self) -> bool {
@@ -134,10 +143,13 @@ pub(super) async fn load(line_id: &str, profile: &'static CarrierProfile)
         }).transpose()?;
         Ok::<_, &'static str>((applications, material))
     }).await.map_err(|_| live_stage_error("isim_read_task_failed"))?.map_err(live_stage_error)?;
-    let imsi = effective_imsi_for_line(line_id, &card.imsi);
-    if !imsi.starts_with(profile.meta.plmn) { return Err(live_stage_error("ims_identity_profile_mismatch")); }
-    let mut target = live_ims_target(line_id, profile);
+    // One immutable settings snapshot supplies both the actual selection and
+    // its source evidence; a concurrent override update cannot relabel it.
     let overrides = line_overrides(line_id);
+    let imsi_override = overrides.effective_imsi.as_ref().filter(|value| !value.is_empty());
+    let imsi = imsi_override.cloned().unwrap_or_else(|| card.imsi.trim().to_owned());
+    if !imsi.starts_with(profile.meta.plmn) { return Err(live_stage_error("ims_identity_profile_mismatch")); }
+    let mut target = live_ims_target_from_overrides(profile, overrides.clone());
     let explicit = !profiles::is_standard_derived_profile(profile);
     let usim_aid = applications.usim_aid.as_deref().unwrap_or(USIM_AID_PREFIX);
     let resolved = uicc_ims::resolve_ims_identity(
@@ -148,9 +160,14 @@ pub(super) async fn load(line_id: &str, profile: &'static CarrierProfile)
     target.domain = resolved.identity.home_domain.clone();
     target.realm = resolved.realm;
     let isim = resolved.source == ImsIdentitySource::Isim;
+    use crate::connectivity::core::registration_diagnostics::{FactSource, IdentityOrigin};
+    let baseline = super::diagnostics_live::profile_source(line_id, profile);
+    let diagnostic_identity = if isim { IdentityOrigin::Isim } else if imsi_override.is_some() { IdentityOrigin::SimOverrideDerived } else { IdentityOrigin::UsimDerived };
+    let diagnostic_domain = if overrides.ims_domain.is_some() { FactSource::SimOverride } else if isim && !explicit { FactSource::Isim } else { baseline };
+    let diagnostic_realm = if overrides.ims_realm.is_some() { FactSource::SimOverride } else if isim && !explicit { FactSource::Isim } else { baseline };
     let selected = Arc::new(LiveImsSelection {
         identity: LiveImsRegisterIdentity { shared: resolved.identity, shape: if isim { "isim" } else { "imsi_home_domain" } },
-        target, device, card, aid: resolved.auth_aid, isim,
+        target, device, card, aid: resolved.auth_aid, isim, diagnostic_identity, diagnostic_domain, diagnostic_realm,
     });
     selected.verify(line_id).await.map_err(live_stage_error)?;
     Ok(selected)
@@ -167,7 +184,10 @@ pub(super) fn selection_for_test(
     };
     register_line_sim_device(line_id, &device.qmi_device, device.uim_slot, &device.modem_path);
     uicc_ims::register_test_binding(&device.modem_path, card.clone());
-    Arc::new(LiveImsSelection { identity, target, device, card, aid: USIM_AID_PREFIX.to_vec(), isim: false })
+    Arc::new(LiveImsSelection { identity, target, device, card, aid: USIM_AID_PREFIX.to_vec(), isim: false,
+        diagnostic_identity: crate::connectivity::core::registration_diagnostics::IdentityOrigin::UsimDerived,
+        diagnostic_domain: crate::connectivity::core::registration_diagnostics::FactSource::Unknown,
+        diagnostic_realm: crate::connectivity::core::registration_diagnostics::FactSource::Unknown })
 }
 
 #[cfg(test)]

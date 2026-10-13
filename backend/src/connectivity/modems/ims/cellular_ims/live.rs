@@ -52,6 +52,7 @@ use crate::{
             status_permits_register_variant_fallback, RegisterAuthenticator, RegisterFailure,
         },
         register_response::RegisterArtifacts,
+        registration_diagnostics as reg_diag,
         registration::{
             ImsRegistrationAccess, RegisteredImsContext, RegistrationLease, RegistrationLossReason,
             RegistrationRefreshResult, UnregisterResult,
@@ -163,6 +164,39 @@ const REGISTER_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// observing refresh behavior on the test device; restore None afterwards so
 /// production scheduling uses the network-provided RegistrationLease value.
 const CELLULAR_IMS_REFRESH_TEST_DELAY_SECONDS: Option<u64> = None;
+
+fn diagnostic_value_source(source: crate::connectivity::modems::ims::profile_override::OverrideSource,
+    profile: reg_diag::FactSource) -> reg_diag::FactSource {
+    use crate::connectivity::modems::ims::profile_override::OverrideSource;
+    match source {
+        OverrideSource::Catalog => profile,
+        OverrideSource::Isim => reg_diag::FactSource::Isim,
+        OverrideSource::SimOverride => reg_diag::FactSource::SimOverride,
+        OverrideSource::Modem => reg_diag::FactSource::Runtime,
+        OverrideSource::Network => reg_diag::FactSource::AccessConfiguration,
+    }
+}
+
+fn diagnostic_pcscf_source(source: super::pcscf::PcscfSource, effective: &EffectiveImsProfile) -> reg_diag::FactSource {
+    use super::pcscf::PcscfSource;
+    match source {
+        PcscfSource::Environment => reg_diag::FactSource::Environment,
+        PcscfSource::BearerPco => reg_diag::FactSource::BearerPco,
+        PcscfSource::Profile => if effective.pcscf.as_ref().is_some_and(|field|
+            field.source == crate::connectivity::modems::ims::profile_override::OverrideSource::SimOverride)
+            { reg_diag::FactSource::SimOverride } else { reg_diag::FactSource::Profile },
+        PcscfSource::Isim => reg_diag::FactSource::Isim,
+        PcscfSource::StandardDns => reg_diag::FactSource::Dns,
+    }
+}
+
+async fn observe_retry_diagnostics(runtime: &CellularImsRuntime, admission: super::register_retry::RetryAdmission) {
+    runtime.observe_diagnostics(|diagnostics| match admission {
+        super::register_retry::RetryAdmission::Allowed => diagnostics.wait_ready(),
+        super::register_retry::RetryAdmission::Deferred { not_before } => diagnostics.wait_until(not_before),
+        super::register_retry::RetryAdmission::Stopped(_) => diagnostics.wait_stopped(),
+    }).await;
+}
 
 fn scheduled_cellular_ims_refresh_delay(lease: &RegistrationLease) -> Duration {
     let normal = lease.refresh_after.max(Duration::from_secs(1));
@@ -506,6 +540,7 @@ struct CellularImsLiveSession {
     voice_calls: HashMap<String, LiveVoiceCall>,
     mwi_subscription: Option<MwiSubscription>,
     reg_event: live_reg_event::Observer,
+    diagnostic_scope: Option<reg_diag::DiagnosticsToken>,
 }
 
 async fn bind_cellular_ims_operator_relay(
@@ -1929,6 +1964,12 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
             self.visited_network_header.as_deref(),
             self.access_network.as_ref(),
         );
+        let diagnostic_offer = sip::header_value(&request, "Security-Client");
+        let diagnostic_digest = prepared.refresh_authorization.as_ref().map(|state| state.challenge.algorithm.clone());
+        self.runtime.observe_diagnostics(|diagnostics| {
+            diagnostics.offer(diagnostic_offer.as_deref());
+            diagnostics.facts.digest_algorithm = diagnostic_digest.as_deref().and_then(reg_diag::DigestAlgorithm::parse);
+        }).await;
         tracing::info!(
             registration_mode = self.mode.as_str(),
             request_authorization_present =
@@ -2091,6 +2132,9 @@ pub async fn connect_live_for_line(
     } else {
         runtime
     };
+    let diagnostic_scope = runtime.begin_diagnostics().await;
+    let diagnostic_runtime = Arc::new(runtime.with_diagnostics(diagnostic_scope));
+    let runtime = &diagnostic_runtime;
     runtime
         .update(|state| {
             state.phase = CellularImsPhase::Starting;
@@ -2187,6 +2231,8 @@ pub async fn connect_live_for_line(
             Ok(runtime.status().await)
         }
         Err(error) => {
+            runtime.observe_diagnostics(|diagnostics|
+                super::runtime::observe_diagnostic_failure(diagnostics, &error, reg_diag::FailureScope::Local)).await;
             let message = error.to_string();
             runtime
                 .update_current(generation, |state| {
@@ -2497,7 +2543,9 @@ async fn connect_inner(
     }
     let endpoint_retries = live.retry_scope.lock().await.for_card(&device_identity.auth_binding);
     let retry_now = Instant::now();
-    if let Some(error) = live_retry::admission_error(endpoint_retries.lock().await.restart_admission(retry_now), retry_now) {
+    let retry_admission = endpoint_retries.lock().await.restart_admission(retry_now);
+    observe_retry_diagnostics(runtime, retry_admission).await;
+    if let Some(error) = live_retry::admission_error(retry_admission, retry_now) {
         return Err(error);
     }
     PcscfTransport::from_profile(device_identity.profile.ims.transport)?;
@@ -2683,16 +2731,20 @@ async fn connect_inner(
             "native_ims_transport_unsupported_for_device",
         )
     })?;
-    let mut native_bearer = match native_bearer::establish_native_ims_bearer(
+    let mut requested_family = None;
+    let established = native_bearer::establish_native_ims_bearer_observed(
         ims_bearer_transport,
         &device.qmi_device,
         &device.modem_id,
         &request,
         &plan,
         expected_mm_sim.as_ref(),
-    )
-    .await
-    {
+        |family| requested_family = Some(family),
+    ).await;
+    runtime.observe_diagnostics(|diagnostics| {
+        diagnostics.facts.requested_family = requested_family.map(reg_diag::IpFamily::parse).unwrap_or_default();
+    }).await;
+    let mut native_bearer = match established {
         Ok(established) => {
             runtime
                 .record_attempt(
@@ -2946,6 +2998,10 @@ async fn connect_inner(
         }
     }
     let mut tls_required = device_identity.profile.ims.transport.eq_ignore_ascii_case("tls");
+    runtime.observe_diagnostics(|diagnostics| {
+        diagnostics.facts.granted_family = reg_diag::IpFamily::granted(
+            bearer.settings.ipv4_address.is_some(), bearer.settings.ipv6_address.is_some());
+    }).await;
     let result = async {
         runtime
             .update(|state| {
@@ -3009,6 +3065,7 @@ async fn connect_inner(
                 .pcscf
                 .as_ref()
                 .map(|field| field.value.as_str());
+            runtime.observe_diagnostics(|diagnostics| diagnostics.start_discovery()).await;
             let pcscf_endpoints = match discover_pcscf_endpoints_with_transport_in_worker(
                 &bearer.settings,
                 &device_identity.ims.home_domain,
@@ -3083,6 +3140,10 @@ async fn connect_inner(
                 if tls_required && endpoint.transport != PcscfTransport::Tls { continue; }
                 tls_required |= endpoint.transport == PcscfTransport::Tls;
                 let pcscf = endpoint.socket;
+                let endpoint_source = diagnostic_pcscf_source(endpoint.source, &device_identity.effective_ims);
+                runtime.observe_diagnostics(|diagnostics| {
+                    diagnostics.endpoint(endpoint_source, endpoint.transport.sip_transport(), pcscf, pcscf_index + 1, pcscf_endpoints.len());
+                }).await;
                 let has_next_pcscf = pcscf_endpoints[pcscf_index + 1..].iter()
                     .any(|next| !tls_required || next.transport == PcscfTransport::Tls);
                 runtime
@@ -3204,11 +3265,15 @@ async fn connect_inner(
     let result = match result {
         Ok(session) => {
             endpoint_retries.lock().await.registered();
+            runtime.observe_diagnostics(|diagnostics| diagnostics.wait_ready()).await;
             Ok(session)
         }
         Err(error) => {
             let now = Instant::now();
             let admission = endpoint_retries.lock().await.pause_restart(now);
+            observe_retry_diagnostics(runtime, admission).await;
+            runtime.observe_diagnostics(|diagnostics|
+                super::runtime::observe_diagnostic_failure(diagnostics, &error, reg_diag::FailureScope::Endpoint)).await;
             Err(match admission {
                 super::register_retry::RetryAdmission::Deferred { not_before } => error.with_retry_not_before(not_before),
                 super::register_retry::RetryAdmission::Stopped(_) => {
@@ -3491,6 +3556,12 @@ async fn connect_family(
                 .map_err(map_channel_error)?
         };
         ensure_worker_binding_current(worker_binding)?;
+        let tls_algorithms = channel.tls_algorithms();
+        let diagnostic_route = channel.route();
+        runtime.observe_diagnostics(|diagnostics| {
+            diagnostics.signaling_route(diagnostic_route);
+            diagnostics.established_tls(tls_algorithms);
+        }).await;
         let socket_worker = worker.clone();
         let receive_port = channel
             .reserve_security_receive_port_in_worker(&socket_worker)
@@ -3553,6 +3624,8 @@ async fn connect_family(
             access_network.as_ref(),
         );
         log_cellular_ims_register_request_metadata(variant, &channel, &initial);
+        let offered = sip::header_value(&initial, "Security-Client");
+        runtime.observe_diagnostics(|diagnostics| diagnostics.offer(offered.as_deref())).await;
         runtime
             .record_attempt(
                 CellularImsStage::RegisterInitial,
@@ -3768,6 +3841,15 @@ async fn connect_family(
                 return Err(map_channel_error(error));
             }
         };
+        let diagnostic_route = channel.route();
+        let diagnostic_verify = channel.security_verify().map(str::to_owned);
+        let diagnostic_digest = authenticator.emitted_authorization().map(|state| state.challenge.algorithm.clone());
+        let diagnostic_rspauth = authenticator.emitted_authorization().and_then(|state| state.request_proof.as_ref())
+            .and_then(|proof| proof.verify_response(&registration.response).ok()).map(|info| info.rspauth_verified());
+        runtime.observe_diagnostics(|diagnostics| {
+            diagnostics.signaling_route(diagnostic_route);
+            diagnostics.accepted(diagnostic_route.transport, diagnostic_verify.as_deref(), diagnostic_digest.as_deref(), diagnostic_rspauth);
+        }).await;
         // Publish the validated binding before retiring the preceding flow.
         // Otherwise a concurrent policy read can briefly see no negotiated
         // binding and incorrectly park the other access.
@@ -3888,6 +3970,7 @@ async fn connect_family(
             voice_calls: HashMap::new(),
             mwi_subscription: None,
             reg_event: live_reg_event::Observer::default(),
+            diagnostic_scope: runtime.diagnostics_token(),
         });
     }
     Err(last_error
@@ -3960,6 +4043,8 @@ async fn unregister_live_session(
     let Some(session) = sessions.as_mut() else {
         return UnregisterResult::AlreadyExpired;
     };
+    let diagnostic_runtime = runtime.with_diagnostics(session.diagnostic_scope);
+    let runtime = &diagnostic_runtime;
     if session.reg_event.revoked { return UnregisterResult::AlreadyExpired; }
     if session
         .registration
@@ -4049,7 +4134,17 @@ async fn unregister_live_session(
     .with_worker_binding(session.worker_binding.clone())
     .with_security_mechanism(session.register_variant.security_mechanism)
     .with_expires_seconds(0);
-    run_unregister(&mut session.channel, &request, &mut authenticator).await
+    runtime.observe_diagnostics(|state| state.facts.procedure = reg_diag::RegistrationProcedure::Unregister).await;
+    match crate::connectivity::core::register::run_unregister_observed(&mut session.channel, &request, &mut authenticator).await {
+        Ok(_) => {
+            runtime.observe_diagnostics(|state| state.facts.failure = None).await;
+            UnregisterResult::Confirmed
+        }
+        Err(failure) => {
+            runtime.observe_diagnostics(|state| state.failure(failure.error.code(), Some(failure.metadata()))).await;
+            if failure.response.is_some() { UnregisterResult::Rejected } else { UnregisterResult::AccessLost }
+        }
+    }
 }
 
 async fn start_live_listener(
@@ -4588,6 +4683,7 @@ async fn refresh_live_registration(
             error: Some(CellularImsError::new(code::REG_EVENT_BINDING_TERMINATED)), retry_after: None,
         };
     }
+    runtime.observe_diagnostics(|diagnostics| diagnostics.facts.procedure = reg_diag::RegistrationProcedure::Refresh).await;
     if let Err(error) = verify_mm_task_bearer(runtime, session.native_bearer.as_mut()).await {
         return lost_refresh_attempt(error);
     }
@@ -4645,6 +4741,7 @@ async fn refresh_live_registration(
     }
     let retry_now = Instant::now();
     let admission = session.endpoint_retries.lock().await.check(session.pcscf, retry_now);
+    observe_retry_diagnostics(runtime, admission).await;
     if let Some(decision) = super::register_retry::refresh_wait_decision(admission, retry_now, remaining_lifetime) {
         let error = live_retry::admission_error(admission, retry_now)
             .unwrap_or_else(|| CellularImsError::new(code::REGISTER_RETRY_DEFERRED));
@@ -4800,6 +4897,8 @@ async fn refresh_live_registration(
             session.access_network.as_ref(),
         );
         log_cellular_ims_register_request_metadata(variant, &session.channel, &initial);
+        let diagnostic_offer = sip::header_value(&initial, "Security-Client");
+        runtime.observe_diagnostics(|diagnostics| diagnostics.offer(diagnostic_offer.as_deref())).await;
         let mut authenticator = CellularImsRegisterAuthenticator::new(
             session.registration_identity.clone(),
             ids.clone(),
@@ -4879,6 +4978,8 @@ async fn refresh_live_registration(
                         session.pcscf, &metadata, Instant::now(),
                         remaining_registration_lifetime(&session.registration),
                     );
+                    let admission = session.endpoint_retries.lock().await.check(session.pcscf, Instant::now());
+                    observe_retry_diagnostics(runtime, admission).await;
                     runtime.record_attempt(CellularImsStage::RegisterRefresh, Some(session.ip_family),
                         "failed", Some(&error), Some("temporary_endpoint_existing_binding".into())).await;
                     return live_retry::refresh_attempt(decision, error);
@@ -4995,6 +5096,15 @@ async fn refresh_live_registration(
                 };
             }
         };
+        let diagnostic_route = session.channel.route();
+        let diagnostic_verify = session.channel.security_verify().map(str::to_owned);
+        let diagnostic_digest = authenticator.emitted_authorization().map(|state| state.challenge.algorithm.clone());
+        let diagnostic_rspauth = authenticator.emitted_authorization().and_then(|state| state.request_proof.as_ref())
+            .and_then(|proof| proof.verify_response(&registration.response).ok()).map(|info| info.rspauth_verified());
+        runtime.observe_diagnostics(|diagnostics| {
+            diagnostics.signaling_route(diagnostic_route);
+            diagnostics.accepted(diagnostic_route.transport, diagnostic_verify.as_deref(), diagnostic_digest.as_deref(), diagnostic_rspauth);
+        }).await;
         // Only the validated final 2xx commits a tentative association and its AKA
         // state. Direct 200 refreshes discard the unneeded offer and keep the
         // exact active sockets/SAs. Retain one old protected path for delayed
@@ -7884,6 +7994,9 @@ async fn load_device_identity(
             state.profile_fallback_reason = resolved.fallback_reason.clone();
         })
         .await;
+    runtime.observe_diagnostics(|diagnostics| {
+        diagnostics.profile(profile.meta.profile_id, reg_diag::FactSource::profile(resolved.origin.as_str()), profile.ims.identity_source);
+    }).await;
     let mut effective_ims = resolve_effective_ims_profile(profile, Some(sim_override));
     let material = if let Some(aid) = applications.isim_aid.as_ref() {
         let endpoint = device.qmi_device.clone();
@@ -7915,6 +8028,14 @@ async fn load_device_identity(
     effective_ims.realm.value = selected.realm;
     let identity_source = if selected.source == uicc_ims::ImsIdentitySource::Isim { "isim" } else { identity_source };
     runtime.update(|state| state.identity_source = Some(identity_source.to_owned())).await;
+    let actual_identity = if selected.source == uicc_ims::ImsIdentitySource::Isim { reg_diag::IdentityOrigin::Isim }
+        else { reg_diag::IdentityOrigin::UsimDerived };
+    let origin = reg_diag::FactSource::profile(resolved.origin.as_str());
+    runtime.observe_diagnostics(|diagnostics| {
+        diagnostics.profile(profile.meta.profile_id, origin, profile.ims.identity_source);
+        diagnostics.identity(actual_identity, diagnostic_value_source(effective_ims.domain.source, origin),
+            diagnostic_value_source(effective_ims.realm.source, origin));
+    }).await;
     let derived_visited_network_candidate = resolved.origin == ProfileOrigin::Derived;
     let visited_network_header = visited_network_header(
         &imsi,
@@ -9686,6 +9807,7 @@ mod tests {
             voice_calls: HashMap::new(),
             mwi_subscription: None,
             reg_event: live_reg_event::Observer::default(),
+            diagnostic_scope: None,
         });
         (live, Arc::new(CellularImsRuntime::new()), pcscf)
     }

@@ -7087,6 +7087,8 @@ pub async fn get_line_ims_status_handler(
 
     let desired = line_ims_access_decision(&app, &line).await;
     let mut state = ImsSubsystemState::build(line_id.as_str(), &policy, &three_gpp, &non_three_gpp);
+    state.three_gpp.diagnostics = cellular_ims.diagnostics.report();
+    state.non_three_gpp.diagnostics = vowifi.diagnostics;
     state.registration_policy = Some(
         line.ims_registration
             .status(profile.ims_access_preference, desired),
@@ -8309,6 +8311,7 @@ pub struct VowifiLineConfigResponse {
     pub matched_profile_id: Option<String>,
     pub matched_profile_source: Option<String>,
     pub matched_profile_fallback_reason: Option<String>,
+    pub diagnostics: crate::connectivity::core::registration_diagnostics::RegistrationDiagnostics,
 }
 
 async fn build_vowifi_line_response(
@@ -8380,6 +8383,7 @@ async fn build_vowifi_line_response(
         matched_profile_id,
         matched_profile_source,
         matched_profile_fallback_reason,
+        diagnostics: status.diagnostics,
     }
 }
 

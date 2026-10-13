@@ -228,6 +228,11 @@ pub(crate) async fn refresh_registered_for_line(
 }
 
 pub(crate) trait RegisteredUnregister: Send + Sync {
+    fn diagnostics_unregister_started<'a>(&'a self) -> futures_util::future::BoxFuture<'a, ()> { Box::pin(async {}) }
+
+    fn diagnostics_unregister_finished<'a>(&'a self, _reason: Option<&'static str>,
+        _metadata: Option<crate::connectivity::core::register::RegisterFailureMetadata>) -> futures_util::future::BoxFuture<'a, ()> { Box::pin(async {}) }
+
     /// Optional observer hooks default safely for legacy/mock registrations.
     fn reg_event_owner_valid<'a>(&'a self) -> futures_util::future::BoxFuture<'a, Result<(), crate::connectivity::core::ImsError>> {
         Box::pin(async { Ok(()) })
@@ -753,12 +758,22 @@ async fn unregister_registration(session: &mut VoiceSession) -> UnregisterResult
     let Some(factory) = session.context.unregister.as_ref().cloned() else {
         return UnregisterResult::AccessLost;
     };
+    factory.diagnostics_unregister_started().await;
     let initial = match factory.initial_request() {
         Ok(request) => request,
-        Err(_) => return UnregisterResult::AccessLost,
+        Err(error) => {
+            factory.diagnostics_unregister_finished(Some(error.code()), None).await;
+            return UnregisterResult::AccessLost;
+        }
     };
-    let mut authenticator = RegisteredUnregisterAdapter { factory };
-    run_unregister(&mut session.channel, &initial, &mut authenticator).await
+    let mut authenticator = RegisteredUnregisterAdapter { factory: factory.clone() };
+    match crate::connectivity::core::register::run_unregister_observed(&mut session.channel, &initial, &mut authenticator).await {
+        Ok(_) => { factory.diagnostics_unregister_finished(None, None).await; UnregisterResult::Confirmed }
+        Err(failure) => {
+            factory.diagnostics_unregister_finished(Some(failure.error.code()), Some(failure.metadata())).await;
+            if failure.response.is_some() { UnregisterResult::Rejected } else { UnregisterResult::AccessLost }
+        }
+    }
 }
 
 fn next_interval(interval: Option<Duration>) -> Option<Instant> {

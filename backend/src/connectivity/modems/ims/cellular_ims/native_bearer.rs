@@ -346,6 +346,17 @@ pub async fn establish_native_ims_bearer(
     plan: &ImsConnectionPlan,
     expected_mm_sim: Option<&(String, u8)>,
 ) -> Result<NativeImsBearer, CellularImsError> {
+    establish_native_ims_bearer_observed(transport, primary_device, modem_id, request, plan, expected_mm_sim, |_| {}).await
+}
+
+/// Observer sees the exact family request passed to the provider. It is
+/// telemetry only and cannot narrow the plan, change a pin or consume budget.
+#[allow(clippy::too_many_arguments)]
+pub async fn establish_native_ims_bearer_observed(
+    transport: &dyn ImsBearerTransport, primary_device: &str, modem_id: &str,
+    request: &BearerRequest, plan: &ImsConnectionPlan, expected_mm_sim: Option<&(String, u8)>,
+    mut observe_request: impl FnMut(&'static str) + Send,
+) -> Result<NativeImsBearer, CellularImsError> {
     let cid = ims_context_cid(request);
     let families = requested_families_for(plan);
     // All production lines share the complete dual-stack -> IPv6 -> IPv4 plan.
@@ -371,6 +382,7 @@ pub async fn establish_native_ims_bearer(
         if let [single] = attempt_families {
             attempted_single.push(*single);
         }
+        observe_request(attempt.as_mm_str());
         let result = transport
             .establish_ims_bearer(
                 primary_device,
@@ -426,6 +438,7 @@ pub async fn establish_native_ims_bearer(
     }
 
     if let Some(forced) = forced_single {
+        observe_request(if forced == 4 { "ipv4" } else { "ipv6" });
         match transport
             .establish_ims_bearer(
                 primary_device,
@@ -698,6 +711,24 @@ mod tests {
         .unwrap();
         let attempts = transport.attempts.into_inner().unwrap();
         (attempts, error)
+    }
+
+    #[tokio::test]
+    async fn actual_family_observer_matches_provider_dispatch_including_forced_fallback() {
+        for failures in [vec![ImsBearerFailureHint::None; 3],
+            vec![ImsBearerFailureHint::NetworkForcedIpv4, ImsBearerFailureHint::None]] {
+            let transport = ScriptedTransport { attempts: std::sync::Mutex::new(Vec::new()),
+                failures: std::sync::Mutex::new(failures.into_iter().collect()) };
+            let mut observed = Vec::new();
+            let result = establish_native_ims_bearer_observed(&transport, "/dev/test-qmi", "0",
+                &BearerRequest::ims(false), &ImsConnectionPlan::default(), None,
+                |family| observed.push(family)).await;
+            assert!(result.is_err());
+            let expected = transport.attempts.lock().unwrap().iter().map(|families| match families.as_slice() {
+                [6, 4] => "ipv4v6", [6] => "ipv6", [4] => "ipv4", _ => panic!("unexpected provider request"),
+            }).collect::<Vec<_>>();
+            assert_eq!(observed, expected, "diagnostics cannot report a plan entry that was skipped");
+        }
     }
 
     #[tokio::test]

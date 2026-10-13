@@ -3,7 +3,8 @@ import { defineConfig, devices } from '@playwright/test'
 // Dedicated, mocked-only suite. No device credentials or live backend needed.
 export default defineConfig({
   testDir: './e2e',
-  testMatch: 'blocked-lines.spec.ts',
+  testMatch: ['blocked-lines.spec.ts', 'ims-execution-diagnostics.spec.ts'],
+  reporter: [['list'], ['json', { outputFile: 'test-results/line-workbench-report.json' }]],
   timeout: 30_000,
   expect: { timeout: 10_000 },
   workers: 1,

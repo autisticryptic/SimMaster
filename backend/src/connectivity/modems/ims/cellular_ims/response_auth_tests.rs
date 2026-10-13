@@ -68,6 +68,69 @@ fn initial_request(auth: &CellularImsRegisterAuthenticator) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn diagnostics_real_cellular_refresh_publishes_only_accepted_algorithms_and_rspauth() {
+    use crate::connectivity::core::registration_diagnostics as facts;
+    let (mut session, runtime, server, _client) = refresh_session().await;
+    let token = runtime.begin_diagnostics().await;
+    session.diagnostic_scope = token;
+    let runtime = runtime.with_diagnostics(token);
+    let remote = session.channel.route().pcscf_addr;
+    runtime.observe_diagnostics(|state| {
+        state.profile(profile().meta.profile_id, facts::FactSource::Derived, "isim");
+        state.endpoint(facts::FactSource::BearerPco, SipTransport::Udp, remote, 1, 1);
+    }).await;
+    let db = Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (request, source) = receive(&server).await;
+        let headers = format!("{}Expires: 7200\r\n", auth_info(&request, false, Some("PRIVATE_NEXTNONCE")));
+        server.send_to(&response(&request, "200 OK", &headers), source).await.unwrap();
+    });
+    let result = refresh_live_registration(&mut session, &runtime, "n7-real-refresh", &db).await;
+    peer.await.unwrap();
+    assert!(matches!(result.outcome, RegistrationRefreshResult::Refreshed(_)));
+    let report = runtime.status().await.diagnostics;
+    assert_eq!(report.procedure, facts::RegistrationProcedure::Refresh);
+    assert_eq!(report.rspauth_verified, Some(true));
+    assert_eq!(report.security_mode, facts::SecurityMode::Ipsec);
+    assert_eq!(report.negotiated_ipsec, facts::ipsec_algorithms(session.channel.security_verify().unwrap()));
+    assert_eq!(report.offered_ipsec.as_ref().unwrap().len(), 2);
+    assert_eq!(report.wait.status, facts::WaitStatus::Ready);
+    assert!(report.negotiated_from_success && report.socket_ready);
+    let json = serde_json::to_string(&report).unwrap();
+    for secret in ["PRIVATE_NEXTNONCE", "old-nonce", "234330000000001", "spi-c", "Authorization"] {
+        assert!(!json.contains(secret));
+    }
+}
+
+#[tokio::test]
+async fn diagnostics_real_cellular_refresh_records_the_enforced_retry_deadline() {
+    use crate::connectivity::core::registration_diagnostics as facts;
+    let (mut session, runtime, server, _client) = refresh_session().await;
+    let token = runtime.begin_diagnostics().await;
+    session.diagnostic_scope = token;
+    let runtime = runtime.with_diagnostics(token);
+    let old_lease = session.registration.lease.clone();
+    let db = Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (request, source) = receive(&server).await;
+        server.send_to(&response(&request, "503 Service Unavailable", "Retry-After: 120\r\n"), source).await.unwrap();
+    });
+    let result = refresh_live_registration(&mut session, &runtime, "n7-real-wait", &db).await;
+    peer.await.unwrap();
+    assert_eq!(result.outcome, RegistrationRefreshResult::Retry);
+    assert_eq!(session.registration.lease, old_lease);
+    let report = runtime.status().await.diagnostics;
+    let failure = report.failure.unwrap();
+    assert_eq!(failure.scope, facts::FailureScope::Endpoint);
+    assert_eq!(failure.sip_status, Some(503));
+    assert_eq!(failure.response_retry_after_seconds, Some(120));
+    assert_eq!(report.wait.status, facts::WaitStatus::Waiting);
+    assert!(report.wait.retry_after_seconds.unwrap() >= 119);
+    assert!(report.wait.not_before.is_some());
+    assert!(!report.negotiated_from_success);
+}
+
+#[tokio::test]
 async fn rspauth_direct_refresh_accepts_supported_algorithms_and_proxy_scopes() {
     for (algorithm, proxy, qop) in [
         ("AKAv1-MD5", false, true), ("AKAv1-MD5", true, false),

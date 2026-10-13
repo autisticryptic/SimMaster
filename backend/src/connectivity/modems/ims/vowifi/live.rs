@@ -177,6 +177,16 @@ static LIVE_TUN_GATEWAY: OnceLock<Mutex<HashMap<String, Arc<TunGatewayRuntime>>>
 // guard for when a line switches carriers.
 #[path = "reg_event_live.rs"]
 mod reg_event_live;
+#[path = "diagnostics_live.rs"]
+mod diagnostics_live;
+
+/// Keep the original runtime/epoch attached even when an awaited stage resumes
+/// after reset. This task-local is telemetry-only; it changes no admission.
+pub(crate) async fn with_registration_diagnostics<F: Future>(
+    owner: &super::runtime::VowifiRuntime, generation: u64, work: F,
+) -> F::Output {
+    diagnostics_live::run_with_owner(owner, generation, work).await
+}
 pub(crate) use reg_event_live::{bind_reg_event_runtime, live_reg_event_retry_remaining_for_line};
 
 static LIVE_IMS_REGISTER_READY: OnceLock<Mutex<HashMap<String, LiveImsRegisterReady>>> =
@@ -435,7 +445,10 @@ struct LiveImsTarget {
 }
 
 fn live_ims_target(line_id: &str, profile: &CarrierProfile) -> LiveImsTarget {
-    let overrides = line_overrides(line_id);
+    live_ims_target_from_overrides(profile, line_overrides(line_id))
+}
+
+fn live_ims_target_from_overrides(profile: &CarrierProfile, overrides: LiveNetworkOverrides) -> LiveImsTarget {
     LiveImsTarget {
         domain: overrides
             .ims_domain
@@ -2513,6 +2526,7 @@ pub struct LiveStageError {
     register_auth_rounds: u8,
     /// Redacted stage/status and lease provenance survive adapter-owned sends.
     register_failure: Option<RegisterFailureMetadata>,
+    requested_ip_family: Option<crate::connectivity::core::registration_diagnostics::IpFamily>,
 }
 
 pub trait LiveStageAdapter: Send + Sync {
@@ -2572,9 +2586,12 @@ impl LiveEpdgAdapter for SystemLiveEpdgAdapter {
     ) -> Pin<Box<dyn Future<Output = Result<ResolvedEpdgEndpoint, LiveStageError>> + Send + 'a>>
     {
         Box::pin(async move {
-            resolve_live_epdg(&self.line_id, profile, &self.access_network)
+            let scope = diagnostics_live::Scope::for_profile(&self.line_id, profile).await;
+            let result = resolve_live_epdg(&self.line_id, profile, &self.access_network)
                 .await
-                .map_err(|_| live_stage_error("epdg_dns_resolution_failed"))
+                .map_err(|_| live_stage_error("epdg_dns_resolution_failed"));
+            if let Err(error) = &result { scope.failure(error, crate::connectivity::core::registration_diagnostics::FailureScope::Endpoint).await; }
+            result
         })
     }
 }
@@ -2611,7 +2628,8 @@ impl LiveDatagramAdapter for SystemLiveDatagramAdapter {
     ) -> Pin<Box<dyn Future<Output = Result<(), LiveStageError>> + Send + 'a>> {
         Box::pin(async move {
             reg_event_live::check_retry_gate(&self.line_id).await?;
-            match stage {
+            let diagnostic_scope = diagnostics_live::Scope::for_profile(&self.line_id, profile).await;
+            let result = match stage {
                 ExecutorStage::Ike => run_live_ike_until(
                     &self.line_id,
                     profile,
@@ -2633,7 +2651,14 @@ impl LiveDatagramAdapter for SystemLiveDatagramAdapter {
                     run_live_voice_until(&self.line_id, profile, &self.access_network).await
                 }
                 _ => Err(live_stage_error("packet_transport_stage_not_implemented")),
+            };
+            if let Err(error) = &result {
+                let fallback = if matches!(stage, ExecutorStage::Ike | ExecutorStage::ChildSa | ExecutorStage::Esp) {
+                    crate::connectivity::core::registration_diagnostics::FailureScope::Bearer
+                } else { crate::connectivity::core::registration_diagnostics::FailureScope::Local };
+                diagnostic_scope.failure(error, fallback).await;
             }
+            result
         })
     }
 }
@@ -2912,6 +2937,7 @@ async fn run_live_ike_until_depth(
 ) -> Result<LiveIkeSession, LiveStageError> {
     wait_for_vowifi_ue_dataplane_ready(line_id, LIVE_UE_DATAPLANE_READY_TIMEOUT).await?;
     let configured_ip_stack = live_ike_access(line_id, profile).ip_stack;
+    let diagnostic_scope = diagnostics_live::Scope::for_profile(line_id, profile).await;
     let mut last_error = None;
 
     // The bearer family is independent from the IKE/SIP transport. Every
@@ -2926,6 +2952,7 @@ async fn run_live_ike_until_depth(
             configured_ip_stack = %configured_ip_stack,
             "Trying VoWiFi IKE address-family policy"
         );
+        diagnostic_scope.requested_family(ip_stack).await;
         match run_live_ike_until_depth_for_stack(
             line_id,
             profile,
@@ -2941,9 +2968,11 @@ async fn run_live_ike_until_depth(
                     line_id,
                     ip_stack, "VoWiFi IKE address-family attempt succeeded"
                 );
+                diagnostic_scope.granted_family(session.configuration.as_ref().map(|configuration| configuration.assigned_inner_addresses.as_slice())).await;
                 return Ok(session);
             }
-            Err(error) => {
+            Err(mut error) => {
+                error.requested_ip_family = Some(crate::connectivity::core::registration_diagnostics::IpFamily::parse(ip_stack));
                 if terminal_ike_auth_rejection(&error) { return Err(error); }
                 if let Some(forced_stack) = vowifi_forced_ip_stack_from_error(&error) {
                     if forced_stack != ip_stack {
@@ -2954,6 +2983,7 @@ async fn run_live_ike_until_depth(
                             reason = %error.reason,
                             "VoWiFi network explicitly selected a single IP family"
                         );
+                        diagnostic_scope.requested_family(forced_stack).await;
                         match run_live_ike_until_depth_for_stack(
                             line_id,
                             profile,
@@ -2964,8 +2994,14 @@ async fn run_live_ike_until_depth(
                         )
                         .await
                         {
-                            Ok(session) => return Ok(session),
-                            Err(forced_error) => last_error = Some(forced_error),
+                            Ok(session) => {
+                                diagnostic_scope.granted_family(session.configuration.as_ref().map(|configuration| configuration.assigned_inner_addresses.as_slice())).await;
+                                return Ok(session);
+                            }
+                            Err(mut forced_error) => {
+                                forced_error.requested_ip_family = Some(crate::connectivity::core::registration_diagnostics::IpFamily::parse(forced_stack));
+                                last_error = Some(forced_error);
+                            }
                         }
                         break;
                     }
@@ -3714,8 +3750,10 @@ async fn ensure_live_tun_gateway(
         .ok_or_else(|| live_stage_error("live_child_sa_configuration_missing"))?;
     let inner_addr = select_inner_address(&session.ip_stack, configuration)
         .ok_or_else(|| live_stage_error("live_inner_address_missing"))?;
-    let pcscf_addr = select_pcscf_address(line_id, profile, configuration, inner_addr)
+    let (static_pcscf, static_source) = static_pcscf_targets(line_id, profile);
+    let pcscf_addr = select_pcscf_from_targets(configuration, inner_addr, &static_pcscf)
         .ok_or_else(|| live_stage_error("live_pcscf_address_missing"))?;
+    let pcscf_addrs = pcscf_candidates_from_targets(configuration, inner_addr, &static_pcscf);
     let transport = session
         .transport
         .clone()
@@ -3725,6 +3763,12 @@ async fn ensure_live_tun_gateway(
         .ok_or_else(|| live_stage_error("live_remote_endpoint_missing"))?;
     let socket_context = required_ue_socket_context(line_id)?;
 
+    let diagnostic_pcscf_sources = pcscf_addrs.iter().copied().map(|address| {
+        let source = if configuration.pcscf_addresses.contains(&address) {
+            crate::connectivity::core::registration_diagnostics::FactSource::AccessConfiguration
+        } else { static_source };
+        (address, source)
+    }).collect();
     let gateway = tun_gateway::start_gateway(TunGatewayConfig {
         profile_id: profile.meta.profile_id,
         // Per-line device name: two connected lines must not contend for one
@@ -3733,7 +3777,12 @@ async fn ensure_live_tun_gateway(
         inner_addr,
         inner_prefix_len: configuration.assigned_ipv6_prefix_length,
         pcscf_addr,
-        pcscf_addrs: pcscf_candidates(line_id, profile, configuration, inner_addr),
+        pcscf_addrs,
+        diagnostic_requested_family: crate::connectivity::core::registration_diagnostics::IpFamily::parse(&session.ip_stack),
+        diagnostic_granted_family: crate::connectivity::core::registration_diagnostics::IpFamily::granted(
+            configuration.assigned_inner_addresses.iter().any(IpAddr::is_ipv4),
+            configuration.assigned_inner_addresses.iter().any(IpAddr::is_ipv6)),
+        diagnostic_pcscf_sources,
         inbound_sa_identifier: child_sa.inbound_sa_identifier,
         outbound_sa_identifier: child_sa.outbound_sa_identifier,
         secrets: child_sa.secrets.clone(),
@@ -3769,12 +3818,24 @@ fn select_inner_address(
     configuration.assigned_inner_addresses.first().copied()
 }
 
+fn static_pcscf_targets(line_id: &str, profile: &CarrierProfile) -> (Vec<String>, crate::connectivity::core::registration_diagnostics::FactSource) {
+    let configured = line_overrides(line_id).ims_pcscf;
+    if configured.is_empty() {
+        (profile.ims.pcscf.map(|value| vec![value.to_owned()]).unwrap_or_default(), crate::connectivity::core::registration_diagnostics::FactSource::Profile)
+    } else { (configured, crate::connectivity::core::registration_diagnostics::FactSource::SimOverride) }
+}
+
 fn select_pcscf_address(
     line_id: &str,
     profile: &'static CarrierProfile,
     configuration: &IkeConfigurationMaterial,
     inner_addr: IpAddr,
 ) -> Option<IpAddr> {
+    let (targets, _) = static_pcscf_targets(line_id, profile);
+    select_pcscf_from_targets(configuration, inner_addr, &targets)
+}
+
+fn select_pcscf_from_targets(configuration: &IkeConfigurationMaterial, inner_addr: IpAddr, targets: &[String]) -> Option<IpAddr> {
     if let Some(addr) = configuration
         .pcscf_addresses
         .iter()
@@ -3784,10 +3845,7 @@ fn select_pcscf_address(
         return Some(addr);
     }
 
-    live_ims_target(line_id, profile)
-        .pcscf
-        .into_iter()
-        .find_map(|pcscf| pcscf.parse::<IpAddr>().ok())
+    targets.iter().find_map(|pcscf| pcscf.parse::<IpAddr>().ok())
         .filter(|addr| addr.is_ipv4() == inner_addr.is_ipv4())
 }
 
@@ -3797,15 +3855,18 @@ fn pcscf_candidates(
     configuration: &IkeConfigurationMaterial,
     inner_addr: IpAddr,
 ) -> Vec<IpAddr> {
+    let (targets, _) = static_pcscf_targets(line_id, profile);
+    pcscf_candidates_from_targets(configuration, inner_addr, &targets)
+}
+
+fn pcscf_candidates_from_targets(configuration: &IkeConfigurationMaterial, inner_addr: IpAddr, targets: &[String]) -> Vec<IpAddr> {
     let mut addrs = configuration
         .pcscf_addresses
         .iter()
         .copied()
         .filter(|addr| addr.is_ipv4() == inner_addr.is_ipv4())
         .collect::<Vec<_>>();
-    for static_addr in live_ims_target(line_id, profile)
-        .pcscf
-        .into_iter()
+    for static_addr in targets.iter()
         .filter_map(|pcscf| pcscf.parse::<IpAddr>().ok())
         .filter(|addr| addr.is_ipv4() == inner_addr.is_ipv4())
     {
@@ -5528,6 +5589,9 @@ async fn run_register_exchange_with_pcscf_variant(
 ) -> Result<String, LiveStageError> {
     let target = SocketAddr::new(pcscf_addr, profile.ims.local_port);
     let transport = ims_transport(profile);
+    let diagnostic_scope = diagnostics_live::Scope::begin(line_id, profile).await;
+    diagnostic_scope.selected(selection, gateway, target, transport).await;
+    let result = async {
     let ue_socket = required_ue_socket_context(line_id)?;
     let socket = connect_sip_socket(
         gateway.inner_addr(),
@@ -5562,13 +5626,14 @@ async fn run_register_exchange_with_pcscf_variant(
         selection,
         variant,
         access_network,
+        &diagnostic_scope,
     )
     .await
     {
         Ok((response, mut context, next_cseq)) => {
             if !context.channel_transferred {
                 validate_live_register_success(context.refresh_authorization.as_ref(), false, response.as_bytes())
-                    .map_err(map_shared_digest_error)?;
+                    .map_err(|error| response_auth_error(error, response.as_bytes()))?;
                 if let Some(auth) = context.refresh_authorization.as_mut() {
                     auth.apply_success(response.as_bytes()).map_err(map_shared_digest_error)?;
                 }
@@ -5588,6 +5653,8 @@ async fn run_register_exchange_with_pcscf_variant(
                     identity.public_uri = uri.to_string();
                 }
                 let security_verify = channel.security_verify().map(str::to_owned);
+                context.diagnostic_scope.accepted(channel.route(), security_verify.as_deref(),
+                    context.refresh_authorization.as_ref(), response.as_bytes()).await;
                 record_live_ims_security_verify(line_id, profile, security_verify.as_deref()).await;
                 record_live_ims_channel(
                     line_id, profile, identity, channel, security_verify, registered, context, variant,
@@ -5602,6 +5669,11 @@ async fn run_register_exchange_with_pcscf_variant(
             Err(err)
         }
     }
+    }.await;
+    if let Err(error) = &result {
+        diagnostic_scope.failure(error, crate::connectivity::core::registration_diagnostics::FailureScope::Endpoint).await;
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5615,6 +5687,7 @@ async fn run_register_exchange_on_connected_stream(
     selection: &Arc<LiveImsSelection>,
     variant: LiveRegisterHeaderVariant,
     access_network_runtime: &ImsAccessNetworkRuntime,
+    diagnostic_scope: &diagnostics_live::Scope,
 ) -> Result<(String, LiveRegisterRequestContext, u32), LiveStageError> {
     let identity = selection.for_format(line_id, variant.identity_format).await?;
     let identity_shape = identity.shape;
@@ -5644,6 +5717,9 @@ async fn run_register_exchange_on_connected_stream(
     context.target = selection.target.clone();
     context.uicc = Some(selection.clone());
     context.access_network = access_network;
+    context.diagnostic_scope = diagnostic_scope.clone();
+    let diagnostic_route = channel.route();
+    context.diagnostic_scope.update(|state| state.signaling_route(diagnostic_route)).await;
     channel.configure_outbound(
         line_id,
         &context.instance_id,
@@ -5655,9 +5731,11 @@ async fn run_register_exchange_on_connected_stream(
             && !variant.header_profile.compact_register,
     );
     let request = context.build_initial_request(profile, variant);
+    context.diagnostic_scope.offer(request.as_bytes(), None).await;
     info!(
         pcscf_family = ip_family_name(pcscf_addr),
-        identity_source = profile.ims.identity_source,
+        declared_identity_source = ?crate::connectivity::core::registration_diagnostics::IdentityPreference::parse(profile.ims.identity_source),
+        actual_identity_source = ?selection.diagnostic_sources().0,
         identity_shape = identity_shape,
         register_variant = variant.label,
         route_header_present = variant.include_route_header,
@@ -6110,12 +6188,13 @@ async fn run_retained_stale_register_exchange(
         profile, variant, cseq, Some(&header), Some(&verify), context.register_expires(profile),
     );
     validate_live_register_request(Some(&authorization), request.as_bytes()).map_err(map_shared_digest_error)?;
+    context.diagnostic_scope.offer(request.as_bytes(), Some(&authorization)).await;
     write_sip_request(channel, &request).await?;
     context.refresh_authorization = Some(authorization);
     let response = read_final_register_response(channel, &request).await?;
     if sip_frame::parse_status(response.as_bytes()).ok().is_some_and(|status| (200..300).contains(&status)) {
         validate_live_register_success(context.refresh_authorization.as_ref(), false, response.as_bytes())
-            .map_err(map_shared_digest_error)?;
+            .map_err(|error| response_auth_error(error, response.as_bytes()))?;
     }
     Ok(response)
 }
@@ -6158,6 +6237,7 @@ async fn run_authenticated_register_exchange(
         info!("IMS REGISTER AKA resync request ready");
         validate_live_register_request(context.refresh_authorization.as_ref(), resync_request.as_bytes())
             .map_err(map_shared_digest_error)?;
+        context.diagnostic_scope.offer(resync_request.as_bytes(), None).await;
         write_sip_request(initial_channel, &resync_request).await?;
         let response = read_final_register_response(initial_channel, &resync_request).await?;
         let summary = ims::parse_sip_response(&response, &context.target.realm)
@@ -6197,6 +6277,7 @@ async fn run_authenticated_register_exchange(
         );
         validate_live_register_request(context.refresh_authorization.as_ref(), authenticated.as_bytes())
             .map_err(map_shared_digest_error)?;
+        context.diagnostic_scope.offer(authenticated.as_bytes(), context.refresh_authorization.as_ref()).await;
         write_sip_request(initial_channel, &authenticated).await?;
         let response = read_final_register_response(initial_channel, &authenticated).await?;
         let summary = ims::parse_sip_response(&response, &context.target.realm)
@@ -6206,7 +6287,7 @@ async fn run_authenticated_register_exchange(
         }
         if (200..300).contains(&summary.status_code) {
             validate_live_register_success(context.refresh_authorization.as_ref(), *resync_sent, response.as_bytes())
-                .map_err(map_shared_digest_error)?;
+                .map_err(|error| response_auth_error(error, response.as_bytes()))?;
         }
         Ok(response)
     }
@@ -6565,6 +6646,7 @@ async fn run_protected_authenticated_register_candidates(
                 );
                 validate_live_register_request(context.refresh_authorization.as_ref(), authenticated.as_bytes())
                     .map_err(map_shared_digest_error)?;
+                context.diagnostic_scope.offer(authenticated.as_bytes(), context.refresh_authorization.as_ref()).await;
                 write_sip_request(&mut protected_channel, &authenticated).await?;
                 // The primary candidate gets the full transaction budget; an
                 // unanswered alternate candidate is likely the same silent
@@ -6603,7 +6685,7 @@ async fn run_protected_authenticated_register_candidates(
                 let expires = context.register_expires(profile);
                 if summary.status_code == 200 {
                     validate_live_register_success(context.refresh_authorization.as_ref(), false, response.as_bytes())
-                        .map_err(map_shared_digest_error)?;
+                        .map_err(|error| response_auth_error(error, response.as_bytes()))?;
                     if let Some(auth) = context.refresh_authorization.as_mut() {
                         auth.apply_success(response.as_bytes()).map_err(map_shared_digest_error)?;
                     }
@@ -6630,6 +6712,8 @@ async fn run_protected_authenticated_register_candidates(
                             response.as_bytes(),
                         ),
                     );
+                    context.diagnostic_scope.accepted(protected_channel.route(), security_verify,
+                        context.refresh_authorization.as_ref(), response.as_bytes()).await;
                     record_live_ims_security_verify(line_id, profile, security_verify).await;
                     record_live_ims_channel(
                         line_id,
@@ -7899,6 +7983,7 @@ struct LiveRegisterRequestContext {
     call_id: String,
     instance_id: String,
     refresh_authorization: Option<LiveRefreshAuthorization>,
+    diagnostic_scope: diagnostics_live::Scope,
     channel_transferred: bool,
     /// Initial 423 floor survives the subsequent authenticated/protected send.
     min_expires: Option<u32>,
@@ -7990,6 +8075,7 @@ impl LiveRegisterRequestContext {
             call_id: format!("{}@simadmin", hex_token(16)),
             instance_id,
             refresh_authorization: None,
+            diagnostic_scope: diagnostics_live::Scope::default(),
             channel_transferred: false,
             min_expires: None,
             security_client_state,
@@ -8716,13 +8802,15 @@ impl RegisterAuthenticator<SipChannel> for VowifiRefreshAuthenticator<'_> {
         let (auth, resync) = self.factory
             .challenged_authorization(response, self.authorization.as_ref()).await?;
         self.authorization = auth;
-        if let Some(resync) = resync {
+        let request = if let Some(resync) = resync {
             if self.resync_sent { return Err(ImsError::new("ims_aka_resync_repeated")); }
             self.resync_sent = true;
-            self.factory.request(self.expires, Some(&resync))
+            self.factory.request(self.expires, Some(&resync))?
         } else {
-            self.request()
-        }
+            self.request()?
+        };
+        self.factory.context.diagnostic_scope.offer(&request, self.authorization.as_ref()).await;
+        Ok(request)
     }
 
     async fn rebuild_register_with_min_expires(
@@ -8733,11 +8821,24 @@ impl RegisterAuthenticator<SipChannel> for VowifiRefreshAuthenticator<'_> {
         _authenticated: bool,
     ) -> Result<Vec<u8>, ImsError> {
         self.expires = self.expires.max(min_expires);
-        self.request()
+        let request = self.request()?;
+        self.factory.context.diagnostic_scope.offer(&request, self.authorization.as_ref()).await;
+        Ok(request)
     }
 }
 
 impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
+    fn diagnostics_unregister_started<'a>(&'a self) -> futures_util::future::BoxFuture<'a, ()> {
+        Box::pin(self.context.diagnostic_scope.update(|state|
+            state.facts.procedure = crate::connectivity::core::registration_diagnostics::RegistrationProcedure::Unregister))
+    }
+    fn diagnostics_unregister_finished<'a>(&'a self, reason: Option<&'static str>, metadata: Option<RegisterFailureMetadata>)
+        -> futures_util::future::BoxFuture<'a, ()> {
+        Box::pin(self.context.diagnostic_scope.update(move |state| {
+            if let Some(reason) = reason { state.failure(reason, metadata); } else { state.facts.failure = None; }
+        }))
+    }
+
     fn reg_event_owner_valid<'a>(&'a self) -> futures_util::future::BoxFuture<'a, Result<(), ImsError>> {
         Box::pin(self.reg_event_check_owner())
     }
@@ -8769,6 +8870,8 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
         channel: &'a mut SipChannel,
     ) -> futures_util::future::BoxFuture<'a, Result<RegisteredImsContext, ImsError>> {
         Box::pin(async move {
+            self.context.diagnostic_scope.update(|state|
+                state.facts.procedure = crate::connectivity::core::registration_diagnostics::RegistrationProcedure::Refresh).await;
             let uicc = self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?;
             uicc.verify(&self.line_id).await.map_err(ImsError::new)?;
             let mut auth = VowifiRefreshAuthenticator {
@@ -8783,8 +8886,17 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
                     .expires_seconds
                     .load(std::sync::atomic::Ordering::Relaxed),
             };
+            let requested_expires = auth.expires;
             let initial = auth.request()?;
+            self.context.diagnostic_scope.offer(&initial, auth.authorization.as_ref()).await;
             let result = run_register_observed(channel, &initial, &mut auth).await;
+            if let Err(failure) = &result {
+                let mut metadata = failure.metadata();
+                if auth.expires > requested_expires {
+                    metadata.min_expires.get_or_insert(crate::connectivity::core::register::RegisterMinExpiresFailure::Negotiated);
+                }
+                self.context.diagnostic_scope.update(|state| state.failure(failure.error.code(), Some(metadata))).await;
+            }
             uicc.verify(&self.line_id).await.map_err(ImsError::new)?;
             let result = result.map_err(|failure| {
                 if is_live_digest_authentication_failure(failure.error.code())
@@ -8812,6 +8924,7 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
             if artifacts.expires_seconds == Some(0) {
                 return Err(ImsError::new("vowifi_refresh_rejected"));
             }
+            self.context.diagnostic_scope.accepted(channel.route(), channel.security_verify(), auth.authorization.as_ref(), &result.response).await;
             *self
                 .refresh_authorization
                 .lock()
@@ -9843,6 +9956,16 @@ fn compute_plain_md5_response(
     Ok(md5_hex(proof_input.as_bytes()))
 }
 
+fn response_auth_error(error: ImsError, response: &[u8]) -> LiveStageError {
+    let mut mapped = map_shared_digest_error(error);
+    let failure = RegisterFailure { error, response: Some(response.to_vec()), auth_rounds: 1 };
+    let mut metadata = failure.metadata();
+    metadata.stage = crate::connectivity::core::register::RegisterFailureStage::Authenticated;
+    mapped.register_failure = Some(metadata);
+    mapped.registration_loss = Some(RegistrationLossReason::AuthenticationRejected);
+    mapped
+}
+
 fn map_shared_digest_error(error: ImsError) -> LiveStageError {
     let reason = match error.code() {
         "aka_res_empty" => "ims_aka_empty_response",
@@ -10416,6 +10539,7 @@ fn live_stage_error(reason: impl Into<String>) -> LiveStageError {
         server_required_sec_agree: false,
         register_auth_rounds: 0,
         register_failure: None,
+        requested_ip_family: None,
     }
 }
 
@@ -10429,6 +10553,7 @@ fn live_registration_error(
         server_required_sec_agree: false,
         register_auth_rounds: 0,
         register_failure: None,
+        requested_ip_family: None,
     }
 }
 

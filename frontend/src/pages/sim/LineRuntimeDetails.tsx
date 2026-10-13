@@ -3,6 +3,8 @@ import { Alert, Box, Chip, Typography } from '@mui/material'
 import Grid from '@mui/material/Grid'
 import type { AppEventEntry, CallRecord, SmsMessage, TrunkProfileResponse, CellularImsLineControlResponse, VowifiLineConfigResponse, VowifiRuntimeEventEntry } from '../../api/current'
 import { standardDerivedProfileMessage, cellularImsErrorMessage } from './cellularImsErrorFormat'
+import { diagnosticIdentity } from './imsDiagnosticsFormat'
+import { ImsExecutionDetails } from './ImsExecutionDetails'
 
 function Field({ label, value }: { label: string, value: ReactNode }) {
   return (
@@ -26,6 +28,8 @@ export function LineCsDetails({ line }: { line: CellularImsLineControlResponse }
 }
 
 export function LineCellularImsDetails({ line }: { line: CellularImsLineControlResponse }) {
+  const facts = line.runtime.diagnostics
+  const identity = facts?.observed ? facts.identity_source : line.runtime.identity_source === 'isim' ? 'isim' : 'unknown'
   const displayError = cellularImsErrorMessage(line.runtime.last_error)
   const imsAttemptInProgress = line.profile.cellular_ims_connection_enabled
     && !line.runtime.registered
@@ -61,9 +65,10 @@ export function LineCellularImsDetails({ line }: { line: CellularImsLineControlR
       <Grid size={{ xs: 12, sm: 6 }}><Field label="P-CSCF" value={line.runtime.pcscf || '尚未发现'} /></Grid>
       <Grid size={{ xs: 12, sm: 6 }}><Field label="IMS 数据路径" value={line.runtime.data_path_mode || '尚未建立'} /></Grid>
       <Grid size={{ xs: 12, sm: 6 }}><Field label="REGISTER 续期" value={`${line.runtime.register_refresh_count ?? 0} 次${line.runtime.last_register_refresh_at ? ` · ${new Date(line.runtime.last_register_refresh_at).toLocaleString()}` : ''}`} /></Grid>
-      <Grid size={{ xs: 12, sm: 6 }}><Field label="身份来源" value={line.runtime.identity_source || '尚未读取'} /></Grid>
+      <Grid size={{ xs: 12, sm: 6 }}><Field label="身份来源" value={diagnosticIdentity(identity)} /></Grid>
       <Grid size={{ xs: 12, sm: 6 }}><Field label="运营商 profile" value={line.runtime.profile_id || '尚未匹配'} /></Grid>
-      <Grid size={{ xs: 12, sm: 6 }}><Field label="ISIM" value={line.runtime.isim_aid ? `已发现 · ${line.runtime.isim_aid}` : '未发现，使用 IMSI 回退'} /></Grid>
+      <Grid size={{ xs: 12, sm: 6 }}><Field label="ISIM" value={identity === 'isim' ? '已选用卡内身份' : identity !== 'unknown' ? '本次未选用 ISIM 身份' : line.runtime.isim_aid ? '已检测到应用，尚未确认选用' : '尚未确认 ISIM 身份'} /></Grid>
+      {facts?.observed && <Grid size={12}><ImsExecutionDetails facts={facts} access="cellular" /></Grid>}
       {fallbackMessage && <Grid size={12}><Alert severity="warning">{fallbackMessage}</Alert></Grid>}
       {displayError && <Grid size={12}><Alert severity="warning">{displayError}</Alert></Grid>}
     </Grid>
@@ -302,6 +307,7 @@ export function LineVowifiDetails({ vowifi }: { vowifi?: VowifiLineConfigRespons
       <Grid size={{ xs: 12, sm: 4 }}><Field label="运营商 profile" value={vowifi.matched_profile_id || '尚未匹配'} /></Grid>
       <Grid size={{ xs: 12, sm: 4 }}><Field label="代理模式" value={vowifi.config.proxy_mode} /></Grid>
       <Grid size={{ xs: 12, sm: 4 }}><Field label="代理端点" value={vowifi.config.proxy_endpoint || '直连'} /></Grid>
+      {vowifi.diagnostics?.observed && <Grid size={12}><ImsExecutionDetails facts={vowifi.diagnostics} access="wifi" /></Grid>}
       {fallbackMessage && <Grid size={12}><Alert severity="warning">{fallbackMessage}</Alert></Grid>}
       {vowifi.runtime_error && vowifi.runtime_error !== 'vowifi_auto_restore_exhausted' && (
         <Grid size={12}><Alert severity="warning">{vowifi.runtime_error}</Alert></Grid>

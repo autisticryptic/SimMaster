@@ -511,6 +511,8 @@ impl CellularImsError {
         self.register_failure.as_ref()
     }
 
+    pub(crate) fn retry_deadline(&self) -> Option<std::time::Instant> { self.retry_not_before }
+
     pub fn with_retry_not_before(mut self, deadline: std::time::Instant) -> Self {
         self.retry_not_before = Some(deadline);
         self

@@ -13,3 +13,10 @@ get {
 settings {
   encodeUrl: true
 }
+
+docs {
+  data.diagnostics is the same execution-facts projection as non_three_gpp.diagnostics
+  in GET /api/modem/lines/{line_id}/ims/status. It is not the saved config or a readiness grant.
+  A missing historical observation remains unknown; actual retry gates are separate from
+  a received Retry-After header. This request does not request live probing.
+}

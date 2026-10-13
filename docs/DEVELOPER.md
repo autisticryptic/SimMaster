@@ -41,6 +41,10 @@
 展示投影与可操作runtime分离：恢复门禁可以阻止写入和承载，但不能把原线路页面替换或清空。
 保留原工作台的列表/详情/标签/保存意图，仅在必要位置提示未知/恢复中，并禁止对应危险操作。
 
+IMS 执行诊断用 `core/registration_diagnostics.rs` 的白名单类型，不回显身份/密钥/原 SIP。
+在实际 provider 请求、UICC 选择、通道建立、报价发送、验证后提交及真实门禁处观察；不得由 profile 标签估计结果。
+epoch/serial 和弱 runtime 只限制诊断写入，不替代原归属/预算/资费校验。最近成功不是当前 readiness，响应 Retry-After 不是已执行的等待。
+
 ## 4. 配置与API
 
 配置文本和SQLite分层由`platform/config_file`、`config_store`及`ConfigManager`负责。
@@ -69,6 +73,12 @@ REGISTER rspauth 另执行 `core::digest_aka::response_auth::tests`、`vowifi::l
 reg-event 执行 `core::reg_event::tests`、`cellular_ims::live::live_reg_event::tests`、
 `vowifi::operator::reg_event_tests`、`vowifi::live::reg_event_live::tests`；DNS TCP 另执行
 `cellular_ims::pcscf::dns_transport::tests`，NAPTR 位于原 DNS/endpoint 测试过滤器中。
+TCP/TLS 另执行 `cellular_ims::channel::sip_stream`、`stream_channel::tests`、IPsec 及原刷新过滤器内的 `stream_registration_tests`。
+N7 另执行 `core::registration_diagnostics::tests`、`cellular_ims::runtime::diagnostics_tests`、
+`vowifi::live::diagnostics_live::tests`，实际 cellular/WiFi 刷新观察位于现有 response-auth/refresh 过滤器；
+原生承载 observer 测试在 `native_bearer::tests`，统一状态 HTTP 契约在私有 D-Bus 中运行。
+Frontend Checks 必须实际运行 `imsDiagnosticsFormat.test.ts` 和 `ims-execution-diagnostics.spec.ts`；
+后者使用原工作台组件、mock API、关闭设备代理，检查来源/等待/旧响应/跨线路及零配置写入，不调用实机端点。
 GitHub artifact 下载需要认证时，用户可直接提供未解压 ZIP；先对比官方 artifact SHA-256，再只读检查日志/JSON，不要求用户提供 token。
 私有D-Bus和fake peer必须与真实系统总线、modem和公网隔离。
 

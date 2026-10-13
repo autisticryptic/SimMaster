@@ -570,10 +570,63 @@ export interface CellularImsConnectionAttempt {
   at: string
 }
 
+export type ImsFactSource = 'unknown' | 'database' | 'carrier_catalog' | 'derived' | 'sim_override' | 'isim' | 'usim' | 'environment' | 'bearer_pco' | 'profile' | 'access_configuration' | 'dns' | 'dhcp' | 'runtime'
+export type ImsFactFamily = 'unknown' | 'ipv4' | 'ipv6' | 'ipv4v6'
+export type ImsFactProcedure = 'not_observed' | 'initial' | 'refresh' | 'unregister' | 'registration_event'
+export interface ImsIpsecAlgorithms {
+  integrity: 'hmac_sha1_96' | 'hmac_md5_96'
+  encryption: 'aes_cbc' | 'null'
+}
+/** Execution facts, not profile estimates or authority to change readiness. */
+export interface ImsRegistrationDiagnostics {
+  version: number
+  observed: boolean
+  procedure: ImsFactProcedure
+  profile_id?: string | null
+  profile_source: ImsFactSource
+  identity_source: 'unknown' | 'isim' | 'usim_derived' | 'sim_override_derived'
+  declared_identity_source: 'unknown' | 'isim' | 'derived' | 'carrier_device_model' | 'other'
+  identity_rule_status: 'not_observed' | 'uicc_resolved' | 'standard_derived' | 'declared_only'
+  domain_source: ImsFactSource
+  realm_source: ImsFactSource
+  requested_family: ImsFactFamily
+  granted_family: ImsFactFamily
+  signaling_family: ImsFactFamily
+  pcscf_source: ImsFactSource
+  transport: 'unknown' | 'udp' | 'tcp' | 'tls'
+  pcscf_port?: number | null
+  signaling_port?: number | null
+  socket_ready: boolean
+  endpoint_index?: number | null
+  endpoint_count?: number | null
+  tls_verification: 'not_observed' | 'not_applicable' | 'pending' | 'verified' | 'failed'
+  tls_algorithms?: { version?: string | null; cipher_suite?: string | null } | null
+  offered_ipsec?: ImsIpsecAlgorithms[] | null
+  negotiated_ipsec: ImsIpsecAlgorithms[]
+  security_mode: 'unknown' | 'plain' | 'ipsec' | 'tls'
+  digest_algorithm?: 'akav1_md5' | 'akav2_md5' | 'akav2_sha256' | 'plain_md5' | null
+  rspauth_verified?: boolean | null
+  failure?: {
+    scope: 'unknown' | 'endpoint' | 'bearer' | 'binding' | 'authentication' | 'negotiation' | 'local' | 'ownership'
+    reason_code?: string | null
+    sip_status?: number | null
+    auth_stage?: 'initial' | 'authentication' | 'authenticated' | null
+    lease_negotiation_observed: boolean
+    response_retry_after_seconds?: number | null
+    response_retry_after_invalid: boolean
+    procedure: ImsFactProcedure
+    endpoint_index?: number | null
+  } | null
+  wait: { status: 'unknown' | 'ready' | 'waiting' | 'stopped'; retry_after_seconds?: number | null; not_before?: string | null }
+  negotiated_from_success: boolean
+  updated_at?: string | null
+}
+
 export interface CellularImsRuntimeStatus {
   phase: string
   stage: string
   registration_mode: string
+  diagnostics?: ImsRegistrationDiagnostics
   pcscf?: string
   session_started_at?: string
   registered_at?: string
@@ -1108,6 +1161,7 @@ export interface VowifiLineConfigResponse {
   matched_profile_id?: string | null
   matched_profile_source?: ImsProfileSource | null
   matched_profile_fallback_reason?: string | null
+  diagnostics?: ImsRegistrationDiagnostics
 }
 
 export interface AccessNetworkRuntimeStatus {
@@ -1287,12 +1341,14 @@ export interface ImsAccessPath {
 }
 
 export interface ThreeGppAccess extends ImsAccessPath {
+  diagnostics?: ImsRegistrationDiagnostics
   radio_available: boolean
   bearer_up: boolean
   registration_mode?: string | null
 }
 
 export interface NonThreeGppAccess extends ImsAccessPath {
+  diagnostics?: ImsRegistrationDiagnostics
   epdg_host?: string | null
   epdg_ready: boolean
   ike_ready: boolean
@@ -2550,6 +2606,7 @@ export interface VowifiRuntimeExecutorReport {
 }
 
 export interface VowifiStatusResponse {
+  diagnostics?: ImsRegistrationDiagnostics
   phase: string
   dataplane_mode: string
   controlplane_mode: string

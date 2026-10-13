@@ -228,9 +228,10 @@
 ### 蜂窝 P-CSCF 端点
 
 - 按来源存在性选择：显式环境值 → bearer PCO → 显式 profile → ISIM P-CSCF → 标准 DNS。显式值无效/解析失败/不支持时不静默跳到其他来源；不同族仍走原实际授予族计划。
-- `PcscfEndpoint` 保留 socket、UDP transport、source、原主机名和可用的 TTL/SRV priority/weight；当前不缓存 TTL，不由 metadata 推断可复用承载。
-- IPv4、裸 IPv6、`[IPv6]:port`、`host:port` 和 `sip:host:port;transport=udp` 保端口。蜂窝尚无 TCP/TLS 通道，profile transport 或显式 URI 请求非 UDP 时明确失败，`sips:` 不再悄悄变成 UDP/5060。
-- 只经 UE worker/当前 bearer DNS 查询；直接 A/AAAA 的完整有界集合优先，其次 UDP SRV，保留端口/优先级和加权顺序。没有全局 resolver。`0c1fff8` 已验证：匹配 TC question/ID 才允许同 resolver 的一次 TCP 重试；旧 direct/SRV 耗尽后增加终端 SIP NAPTR→UDP SRV，明确不把 D2T 当 UDP。蜂窝 SIP TCP/TLS 仍待后续接线。
+- `PcscfEndpoint` 保留 socket、UDP/TCP/TLS transport、source、原 authority、可用 TTL/SRV priority/weight；当前不缓存 TTL，不由 metadata 推断可复用承载。
+- IPv4、裸 IPv6、`[IPv6]:port`、`host:port` 和显式 SIP URI 保持端口/传输；`sips:` 使用 TLS，不降为 UDP。TCP/IPsec 使用四向 selector，protected 接收端口先 bind、SA 安装后 listen；原 UDP 两向实现保持。
+- TLS1.2/1.3 使用内置 WebPKI roots，校验原逻辑 authority 的精确 DNS/IP SAN，不接受通配符、错名、不可信链或静默降级。显式 required-IPsec 与不支持的新 TLS/IPsec/客户端证书组合拒绝，不以 TLS 撤销 IMS 安全要求。
+- 只经 UE worker/当前 bearer DNS 查询，没有全局 resolver。保留 direct/SRV 优先和现有加权策略；匹配 TC question/ID 才允许同 resolver 的一次 TCP 重试，原查询总 deadline 不延长。旧路径耗尽后有界 NAPTR D2U/D2T/SIPS D2T，TLS 原 authority 不被 SRV 目标改名；完整 N6 由 `6c0c140` 验证。
 - 最多 16 个端点、16 次 DNS 查询、3 个同族 bearer resolver；每次查询最多 4 秒、整个发现最多 12 秒。重复查询与端点去重，DNS 长度/owner/CNAME/截断边界继续严格校验。
 
 ## 8. REGISTER 三态与写入契约
@@ -315,6 +316,17 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 - 每路响应 `require_outbound/flow_timer_seconds` 与 `cellular_flow/wlan_flow` 分开报告
   lifetime、offered/negotiated、`transport_validated`；不能用两个缓存 registered 标志证明双流。
 - 不输出 Contact、订户身份、Authorization 或 SA keys；日志同样仅记录能力/归属元数据。
+
+### 执行事实 `diagnostics`（N7，实现验证状态见 HANDOFF）
+
+- 统一状态的 `three_gpp.diagnostics` / `non_three_gpp.diagnostics`，cellular 线路的 `runtime.diagnostics` 与 WiFi 线路的 `diagnostics` 都来自各自 runtime 的同一投影，不重新读卡、建连接或修改恢复条件。
+- `version=1`、`observed=false`/`unknown` 保留未观察状态。profile/identity/domain/realm/P-CSCF 只给来源类型和配置 ID；身份值、AID、原始 SIP、nonce、密钥和证书不属于这个 schema。
+- `declared_identity_source` 是配置声明；`identity_source` 是实际选择，`declared_only` 明确模板规则未实现/未执行，不由标签伪造能力。请求/授予/信令族分开，合法单族授予不能被说成双栈。
+- `pcscf_port` 是发现端口，`signaling_port` 是通道实际目的端口；`socket_ready` 仅记曾创建自有通道，不保证仍存活。实际 TLS 版本/套件和白名单 IPsec 报价、协商分开；`negotiated_from_success` 是最近成功历史，不是当前注册权威。缺可选 rspauth 不冒称验证成功。
+- 失败带 scope、initial/refresh/unregister/reg-event、鉴权阶段、状态码和 423 依据；`failure.response_retry_after_seconds` 是收到的要求，`wait.not_before`/remaining 是实际控制门禁。长等待/停止不伪造零秒重试，查询不刷新 deadline。
+- epoch/serial 令牌拒绝旧尝试更新；WiFi 弱 runtime 与执行阶段原 owner/epoch 上下文防止 reset 后才恢复的任务认领新状态。投影不重置任何协议预算、授予 readiness 或改变 UI 保存意图。
+- 原工作台详情内增加可选只读折叠区；旧响应无字段仍可显示。Bruno `get_ims_status` 是被动查询；既有 `get_vowifi_status?live=true` 保留原显式探测语义，不能把所有 GET 都称为无副作用。
+- 已识别的刷新 423 预算与 WiFi 普通 REGISTER Retry-After 控制缺口仍按开发计划独立补齐；出现诊断字段不代表这两项已完成。
 
 ## 10. 验证清单与验收标准
 

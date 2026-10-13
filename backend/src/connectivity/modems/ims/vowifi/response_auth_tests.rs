@@ -182,6 +182,49 @@ fn initial_empty_or_auts_never_borrows_a_prior_proof() {
 }
 
 #[tokio::test]
+async fn diagnostics_real_wifi_refresh_projects_sent_offer_validated_success_and_actual_auth_failure() {
+    use crate::connectivity::core::registration_diagnostics as facts;
+    for valid in [true, false] {
+        let (mut factory, mut channel, server) = fixture(false).await;
+        let runtime = Arc::new(crate::connectivity::modems::ims::vowifi::runtime::VowifiRuntime::for_line(&factory.line_id));
+        reg_event_live::bind_reg_event_runtime(&factory.line_id, &runtime);
+        let scope = diagnostics_live::Scope::begin(&factory.line_id, factory.profile).await;
+        Arc::get_mut(&mut factory).unwrap().context.diagnostic_scope = scope;
+        let peer = tokio::spawn(async move {
+            let (request, source) = receive(&server).await;
+            let offered = facts::ipsec_algorithms(&sip_frame::header_values(&request, "Security-Client").join(","));
+            let headers = info(&request, false);
+            let headers = if valid { headers } else { headers.replace("cnonce=\"", "cnonce=\"invalid-") };
+            server.send_to(&response(&request, "200 OK", &format!("Expires: 4800\r\n{headers}")), source).await.unwrap();
+            offered
+        });
+        let result = factory.refresh(&mut channel).await;
+        let offered = peer.await.unwrap();
+        let snapshot = runtime.snapshot().await;
+        let report = snapshot.status_response().diagnostics;
+        assert_eq!(report.procedure, facts::RegistrationProcedure::Refresh);
+        assert_eq!(report.offered_ipsec, Some(offered));
+        assert_eq!(report.negotiated_from_success, valid);
+        if valid {
+            assert_eq!(result.unwrap().lease.expires_seconds, 4800);
+            assert_eq!(report.rspauth_verified, Some(true));
+            assert_eq!(report.negotiated_ipsec, facts::ipsec_algorithms(VERIFY));
+            assert_eq!(report.wait.status, facts::WaitStatus::Ready);
+        } else {
+            assert!(result.unwrap_err().code().starts_with("digest_response_auth_"));
+            let failure = report.failure.as_ref().unwrap();
+            assert_eq!(failure.scope, facts::FailureScope::Authentication);
+            assert_eq!(failure.sip_status, Some(200));
+            assert!(report.negotiated_ipsec.is_empty());
+            assert_retained(&factory, 2);
+        }
+        assert!(!snapshot.live_readiness.ims_registered, "diagnostics never grant runtime readiness");
+        let json = serde_json::to_string(&report).unwrap();
+        for secret in [&factory.context.identity.private_user, &nonce(1), &nonce(3)] { assert!(!json.contains(secret.as_str())); }
+    }
+}
+
+#[tokio::test]
 async fn registered_direct_refresh_optional_and_verified_nextnonce_paths() {
     for mode in 0..3 {
         let (factory, mut channel, server) = fixture(false).await;

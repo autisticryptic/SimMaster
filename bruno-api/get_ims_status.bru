@@ -13,3 +13,31 @@ get {
 settings {
   encodeUrl: true
 }
+
+docs {
+  Both access objects include additive diagnostics v1 from actual runtime observations.
+  Unknown/unobserved is not an inferred configuration result; declared identity templates
+  are not evidence that a template rule executed. requested_family differs from granted_family.
+  offered_ipsec differs from negotiated_ipsec. negotiated_from_success is historical evidence,
+  not current registration or permission to register. failure.response_retry_after_seconds
+  is the response requirement; wait.not_before is the actual enforced runtime gate.
+  Reading this projection does not start registration or send a hardware command.
+  Never include identity values, raw SIP, keys, AIDs, nonce or certificate material here.
+}
+
+tests {
+  test("both access diagnostics preserve the passive execution contract", function () {
+    expect(res.getStatus()).to.equal(200);
+    const state = res.getBody().data;
+    for (const access of [state.three_gpp, state.non_three_gpp]) {
+      const facts = access.diagnostics;
+      expect(facts.version).to.equal(1);
+      expect(facts.observed).to.be.a('boolean');
+      expect(facts.negotiated_from_success).to.be.a('boolean');
+      expect(['unknown', 'ready', 'waiting', 'stopped']).to.include(facts.wait.status);
+      for (const secret of ['imsi', 'impi', 'impu', 'raw_sip', 'authorization', 'nonce', 'ck', 'ik', 'aid']) {
+        expect(facts).not.to.have.property(secret);
+      }
+    }
+  });
+}
