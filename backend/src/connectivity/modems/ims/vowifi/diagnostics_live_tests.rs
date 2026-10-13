@@ -65,6 +65,16 @@ async fn destroyed_runtime_cannot_publish_into_a_new_runtime_with_the_same_line_
 }
 
 #[tokio::test]
+async fn ike_authentication_rejection_is_not_misreported_as_an_ordinary_bearer_failure() {
+    let (line, runtime) = runtime();
+    let scope = Scope::begin(&line, profile()).await;
+    scope.failure(&live_stage_error("ike_auth_notify_authentication_failed"), FailureScope::Bearer).await;
+    let failure = runtime.snapshot().await.status_response().diagnostics.failure.unwrap();
+    assert_eq!(failure.scope, FailureScope::Authentication);
+    assert_eq!(failure.sip_status, None, "IKE failure must not fabricate a SIP response");
+}
+
+#[tokio::test]
 async fn wifi_rspauth_failure_projects_actual_200_not_the_previous_401() {
     let (line, runtime) = runtime();
     let scope = Scope::begin(&line, profile()).await;

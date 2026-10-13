@@ -68,6 +68,23 @@ fn initial_request(auth: &CellularImsRegisterAuthenticator) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn diagnostics_cellular_preflight_binding_failure_is_visible_without_emitting_sip() {
+    use crate::connectivity::core::registration_diagnostics as facts;
+    let (mut session, runtime, server, _client) = refresh_session().await;
+    let token = runtime.begin_diagnostics().await;
+    session.diagnostic_scope = token;
+    let runtime = runtime.with_diagnostics(token);
+    session.auth_binding = None;
+    let db = Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+    let result = refresh_live_registration(&mut session, &runtime, "n7-binding-preflight", &db).await;
+    assert_eq!(result.error.unwrap().code(), "ims_uicc_binding_invalid");
+    let report = runtime.status().await.diagnostics;
+    assert_eq!(report.failure.unwrap().scope, facts::FailureScope::Ownership);
+    assert!(!report.negotiated_from_success);
+    assert_eq!(server.try_recv_from(&mut [0u8; 2048]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[tokio::test]
 async fn diagnostics_real_cellular_refresh_publishes_only_accepted_algorithms_and_rspauth() {
     use crate::connectivity::core::registration_diagnostics as facts;
     let (mut session, runtime, server, _client) = refresh_session().await;

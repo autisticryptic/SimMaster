@@ -8874,8 +8874,16 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
         Box::pin(async move {
             self.context.diagnostic_scope.update(|state|
                 state.facts.procedure = crate::connectivity::core::registration_diagnostics::RegistrationProcedure::Refresh).await;
-            let uicc = self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?;
-            uicc.verify(&self.line_id).await.map_err(ImsError::new)?;
+            let Some(uicc) = self.context.uicc.as_ref() else {
+                let error = ImsError::new("ims_uicc_binding_invalid");
+                self.context.diagnostic_scope.core_failure(&error, crate::connectivity::core::registration_diagnostics::FailureScope::Ownership).await;
+                return Err(error);
+            };
+            if let Err(reason) = uicc.verify(&self.line_id).await {
+                let error = ImsError::new(reason);
+                self.context.diagnostic_scope.core_failure(&error, crate::connectivity::core::registration_diagnostics::FailureScope::Ownership).await;
+                return Err(error);
+            }
             let mut auth = VowifiRefreshAuthenticator {
                 factory: self,
                 resync_sent: false,
@@ -8899,7 +8907,11 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
                 }
                 self.context.diagnostic_scope.update(|state| state.failure(failure.error.code(), Some(metadata))).await;
             }
-            uicc.verify(&self.line_id).await.map_err(ImsError::new)?;
+            if let Err(reason) = uicc.verify(&self.line_id).await {
+                let error = ImsError::new(reason);
+                self.context.diagnostic_scope.core_failure(&error, crate::connectivity::core::registration_diagnostics::FailureScope::Ownership).await;
+                return Err(error);
+            }
             let result = result.map_err(|failure| {
                 if is_live_digest_authentication_failure(failure.error.code())
                     || failure.error.code().starts_with("ims_outbound_")

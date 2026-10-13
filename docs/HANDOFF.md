@@ -18,6 +18,8 @@ N7 当前实现接入实际 provider/UICC/端点/请求/响应观察、epoch/尝
 
 N7 首轮 `ee2b440` 的编译/lint 未通过：缺少错误类型 import、Child-SA 配置路径错误，以及新 Node 单测/严格比较的 lint 问题已修正，待重新 Actions。首轮 annotations 与经官方 SHA 核验的 Beta 测试 ZIP 已保留；没有取消门禁或拿旧提交结果替代。
 
+第二轮 `e5f4387` 的 Beta 与前端 lint/type/build/43 单测通过；新 browser fixture 漏掉顶层 `line_id` 导致 WiFi 响应未匹配，已按真实契约修正，未放宽断言。双接入 SIP 前归属失败和 IKE 鉴权失败的诊断另补生产回归，仍需新提交全套验证。
+
 新审查确认两项仍须实施：**蜂窝刷新 423→400 的候选预算连续性**与 **WiFi 普通 REGISTER 的 503/Retry-After 实际门禁**。诊断将响应等待要求和真正执行的 not-before 分开；已有 reg-event 等待不能代替普通 REGISTER 恢复。随后继续 N8 承载能力、相关 catalog/provider 与完整 EC20 固件复审，不在 N7 或 CI 绿色后结束整体目标。
 
 ## 已验证：reg-event

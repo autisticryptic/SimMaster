@@ -34,7 +34,9 @@ async function installFixtures(page: Page, includeDiagnostics: boolean) {
       identity_source: 'at_cimi_isim_detected', isim_aid: 'DO_NOT_RENDER_APPLICATION_ID',
       ...(includeDiagnostics ? { diagnostics: { ...facts(`cell-profile-${id}`, false), raw_sip: 'DO_NOT_RENDER_SIP', authorization: 'DO_NOT_RENDER_AUTH' } } : {}) },
   }))
-  const wifi = lines.map((line) => ({ modem: line.modem, config: { enabled: true, runtime_mode: 'live', proxy_endpoint: null },
+  const wifi = lines.map((line) => ({ line_id: line.modem.line_id, modem: line.modem,
+    config: { enabled: true, runtime_mode: 'live', proxy_endpoint: null },
+    runtime_phase: 'degraded', runtime_stage: 'ims_register', runtime_restore_in_progress: false,
     runtime_registered: false, runtime_readiness: { ike_ready: true, eap_ready: true, child_sa_ready: true, ims_registered: false },
     runtime_ims_transport_mode: 'tcp_ipsec', runtime_p_cscf: [], runtime_ike_algorithm_set: 'standard',
     runtime_ike_encryption: 'AES-CBC', runtime_ike_integrity: 'HMAC-SHA1-96', runtime_ike_prf: 'HMAC-SHA1',

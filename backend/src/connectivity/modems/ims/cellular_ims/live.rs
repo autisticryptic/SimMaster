@@ -4685,6 +4685,8 @@ async fn refresh_live_registration(
     }
     runtime.observe_diagnostics(|diagnostics| diagnostics.facts.procedure = reg_diag::RegistrationProcedure::Refresh).await;
     if let Err(error) = verify_mm_task_bearer(runtime, session.native_bearer.as_mut()).await {
+        runtime.observe_diagnostics(|state|
+            super::runtime::observe_diagnostic_failure(state, &error, reg_diag::FailureScope::Bearer)).await;
         return lost_refresh_attempt(error);
     }
     // Do not start another SIP/XFRM attempt after the network lease has
@@ -4737,7 +4739,10 @@ async fn refresh_live_registration(
         };
     }
     if let Err(error) = verify_ims_card_binding(&session.device, session.auth_binding.as_ref()).await {
-        return lost_refresh_attempt(CellularImsError::new(error.code()));
+        let error = CellularImsError::new(error.code());
+        runtime.observe_diagnostics(|state|
+            super::runtime::observe_diagnostic_failure(state, &error, reg_diag::FailureScope::Ownership)).await;
+        return lost_refresh_attempt(error);
     }
     let retry_now = Instant::now();
     let admission = session.endpoint_retries.lock().await.check(session.pcscf, retry_now);

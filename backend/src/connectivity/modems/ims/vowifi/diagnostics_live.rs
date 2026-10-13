@@ -112,9 +112,15 @@ impl Scope {
             state.accepted(route.transport, verify, digest, rspauth);
         }).await;
     }
+    pub(super) async fn core_failure(&self, error: &ImsError, fallback: facts::FailureScope) {
+        self.update(|state| state.failure_in_scope(error.code(), None, fallback)).await;
+    }
     pub(super) async fn failure(&self, error: &LiveStageError, fallback: facts::FailureScope) {
         self.update(|state| {
             state.failure_in_scope(&error.reason, error.register_failure, fallback);
+            if terminal_ike_auth_rejection(error) {
+                if let Some(failure) = state.facts.failure.as_mut() { failure.scope = facts::FailureScope::Authentication; }
+            }
             if matches!(error.reason.as_str(), "vowifi_runtime_ue_worker_generation_changed" | "ike_ue_worker_generation_changed") {
                 if let Some(failure) = state.facts.failure.as_mut() { failure.scope = facts::FailureScope::Ownership; }
             }

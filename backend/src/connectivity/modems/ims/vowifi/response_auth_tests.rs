@@ -182,6 +182,23 @@ fn initial_empty_or_auts_never_borrows_a_prior_proof() {
 }
 
 #[tokio::test]
+async fn diagnostics_wifi_preflight_binding_failure_is_visible_without_emitting_sip() {
+    use crate::connectivity::core::registration_diagnostics as facts;
+    let (mut factory, mut channel, server) = fixture(false).await;
+    let runtime = Arc::new(crate::connectivity::modems::ims::vowifi::runtime::VowifiRuntime::for_line(&factory.line_id));
+    reg_event_live::bind_reg_event_runtime(&factory.line_id, &runtime);
+    let scope = diagnostics_live::Scope::begin(&factory.line_id, factory.profile).await;
+    let mutable = Arc::get_mut(&mut factory).unwrap();
+    mutable.context.diagnostic_scope = scope;
+    mutable.context.uicc = None;
+    assert_eq!(factory.refresh(&mut channel).await.unwrap_err().code(), "ims_uicc_binding_invalid");
+    let report = runtime.snapshot().await.status_response().diagnostics;
+    assert_eq!(report.failure.unwrap().scope, facts::FailureScope::Ownership);
+    assert!(!report.negotiated_from_success);
+    assert_eq!(server.try_recv_from(&mut [0u8; 2048]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[tokio::test]
 async fn diagnostics_real_wifi_refresh_projects_sent_offer_validated_success_and_actual_auth_failure() {
     use crate::connectivity::core::registration_diagnostics as facts;
     for valid in [true, false] {
