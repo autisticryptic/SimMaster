@@ -10,17 +10,17 @@
 4. 2026-10-07 的 410 部署属于已结束的历史授权；本轮只实施 IMS 补全和 Actions 验证，**未部署、未访问设备，也不主动连接 IDA**。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：TCP/TLS 已验证，执行诊断待 CI
+## 当前：N7 诊断已验证，继续刷新预算与 WiFi 等待补漏
 
-N6 代码 **`6c0c14067941c9e6cd3d226c5e1bca12e3f587f9`** 已通过 Build-Release `38335177956`、Validate Beta `38335177980` 和 ARM64/AMD64；Release skipped。两套测试 ZIP 官方摘要、各 219 项相关回归及四矩阵 86 场景已核验，报告 `.local/evidence/ims-sip-stream/verified-6c0c140.json`。worker 内 SIP TCP、四向 TCP/IPsec、TLS1.2/1.3 与精确原 authority DNS/IP SAN、有界 DNS TC→TCP/NAPTR D2T 已接通，保留旧 UDP 与跨 profile 防降级。TLS 不绕过 required-IPsec，不冒称私有 CA、mTLS 或新的反向 TLS/IPsec 组合已支持。
+已验证代码 **`ee9ee28a5f5ba49111234a905d6188c90d5ea7cf`**：[Build-Release 38399859012](https://github.com/autisticryptic/SimMaster/actions/runs/38399859012)、[Validate Beta 38399859071](https://github.com/autisticryptic/SimMaster/actions/runs/38399859071)、[Frontend Checks 38399859035](https://github.com/autisticryptic/SimMaster/actions/runs/38399859035) 和 ARM64/AMD64 success，Release skipped。两套官方测试 ZIP 各逐名核验 **250 项相关回归**、四矩阵 86 场景；前端 **43 单测 / 3 原工作台 browser**（0 skip/flaky）、源码指纹与官方 SHA/截图均已核验。报告 `.local/evidence/ims-execution-diagnostics/verified-ee9ee28.json`，未部署、未验收程序包或实机。
 
-N7 当前实现接入实际 provider/UICC/端点/请求/响应观察、epoch/尝试 token、统一 API 和原 IMS 工作台只读折叠区；类型/生产回归/HTTP/格式化/浏览器测试已经加入，**尚待本提交的 Actions 执行与制品核验**。第一轮静态检查发现共享诊断重复了蜂窝错误码字面量，已改为适配层使用 canonical 常量，未绕开守卫或让 core 依赖 modem 错误表。
+- 实际 provider/UICC/端点/请求/响应/门禁观察进入同源 API 与原工作台只读折叠区；声明模板、请求/授予族、报价/协商、收到等待/真实门禁、历史成功/当前 readiness 分开，不输出身份、AID、nonce、密钥或原 SIP。
+- epoch/serial、弱 runtime 与阶段原 owner 保护旧异步工作；双接入 SIP 前归属失败可见，IKE 鉴权拒绝不误报普通承载错误；读取不重置预算、不发硬件命令、不改配置/资费。
+- 首轮 `ee2b440` 的错误类型 import、Child-SA 配置路径和 Node lint 失败已修正；第二轮 `e5f4387` 的 browser fixture 缺顶层 `line_id` 已按真实 DTO 修正，没有放宽断言。原 annotations/官方失败 ZIP 保留，308 项本机静态/mock 检查通过。
 
-N7 首轮 `ee2b440` 的编译/lint 未通过：缺少错误类型 import、Child-SA 配置路径错误，以及新 Node 单测/严格比较的 lint 问题已修正，待重新 Actions。首轮 annotations 与经官方 SHA 核验的 Beta 测试 ZIP 已保留；没有取消门禁或拿旧提交结果替代。
+此前 N6 **`6c0c140`** 已验证 worker 内 SIP TCP、四向 TCP/IPsec、TLS1.2/1.3 与精确原 authority DNS/IP SAN、有界 DNS TC→TCP/NAPTR D2T；旧 UDP 和跨 profile 防降级保持。TLS 不绕过 required-IPsec，不冒称私有 CA、mTLS 或新的反向 TLS/IPsec 组合已支持。
 
-第二轮 `e5f4387` 的 Beta 与前端 lint/type/build/43 单测通过；新 browser fixture 漏掉顶层 `line_id` 导致 WiFi 响应未匹配，已按真实契约修正，未放宽断言。双接入 SIP 前归属失败和 IKE 鉴权失败的诊断另补生产回归，仍需新提交全套验证。
-
-新审查确认两项仍须实施：**蜂窝刷新 423→400 的候选预算连续性**与 **WiFi 普通 REGISTER 的 503/Retry-After 实际门禁**。诊断将响应等待要求和真正执行的 not-before 分开；已有 reg-event 等待不能代替普通 REGISTER 恢复。随后继续 N8 承载能力、相关 catalog/provider 与完整 EC20 固件复审，不在 N7 或 CI 绿色后结束整体目标。
+必须继续：**蜂窝刷新 423→400 的候选预算连续性**与 **WiFi 普通 REGISTER 的 503/Retry-After 实际门禁**。已有 reg-event 等待或诊断字段不能代替普通 REGISTER 恢复；随后继续 N8、相关 catalog/provider 与完整 EC20 固件复审，N7/CI 绿色不代表整体目标完成。
 
 ## 已验证：reg-event
 
@@ -45,13 +45,13 @@ N5 代码 **`3d54aa87b1cc0ae5f2294991a46ad2ce43984e6a`** 已通过 [Build-Releas
 
 上一阶段 AUTS/stale/跨候选 423 在 `344308c` 已验证；两套 Actions（[38138978950](https://github.com/autisticryptic/SimMaster/actions/runs/38138978950)、[38138978978](https://github.com/autisticryptic/SimMaster/actions/runs/38138978978)）各核验 46 项相关回归和四矩阵。独立 AKA 来源、受保护 stale 不重装旧 ESP、AUTS 不冒充证明、423 尝试级预算均保持；WiFi 初次认证后 423 仍明确 unsupported。
 
-**完整补全任务尚未完成。** N4～N6 已验证；N7 诊断、刷新预算/WiFi 普通等待补漏、N8 承载能力继续推进。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界，见[开发计划](DEVELOPMENT_PLAN.md)。
+**完整补全任务尚未完成。** N4～N7 已验证；刷新预算/WiFi 普通等待补漏、N8 承载能力继续推进。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界，见[开发计划](DEVELOPMENT_PLAN.md)。
 
 ## 第一批：ISIM、P-CSCF 与临时拒绝补全
 
 代码基线 **`5aaf3eab6515aba9f5f5eb43553ea00a1cec3264`**（前一实现提交 `e702cef`），已推送 `simmaster/master`。
 
-**这是第一批实现及验证闭环，不是原 EC20 审查全部建议已完成。** AUTS/stale 与跨候选 423 后续已验证；rspauth、reg-event 后续已验证，当前继续诊断、恢复补漏与承载能力；完整范围和跨项目/IDA 边界见[开发计划](DEVELOPMENT_PLAN.md)。
+**这是第一批实现及验证闭环，不是原 EC20 审查全部建议已完成。** AUTS/stale 与跨候选 423 后续已验证；rspauth、reg-event 后续已验证，当前继续恢复补漏与承载能力；完整范围和跨项目/IDA 边界见[开发计划](DEVELOPMENT_PLAN.md)。
 
 - 共享读取 ISIM 的 IMPI/DOMAIN/IMPU/P-CSCF；完整身份与认证 AID 一起选用，合法未配置时保留 USIM 派生；读取错误、损坏、换卡不假装缺省。VoWiFi 的 EAP 仍使用 USIM。
 - QMI 按 slot 发现应用，native AT 通过自有通道读取 EF_DIR；PC/SC 每个进程重选完整 AID/文件，并用稳定 reader 名称防止索引重排。卡/slot/owner 检查是分阶段观察，不冒称可原子排除所有物理热插拔竞态。

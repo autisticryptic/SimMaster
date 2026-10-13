@@ -5,7 +5,7 @@
 
 ## 1.1.5 主线
 
-- N7 执行诊断已接入 shared schema、cellular/WiFi 实际观察、统一 API 与原工作台只读折叠区，新增 runtime/协议适配/HTTP/格式化/浏览器回归，**本轮仍待 CI 和制品核验**。未知值不估计；声明模板、报价/协商、收到等待/真实门禁、历史成功/当前 readiness 分开。发现的刷新 423 连续预算与 WiFi 普通等待缺口仍独立待修，不以诊断页面算完成。
+- `ee9ee28` 完成 N7 同源执行诊断：shared schema、cellular/WiFi 实际观察、epoch/serial/弱owner、统一 API 与原工作台只读折叠区；三套 Actions/双架构、各250项相关后端回归/四矩阵、43单测/3browser与官方摘要/截图核验通过。声明模板、报价/协商、收到等待/真实门禁、历史成功/当前 readiness 分开。首轮编译lint和第二轮browser fixture问题修复留证，未部署。刷新423连续预算与WiFi普通等待仍独立待修，不以页面或绿色CI算整体完成。
 - `6c0c140` 完成 worker 内 SIP TCP/TLS、四向 TCP/IPsec、原 authority 精确 TLS DNS/IP SAN、有界 DNS TC→TCP/NAPTR D2T，保留 UDP 和防降级；两套 Actions、双架构、各 219 项相关回归及四矩阵/官方测试摘要通过，未部署。TLS 不绕过 required-IPsec，私有 CA/mTLS/新的反向 TLS-IPsec 未冒称支持；首次 E0451 已修复并留证。
 
 - `3d54aa8` 接入同 owner 的 reg-event 订阅与注册状态通知，严格匹配实际 REGISTER 绑定和版本/dialog；无关或坏通知不影响 readiness。合法撤销保留同卡恢复等待与活动对话排空，MWI/REFER 不变；两套 Actions、双架构与相关制品证据通过，未部署。

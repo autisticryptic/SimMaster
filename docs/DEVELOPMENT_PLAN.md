@@ -6,7 +6,7 @@
 
 ## 当前基线与工作规则
 
-- 当前已验证源码基线为 `6c0c140`：TCP/TLS、TCP/IPsec、DNS TC→TCP/NAPTR D2T 已通过两套 Actions、各 219 项相关回归、四矩阵及双架构；更早 N4/N5/AUTS/stale/初始 423 也已核验。**N7 执行诊断已接入待 CI；继续刷新预算/WiFi 等待补漏和 N8，未部署**，见 [HANDOFF](HANDOFF.md)。
+- 当前已验证源码基线为 `ee9ee28`：N7 同源执行诊断通过 Build/Beta/Frontend Checks、双架构、各250项相关后端回归、四矩阵、43单测和3原工作台browser/官方制品核验；N4～N6既有保护保持。**继续刷新预算/WiFi普通等待补漏和N8，未部署**，见 [HANDOFF](HANDOFF.md)。
 - 设备历史基线仍为全局兜底修复 `c174551`，已通过 Actions 和 410 原 Globe 配置的初始注册验收。
   `7bd` 的运营商专用补丁及测试仍保持由 `0502395` 撤销的状态；当前成功不能替代中国移动同卡验收。
 - **当前优先级是继续原 EC20 审查中的第二批协议补强，而不是把第一批当作整个委托结束。** 同卡/自然续期验收与停服时的 MM 重枚举/AT 超时调查独立保留，设备操作另需明确授权。
@@ -33,12 +33,12 @@
 - 已验证 AUTS/stale 与 423 的剩余限制：WiFi 初次认证后的 423 明确 unsupported；需要新安全上下文的受保护 stale 不重装旧 ESP；非 REGISTER 业务的响应认证/恢复需单独核对。
 - 新发现 **蜂窝刷新 423→400 预算缺口**：刷新三候选仍需共用尝试级 `RegisterNegotiationBudget` 和结构化止损；不能拿已验证的初始 REGISTER 预算替代。
 - 新发现 **WiFi 普通 REGISTER 等待缺口**：503/Retry-After 还须贯通同 SIM/端点/profile/worker 的实际 not-before 和有效旧租期保护；reg-event 等待与诊断展示都不是控制逻辑实现。
-- 实施顺序为 N7 诊断 CI/制品闭环 → 上述两项恢复补漏 → N8 承载能力/相关扩展 → 完整离线 EC20 复审；不能把“已有算法/helper”当成生产路径接通。
+- N7 已完成 CI/制品闭环；继续上述两项恢复补漏 → N8 承载能力/相关扩展 → 完整离线 EC20 复审，不能把“已有算法/helper”当成生产路径接通。
 
 ## P1：原报告的传输与功能扩展（部分基础已具备）
 
 - **P-CSCF 传输已由 N6 验证。** worker 内 TCP/TLS、TCP/IPsec 四向选择器、原 authority 精确 TLS 身份、有界 DNS TCP/NAPTR D2T 接通；旧 UDP、来源/预算/跨 profile 防降级保持。TLS/IPsec 组合边界和实机验收仍须明确，不能把字段存在当作全组合支持。
-- **来源诊断实现待验证。** 实际 profile/身份/domain/realm/端点、请求/授予族、报价/协商/响应认证、失败作用域和真实门禁已进入同源 API/原 GUI；epoch/serial 与弱 runtime 保护晚到写入。新增编译测试/浏览器/HTTP 回归待 Actions；声明模板和最近成功都不授予当前 readiness。
+- **来源诊断已由 N7 软件验证。** 实际 profile/身份/domain/realm/端点、请求/授予族、报价/协商/响应认证、失败作用域和真实门禁已进入同源 API/原 GUI；epoch/serial 与弱 runtime 拒绝晚到写入。声明模板、收到的 Retry-After 与最近成功都不授予当前 readiness；实机未知值仍如实未知。
 - **承载能力门禁尚需补齐。** 显式 APN PAP/CHAP、通用 PCO request policy、PCO FQDN 和 DHCP adapter 需按设备能力报告 supported/unsupported/unknown；不能借普通数据 APN 激活或猜测凭据。协议支持和真实驱动验收分别完成。
 - **EC20 离线 catalog 来源尚未接入。** 在独立 `carrier_Bundles` 侧维护版本绑定的 MCFG extractor、选择器及字段证据；未知 `qp_ims_*` raw bytes 不得猜为 ready。跨项目实施范围另行明确。
 - **EC20 原生 IMS 只读观测 provider 尚未接入。** IMSA/注册/业务状态观测需明确与主机软 IMS 的 owner/互斥；可能写 NV 的 URC 开关不归入只读采证。

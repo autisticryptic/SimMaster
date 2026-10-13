@@ -317,7 +317,7 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
   lifetime、offered/negotiated、`transport_validated`；不能用两个缓存 registered 标志证明双流。
 - 不输出 Contact、订户身份、Authorization 或 SA keys；日志同样仅记录能力/归属元数据。
 
-### 执行事实 `diagnostics`（N7，实现验证状态见 HANDOFF）
+### 执行事实 `diagnostics`（N7，`ee9ee28` 已软件验证）
 
 - 统一状态的 `three_gpp.diagnostics` / `non_three_gpp.diagnostics`，cellular 线路的 `runtime.diagnostics` 与 WiFi 线路的 `diagnostics` 都来自各自 runtime 的同一投影，不重新读卡、建连接或修改恢复条件。
 - `version=1`、`observed=false`/`unknown` 保留未观察状态。profile/identity/domain/realm/P-CSCF 只给来源类型和配置 ID；身份值、AID、原始 SIP、nonce、密钥和证书不属于这个 schema。
