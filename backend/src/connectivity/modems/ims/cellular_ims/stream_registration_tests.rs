@@ -97,6 +97,26 @@ async fn prepare_protected(session: &mut CellularImsLiveSession, runtime: &Cellu
     (auth, peer, peer_client, frame)
 }
 
+#[test]
+fn tls_register_wire_names_and_runtime_mode_never_claim_plain_tcp_or_udp() {
+    let profile = crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+        "001", "01", crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc).unwrap();
+    let effective = resolve_effective_ims_profile(profile, None);
+    let identity = ImsIdentity { private_user: "user@ims.example".into(), public_uri: "sip:user@ims.example".into(),
+        contact_user: "user".into(), home_domain: "ims.example".into(), contact_user_phone: false };
+    let route = ImsRoute { local_addr: "192.0.2.2:5080".parse().unwrap(), pcscf_addr: "192.0.2.1:5061".parse().unwrap(), transport: SipTransport::Tls };
+    let request = sip::build_register_from_profile_with_target_visited_and_access(
+        profile, effective_register_target(&effective), sip::RegisterPhase::Initial, &identity, &route,
+        &RequestIds::fresh(1), 600, None, None, None, "urn:uuid:00000000-0000-4000-8000-000000000019",
+        register_variants(profile)[0].policy, None, None,
+    );
+    assert!(sip::header_value(&request, "Via").unwrap().starts_with("SIP/2.0/TLS "));
+    assert!(sip::header_value(&request, "Contact").unwrap().contains("transport=tls"));
+    assert_eq!(RegistrationMode::from_transport(route.transport).as_str(), "tls");
+    assert_eq!(RegistrationMode::from_transport(SipTransport::Tcp).as_str(), "tcp");
+    assert_eq!(RegistrationMode::from_transport(SipTransport::Udp).as_str(), "udp");
+}
+
 #[tokio::test]
 async fn real_tcp_authenticated_register_checks_rspauth_before_committing_four_direction_sa() {
     for invalid in [false, true] {

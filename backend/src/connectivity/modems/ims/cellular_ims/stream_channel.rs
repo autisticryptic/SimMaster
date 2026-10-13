@@ -304,7 +304,11 @@ impl CellularStreamTransport {
                     if let Some(target) = target { target.server = Some(SipStream::plain(socket)?); }
                     else {
                         drop(socket); rejected_connections += 1;
-                        if rejected_connections >= 8 { return Err(ImsError::new(code::CHANNEL_STREAM_FRAME_INVALID)); }
+                        // Unrelated peers are not evidence that the admitted
+                        // connection failed. Bound work per receive call and
+                        // yield without turning a SYN flood into a fatal flow
+                        // error or accepting any of those peers' SIP frames.
+                        if rejected_connections >= 8 { return Err(ImsError::new(code::CHANNEL_READ_TIMEOUT)); }
                     }
                     continue;
                 }

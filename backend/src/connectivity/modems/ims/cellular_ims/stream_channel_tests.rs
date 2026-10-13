@@ -132,6 +132,29 @@ async fn tcp_committed_rollover_keeps_old_connections_for_delayed_frames() {
 }
 
 #[tokio::test]
+async fn wrong_peer_connection_burst_yields_without_invalidating_the_owned_flow() {
+    let (mut stream, _old_peer) = fixture().await;
+    let (client, server_port) = stream.reserve_for_test().await;
+    let remote = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let expected = TcpSocket::new_v4().unwrap(); expected.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    stream.activate(ImsRoute { local_addr: SocketAddr::from(([127,0,0,1], client)), pcscf_addr: remote.local_addr().unwrap(), transport: SipTransport::Tcp },
+        SocketAddr::from(([127,0,0,1], server_port)), expected.local_addr().unwrap(), Some("verified".into())).await.unwrap();
+    let (mut primary, _) = remote.accept().await.unwrap();
+    let peers = tokio::spawn(async move {
+        let mut peers = Vec::new();
+        for _ in 0..8 { peers.push(TcpStream::connect(SocketAddr::from(([127,0,0,1], server_port))).await.unwrap()); }
+        peers
+    });
+    assert_eq!(stream.receive(Duration::from_secs(3), true).await.unwrap_err().code(), code::CHANNEL_READ_TIMEOUT);
+    let _peers = peers.await.unwrap();
+    assert_eq!(stream.security_verify(), Some("verified"));
+    assert!(stream.current.streams.client.is_usable());
+    let valid = request("after-burst", "OPTIONS", server_port);
+    primary.write_all(&valid).await.unwrap();
+    assert_eq!(stream.receive(Duration::from_secs(2), true).await.unwrap(), valid);
+}
+
+#[tokio::test]
 async fn tcp_listener_rejects_a_different_remote_tuple_without_borrowing_its_frames() {
     let (mut stream, _old_peer) = fixture().await; let (client, server_port)=stream.reserve_for_test().await;
     let remote=TcpListener::bind("127.0.0.1:0").await.unwrap();
