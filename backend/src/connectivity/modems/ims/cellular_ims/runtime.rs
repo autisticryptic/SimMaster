@@ -18,6 +18,7 @@ use std::sync::{
 
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
+use super::errors::CellularImsError;
 
 use crate::{
     connectivity::core::ims_failure::ImsServiceState, platform::config::ImsProfileCandidate,

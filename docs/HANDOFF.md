@@ -16,6 +16,8 @@ N6 代码 **`6c0c14067941c9e6cd3d226c5e1bca12e3f587f9`** 已通过 Build-Release
 
 N7 当前实现接入实际 provider/UICC/端点/请求/响应观察、epoch/尝试 token、统一 API 和原 IMS 工作台只读折叠区；类型/生产回归/HTTP/格式化/浏览器测试已经加入，**尚待本提交的 Actions 执行与制品核验**。第一轮静态检查发现共享诊断重复了蜂窝错误码字面量，已改为适配层使用 canonical 常量，未绕开守卫或让 core 依赖 modem 错误表。
 
+N7 首轮 `ee2b440` 的编译/lint 未通过：缺少错误类型 import、Child-SA 配置路径错误，以及新 Node 单测/严格比较的 lint 问题已修正，待重新 Actions。首轮 annotations 与经官方 SHA 核验的 Beta 测试 ZIP 已保留；没有取消门禁或拿旧提交结果替代。
+
 新审查确认两项仍须实施：**蜂窝刷新 423→400 的候选预算连续性**与 **WiFi 普通 REGISTER 的 503/Retry-After 实际门禁**。诊断将响应等待要求和真正执行的 not-before 分开；已有 reg-event 等待不能代替普通 REGISTER 恢复。随后继续 N8 承载能力、相关 catalog/provider 与完整 EC20 固件复审，不在 N7 或 CI 绿色后结束整体目标。
 
 ## 已验证：reg-event

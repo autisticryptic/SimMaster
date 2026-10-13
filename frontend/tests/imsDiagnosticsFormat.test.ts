@@ -20,13 +20,13 @@ function row(data: ImsRegistrationDiagnostics, label: string) {
   return imsDiagnosticRows(data).find((row) => row.label === label)?.value ?? ''
 }
 
-test('missing/unknown versions do not turn configuration into execution evidence', () => {
+void test('missing/unknown versions do not turn configuration into execution evidence', () => {
   assert.deepEqual(imsDiagnosticRows(undefined), [])
   assert.deepEqual(imsDiagnosticRows(facts({ version: 2 })), [])
   assert.deepEqual(imsDiagnosticRows(facts({ observed: false })), [])
 })
 
-test('actual identity, requested and granted families and profile source are independent', () => {
+void test('actual identity, requested and granted families and profile source are independent', () => {
   const data = facts()
   assert.match(row(data, '实际 profile 来源'), /自定义数据库.*actual-profile/)
   assert.equal(row(data, '实际身份来源'), 'ISIM 卡内身份')
@@ -36,7 +36,7 @@ test('actual identity, requested and granted families and profile source are ind
   assert.equal(row(data, '发现端口 / 信令端口'), '5060 / 5098')
 })
 
-test('IPsec offers are not reported as negotiated and optional rspauth is not fabricated', () => {
+void test('IPsec offers are not reported as negotiated and optional rspauth is not fabricated', () => {
   const data = facts()
   assert.match(row(data, 'SIP/IPsec 报价'), /AES-CBC/)
   assert.match(row(data, 'SIP/IPsec 报价'), /null/)
@@ -46,7 +46,7 @@ test('IPsec offers are not reported as negotiated and optional rspauth is not fa
   assert.equal(row(facts({ negotiated_from_success: false }), '最近成功的安全协商'), '尚未记录成功协商')
 })
 
-test('TLS information distinguishes a candidate from a verified connection', () => {
+void test('TLS information distinguishes a candidate from a verified connection', () => {
   const pending = facts({ transport: 'tls', socket_ready: false, tls_verification: 'pending', negotiated_from_success: false })
   assert.match(row(pending, '信令传输'), /TLS.*仅候选/)
   assert.match(row(pending, 'TLS 身份与算法'), /尚未完成验证/)
@@ -55,7 +55,7 @@ test('TLS information distinguishes a candidate from a verified connection', () 
   assert.match(row(verified, 'TLS 身份与算法'), /已验证.*TLS 1\.3.*AES-128-GCM/)
 })
 
-test('response requested wait and the actual gate are not conflated', () => {
+void test('response requested wait and the actual gate are not conflated', () => {
   const data = facts({ procedure: 'refresh', failure: { scope: 'endpoint', reason_code: 'ims_register_authenticated_unexpected_status',
     sip_status: 503, auth_stage: 'authenticated', procedure: 'refresh', endpoint_index: 1,
     lease_negotiation_observed: false, response_retry_after_seconds: 300, response_retry_after_invalid: false },
@@ -68,7 +68,7 @@ test('response requested wait and the actual gate are not conflated', () => {
   assert.match(row(facts({ wait: { status: 'stopped' } }), '实际重试门禁'), /不能清预算绕过/)
 })
 
-test('only documented fields and known labels are rendered, never raw secrets or prototype values', () => {
+void test('only documented fields and known labels are rendered, never raw secrets or prototype values', () => {
   const forged = { ...facts(), profile_source: '__proto__', identity_source: 'constructor',
     authorization: 'SECRET_AUTH', raw_sip: 'SECRET_SIP', nonce: 'SECRET_NONCE',
     tls_verification: 'verified', tls_algorithms: { version: 'SECRET_VERSION', cipher_suite: 'SECRET_CIPHER' },

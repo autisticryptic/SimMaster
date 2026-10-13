@@ -2968,7 +2968,8 @@ async fn run_live_ike_until_depth(
                     line_id,
                     ip_stack, "VoWiFi IKE address-family attempt succeeded"
                 );
-                diagnostic_scope.granted_family(session.configuration.as_ref().map(|configuration| configuration.assigned_inner_addresses.as_slice())).await;
+                diagnostic_scope.granted_family(session.child_sa.as_ref().and_then(|child| child.configuration.as_ref())
+                    .map(|configuration| configuration.assigned_inner_addresses.as_slice())).await;
                 return Ok(session);
             }
             Err(mut error) => {
@@ -2995,7 +2996,8 @@ async fn run_live_ike_until_depth(
                         .await
                         {
                             Ok(session) => {
-                                diagnostic_scope.granted_family(session.configuration.as_ref().map(|configuration| configuration.assigned_inner_addresses.as_slice())).await;
+                                diagnostic_scope.granted_family(session.child_sa.as_ref().and_then(|child| child.configuration.as_ref())
+                                    .map(|configuration| configuration.assigned_inner_addresses.as_slice())).await;
                                 return Ok(session);
                             }
                             Err(mut forced_error) => {

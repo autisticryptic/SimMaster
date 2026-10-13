@@ -26,7 +26,7 @@ use crate::{
                 ActiveRtpRelay, MediaRelayPolicy, OperatorSocketCreator, PayloadTypeMapping,
                 PendingRtpRelay,
             },
-            register::{run_unregister, RegisterAuthenticator},
+            register::RegisterAuthenticator,
             registration::{ImsRegistrationAccess, RegisteredImsContext, UnregisterResult},
             sip_frame,
             sip_message::SipHeader,

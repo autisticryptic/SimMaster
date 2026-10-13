@@ -69,7 +69,7 @@ export function imsDiagnosticRows(facts?: ImsRegistrationDiagnostics | null): Im
       ? `IPsec · ${algorithms(facts.negotiated_ipsec, '算法未确认')}` : facts.security_mode === 'tls' ? 'TLS（不替代明确的 IPsec 要求）'
         : facts.security_mode === 'plain' ? 'SIP 层未协商独立 IPsec；接入隧道状态另列' : '未确认' },
     { label: '请求 Digest 方案', value: lookup(digests, facts.digest_algorithm, '未记录') },
-    { label: '最近成功响应 rspauth', value: !facts.negotiated_from_success || facts.rspauth_verified == null ? '未记录'
+    { label: '最近成功响应 rspauth', value: !facts.negotiated_from_success || (facts.rspauth_verified === null || facts.rspauth_verified === undefined) ? '未记录'
       : facts.rspauth_verified ? '已验证服务器响应证明' : '未提供可选 rspauth，不冒称已验' },
   ]
   const tlsLabel = lookup({ not_observed: '未记录', not_applicable: '不适用', pending: '尚未完成验证', verified: '建立连接时已验证', failed: '验证/握手失败' }, facts.tls_verification, '未确认')

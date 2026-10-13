@@ -41,7 +41,7 @@ class ImsExecutionDiagnosticsContract(unittest.TestCase):
         self.assertIn('observe_request(if forced == 4 { "ipv4" } else { "ipv6" })', native)
         self.assertIn("diagnostics.accepted(diagnostic_route.transport", cell)
         self.assertIn("diagnostic_scope.accepted(channel.route()", wifi)
-        self.assertIn("diagnostic_scope.granted_family(session.configuration", wifi)
+        self.assertIn("diagnostic_scope.granted_family(session.child_sa", wifi)
         self.assertIn("diagnostic_scope.requested_family(forced_stack)", wifi)
 
     def test_actions_run_nonempty_backend_and_original_workbench_regressions(self):
