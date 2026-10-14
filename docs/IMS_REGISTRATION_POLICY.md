@@ -149,7 +149,7 @@
 - 临时刷新拒绝先回滚暂存 SA/socket/auth，再保留仍有效的原保护绑定。等待越过旧 expiry 时只保留到原截止；到期唤醒做失效处理，不提前 REGISTER，也不把请求中的新 Expires 当成新租期。
 - 已死亡 outbound flow、SIM/owner 失效和身份/认证拒绝不据此保留。注销仍检查绑定与端点等待，不向可能换卡后的订阅发送旧身份。
 - WiFi 初次等待键使用发现时的逻辑 P-CSCF 地址/端口，不使用后协商的 IPsec 端口；临时响应立即停止同端点头型阶梯，未开始新AKA时可选合格其他端点，认证/423后的止损保持。完整失败轮次之后，重启/profile/ESP重建先查同卡门禁。
-- WiFi operator 通过不可序列化的 `RegisterRecovery`/`RegisteredRefreshFailure` 传递真实 metadata、not-before、原 lease deadline 与是否实际发送；这些控制值独立于被动 diagnostics。等待只恢复本来已有的服务flags，到旧截止降readiness，不补发早到REGISTER；保留活动对话原排空逻辑。
+- WiFi operator 通过不可序列化的 `RegisterRecovery`/`RegisteredRefreshFailure` 传递真实 metadata、not-before、原 lease deadline 与是否实际发送；这些控制值独立于被动 diagnostics。等待只恢复本来已有的服务flags，到旧截止降readiness，不补发早到REGISTER；保留活动对话原排空逻辑。独立撤销serial在最终stage发布处重验，网络reg-event撤销后，旧刷新不能恢复绑定。
 - API 只计实际失败轮次，不把等待轮询计成新失败；耗尽后的重建动作也等门禁，清理只消费 pending 动作位，不清失败次数。新注册成功或正向确认换卡才清旧预算；有限scope/端点容量耗尽fail-closed。
 - WiFi 注册捕获原 worker binding，刷新/后续鉴权/注销核验原实例与代次；替换后的新worker不能被旧channel借用。TCP EOF/确定的连接错误按死流恢复，不能用旧租期包装成可重试UDP收包缺口。
 

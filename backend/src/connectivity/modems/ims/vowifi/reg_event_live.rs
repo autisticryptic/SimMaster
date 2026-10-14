@@ -151,7 +151,7 @@ impl VowifiUnregisterFactory {
         super::diagnostics_live::network_wait(&self.line_id, observed_deadline).await;
         let runtime = runtime_for_line(&self.line_id);
         if let Some(runtime) = runtime {
-            runtime.prepare_live_ims_registration_refresh(LOSS_REASON).await;
+            runtime.revoke_live_ims_registration(LOSS_REASON).await;
         }
     }
 }

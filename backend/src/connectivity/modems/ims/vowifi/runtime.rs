@@ -126,6 +126,7 @@ pub struct VowifiRuntime {
     snapshot: Arc<RwLock<RuntimeSnapshot>>,
     live_refresh: Arc<Mutex<LiveRefreshState>>,
     live_generation: Arc<AtomicU64>,
+    registration_revocation_serial: Arc<AtomicU64>,
     diagnostic_serial: Arc<AtomicU64>,
     /// Which line this runtime serves. Threaded into every executor stage so the
     /// stage picks up this line's ePDG/DNS/proxy overrides — two SIMs on different
@@ -190,6 +191,7 @@ impl VowifiRuntime {
                 last_finished: None,
             })),
             live_generation: Arc::new(AtomicU64::new(0)),
+            registration_revocation_serial: Arc::new(AtomicU64::new(0)),
             diagnostic_serial: Arc::new(AtomicU64::new(0)),
             line_id: Arc::from(line_id),
             access_network,
@@ -365,6 +367,22 @@ impl VowifiRuntime {
         snapshot.clone()
     }
 
+    /// A registrar loss is not a refresh-in-progress: never let a late
+    /// temporary refresh result restore the just-revoked binding.
+    pub(crate) async fn revoke_live_ims_registration(&self, reason: &str) -> RuntimeSnapshot {
+        let mut snapshot = self.snapshot.write().await;
+        self.registration_revocation_serial.fetch_add(1, Ordering::SeqCst);
+        snapshot.phase = RuntimePhase::ProfileMatched;
+        snapshot.live_readiness.ims_registered = false;
+        snapshot.live_readiness.sms_ready = false;
+        snapshot.live_readiness.voice_ready = false;
+        snapshot.live_readiness.refresh_prior = None;
+        snapshot.live_readiness.retained_until = None;
+        snapshot.live_readiness.register_recovery = None;
+        snapshot.degraded_reason = Some(reason.to_owned());
+        snapshot.clone()
+    }
+
     pub async fn refresh_live_readiness(
         &self,
         db: Option<&crate::platform::db::Database>,
@@ -469,6 +487,7 @@ impl VowifiRuntime {
         scope: LiveRefreshScope,
     ) -> RuntimeSnapshot {
         let generation = self.live_generation.load(Ordering::SeqCst);
+        let revocation_serial = self.registration_revocation_serial.load(Ordering::SeqCst);
         let snapshot = self.snapshot().await;
         if !snapshot.profile.matched {
             return snapshot;
@@ -630,6 +649,9 @@ impl VowifiRuntime {
                 super::live::clear_live_runtime_for_line(self.line_id()).await;
                 return self.snapshot().await;
             }
+            if self.registration_revocation_serial.load(Ordering::SeqCst) != revocation_serial {
+                return self.snapshot().await;
+            }
             let terminal = result.status != "completed";
             next.apply_stage_result(stage, &result);
             if terminal {
@@ -641,8 +663,13 @@ impl VowifiRuntime {
             super::live::clear_live_runtime_for_line(self.line_id()).await;
             return self.snapshot().await;
         }
+        self.publish_live_stages(generation, revocation_serial, next).await
+    }
+
+    async fn publish_live_stages(&self, generation: u64, revocation_serial: u64, mut next: RuntimeSnapshot) -> RuntimeSnapshot {
         let mut current = self.snapshot.write().await;
-        if self.live_generation.load(Ordering::SeqCst) != generation { return current.clone(); }
+        if self.live_generation.load(Ordering::SeqCst) != generation
+            || self.registration_revocation_serial.load(Ordering::SeqCst) != revocation_serial { return current.clone(); }
         // The live adapters publish observations while run_stage awaits. Do
         // not overwrite their actual facts with the pre-stage snapshot clone.
         next.diagnostics = current.diagnostics.clone();

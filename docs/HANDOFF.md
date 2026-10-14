@@ -18,7 +18,7 @@ R1 代码 **`b6a78884600684b2f4c2b31aa5f2f2b08621f4a2`** 已通过 [Build-Releas
 
 **R2 已接线，待本轮 Actions 验证**：WiFi 初次端点/头型候选、原通道刷新、注销、API/profile batch/重连共用同卡 not-before；316 项本机静态/mock通过。共享无I/O等待策略由原蜂窝实现下沉，旧测试入口保持。实际临时刷新只保留 operator 原租期，typed recovery 与诊断分离；轮询不增失败计数、清理不清已耗预算，换卡须正向确认。新增原worker绑定校验，TCP EOF不冒充可保留的超时。新 controller/factory/operator/runtime/API 回归仅已写入，尚未编译执行。随后仍 N8、相关扩展与完整固件复审，未部署。
 
-R2 首轮 `37b36e8` 已编译，新增7项真实刷新/operator回归通过，但旧认证前404兼容断言失败；新增的泛化身份分类过宽，已恢复原认证前分类而保留真正的等待/认证后/423/死流门禁，并追加 controller 普通404兼容回归。未删除旧测试；官方失败ZIP和annotations留证，待新提交全套验证。
+R2 首轮 `37b36e8` 因新增泛化分类误关旧认证前404兼容而失败；`e06b0ed` 恢复原分类，保留等待/认证后/423/死流门禁并加真实controller回归，两套Actions/双架构及各303项相关回归/制品已核验。继续审查增加 reg-event 撤销 serial，防止晚到temporary refresh重新发布已撤销绑定；**新增竞态保护仍待新提交验证，R2暂未完成**。原失败ZIP与annotations保留，未删旧测试。
 
 ## 已验证：N7 同源执行诊断
 

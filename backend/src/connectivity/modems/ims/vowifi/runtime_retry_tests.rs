@@ -51,6 +51,23 @@ async fn diagnostic_history_cannot_preserve_registration_without_operator_lease_
 }
 
 #[tokio::test]
+async fn late_refresh_stage_cannot_republish_a_reg_event_revoked_binding() {
+    let runtime = VowifiRuntime::for_line("r2-runtime-revoked");
+    runtime.seed_registered_for_reg_event_test().await;
+    runtime.prepare_live_ims_registration_refresh("vowifi_registration_refresh_due").await;
+    let generation = runtime.live_generation.load(Ordering::SeqCst);
+    let revocation_serial = runtime.registration_revocation_serial.load(Ordering::SeqCst);
+    let mut late = runtime.snapshot().await;
+    late.apply_stage_result(ExecutorStage::ImsRegister, &failure(Some(Instant::now() + Duration::from_secs(60)), true));
+    assert!(late.readiness().ims_registered);
+    runtime.revoke_live_ims_registration("ims_reg_event_binding_terminated").await;
+    let current = runtime.publish_live_stages(generation, revocation_serial, late).await;
+    assert!(!current.readiness().ims_registered && !current.readiness().sms_ready);
+    assert_eq!(current.degraded_reason.as_deref(), Some("ims_reg_event_binding_terminated"));
+    assert!(current.live_readiness.retained_until.is_none());
+}
+
+#[tokio::test]
 async fn reset_or_never_registered_runtime_does_not_accept_retention_from_an_old_lease() {
     let runtime = VowifiRuntime::for_line("r2-runtime-reset");
     runtime.seed_registered_for_reg_event_test().await;

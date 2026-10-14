@@ -57,6 +57,8 @@ class VowifiRegisterRetryContract(unittest.TestCase):
         self.assertIn('if let Ok(registration) = &result', operator)
         self.assertIn('self.retained_until.is_some_and(|expiry| expiry <= Instant::now())', runtime)
         self.assertIn('self.live_readiness.refresh_prior', runtime)
+        self.assertIn('self.publish_live_stages(generation, revocation_serial, next).await', runtime)
+        self.assertIn('runtime.revoke_live_ims_registration(LOSS_REASON).await', read(BASE + 'reg_event_live.rs'))
         self.assertIn('#[serde(skip)]\n    pub(crate) register_recovery', executor)
         self.assertIn('if let Some(recovery) = last_status.register_recovery', api)
         self.assertIn('if refresh_cycle && recovery.attempted', api)
