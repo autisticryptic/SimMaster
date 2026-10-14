@@ -123,7 +123,7 @@
 
 - AUTS 保留选定 qop/opaque，但不是有效鉴权证明；非法/重复 AUTS 或仅 AUTS 后直接 2xx 不能形成注册或确认注销。
 - stale 必须关联上一条已发送的同 scope 请求；同 RAND/AUTN 才复用绑定凭据，独立 `aka_origin` 不被 nextnonce 覆盖。已保护通道不因 stale 重装同 SPI/key 或退明文；需新安全上下文时明确恢复。
-- 蜂窝刷新三候选共用一个 `RegisterNegotiationBudget`，包括 423→400/415/420/421/494 后不再换头型。门禁必须使用 `RegisterFailureMetadata.permits_variant_fallback()`，不能只看最后 SIP 状态；新鉴权后的 400 也不得重新开启 AKA/头型预算。返回错误保留 budget 的 Min-Expires 来源，正常交换首包格式兼容及 423→2xx 仍保留。R1 软件验证状态见 HANDOFF。
+- 蜂窝刷新三候选共用一个 `RegisterNegotiationBudget`，包括 423→400/415/420/421/494 后不再换头型。门禁必须使用 `RegisterFailureMetadata.permits_variant_fallback()`，不能只看最后 SIP 状态；新鉴权后的 400 也不得重新开启 AKA/头型预算。返回错误保留 budget 的 Min-Expires 来源，正常交换首包格式兼容及 423→2xx 仍保留。R1 已由 `b6a7888` 软件验证，实机互通仍独立。
 - 423 协商一旦开始，就关闭本次静态头型/profile/端点兼容扩张；无效/过大/不增长/耗尽的 floor 不能重开预算。零租期注销不协商正租期；WiFi 初次认证后 423 尚不支持，注册后 credential-aware 刷新仍支持。
 - `3509e15` 已接通并验证 rspauth：仅对实际生成的非空 Digest 证明捕获不可变请求上下文，发送前检查最终 URI/Authorization/opaque，2xx 发布前验证响应对应的 qop/nc/cnonce 和 rspauth。Authentication-Info/Proxy-Authentication-Info 不串用，重复/畸形/不匹配明确失败；缺少可选 rspauth 仍兼容，不把 nextnonce-only 冒充服务器证明已验。当前支持范围为既有 REGISTER 算法、qop=auth/无 qop 和单一鉴权 scope。
 - 响应认证失败不是传输失败或可换头型的协商提示；不能提交新的 nextnonce、租期、业务身份或安全上下文。失败保留已发送的原 nonce-count、回滚暂存状态；不放宽 AKA/ESP 算法门禁。本轮范围为 REGISTER，非 REGISTER 业务不自动宣称已支持。
@@ -329,7 +329,7 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 - 失败带 scope、initial/refresh/unregister/reg-event、鉴权阶段、状态码和 423 依据；`failure.response_retry_after_seconds` 是收到的要求，`wait.not_before`/remaining 是实际控制门禁。长等待/停止不伪造零秒重试，查询不刷新 deadline。
 - epoch/serial 令牌拒绝旧尝试更新；WiFi 弱 runtime 与执行阶段原 owner/epoch 上下文防止 reset 后才恢复的任务认领新状态。投影不重置任何协议预算、授予 readiness 或改变 UI 保存意图。
 - 原工作台详情内增加可选只读折叠区；旧响应无字段仍可显示。Bruno `get_ims_status` 是被动查询；既有 `get_vowifi_status?live=true` 保留原显式探测语义，不能把所有 GET 都称为无副作用。
-- 刷新 423 预算的 R1 补漏已接线待本轮独立验证；WiFi 普通 REGISTER Retry-After 控制缺口仍按 R2 补齐，出现诊断字段不代表恢复实现完成。
+- 刷新 423 预算的 R1 补漏已由 `b6a7888` 验证；WiFi 普通 REGISTER Retry-After 控制缺口仍按 R2 补齐，出现诊断字段不代表恢复实现完成。
 
 ## 10. 验证清单与验收标准
 

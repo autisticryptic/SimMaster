@@ -77,7 +77,7 @@ TCP/TLS 另执行 `cellular_ims::channel::sip_stream`、`stream_channel::tests`�
 N7 另执行 `core::registration_diagnostics::tests`、`cellular_ims::runtime::diagnostics_tests`、
 `vowifi::live::diagnostics_live::tests`，实际 cellular/WiFi 刷新观察位于现有 response-auth/refresh 过滤器；
 原生承载 observer 测试在 `native_bearer::tests`，统一状态 HTTP 契约在私有 D-Bus 中运行。
-刷新预算补漏的 `refresh_budget_tests` 与 TCP EOF/423 回归位于既有 `cellular_ims::live::refresh_tests` 执行过滤器；新增测试仍须逐名核验，不用静态 Python 守卫替代生产交换。
+刷新预算补漏的 `refresh_budget_tests` 与 TCP EOF/423 回归位于既有 `cellular_ims::live::refresh_tests` 执行过滤器；新增测试仍须逐名核验，不用静态 Python 守卫替代生产交换。R1 `b6a7888` 的两套日志各257项相关回归/四矩阵和双架构已核验，前端未变沿用并复核 N7 browser 源码证据，不冒称每次后端提交都重跑浏览器。
 Frontend Checks 必须实际运行 `imsDiagnosticsFormat.test.ts` 和 `ims-execution-diagnostics.spec.ts`；
 后者使用原工作台组件、mock API、关闭设备代理，检查来源/等待/旧响应/跨线路及零配置写入，不调用实机端点。
 N7 已验证代码 `ee9ee28`：两套后端日志各250项相关回归，前端43单测/3browser、官方制品摘要、source/run和原界面截图已核验；新代码需重新执行，不能沿用此结果。

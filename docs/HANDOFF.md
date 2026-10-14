@@ -10,7 +10,15 @@
 4. 2026-10-07 的 410 部署属于已结束的历史授权；本轮只实施 IMS 补全和 Actions 验证，**未部署、未访问设备，也不主动连接 IDA**。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：N7 诊断已验证，继续刷新预算与 WiFi 等待补漏
+## 当前：刷新预算已验证，继续 WiFi 普通等待与承载能力
+
+R1 代码 **`b6a78884600684b2f4c2b31aa5f2f2b08621f4a2`** 已通过 [Build-Release 38502470702](https://github.com/autisticryptic/SimMaster/actions/runs/38502470702)、[Validate Beta 38502470703](https://github.com/autisticryptic/SimMaster/actions/runs/38502470703) 和双架构构建；Release skipped。两套官方测试 ZIP 各 **257 项相关回归**及四矩阵 86 场景已核验，报告 `.local/evidence/ims-refresh-budget/verified-b6a7888.json`。前端构建输入与 N7 相同，原 43 单测/3browser 证据重新校验但未冒称本轮重跑 browser；未部署。
+
+真实刷新三候选共用 423 协商预算，结构化失败阶段/kind/Retry-After/Min-Expires 决定是否还能换头型；423→格式拒绝、新鉴权后400不重开候选，返回错误保留前序协商依据。正常首包格式兼容、423→2xx、旧 SA/租期/nonce/CSeq、503 等待和 TCP 死流处理保持。7 项新生产回归与 311 项静态/mock 通过。
+
+**下一步 R2**：WiFi 普通 REGISTER 的 503/Retry-After 仍需实际同卡/端点/profile/worker 门禁与有效旧租期保护；随后 N8、相关 catalog/provider 与完整 EC20 固件复审。不能拿 reg-event 等待或诊断页面代替恢复实现。
+
+## 已验证：N7 同源执行诊断
 
 已验证代码 **`ee9ee28a5f5ba49111234a905d6188c90d5ea7cf`**：[Build-Release 38399859012](https://github.com/autisticryptic/SimMaster/actions/runs/38399859012)、[Validate Beta 38399859071](https://github.com/autisticryptic/SimMaster/actions/runs/38399859071)、[Frontend Checks 38399859035](https://github.com/autisticryptic/SimMaster/actions/runs/38399859035) 和 ARM64/AMD64 success，Release skipped。两套官方测试 ZIP 各逐名核验 **250 项相关回归**、四矩阵 86 场景；前端 **43 单测 / 3 原工作台 browser**（0 skip/flaky）、源码指纹与官方 SHA/截图均已核验。报告 `.local/evidence/ims-execution-diagnostics/verified-ee9ee28.json`，未部署、未验收程序包或实机。
 
@@ -20,9 +28,7 @@
 
 此前 N6 **`6c0c140`** 已验证 worker 内 SIP TCP、四向 TCP/IPsec、TLS1.2/1.3 与精确原 authority DNS/IP SAN、有界 DNS TC→TCP/NAPTR D2T；旧 UDP 和跨 profile 防降级保持。TLS 不绕过 required-IPsec，不冒称私有 CA、mTLS 或新的反向 TLS/IPsec 组合已支持。
 
-R1 已在工作树接入一次刷新共用的 `RegisterNegotiationBudget`、结构化候选门禁和失败 Min-Expires 依据传播；新增真实 loopback 的 423→格式拒绝/503、floor 边界、新挑战后400、普通兼容与 TCP 死流回归，尚待本轮 Actions，不能沿用 N7 验证结果。
-
-必须继续：**蜂窝刷新 423→400 的候选预算连续性**与 **WiFi 普通 REGISTER 的 503/Retry-After 实际门禁**。已有 reg-event 等待或诊断字段不能代替普通 REGISTER 恢复；随后继续 N8、相关 catalog/provider 与完整 EC20 固件复审，N7/CI 绿色不代表整体目标完成。
+R1 刷新预算补漏以本页顶部 `b6a7888` 的独立结果为准，不再只引用 N7。R2、N8 与最终固件复审未完成，N7/CI 绿色不代表整体目标完成。
 
 ## 已验证：reg-event
 
@@ -47,7 +53,7 @@ N5 代码 **`3d54aa87b1cc0ae5f2294991a46ad2ce43984e6a`** 已通过 [Build-Releas
 
 上一阶段 AUTS/stale/跨候选 423 在 `344308c` 已验证；两套 Actions（[38138978950](https://github.com/autisticryptic/SimMaster/actions/runs/38138978950)、[38138978978](https://github.com/autisticryptic/SimMaster/actions/runs/38138978978)）各核验 46 项相关回归和四矩阵。独立 AKA 来源、受保护 stale 不重装旧 ESP、AUTS 不冒充证明、423 尝试级预算均保持；WiFi 初次认证后 423 仍明确 unsupported。
 
-**完整补全任务尚未完成。** N4～N7 已验证；刷新预算/WiFi 普通等待补漏、N8 承载能力继续推进。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界，见[开发计划](DEVELOPMENT_PLAN.md)。
+**完整补全任务尚未完成。** N4～N7 与 R1 已验证；WiFi 普通等待补漏、N8 承载能力继续推进。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界，见[开发计划](DEVELOPMENT_PLAN.md)。
 
 ## 第一批：ISIM、P-CSCF 与临时拒绝补全
 
