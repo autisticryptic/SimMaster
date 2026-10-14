@@ -138,7 +138,7 @@
 
 ### 临时拒绝与 Retry-After
 
-以下等待策略在 `core/register_retry.rs` 统一；原蜂窝已验证，R2 将 WiFi 生产路径接入后仍需本轮独立验证（见 HANDOFF），不是由 reg-event 或诊断字段推导支持。
+以下等待策略在 `core/register_retry.rs` 统一；蜂窝与 WiFi 的生产接线由 `c3fb036` 及既有代码完成软件验证（见 HANDOFF），不是由 reg-event 或诊断字段推导支持。
 
 - `RegisterFailure::metadata()` 区分初始/认证阶段、端点临时拒绝、传输故障、身份/认证拒绝和本地错误；不得从 `detail` 文本或上一次保存的 401 猜当前发送结果。
 - 初始完整 408/500/502/503/504 可尝试同承载内另一合格 P-CSCF；普通身份拒绝、认证后失败不借静态头型/profile 更换重开当前鉴权。
@@ -333,7 +333,7 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 - 失败带 scope、initial/refresh/unregister/reg-event、鉴权阶段、状态码和 423 依据；`failure.response_retry_after_seconds` 是收到的要求，`wait.not_before`/remaining 是实际控制门禁。长等待/停止不伪造零秒重试，查询不刷新 deadline。
 - epoch/serial 令牌拒绝旧尝试更新；WiFi 弱 runtime 与执行阶段原 owner/epoch 上下文防止 reset 后才恢复的任务认领新状态。投影不重置任何协议预算、授予 readiness 或改变 UI 保存意图。
 - 原工作台详情内增加可选只读折叠区；旧响应无字段仍可显示。Bruno `get_ims_status` 是被动查询；既有 `get_vowifi_status?live=true` 保留原显式探测语义，不能把所有 GET 都称为无副作用。
-- R1 刷新423预算已验证；R2普通WiFi等待的生产接线与新回归仍待本轮Actions。诊断字段绝不作为授权重试或保留租期的控制输入。
+- R1 刷新423预算、R2普通WiFi等待均已软件验证；诊断字段绝不作为授权重试或保留租期的控制输入。真实网络与驱动硬件验收仍独立。
 
 ## 10. 验证清单与验收标准
 

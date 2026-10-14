@@ -10,15 +10,20 @@
 4. 2026-10-07 的 410 部署属于已结束的历史授权；本轮只实施 IMS 补全和 Actions 验证，**未部署、未访问设备，也不主动连接 IDA**。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：刷新预算已验证，继续 WiFi 普通等待与承载能力
+## 当前：WiFi 普通等待已验证，继续承载能力与固件复审
+
+R2 最终代码 **`c3fb0361853388ebe551f50657a8786a1155a877`** 已通过 [Build-Release 38520139107](https://github.com/autisticryptic/SimMaster/actions/runs/38520139107)、[Validate Beta 38520139336](https://github.com/autisticryptic/SimMaster/actions/runs/38520139336) 与 ARM64/AMD64；Release skipped。两套官方测试 ZIP 各逐名核验 **304 项相关回归**及四矩阵 86 场景，报告 `.local/evidence/ims-wifi-retry/verified-c3fb036.json`，316 项本机静态/mock 通过。前端输入与 N7 相同，旧 43单测/3browser 制品与源码已复核，不冒称本轮新跑 browser。未部署/程序包或实网验收。
+
+- WiFi 初次端点/头型、刷新、注销、profile batch/重连均执行同卡 not-before；端点地址、原 worker、租期和结构化失败与诊断分开。等待只保留到原截止，TCP死流/身份拒绝不因此保留。
+- API 按实际发送结果计失败轮次，轮询不增次数；清理保留已耗计数，只消费重建pending动作。换卡须正向确认，控制端口/worker变化不清等待。reg-event独立撤销serial防止晚到刷新重授旧ready。
+- 首轮过宽分类误关认证前404，已恢复原分类而保留真正的等待/认证后/423/死流门禁；旧测试未改且两套最终日志均通过，新增真实controller404回归。失败ZIP、annotations与`failure-closeout.json`保留。
+- **接着 N8：驱动声明的 APN PAP/CHAP、PCO 请求/FQDN、DHCP 能力与适配；然后相关 catalog/provider 和完整 EC20 固件复审。** 不按未知raw bytes猜能力，不凭当前CI冒称所有兜底完成。
+
+## 已验证：R1 刷新预算
 
 R1 代码 **`b6a78884600684b2f4c2b31aa5f2f2b08621f4a2`** 已通过 [Build-Release 38502470702](https://github.com/autisticryptic/SimMaster/actions/runs/38502470702)、[Validate Beta 38502470703](https://github.com/autisticryptic/SimMaster/actions/runs/38502470703) 和双架构构建；Release skipped。两套官方测试 ZIP 各 **257 项相关回归**及四矩阵 86 场景已核验，报告 `.local/evidence/ims-refresh-budget/verified-b6a7888.json`。前端构建输入与 N7 相同，原 43 单测/3browser 证据重新校验但未冒称本轮重跑 browser；未部署。
 
 真实刷新三候选共用 423 协商预算，结构化失败阶段/kind/Retry-After/Min-Expires 决定是否还能换头型；423→格式拒绝、新鉴权后400不重开候选，返回错误保留前序协商依据。正常首包格式兼容、423→2xx、旧 SA/租期/nonce/CSeq、503 等待和 TCP 死流处理保持。7 项新生产回归与 311 项静态/mock 通过。
-
-**R2 已接线，待本轮 Actions 验证**：WiFi 初次端点/头型候选、原通道刷新、注销、API/profile batch/重连共用同卡 not-before；316 项本机静态/mock通过。共享无I/O等待策略由原蜂窝实现下沉，旧测试入口保持。实际临时刷新只保留 operator 原租期，typed recovery 与诊断分离；轮询不增失败计数、清理不清已耗预算，换卡须正向确认。新增原worker绑定校验，TCP EOF不冒充可保留的超时。新 controller/factory/operator/runtime/API 回归仅已写入，尚未编译执行。随后仍 N8、相关扩展与完整固件复审，未部署。
-
-R2 首轮 `37b36e8` 因新增泛化分类误关旧认证前404兼容而失败；`e06b0ed` 恢复原分类，保留等待/认证后/423/死流门禁并加真实controller回归，两套Actions/双架构及各303项相关回归/制品已核验。继续审查增加 reg-event 撤销 serial，防止晚到temporary refresh重新发布已撤销绑定；**新增竞态保护仍待新提交验证，R2暂未完成**。原失败ZIP与annotations保留，未删旧测试。
 
 ## 已验证：N7 同源执行诊断
 
@@ -29,8 +34,6 @@ R2 首轮 `37b36e8` 因新增泛化分类误关旧认证前404兼容而失败；
 - 首轮 `ee2b440` 的错误类型 import、Child-SA 配置路径和 Node lint 失败已修正；第二轮 `e5f4387` 的 browser fixture 缺顶层 `line_id` 已按真实 DTO 修正，没有放宽断言。原 annotations/官方失败 ZIP 保留，308 项本机静态/mock 检查通过。
 
 此前 N6 **`6c0c140`** 已验证 worker 内 SIP TCP、四向 TCP/IPsec、TLS1.2/1.3 与精确原 authority DNS/IP SAN、有界 DNS TC→TCP/NAPTR D2T；旧 UDP 和跨 profile 防降级保持。TLS 不绕过 required-IPsec，不冒称私有 CA、mTLS 或新的反向 TLS/IPsec 组合已支持。
-
-R1 刷新预算补漏以本页顶部 `b6a7888` 的独立结果为准，不再只引用 N7。R2、N8 与最终固件复审未完成，N7/CI 绿色不代表整体目标完成。
 
 ## 已验证：reg-event
 
@@ -55,13 +58,11 @@ N5 代码 **`3d54aa87b1cc0ae5f2294991a46ad2ce43984e6a`** 已通过 [Build-Releas
 
 上一阶段 AUTS/stale/跨候选 423 在 `344308c` 已验证；两套 Actions（[38138978950](https://github.com/autisticryptic/SimMaster/actions/runs/38138978950)、[38138978978](https://github.com/autisticryptic/SimMaster/actions/runs/38138978978)）各核验 46 项相关回归和四矩阵。独立 AKA 来源、受保护 stale 不重装旧 ESP、AUTS 不冒充证明、423 尝试级预算均保持；WiFi 初次认证后 423 仍明确 unsupported。
 
-**完整补全任务尚未完成。** N4～N7 与 R1 已验证；WiFi 普通等待补漏、N8 承载能力继续推进。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界，见[开发计划](DEVELOPMENT_PLAN.md)。
+**完整补全任务尚未完成。** N4～N7 与 R1/R2 已验证；N8 承载能力、相关扩展与最终固件复审继续推进。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界，见[开发计划](DEVELOPMENT_PLAN.md)。
 
 ## 第一批：ISIM、P-CSCF 与临时拒绝补全
 
 代码基线 **`5aaf3eab6515aba9f5f5eb43553ea00a1cec3264`**（前一实现提交 `e702cef`），已推送 `simmaster/master`。
-
-**这是第一批实现及验证闭环，不是原 EC20 审查全部建议已完成。** AUTS/stale 与跨候选 423 后续已验证；rspauth、reg-event 后续已验证，当前继续恢复补漏与承载能力；完整范围和跨项目/IDA 边界见[开发计划](DEVELOPMENT_PLAN.md)。
 
 - 共享读取 ISIM 的 IMPI/DOMAIN/IMPU/P-CSCF；完整身份与认证 AID 一起选用，合法未配置时保留 USIM 派生；读取错误、损坏、换卡不假装缺省。VoWiFi 的 EAP 仍使用 USIM。
 - QMI 按 slot 发现应用，native AT 通过自有通道读取 EF_DIR；PC/SC 每个进程重选完整 AID/文件，并用稳定 reader 名称防止索引重排。卡/slot/owner 检查是分阶段观察，不冒称可原子排除所有物理热插拔竞态。

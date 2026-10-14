@@ -5,7 +5,7 @@
 
 ## 1.1.5 主线
 
-- R2 WiFi 普通 Retry-After 恢复已接线待验证：统一无I/O端点策略、同卡跨profile/worker等待、保留有效原租期、结构化operator/API控制、实际失败计数和注销门禁；TCP死流及原worker绑定独立核验，诊断不驱动恢复。新增controller/factory/operator/runtime/API回归，316静态/mock通过，尚未本轮Actions验证/部署，N8/固件复审继续。
+- `c3fb036` 完成 R2 WiFi 普通 Retry-After 恢复：统一端点策略、同卡跨profile/worker等待与已耗计数、有效原租期/typed operator-API控制、注销门禁；TCP死流、原worker与reg-event撤销竞态有独立回归。两套Actions/双架构、各304项相关回归/四矩阵及官方摘要通过，316静态/mock通过。首轮误关旧认证前404兼容已恢复，旧测试不改且最终通过，失败证据保留。未部署，N8/相关扩展/固件复审继续。
 
 - `b6a7888` 完成 R1 刷新预算补漏：三候选共用423协商预算，按结构化失败止损并保留 Min-Expires 依据；423→格式拒绝/503、floor边界、新鉴权后400、正常兼容与TCP死流有7项新生产回归。两套Actions/双架构、各257项相关回归/四矩阵及官方摘要核验通过，311静态/mock通过，未部署。前端源码与N7相同，R2/N8/固件复审仍继续。
 
