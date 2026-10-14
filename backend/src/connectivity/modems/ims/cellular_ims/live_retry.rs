@@ -17,8 +17,7 @@ impl RetryScope {
         // MM owner/generation changes still require the normal admission gates,
         // but cannot shorten a remote wait for the same physical subscription.
         let same_subscription = self.card.as_ref().is_some_and(|old| {
-            old.endpoint == card.endpoint && old.slot == card.slot
-                && old.iccid == card.iccid && old.imsi == card.imsi
+            old.slot == card.slot && old.iccid == card.iccid && old.imsi == card.imsi
         });
         if !same_subscription {
             self.card = Some(card.clone());
@@ -83,6 +82,7 @@ mod tests {
             kind: RegisterFailureKind::TemporaryEndpoint, retry_after: RetryAfter::DelaySeconds(120),
         }, now);
         binding.owner = "owner-b".into();
+        binding.endpoint = "renumbered-control-port".into();
         let again = scope.for_card(&binding);
         assert!(Arc::ptr_eq(&first, &again));
         assert!(!again.lock().await.check(endpoint, now).is_allowed());

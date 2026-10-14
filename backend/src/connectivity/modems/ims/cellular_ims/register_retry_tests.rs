@@ -244,9 +244,9 @@ fn register_retry_capacity_overflow_stops_scope_instead_of_evicting() {
     for i in 0..MAX_ENDPOINT_RETRY_ENTRIES {
         assert!(matches!(state.observe_failure(endpoint(5060 + i as u16), &metadata, now), RetryAdmission::Deferred { .. }));
     }
-    assert_eq!(state.entries.len(), MAX_ENDPOINT_RETRY_ENTRIES);
+    assert_eq!(state.entry_count(), MAX_ENDPOINT_RETRY_ENTRIES);
     assert_eq!(state.observe_failure(endpoint(6000), &metadata, now), RetryAdmission::Stopped(RetryStopReason::CapacityExceeded));
-    assert_eq!(state.entries.len(), MAX_ENDPOINT_RETRY_ENTRIES);
+    assert_eq!(state.entry_count(), MAX_ENDPOINT_RETRY_ENTRIES);
     assert_eq!(state.check(endpoint(7000), now + Duration::from_secs(120)), RetryAdmission::Stopped(RetryStopReason::CapacityExceeded));
 }
 
@@ -259,7 +259,7 @@ fn register_retry_expired_entries_are_pruned_before_capacity_is_checked() {
         state.observe_failure(endpoint(5060 + i as u16), &metadata, now);
     }
     assert!(matches!(state.observe_failure(endpoint(6000), &metadata, now + Duration::from_secs(1)), RetryAdmission::Deferred { .. }));
-    assert_eq!(state.entries.len(), 1);
+    assert_eq!(state.entry_count(), 1);
 }
 
 #[test]

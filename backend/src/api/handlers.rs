@@ -7114,9 +7114,20 @@ fn vowifi_restore_reason_is_soft_retry(reason: Option<&str>) -> bool {
                 | "live_connect_already_running"
                 | "ims_access_transition_in_progress"
                 | "ims_access_registration_parked"
-        ) || reason.starts_with("vowifi_registration_refresh_retry_pending")
+                | "vowifi_register_retry_deferred"
+                | "vowifi_register_retry_stopped"
+        ) || reason.split(':').any(|code| matches!(code, "vowifi_register_retry_deferred" | "vowifi_register_retry_stopped"))
+            || reason.starts_with("vowifi_registration_refresh_retry_pending")
             || reason.starts_with("vowifi_registration_refresh_rebuild_pending")
     })
+}
+
+async fn vowifi_register_wait_status(app: &AppState, scope: &VowifiScope) -> Option<VowifiStatusResponse> {
+    let error = crate::connectivity::modems::ims::vowifi::live::check_live_register_retry_gate(scope.line_id()).await.err()?;
+    let mut status = scope.status().await;
+    status.degraded_reason = Some(error.reason);
+    persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
+    Some(status)
 }
 
 fn vowifi_auto_restore_is_exhausted(reason: Option<&str>) -> bool {
@@ -7145,6 +7156,7 @@ fn spawn_pending_vowifi_rebuild(app: &AppState, line_id: &str) {
         if !live_ims_refresh_rebuild_pending_for_line(&line_id).await
             || line_has_protected_active_call(&app, &line_id).await
             || crate::connectivity::modems::ims::vowifi::live::live_reg_event_retry_remaining_for_line(&line_id).await.is_some()
+            || crate::connectivity::modems::ims::vowifi::live::live_register_retry_remaining_for_line(&line_id).await.is_some()
         {
             return;
         }
@@ -7160,6 +7172,7 @@ fn spawn_pending_vowifi_rebuild(app: &AppState, line_id: &str) {
             let _transition = scope.line.ims_registration.transition_lock.lock().await;
             if line_has_call_blocking_ims_switch(&app, &line_id).await
                 || crate::connectivity::modems::ims::vowifi::live::live_reg_event_retry_remaining_for_line(&line_id).await.is_some()
+                || crate::connectivity::modems::ims::vowifi::live::live_register_retry_remaining_for_line(&line_id).await.is_some()
                 || !apply_line_ims_access_policy_locked(
                     &app,
                     scope.line(),
@@ -7932,6 +7945,11 @@ async fn select_vowifi_profile_candidate(
     )
 }
 
+#[cfg(test)]
+pub(crate) async fn connect_vowifi_wait_test(app: &AppState, line: Arc<crate::services::line_registry::LineRuntime>) -> VowifiStatusResponse {
+    connect_vowifi_on_line(app, &VowifiScope::for_line(line), 3, Duration::ZERO, false).await
+}
+
 async fn connect_vowifi_on_line(
     app: &AppState,
     scope: &VowifiScope,
@@ -7952,6 +7970,7 @@ async fn connect_vowifi_on_line(
         persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
         return status;
     }
+    if let Some(status) = vowifi_register_wait_status(app, scope).await { return status; }
     let Ok(_transition_guard) = scope.line.ims_registration.transition_lock.try_lock() else {
         let mut status = scope.status().await;
         status.degraded_reason = Some("ims_access_transition_in_progress".to_string());
@@ -8090,6 +8109,9 @@ async fn connect_vowifi_on_line(
     };
     let mut last_status = disabled_vowifi_status("vowifi_connect_not_attempted");
     for attempt in 1..=attempts {
+        // Recheck before selecting/resetting another profile, not merely before
+        // its SIP send. Waiting does not consume a new attempt or data action.
+        if let Some(status) = vowifi_register_wait_status(app, scope).await { return status; }
         let candidate = (!refresh_cycle)
             .then(|| profile_candidates.get(usize::from(attempt - 1)))
             .flatten();
@@ -8158,6 +8180,24 @@ async fn connect_vowifi_on_line(
             "WiFi Calling connection attempt started"
         );
         last_status = attempt_vowifi_connect_once(app, scope, false).await;
+        if let Some(recovery) = last_status.register_recovery {
+            if refresh_cycle && recovery.attempted {
+                // Typed control evidence, not diagnostics or a reason-string
+                // guess. Count this real failure once even if a short wait has
+                // already elapsed while returning through the API.
+                let reason = last_status.degraded_reason.as_deref().unwrap_or("vowifi_registration_refresh_failed");
+                if matches!(record_live_ims_refresh_failure(scope.line_id(), reason).await,
+                    LiveImsRefreshFailureDecision::RebuildAccess) {
+                    mark_live_ims_refresh_rebuild_pending(scope.line_id()).await;
+                }
+            }
+            if let Some(wait_status) = vowifi_register_wait_status(app, scope).await { return wait_status; }
+            if refresh_cycle {
+                last_status.degraded_reason = Some(format!("vowifi_registration_refresh_retry_pending:{}",
+                    last_status.degraded_reason.as_deref().unwrap_or("vowifi_registration_refresh_failed")));
+            }
+            return last_status;
+        }
         if last_status.readiness.sms_ready {
             return last_status;
         }

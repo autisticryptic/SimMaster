@@ -16,7 +16,7 @@ R1 代码 **`b6a78884600684b2f4c2b31aa5f2f2b08621f4a2`** 已通过 [Build-Releas
 
 真实刷新三候选共用 423 协商预算，结构化失败阶段/kind/Retry-After/Min-Expires 决定是否还能换头型；423→格式拒绝、新鉴权后400不重开候选，返回错误保留前序协商依据。正常首包格式兼容、423→2xx、旧 SA/租期/nonce/CSeq、503 等待和 TCP 死流处理保持。7 项新生产回归与 311 项静态/mock 通过。
 
-**下一步 R2**：WiFi 普通 REGISTER 的 503/Retry-After 仍需实际同卡/端点/profile/worker 门禁与有效旧租期保护；随后 N8、相关 catalog/provider 与完整 EC20 固件复审。不能拿 reg-event 等待或诊断页面代替恢复实现。
+**R2 已接线，待本轮 Actions 验证**：WiFi 初次端点/头型候选、原通道刷新、注销、API/profile batch/重连共用同卡 not-before；316 项本机静态/mock通过。共享无I/O等待策略由原蜂窝实现下沉，旧测试入口保持。实际临时刷新只保留 operator 原租期，typed recovery 与诊断分离；轮询不增失败计数、清理不清已耗预算，换卡须正向确认。新增原worker绑定校验，TCP EOF不冒充可保留的超时。新 controller/factory/operator/runtime/API 回归仅已写入，尚未编译执行。随后仍 N8、相关扩展与完整固件复审，未部署。
 
 ## 已验证：N7 同源执行诊断
 

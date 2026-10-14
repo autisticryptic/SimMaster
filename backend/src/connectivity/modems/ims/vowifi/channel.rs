@@ -106,9 +106,9 @@ impl EpdgSipChannel {
             )
             .await
             {
-                Ok(Ok(0)) => return Err(ImsError::new("ims_channel_closed")),
+                Ok(Ok(0)) => return Err(self.outbound.fail("ims_outbound_flow_failed")),
                 Ok(Ok(n)) => self.pending.extend_from_slice(&chunk[..n]),
-                Ok(Err(_)) => return Err(ImsError::new("ims_channel_read_failed")),
+                Ok(Err(_)) => return Err(self.outbound.fail("ims_outbound_flow_failed")),
                 Err(_) if wake < deadline => continue,
                 Err(_) => return Err(ImsError::new("ims_channel_read_timeout")),
             }
@@ -133,14 +133,10 @@ impl ImsChannel for EpdgSipChannel {
     async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
         let prepared = self.outbound.prepare(frame)?;
         let frame = prepared.as_slice();
-        self.stream
-            .write_all(frame)
-            .await
-            .map_err(|_| ImsError::new("ims_channel_write_failed"))?;
-        self.stream
-            .flush()
-            .await
-            .map_err(|_| ImsError::new("ims_channel_flush_failed"))
+        if self.stream.write_all(frame).await.is_err() || self.stream.flush().await.is_err() {
+            return Err(self.outbound.fail("ims_outbound_flow_failed"));
+        }
+        Ok(())
     }
 
     async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {

@@ -77,10 +77,19 @@ pub struct RuntimeLiveReadiness {
     pub ims_registered: bool,
     pub sms_ready: bool,
     pub voice_ready: bool,
+    // Only a real refresh result with the original installed lease can restore
+    // these former service flags. Neither config nor diagnostic facts can.
+    refresh_prior: Option<[bool; 3]>,
+    retained_until: Option<Instant>,
+    register_recovery: Option<super::executor::RegisterRecovery>,
 }
 
 impl RuntimeLiveReadiness {
     fn normalize_protocol_prerequisites(&mut self) {
+        if self.retained_until.is_some_and(|expiry| expiry <= Instant::now()) {
+            self.ims_registered = false; self.sms_ready = false; self.voice_ready = false;
+            self.refresh_prior = None; self.retained_until = None;
+        }
         if self.epdg_ready
             || self.ike_ready
             || self.child_sa_ready
@@ -278,6 +287,7 @@ impl VowifiRuntime {
     pub async fn snapshot(&self) -> RuntimeSnapshot {
         let mut snapshot = self.snapshot.read().await.clone();
         snapshot.diagnostics.discard_stale(self.live_generation.load(Ordering::SeqCst));
+        snapshot.live_readiness.normalize_protocol_prerequisites();
         snapshot
     }
 
@@ -339,18 +349,20 @@ impl VowifiRuntime {
         &self,
         reason: impl Into<String>,
     ) -> RuntimeSnapshot {
-        let mut snapshot = self.snapshot().await;
-        if !snapshot.profile.matched {
-            return snapshot;
-        }
+        let mut snapshot = self.snapshot.write().await;
+        if !snapshot.profile.matched { return snapshot.clone(); }
+        snapshot.live_readiness.normalize_protocol_prerequisites();
+        let readiness = &mut snapshot.live_readiness;
+        readiness.refresh_prior = readiness.ims_registered.then_some([readiness.ims_registered, readiness.sms_ready, readiness.voice_ready]);
+        readiness.retained_until = None;
+        readiness.register_recovery = None;
         snapshot.phase = RuntimePhase::ProfileMatched;
         snapshot.live_readiness.ims_registered = false;
         snapshot.live_readiness.sms_ready = false;
         snapshot.live_readiness.voice_ready = false;
         snapshot.live_readiness.normalize_protocol_prerequisites();
         snapshot.degraded_reason = Some(reason.into());
-        *self.snapshot.write().await = snapshot.clone();
-        snapshot
+        snapshot.clone()
     }
 
     pub async fn refresh_live_readiness(
@@ -536,6 +548,7 @@ impl VowifiRuntime {
                         readiness_key: readiness_key_for_stage(stage),
                         reason: Some(format!("{}_stage_timeout", stage.as_str())),
                         soak_observation: None,
+                        register_recovery: None,
                     },
                 };
 
@@ -754,6 +767,25 @@ impl RuntimeSnapshot {
 
     fn apply_stage_result(&mut self, stage: ExecutorStage, result: &ExecutorStageResult) {
         let completed = result.status == "completed";
+        if stage == ExecutorStage::ImsRegister {
+            self.live_readiness.register_recovery = result.register_recovery;
+            if !completed {
+                if let (Some(expiry), Some([true, sms_ready, voice_ready])) = (
+                    result.register_recovery.and_then(|recovery| recovery.retained_until).filter(|expiry| *expiry > Instant::now()),
+                    self.live_readiness.refresh_prior,
+                ) {
+                    self.live_readiness.ims_registered = true;
+                    self.live_readiness.sms_ready = sms_ready;
+                    self.live_readiness.voice_ready = voice_ready;
+                    self.live_readiness.retained_until = Some(expiry);
+                    self.degraded_reason = result.reason.clone();
+                    self.live_readiness.normalize_protocol_prerequisites();
+                    return;
+                }
+            }
+            self.live_readiness.refresh_prior = None;
+            self.live_readiness.retained_until = None;
+        }
         match stage {
             ExecutorStage::SimAuth => self.live_readiness.sim_auth_ready = completed,
             ExecutorStage::Epdg => self.live_readiness.epdg_ready = completed,
@@ -865,9 +897,14 @@ impl RuntimeSnapshot {
             switch_sim_auth_ready: restore.sim_auth_ready,
             switch_retry_count: restore.retry_count,
             diagnostics: self.diagnostics.report(),
+            register_recovery: self.live_readiness.register_recovery,
         }
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_retry_tests.rs"]
+mod retry_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1073,6 +1110,7 @@ mod tests {
                 readiness_key: "epdg_ready",
                 reason: None,
                 soak_observation: None,
+                register_recovery: None,
             },
         );
 
@@ -1172,6 +1210,7 @@ mod tests {
                 readiness_key: "esp_ready",
                 reason: None,
                 soak_observation: None,
+                register_recovery: None,
             },
         );
 

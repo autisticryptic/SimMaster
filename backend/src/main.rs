@@ -3098,6 +3098,35 @@ mod http_router_tests {
     }
 
     #[tokio::test]
+    async fn vowifi_register_wait_admission_preserves_profile_intent_and_failure_budget() {
+        use crate::connectivity::modems::ims::vowifi::live;
+        let state = build_test_router().await.expect("private D-Bus only; no hardware");
+        let binding = radio_test_binding(0xd1a611, true);
+        let line_id = binding.line_id.clone();
+        let line = state.app.line_registry.insert_control_test_line(binding).await;
+        state.config_manager.reconcile_line_profiles(&[line_id.clone()]).unwrap();
+        let before = serde_json::to_value(state.config_manager.get_line_profile(&line_id)).unwrap();
+        live::seed_register_retry_for_test(&line_id, 120).await;
+        live::record_live_ims_refresh_failure(&line_id, "actual-failed-cycle").await;
+        live::record_live_ims_refresh_failure(&line_id, "actual-failed-cycle").await;
+        for _ in 0..3 {
+            let status = crate::api::handlers::connect_vowifi_wait_test(&state.app, line.clone()).await;
+            assert_eq!(status.degraded_reason.as_deref(), Some("vowifi_register_retry_deferred"));
+            assert!(status.register_recovery.is_none(), "gate visits are not executed REGISTER attempts");
+            assert_eq!(live::live_ims_refresh_failure_count_for_line(&line_id).await, 2);
+            assert_eq!(serde_json::to_value(state.config_manager.get_line_profile(&line_id)).unwrap(), before);
+        }
+        let served = serve(state.router.clone()).await;
+        let cookie = authenticate(&served).await;
+        let path = format!("/api/modem/lines/{line_id}/ims/status");
+        let (status, body) = get_with_cookie(&served, &path, &cookie).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["data"]["non_three_gpp"]["diagnostics"]["wait"]["status"], "waiting");
+        assert!(!body.contains("register_recovery") && !body.contains("retained_until"));
+    }
+
+    #[tokio::test]
     async fn ims_execution_diagnostics_api_is_same_runtime_projection_without_changing_intents() {
         use crate::connectivity::core::registration_diagnostics as facts;
         let state = build_test_router().await.expect("private test D-Bus only; no hardware");

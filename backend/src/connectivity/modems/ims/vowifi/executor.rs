@@ -278,6 +278,15 @@ pub struct ExecutorSoakObservation {
     pub sensitive_values_policy: &'static str,
 }
 
+/// Internal recovery evidence, not a diagnostic projection or serialized API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RegisterRecovery {
+    pub admission: crate::connectivity::core::register_retry::RetryAdmission,
+    pub retained_until: Option<std::time::Instant>,
+    /// False when only checking an existing gate; do not consume another cycle.
+    pub attempted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutorStageResult {
     pub stage: &'static str,
@@ -285,6 +294,9 @@ pub struct ExecutorStageResult {
     pub readiness_key: &'static str,
     pub reason: Option<String>,
     pub soak_observation: Option<ExecutorSoakObservation>,
+    /// Internal control evidence from the installed operator, never diagnostics.
+    #[serde(skip)]
+    pub(crate) register_recovery: Option<RegisterRecovery>,
 }
 
 pub trait RuntimeExecutor: Send + Sync {
@@ -332,6 +344,7 @@ impl RuntimeExecutor for NoopRuntimeExecutor {
                 readiness_key: readiness_key_for_stage(request.stage),
                 reason: Some("noop_executor_does_not_touch_device_or_network".to_string()),
                 soak_observation: None,
+                register_recovery: None,
             }
         })
     }
@@ -456,6 +469,7 @@ impl RuntimeExecutor for DryRunRuntimeExecutor {
                 readiness_key: readiness_key_for_stage(request.stage),
                 reason: Some(dry_run_stage_run_reason(request.stage).to_string()),
                 soak_observation: Some(soak_observation_for_stage(request.stage)),
+                register_recovery: None,
             }
         })
     }
@@ -529,6 +543,7 @@ impl RuntimeExecutor for LiveRuntimeExecutor {
                     readiness_key: readiness_key_for_stage(request.stage),
                     reason: Some("carrier_profile_not_found_in_database".to_string()),
                     soak_observation: None,
+                    register_recovery: None,
                 };
             };
             if request.trace_id == "runtime-status-probe" && request.stage == ExecutorStage::Ike {

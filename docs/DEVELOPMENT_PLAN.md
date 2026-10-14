@@ -32,7 +32,7 @@
 - REGISTER rspauth 已验证；后续互通须单独验证真实服务器响应。现有范围仅 qop=auth/无 qop 和单一 Authorization scope，不宣称 auth-int、多重 origin/proxy 鉴权或非 REGISTER 业务已经支持。
 - 已验证 AUTS/stale 与 423 的剩余限制：WiFi 初次认证后的 423 明确 unsupported；需要新安全上下文的受保护 stale 不重装旧 ESP；非 REGISTER 业务的响应认证/恢复需单独核对。
 - 蜂窝刷新 423→400/新鉴权后400的预算补漏已由 `b6a7888` 验证；后续需保持结构化门禁、Min-Expires来源和旧通道/租期/计数，不回到末次状态猜测。
-- 新发现 **WiFi 普通 REGISTER 等待缺口**：503/Retry-After 还须贯通同 SIM/端点/profile/worker 的实际 not-before 和有效旧租期保护；reg-event 等待与诊断展示都不是控制逻辑实现。
+- **R2 WiFi 普通 REGISTER 等待已接线待验证**：共享端点 not-before 进入初次/刷新/注销/operator/API/profile重连路径；同卡端口/worker变化不清等待和失败次数，临时失败保留的只是原operator租期，身份拒绝/死流不借此保留。新增loopback/controller/runtime/API回归待Actions，不能用316静态检查或N7绿灯替代。
 - N7/R1 已完成 CI/制品闭环；继续 R2 实际等待 → N8 承载能力/相关扩展 → 完整离线 EC20 复审，不能把“已有算法/helper”当成生产路径接通。
 
 ## P1：原报告的传输与功能扩展（部分基础已具备）

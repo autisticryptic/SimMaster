@@ -1,6 +1,8 @@
 //! Device-free production WiFi REGISTER response-authentication gates.
 //! Synthetic loopback peers only; compiled/executed in Actions, never locally.
 use super::*;
+#[path = "register_retry_refresh_tests.rs"]
+mod retry_recovery_tests;
 use crate::connectivity::core::{
     digest_aka::{self, DigestRequestProof},
     register::run_unregister,
@@ -48,6 +50,7 @@ fn context(line: &str, local: SocketAddr, remote: SocketAddr) -> (LiveRegisterRe
         iccid: "synthetic-rspauth-card".into(), imsi: "001010123456789".into(),
     };
     context.uicc = Some(live_identity::selection_for_test(line, context.identity.clone(), context.target.clone(), card));
+    context.bind_test_worker(line);
     (context, profile)
 }
 

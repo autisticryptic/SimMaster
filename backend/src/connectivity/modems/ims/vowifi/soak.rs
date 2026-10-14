@@ -114,6 +114,7 @@ mod tests {
             readiness_key: readiness_key_for_stage(request.stage),
             reason: Some("live_runtime_executor_not_implemented".to_string()),
             soak_observation: Some(soak_observation_for_stage(request.stage)),
+            register_recovery: None,
         };
 
         let run_id = persist_stage_observation(&db, &request, &result)

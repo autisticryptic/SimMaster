@@ -112,6 +112,14 @@ impl Scope {
             state.accepted(route.transport, verify, digest, rspauth);
         }).await;
     }
+    pub(super) async fn admission(&self, admission: crate::connectivity::core::register_retry::RetryAdmission) {
+        use crate::connectivity::core::register_retry::RetryAdmission;
+        self.update(|state| match admission {
+            RetryAdmission::Allowed => state.wait_ready(),
+            RetryAdmission::Deferred { not_before } => state.wait_until(not_before),
+            RetryAdmission::Stopped(_) => state.wait_stopped(),
+        }).await;
+    }
     pub(super) async fn core_failure(&self, error: &ImsError, fallback: facts::FailureScope) {
         self.update(|state| state.failure_in_scope(error.code(), None, fallback)).await;
     }

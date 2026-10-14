@@ -40,7 +40,9 @@ class ImsExecutionDiagnosticsContract(unittest.TestCase):
         self.assertIn("observe_request(attempt.as_mm_str())", native)
         self.assertIn('observe_request(if forced == 4 { "ipv4" } else { "ipv6" })', native)
         self.assertIn("diagnostics.accepted(diagnostic_route.transport", cell)
-        self.assertIn("diagnostic_scope.accepted(channel.route()", wifi)
+        refresh = read("backend/src/connectivity/modems/ims/vowifi/register_refresh_live.rs")
+        self.assertIn("diagnostic_scope.accepted(channel.route()", refresh)
+        self.assertIn("self.refresh_with_recovery(channel, Some(original_expiry))", wifi)
         self.assertIn("diagnostic_scope.granted_family(session.child_sa", wifi)
         self.assertIn("diagnostic_scope.requested_family(forced_stack)", wifi)
 

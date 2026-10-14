@@ -138,7 +138,7 @@
 
 ### 临时拒绝与 Retry-After
 
-以下普通 REGISTER/刷新控制已经在蜂窝实现；WiFi 的普通 REGISTER 对应门禁仍按 R2 补齐，已有 reg-event 等待不等价。
+以下等待策略在 `core/register_retry.rs` 统一；原蜂窝已验证，R2 将 WiFi 生产路径接入后仍需本轮独立验证（见 HANDOFF），不是由 reg-event 或诊断字段推导支持。
 
 - `RegisterFailure::metadata()` 区分初始/认证阶段、端点临时拒绝、传输故障、身份/认证拒绝和本地错误；不得从 `detail` 文本或上一次保存的 401 猜当前发送结果。
 - 初始完整 408/500/502/503/504 可尝试同承载内另一合格 P-CSCF；普通身份拒绝、认证后失败不借静态头型/profile 更换重开当前鉴权。
@@ -148,6 +148,10 @@
 - 所有可用端点失败后，在下一批 bearer/profile 分配前检查 not-before；恢复调度使用结构化剩余时间，而不是用换 profile/重建 PDN 绕过等待。
 - 临时刷新拒绝先回滚暂存 SA/socket/auth，再保留仍有效的原保护绑定。等待越过旧 expiry 时只保留到原截止；到期唤醒做失效处理，不提前 REGISTER，也不把请求中的新 Expires 当成新租期。
 - 已死亡 outbound flow、SIM/owner 失效和身份/认证拒绝不据此保留。注销仍检查绑定与端点等待，不向可能换卡后的订阅发送旧身份。
+- WiFi 初次等待键使用发现时的逻辑 P-CSCF 地址/端口，不使用后协商的 IPsec 端口；临时响应立即停止同端点头型阶梯，未开始新AKA时可选合格其他端点，认证/423后的止损保持。完整失败轮次之后，重启/profile/ESP重建先查同卡门禁。
+- WiFi operator 通过不可序列化的 `RegisterRecovery`/`RegisteredRefreshFailure` 传递真实 metadata、not-before、原 lease deadline 与是否实际发送；这些控制值独立于被动 diagnostics。等待只恢复本来已有的服务flags，到旧截止降readiness，不补发早到REGISTER；保留活动对话原排空逻辑。
+- API 只计实际失败轮次，不把等待轮询计成新失败；耗尽后的重建动作也等门禁，清理只消费 pending 动作位，不清失败次数。新注册成功或正向确认换卡才清旧预算；有限scope/端点容量耗尽fail-closed。
+- WiFi 注册捕获原 worker binding，刷新/后续鉴权/注销核验原实例与代次；替换后的新worker不能被旧channel借用。TCP EOF/确定的连接错误按死流恢复，不能用旧租期包装成可重试UDP收包缺口。
 
 ## 6. 资费保护与业务路由
 
@@ -329,7 +333,7 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 - 失败带 scope、initial/refresh/unregister/reg-event、鉴权阶段、状态码和 423 依据；`failure.response_retry_after_seconds` 是收到的要求，`wait.not_before`/remaining 是实际控制门禁。长等待/停止不伪造零秒重试，查询不刷新 deadline。
 - epoch/serial 令牌拒绝旧尝试更新；WiFi 弱 runtime 与执行阶段原 owner/epoch 上下文防止 reset 后才恢复的任务认领新状态。投影不重置任何协议预算、授予 readiness 或改变 UI 保存意图。
 - 原工作台详情内增加可选只读折叠区；旧响应无字段仍可显示。Bruno `get_ims_status` 是被动查询；既有 `get_vowifi_status?live=true` 保留原显式探测语义，不能把所有 GET 都称为无副作用。
-- 刷新 423 预算的 R1 补漏已由 `b6a7888` 验证；WiFi 普通 REGISTER Retry-After 控制缺口仍按 R2 补齐，出现诊断字段不代表恢复实现完成。
+- R1 刷新423预算已验证；R2普通WiFi等待的生产接线与新回归仍待本轮Actions。诊断字段绝不作为授权重试或保留租期的控制输入。
 
 ## 10. 验证清单与验收标准
 

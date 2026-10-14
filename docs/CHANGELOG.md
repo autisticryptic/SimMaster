@@ -5,6 +5,8 @@
 
 ## 1.1.5 主线
 
+- R2 WiFi 普通 Retry-After 恢复已接线待验证：统一无I/O端点策略、同卡跨profile/worker等待、保留有效原租期、结构化operator/API控制、实际失败计数和注销门禁；TCP死流及原worker绑定独立核验，诊断不驱动恢复。新增controller/factory/operator/runtime/API回归，316静态/mock通过，尚未本轮Actions验证/部署，N8/固件复审继续。
+
 - `b6a7888` 完成 R1 刷新预算补漏：三候选共用423协商预算，按结构化失败止损并保留 Min-Expires 依据；423→格式拒绝/503、floor边界、新鉴权后400、正常兼容与TCP死流有7项新生产回归。两套Actions/双架构、各257项相关回归/四矩阵及官方摘要核验通过，311静态/mock通过，未部署。前端源码与N7相同，R2/N8/固件复审仍继续。
 
 - `ee9ee28` 完成 N7 同源执行诊断：shared schema、cellular/WiFi 实际观察、epoch/serial/弱owner、统一 API 与原工作台只读折叠区；三套 Actions/双架构、各250项相关后端回归/四矩阵、43单测/3browser与官方摘要/截图核验通过。声明模板、报价/协商、收到等待/真实门禁、历史成功/当前 readiness 分开。首轮编译lint和第二轮browser fixture问题修复留证，未部署。刷新423连续预算与WiFi普通等待仍独立待修，不以页面或绿色CI算整体完成。

@@ -90,10 +90,12 @@ fn bind_context(context: &mut LiveRegisterRequestContext) {
 
 fn factory(previous: Option<LiveRefreshAuthorization>) -> VowifiUnregisterFactory {
     let profile = profile();
+    let mut context = context(profile);
+    context.bind_test_worker("n2-wifi-synthetic");
     VowifiUnregisterFactory {
         line_id: "n2-wifi-synthetic".into(),
         profile,
-        context: context(profile),
+        context,
         variant: live_register_header_variants(profile)[0],
         next_cseq: std::sync::atomic::AtomicU32::new(4),
         expires_seconds: std::sync::atomic::AtomicU32::new(3600),

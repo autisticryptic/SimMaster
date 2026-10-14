@@ -309,6 +309,8 @@ jobs:
             connectivity::core::registration_diagnostics::tests \
             connectivity::modems::ims::cellular_ims::runtime::diagnostics_tests \
             connectivity::modems::ims::vowifi::live::diagnostics_live::tests \
+            connectivity::modems::ims::vowifi::live::register_retry_live::tests \
+            connectivity::modems::ims::vowifi::runtime::retry_tests \
             connectivity::core::reg_event::tests \
             connectivity::modems::ims::cellular_ims::live::live_reg_event::tests \
             connectivity::modems::ims::vowifi::operator::reg_event_tests \
@@ -364,7 +366,7 @@ jobs:
           if ! dbus-run-session -- sh -c '
             set -eu
             export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"
-            for filter in ims_execution_diagnostics_api_is_same_runtime_projection_without_changing_intents retired_family_override_routes_cannot_modify_any_line cellular_ims_route_aliases_keep_auth_and_response_contract ims_registration_preference_api_preserves_cost_and_enable_settings http_router_tests::radio_intent_ http_router_tests::backend_selection_ hardware::devices::qcm410::primary_ims_lifecycle::ip_config_dbus_tests hardware::devices::qcm410::primary_ims_lifecycle::profile_lease::dbus_tests hardware::devices::qcm410::primary_ims_lifecycle::profile_lease::runtime::dbus_tests hardware::cellular::mm_observations::dbus_tests; do
+            for filter in vowifi_register_wait_admission_preserves_profile_intent_and_failure_budget ims_execution_diagnostics_api_is_same_runtime_projection_without_changing_intents retired_family_override_routes_cannot_modify_any_line cellular_ims_route_aliases_keep_auth_and_response_contract ims_registration_preference_api_preserves_cost_and_enable_settings http_router_tests::radio_intent_ http_router_tests::backend_selection_ hardware::devices::qcm410::primary_ims_lifecycle::ip_config_dbus_tests hardware::devices::qcm410::primary_ims_lifecycle::profile_lease::dbus_tests hardware::devices::qcm410::primary_ims_lifecycle::profile_lease::runtime::dbus_tests hardware::cellular::mm_observations::dbus_tests; do
               cargo test --locked "$filter" -- --list > release-api-test-list.txt
               grep -q ": test$" release-api-test-list.txt
               cargo test --locked "$filter" -- --test-threads=1

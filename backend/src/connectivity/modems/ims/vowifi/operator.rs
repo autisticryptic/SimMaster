@@ -197,8 +197,34 @@ async fn bind_operator_relay(
     .map_err(|error| format!("{failure_label}:{error}"))
 }
 
-type RefreshReply =
-    oneshot::Sender<Result<RegisteredImsContext, crate::connectivity::core::ImsError>>;
+type RefreshReply = oneshot::Sender<Result<RegisteredImsContext, RegisteredRefreshFailure>>;
+
+/// No raw SIP or identity material crosses the operator control boundary.
+#[derive(Debug, Clone)]
+pub(crate) struct RegisteredRefreshFailure {
+    pub error: crate::connectivity::core::ImsError,
+    pub metadata: Option<crate::connectivity::core::register::RegisterFailureMetadata>,
+    pub retry_admission: Option<crate::connectivity::core::register_retry::RetryAdmission>,
+    /// Proven original operator expiry; temporary failure never extends it.
+    pub retained_until: Option<Instant>,
+}
+impl RegisteredRefreshFailure {
+    pub(crate) fn code(&self) -> &'static str { self.error.code() }
+    fn fatal(&self) -> bool {
+        use crate::connectivity::core::register::RegisterFailureKind;
+        self.metadata.is_some_and(|metadata| matches!(metadata.kind,
+            RegisterFailureKind::AuthenticationRejected | RegisterFailureKind::IdentityRejected | RegisterFailureKind::FlowFailed))
+            || self.code().starts_with("ims_outbound_")
+            || self.code().starts_with("digest_response_auth_")
+            || matches!(self.code(), "ims_uicc_binding_invalid" | "ims_uicc_binding_changed"
+                | "vowifi_runtime_ue_worker_generation_changed" | "vowifi_refresh_rejected" | "vowifi_refresh_security_update_required")
+    }
+}
+impl From<crate::connectivity::core::ImsError> for RegisteredRefreshFailure {
+    fn from(error: crate::connectivity::core::ImsError) -> Self {
+        Self { error, metadata: None, retry_admission: None, retained_until: None }
+    }
+}
 
 /// Ask the existing socket owner to refresh, not a second task to register on
 /// a fresh source port. Do not time out and retry while the owner still holds
@@ -206,7 +232,7 @@ type RefreshReply =
 pub(crate) async fn refresh_registered_for_line(
     line_id: &str,
     profile_id: &str,
-) -> Option<Result<RegisteredImsContext, crate::connectivity::core::ImsError>> {
+) -> Option<Result<RegisteredImsContext, RegisteredRefreshFailure>> {
     let handle = handle_for_line(line_id);
     let sender = {
         let installed = handle.installed.lock().await;
@@ -223,11 +249,15 @@ pub(crate) async fn refresh_registered_for_line(
     Some(rx.await.unwrap_or_else(|_| {
         Err(crate::connectivity::core::ImsError::new(
             "ims_outbound_flow_failed",
-        ))
+        ).into())
     }))
 }
 
 pub(crate) trait RegisteredUnregister: Send + Sync {
+    fn unregister_admitted<'a>(&'a self) -> futures_util::future::BoxFuture<'a, Result<(), crate::connectivity::core::ImsError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn diagnostics_unregister_started<'a>(&'a self) -> futures_util::future::BoxFuture<'a, ()> { Box::pin(async {}) }
 
     fn diagnostics_unregister_finished<'a>(&'a self, _reason: Option<&'static str>,
@@ -266,6 +296,11 @@ pub(crate) trait RegisteredUnregister: Send + Sync {
                 "vowifi_refresh_not_supported",
             ))
         })
+    }
+
+    fn refresh_observed<'a>(&'a self, channel: &'a mut SipChannel, _original_expiry: Instant)
+        -> futures_util::future::BoxFuture<'a, Result<RegisteredImsContext, RegisteredRefreshFailure>> {
+        Box::pin(async move { self.refresh(channel).await.map_err(RegisteredRefreshFailure::from) })
     }
 
     fn initial_request(&self) -> Result<Vec<u8>, crate::connectivity::core::ImsError>;
@@ -665,13 +700,14 @@ async fn run_session_with_initial_mwi_subscription(
         }
         tokio::select! {
             Some(reply) = refresh_requests.recv() => {
-                if session.reg_event.revoked {
-                    let _ = reply.send(Err(crate::connectivity::core::ImsError::new(reg_event::LOSS_REASON)));
+                if session.reg_event.revoked || Instant::now() >= session.context.expires_at {
+                    let reason = if session.reg_event.revoked { reg_event::LOSS_REASON } else { "vowifi_registration_expired" };
+                    let _ = reply.send(Err(crate::connectivity::core::ImsError::new(reason).into()));
                     continue;
                 }
                 let result = match session.context.unregister.clone() {
-                    Some(factory) => factory.refresh(&mut session.channel).await,
-                    None => Err(crate::connectivity::core::ImsError::new("vowifi_refresh_not_supported")),
+                    Some(factory) => factory.refresh_observed(&mut session.channel, session.context.expires_at).await,
+                    None => Err(crate::connectivity::core::ImsError::new("vowifi_refresh_not_supported").into()),
                 };
                 if let Ok(registration) = &result {
                     session.context.expires_at = Instant::now() + registration.lease.expires_after;
@@ -681,9 +717,7 @@ async fn run_session_with_initial_mwi_subscription(
                     }
                     link.set_ready(true);
                 }
-                let fatal = result.as_ref().err().filter(|error| {
-                    error.code().starts_with("ims_outbound_") || matches!(error.code(), "vowifi_refresh_rejected" | "vowifi_refresh_security_update_required")
-                }).map(|e| e.code());
+                let fatal = result.as_ref().err().filter(|error| error.fatal()).map(|error| error.code());
                 let _ = reply.send(result);
                 if let Some(reason) = fatal {
                     end_active_calls(&mut session, &link);
@@ -759,6 +793,10 @@ async fn unregister_registration(session: &mut VoiceSession) -> UnregisterResult
         return UnregisterResult::AccessLost;
     };
     factory.diagnostics_unregister_started().await;
+    if let Err(error) = factory.unregister_admitted().await {
+        factory.diagnostics_unregister_finished(Some(error.code()), None).await;
+        return UnregisterResult::AccessLost;
+    }
     let initial = match factory.initial_request() {
         Ok(request) => request,
         Err(error) => {

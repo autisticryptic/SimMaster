@@ -41,6 +41,7 @@ pub mod register_message;
 pub mod register_response;
 pub mod registration;
 pub mod registration_diagnostics;
+pub(crate) mod register_retry;
 pub mod sip_frame;
 pub mod sip_message;
 pub mod sms_codec;
