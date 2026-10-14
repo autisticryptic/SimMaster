@@ -18,6 +18,8 @@ R1 代码 **`b6a78884600684b2f4c2b31aa5f2f2b08621f4a2`** 已通过 [Build-Releas
 
 **R2 已接线，待本轮 Actions 验证**：WiFi 初次端点/头型候选、原通道刷新、注销、API/profile batch/重连共用同卡 not-before；316 项本机静态/mock通过。共享无I/O等待策略由原蜂窝实现下沉，旧测试入口保持。实际临时刷新只保留 operator 原租期，typed recovery 与诊断分离；轮询不增失败计数、清理不清已耗预算，换卡须正向确认。新增原worker绑定校验，TCP EOF不冒充可保留的超时。新 controller/factory/operator/runtime/API 回归仅已写入，尚未编译执行。随后仍 N8、相关扩展与完整固件复审，未部署。
 
+R2 首轮 `37b36e8` 已编译，新增7项真实刷新/operator回归通过，但旧认证前404兼容断言失败；新增的泛化身份分类过宽，已恢复原认证前分类而保留真正的等待/认证后/423/死流门禁，并追加 controller 普通404兼容回归。未删除旧测试；官方失败ZIP和annotations留证，待新提交全套验证。
+
 ## 已验证：N7 同源执行诊断
 
 已验证代码 **`ee9ee28a5f5ba49111234a905d6188c90d5ea7cf`**：[Build-Release 38399859012](https://github.com/autisticryptic/SimMaster/actions/runs/38399859012)、[Validate Beta 38399859071](https://github.com/autisticryptic/SimMaster/actions/runs/38399859071)、[Frontend Checks 38399859035](https://github.com/autisticryptic/SimMaster/actions/runs/38399859035) 和 ARM64/AMD64 success，Release skipped。两套官方测试 ZIP 各逐名核验 **250 项相关回归**、四矩阵 86 场景；前端 **43 单测 / 3 原工作台 browser**（0 skip/flaky）、源码指纹与官方 SHA/截图均已核验。报告 `.local/evidence/ims-execution-diagnostics/verified-ee9ee28.json`，未部署、未验收程序包或实机。

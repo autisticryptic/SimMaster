@@ -150,6 +150,18 @@ async fn real_initial_503_uses_an_eligible_alternate_without_retrying_the_deferr
 }
 
 #[tokio::test]
+async fn ordinary_pre_auth_404_compatibility_is_preserved_without_a_server_wait() {
+    let line = line(); let selected = owner(&line, "card-one", "before");
+    let scope = Scope::for_owner(&line, &selected).await.unwrap();
+    let (first, a) = peer(vec![(404, "")]).await;
+    let (second, b) = peer(vec![(200, "Expires: 3600\r\n")]).await;
+    run_candidates(&scope, &[first, second], exchange).await.unwrap();
+    a.await.unwrap(); b.await.unwrap();
+    assert!(scope.check(first).await.is_allowed());
+    assert!(restart_admission(&line).await.is_allowed());
+}
+
+#[tokio::test]
 async fn real_authenticated_503_preserves_final_response_not_the_prior_401_and_stops_alternates() {
     let line = line(); let selected = owner(&line, "card-one", "before");
     let scope = Scope::for_owner(&line, &selected).await.unwrap();

@@ -6077,10 +6077,9 @@ fn live_register_lease_negotiation_stopped(error: &LiveStageError) -> bool {
 
 fn live_register_error_is_terminal(error: &LiveStageError) -> bool {
     if error.register_auth_rounds > 0 { return true; }
-    if error.register_failure.is_some_and(|metadata| matches!(metadata.kind,
-        crate::connectivity::core::register::RegisterFailureKind::IdentityRejected
-        | crate::connectivity::core::register::RegisterFailureKind::AuthenticationRejected
-        | crate::connectivity::core::register::RegisterFailureKind::FlowFailed)) { return true; }
+    // Preserve legacy pre-authentication status compatibility. Real server
+    // waits are stopped by the endpoint/header controller, and an installed
+    // flow's identity/flow failures are handled by the refresh owner instead.
     if live_register_lease_negotiation_stopped(error) {
         return true;
     }
