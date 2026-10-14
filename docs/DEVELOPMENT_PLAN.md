@@ -31,7 +31,7 @@
 - reg-event 已实现并验证；仍需真实网络互通/设备验收。自定义或歧义 Contact 不猜绑定；不支持的订阅挑战、超时或 XML 缺口只停止/重同步观察，不伪造 REGISTER 丢失。
 - REGISTER rspauth 已验证；后续互通须单独验证真实服务器响应。现有范围仅 qop=auth/无 qop 和单一 Authorization scope，不宣称 auth-int、多重 origin/proxy 鉴权或非 REGISTER 业务已经支持。
 - 已验证 AUTS/stale 与 423 的剩余限制：WiFi 初次认证后的 423 明确 unsupported；需要新安全上下文的受保护 stale 不重装旧 ESP；非 REGISTER 业务的响应认证/恢复需单独核对。
-- 新发现 **蜂窝刷新 423→400 预算缺口**：刷新三候选仍需共用尝试级 `RegisterNegotiationBudget` 和结构化止损；不能拿已验证的初始 REGISTER 预算替代。
+- **蜂窝刷新 423→400 预算补漏实现待验证**：真实三候选现共用 `RegisterNegotiationBudget`，由结构化阶段/kind/Retry-After/Min-Expires 判断扩张并向外保留依据；新增生产回归待 Actions，不能拿已验证的初始 REGISTER/N7 结果替代。
 - 新发现 **WiFi 普通 REGISTER 等待缺口**：503/Retry-After 还须贯通同 SIM/端点/profile/worker 的实际 not-before 和有效旧租期保护；reg-event 等待与诊断展示都不是控制逻辑实现。
 - N7 已完成 CI/制品闭环；继续上述两项恢复补漏 → N8 承载能力/相关扩展 → 完整离线 EC20 复审，不能把“已有算法/helper”当成生产路径接通。
 

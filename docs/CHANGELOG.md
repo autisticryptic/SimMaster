@@ -5,6 +5,8 @@
 
 ## 1.1.5 主线
 
+- R1 刷新预算补漏已接线待验证：三候选共用 423 协商预算，按结构化失败而非末次状态止损，并保留 Min-Expires 依据；新增 loopback 覆盖 423→格式拒绝/503、floor 边界、新鉴权后400、普通兼容和 TCP 死流。当前不能以 N7 绿灯算本改动已验证，R2/N8/固件复审仍继续。
+
 - `ee9ee28` 完成 N7 同源执行诊断：shared schema、cellular/WiFi 实际观察、epoch/serial/弱owner、统一 API 与原工作台只读折叠区；三套 Actions/双架构、各250项相关后端回归/四矩阵、43单测/3browser与官方摘要/截图核验通过。声明模板、报价/协商、收到等待/真实门禁、历史成功/当前 readiness 分开。首轮编译lint和第二轮browser fixture问题修复留证，未部署。刷新423连续预算与WiFi普通等待仍独立待修，不以页面或绿色CI算整体完成。
 - `6c0c140` 完成 worker 内 SIP TCP/TLS、四向 TCP/IPsec、原 authority 精确 TLS DNS/IP SAN、有界 DNS TC→TCP/NAPTR D2T，保留 UDP 和防降级；两套 Actions、双架构、各 219 项相关回归及四矩阵/官方测试摘要通过，未部署。TLS 不绕过 required-IPsec，私有 CA/mTLS/新的反向 TLS-IPsec 未冒称支持；首次 E0451 已修复并留证。
 

@@ -20,6 +20,8 @@
 
 此前 N6 **`6c0c140`** 已验证 worker 内 SIP TCP、四向 TCP/IPsec、TLS1.2/1.3 与精确原 authority DNS/IP SAN、有界 DNS TC→TCP/NAPTR D2T；旧 UDP 和跨 profile 防降级保持。TLS 不绕过 required-IPsec，不冒称私有 CA、mTLS 或新的反向 TLS/IPsec 组合已支持。
 
+R1 已在工作树接入一次刷新共用的 `RegisterNegotiationBudget`、结构化候选门禁和失败 Min-Expires 依据传播；新增真实 loopback 的 423→格式拒绝/503、floor 边界、新挑战后400、普通兼容与 TCP 死流回归，尚待本轮 Actions，不能沿用 N7 验证结果。
+
 必须继续：**蜂窝刷新 423→400 的候选预算连续性**与 **WiFi 普通 REGISTER 的 503/Retry-After 实际门禁**。已有 reg-event 等待或诊断字段不能代替普通 REGISTER 恢复；随后继续 N8、相关 catalog/provider 与完整 EC20 固件复审，N7/CI 绿色不代表整体目标完成。
 
 ## 已验证：reg-event

@@ -4801,6 +4801,10 @@ async fn refresh_live_registration(
         session.register_variant.without_access_network_info(),
         session.register_variant.without_route_header(),
     ];
+    // A 423 is lease negotiation, not a header-format hint. Keep its budget
+    // outside the entire refresh ladder so a later 400/timeout cannot start
+    // another exchange with a fresh Min-Expires/authentication allowance.
+    let mut lease_budget = crate::connectivity::core::register::RegisterNegotiationBudget::default();
     let mut last_failure: Option<(CellularImsRegisterVariant, RegisterFailure)> = None;
     for variant in candidates.into_iter().take(if session.register_variant.security_mechanism.is_some() { 1 } else { 3 }) {
         let mut ids = session.register_ids.clone();
@@ -4937,7 +4941,9 @@ async fn refresh_live_registration(
             return lost_refresh_attempt(error);
         }
         let registration_result =
-            run_register_observed(&mut session.channel, &initial, &mut authenticator).await;
+            crate::connectivity::core::register::run_register_observed_with_budget(
+                &mut session.channel, &initial, &mut authenticator, &mut lease_budget,
+            ).await;
         if let Err(error) = verify_mm_task_bearer(runtime, session.native_bearer.as_mut()).await {
             authenticator.rollback_security(&mut session.channel).await;
             return lost_refresh_attempt(error);
@@ -4961,7 +4967,8 @@ async fn refresh_live_registration(
                 if let Some(authorization) = authenticator.refresh_authorization_after_failure() {
                     session.refresh_authorization = Some(authorization);
                 }
-                let error = map_refresh_register_failure(&failure);
+                let metadata = lease_budget.failure_metadata(&failure);
+                let error = map_refresh_register_failure(&failure).with_register_failure(metadata);
                 let invalid_security_offer = failure.error.code() == code::SECURITY_SERVER_INVALID;
                 // A SIP REGISTER with no response is retryable on this flow;
                 // an RFC 5626 keepalive failure is different: the flow has
@@ -4977,7 +4984,6 @@ async fn refresh_live_registration(
                         retry_after: None,
                     };
                 }
-                let metadata = failure.metadata();
                 if metadata.kind == crate::connectivity::core::register::RegisterFailureKind::TemporaryEndpoint {
                     let decision = session.endpoint_retries.lock().await.observe_refresh_failure(
                         session.pcscf, &metadata, Instant::now(),
@@ -5049,11 +5055,12 @@ async fn refresh_live_registration(
                         retry_after: None,
                     };
                 }
-                let retry_variant = failure
-                    .response
-                    .as_deref()
-                    .and_then(|response| sip::parse_status(response).ok())
-                    .is_some_and(status_permits_register_variant_fallback);
+                // A first protected refresh request is still the exchange's
+                // Initial stage. Its ordinary 400/415/... compatibility stays
+                // eligible, but new AKA, 423 provenance or Retry-After never
+                // becomes permission to reopen the header ladder.
+                let retry_variant = lease_budget.permits_candidate_expansion()
+                    && metadata.permits_variant_fallback();
                 last_failure = Some((variant, failure));
                 if retry_variant {
                     continue;
@@ -5199,7 +5206,8 @@ async fn refresh_live_registration(
     }
     let (variant, failure) = last_failure.expect("at least one refresh candidate");
     let loss_reason = RegistrationLossReason::from_register_failure(&failure);
-    let error = map_refresh_register_failure(&failure);
+    let error = map_refresh_register_failure(&failure)
+        .with_register_failure(lease_budget.failure_metadata(&failure));
     runtime
         .record_attempt(
             CellularImsStage::RegisterRefresh,

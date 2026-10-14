@@ -156,6 +156,37 @@ async fn real_tcp_authenticated_register_checks_rspauth_before_committing_four_d
 }
 
 #[tokio::test]
+async fn real_tcp_refresh_423_then_eof_keeps_lease_provenance_but_recovers_dead_flow() {
+    use crate::connectivity::core::register::{RegisterFailureKind, RegisterMinExpiresFailure};
+    let (mut session, runtime, listener, mut peer) = fixture().await;
+    let mut authorization = CellularImsRefreshAuthorization::new(challenge("existing-nonce"), aka());
+    authorization.nonce_count = 2;
+    session.refresh_authorization = Some(authorization);
+    let old_registration = session.registration.clone();
+    let old_cseq = session.next_register_cseq;
+    let task = tokio::spawn(async move {
+        let first = read_frame(&mut peer).await;
+        peer.write_all(&response(&first, "423 Interval Too Brief", "Min-Expires: 7200\r\n")).await.unwrap();
+        let next = read_frame(&mut peer).await;
+        assert_eq!(sip::header_value(&next, "Expires").as_deref(), Some("7200"));
+        assert_eq!(sip::header_value(&next, "Call-ID"), sip::header_value(&first, "Call-ID"));
+        drop(peer);
+    });
+    let db = Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+    let result = refresh_live_registration(&mut session, &runtime, "r1-tcp-dead-flow", &db).await;
+    task.await.unwrap();
+    assert_eq!(result.outcome, RegistrationRefreshResult::RebuildAccess(RegistrationLossReason::AccessTransportLost));
+    let metadata = *result.error.unwrap().register_failure().unwrap();
+    assert_eq!(metadata.kind, RegisterFailureKind::FlowFailed);
+    assert_eq!(metadata.min_expires, Some(RegisterMinExpiresFailure::Negotiated));
+    assert_eq!(session.registration, old_registration);
+    assert_eq!(session.next_register_cseq, old_cseq + 2);
+    assert_eq!(session.refresh_authorization.as_ref().unwrap().nonce_count, 4);
+    assert!(tokio::time::timeout(Duration::from_millis(100), listener.accept()).await.is_err(),
+        "dead reliable flow must not open another header candidate connection");
+}
+
+#[tokio::test]
 async fn real_tcp_direct_refresh_reuses_established_connection_and_does_not_commit_bad_response() {
     for invalid in [false, true] {
         let (mut session, runtime, listener, _original_peer) = fixture().await;
