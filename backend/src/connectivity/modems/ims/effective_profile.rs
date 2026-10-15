@@ -17,6 +17,7 @@
 //! lets the API explain where each effective value came from.
 
 use crate::connectivity::modems::ims::vowifi::profiles::CarrierProfile;
+use crate::hardware::devices::ims_bearer_policy::ImsBearerRequirements;
 
 use super::profile_override::{ImsAccessOverride, OverrideSource, SimOverride};
 
@@ -65,11 +66,26 @@ pub struct EffectiveImsProfile {
     pub registrar: Option<EffectiveField>,
     /// APN used for the IMS bearer.
     pub ims_apn: Option<EffectiveField>,
+    /// Atomic configured requirement, never an assertion of driver support.
+    pub bearer: ImsBearerRequirements,
+    pub bearer_source: OverrideSource,
+    /// Resolution can still be displayed when execution is blocked. Consumers
+    /// MUST call validate_bearer before any access-specific network operation.
+    pub bearer_validation_error: Option<&'static str>,
     /// Preferred IP stack for this access. For LTE catalog rows this is the
     /// normalized `access.lte.ip_family` value.
     pub ip_stack: EffectiveField,
     /// Whether the user explicitly pinned a carrier profile.
     pub pinned_profile_id: Option<EffectiveField>,
+}
+
+impl EffectiveImsProfile {
+    pub fn validate_bearer(&self) -> Result<(), &'static str> {
+        if let Some(code) = self.bearer_validation_error {
+            return Err(code);
+        }
+        self.bearer.validate()
+    }
 }
 
 /// Effective device identity resolved for one line.
@@ -192,7 +208,34 @@ pub fn resolve_effective_ims_profile_for_access(
     access_kind: EffectiveImsAccess,
 ) -> EffectiveImsProfile {
     let access = override_.map(|override_| access_kind.override_from(override_));
+    let explicit_bearer = access.and_then(|value| value.bearer.as_ref());
+    let bearer = explicit_bearer.unwrap_or(catalog.ims.bearer).clone();
+    let bearer_source = if explicit_bearer.is_some() {
+        OverrideSource::SimOverride
+    } else {
+        OverrideSource::Catalog
+    };
+    // An APN edit is not consent to forward a catalog secret to a new APN.
+    // Keep the configured value visible, but fail execution until the user
+    // supplies a whole bearer override, including an explicit no-auth policy.
+    let apn_changed = access
+        .and_then(|value| value.apn.as_deref())
+        .filter(|value| !value.is_empty())
+        .is_some_and(|apn| Some(apn) != catalog.epdg.apn);
+    let bearer_validation_error = if explicit_bearer.is_none()
+        && apn_changed
+        && catalog.ims.bearer.authentication.has_nonempty_credentials()
+    {
+        Some("ims_bearer_apn_override_requires_explicit_bearer")
+    } else if access_kind == EffectiveImsAccess::Vowifi {
+        bearer.validate_for_wifi().err()
+    } else {
+        bearer.validate().err()
+    };
     EffectiveImsProfile {
+        bearer,
+        bearer_source,
+        bearer_validation_error,
         profile_id: catalog.meta.profile_id.to_string(),
         domain: access
             .and_then(|a| a.domain.as_deref())
@@ -422,6 +465,16 @@ pub fn validate_override(override_: &SimOverride) -> Vec<String> {
 }
 
 fn validate_access(access: &ImsAccessOverride, name: &str, problems: &mut Vec<String>) {
+    if let Some(bearer) = &access.bearer {
+        let validation = if name == "ims_vowifi" {
+            bearer.validate_for_wifi()
+        } else {
+            bearer.validate()
+        };
+        if let Err(code) = validation {
+            problems.push(format!("{name}.{code}"));
+        }
+    }
     if let Some(ip_stack) = access.ip_stack.as_deref() {
         if !matches!(ip_stack.trim(), "ipv4" | "ipv6" | "ipv4v6") {
             problems.push(format!("{name}.ip_stack_invalid"));
@@ -485,6 +538,7 @@ pub fn source_map_of(
         push_field(&mut map, &format!("vowifi.dns[{index}]"), server);
     }
     for (prefix, ims) in [("cellular_ims", cellular_ims), ("vowifi_ims", vowifi_ims)] {
+        map.push((format!("{prefix}.bearer"), ims.bearer_source));
         push_field(&mut map, &format!("{prefix}.domain"), &ims.domain);
         push_field(&mut map, &format!("{prefix}.realm"), &ims.realm);
         if let Some(pcscf) = &ims.pcscf {
@@ -520,6 +574,10 @@ pub fn source_map_of(
 fn push_field(map: &mut Vec<(String, OverrideSource)>, name: &str, field: &EffectiveField) {
     map.push((name.to_string(), field.source));
 }
+
+#[cfg(test)]
+#[path = "effective_profile_bearer_tests.rs"]
+mod bearer_tests;
 
 #[cfg(test)]
 mod tests {

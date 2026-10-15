@@ -43,6 +43,9 @@ jobs:
           files = ['package.json', 'pnpm-lock.yaml', 'playwright.lines.config.ts',
                    'src/api/contracts.ts', 'src/pages/sim/LineRuntimeDetails.tsx',
                    'src/pages/sim/ImsExecutionDetails.tsx', 'src/pages/sim/imsDiagnosticsFormat.ts',
+                   'src/pages/sim/CarrierProfileEditor.tsx', 'src/pages/sim/ModemLinesPanel.tsx',
+                   'src/pages/sim/VowifiLineDialog.tsx', 'src/pages/sim/cellularImsErrorCodes.ts',
+                   'src/pages/sim/cellularImsErrorFormat.ts', 'tests/cellularImsErrorFormat.test.ts',
                    'tests/imsDiagnosticsFormat.test.ts', 'e2e/ims-execution-diagnostics.spec.ts',
                    'e2e/blocked-lines.spec.ts', 'e2e/fixtures/lines.tsx']
           report = {'schema': 'ims-execution-ui-v1', 'commit': os.environ['GITHUB_SHA'],

@@ -14,6 +14,8 @@ use super::{
 };
 use crate::hardware::devices::transport::TransportFuture;
 
+pub use super::wds_pcscf::RetainedWdsSettings;
+
 pub trait NativeIo: Send + Sync {
     /// Fence an uncertain reset/write outcome. Existing receipts remain owned.
     fn invalidate(&self) {}
@@ -22,6 +24,19 @@ pub trait NativeIo: Send + Sync {
         &'a self,
         request: &'a CommandRequest,
     ) -> TransportFuture<'a, Result<String, NativeError>>;
+
+    /// Read P-CSCF lists on an exact retained WDS CID. The caller must hold
+    /// the device operation lock and prove the CID belongs to this endpoint.
+    /// This must not allocate/release clients or change bearer/profile state.
+    fn read_wds_pcscf<'a>(
+        &'a self,
+        _endpoint: &'a NativeBearerConfig,
+        _client_id: u8,
+    ) -> TransportFuture<'a, Result<RetainedWdsSettings, NativeError>> {
+        Box::pin(async {
+            Err(NativeError::Unsupported("native_wds_pcscf_unavailable"))
+        })
+    }
 
     fn verify_bearer<'a>(
         &'a self,
@@ -245,6 +260,24 @@ impl SystemNativeIo {
         }
     }
 
+    /// Unlike initial verify_bearer, this permits a live interface's addresses.
+    /// It verifies the entire configured endpoint, physical owner/proxy epoch,
+    /// Retained-session reads are also issued after the data netdev has moved
+    /// into the UE worker. Validate the physical control endpoint and proxy
+    /// owner here; a host /sys/class/net lookup would reject that valid move.
+    /// The caller holds the session operation lock and fences its captured UE
+    /// binding before/after discovery. No netdev is accessed by this query.
+    #[cfg(unix)]
+    async fn verify_retained_wds_endpoint(
+        &self,
+        endpoint: &NativeBearerConfig,
+        client_id: u8,
+    ) -> Result<PortIdentity, NativeError> {
+        validate_retained_wds_endpoint(&self.spec, endpoint, client_id)?;
+        self.verify(&endpoint.control_device).await?;
+        identity(&endpoint.control_device, &self.anchor)
+    }
+
     async fn verify(&self, device: &str) -> Result<(), NativeError> {
         if self.invalidated.load(std::sync::atomic::Ordering::Acquire) {
             return Err(NativeError::OwnerConflict(
@@ -272,6 +305,23 @@ impl SystemNativeIo {
         #[cfg(not(unix))]
         Err(NativeError::Unsupported("native_backend_requires_linux"))
     }
+}
+
+fn validate_retained_wds_endpoint(
+    spec: &NativeDeviceConfig,
+    endpoint: &NativeBearerConfig,
+    client_id: u8,
+) -> Result<(), NativeError> {
+    if spec.protocol != NativeProtocol::Qmi {
+        return Err(NativeError::Unsupported("native_wds_pcscf_requires_qmi"));
+    }
+    if !spec.ims.iter().chain(spec.data.iter()).any(|owned| owned == endpoint) {
+        return Err(NativeError::OwnerConflict("native_wds_pcscf_endpoint_not_owned".into()));
+    }
+    if matches!(client_id, 0 | 255) {
+        return Err(NativeError::Protocol("native_wds_pcscf_client_invalid".into()));
+    }
+    Ok(())
 }
 
 fn verify_receipts_clear(directory: &std::path::Path, _line: &str) -> Result<(), NativeError> {
@@ -335,6 +385,40 @@ impl NativeIo for SystemNativeIo {
         }
         #[cfg(not(unix))] { let _ = key; Err(NativeError::Unsupported("native_backend_requires_linux")) }
     }
+    fn read_wds_pcscf<'a>(
+        &'a self,
+        endpoint: &'a NativeBearerConfig,
+        client_id: u8,
+    ) -> TransportFuture<'a, Result<RetainedWdsSettings, NativeError>> {
+        Box::pin(async move {
+            #[cfg(unix)]
+            {
+                // One deadline also bounds pre/post owner verification. A
+                // cancelled future drops only its local socket, not the CID.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                tokio::time::timeout_at(deadline, async {
+                    let before = self.verify_retained_wds_endpoint(endpoint, client_id).await?;
+                    let result = super::wds_pcscf::read_retained(
+                        &endpoint.control_device, client_id, deadline,
+                    ).await;
+                    let after = self.verify_retained_wds_endpoint(endpoint, client_id).await?;
+                    if before != after {
+                        return Err(NativeError::OwnerConflict("native_wds_pcscf_endpoint_changed".into()));
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(super::wds_pcscf::timeout_error());
+                    }
+                    result
+                }).await.map_err(|_| NativeError::OwnerConflict("native_wds_pcscf_owner_verification_timeout".into()))?
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (endpoint, client_id);
+                Err(NativeError::Unsupported("native_backend_requires_linux"))
+            }
+        })
+    }
+
     fn verify_bearer<'a>(
         &'a self,
         endpoint: &'a NativeBearerConfig,
@@ -603,6 +687,76 @@ fn classify_failed_command(stderr: &[u8]) -> NativeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wds_fixture() -> (NativeDeviceConfig, NativeBearerConfig) {
+        let endpoint = NativeBearerConfig {
+            control_device: "/dev/fixture".into(),
+            interface: "wwan-fixture".into(),
+            session_id: 0,
+            qmi_data_port: Some("a2-mux-rmnet0".into()),
+            qmi_binding: None,
+        };
+        let spec = NativeDeviceConfig {
+            hardware_key: "wds-fixture".into(),
+            sysfs_anchor: "/sys/devices/fixture".into(),
+            protocol: NativeProtocol::Qmi,
+            control_device: endpoint.control_device.clone(),
+            at_device: None,
+            sms_reception_enabled: false,
+            uim_slot: 1,
+            ims: Some(endpoint.clone()),
+            data: None,
+        };
+        (spec, endpoint)
+    }
+
+    #[test]
+    fn retained_wds_query_requires_the_entire_configured_endpoint_and_valid_cid() {
+        let (mut spec, endpoint) = wds_fixture();
+        validate_retained_wds_endpoint(&spec, &endpoint, 7).unwrap();
+        for cid in [0, 255] {
+            assert!(validate_retained_wds_endpoint(&spec, &endpoint, cid).is_err());
+        }
+        for field in 0..5 {
+            let mut changed = endpoint.clone();
+            match field {
+                0 => changed.control_device = "/dev/other".into(),
+                1 => changed.interface = "wwan-other".into(),
+                2 => changed.session_id = 1,
+                3 => changed.qmi_data_port = None,
+                _ => changed.qmi_binding = Some(super::super::config::QmiEndpointBinding {
+                    endpoint_type: "bam-dmux".into(), interface_number: 0, mux_id: 1,
+                }),
+            }
+            assert!(matches!(validate_retained_wds_endpoint(&spec, &changed, 7),
+                Err(NativeError::OwnerConflict(_))));
+        }
+        for protocol in [NativeProtocol::At, NativeProtocol::Mbim] {
+            spec.protocol = protocol;
+            assert_eq!(validate_retained_wds_endpoint(&spec, &endpoint, 7),
+                Err(NativeError::Unsupported("native_wds_pcscf_requires_qmi")));
+        }
+        spec.protocol = NativeProtocol::Qmi;
+        spec.ims = None;
+        assert!(validate_retained_wds_endpoint(&spec, &endpoint, 7).is_err());
+        spec.data = Some(endpoint.clone());
+        validate_retained_wds_endpoint(&spec, &endpoint, 7).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_wds_default_io_is_fail_closed_without_executing_commands() {
+        struct LegacyIo;
+        impl NativeIo for LegacyIo {
+            fn execute<'a>(&'a self, _: &'a CommandRequest) -> TransportFuture<'a, Result<String, NativeError>> {
+                panic!("read-only WDS capability must not fall back to a CLI command")
+            }
+        }
+        let io: &dyn NativeIo = &LegacyIo;
+        let (_, endpoint) = wds_fixture();
+        assert_eq!(io.read_wds_pcscf(&endpoint, 7).await,
+            Err(NativeError::Unsupported("native_wds_pcscf_unavailable")));
+    }
+
     #[test]
     fn helper_failure_is_not_silently_treated_as_a_protocol_rejection() {
         assert_eq!(

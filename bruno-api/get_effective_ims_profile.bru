@@ -1,0 +1,38 @@
+meta {
+  name: get_effective_ims_profile
+  type: http
+  seq: 156
+}
+
+get {
+  url: {{base_url}}/api/ims/lines/{{line_id}}/profile
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}
+
+docs {
+  cellular_ims.bearer and vowifi_ims.bearer are optional safe configuration metadata:
+  authentication.method, username_present/password_present flags (never values),
+  pcscf_via_pco, pcscf_via_dhcp, source and optional validation_error.
+  These requirements do not claim adapter support or current registration readiness.
+
+  Credential write intent (authenticated API only):
+  PATCH /api/ims/lines/{line_id}/override uses ims_cellular.bearer / ims_vowifi.bearer.
+  Omission preserves the stored policy only at the unchanged SIM/profile/APN binding;
+  explicit null clears the whole override (inherits catalog), and a complete policy
+  object replaces it atomically. Redacted PAP/CHAP responses are invalid replacements.
+  Both username and password must be supplied for PAP/CHAP replacement; missing and
+  deliberately empty password are different. WiFi rejects cellular bearer requirements.
+
+  PUT /api/vowifi/carrier-profiles similarly treats omitted ims.bearer as unchanged,
+  null as reset to default, and a full object as replacement. An editor carrying a
+  non-default redacted policy also sends ims.bearer_unchanged=true, requiring an
+  existing database record at the same profile/PLMN/APN; this rejects accidental
+  credential removal when copying a catalog record or changing the profile id.
+  Do not send bearer_unchanged together with an explicit bearer replacement/clear.
+  Private storage retains credentials; detail/list/write/status responses never do.
+}

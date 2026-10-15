@@ -28,11 +28,11 @@ use crate::{
     },
     hardware::{
         cellular::qmi_wds,
-        devices::transport::{
-            BearerDomain, BearerInterfaceOwnership, CellularDataTransport, ImsBearerError,
+        devices::{ims_bearer_policy::{ImsApnAuthMethod, ImsBearerRequirements, DEFAULT_IMS_BEARER_REQUIREMENTS}, transport::{
+            BearerDomain, BearerInterfaceOwnership, CapabilitySupport, CellularDataTransport, ImsBearerCapabilities, ImsBearerError,
             ImsBearerErrorKind, ImsBearerFailureHint, ImsBearerHandle, ImsBearerInfo,
-            ImsBearerTransport, ThreeGppRat, TransportFuture,
-        },
+            ImsBearerTransport, ImsPcscfDiscovery, ThreeGppRat, TransportFuture,
+        }},
     },
     platform::config::ApnConfig,
     services::ue_worker::{worker_for_line, NetConfigOp, UeWorkerBinding},
@@ -310,6 +310,10 @@ fn qmi_start(apn: &ApnConfig, family: u8, profile_id: Option<u32>) -> Result<Str
             safe_parameter(&apn.username)?,
             safe_parameter(&apn.password)?
         ));
+    } else if apn.auth_method.eq_ignore_ascii_case("none") {
+        // An explicit no-auth policy must not inherit authentication from a
+        // selected modem profile. The unspecified legacy path remains unchanged.
+        action.push_str(",auth=NONE");
     }
     Ok(action)
 }
@@ -718,6 +722,58 @@ impl ImsBearerHandle for NativeHandle {
             Ok(())
         }
     }
+    fn discover_pcscf(
+        &mut self,
+    ) -> TransportFuture<'_, Result<Option<ImsPcscfDiscovery>, ImsBearerError>> {
+        Box::pin(async move {
+            self.check_liveness()?;
+            let session = self.session.as_ref().expect("liveness checked");
+            if !matches!(session.role, Role::Ims) || session.device.spec.protocol != NativeProtocol::Qmi {
+                return Ok(None);
+            }
+            let _operation = session.device.operation.lock().await;
+            if session.lost.load(Ordering::Acquire) || session.clients.is_empty() {
+                return Err(ims_error(NativeError::Unavailable("native_bearer_session_lost".into()),
+                    ImsBearerErrorKind::SessionLost));
+            }
+            let mut discovery = ImsPcscfDiscovery { candidates: Vec::new(), domains: Vec::new(),
+                context_id: None, source: "retained_wds_current_settings" };
+            let mut observed = false;
+            for client in &session.clients {
+                let cid = client.cid.filter(|cid| *cid != 0 && *cid != 255)
+                    .filter(|_| client.packet_handle.is_some()).ok_or_else(|| ims_error(
+                        NativeError::OwnerConflict("native_retained_wds_client_unconfirmed".into()),
+                        ImsBearerErrorKind::SessionLost))?;
+                match session.device.io.read_wds_pcscf(&session.endpoint, cid).await {
+                    Ok(settings) => {
+                        observed = true;
+                        for address in settings.addresses {
+                            if !discovery.candidates.contains(&address) { discovery.candidates.push(address); }
+                        }
+                        for domain in settings.domains {
+                            if !discovery.domains.contains(&domain) { discovery.domains.push(domain); }
+                        }
+                    }
+                    Err(NativeError::Unsupported(_)) => {}
+                    Err(error) => {
+                        let kind = if matches!(error, NativeError::OwnerConflict(_)
+                            | NativeError::ProtocolRejected(7 | 9 | 22)) {
+                            ImsBearerErrorKind::SessionLost
+                        } else { ImsBearerErrorKind::PcscfUnavailable };
+                        return Err(ims_error(error, kind));
+                    }
+                }
+                if session.lost.load(Ordering::Acquire) {
+                    return Err(ims_error(NativeError::Unavailable("native_bearer_session_lost".into()),
+                        ImsBearerErrorKind::SessionLost));
+                }
+            }
+            // Empty-but-observed is authoritative absence, not permission to
+            // query another client. Only true unsupported keeps legacy AT.
+            Ok(observed.then_some(discovery))
+        })
+    }
+
     fn prepare_namespace_move(&mut self, namespace: &str) -> Result<Box<dyn Send>, ImsBearerError> {
         let session = self.session.as_mut().ok_or_else(|| {
             ims_error(
@@ -794,6 +850,37 @@ impl NativeImsTransport {
     }
 }
 impl ImsBearerTransport for NativeImsTransport {
+    fn ims_bearer_capabilities(&self) -> ImsBearerCapabilities {
+        use CapabilitySupport::{Supported, Unsupported};
+        let packet = matches!(self.device.spec.protocol, NativeProtocol::Qmi | NativeProtocol::Mbim);
+        let qmi = self.device.spec.protocol == NativeProtocol::Qmi;
+        ImsBearerCapabilities {
+            auth_none: if packet { Supported } else { Unsupported },
+            pap: if packet { Supported } else { Unsupported },
+            chap: if packet { Supported } else { Unsupported },
+            pap_or_chap: if qmi { Supported } else { Unsupported },
+            // Neither Start Network nor MBIM Connect provides a PCO profile
+            // request switch. Do not invent a CLI option or write foreign NV.
+            pco_request_policy: Unsupported,
+            pco_pcscf_addresses: if qmi { Supported } else { Unsupported },
+            pco_pcscf_domains: if qmi { Supported } else { Unsupported },
+            dhcp_information: if packet && cfg!(target_os = "linux") { Supported } else { Unsupported },
+        }
+    }
+
+    fn validate_ims_bearer_requirements(&self, requirements: &ImsBearerRequirements) -> Result<(), ImsBearerError> {
+        self.ims_bearer_capabilities().check(requirements)?;
+        // qmicli/mbimcli have a key-value grammar even without a shell. Reject
+        // delimiters before any profile allocation or radio/provider query.
+        for value in [&requirements.authentication.username, &requirements.authentication.password]
+            .into_iter().flatten() {
+            safe_parameter(value).map_err(|_| ims_error(
+                NativeError::Protocol("native_ims_authentication_unencodable".into()),
+                ImsBearerErrorKind::RequirementsInvalid))?;
+        }
+        Ok(())
+    }
+
     fn endpoint_available(&self, primary: &str) -> bool {
         self.device.spec.control_device == primary && self.device.spec.ims.is_some()
     }
@@ -803,13 +890,30 @@ impl ImsBearerTransport for NativeImsTransport {
         selector: &'a str,
         apn: &'a str,
         profile: Option<u32>,
+        cid: u8,
+        families: &'a [u8],
+        roaming: bool,
+        expected_mm_sim: Option<(&'a str, u8)>,
+    ) -> TransportFuture<'a, Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>>
+    {
+        self.establish_ims_bearer_with_requirements(primary, selector, apn, profile, cid,
+            families, roaming, expected_mm_sim, &DEFAULT_IMS_BEARER_REQUIREMENTS)
+    }
+
+    fn establish_ims_bearer_with_requirements<'a>(
+        &'a self,
+        primary: &'a str,
+        selector: &'a str,
+        apn: &'a str,
+        profile: Option<u32>,
         _cid: u8,
         families: &'a [u8],
         roaming: bool,
         _expected_mm_sim: Option<(&'a str, u8)>,
-    ) -> TransportFuture<'a, Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>>
-    {
+        requirements: &'a ImsBearerRequirements,
+    ) -> TransportFuture<'a, Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>> {
         Box::pin(async move {
+            self.validate_ims_bearer_requirements(requirements)?;
             if !self.endpoint_available(primary) || selector != self.device.spec.selector() {
                 return Err(ims_error(
                     NativeError::OwnerConflict("native_ims_endpoint_owner_mismatch".into()),
@@ -819,10 +923,7 @@ impl ImsBearerTransport for NativeImsTransport {
             begin(
                 self.device.clone(),
                 Role::Ims,
-                ApnConfig {
-                    apn: apn.into(),
-                    ..Default::default()
-                },
+                ims_apn_configuration(apn, requirements),
                 families.to_vec(),
                 profile,
                 roaming,
@@ -830,6 +931,25 @@ impl ImsBearerTransport for NativeImsTransport {
             .await
             .map_err(|e| ims_error(e, ImsBearerErrorKind::SessionStartFailed))
         })
+    }
+}
+
+/// Conversion only after requirement validation; no ordinary-data defaults or
+/// credentials are consulted for an IMS APN.
+fn ims_apn_configuration(apn: &str, requirements: &ImsBearerRequirements) -> ApnConfig {
+    let auth = &requirements.authentication;
+    ApnConfig {
+        apn: apn.to_owned(),
+        auth_method: match auth.method {
+            ImsApnAuthMethod::Unspecified => "",
+            ImsApnAuthMethod::None => "none",
+            ImsApnAuthMethod::Pap => "pap",
+            ImsApnAuthMethod::Chap => "chap",
+            ImsApnAuthMethod::PapOrChap => "both",
+        }.to_owned(),
+        username: auth.username.clone().unwrap_or_default(),
+        password: auth.password.clone().unwrap_or_default(),
+        ..Default::default()
     }
 }
 
@@ -1209,12 +1329,23 @@ mod tests {
 
     struct MemoryIo {
         requests: std::sync::Mutex<Vec<CommandRequest>>,
+        pcscf_calls: std::sync::Mutex<Vec<u8>>,
+        pcscf_result: std::sync::Mutex<Option<Result<super::super::io::RetainedWdsSettings, NativeError>>>,
         receipts: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
         interface_available: AtomicBool,
         reject_receipt_update: AtomicBool,
         failure: Option<&'static str>,
     }
     impl super::super::io::NativeIo for MemoryIo {
+        fn read_wds_pcscf<'a>(&'a self, endpoint: &'a NativeBearerConfig, cid: u8)
+            -> TransportFuture<'a, Result<super::super::io::RetainedWdsSettings, NativeError>> {
+            Box::pin(async move {
+                assert_eq!(endpoint.control_device, "/dev/fixture");
+                self.pcscf_calls.lock().unwrap().push(cid);
+                self.pcscf_result.lock().unwrap().clone()
+                    .unwrap_or(Err(NativeError::Unsupported("fixture_pcscf_unsupported")))
+            })
+        }
         fn execute<'a>(
             &'a self,
             request: &'a CommandRequest,
@@ -1222,6 +1353,18 @@ mod tests {
             Box::pin(async move {
                 self.requests.lock().unwrap().push(request.clone());
                 let action = &request.arguments[3];
+                if action == "--query-radio-state" {
+                    return Ok("Hardware radio state: 'on'\nSoftware radio state: 'on'".into());
+                }
+                if action == "--query-registration-state" {
+                    return Ok("Registration state: 'home'\nProvider ID: '00101'".into());
+                }
+                if action.starts_with("--query-connection-state=") {
+                    return Ok("Activation state: 'deactivated'".into());
+                }
+                if action.starts_with("--query-ip-configuration=") {
+                    return Ok("IPv4 configuration available: 'address, gateway, dns'\nIP [0]: '192.0.2.2/30'\nGateway: '192.0.2.1'\nDNS [0]: '192.0.2.53'".into());
+                }
                 if action == "--dms-get-operating-mode" {
                     return Ok("Mode: 'online'".into());
                 }
@@ -1294,6 +1437,8 @@ mod tests {
     fn memory_device(failure: Option<&'static str>) -> (Arc<NativeDevice>, Arc<MemoryIo>) {
         let io = Arc::new(MemoryIo {
             requests: Default::default(),
+            pcscf_calls: Default::default(),
+            pcscf_result: Default::default(),
             receipts: Default::default(),
             interface_available: AtomicBool::new(true),
             reject_receipt_update: AtomicBool::new(false),
@@ -1314,6 +1459,10 @@ mod tests {
             io.clone(),
         );
         (device, io)
+    }
+
+    mod requirements_tests {
+        include!("bearer_requirements_tests.rs");
     }
 
     #[tokio::test]

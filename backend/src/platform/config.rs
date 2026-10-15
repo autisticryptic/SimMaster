@@ -4074,7 +4074,7 @@ fn default_lpac_path() -> String {
     "/opt/simadmin/lpac/lpac".to_string()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApnConfig {
     #[serde(default)]
     pub apn: String,
@@ -4086,6 +4086,18 @@ pub struct ApnConfig {
     pub password: String,
     #[serde(default = "default_apn_auth_method")]
     pub auth_method: String,
+}
+
+impl std::fmt::Debug for ApnConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApnConfig")
+            .field("apn", &self.apn)
+            .field("protocol", &self.protocol)
+            .field("auth_method", &self.auth_method)
+            .field("username_present", &!self.username.is_empty())
+            .field("password_present", &!self.password.is_empty())
+            .finish()
+    }
 }
 
 impl Default for ApnConfig {

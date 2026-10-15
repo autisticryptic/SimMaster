@@ -254,6 +254,10 @@ pub struct UeSocketSpec {
     pub reuse_address: bool,
     /// TCP connect timeout in seconds; default 10s when `None`.
     pub connect_timeout_secs: Option<u64>,
+    /// Information-only DHCP sockets: IPv4 broadcast, or IPv6 multicast
+    /// interface/scope resolved by the socket factory in the UE namespace.
+    #[serde(default)]
+    pub dhcp_information: bool,
 }
 
 impl UeSocketSpec {
@@ -266,6 +270,7 @@ impl UeSocketSpec {
             bind_to_device,
             reuse_address: true,
             connect_timeout_secs: None,
+            dhcp_information: false,
         }
     }
 
@@ -281,7 +286,8 @@ impl UeSocketSpec {
 
     pub fn tcp_bound(local: SocketAddr, bind_to_device: Option<String>) -> Self {
         Self { kind: UeSocketKind::TcpBound, family: socket_family(local), bind: Some(local),
-            connect: None, bind_to_device, reuse_address: true, connect_timeout_secs: None }
+            connect: None, bind_to_device, reuse_address: true, connect_timeout_secs: None,
+            dhcp_information: false }
     }
 
     pub fn tcp_listener(local: SocketAddr, bind_to_device: Option<String>) -> Self {
@@ -302,6 +308,7 @@ impl UeSocketSpec {
             bind_to_device,
             reuse_address: true,
             connect_timeout_secs: Some(connect_timeout_secs),
+            dhcp_information: false,
         }
     }
 }
@@ -555,6 +562,22 @@ impl UeWorkerBinding {
         Ok(guard)
     }
 
+    /// Create on the originally captured generation, never a replacement.
+    /// The lifecycle lock covers enqueue only, not the response await.
+    pub async fn create_socket(&self, spec: UeSocketSpec) -> Result<UeSocket, UeWorkerError> {
+        if !self.is_current() {
+            return Err(UeWorkerError::Protocol("worker generation changed".into()));
+        }
+        #[cfg(unix)]
+        let result = self.worker.create_socket_unix(spec, self.generation).await;
+        #[cfg(not(unix))]
+        let result = { let _ = spec; Err(UeWorkerError::Unsupported) };
+        if !self.is_current() {
+            return Err(UeWorkerError::Protocol("worker generation changed".into()));
+        }
+        result
+    }
+
     /// Every operation in the batch executes on the captured process. A
     /// control-channel failure returns an error; it is never retried on a new
     /// process. The generation is checked both before and after the request,
@@ -756,6 +779,42 @@ impl UeWorkerHandle {
         });
     }
 
+    /// Test-only socket control responder. Uses the real request correlation,
+    /// generation checks and fd-to-Tokio conversion, without namespaces/devices.
+    #[cfg(all(test, unix))]
+    pub(crate) async fn enable_test_socket_factory<F>(&self, mut factory: F)
+    where
+        F: FnMut(UeSocketSpec) -> std::io::Result<SocketFd> + Send + 'static,
+    {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *self.core.tx.lock().unwrap() = Some(tx);
+        let core = Arc::clone(&self.core);
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                let UeWorkerMessage::SocketCreateRequest { request_id, spec } = message else {
+                    panic!("unexpected operation in socket-only test worker");
+                };
+                let result = factory(spec);
+                let (fd, error) = match result {
+                    Ok(fd) => (Some(fd), None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+                let pending = core.pending.lock().unwrap().remove(&request_id);
+                if let Some(PendingRequest::Socket(sender)) = pending {
+                    let _ = sender.send(SocketCreateOutcome {
+                        request_id, ok: error.is_none(), error, fd,
+                    });
+                }
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn advance_test_generation(&self) {
+        let _guard = self.core.lifecycle.lock().await;
+        self.core.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Ask the worker for an immediate namespace snapshot and wait briefly for
     /// the reader task to publish it. This is used after moving a native WWAN
     /// interface so feature gates never rely on a stale pre-migration view.
@@ -785,19 +844,15 @@ impl UeWorkerHandle {
     /// back to this process. The returned socket is a normal tokio socket; its
     /// kernel state belongs to the UE stack exclusively.
     pub async fn create_socket(&self, spec: UeSocketSpec) -> Result<UeSocket, UeWorkerError> {
-        #[cfg(unix)]
-        {
-            self.create_socket_unix(spec).await
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = spec;
-            Err(UeWorkerError::Unsupported)
-        }
+        self.bind().create_socket(spec).await
     }
 
     #[cfg(unix)]
-    async fn create_socket_unix(&self, spec: UeSocketSpec) -> Result<UeSocket, UeWorkerError> {
+    async fn create_socket_unix(&self, spec: UeSocketSpec, expected_generation: u64) -> Result<UeSocket, UeWorkerError> {
+        let lifecycle = self.core.lifecycle.lock().await;
+        if self.generation() != expected_generation {
+            return Err(UeWorkerError::Protocol("worker generation changed".into()));
+        }
         let request_id = self.core.request_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel::<SocketCreateOutcome>();
         {
@@ -817,6 +872,7 @@ impl UeWorkerHandle {
                 "worker control channel is not up".to_string(),
             ));
         }
+        drop(lifecycle);
         let outcome = match tokio::time::timeout(SOCKET_CREATE_TIMEOUT, rx).await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(_)) => {
@@ -1733,8 +1789,12 @@ fn create_socket_fd(spec: &UeSocketSpec) -> std::io::Result<std::os::fd::OwnedFd
     if let Some(device) = &spec.bind_to_device {
         set_bind_to_device(&socket, device)?;
     }
-    if let Some(bind) = &spec.bind {
-        socket.bind(&socket2::SockAddr::from(*bind))?;
+    let mut bind = spec.bind;
+    if spec.dhcp_information {
+        bind = Some(configure_dhcp_information_socket(&socket, spec)?);
+    }
+    if let Some(bind) = bind {
+        socket.bind(&socket2::SockAddr::from(bind))?;
     }
     match spec.kind {
         UeSocketKind::Udp => {
@@ -1765,6 +1825,42 @@ fn create_socket_fd(spec: &UeSocketSpec) -> std::io::Result<std::os::fd::OwnedFd
     // it returns, so setting the flag any earlier would be silently undone.
     socket.set_nonblocking(true)?;
     Ok(socket.into())
+}
+
+#[cfg(unix)]
+fn configure_dhcp_information_socket(
+    socket: &socket2::Socket,
+    spec: &UeSocketSpec,
+) -> std::io::Result<SocketAddr> {
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidInput,
+        "DHCP information socket requires UDP, explicit local address and device, no connect/reuse");
+    if spec.kind != UeSocketKind::Udp || spec.connect.is_some() || spec.reuse_address {
+        return Err(invalid());
+    }
+    let device = spec.bind_to_device.as_deref().filter(|name| !name.is_empty()).ok_or_else(invalid)?;
+    let mut bind = spec.bind.ok_or_else(invalid)?;
+    if bind.ip().is_unspecified() || bind.ip().is_multicast() {
+        return Err(invalid());
+    }
+    match &mut bind {
+        SocketAddr::V4(local) => {
+            if spec.family != UeSocketFamily::Ipv4 || local.port() != 68 { return Err(invalid()); }
+            socket.set_broadcast(true)?;
+        }
+        SocketAddr::V6(local) => {
+            if spec.family != UeSocketFamily::Ipv6 || local.port() != 546 { return Err(invalid()); }
+            // This runs in the already-entered UE worker, never the parent.
+            let device = std::ffi::CString::new(device).map_err(|_| invalid())?;
+            let index = unsafe { libc::if_nametoindex(device.as_ptr()) };
+            if index == 0 { return Err(std::io::Error::last_os_error()); }
+            socket.set_only_v6(true)?;
+            socket.set_multicast_if_v6(index)?;
+            socket.set_multicast_hops_v6(1)?;
+            socket.set_multicast_loop_v6(false)?;
+            local.set_scope_id(if local.ip().is_unicast_link_local() { index } else { 0 });
+        }
+    }
+    Ok(bind)
 }
 
 #[cfg(target_os = "linux")]
@@ -2859,6 +2955,87 @@ mod tests {
         assert!(!diagnostic.contains("secret-ik"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dhcp_stale_binding_cannot_enqueue_socket_on_replacement() {
+        let worker = UeWorkerHandle::for_line("dhcp", NetnsName::for_line("sa-ue", "dhcp"));
+        let bound = worker.bind();
+        worker.advance_test_generation().await;
+        let before = worker.core.request_seq.load(Ordering::Relaxed);
+        let result = bound.create_socket(UeSocketSpec::udp_bound("192.0.2.2:68".parse().unwrap(), Some("wwan0".into()))).await;
+        assert!(result.is_err());
+        assert_eq!(before, worker.core.request_seq.load(Ordering::Relaxed));
+        assert!(worker.core.pending.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dhcp_socket_generation_is_rechecked_after_lifecycle_await() {
+        let worker = UeWorkerHandle::for_line("dhcp", NetnsName::for_line("sa-ue", "dhcp"));
+        let bound = worker.bind();
+        let guard = worker.core.lifecycle.lock().await;
+        let request = bound.create_socket(UeSocketSpec::udp_bound("192.0.2.2:68".parse().unwrap(), Some("wwan0".into())));
+        tokio::pin!(request);
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut request).await.is_err());
+        worker.core.generation.fetch_add(1, Ordering::SeqCst);
+        drop(guard);
+        assert!(request.await.unwrap_err().to_string().contains("generation changed"));
+        assert!(worker.core.pending.lock().unwrap().is_empty());
+        assert_eq!(worker.core.request_seq.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dhcp_late_socket_fd_from_old_generation_is_not_published() {
+        let worker = UeWorkerHandle::for_line("dhcp", NetnsName::for_line("sa-ue", "dhcp"));
+        let bound = worker.bind();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *worker.core.tx.lock().unwrap() = Some(tx);
+        let responder = async {
+            let Some(UeWorkerMessage::SocketCreateRequest { request_id, .. }) = rx.recv().await else { panic!("socket request missing"); };
+            // No lock across result wait: failure/restart can retire the old generation.
+            let _guard = worker.core.lifecycle.lock().await;
+            worker.core.generation.fetch_add(1, Ordering::SeqCst);
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let pending = worker.core.pending.lock().unwrap().remove(&request_id);
+            if let Some(PendingRequest::Socket(sender)) = pending {
+                let _ = sender.send(SocketCreateOutcome { request_id, ok: true, error: None, fd: Some(socket.into()) });
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(bound.create_socket(UeSocketSpec::udp_bound("192.0.2.2:68".parse().unwrap(), Some("wwan0".into()))), responder).0
+        }).await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("generation changed"));
+        assert!(worker.core.pending.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dhcp_socket_options_are_explicit_and_fixed_port_only() {
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)).unwrap();
+        let mut spec = UeSocketSpec::udp_bound("192.0.2.2:68".parse().unwrap(), Some("wwan0".into()));
+        // Missing field in old control messages stays disabled.
+        let mut json = serde_json::to_value(&spec).unwrap();
+        json.as_object_mut().unwrap().remove("dhcp_information");
+        assert!(!serde_json::from_value::<UeSocketSpec>(json).unwrap().dhcp_information);
+        spec.dhcp_information = true;
+        spec.reuse_address = false;
+        assert_eq!(configure_dhcp_information_socket(&socket, &spec).unwrap(), spec.bind.unwrap());
+        assert!(socket.broadcast().unwrap());
+        for port in [0, 67, 1068] {
+            let mut bad = spec.clone(); bad.bind = Some(SocketAddr::new("192.0.2.2".parse().unwrap(), port));
+            assert!(configure_dhcp_information_socket(&socket, &bad).is_err());
+        }
+        let mut bad = spec.clone(); bad.reuse_address = true;
+        assert!(configure_dhcp_information_socket(&socket, &bad).is_err());
+        let mut bad = spec.clone(); bad.bind_to_device = None;
+        assert!(configure_dhcp_information_socket(&socket, &bad).is_err());
+        let mut bad = spec.clone(); bad.connect = Some("192.0.2.1:67".parse().unwrap());
+        assert!(configure_dhcp_information_socket(&socket, &bad).is_err());
+        let mut bad = spec; bad.kind = UeSocketKind::Tcp;
+        assert!(configure_dhcp_information_socket(&socket, &bad).is_err());
+    }
+
     #[test]
     fn handle_namespace_is_stable_per_line() {
         let namespace = NetnsName::for_line("sa-ue", "line-abc");
@@ -3073,6 +3250,7 @@ mod tests {
             bind_to_device: None,
             reuse_address: true,
             connect_timeout_secs: Some(5),
+            dhcp_information: false,
         };
         let fd = create_socket_fd(&spec).expect("connect loopback tcp");
         assert!(

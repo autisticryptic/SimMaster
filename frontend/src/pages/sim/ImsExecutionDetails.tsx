@@ -1,7 +1,26 @@
 import { Box, Typography } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import type { ImsRegistrationDiagnostics } from '../../api/contracts.ts'
-import { imsDiagnosticRows } from './imsDiagnosticsFormat.ts'
+import type { ImsBearerCapabilities, ImsRegistrationDiagnostics } from '../../api/contracts.ts'
+import { imsBearerCapabilityRows, imsDiagnosticRows } from './imsDiagnosticsFormat.ts'
+
+export function ImsBearerDetails({ capabilities }: { capabilities?: ImsBearerCapabilities }) {
+  return (
+    <Box component="details" data-testid="ims-bearer-capabilities" sx={{ border: 1, borderColor: 'divider', borderRadius: 1, p: 1.5 }}>
+      <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 600 }}>IMS 承载适配器能力（只读）</Box>
+      <Typography variant="caption" color="text.secondary" component="p" sx={{ my: 1 }}>
+        仅表示适配器支持情况，不代表当前承载、P-CSCF 或 IMS 注册已就绪；未知不等于不支持。不会触发设备探测或修改保存的配置。
+      </Typography>
+      <Grid container spacing={1.5}>
+        {imsBearerCapabilityRows(capabilities).map(({ label, value }) => (
+          <Grid key={label} size={{ xs: 12, sm: 6 }}>
+            <Typography variant="caption" color="text.secondary">{label}</Typography>
+            <Typography variant="body2">{value}</Typography>
+          </Grid>
+        ))}
+      </Grid>
+    </Box>
+  )
+}
 
 export function ImsExecutionDetails({ facts, access }: { facts?: ImsRegistrationDiagnostics | null; access: 'cellular' | 'wifi' }) {
   const rows = imsDiagnosticRows(facts)

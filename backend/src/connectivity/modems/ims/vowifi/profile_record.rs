@@ -24,6 +24,9 @@ use super::profiles::{
 };
 use crate::connectivity::core::access_network::AccessIdentityPolicy;
 use crate::connectivity::core::voice::AudioCodec;
+use crate::hardware::devices::ims_bearer_policy::{
+    ImsBearerRequirements, DEFAULT_IMS_BEARER_REQUIREMENTS,
+};
 
 /// Version of the JSON shape persisted in `custom_carrier_profiles`.
 ///
@@ -226,6 +229,9 @@ fn default_options_ping_interval_seconds() -> u16 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImsPolicyRecord {
+    /// Private persistence encoding; use a sanitized projection for responses.
+    #[serde(default)]
+    pub bearer: ImsBearerRequirements,
     pub domain: String,
     pub realm: String,
     #[serde(default)]
@@ -429,9 +435,9 @@ impl CarrierProfileRecord {
     /// copied catalog rows and profiles written by older SimAdmin releases.
     pub fn from_database_json(json: &str) -> Result<Self, String> {
         let value = serde_json::from_str::<Value>(json)
-            .map_err(|error| format!("carrier_profile_json_invalid:{error}"))?;
+            .map_err(|_| "carrier_profile_json_invalid".to_string())?;
         let mut record = serde_json::from_value::<Self>(value.clone())
-            .map_err(|error| format!("carrier_profile_json_invalid:{error}"))?;
+            .map_err(|_| "carrier_profile_json_invalid".to_string())?;
         record.normalize_legacy_database_record(&value)?;
         record.validate()?;
         Ok(record)
@@ -469,7 +475,7 @@ impl CarrierProfileRecord {
     /// to fix the caller.
     pub fn from_api_json(json: &str) -> Result<Self, String> {
         let value = serde_json::from_str::<Value>(json)
-            .map_err(|error| format!("carrier_profile_json_invalid:{error}"))?;
+            .map_err(|_| "carrier_profile_json_invalid".to_string())?;
         Self::from_api_value(value)
     }
 
@@ -492,7 +498,7 @@ impl CarrierProfileRecord {
         }
 
         let record = serde_json::from_value::<Self>(value)
-            .map_err(|error| format!("carrier_profile_json_invalid:{error}"))?;
+            .map_err(|_| "carrier_profile_json_invalid".to_string())?;
         record.validate()?;
         Ok(record)
     }
@@ -645,6 +651,13 @@ impl CarrierProfileRecord {
                 identity_template: self.ikev2.identity_template.as_deref().map(intern_str),
             },
             ims: ImsPolicy {
+                // Whole records are already deduplicated by intern(). Do not
+                // use intern_opt here: it trims strings and drops empty ones.
+                bearer: if self.ims.bearer.is_default() {
+                    &DEFAULT_IMS_BEARER_REQUIREMENTS
+                } else {
+                    Box::leak(Box::new(self.ims.bearer.clone()))
+                },
                 domain: intern_str(&self.ims.domain),
                 realm: intern_str(&self.ims.realm),
                 registrar: intern_opt(self.ims.registrar.as_ref()),
@@ -792,6 +805,7 @@ impl CarrierProfileRecord {
                 identity_template: profile.ikev2.identity_template.map(str::to_string),
             },
             ims: ImsPolicyRecord {
+                bearer: profile.ims.bearer.clone(),
                 domain: profile.ims.domain.to_string(),
                 realm: profile.ims.realm.to_string(),
                 registrar: profile.ims.registrar.map(str::to_string),
@@ -910,6 +924,14 @@ impl CarrierProfileRecord {
         }
     }
 
+    /// Display-only projection. Missing credentials cannot be submitted back
+    /// as a valid PAP/CHAP policy; persistence must use the original record.
+    pub fn sanitized(&self) -> Self {
+        let mut record = self.clone();
+        record.ims.bearer = record.ims.bearer.sanitized();
+        record
+    }
+
     /// Reject records that would produce an unusable profile. Called before
     /// anything is written to the database or handed to the runtime.
     pub fn validate(&self) -> Result<(), String> {
@@ -957,6 +979,7 @@ impl CarrierProfileRecord {
     /// do not require an ePDG or IKE row, while VoWiFi profiles call the stricter
     /// [`Self::validate`] above.
     pub fn validate_ims_only(&self) -> Result<(), String> {
+        self.ims.bearer.validate().map_err(str::to_string)?;
         let meta = &self.meta;
         if meta.profile_id.trim().is_empty() {
             return Err("profile_id_required".to_string());
@@ -1314,6 +1337,10 @@ pub fn parse_dns_server(value: &str) -> Option<std::net::SocketAddr> {
         .ok()
         .map(|ip| std::net::SocketAddr::new(ip, 53))
 }
+
+#[cfg(test)]
+#[path = "profile_record_bearer_tests.rs"]
+mod bearer_tests;
 
 #[cfg(test)]
 mod tests {

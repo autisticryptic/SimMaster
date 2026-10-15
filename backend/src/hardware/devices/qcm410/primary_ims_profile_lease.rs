@@ -887,6 +887,10 @@ impl VerifiedProfileProbe {
 }
 
 impl crate::hardware::devices::transport::ImsBearerTransport for VerifiedProfileProbe {
+    fn ims_bearer_capabilities(&self) -> crate::hardware::devices::transport::ImsBearerCapabilities {
+        crate::hardware::devices::transport::ImsBearerCapabilities::retained_mm()
+    }
+
     fn endpoint_available(&self, primary_device: &str) -> bool {
         primary_device == self.bus.device
             && crate::hardware::devices::qcm410::ims_bearer::Qcm410ImsBearer

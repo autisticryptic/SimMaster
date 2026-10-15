@@ -181,6 +181,15 @@ export function cellularImsErrorMessage(error?: string | null) {
   if (codes.has('cellular_ims_carrier_profile_missing')) {
     return 'SIM 身份已读取，但未匹配到可用的运营商 VoLTE profile。请检查线路 Profile 或更新 carrier catalog。'
   }
+  if (codes.has('cellular_ims_bearer_requirements_invalid')) {
+    return 'IMS 承载要求无效或认证凭据与 APN 不匹配，已在创建 Profile 和激活承载前停止。请检查完整认证设置，不要把脱敏响应当作凭据回写。'
+  }
+  if (codes.has('cellular_ims_bearer_requirements_unsupported')) {
+    return '当前驱动无法执行显式 APN 认证或 PCO/DHCP 要求，已停止本轮重试。不会丢弃要求、借用普通数据 APN 或降低安全策略。'
+  }
+  if (codes.has('cellular_ims_dhcp_pcscf_failed')) {
+    return '原 IMS 承载内的 DHCP 信息请求未得到有效 P-CSCF；没有分配地址、改写 DNS 或安装默认路由。请核对网络是否提供此发现方式。'
+  }
   if (codes.has('cellular_ims_carrier_ims_apn_missing')) {
     return '已匹配运营商 Profile，但其中缺少 IMS APN，无法建立 VoLTE Bearer。'
   }
@@ -221,6 +230,9 @@ export function cellularImsErrorStatusLabel(error?: string | null) {
   const networkFailure = networkFailureStatusLabel(error, codes)
   if (networkFailure) return networkFailure
   if (codes.has('cellular_ims_carrier_profile_missing') || PROFILE_NOT_READY.test(error) || PROFILE_PLMN.test(error)) return '缺少运营商配置'
+  if (codes.has('cellular_ims_bearer_requirements_invalid')) return 'IMS 承载要求无效'
+  if (codes.has('cellular_ims_bearer_requirements_unsupported')) return '驱动不支持承载要求'
+  if (codes.has('cellular_ims_dhcp_pcscf_failed')) return 'DHCP P-CSCF 发现失败'
   if (codes.has('cellular_ims_carrier_ims_apn_missing')) return '缺少 IMS APN'
   if (codes.has('cellular_ims_mm_imsi_missing') || codes.has('cellular_ims_imsi_missing')) return '无法读取 SIM 身份'
   if (codes.has('cellular_ims_runtime_mm_modem_wait_timeout')) return '等待基带超时'

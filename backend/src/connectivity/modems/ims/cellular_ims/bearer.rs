@@ -51,6 +51,9 @@ pub const BEARER_PATH_PREFIX: &str = "/org/freedesktop/ModemManager1/Bearer/";
 pub struct BearerRequest {
     pub apn: String,
     pub allow_roaming: bool,
+    /// Explicit requirements remain attached to every family attempt. The
+    /// provider must reject unsupported fields before any activation/profile IO.
+    pub requirements: crate::hardware::devices::ims_bearer_policy::ImsBearerRequirements,
     /// Optional 3GPP profile id (as in `--wds-start-network=...,3gpp-profile=<n>`).
     pub profile_id: Option<u32>,
 }
@@ -92,6 +95,7 @@ impl Default for BearerRequest {
         Self {
             apn: IMS_APN.to_string(),
             allow_roaming: false,
+            requirements: Default::default(),
             profile_id: None,
         }
     }
@@ -110,6 +114,7 @@ impl BearerRequest {
         Self {
             apn: apn.into(),
             allow_roaming,
+            requirements: Default::default(),
             profile_id: None,
         }
     }
@@ -1637,6 +1642,7 @@ mod tests {
             apn: "ims".to_string(),
             allow_roaming: true,
             profile_id: Some(3),
+            requirements: Default::default(),
         };
         assert_eq!(
             r2.wds_start_network_arg(),

@@ -24,6 +24,7 @@ import {
 } from '@mui/material'
 import { ExpandMore } from '@mui/icons-material'
 import { api, type CarrierProfileRecord, type VoiceCodecPolicyRecord } from '../../api/current'
+import { carrierBearerUnchanged, withoutBearerUpdate } from './imsDiagnosticsFormat'
 
 interface Props {
   open: boolean
@@ -260,7 +261,9 @@ export default function CarrierProfileEditor({
     setSaving(true)
     setError(null)
     try {
-      await api.saveVowifiCarrierProfile(draft)
+      await api.saveVowifiCarrierProfile({ ...draft, ims: {
+        ...withoutBearerUpdate(draft.ims), bearer_unchanged: carrierBearerUnchanged(draft.ims),
+      } })
       onSaved()
       onClose()
     } catch (err) {

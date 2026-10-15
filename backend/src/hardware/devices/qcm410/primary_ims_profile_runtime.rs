@@ -823,6 +823,10 @@ fn requested_family(families: &[u8]) -> Result<u32, String> {
 }
 
 impl ImsBearerTransport for RuntimeProfileTransport {
+    fn ims_bearer_capabilities(&self) -> crate::hardware::devices::transport::ImsBearerCapabilities {
+        crate::hardware::devices::transport::ImsBearerCapabilities::retained_mm()
+    }
+
     fn endpoint_available(&self, device: &str) -> bool {
         device.trim() == self.context.bus.device && (self.context.current)()
     }

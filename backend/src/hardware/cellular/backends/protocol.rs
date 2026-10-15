@@ -18,12 +18,24 @@ pub enum Tool {
     AtSms,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CommandRequest {
     pub tool: Tool,
     pub device: String,
     pub arguments: Vec<String>,
     pub timeout_seconds: u64,
+}
+
+impl std::fmt::Debug for CommandRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Arguments may include APN passwords, UICC material or SMS content.
+        // Keep equality/transport encoding unchanged; diagnostics are metadata.
+        f.debug_struct("CommandRequest")
+            .field("tool", &self.tool)
+            .field("argument_count", &self.arguments.len())
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CommandRequest {

@@ -27,6 +27,9 @@ async function installFixtures(page: Page, includeDiagnostics: boolean) {
       display_order: index + 1, uim_slot: 1, present: true, sim_iccid: '', modem_path: '', qmi_device: null, state: 'registered' },
     profile: { enabled: true, cellular_ims_connection_enabled: true, data_connection_enabled: true,
       airplane_mode_enabled: true, roaming_allowed: true, vowifi: { enabled: true }, trunk: { enabled: false } },
+    ...(includeDiagnostics && index === 0 ? { bearer_capabilities: { auth_none: 'supported', pap: 'supported', chap: 'unsupported', pap_or_chap: 'unknown',
+      pco_request_policy: 'unknown', pco_pcscf_addresses: 'supported', pco_pcscf_domains: 'unsupported', dhcp_information: 'unknown',
+      password: 'DO_NOT_RENDER_BEARER_CREDENTIAL' } } : {}),
     runtime: { phase: 'degraded', stage: 'register_refresh', registered: false, registration_mode: 'tcp_ipsec',
       recovery_state: 'retrying', manual_retry_available: false, connection_attempts: [], profile_attempt_results: [],
       retry_attempt: 1, retry_max: 3, modem_restart_attempt: 0, modem_restart_max: 0, reconnect_count: 0,
@@ -35,7 +38,9 @@ async function installFixtures(page: Page, includeDiagnostics: boolean) {
       ...(includeDiagnostics ? { diagnostics: { ...facts(`cell-profile-${id}`, false), raw_sip: 'DO_NOT_RENDER_SIP', authorization: 'DO_NOT_RENDER_AUTH' } } : {}) },
   }))
   const wifi = lines.map((line) => ({ line_id: line.modem.line_id, modem: line.modem,
-    config: { enabled: true, runtime_mode: 'live', proxy_endpoint: null },
+    config: { enabled: true, proxy_mode: 'direct', proxy_endpoint: '',
+      profile_selection: { attempts: [{ source: 'database', profile_id: 'saved-profile' }, { source: 'carrier_catalog', profile_id: null }, { source: 'derived', profile_id: null }] },
+      auto_restore: { enabled: false } },
     runtime_phase: 'degraded', runtime_stage: 'ims_register', runtime_restore_in_progress: false,
     runtime_registered: false, runtime_readiness: { ike_ready: true, eap_ready: true, child_sa_ready: true, ims_registered: false },
     runtime_ims_transport_mode: 'tcp_ipsec', runtime_p_cscf: [], runtime_ike_algorithm_set: 'standard',
@@ -54,7 +59,7 @@ async function installFixtures(page: Page, includeDiagnostics: boolean) {
     if (['/api/trunk/lines', '/api/modem/line-controls'].includes(url.pathname)) return route.fulfill({ json: { status: 'ok', data: [] } })
     return route.fulfill({ json: { status: 'ok', data: { events: [], messages: [], records: [] } } })
   })
-  return { mutations, errors }
+  return { mutations, errors, wifi }
 }
 
 test('execution facts render inside the original workbench without mutating saved controls or crossing lines', async ({ page }, testInfo) => {
@@ -65,6 +70,12 @@ test('execution facts render inside the original workbench without mutating save
   await expect(page.getByRole('checkbox', { name: '飞行模式' })).toBeChecked()
   await expect(page.getByRole('tab')).toHaveCount(7)
   await page.getByRole('tab', { name: 'IMS 与 Trunk', exact: true }).click()
+  const capabilities = page.getByTestId('ims-bearer-capabilities')
+  await capabilities.locator('summary').click()
+  await expect(capabilities).toContainText('适配器支持')
+  await expect(capabilities).toContainText('适配器不支持')
+  await expect(capabilities).toContainText('支持情况未知')
+  await expect(capabilities).toContainText('不代表当前承载、P-CSCF 或 IMS 注册已就绪')
   const cellular = page.getByTestId('ims-diagnostics-cellular'), wifi = page.getByTestId('ims-diagnostics-wifi')
   await cellular.locator('summary').click()
   await wifi.locator('summary').click()
@@ -87,7 +98,47 @@ test('execution facts render inside the original workbench without mutating save
   await page.getByRole('tab', { name: 'IMS 与 Trunk', exact: true }).click()
   await page.getByTestId('ims-diagnostics-cellular').locator('summary').click()
   await expect(page.getByTestId('ims-diagnostics-cellular')).toContainText('cell-profile-b')
+  await page.getByTestId('ims-bearer-capabilities').locator('summary').click()
+  await expect(page.getByTestId('ims-bearer-capabilities')).toContainText('支持情况未知')
+  await expect(page.getByTestId('ims-bearer-capabilities')).not.toContainText('适配器支持')
   await expect(page.locator('body')).not.toContainText('cell-profile-a')
+  expect(mutations).toEqual([])
+  expect(errors).toEqual([])
+})
+
+test('original WiFi editor preserves cellular bearer intent and saved profile slots without replaying redacted credentials', async ({ page }) => {
+  const { mutations, errors, wifi } = await installFixtures(page, true)
+  const policy = { authentication: { method: 'pap', username: null, password: null }, pcscf_via_pco: 'required', pcscf_via_dhcp: 'disabled' }
+  const saved = { ims_common: {}, ims_cellular: { apn: 'ims', profile_id: 'saved-cellular', bearer: policy, spoof_imsi: false },
+    ims_vowifi: { spoof_imsi: false, custom_imsi: null }, services: { call_waiting: true }, emergency: {} }
+  const writes: Array<{ path: string; body: Record<string, unknown> }> = []
+  await page.route('**/api/vowifi/carrier-profiles', (route) => route.fulfill({ json: { status: 'ok', data: [] } }))
+  await page.route('**/api/ims/lines/line-a/override', async (route) => {
+    if (route.request().method() === 'PATCH') writes.push({ path: 'override', body: route.request().postDataJSON() as Record<string, unknown> })
+    await route.fulfill({ json: { status: 'ok', data: { binding: { kind: 'plain', iccid_last4: '0001' }, override_: saved } } })
+  })
+  await page.route('**/api/vowifi/lines/line-a', async (route) => {
+    if (route.request().method() === 'POST') writes.push({ path: 'wifi', body: route.request().postDataJSON() as Record<string, unknown> })
+    await route.fulfill({ json: { status: 'ok', data: wifi[0] } })
+  })
+  await page.goto('/e2e/fixtures/lines.html')
+  await page.getByRole('tab', { name: 'IMS 与 Trunk', exact: true }).click()
+  await page.getByTestId('vowifi-profile-config').click()
+  const dialog = page.getByRole('dialog')
+  await expect(dialog).toContainText('WiFi Calling 配置')
+  await expect(dialog.getByRole('button', { name: '保存配置' })).toBeEnabled()
+  expect(writes).toEqual([])
+  await dialog.getByRole('button', { name: '保存配置' }).click()
+  await expect(dialog).toHaveCount(0)
+  expect(writes.map(({ path }) => path)).toEqual(['override', 'wifi'])
+  expect(writes[0].body.ims_cellular).toEqual({ apn: 'ims', profile_id: 'saved-cellular', spoof_imsi: false })
+  expect(writes[0].body.services).toEqual({ call_waiting: true })
+  expect(JSON.stringify(writes)).not.toContain('bearer')
+  expect(JSON.stringify(writes)).not.toContain('password')
+  expect(writes[1].body.profile_selection).toEqual(wifi[0].config.profile_selection)
+  expect(writes[1].body.enabled).toBe(true)
+  expect(saved.ims_cellular.bearer).toEqual(policy)
+  await expect(page.getByTestId('selected-line')).toHaveText('line-a')
   expect(mutations).toEqual([])
   expect(errors).toEqual([])
 })
@@ -100,6 +151,8 @@ test('older API responses keep the workbench and do not claim detected ISIM was 
   await expect(page.getByText('已检测到应用，尚未确认选用', { exact: true })).toBeVisible()
   await expect(page.getByTestId('ims-diagnostics-cellular')).toHaveCount(0)
   await expect(page.getByTestId('ims-diagnostics-wifi')).toHaveCount(0)
+  await page.getByTestId('ims-bearer-capabilities').locator('summary').click()
+  await expect(page.getByTestId('ims-bearer-capabilities')).toContainText('支持情况未知')
   await expect(page.locator('body')).not.toContainText('DO_NOT_RENDER')
   expect(mutations).toEqual([])
   expect(errors).toEqual([])

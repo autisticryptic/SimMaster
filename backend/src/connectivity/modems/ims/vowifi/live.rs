@@ -378,6 +378,10 @@ fn build_live_network_overrides(
         }
     };
     let access = sim_override.map(|override_| &override_.ims_vowifi);
+    if let Some(requirements) = access.and_then(|access| access.bearer.as_ref()) {
+        requirements.validate_for_wifi()
+            .map_err(|reason| format!("ims_bearer_requirement_rejected:{reason}"))?;
+    }
     Ok(LiveNetworkOverrides {
         proxy,
         profile_id: access
@@ -6037,6 +6041,7 @@ fn preserve_min_expires_profile_stop(error: &mut LiveStageError) {
 pub(crate) fn register_reason_blocks_profile_fallback(reason: &str) -> bool {
     is_live_digest_authentication_failure(reason) || reason.split(':').any(|code| matches!(code,
         "vowifi_register_retry_deferred"
+        | "ims_bearer_requirement_rejected"
         | "vowifi_register_retry_stopped"
         | "ims_register_min_expires_negotiated"
         | "ims_register_authenticated_stop"
@@ -10696,6 +10701,12 @@ where
     }
 
     pub async fn run(&self, request: ExecutorStageRequest) -> ExecutorStageResult {
+        if stage_requires_live_network(request.stage) {
+            if let Err(reason) = self.profile.ims.bearer.validate_for_wifi() {
+                return stage_result(request.stage, ExecutorStageStatus::Failed,
+                    Some(format!("ims_bearer_requirement_rejected:{reason}")));
+            }
+        }
         if let Some(reason) = gate_blocker_for_stage(request.stage, &self.gate) {
             return stage_result(
                 request.stage,
@@ -12403,6 +12414,34 @@ mod tests {
             blockers: Vec::new(),
             sensitive_values_policy: "presence_flags_only_no_paths_or_urls_serialized",
         }
+    }
+
+    #[tokio::test]
+    async fn bearer_policy_rejection_precedes_wifi_network_adapter_and_profile_fallback() {
+        use crate::hardware::devices::ims_bearer_policy::{ImsApnAuthentication, ImsApnAuthMethod, ImsBearerRequirements};
+        struct NoNetwork;
+        impl LiveStageAdapter for NoNetwork {
+            fn run_stage<'a>(&'a self, _: ExecutorStage, _: &'static CarrierProfile) -> LiveAdapterFuture<'a> {
+                panic!("cellular PAP policy must not reach WiFi EAP/network adapter")
+            }
+        }
+        let requirements = ImsBearerRequirements { authentication: ImsApnAuthentication {
+            method: ImsApnAuthMethod::Pap, username: Some("fixture-user".into()), password: Some("fixture-secret".into()),
+        }, ..Default::default() };
+        let mut profile = *super::super::profiles::derive_standard_3gpp_profile("001", "01",
+            super::super::profiles::Standard3gppAccess::WifiEpdg).unwrap();
+        profile.ims.bearer = Box::leak(Box::new(requirements.clone()));
+        let profile = Box::leak(Box::new(profile));
+        let runner = LiveStageRunner::new(enabled_gate(), profile, NoNetwork);
+        let result = runner.run(ExecutorStageRequest { stage: ExecutorStage::Epdg,
+            profile_id: Some(profile.meta.profile_id.into()), plmn: Some("00101".into()),
+            trace_id: "bearer-policy".into(), line_id: "fixture".into() }).await;
+        assert_eq!(result.status, "failed");
+        assert!(register_reason_blocks_profile_fallback(result.reason.as_deref().unwrap()));
+        assert!(!format!("{result:?}").contains("fixture-secret"));
+        let mut override_ = SimOverride::default();
+        override_.ims_vowifi.bearer = Some(requirements);
+        assert!(validate_live_network_overrides(&LineVowifiConfig::default(), Some(&override_)).is_err());
     }
 
     #[tokio::test]

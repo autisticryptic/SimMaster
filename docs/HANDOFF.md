@@ -10,7 +10,9 @@
 4. 2026-10-07 的 410 部署属于已结束的历史授权；本轮只实施 IMS 补全和 Actions 验证，**未部署、未访问设备，也不主动连接 IDA**。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：WiFi 普通等待已验证，继续承载能力与固件复审
+## 当前：N8 承载能力已接线，待 Actions 验证
+
+N8 从 `577bd363` 接续：类型化APN认证/PCO/DHCP需求、driver前置门禁、Native QMI/MBIM认证、原WDS client只读P-CSCF域名与opt-in DHCP信息请求已接线；API/原工作台保留旧保存意图并脱敏凭据。当前321项静态/mock通过，**新增代码尚未编译/CI验证**；通用PCO策略写入、MM认证变更和DHCP地址分配不冒称支持，未操作设备/IDA。
 
 R2 最终代码 **`c3fb0361853388ebe551f50657a8786a1155a877`** 已通过 [Build-Release 38520139107](https://github.com/autisticryptic/SimMaster/actions/runs/38520139107)、[Validate Beta 38520139336](https://github.com/autisticryptic/SimMaster/actions/runs/38520139336) 与 ARM64/AMD64；Release skipped。两套官方测试 ZIP 各逐名核验 **304 项相关回归**及四矩阵 86 场景，报告 `.local/evidence/ims-wifi-retry/verified-c3fb036.json`，316 项本机静态/mock 通过。前端输入与 N7 相同，旧 43单测/3browser 制品与源码已复核，不冒称本轮新跑 browser。未部署/程序包或实网验收。
 

@@ -8,6 +8,11 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::platform::config::ApnConfig;
+use super::ims_bearer_policy::ImsBearerRequirements;
+
+#[path = "ims_bearer_capabilities.rs"]
+mod capabilities;
+pub use capabilities::{CapabilitySupport, ImsBearerCapabilities};
 
 /// Object-safe asynchronous return type shared by device contracts.
 pub type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -126,6 +131,9 @@ pub struct ImsBearerInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImsPcscfDiscovery {
     pub candidates: Vec<IpAddr>,
+    /// Only P-CSCF-specific FQDNs from the retained provider/DHCP response;
+    /// generic DNS search domains must never enter this list.
+    pub domains: Vec<String>,
     pub context_id: Option<u8>,
     pub source: &'static str,
 }
@@ -193,6 +201,10 @@ pub trait ImsBearerHandle: Send {
 /// error without knowing the device's transport details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImsBearerErrorKind {
+    /// The explicit request is malformed; do not try other families/profiles.
+    RequirementsInvalid,
+    /// This adapter cannot execute the explicit request. Never drop its fields.
+    RequirementsUnsupported,
     /// The primary device could not be mapped to a baseband.
     BasebandUnresolved,
     /// The device's required IMS control endpoint is unavailable or invalid.
@@ -248,6 +260,42 @@ impl fmt::Display for ImsBearerError {
 /// that tears the session down again. On failure the implementation is
 /// responsible for releasing anything it bound.
 pub trait ImsBearerTransport: Send + Sync {
+    /// Cheap, side-effect-free declarations of the actual installed adapters.
+    fn ims_bearer_capabilities(&self) -> ImsBearerCapabilities {
+        ImsBearerCapabilities::default()
+    }
+
+    /// Call before profile creation, reporting changes or bearer activation.
+    /// Provider implementations may additionally reject unencodable parameters.
+    fn validate_ims_bearer_requirements(&self, requirements: &ImsBearerRequirements) -> Result<(), ImsBearerError> {
+        self.ims_bearer_capabilities().check(requirements)
+    }
+
+    /// Backwards-compatible seam with an explicit fail-closed default. A
+    /// declaration alone cannot make an old provider consume PAP/CHAP/PCO.
+    #[allow(clippy::too_many_arguments)]
+    fn establish_ims_bearer_with_requirements<'a>(
+        &'a self,
+        primary_device: &'a str,
+        modem_id: &'a str,
+        apn: &'a str,
+        profile_id: Option<u32>,
+        cid: u8,
+        families: &'a [u8],
+        allow_roaming: bool,
+        expected_mm_sim: Option<(&'a str, u8)>,
+        requirements: &'a ImsBearerRequirements,
+    ) -> TransportFuture<'a, Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>> {
+        Box::pin(async move {
+            self.validate_ims_bearer_requirements(requirements)?;
+            if !capabilities::legacy_parameters_only(requirements) {
+                return Err(capabilities::unsupported_requirements("ims_bearer_requirement_adapter_missing"));
+            }
+            self.establish_ims_bearer(primary_device, modem_id, apn, profile_id, cid,
+                families, allow_roaming, expected_mm_sim).await
+        })
+    }
+
     /// Opt in only for a provider with a verified owned-profile preparation
     /// implementation. Other device backends retain their existing path.
     fn supports_owned_mm_profile_preparation(&self) -> bool {

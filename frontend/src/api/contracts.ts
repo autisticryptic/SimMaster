@@ -883,7 +883,53 @@ export interface RegisterPolicyRecord {
   temporary_retry_seconds: number
 }
 
+export type ImsBearerCapabilitySupport = 'supported' | 'unsupported' | 'unknown'
+
+/** Passive adapter support, never current network or registration readiness. */
+export interface ImsBearerCapabilities {
+  auth_none: ImsBearerCapabilitySupport
+  pap: ImsBearerCapabilitySupport
+  chap: ImsBearerCapabilitySupport
+  pap_or_chap: ImsBearerCapabilitySupport
+  pco_request_policy: ImsBearerCapabilitySupport
+  pco_pcscf_addresses: ImsBearerCapabilitySupport
+  pco_pcscf_domains: ImsBearerCapabilitySupport
+  dhcp_information: ImsBearerCapabilitySupport
+}
+
+/** Public metadata only. Credential values are deliberately not in this type. */
+export interface ImsBearerPolicy {
+  authentication: {
+    method: 'unspecified' | 'none' | 'pap' | 'chap' | 'pap_or_chap'
+    username_present?: boolean
+    password_present?: boolean
+  }
+  pcscf_via_pco: 'network_default' | 'required' | 'disabled'
+  pcscf_via_dhcp: 'disabled' | 'information_request'
+}
+
+export interface EffectiveImsBearerPolicy extends ImsBearerPolicy {
+  source: string
+  validation_error?: string
+}
+
+export interface EffectiveImsField { value: string; source: string }
+export interface EffectiveImsProfile {
+  profile_id: string
+  domain: EffectiveImsField
+  realm: EffectiveImsField
+  pcscf?: EffectiveImsField
+  registrar?: EffectiveImsField
+  ims_apn?: EffectiveImsField
+  pinned_profile_id?: EffectiveImsField
+  bearer?: EffectiveImsBearerPolicy
+}
+
 export interface ImsPolicyRecord {
+  /** Redacted metadata. Omit on unchanged saves; never replay as credentials. */
+  bearer?: ImsBearerPolicy
+  /** Request-only guard: require an existing policy at this profile/APN. */
+  bearer_unchanged?: true
   domain: string
   realm: string
   registrar: string | null
@@ -1111,6 +1157,8 @@ export interface LineVowifiConfig {
 }
 
 export interface ImsAccessOverride {
+  /** Response metadata; editors omit it on unchanged saves. Explicit null clears via API. */
+  bearer?: ImsBearerPolicy | null
   profile_id?: string | null
   apn?: string | null
   domain?: string | null
@@ -1212,6 +1260,7 @@ export interface MessageCount {
 }
 
 export interface CellularImsLineControlResponse {
+  bearer_capabilities?: ImsBearerCapabilities
   /** Cached display projection; never an operational line admission. */
   read_only?: boolean
   blocked_reason?: string

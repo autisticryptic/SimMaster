@@ -32,6 +32,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::platform::utils::normalize_iccid;
+use crate::hardware::devices::ims_bearer_policy::ImsBearerRequirements;
 
 pub const OVERRIDE_SCHEMA_VERSION: u32 = 1;
 
@@ -140,6 +141,9 @@ pub struct ImsAccessOverride {
     pub profile_id: Option<String>,
     /// IMS APN override.
     pub apn: Option<String>,
+    /// Atomic bearer override. None inherits the whole catalog policy; never
+    /// merge individual credentials with catalog values.
+    pub bearer: Option<ImsBearerRequirements>,
     /// IMS domain override.
     pub domain: Option<String>,
     /// IMS authentication realm override.
@@ -172,6 +176,7 @@ impl ImsAccessOverride {
     pub fn is_empty(&self) -> bool {
         self.profile_id.is_none()
             && self.apn.is_none()
+            && self.bearer.is_none()
             && self.domain.is_none()
             && self.realm.is_none()
             && self.registrar.is_none()
@@ -260,8 +265,28 @@ impl SimOverride {
             && self.emergency.is_empty()
     }
 
+    /// Response-only projection. PAP/CHAP credentials must be explicitly
+    /// supplied again for replacement; sanitized input is not executable.
     pub fn sanitized(&self) -> Self {
-        self.clone()
+        let mut sanitized = self.clone();
+        for access in [&mut sanitized.ims_cellular, &mut sanitized.ims_vowifi] {
+            access.bearer = access.bearer.as_ref().map(ImsBearerRequirements::sanitized);
+        }
+        sanitized
+    }
+
+    fn validate_bearer_requirements(&self) -> Result<(), OverrideError> {
+        if let Some(bearer) = &self.ims_cellular.bearer {
+            bearer.validate().map_err(|code| {
+                OverrideError::new(format!("ims_cellular.{code}"))
+            })?;
+        }
+        if let Some(bearer) = &self.ims_vowifi.bearer {
+            bearer.validate_for_wifi().map_err(|code| {
+                OverrideError::new(format!("ims_vowifi.{code}"))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -509,12 +534,15 @@ impl SimOverrideStore {
         if !file.binding.matches(key) {
             return Err(OverrideError::new("sim_override_binding_mismatch"));
         }
-        Ok(Some(file.into_override()))
+        let override_ = file.into_override();
+        override_.validate_bearer_requirements()?;
+        Ok(Some(override_))
     }
 
     /// Persist `override_` for `key`. An empty override removes the record: no
     /// override is the normal state, so an emptied one leaves nothing behind.
     pub fn save(&self, key: &SimBindingKey, override_: &SimOverride) -> Result<(), OverrideError> {
+        override_.validate_bearer_requirements()?;
         let (dir, write_lock) = match &self.backend {
             Backend::Database(database) => {
                 if override_.is_empty() {
@@ -730,7 +758,9 @@ fn read_stored_override(
     if !file.binding.matches(key) {
         return Err(OverrideError::new("sim_override_binding_mismatch"));
     }
-    Ok(file.into_override())
+    let override_ = file.into_override();
+    override_.validate_bearer_requirements()?;
+    Ok(override_)
 }
 
 /// Validate one serialized SQLite override row without loading it for a
@@ -753,7 +783,7 @@ pub(crate) fn validate_stored_override_document(
     if file.binding.sha256() != binding_hash {
         return Err(OverrideError::new("sim_override_binding_hash_mismatch"));
     }
-    Ok(())
+    file.into_override().validate_bearer_requirements()
 }
 
 fn safe_regular_file_exists(path: &Path) -> Result<bool, OverrideError> {
@@ -843,9 +873,9 @@ fn sync_dir(dir: &Path) -> Result<(), OverrideError> {
 }
 
 fn redact_json_error(error: &serde_json::Error) -> String {
-    // serde_json errors never embed file contents, but we keep the helper so
-    // future error paths that could leak secrets have a single redaction point.
-    error.to_string()
+    // Serde enum/type errors CAN embed the offending input. Only position is
+    // safe: malformed auth fields might contain a misplaced credential.
+    format!("json_invalid_at_{}_{}", error.line(), error.column())
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -857,6 +887,10 @@ fn sha256_hex(data: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+#[path = "profile_override_bearer_tests.rs"]
+mod bearer_tests;
 
 #[cfg(test)]
 mod tests {

@@ -453,6 +453,7 @@ where
                 return Err(session_changed("ip_config_changed"));
             }
             return Ok(ImsPcscfDiscovery {
+                domains: Vec::new(),
                 candidates,
                 context_id: Some(cid),
                 source,

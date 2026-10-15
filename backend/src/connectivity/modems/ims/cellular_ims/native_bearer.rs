@@ -357,6 +357,8 @@ pub async fn establish_native_ims_bearer_observed(
     request: &BearerRequest, plan: &ImsConnectionPlan, expected_mm_sim: Option<&(String, u8)>,
     mut observe_request: impl FnMut(&'static str) + Send,
 ) -> Result<NativeImsBearer, CellularImsError> {
+    transport.validate_ims_bearer_requirements(&request.requirements)
+        .map_err(cellular_ims_error_from_ims_bearer)?;
     let cid = ims_context_cid(request);
     let families = requested_families_for(plan);
     // All production lines share the complete dual-stack -> IPv6 -> IPv4 plan.
@@ -384,7 +386,7 @@ pub async fn establish_native_ims_bearer_observed(
         }
         observe_request(attempt.as_mm_str());
         let result = transport
-            .establish_ims_bearer(
+            .establish_ims_bearer_with_requirements(
                 primary_device,
                 modem_id,
                 &request.apn,
@@ -393,14 +395,16 @@ pub async fn establish_native_ims_bearer_observed(
                 attempt_families,
                 request.allow_roaming,
                 expected_mm_sim.map(|(iccid, slot)| (iccid.as_str(), *slot)),
+                &request.requirements,
             )
             .await;
         match result {
             Ok((info, handle)) => return adopt_bearer(info, handle).await,
             Err(error) => {
+                let policy_rejected = matches!(error.kind, ImsBearerErrorKind::RequirementsInvalid | ImsBearerErrorKind::RequirementsUnsupported);
                 let hint = error.hint;
                 let error = cellular_ims_error_from_ims_bearer(error);
-                if matches!(
+                if policy_rejected || matches!(
                     hint,
                     ImsBearerFailureHint::BasebandWedged | ImsBearerFailureHint::BindingChanged
                 ) {
@@ -440,7 +444,7 @@ pub async fn establish_native_ims_bearer_observed(
     if let Some(forced) = forced_single {
         observe_request(if forced == 4 { "ipv4" } else { "ipv6" });
         match transport
-            .establish_ims_bearer(
+            .establish_ims_bearer_with_requirements(
                 primary_device,
                 modem_id,
                 &request.apn,
@@ -449,6 +453,7 @@ pub async fn establish_native_ims_bearer_observed(
                 &[forced],
                 request.allow_roaming,
                 expected_mm_sim.map(|(iccid, slot)| (iccid.as_str(), *slot)),
+                &request.requirements,
             )
             .await
         {
@@ -549,6 +554,8 @@ pub(crate) fn cellular_ims_error_from_ims_bearer(error: ImsBearerError) -> Cellu
         return CellularImsError::with_detail(code::RUNTIME_IMS_BASEBAND_WEDGED, error.detail);
     }
     let error_code = match error.kind {
+        ImsBearerErrorKind::RequirementsInvalid => code::BEARER_REQUIREMENTS_INVALID,
+        ImsBearerErrorKind::RequirementsUnsupported => code::BEARER_REQUIREMENTS_UNSUPPORTED,
         ImsBearerErrorKind::BasebandUnresolved => code::IP_SETTINGS_MISSING,
         ImsBearerErrorKind::EndpointUnavailable => code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE,
         ImsBearerErrorKind::SessionStartFailed | ImsBearerErrorKind::NetdevUnresolved => {
@@ -591,6 +598,10 @@ pub fn to_bearer_connection(info: &ImsBearerInfo) -> Result<BearerConnection, Ce
         mtu: None,
     })
 }
+
+#[cfg(test)]
+#[path = "native_bearer_policy_tests.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {
@@ -829,6 +840,7 @@ mod tests {
 
     fn discovered(source: &'static str) -> ImsPcscfDiscovery {
         ImsPcscfDiscovery {
+            domains: Vec::new(),
             candidates: vec!["192.0.2.20".parse().unwrap()],
             context_id: Some(2),
             source,

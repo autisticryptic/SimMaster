@@ -146,6 +146,71 @@ fn source_priority_is_presence_based_including_isim_before_standard_dns() {
     assert!(select_source(None, &settings, None, &vec!["host".to_string(); MAX_CONFIGURED_TARGETS + 1]).is_err());
 }
 
+#[tokio::test]
+async fn retained_pco_fqdn_resolves_on_bearer_dns_with_original_tls_authority() {
+    let settings = settings();
+    let domains = vec!["PCSCF.Example.Test.".to_string()];
+    let selection = select_source_with_discovery(None, &settings, Some("192.0.2.99"), &[], &domains, None).unwrap();
+    let mut queries = Vec::new();
+    let endpoints = discover_with(selection, &settings, "ims.example", local(), |resolver, name, kind| {
+        assert_eq!(resolver, server());
+        queries.push((name.clone(), kind));
+        ready(Ok(if name == "pcscf.example.test" && kind == 1 {
+            addresses(&["192.0.2.20", "192.0.2.21"], 60)
+        } else { DnsRecords::default() }))
+    }, DiscoveryLimits::for_transport(PcscfTransport::Tls)).await.unwrap();
+    assert_eq!(endpoints.len(), 2);
+    assert!(endpoints.iter().all(|endpoint| endpoint.source == PcscfSource::BearerPco
+        && endpoint.transport == PcscfTransport::Tls && endpoint.socket.port() == 5061
+        && endpoint.tls_authority.as_deref() == Some("pcscf.example.test")));
+    assert!(queries.iter().all(|(name, _)| name == "pcscf.example.test"));
+}
+
+#[test]
+fn dhcp_information_preserves_original_source_precedence() {
+    let settings = settings();
+    let dhcp = crate::hardware::devices::transport::ImsPcscfDiscovery {
+        candidates: vec!["192.0.2.25".parse().unwrap()], domains: vec!["dhcp.example.test".into()],
+        context_id: None, source: "dhcp_information",
+    };
+    for (configured, isim, expected) in [
+        (Some("192.0.2.22"), vec![], PcscfSource::Profile),
+        (None, vec!["192.0.2.23".into()], PcscfSource::Isim),
+        (None, vec![], PcscfSource::BearerDhcp),
+    ] {
+        let selection = select_source_with_discovery(None, &settings, configured, &isim, &[], Some(&dhcp)).unwrap();
+        assert!(matches!(selection, Selection::Explicit(source, _) if source == expected));
+    }
+    let pco = vec!["pco.example.test".into()];
+    assert!(matches!(select_source_with_discovery(None, &settings, None, &[], &pco, Some(&dhcp)).unwrap(),
+        Selection::Explicit(PcscfSource::BearerPco, _)));
+    assert!(matches!(select_source_with_discovery(Some("192.0.2.10"), &settings, None, &[], &pco, Some(&dhcp)).unwrap(),
+        Selection::Explicit(PcscfSource::Environment, _)));
+}
+
+#[tokio::test]
+async fn provided_pco_name_does_not_silently_become_profile_or_standard_dns() {
+    let settings = settings();
+    let domains = vec!["unresolved.example.test".into()];
+    let selection = select_source_with_discovery(None, &settings, Some("192.0.2.99"), &[], &domains, None).unwrap();
+    let error = discover_with(selection, &settings, "ims.example", local(), |_, name, _| {
+        assert_eq!(name, "unresolved.example.test");
+        ready(Ok(DnsRecords::default()))
+    }, DiscoveryLimits::default()).await.unwrap_err();
+    assert_eq!(error.code(), code::RUNTIME_ALL_PCSCF_FAILED);
+    for domain in ["sip:pcscf.example", "pcscf.example:5060", "pcscf.example;transport=udp", "bad..example", "192.0.2.999"] {
+        assert!(select_source_with_discovery(None, &settings, Some("192.0.2.99"), &[], &[domain.into()], None).is_err());
+    }
+}
+
+#[test]
+fn combined_pco_address_and_fqdn_list_shares_one_bound() {
+    let mut settings = settings();
+    settings.pcscf = vec!["192.0.2.20".parse().unwrap(); MAX_CONFIGURED_TARGETS];
+    assert!(select_source_with_discovery(None, &settings, None, &[], &["pcscf.example.test".into()], None).is_err());
+    assert!(select_source_with_discovery(None, &settings, None, &[], &[], None).is_ok());
+}
+
 #[test]
 fn environment_legacy_alias_is_used_only_when_new_name_is_absent() {
     let mut names = Vec::new();

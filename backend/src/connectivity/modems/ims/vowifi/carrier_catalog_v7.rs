@@ -24,6 +24,14 @@ use crate::connectivity::modems::ims::vowifi::profile_record::{
     CURRENT_SCHEMA_VERSION,
 };
 use crate::connectivity::modems::ims::vowifi::profiles;
+use crate::hardware::devices::ims_bearer_policy::{
+    DhcpPcscfPolicy, ImsApnAuthentication, ImsApnAuthMethod, ImsBearerRequirements,
+    PcoRequestPolicy,
+};
+
+#[cfg(test)]
+#[path = "carrier_catalog_v7_bearer_tests.rs"]
+mod bearer_tests;
 
 #[cfg(test)]
 #[path = "carrier_catalog_v7_variants_tests.rs"]
@@ -745,6 +753,7 @@ fn project_config(
 
     let access_path = format!("/access/{}", access.v7_config_key());
     let access_config = config.pointer(&access_path).unwrap_or(&Value::Null);
+    let bearer = project_bearer_requirements(access_config, access)?;
     let apn = string_at(access_config, "/apn")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("ims")
@@ -845,6 +854,7 @@ fn project_config(
         epdg,
         ikev2,
         ims: ImsPolicyRecord {
+            bearer,
             domain,
             realm,
             registrar,
@@ -896,6 +906,74 @@ fn project_config(
         CatalogAccessKind::WifiEpdg => record.validate()?,
     }
     Ok(record)
+}
+
+/// The Pixel producer emits these exact normalized auth_type strings (not
+/// Android integer enum values). Its schema permits additional access keys;
+/// explicit PCO/DHCP keys below are typed demands, unlike pcscf_discovery hints.
+/// Never include an offending value in errors: it may be a misplaced secret.
+fn project_bearer_requirements(
+    config: &Value,
+    access: CatalogAccessKind,
+) -> Result<ImsBearerRequirements, String> {
+    let invalid = |code: &str| format!("carrier_catalog_bearer_invalid:{}:{code}", access.as_str());
+    let method = match config.get("auth_type") {
+        None => ImsApnAuthMethod::Unspecified,
+        Some(Value::String(value)) => match value.as_str() {
+            "unspecified" => ImsApnAuthMethod::Unspecified,
+            "none" => ImsApnAuthMethod::None,
+            "pap" => ImsApnAuthMethod::Pap,
+            "chap" => ImsApnAuthMethod::Chap,
+            "pap_or_chap" => ImsApnAuthMethod::PapOrChap,
+            _ => return Err(invalid("auth_type_unsupported")),
+        },
+        Some(_) => return Err(invalid("auth_type_invalid")),
+    };
+    let credential = |key: &str| -> Result<Option<String>, String> {
+        match config.get(key) {
+            None => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            Some(_) => Err(invalid("credential_type_invalid")),
+        }
+    };
+    let pcscf_via_pco = match config.get("pcscf_via_pco") {
+        None => PcoRequestPolicy::NetworkDefault,
+        Some(Value::Bool(true)) => PcoRequestPolicy::Required,
+        Some(Value::Bool(false)) => PcoRequestPolicy::Disabled,
+        Some(Value::String(value)) => match value.as_str() {
+            "network_default" => PcoRequestPolicy::NetworkDefault,
+            "required" => PcoRequestPolicy::Required,
+            "disabled" => PcoRequestPolicy::Disabled,
+            _ => return Err(invalid("pcscf_via_pco_invalid")),
+        },
+        Some(_) => return Err(invalid("pcscf_via_pco_invalid")),
+    };
+    let pcscf_via_dhcp = match config.get("pcscf_via_dhcp") {
+        None => DhcpPcscfPolicy::Disabled,
+        Some(Value::Bool(true)) => DhcpPcscfPolicy::InformationRequest,
+        Some(Value::Bool(false)) => DhcpPcscfPolicy::Disabled,
+        Some(Value::String(value)) => match value.as_str() {
+            "disabled" => DhcpPcscfPolicy::Disabled,
+            "information_request" => DhcpPcscfPolicy::InformationRequest,
+            _ => return Err(invalid("pcscf_via_dhcp_invalid")),
+        },
+        Some(_) => return Err(invalid("pcscf_via_dhcp_invalid")),
+    };
+    let bearer = ImsBearerRequirements {
+        authentication: ImsApnAuthentication {
+            method,
+            username: credential("username")?,
+            password: credential("password")?,
+        },
+        pcscf_via_pco,
+        pcscf_via_dhcp,
+    };
+    match access {
+        CatalogAccessKind::LteEpc => bearer.validate(),
+        CatalogAccessKind::WifiEpdg => bearer.validate_for_wifi(),
+    }
+    .map_err(|code| invalid(code))?;
+    Ok(bearer)
 }
 
 /// UT is unavailable unless the carrier catalog explicitly provides a complete

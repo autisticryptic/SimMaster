@@ -31,6 +31,7 @@ pub mod channel;
 // resolves a real secondary netdev before the runtime migrates it into the UE
 // namespace. There is no primary ModemManager/host bearer alternative.
 pub mod data_slot;
+mod dhcp_pcscf;
 pub mod digest_aka;
 pub mod errors;
 pub mod identity;

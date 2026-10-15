@@ -8332,6 +8332,9 @@ pub struct CellularImsLineControlResponse {
     pub modem: crate::hardware::cellular::control::ModemBinding,
     pub profile: LineProfileConfig,
     pub runtime: crate::connectivity::modems::ims::cellular_ims::CellularImsRuntimeStatus,
+    /// Passive adapter support, not proof of current bearer/network readiness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_capabilities: Option<crate::hardware::devices::transport::ImsBearerCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8771,10 +8774,12 @@ pub async fn set_line_esim_control_handler(
     )
 }
 
-fn build_cellular_ims_line_response(
+async fn build_cellular_ims_line_response(
     app: &AppState,
     status: crate::services::line_registry::LineRuntimeStatus,
 ) -> CellularImsLineControlResponse {
+    let bearer_capabilities = app.line_registry.get(&status.modem.line_id).await
+        .and_then(|line| line.ims_bearer.as_ref().map(|transport| transport.ims_bearer_capabilities()));
     CellularImsLineControlResponse {
         // Redacted: the embedded trunk settings carry a Digest secret that must
         // never cross the API boundary.
@@ -8784,6 +8789,7 @@ fn build_cellular_ims_line_response(
             .redacted(),
         modem: status.modem,
         runtime: status.cellular_ims,
+        bearer_capabilities,
         read_only: None,
         blocked_reason: None,
     }
@@ -8818,6 +8824,7 @@ fn build_blocked_cellular_ims_line_response(
             voice_service: "unknown".into(), voice_service_code: "ims_voice_service_unknown".into(),
             ..Default::default()
         },
+        bearer_capabilities: None,
         read_only: Some(true), blocked_reason: Some(reason.into()),
     }
 }
@@ -8853,13 +8860,10 @@ pub async fn get_cellular_ims_lines_handler(
             )).into()),
         );
     }
-    let lines: Vec<_> = app
-        .line_registry
-        .statuses()
-        .await
-        .into_iter()
-        .map(|status| build_cellular_ims_line_response(&app, status))
-        .collect();
+    let mut lines = Vec::new();
+    for status in app.line_registry.statuses().await {
+        lines.push(build_cellular_ims_line_response(&app, status).await);
+    }
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message("Success", lines).into()),
@@ -8893,7 +8897,7 @@ pub async fn get_cellular_ims_line_handler(
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
             "Success",
-            build_cellular_ims_line_response(&app, line.status().await),
+            build_cellular_ims_line_response(&app, line.status().await).await,
         )),
     )
 }
@@ -9252,6 +9256,7 @@ pub async fn set_cellular_ims_line_connection_handler(
                     modem: line.binding(),
                     profile: profile.redacted(),
                     runtime: line.cellular_ims.status().await,
+                    bearer_capabilities: line.ims_bearer.as_ref().map(|transport| transport.ims_bearer_capabilities()),
                     read_only: None, blocked_reason: None,
                 },
             )),
@@ -9284,6 +9289,7 @@ pub async fn set_cellular_ims_line_connection_handler(
         modem: line.binding(),
         profile: profile.redacted(),
         runtime: line.cellular_ims.status().await,
+        bearer_capabilities: line.ims_bearer.as_ref().map(|transport| transport.ims_bearer_capabilities()),
         read_only: None, blocked_reason: None,
     };
     match result {
@@ -9338,7 +9344,7 @@ pub async fn retry_cellular_ims_line_handler(
         StatusCode::ACCEPTED,
         Json(ApiResponse::success_with_message(
             "VoLTE retry started",
-            build_cellular_ims_line_response(&app, line.status().await),
+            build_cellular_ims_line_response(&app, line.status().await).await,
         )),
     )
 }
@@ -10451,8 +10457,29 @@ pub async fn get_vowifi_carrier_profile_handler(
 /// and names the missing fields.
 pub async fn upsert_vowifi_carrier_profile_handler(
     State(app): State<AppState>,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    let store = profile_store(&app);
+    let profile_id = body.pointer("/meta/profile_id").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+    use crate::connectivity::modems::ims::vowifi::profile_store::ProfileOrigin;
+    let existing = match store.get_stored_profile(ProfileOrigin::Database, &profile_id) {
+        Ok(existing) => existing,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(error))),
+    };
+    if existing.is_none() && body.pointer("/ims/bearer").is_none() {
+        // Browsing omits invalid database rows. An old editor must not mistake
+        // such a row for a new profile and overwrite an unparsed bearer policy.
+        match app.database.list_custom_carrier_profiles() {
+            Ok(entries) if entries.iter().any(|entry| entry.profile_id == profile_id) => {
+                return (StatusCode::BAD_REQUEST, Json(ApiResponse::error("ims_bearer_update_intent_required")));
+            }
+            Err(_) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error("custom_carrier_profile_list_failed"))),
+            _ => {}
+        }
+    }
+    if let Err(error) = preserve_carrier_bearer_update(&mut body, existing.as_ref().map(|profile| &profile.record)) {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(error)));
+    }
     let record =
         match crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord::from_api_value(
             body,
@@ -10470,6 +10497,45 @@ pub async fn upsert_vowifi_carrier_profile_handler(
         ),
         Err(error) => (StatusCode::BAD_REQUEST, Json(ApiResponse::error(error))),
     }
+}
+
+/// Omission is the legacy "unchanged" intent, never a credential merge.
+/// Explicit null clears the entire policy; an object replaces it atomically.
+fn preserve_carrier_bearer_update(
+    body: &mut serde_json::Value,
+    existing: Option<&crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord>,
+) -> Result<(), String> {
+    use crate::hardware::devices::ims_bearer_policy::ImsBearerRequirements;
+    // Editors mark non-default redacted policies explicitly, so a catalog copy
+    // or changed profile id cannot silently turn into a new default policy.
+    if let Some(marker) = body.pointer("/ims/bearer_unchanged") {
+        if marker != &serde_json::Value::Bool(true)
+            || body.pointer("/ims/bearer").is_some()
+            || existing.is_none()
+        {
+            return Err("ims_bearer_update_intent_required".into());
+        }
+        body["ims"].as_object_mut().unwrap().remove("bearer_unchanged");
+    }
+    if body.pointer("/ims/bearer").is_some_and(serde_json::Value::is_null) {
+        body["ims"]["bearer"] = serde_json::to_value(ImsBearerRequirements::default()).unwrap();
+    } else if body.pointer("/ims/bearer").is_none() {
+        if let Some(existing) = existing {
+            let candidate: crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord =
+                serde_json::from_value(body.clone()).map_err(|_| "carrier_profile_json_invalid".to_string())?;
+            if !existing.ims.bearer.is_default()
+                && (candidate.meta.profile_id != existing.meta.profile_id
+                    || candidate.meta.plmn != existing.meta.plmn
+                    || candidate.meta.mcc != existing.meta.mcc
+                    || candidate.meta.mnc != existing.meta.mnc
+                    || candidate.epdg.apn != existing.epdg.apn)
+            {
+                return Err("ims_bearer_update_intent_required".into());
+            }
+            body["ims"]["bearer"] = serde_json::to_value(&existing.ims.bearer).unwrap();
+        }
+    }
+    Ok(())
 }
 
 /// DELETE /api/vowifi/carrier-profiles/{profile_id}
@@ -10549,7 +10615,7 @@ pub async fn resolve_vowifi_carrier_profile_handler(
                         json!({
                             "origin": profile.origin.as_str(),
                             "e911_expected": e911_expected,
-                            "record": profile.record,
+                            "record": profile.record.sanitized(),
                         }),
                     )),
                 )
@@ -10980,6 +11046,7 @@ fn cellular_ims_profile_batch_action(
     } else if error.retry_remaining().is_some() {
         CellularImsProfileBatchAction::WaitForRegister
     } else if matches!(error.code(), code::REGISTER_RETRY_STOPPED | code::REGISTER_RETRY_DEFERRED
+        | code::BEARER_REQUIREMENTS_INVALID | code::BEARER_REQUIREMENTS_UNSUPPORTED | code::DHCP_PCSCF_FAILED
         | code::TLS_ENDPOINT_FAILED | code::TLS_AUTHORITY_INVALID | code::TLS_HANDSHAKE_FAILED | code::TLS_HANDSHAKE_TIMEOUT
         | code::TLS_IPSEC_UNSUPPORTED | code::CHANNEL_STREAM_BUDGET_EXHAUSTED
         | code::CHANNEL_STREAM_FRAME_INVALID | code::CHANNEL_STREAM_RESPONSE_OWNER_MISSING)
@@ -13626,6 +13693,17 @@ fn effective_ims_dto(
             value: apn.value.clone(),
             source: source_str(apn.source),
         }),
+        bearer: Some(ImsBearerRequirementDto {
+            authentication: ImsBearerAuthenticationDto {
+                method: profile.bearer.authentication.method,
+                username_present: profile.bearer.authentication.username.is_some(),
+                password_present: profile.bearer.authentication.password.is_some(),
+            },
+            pcscf_via_pco: profile.bearer.pcscf_via_pco,
+            pcscf_via_dhcp: profile.bearer.pcscf_via_dhcp,
+            source: source_str(profile.bearer_source),
+            validation_error: profile.validate_bearer().err().map(str::to_string),
+        }),
         pinned_profile_id: profile.pinned_profile_id.as_ref().map(|pinned| FieldDto {
             value: pinned.value.clone(),
             source: source_str(pinned.source),
@@ -13689,7 +13767,7 @@ async fn ims_override_for_line(
 fn override_response(key: &SimBindingKey, override_: &SimOverride) -> ImsOverrideResponse {
     ImsOverrideResponse {
         binding: binding_dto(key),
-        override_: override_.clone(),
+        override_: override_.sanitized(),
     }
 }
 
@@ -14166,13 +14244,35 @@ pub async fn get_ims_override_handler(
     )
 }
 
+fn parse_ims_override_update(
+    body: serde_json::Value,
+    existing: &SimOverride,
+) -> Result<SimOverride, String> {
+    let mut payload: SimOverride = serde_json::from_value(body.clone())
+        .map_err(|_| "ims_override_json_invalid".to_string())?;
+    for (name, alias, next, previous) in [
+        ("ims_cellular", "ims_volte", &mut payload.ims_cellular, &existing.ims_cellular),
+        ("ims_vowifi", "ims_vowifi", &mut payload.ims_vowifi, &existing.ims_vowifi),
+    ] {
+        let explicit = body.get(name).or_else(|| body.get(alias))
+            .and_then(|access| access.get("bearer")).is_some();
+        if !explicit && previous.bearer.is_some() {
+            if next.apn != previous.apn || next.profile_id != previous.profile_id {
+                return Err("ims_bearer_update_intent_required".into());
+            }
+            next.bearer = previous.bearer.clone();
+        }
+    }
+    Ok(normalize_ims_override_payload(payload))
+}
+
 /// PATCH /api/ims/lines/{line_id}/override
 pub async fn patch_ims_override_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
-    Json(payload): Json<SimOverride>,
+    Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<ApiResponse<ImsOverrideResponse>>) {
-    let (initial_key, _binding) = match resolve_ims_binding(&app, &line_id).await {
+    let (initial_key, existing) = match ims_override_for_line(&app, &line_id).await {
         Ok(resolved) => resolved,
         Err(reason) => {
             return (
@@ -14181,7 +14281,10 @@ pub async fn patch_ims_override_handler(
             );
         }
     };
-    let payload = normalize_ims_override_payload(payload);
+    let payload = match parse_ims_override_update(body, &existing) {
+        Ok(payload) => payload,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(ApiResponse::error(error))),
+    };
     let problems = crate::connectivity::modems::ims::effective_profile::validate_override(&payload);
     if !problems.is_empty() {
         return (
@@ -14264,11 +14367,16 @@ pub async fn delete_ims_override_handler(
 pub async fn validate_ims_override_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
-    Json(payload): Json<SimOverride>,
+    Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<ApiResponse<ImsOverrideValidationResponse>>) {
-    let _ = app;
-    let _ = line_id;
-    let problems = crate::connectivity::modems::ims::effective_profile::validate_override(&payload);
+    let (_, existing) = match ims_override_for_line(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(error) => return (StatusCode::NOT_FOUND, Json(ApiResponse::error(error))),
+    };
+    let problems = match parse_ims_override_update(body, &existing) {
+        Ok(payload) => crate::connectivity::modems::ims::effective_profile::validate_override(&payload),
+        Err(error) => vec![error],
+    };
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
@@ -14949,6 +15057,205 @@ pub async fn delete_e911_address_handler(
 }
 
 #[cfg(test)]
+pub(crate) mod ims_bearer_api_tests {
+    use super::*;
+    use crate::connectivity::modems::ims::vowifi::{profile_record::CarrierProfileRecord, profiles};
+    use crate::hardware::devices::ims_bearer_policy::{ImsApnAuthMethod, ImsBearerRequirements};
+
+    fn requirements() -> ImsBearerRequirements {
+        let mut policy = ImsBearerRequirements::default();
+        policy.authentication.method = ImsApnAuthMethod::Pap;
+        policy.authentication.username = Some("synthetic-pap-user".into());
+        policy.authentication.password = Some("synthetic-pap-password".into());
+        policy
+    }
+
+    fn record() -> CarrierProfileRecord {
+        let profile = profiles::derive_standard_3gpp_profile("001", "01", profiles::Standard3gppAccess::LteEpc).unwrap();
+        let mut record = CarrierProfileRecord::from_profile(profile);
+        record.meta.profile_id = "synthetic-bearer-api".into();
+        record.ims.bearer = requirements();
+        record
+    }
+
+    fn assert_no_credentials(value: &serde_json::Value) {
+        let text = value.to_string();
+        assert!(!text.contains("synthetic-pap-user"));
+        assert!(!text.contains("synthetic-pap-password"));
+    }
+
+    #[test]
+    fn bearer_api_response_projections_redact_but_private_records_roundtrip() {
+        use crate::connectivity::modems::ims::effective_profile::resolve_effective_ims_profile;
+        use crate::connectivity::modems::ims::vowifi::profile_store::{ProfileOrigin, StoredProfile};
+        let record = record();
+        let private = serde_json::to_value(&record).unwrap();
+        assert_eq!(serde_json::from_value::<CarrierProfileRecord>(private.clone()).unwrap(), record);
+        assert_eq!(private["ims"]["bearer"]["authentication"]["password"], "synthetic-pap-password");
+        let stored = StoredProfile {
+            profile_id: record.meta.profile_id.clone(), plmn: record.meta.plmn.clone(),
+            origin: ProfileOrigin::Database, source: "manual".into(), updated_at: String::new(),
+            record: record.clone(), cellular_ims_ready: true, vowifi_ready: false,
+            vilte_enabled: false, smsoip_enabled: true, ut_xcap_enabled: false,
+        };
+        assert_no_credentials(&serde_json::to_value(&stored).unwrap());
+        // Listing a profile does not mutate the private record subsequently used for execution.
+        assert_eq!(stored.record.ims.bearer, requirements());
+        let mut override_ = SimOverride::default();
+        override_.ims_cellular.bearer = Some(requirements());
+        let key = SimBindingKey::resolve(Some("8900101000000000001"), None).unwrap();
+        assert_no_credentials(&serde_json::to_value(override_response(&key, &override_)).unwrap());
+        assert_eq!(override_.ims_cellular.bearer, Some(requirements()));
+        let effective = resolve_effective_ims_profile(record.intern(), Some(&override_));
+        let dto = serde_json::to_value(effective_ims_dto(&effective)).unwrap();
+        assert_no_credentials(&dto);
+        assert_eq!(dto["bearer"]["authentication"]["method"], "pap");
+        assert_eq!(dto["bearer"]["authentication"]["username_present"], true);
+        assert_eq!(dto["bearer"]["authentication"]["password_present"], true);
+        assert_eq!(dto["bearer"]["source"], "sim_override");
+    }
+
+    #[test]
+    fn bearer_api_carrier_update_omission_preserves_and_explicit_clear_or_replace_is_atomic() {
+        let saved = record();
+        let mut body = serde_json::to_value(saved.sanitized()).unwrap();
+        assert!(CarrierProfileRecord::from_api_value(body.clone()).is_err(), "redacted PAP is not replacement input");
+        body["ims"].as_object_mut().unwrap().remove("bearer");
+        body["ims"]["bearer_unchanged"] = json!(true);
+        assert_eq!(preserve_carrier_bearer_update(&mut body.clone(), None).unwrap_err(), "ims_bearer_update_intent_required", "a catalog copy/new id must not drop auth");
+        body["ims"]["user_agent"] = json!("Synthetic editor update");
+        preserve_carrier_bearer_update(&mut body, Some(&saved)).unwrap();
+        assert_eq!(CarrierProfileRecord::from_api_value(body.clone()).unwrap().ims.bearer, saved.ims.bearer);
+        body["ims"].as_object_mut().unwrap().remove("bearer");
+        body["epdg"]["apn"] = json!("changed-apn");
+        assert_eq!(preserve_carrier_bearer_update(&mut body, Some(&saved)).unwrap_err(), "ims_bearer_update_intent_required");
+        body["ims"]["bearer"] = serde_json::Value::Null;
+        preserve_carrier_bearer_update(&mut body, Some(&saved)).unwrap();
+        assert!(CarrierProfileRecord::from_api_value(body.clone()).unwrap().ims.bearer.is_default());
+        let mut replacement = requirements();
+        replacement.authentication.method = ImsApnAuthMethod::Chap;
+        replacement.authentication.password = Some(String::new());
+        body["ims"]["bearer"] = serde_json::to_value(&replacement).unwrap();
+        preserve_carrier_bearer_update(&mut body, Some(&saved)).unwrap();
+        assert_eq!(CarrierProfileRecord::from_api_value(body).unwrap().ims.bearer, replacement);
+    }
+
+    #[test]
+    fn bearer_api_override_legacy_save_preserves_without_accepting_redacted_credentials() {
+        let mut saved = SimOverride::default();
+        saved.ims_cellular.apn = Some("ims".into());
+        saved.ims_cellular.bearer = Some(requirements());
+        let mut body = serde_json::to_value(saved.sanitized()).unwrap();
+        let replay = parse_ims_override_update(body.clone(), &saved).unwrap();
+        assert!(!crate::connectivity::modems::ims::effective_profile::validate_override(&replay).is_empty());
+        body["ims_cellular"].as_object_mut().unwrap().remove("bearer");
+        body["services"]["call_waiting"] = json!(true);
+        let update = parse_ims_override_update(body.clone(), &saved).unwrap();
+        assert_eq!(update.ims_cellular.bearer, saved.ims_cellular.bearer);
+        assert_eq!(update.services.call_waiting, Some(true));
+        body["ims_cellular"]["apn"] = json!("another-apn");
+        assert_eq!(parse_ims_override_update(body.clone(), &saved).unwrap_err(), "ims_bearer_update_intent_required");
+        body["ims_cellular"]["bearer"] = serde_json::Value::Null;
+        assert!(parse_ims_override_update(body.clone(), &saved).unwrap().ims_cellular.bearer.is_none());
+        body["ims_cellular"]["bearer"] = serde_json::to_value(requirements()).unwrap();
+        assert_eq!(parse_ims_override_update(body, &saved).unwrap().ims_cellular.bearer, Some(requirements()));
+    }
+
+    /// Called by the main private-D-Bus HTTP fixture, which owns router setup,
+    /// authentication and ephemeral listener teardown. No live selectors exist.
+    pub(crate) async fn http_contract(app: &AppState, base: &str, cookie: &str) {
+        use crate::connectivity::modems::ims::vowifi::profile_store::ProfileOrigin;
+        use reqwest::StatusCode;
+        let client = crate::platform::dns::http_client_builder().no_proxy()
+            .timeout(std::time::Duration::from_secs(10)).build().unwrap();
+        let record = record();
+        let path = format!("{base}/api/vowifi/carrier-profiles");
+        let unauthenticated = client.put(&path).json(&record).send().await.unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let response = client.put(&path).header("Cookie", cookie).json(&record).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_no_credentials(&body);
+        let detail = format!("{path}/detail/database/{}", record.meta.profile_id);
+        let body: serde_json::Value = client.get(&detail).header("Cookie", cookie).send().await.unwrap().json().await.unwrap();
+        assert_no_credentials(&body);
+        let mut update = body["data"]["record"].clone();
+        assert_eq!(update["ims"]["bearer"]["authentication"]["method"], "pap");
+        let replay = client.put(&path).header("Cookie", cookie).json(&update).send().await.unwrap();
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST, "redacted response cannot become credentials");
+        update["ims"].as_object_mut().unwrap().remove("bearer");
+        update["ims"]["bearer_unchanged"] = json!(true);
+        update["ims"]["user_agent"] = json!("Synthetic unchanged bearer editor");
+        let response = client.put(&path).header("Cookie", cookie).json(&update).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_no_credentials(&response.json().await.unwrap());
+        let stored = profile_store(app).get_stored_profile(ProfileOrigin::Database, &record.meta.profile_id).unwrap().unwrap();
+        assert_eq!(stored.record.ims.bearer, requirements());
+        let mut ambiguous = update.clone();
+        ambiguous["epdg"]["apn"] = json!("changed-apn");
+        assert_eq!(client.put(&path).header("Cookie", cookie).json(&ambiguous).send().await.unwrap().status(), StatusCode::BAD_REQUEST);
+        update["ims"].as_object_mut().unwrap().remove("bearer_unchanged");
+        update["ims"]["bearer"] = serde_json::Value::Null;
+        assert_eq!(client.put(&path).header("Cookie", cookie).json(&update).send().await.unwrap().status(), StatusCode::OK);
+        assert!(profile_store(app).get_stored_profile(ProfileOrigin::Database, &record.meta.profile_id).unwrap().unwrap().record.ims.bearer.is_default());
+        let response = client.put(&path).header("Cookie", cookie).json(&record).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_no_credentials(&response.json().await.unwrap());
+        assert_eq!(profile_store(app).get_stored_profile(ProfileOrigin::Database, &record.meta.profile_id).unwrap().unwrap().record.ims.bearer, requirements());
+
+        let line_id = "line-00000000000000000000000000bea001";
+        let binding = crate::hardware::cellular::control::ModemBinding {
+            line_id: line_id.into(), hardware_key: "synthetic-bearer-http".into(),
+            line_kind: "baseband".into(), sim_iccid: "8900101000000000001".into(),
+            // No modem/QMI selector; this fixture never opens real hardware.
+            ..Default::default()
+        };
+        let line = app.line_registry.insert_control_test_line(binding).await;
+        app.config_manager.reconcile_line_profiles(&[line_id.into()]).unwrap();
+        let before = serde_json::to_value(app.config_manager.get_line_profile(line_id)).unwrap();
+        let override_path = format!("{base}/api/ims/lines/{line_id}/override");
+        let mut saved = SimOverride::default();
+        saved.ims_cellular.apn = Some("ims".into());
+        saved.ims_cellular.bearer = Some(requirements());
+        let response = client.patch(&override_path).header("Cookie", cookie).json(&saved).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_no_credentials(&response.json().await.unwrap());
+        let body: serde_json::Value = client.get(&override_path).header("Cookie", cookie).send().await.unwrap().json().await.unwrap();
+        assert_no_credentials(&body);
+        let mut update = body["data"]["override_"].clone();
+        update["ims_cellular"].as_object_mut().unwrap().remove("bearer");
+        update["services"]["call_waiting"] = json!(true);
+        let response = client.patch(&override_path).header("Cookie", cookie).json(&update).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_no_credentials(&response.json().await.unwrap());
+        let key = SimBindingKey::resolve(Some("8900101000000000001"), None).unwrap();
+        assert_eq!(app.sim_overrides.load(&key).unwrap().unwrap().ims_cellular.bearer, saved.ims_cellular.bearer);
+        update["ims_cellular"]["apn"] = json!("another-apn");
+        assert_eq!(client.patch(&override_path).header("Cookie", cookie).json(&update).send().await.unwrap().status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let response: serde_json::Value = client.get(format!("{base}/api/cellular-ims/lines/{line_id}")).header("Cookie", cookie).send().await.unwrap().json().await.unwrap();
+        let expected = line.ims_bearer.as_ref().map(|transport| transport.ims_bearer_capabilities());
+        assert_eq!(response["data"]["bearer_capabilities"], serde_json::to_value(expected).unwrap());
+        assert_eq!(response["data"]["runtime"]["registered"], false);
+        assert_no_credentials(&response);
+        let selection: serde_json::Value = client.get(format!("{base}/api/cellular-ims/lines/{line_id}/profile-selection")).header("Cookie", cookie).send().await.unwrap().json().await.unwrap();
+        assert_no_credentials(&selection);
+        assert!(selection["data"]["profiles"].as_array().unwrap().iter().any(|profile| profile["profile_id"] == record.meta.profile_id));
+        assert_eq!(serde_json::to_value(app.config_manager.get_line_profile(line_id)).unwrap(), before);
+    }
+
+    #[test]
+    fn bearer_api_support_projection_is_not_registration_readiness() {
+        use crate::hardware::devices::transport::{CapabilitySupport, ImsBearerCapabilities};
+        let mut response = CellularImsLineControlResponse::default();
+        response.bearer_capabilities = Some(ImsBearerCapabilities { pap: CapabilitySupport::Supported, ..Default::default() });
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["bearer_capabilities"]["pap"], "supported");
+        assert_eq!(value["bearer_capabilities"]["chap"], "unknown");
+        assert_eq!(value["runtime"]["registered"], false);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -15508,6 +15815,17 @@ mod tests {
                 _ => observed.slot_conflict = true,
             }
             assert!(!same_voice_binding(&expected, &observed));
+        }
+    }
+
+    #[test]
+    fn cellular_ims_profile_batch_keeps_explicit_bearer_requirements() {
+        for reason in [code::BEARER_REQUIREMENTS_INVALID, code::BEARER_REQUIREMENTS_UNSUPPORTED,
+            code::DHCP_PCSCF_FAILED] {
+            let error = crate::connectivity::modems::ims::cellular_ims::CellularImsError::new(reason);
+            assert_eq!(cellular_ims_profile_batch_action(true, 1, 8, Some(&error)),
+                CellularImsProfileBatchAction::StopRegister,
+                "new profile must not discard an explicit APN/PCO/DHCP requirement");
         }
     }
 

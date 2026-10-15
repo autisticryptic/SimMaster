@@ -1,4 +1,4 @@
-import type { ImsFactSource, ImsIpsecAlgorithms, ImsRegistrationDiagnostics } from '../../api/contracts.ts'
+import type { ImsBearerCapabilities, ImsBearerPolicy, EffectiveImsBearerPolicy, ImsFactSource, ImsIpsecAlgorithms, ImsRegistrationDiagnostics } from '../../api/contracts.ts'
 
 const sources: Record<ImsFactSource, string> = {
   unknown: '未确认', database: '自定义数据库', carrier_catalog: '只读运营商库', derived: '3GPP 标准派生',
@@ -54,6 +54,45 @@ function algorithms(value: ImsIpsecAlgorithms[] | null | undefined, empty: strin
 }
 
 export interface ImsDiagnosticRow { label: string; value: string }
+
+/** Editors do not own bearer policy. Omission explicitly preserves it server-side
+ * only while profile/SIM/APN binding is unchanged; redaction is not replacement. */
+export function withoutBearerUpdate<T extends { bearer?: ImsBearerPolicy | null }>(access: T): T {
+  const copy = { ...access }
+  delete copy.bearer
+  return copy
+}
+
+export function carrierBearerUnchanged(access: { bearer?: ImsBearerPolicy }): true | undefined {
+  const policy = access.bearer
+  return policy && (policy.authentication.method !== 'unspecified'
+    || policy.pcscf_via_pco !== 'network_default' || policy.pcscf_via_dhcp !== 'disabled') ? true : undefined
+}
+
+export function imsBearerCapabilityRows(capabilities?: ImsBearerCapabilities | null): ImsDiagnosticRow[] {
+  const labels: Record<keyof ImsBearerCapabilities, string> = {
+    auth_none: '无 APN 认证', pap: 'PAP', chap: 'CHAP', pap_or_chap: 'PAP 或 CHAP',
+    pco_request_policy: 'PCO 请求策略', pco_pcscf_addresses: 'PCO P-CSCF 地址',
+    pco_pcscf_domains: 'PCO P-CSCF 域名', dhcp_information: 'DHCP 信息请求',
+  }
+  return (Object.keys(labels) as Array<keyof ImsBearerCapabilities>).map((key) => ({
+    label: labels[key], value: lookup({ supported: '适配器支持', unsupported: '适配器不支持', unknown: '支持情况未知' }, capabilities?.[key], '支持情况未知'),
+  }))
+}
+
+export function imsBearerRequirementRows(policy?: EffectiveImsBearerPolicy | null): ImsDiagnosticRow[] {
+  if (!policy) return []
+  const present = (value: unknown) => value === true ? '已保存' : value === false ? '未保存' : '未知'
+  return [
+    { label: '配置的 APN 认证', value: lookup({ unspecified: '网络默认', none: '无认证', pap: 'PAP', chap: 'CHAP', pap_or_chap: 'PAP 或 CHAP' }, policy.authentication?.method, '未知') },
+    { label: '用户名 / 密码', value: `${present(policy.authentication?.username_present)} / ${present(policy.authentication?.password_present)}（不回显）` },
+    { label: '配置的 PCO 策略', value: lookup({ network_default: '网络默认', required: '要求请求', disabled: '禁用' }, policy.pcscf_via_pco, '未知') },
+    { label: '配置的 DHCP 策略', value: lookup({ disabled: '禁用', information_request: '信息请求' }, policy.pcscf_via_dhcp, '未知') },
+    { label: '承载要求来源', value: lookup({ catalog: '运营商配置', sim_override: 'SIM 覆盖' }, policy.source, '未确认') },
+    { label: '配置校验', value: policy.validation_error ? reasonCode(policy.validation_error) : '未报告配置错误（非就绪证明）' },
+  ]
+}
+
 export function imsDiagnosticRows(facts?: ImsRegistrationDiagnostics | null): ImsDiagnosticRow[] {
   if (!facts || facts.version !== 1 || !facts.observed) return []
   const rows: ImsDiagnosticRow[] = [

@@ -971,9 +971,19 @@ pub async fn discover_pcscf_endpoints_with_transport_in_worker(
     settings: &ImsIpSettings, home_domain: &str, configured_pcscf: Option<&str>, isim_pcscf: &[String],
     local: IpAddr, interface: &str, worker: &UeWorkerHandle, requested_transport: PcscfTransport,
 ) -> Result<Vec<PcscfEndpoint>, CellularImsError> {
+    discover_pcscf_endpoints_with_discovery_in_worker(settings, home_domain, configured_pcscf,
+        isim_pcscf, &[], None, local, interface, worker, requested_transport).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn discover_pcscf_endpoints_with_discovery_in_worker(
+    settings: &ImsIpSettings, home_domain: &str, configured_pcscf: Option<&str>, isim_pcscf: &[String],
+    pco_domains: &[String], dhcp: Option<&crate::hardware::devices::transport::ImsPcscfDiscovery>,
+    local: IpAddr, interface: &str, worker: &UeWorkerHandle, requested_transport: PcscfTransport,
+) -> Result<Vec<PcscfEndpoint>, CellularImsError> {
     let environment = endpoint::environment_override_with(|name| std::env::var(name))?;
-    let selection = endpoint::select_source(
-        environment.as_deref(), settings, configured_pcscf, isim_pcscf,
+    let selection = endpoint::select_source_with_discovery(
+        environment.as_deref(), settings, configured_pcscf, isim_pcscf, pco_domains, dhcp,
     )?;
     endpoint::discover_with(
         selection,

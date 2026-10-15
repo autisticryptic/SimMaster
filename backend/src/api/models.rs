@@ -1201,8 +1201,29 @@ pub struct EffectiveImsDto {
     pub registrar: Option<FieldDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ims_apn: Option<FieldDto>,
+    /// Configuration only, not current bearer or registration readiness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer: Option<ImsBearerRequirementDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_profile_id: Option<FieldDto>,
+}
+
+/// Safe bearer projection. The credential values have no public DTO fields.
+#[derive(Debug, Serialize)]
+pub struct ImsBearerRequirementDto {
+    pub authentication: ImsBearerAuthenticationDto,
+    pub pcscf_via_pco: crate::hardware::devices::ims_bearer_policy::PcoRequestPolicy,
+    pub pcscf_via_dhcp: crate::hardware::devices::ims_bearer_policy::DhcpPcscfPolicy,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImsBearerAuthenticationDto {
+    pub method: crate::hardware::devices::ims_bearer_policy::ImsApnAuthMethod,
+    pub username_present: bool,
+    pub password_present: bool,
 }
 
 /// Effective device identity returned by the IMS profile API.

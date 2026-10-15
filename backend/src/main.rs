@@ -3127,6 +3127,69 @@ mod http_router_tests {
     }
 
     #[tokio::test]
+    async fn ims_bearer_policy_api_preserves_credentials_and_projects_capabilities() {
+        let state = build_test_router().await.expect("private D-Bus required; no hardware");
+        let served = serve(state.router.clone()).await;
+        let cookie = authenticate(&served).await;
+        api::handlers::ims_bearer_api_tests::http_contract(&state.app, &served.base, &cookie).await;
+    }
+
+    #[tokio::test]
+    async fn ims_bearer_api_redacts_credentials_and_preserves_legacy_profile_saves() {
+        use crate::connectivity::modems::ims::vowifi::{
+            profile_record::CarrierProfileRecord,
+            profile_store::{ProfileOrigin, ProfileStore},
+            profiles::{derive_standard_3gpp_profile, Standard3gppAccess},
+        };
+        use crate::hardware::devices::ims_bearer_policy::{ImsApnAuthMethod, ImsApnAuthentication};
+        let state = build_test_router().await.expect("private D-Bus required; no modem or network gateway");
+        let served = serve(state.router.clone()).await;
+        let path = "/api/vowifi/carrier-profiles";
+        assert_eq!(send(&served, reqwest::Method::PUT, path).await.0, StatusCode::UNAUTHORIZED);
+        let cookie = authenticate(&served).await;
+        let mut record = CarrierProfileRecord::from_profile(
+            derive_standard_3gpp_profile("001", "01", Standard3gppAccess::LteEpc).unwrap());
+        record.meta.profile_id = "synthetic-http-bearer".into();
+        record.ims.bearer.authentication = ImsApnAuthentication {
+            method: ImsApnAuthMethod::Pap, username: Some("http-fixture-user".into()),
+            password: Some("http-fixture-secret".into()),
+        };
+        let requirements = record.ims.bearer.clone();
+        let store = ProfileStore::new(state.app.carrier_catalog.clone(), state.app.database.clone());
+        let original = serde_json::to_value(&record).unwrap();
+        let (status, body) = put_json(&served, path, original.clone(), &cookie).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("http-fixture-user") && !body.contains("http-fixture-secret"));
+        assert_eq!(store.get_stored_profile(ProfileOrigin::Database, &record.meta.profile_id).unwrap().unwrap().record.ims.bearer, requirements);
+        let detail = format!("/api/vowifi/carrier-profiles/detail/database/{}", record.meta.profile_id);
+        let (status, body) = get_with_cookie(&served, &detail, &cookie).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("http-fixture-user") && !body.contains("http-fixture-secret"));
+        let safe: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let (status, body) = put_json(&served, path, safe["data"]["record"].clone(), &cookie).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "redacted credentials must not be saved: {body}");
+        assert_eq!(store.get_stored_profile(ProfileOrigin::Database, &record.meta.profile_id).unwrap().unwrap().record.ims.bearer, requirements);
+        let mut legacy = original.clone();
+        legacy["ims"].as_object_mut().unwrap().remove("bearer");
+        legacy["ims"]["user_agent"] = "Synthetic legacy editor".into();
+        let (status, body) = put_json(&served, path, legacy.clone(), &cookie).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("http-fixture-user") && !body.contains("http-fixture-secret"));
+        let saved = store.get_stored_profile(ProfileOrigin::Database, &record.meta.profile_id).unwrap().unwrap();
+        assert_eq!(saved.record.ims.bearer, requirements);
+        assert_eq!(saved.record.ims.user_agent, "Synthetic legacy editor");
+        legacy["epdg"]["apn"] = "different.example".into();
+        let (status, _) = put_json(&served, path, legacy, &cookie).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "APN cannot redirect inherited credentials");
+        let mut invalid = original;
+        invalid["ims"]["bearer"]["authentication"]["method"] = "misplaced-http-secret".into();
+        let (status, body) = put_json(&served, path, invalid, &cookie).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.contains("misplaced-http-secret"));
+        assert_eq!(store.get_stored_profile(ProfileOrigin::Database, &record.meta.profile_id).unwrap().unwrap().record.ims.bearer, requirements);
+    }
+
+    #[tokio::test]
     async fn ims_execution_diagnostics_api_is_same_runtime_projection_without_changing_intents() {
         use crate::connectivity::core::registration_diagnostics as facts;
         let state = build_test_router().await.expect("private test D-Bus only; no hardware");

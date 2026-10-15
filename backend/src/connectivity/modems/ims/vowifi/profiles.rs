@@ -6,6 +6,9 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use crate::connectivity::core::access_network::AccessIdentityPolicy;
+use crate::hardware::devices::ims_bearer_policy::{
+    ImsBearerRequirements, DEFAULT_IMS_BEARER_REQUIREMENTS,
+};
 #[cfg(test)]
 use crate::connectivity::core::voice::AudioCodec;
 
@@ -170,6 +173,11 @@ pub struct RegisterPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ImsPolicy {
+    /// Configured requirements, not a claim about the current driver. Runtime
+    /// profile serialization is public metadata; credentials persist only in
+    /// CarrierProfileRecord and are projected separately by the API.
+    #[serde(skip_serializing)]
+    pub bearer: &'static ImsBearerRequirements,
     pub domain: &'static str,
     pub realm: &'static str,
     pub registrar: Option<&'static str>,
@@ -401,6 +409,7 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
         identity_template: None,
     },
     ims: ImsPolicy {
+        bearer: &DEFAULT_IMS_BEARER_REQUIREMENTS,
         domain: "ims.mnc033.mcc234.3gppnetwork.org",
         realm: "ims.mnc033.mcc234.3gppnetwork.org",
         registrar: None,
@@ -504,6 +513,7 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
         identity_template: None,
     },
     ims: ImsPolicy {
+        bearer: &DEFAULT_IMS_BEARER_REQUIREMENTS,
         domain: "ims.mnc004.mcc204.3gppnetwork.org",
         realm: "ims.mnc004.mcc204.3gppnetwork.org",
         registrar: None,
@@ -604,6 +614,7 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
         identity_template: None,
     },
     ims: ImsPolicy {
+        bearer: &DEFAULT_IMS_BEARER_REQUIREMENTS,
         domain: "ims.mnc260.mcc310.3gppnetwork.org",
         realm: "ims.mnc260.mcc310.3gppnetwork.org",
         registrar: None,
@@ -704,6 +715,7 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
         identity_template: None,
     },
     ims: ImsPolicy {
+        bearer: &DEFAULT_IMS_BEARER_REQUIREMENTS,
         domain: "ims.mnc410.mcc310.3gppnetwork.org",
         realm: "ims.mnc410.mcc310.3gppnetwork.org",
         registrar: None,
@@ -804,6 +816,7 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
         identity_template: None,
     },
     ims: ImsPolicy {
+        bearer: &DEFAULT_IMS_BEARER_REQUIREMENTS,
         domain: "ims.mnc007.mcc262.3gppnetwork.org",
         realm: "ims.mnc007.mcc262.3gppnetwork.org",
         registrar: None,
@@ -904,6 +917,7 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
         identity_template: None,
     },
     ims: ImsPolicy {
+        bearer: &DEFAULT_IMS_BEARER_REQUIREMENTS,
         domain: "ims.mnc005.mcc530.3gppnetwork.org",
         realm: "ims.mnc005.mcc530.3gppnetwork.org",
         registrar: None,
@@ -1181,6 +1195,7 @@ pub fn derive_standard_3gpp_profile(
             identity_template: None,
         },
         ims: ImsPolicy {
+            bearer: &DEFAULT_IMS_BEARER_REQUIREMENTS,
             domain: ims_domain,
             realm: ims_domain,
             registrar: None,

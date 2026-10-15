@@ -17,6 +17,7 @@ import {
 } from '../../api/current'
 import { shortLineId } from '../../components/modemLineFormat'
 import { loadCarrierProfileSummaries } from './carrierProfileSummaryCache'
+import { withoutBearerUpdate } from './imsDiagnosticsFormat'
 
 interface Props {
   open: boolean
@@ -104,8 +105,9 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
     try {
       await api.setImsOverride(line.line_id, {
         ...override,
+        ims_cellular: withoutBearerUpdate(override.ims_cellular),
         ims_vowifi: {
-          ...override.ims_vowifi,
+          ...withoutBearerUpdate(override.ims_vowifi),
           dns: null,
           custom_imsi: override.ims_vowifi.spoof_imsi
             ? override.ims_vowifi.custom_imsi?.trim() || null

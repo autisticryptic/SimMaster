@@ -114,7 +114,7 @@ use super::{
     ipsec::{self, SecAgree, XfrmInstallPlan},
     native_bearer::{self, NativeImsBearer},
     pcscf::{
-        discover_pcscf_endpoints_with_transport_in_worker, discover_pcscf_via_active_at_context, pcscf_socket,
+        discover_pcscf_endpoints_with_discovery_in_worker, discover_pcscf_via_active_at_context, pcscf_socket,
         PcscfEndpoint, PcscfTransport,
         prepare_ims_profile_context, set_pcscf_reporting, ImsProfileLease,
     },
@@ -182,6 +182,7 @@ fn diagnostic_pcscf_source(source: super::pcscf::PcscfSource, effective: &Effect
     match source {
         PcscfSource::Environment => reg_diag::FactSource::Environment,
         PcscfSource::BearerPco => reg_diag::FactSource::BearerPco,
+        PcscfSource::BearerDhcp => reg_diag::FactSource::Dhcp,
         PcscfSource::Profile => if effective.pcscf.as_ref().is_some_and(|field|
             field.source == crate::connectivity::modems::ims::profile_override::OverrideSource::SimOverride)
             { reg_diag::FactSource::SimOverride } else { reg_diag::FactSource::Profile },
@@ -2441,12 +2442,15 @@ fn failure_stage(error: &CellularImsError) -> Option<CellularImsStage> {
         | code::RUNTIME_MM_BEARER_CONNECT_FAILED
         | code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE
         | code::RUNTIME_IMS_BEARER_START_FAILED
+        | code::BEARER_REQUIREMENTS_INVALID
+        | code::BEARER_REQUIREMENTS_UNSUPPORTED
         | code::BEARER_SESSION_LOST
         | code::RUNTIME_MM_BEARER_PATH_MISSING
         | code::RUNTIME_IMS_FAMILY_UNSUPPORTED
         | code::DATA_SLOT_MODE_MISSING => CellularImsStage::Bearer,
         code::RUNTIME_ALL_PCSCF_FAILED
         | code::RUNTIME_PROFILE_PCSCF_MISSING
+        | code::DHCP_PCSCF_FAILED
         | code::PCSCF_FAMILY_MISMATCH => CellularImsStage::Pcscf,
         code::IP_SETTINGS_MISSING
         | code::IPV6_GATEWAY_MISSING
@@ -2470,6 +2474,19 @@ fn failure_stage(error: &CellularImsError) -> Option<CellularImsStage> {
         | code::RUNTIME_UE_WORKER_GENERATION_CHANGED => CellularImsStage::RegisterRefresh,
         _ => return None,
     })
+}
+
+/// The admission gate is deliberately before owned-profile preparation and
+/// reporting changes, not merely before the eventual bearer activation.
+fn validate_bearer_profile_requirements(
+    transport: Option<&dyn ImsBearerTransport>, effective: &EffectiveImsProfile,
+) -> Result<(), CellularImsError> {
+    effective.validate_bearer().map_err(|reason|
+        CellularImsError::with_detail(code::BEARER_REQUIREMENTS_INVALID, reason))?;
+    transport.ok_or_else(|| CellularImsError::with_detail(
+        code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE, "native_ims_transport_unsupported_for_device"))?
+        .validate_ims_bearer_requirements(&effective.bearer)
+        .map_err(native_bearer::cellular_ims_error_from_ims_bearer)
 }
 
 async fn connect_inner(
@@ -2559,6 +2576,7 @@ async fn connect_inner(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| CellularImsError::new(code::CARRIER_IMS_APN_MISSING))?;
     ensure_generation(runtime, generation)?;
+    validate_bearer_profile_requirements(ims_bearer_transport, &device_identity.effective_ims)?;
 
     runtime
         .update(|state| state.stage = CellularImsStage::ImsContext)
@@ -2688,6 +2706,7 @@ async fn connect_inner(
     };
     ensure_generation(runtime, generation)?;
     let mut request = BearerRequest::for_apn(ims_apn, allow_roaming);
+    request.requirements = device_identity.effective_ims.bearer.clone();
     request.profile_id = ims_profile.map(|profile| u32::from(profile.cid));
 
     // WDS must be the only activation owner. Arm P-CSCF reporting on the
@@ -2892,6 +2911,7 @@ async fn connect_inner(
         return Err(error);
     }
     let network_worker = worker;
+    let mut pco_domains = Vec::new();
     if !bearer.settings.pcscf.is_empty() {
         tracing::info!(
             pcscf_count = bearer.settings.pcscf.len(),
@@ -2927,6 +2947,7 @@ async fn connect_inner(
                 .await
                 .map(|discovery| ImsPcscfDiscovery {
                     candidates: discovery.candidates,
+                    domains: Vec::new(),
                     context_id: Some(discovery.cid),
                     source: "at_cgcontrdp_exact_address",
                 })
@@ -2970,6 +2991,7 @@ async fn connect_inner(
                 runtime
                     .update(|state| state.at_cid = discovery.context_id)
                     .await;
+                pco_domains = discovery.domains;
                 for candidate in discovery.candidates {
                     if !bearer.settings.pcscf.contains(&candidate) {
                         bearer.settings.pcscf.push(candidate);
@@ -3036,6 +3058,17 @@ async fn connect_inner(
             )
             .await;
         ensure_generation(runtime, generation)?;
+        let dhcp_discovery = if request.requirements.pcscf_via_dhcp
+            == crate::hardware::devices::ims_bearer_policy::DhcpPcscfPolicy::InformationRequest {
+            verify_mm_task_bearer(runtime, native_bearer.as_mut()).await?;
+            let locals = bearer.settings.ordered_local_addrs(&plan);
+            let discovery = super::dhcp_pcscf::discover(&network_worker_binding,
+                &bearer.interface, &locals).await?;
+            ensure_generation(runtime, generation)?;
+            ensure_worker_binding_current(&network_worker_binding)?;
+            verify_mm_task_bearer(runtime, native_bearer.as_mut()).await?;
+            Some(discovery)
+        } else { None };
         let local_addrs = bearer.settings.ordered_local_addrs(&plan);
         if local_addrs.is_empty() {
             // The bearer connected but carries no address in a family the
@@ -3066,11 +3099,13 @@ async fn connect_inner(
                 .as_ref()
                 .map(|field| field.value.as_str());
             runtime.observe_diagnostics(|diagnostics| diagnostics.start_discovery()).await;
-            let pcscf_endpoints = match discover_pcscf_endpoints_with_transport_in_worker(
+            let pcscf_endpoints = match discover_pcscf_endpoints_with_discovery_in_worker(
                 &bearer.settings,
                 &device_identity.ims.home_domain,
                 configured_pcscf,
                 &device_identity.isim_pcscf,
+                &pco_domains,
+                dhcp_discovery.as_ref(),
                 local_addr,
                 &bearer.interface,
                 &worker,
@@ -9172,6 +9207,10 @@ fn ip_family_name(address: IpAddr) -> &'static str {
         "ipv4"
     }
 }
+
+#[cfg(test)]
+#[path = "live_bearer_policy_tests.rs"]
+mod bearer_policy_tests;
 
 #[cfg(test)]
 mod tests {

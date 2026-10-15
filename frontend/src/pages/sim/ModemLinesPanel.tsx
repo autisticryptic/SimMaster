@@ -1159,6 +1159,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         <Button
                           size="small"
                           variant="text"
+                          data-testid="vowifi-profile-config"
                           onClick={() => { if (canMutateLine(line.modem.line_id) && vowifiLine) setEditingVowifiLine(vowifiLine) }}
                           disabled={!vowifiLine || savingKey !== null}
                         >

@@ -19,6 +19,7 @@ pub mod qmi_proxy;
 pub mod recovery;
 pub mod sim;
 pub mod sim_ledger;
+mod wds_pcscf;
 
 static ACTIVE_NATIVE: std::sync::OnceLock<std::sync::Arc<native::NativeFleet>> =
     std::sync::OnceLock::new();

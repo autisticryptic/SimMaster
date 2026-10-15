@@ -13,6 +13,7 @@ use self::transport::{CellularDataTransport, ImsBearerTransport, TransportFuture
 
 pub mod baseband_faults;
 pub mod dji;
+pub mod ims_bearer_policy;
 pub mod pcsc;
 pub mod qcm410;
 pub mod quectel;

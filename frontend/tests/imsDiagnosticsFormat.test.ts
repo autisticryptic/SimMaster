@@ -1,7 +1,36 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import type { ImsRegistrationDiagnostics } from '../src/api/contracts.ts'
-import { diagnosticIdentity, diagnosticSource, diagnosticTransport, imsDiagnosticRows } from '../src/pages/sim/imsDiagnosticsFormat.ts'
+import type { EffectiveImsBearerPolicy, ImsBearerCapabilities, ImsRegistrationDiagnostics } from '../src/api/contracts.ts'
+import { carrierBearerUnchanged, diagnosticIdentity, diagnosticSource, diagnosticTransport, imsBearerCapabilityRows, imsBearerRequirementRows, imsDiagnosticRows, withoutBearerUpdate } from '../src/pages/sim/imsDiagnosticsFormat.ts'
+
+void test('bearer support is passive capability, unknown is not unsupported or ready', () => {
+  assert.ok(imsBearerCapabilityRows().every(({ value }) => value === '支持情况未知'))
+  const capabilities = { pap: 'supported', chap: 'unsupported', dhcp_information: 'unknown', auth_none: '__proto__' } as unknown as ImsBearerCapabilities
+  const rows = imsBearerCapabilityRows(capabilities)
+  assert.equal(rows.find(({ label }) => label === 'PAP')?.value, '适配器支持')
+  assert.equal(rows.find(({ label }) => label === 'CHAP')?.value, '适配器不支持')
+  assert.equal(rows.find(({ label }) => label === 'DHCP 信息请求')?.value, '支持情况未知')
+  assert.doesNotMatch(JSON.stringify(rows), /已注册|已就绪|__proto__/)
+})
+
+void test('bearer requirement projection never displays credential values and editor saves omit rather than replay redaction', () => {
+  const policy = { authentication: { method: 'pap', username_present: true, password_present: true,
+    username: 'SYNTHETIC_USER_DO_NOT_RENDER', password: 'SYNTHETIC_PASSWORD_DO_NOT_RENDER' },
+    pcscf_via_pco: 'required', pcscf_via_dhcp: 'disabled', source: 'sim_override' } as EffectiveImsBearerPolicy
+  const text = JSON.stringify(imsBearerRequirementRows(policy))
+  assert.match(text, /PAP/)
+  assert.match(text, /已保存 \/ 已保存/)
+  assert.doesNotMatch(text, /SYNTHETIC/)
+  const original = { bearer: policy, apn: 'ims', domain: 'ims.example.test' }
+  const write = withoutBearerUpdate(original)
+  assert.equal(Object.hasOwn(write, 'bearer'), false)
+  assert.equal(write.apn, 'ims')
+  assert.equal(write.domain, original.domain)
+  assert.equal(original.bearer, policy)
+  assert.equal(carrierBearerUnchanged(original), true)
+  assert.equal(carrierBearerUnchanged({}), undefined)
+  assert.doesNotMatch(JSON.stringify(write), /SYNTHETIC|authentication|bearer/)
+})
 
 function facts(overrides: Partial<ImsRegistrationDiagnostics> = {}): ImsRegistrationDiagnostics {
   return {

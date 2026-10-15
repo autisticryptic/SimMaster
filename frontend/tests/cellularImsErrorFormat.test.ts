@@ -21,6 +21,14 @@ await test('ordinary bearer failure and transient refresh diagnostics retain the
   assert.equal(cellularImsErrorMessage(null), null)
 })
 
+await test('explicit bearer requirements are not network registration failures or permission to downgrade', () => {
+  assert.equal(cellularImsErrorStatusLabel('cellular_ims_bearer_requirements_invalid'), 'IMS 承载要求无效')
+  assert.equal(cellularImsErrorStatusLabel('cellular_ims_bearer_requirements_unsupported'), '驱动不支持承载要求')
+  assert.match(cellularImsErrorMessage('cellular_ims_bearer_requirements_unsupported') ?? '', /不会丢弃要求/)
+  assert.equal(cellularImsErrorStatusLabel('cellular_ims_dhcp_pcscf_failed'), 'DHCP P-CSCF 发现失败')
+  assert.match(cellularImsErrorMessage('cellular_ims_dhcp_pcscf_failed') ?? '', /没有分配地址/)
+})
+
 await test('codes are matched as whole tokens, never as substrings', () => {
   // A known code embedded in a longer identifier is a different value.
   assert.equal(cellularImsErrorStatusLabel('cellular_ims_carrier_profile_missing_extra'), null)

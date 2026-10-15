@@ -1238,6 +1238,7 @@ pub struct StoredProfile {
     /// Where the row came from, such as a sealed catalog release.
     pub source: String,
     pub updated_at: String,
+    #[serde(serialize_with = "serialize_public_profile_record")]
     pub record: CarrierProfileRecord,
     #[serde(rename = "cellular_ims_ready", alias = "volte_ready")]
     pub cellular_ims_ready: bool,
@@ -1245,6 +1246,15 @@ pub struct StoredProfile {
     pub vilte_enabled: bool,
     pub smsoip_enabled: bool,
     pub ut_xcap_enabled: bool,
+}
+
+/// StoredProfile is an API envelope. Only this projection is redacted; the
+/// record's own serde remains private persistence and keeps both credentials.
+fn serialize_public_profile_record<S: serde::Serializer>(
+    record: &CarrierProfileRecord,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&record.sanitized(), serializer)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

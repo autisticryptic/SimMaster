@@ -39,7 +39,7 @@
 
 - **P-CSCF 传输已由 N6 验证。** worker 内 TCP/TLS、TCP/IPsec 四向选择器、原 authority 精确 TLS 身份、有界 DNS TCP/NAPTR D2T 接通；旧 UDP、来源/预算/跨 profile 防降级保持。TLS/IPsec 组合边界和实机验收仍须明确，不能把字段存在当作全组合支持。
 - **来源诊断已由 N7 软件验证。** 实际 profile/身份/domain/realm/端点、请求/授予族、报价/协商/响应认证、失败作用域和真实门禁已进入同源 API/原 GUI；epoch/serial 与弱 runtime 拒绝晚到写入。声明模板、收到的 Retry-After 与最近成功都不授予当前 readiness；实机未知值仍如实未知。
-- **承载能力门禁尚需补齐。** 显式 APN PAP/CHAP、通用 PCO request policy、PCO FQDN 和 DHCP adapter 需按设备能力报告 supported/unsupported/unknown；不能借普通数据 APN 激活或猜测凭据。协议支持和真实驱动验收分别完成。
+- **N8 承载能力正在验证前接线。** 已保留catalog/override显式认证、PCO/DHCP需求并在profile准备和每次family dispatch前门禁；Native QMI支持PAP/CHAP/BOTH、MBIM支持PAP/CHAP，原retained WDS client读取P-CSCF地址/域名，opt-in DHCP只请求信息。新API/原UI只投影能力与凭据存在标志，旧保存不得清空认证。尚未Actions；通用PCO策略写入、旧MM认证变更和DHCP地址分配明确unsupported，不借普通data APN或猜凭据。
 - **EC20 离线 catalog 来源尚未接入。** 在独立 `carrier_Bundles` 侧维护版本绑定的 MCFG extractor、选择器及字段证据；未知 `qp_ims_*` raw bytes 不得猜为 ready。跨项目实施范围另行明确。
 - **EC20 原生 IMS 只读观测 provider 尚未接入。** IMSA/注册/业务状态观测需明确与主机软 IMS 的 owner/互斥；可能写 NV 的 URC 开关不归入只读采证。
 - **固件函数级确认尚未进行。** 原报告已有解包/容器/载荷证据和字符串锚点，但配置优先级、结构版本、算法与失败回退的实际分支仍待证实；需要 IDA 时必须由用户手动启动并选定分析文件。

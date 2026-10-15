@@ -64,6 +64,7 @@ YAML写后重解析，保留未变注释；线路映射/业务历史不因重构
 - `Frontend Checks`：路径匹配时运行lint/类型/构建与隔离Playwright工作台回归。
 
 新Rust测试必须加入执行过滤器；仅`cargo test --no-run`通过不表示执行过测试。
+N8新增 `hardware::devices::ims_bearer_policy::tests`、`transport::capabilities::tests`、`backends::wds_pcscf::tests`/`io::tests::retained_wds_`，双接入profile/record/override与真实provider/family/worker/DHCP回归；全部须在Actions实际执行。承载能力是driver支持声明，不是网络授予或readiness；PCO reporting不等于profile request-policy。存储可含显式认证材料，但Debug/API/界面只能暴露方法与存在标志；GET/保存回复不得回显用户名或密码，旧客户端遗漏字段不可清空已存要求。
 过滤器选中0条应失败；下载日志逐名核验新增回归，避免只看绿色workflow。
 ISIM/端点/恢复第一批另包含 `qmi_uim::isim::tests`、`isim_binding_tests`、`uicc_ims::tests`、
 `vowifi::live::live_identity::tests`、`pcsc::ims::tests`、`cellular_ims::pcscf::endpoint::tests`、

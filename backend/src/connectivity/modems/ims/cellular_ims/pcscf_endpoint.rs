@@ -25,6 +25,7 @@ const DNS_TOTAL_TIMEOUT: Duration = Duration::from_secs(12);
 pub enum PcscfSource {
     Environment,
     BearerPco,
+    BearerDhcp,
     Profile,
     Isim,
     StandardDns,
@@ -235,18 +236,26 @@ pub(super) fn select_source(
     configured: Option<&str>,
     isim: &[String],
 ) -> Result<Selection, CellularImsError> {
+    select_source_with_discovery(environment, settings, configured, isim, &[], None)
+}
+
+/// Preserve existing source precedence. Retained-provider FQDNs belong to PCO,
+/// not to user configuration or the generic DNS search list. Explicit DHCP
+/// information is a fallback after the existing authored/ISIM sources.
+pub(super) fn select_source_with_discovery(
+    environment: Option<&str>,
+    settings: &ImsIpSettings,
+    configured: Option<&str>,
+    isim: &[String],
+    pco_domains: &[String],
+    dhcp: Option<&crate::hardware::devices::transport::ImsPcscfDiscovery>,
+) -> Result<Selection, CellularImsError> {
     if let Some(value) = environment {
         return Ok(Selection::Explicit(PcscfSource::Environment, parse_list(value)?));
     }
-    if !settings.pcscf.is_empty() {
-        if settings.pcscf.len() > MAX_CONFIGURED_TARGETS {
-            return Err(invalid("pco_endpoint_limit"));
-        }
+    if !settings.pcscf.is_empty() || !pco_domains.is_empty() {
         return Ok(Selection::Explicit(PcscfSource::BearerPco,
-            settings.pcscf.iter().map(|address| ParsedPcscfEndpoint {
-                host: PcscfHost::Address(*address), port: SIP_PORT, transport: PcscfTransport::Udp,
-                port_explicit: false, transport_explicit: false,
-            }).collect()));
+            discovery_targets(&settings.pcscf, pco_domains)?));
     }
     if let Some(value) = configured {
         return Ok(Selection::Explicit(PcscfSource::Profile, parse_list(value)?));
@@ -259,7 +268,30 @@ pub(super) fn select_source(
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(Selection::Explicit(PcscfSource::Isim, targets));
     }
+    if let Some(discovery) = dhcp.filter(|value| !value.candidates.is_empty() || !value.domains.is_empty()) {
+        let mut targets = discovery_targets(&discovery.candidates, &discovery.domains)?;
+        // RFC 3319: try domain-derived servers first, then the address list if
+        // none resolves/reaches a server. Preserve the server's order per list.
+        targets.rotate_left(discovery.candidates.len());
+        return Ok(Selection::Explicit(PcscfSource::BearerDhcp, targets));
+    }
     Ok(Selection::StandardDns)
+}
+
+fn discovery_targets(addresses: &[IpAddr], domains: &[String]) -> Result<Vec<ParsedPcscfEndpoint>, CellularImsError> {
+    if addresses.len().saturating_add(domains.len()) > MAX_CONFIGURED_TARGETS {
+        return Err(invalid("pco_endpoint_limit"));
+    }
+    let mut targets = addresses.iter().map(|address| ParsedPcscfEndpoint {
+        host: PcscfHost::Address(*address), port: SIP_PORT, transport: PcscfTransport::Udp,
+        port_explicit: false, transport_explicit: false,
+    }).collect::<Vec<_>>();
+    for domain in domains {
+        targets.push(ParsedPcscfEndpoint { host: PcscfHost::Name(hostname(domain)?),
+            port: SIP_PORT, transport: PcscfTransport::Udp,
+            port_explicit: false, transport_explicit: false });
+    }
+    Ok(targets)
 }
 
 #[derive(Clone, Copy)]

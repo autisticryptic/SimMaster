@@ -109,6 +109,10 @@ impl ImsBearerHandle for Qcm410ImsBearerHandle {
 pub struct Qcm410ImsBearer;
 
 impl ImsBearerTransport for Qcm410ImsBearer {
+    fn ims_bearer_capabilities(&self) -> crate::hardware::devices::transport::ImsBearerCapabilities {
+        crate::hardware::devices::transport::ImsBearerCapabilities::retained_mm()
+    }
+
     fn supports_owned_mm_profile_preparation(&self) -> bool {
         true
     }

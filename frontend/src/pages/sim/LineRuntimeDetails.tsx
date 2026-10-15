@@ -4,7 +4,7 @@ import Grid from '@mui/material/Grid'
 import type { AppEventEntry, CallRecord, SmsMessage, TrunkProfileResponse, CellularImsLineControlResponse, VowifiLineConfigResponse, VowifiRuntimeEventEntry } from '../../api/current'
 import { standardDerivedProfileMessage, cellularImsErrorMessage } from './cellularImsErrorFormat'
 import { diagnosticIdentity } from './imsDiagnosticsFormat'
-import { ImsExecutionDetails } from './ImsExecutionDetails'
+import { ImsBearerDetails, ImsExecutionDetails } from './ImsExecutionDetails'
 
 function Field({ label, value }: { label: string, value: ReactNode }) {
   return (
@@ -68,6 +68,7 @@ export function LineCellularImsDetails({ line }: { line: CellularImsLineControlR
       <Grid size={{ xs: 12, sm: 6 }}><Field label="身份来源" value={diagnosticIdentity(identity)} /></Grid>
       <Grid size={{ xs: 12, sm: 6 }}><Field label="运营商 profile" value={line.runtime.profile_id || '尚未匹配'} /></Grid>
       <Grid size={{ xs: 12, sm: 6 }}><Field label="ISIM" value={identity === 'isim' ? '已选用卡内身份' : identity !== 'unknown' ? '本次未选用 ISIM 身份' : line.runtime.isim_aid ? '已检测到应用，尚未确认选用' : '尚未确认 ISIM 身份'} /></Grid>
+      <Grid size={12}><ImsBearerDetails capabilities={line.bearer_capabilities} /></Grid>
       {facts?.observed && <Grid size={12}><ImsExecutionDetails facts={facts} access="cellular" /></Grid>}
       {fallbackMessage && <Grid size={12}><Alert severity="warning">{fallbackMessage}</Alert></Grid>}
       {displayError && <Grid size={12}><Alert severity="warning">{displayError}</Alert></Grid>}

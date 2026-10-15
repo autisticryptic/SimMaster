@@ -20,4 +20,10 @@ docs {
   requested/granted family, endpoint transport, offered/accepted security and real waiting.
   Negotiation history never grants current readiness; no identity or authentication values
   are included in diagnostics. Reading diagnostics does not request a reconnect.
+
+  Optional data.bearer_capabilities reports passive adapter support: auth_none, pap,
+  chap, pap_or_chap, pco_request_policy, pco_pcscf_addresses, pco_pcscf_domains,
+  dhcp_information. Values are supported/unsupported/unknown, NOT current readiness.
+  An absent field (including startup-blocked inventory) means unknown, not unsupported.
+  GET does not establish a bearer or probe these capabilities.
 }

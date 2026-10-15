@@ -64,6 +64,9 @@ pub mod code {
     pub const HEX_INVALID: &str = "cellular_ims_hex_invalid";
 
     // Bearer / modem / P-CSCF.
+    pub const BEARER_REQUIREMENTS_INVALID: &str = "cellular_ims_bearer_requirements_invalid";
+    pub const BEARER_REQUIREMENTS_UNSUPPORTED: &str = "cellular_ims_bearer_requirements_unsupported";
+    pub const DHCP_PCSCF_FAILED: &str = "cellular_ims_dhcp_pcscf_failed";
     pub const RUNTIME_MM_BEARER_ROAMING_FORBIDDEN: &str =
         "cellular_ims_runtime_mm_bearer_roaming_forbidden";
     pub const RUNTIME_MM_BEARER_NOT_CONNECTED: &str =
@@ -295,6 +298,8 @@ pub mod code {
         BEARER_NETDEV_NOT_READY,
         BEARER_NETDEV_NOT_UP,
         BEARER_NETDEV_RUNTIME_ERROR,
+        BEARER_REQUIREMENTS_INVALID,
+        BEARER_REQUIREMENTS_UNSUPPORTED,
         BEARER_SESSION_LOST,
         CARRIER_IMS_APN_MISSING,
         CARRIER_PROFILE_MISSING,
@@ -347,6 +352,7 @@ pub mod code {
         DEGRADED,
         DEPENDENCY_MISSING_IP,
         DERIVED_PROFILE_ID_NOT_ALLOWED,
+        DHCP_PCSCF_FAILED,
         DIGEST_ALGORITHM_UNSUPPORTED,
         DIGEST_CHALLENGE_MISSING,
         DIGEST_NONCE_DECODE_FAILED,
@@ -587,7 +593,7 @@ mod tests {
         // Keep in step with the `pub const` count in `mod code`.
         assert_eq!(
             code::ALL.len(),
-            177,
+            180,
             "code::ALL is out of sync with mod code"
         );
         let mut seen = std::collections::BTreeSet::new();
