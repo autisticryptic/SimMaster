@@ -171,7 +171,7 @@ fn dhcp_information_preserves_original_source_precedence() {
     let settings = settings();
     let dhcp = crate::hardware::devices::transport::ImsPcscfDiscovery {
         candidates: vec!["192.0.2.25".parse().unwrap()], domains: vec!["dhcp.example.test".into()],
-        context_id: None, source: "dhcp_information",
+        ipv6_complete: true, context_id: None, source: "dhcp_information",
     };
     for (configured, isim, expected) in [
         (Some("192.0.2.22"), vec![], PcscfSource::Profile),

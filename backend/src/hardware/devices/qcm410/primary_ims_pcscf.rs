@@ -454,6 +454,7 @@ where
             }
             return Ok(ImsPcscfDiscovery {
                 domains: Vec::new(),
+                ipv6_complete: true,
                 candidates,
                 context_id: Some(cid),
                 source,

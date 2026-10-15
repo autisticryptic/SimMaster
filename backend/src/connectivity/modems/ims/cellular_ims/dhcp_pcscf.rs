@@ -311,7 +311,7 @@ fn push_v6(packet: &mut Vec<u8>, code: u16, value: &[u8]) {
 }
 
 fn discovery() -> ImsPcscfDiscovery {
-    ImsPcscfDiscovery { candidates: Vec::new(), domains: Vec::new(), context_id: None, source: "dhcp_information" }
+    ImsPcscfDiscovery { candidates: Vec::new(), domains: Vec::new(), ipv6_complete: true, context_id: None, source: "dhcp_information" }
 }
 
 fn complete(result: ImsPcscfDiscovery) -> DecodeResult<ImsPcscfDiscovery> {

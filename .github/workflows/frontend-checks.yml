@@ -74,7 +74,7 @@ jobs:
       - name: Install isolated browser
         run: pnpm exec playwright install --with-deps chromium
 
-      - name: Verify original workbench recovery and execution diagnostics
+      - name: Verify original workbench recovery, diagnostics and bearer policies
         run: pnpm exec playwright test --config playwright.lines.config.ts
 
       - uses: actions/upload-artifact@v4

@@ -737,7 +737,7 @@ impl ImsBearerHandle for NativeHandle {
                     ImsBearerErrorKind::SessionLost));
             }
             let mut discovery = ImsPcscfDiscovery { candidates: Vec::new(), domains: Vec::new(),
-                context_id: None, source: "retained_wds_current_settings" };
+                ipv6_complete: false, context_id: None, source: "retained_wds_current_settings" };
             let mut observed = false;
             for client in &session.clients {
                 let cid = client.cid.filter(|cid| *cid != 0 && *cid != 255)
@@ -768,8 +768,9 @@ impl ImsBearerHandle for NativeHandle {
                         ImsBearerErrorKind::SessionLost));
                 }
             }
-            // Empty-but-observed is authoritative absence, not permission to
-            // query another client. Only true unsupported keeps legacy AT.
+            // Empty-but-observed covers only the pinned IPv4/FQDN schema.
+            // The strategy supplements numeric IPv6 from its existing exact
+            // association, never an arbitrary modem/client lookup.
             Ok(observed.then_some(discovery))
         })
     }

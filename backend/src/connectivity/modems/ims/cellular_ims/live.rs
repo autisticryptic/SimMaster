@@ -2948,6 +2948,7 @@ async fn connect_inner(
                 .map(|discovery| ImsPcscfDiscovery {
                     candidates: discovery.candidates,
                     domains: Vec::new(),
+                    ipv6_complete: true,
                     context_id: Some(discovery.cid),
                     source: "at_cgcontrdp_exact_address",
                 })

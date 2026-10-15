@@ -112,8 +112,9 @@ impl NativeImsBearer {
             .map_err(cellular_ims_error_from_ims_bearer)
     }
 
-    /// Use the retained provider's association if supported. Only an explicit
-    /// unsupported result permits the legacy exact-address observation.
+    /// Use the retained provider's association if supported. Only explicit
+    /// unsupported, or a declared IPv4-only observation on an IPv6 grant,
+    /// permits the original exact-address observation. Errors never do.
     pub async fn discover_pcscf<F, Fut>(
         &mut self,
         exact_at_fallback: F,
@@ -128,6 +129,7 @@ impl NativeImsBearer {
                 code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
             ));
         }
+        let ipv6_granted = self.connection.settings.ipv6_address.is_some();
         let provider = self.handle.discover_pcscf().await;
         self.check_liveness()?;
         if !self.worker_binding_is_current() {
@@ -136,6 +138,21 @@ impl NativeImsBearer {
             ));
         }
         let result = match provider {
+            Ok(Some(mut discovery)) if ipv6_granted && !discovery.ipv6_complete => {
+                match exact_at_fallback().await {
+                    Ok(supplement) => {
+                        for address in supplement.candidates.into_iter().filter(IpAddr::is_ipv6) {
+                            if !discovery.candidates.contains(&address) { discovery.candidates.push(address); }
+                        }
+                        discovery.ipv6_complete = true;
+                        discovery.context_id = supplement.context_id;
+                        discovery.source = "retained_wds_with_exact_ipv6";
+                        Ok(discovery)
+                    }
+                    Err(error) if error.code() == code::RUNTIME_ALL_PCSCF_FAILED => Ok(discovery),
+                    Err(error) => Err(error),
+                }
+            }
             Ok(Some(discovery)) => Ok(discovery),
             Ok(None) => exact_at_fallback().await,
             Err(error) => Err(cellular_ims_error_from_ims_bearer(error)),
@@ -841,9 +858,61 @@ mod tests {
     fn discovered(source: &'static str) -> ImsPcscfDiscovery {
         ImsPcscfDiscovery {
             domains: Vec::new(),
+            ipv6_complete: true,
             candidates: vec!["192.0.2.20".parse().unwrap()],
             context_id: Some(2),
             source,
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_wds_observation_preserves_exact_ipv6_without_replacing_domains() {
+        for ipv6_granted in [false, true] {
+            let mut partial = discovered("retained_wds_current_settings");
+            partial.ipv6_complete = false;
+            partial.domains = vec!["pcscf.example.test".into()];
+            let handle = PcscfHandle { result: Some(Ok(Some(partial.clone()))),
+                alive: Arc::new(AtomicBool::new(true)), calls: Arc::new(AtomicUsize::new(0)),
+                lose_during_read: false };
+            let mut info = reference_info();
+            info.ipv4_address = Some("192.0.2.2".parse().unwrap());
+            info.ipv6_address = ipv6_granted.then(|| "2001:db8::2".parse().unwrap());
+            let mut bearer = adopt_bearer(info, Box::new(handle)).await.unwrap();
+            let calls = AtomicUsize::new(0);
+            let result = bearer.discover_pcscf(|| async {
+                calls.fetch_add(1, Ordering::AcqRel);
+                let mut exact = discovered("at_cgcontrdp_exact_address");
+                exact.candidates = vec!["192.0.2.99".parse().unwrap(), "2001:db8::20".parse().unwrap()];
+                Ok(exact)
+            }).await.unwrap();
+            assert_eq!(calls.load(Ordering::Acquire), if ipv6_granted { 1 } else { 0 });
+            assert_eq!(result.domains, partial.domains);
+            assert_eq!(result.candidates.contains(&"2001:db8::20".parse().unwrap()), ipv6_granted);
+            assert!(!result.candidates.contains(&"192.0.2.99".parse().unwrap()), "IPv4 is already covered by retained WDS");
+            assert_eq!(result.ipv6_complete, ipv6_granted);
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_ipv6_supplement_cannot_mask_binding_loss_or_clear_valid_pco() {
+        for error_code in [code::RUNTIME_ALL_PCSCF_FAILED, code::BEARER_SESSION_LOST] {
+            let mut partial = discovered("retained_wds_current_settings");
+            partial.ipv6_complete = false;
+            partial.domains = vec!["pcscf.example.test".into()];
+            let handle = PcscfHandle { result: Some(Ok(Some(partial.clone()))),
+                alive: Arc::new(AtomicBool::new(true)), calls: Arc::new(AtomicUsize::new(0)),
+                lose_during_read: false };
+            let mut info = reference_info();
+            info.ipv6_address = Some("2001:db8::2".parse().unwrap());
+            let mut bearer = adopt_bearer(info, Box::new(handle)).await.unwrap();
+            let result = bearer.discover_pcscf(|| async { Err(CellularImsError::new(error_code)) }).await;
+            if error_code == code::RUNTIME_ALL_PCSCF_FAILED {
+                let result = result.unwrap();
+                assert_eq!(result.domains, partial.domains);
+                assert!(!result.ipv6_complete);
+            } else {
+                assert_eq!(result.unwrap_err().code(), code::BEARER_SESSION_LOST);
+            }
         }
     }
 

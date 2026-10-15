@@ -133,6 +133,7 @@ async fn real_native_handle_reads_only_retained_client_without_resource_mutation
     assert_eq!(found.candidates, vec!["192.0.2.20".parse::<IpAddr>().unwrap()]);
     assert_eq!(found.domains, vec!["pcscf.example.test"]);
     assert_eq!(found.source, "retained_wds_current_settings");
+    assert!(!found.ipv6_complete, "the pinned WDS schema must not suppress existing IPv6 observation");
     assert_eq!(*io.pcscf_calls.lock().unwrap(), vec![17]);
     assert_eq!(*io.requests.lock().unwrap(), before);
     assert_eq!(*io.receipts.lock().unwrap(), receipts);

@@ -342,7 +342,7 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 - `pcscf_via_dhcp=disabled/information_request`默认关闭；显式启用只在已授予并已配置的原UE接口上发送DHCPINFORM/INFORMATION-REQUEST，不分配地址、不安装默认路由或替换DNS。DHCP地址配置、PPP等仍不得伪装静态授予。
 - driver返回`supported/unsupported/unknown`；Native QMI支持PAP/CHAP/BOTH与明确none，MBIM支持PAP/CHAP/none但不猜BOTH。旧MM认证变更未接owned-profile凭据readback，明确unsupported。支持声明不是当前订阅开通、实际授予或readiness。
 - 需求在profile创建/reporting前和每次family dispatch前验证；显式要求失败阻止继续family/profile，不丢字段退APN-only。APN改变时不能将catalog凭据隐式转给另一个APN，须同时明确整个bearer覆写。
-- QMI P-CSCF只在原retained WDS CID上查询`0x002d`/mask`0x1800`，严格解析`0x23` IPv4列表和`0x24`域名；不分配/释放其他client、不把generic Domains或IPv6地址TLV冒认P-CSCF。控制口/proxy归属和原worker前后核验，已移入UE的网卡不从宿主机重新认领。
+- QMI P-CSCF只在原retained WDS CID上查询`0x002d`/mask`0x1800`，严格解析`0x23` IPv4列表和`0x24`域名；不分配/释放其他client、不把generic Domains或IPv6地址TLV冒认P-CSCF。声明该查询不覆盖数值IPv6，IPv6授予保留原exact-address AT补充观察，不因空/IPv4返回而丢失原IPv6来源；真正owner/协议查询错误不转AT。控制口/proxy归属和原worker前后核验，已移入UE的网卡不从宿主机重新认领。
 - 域名在原承载DNS解析并保留TLS authority。默认来源顺序不变；DHCP信息位于原PCO/profile/ISIM后、标准DNS前，其域名优先于地址。DHCP有总时限/消息/长度/事务与客户端标识门禁；IPv4仅接受直接服务端和client-ID echo，未知relay不猜信任。
 - API/原工作台只返回方法、凭据存在标志、来源和driver能力；Debug、profile详情、覆写和保存响应均不得回显用户名/密码。旧编辑器省略bearer字段时保留原存储；显式clear/replace与脱敏结果回写必须区分，不能把脱敏对象当有效凭据或混用别的SIM/profile。
 

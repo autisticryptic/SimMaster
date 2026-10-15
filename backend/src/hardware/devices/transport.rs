@@ -134,6 +134,10 @@ pub struct ImsPcscfDiscovery {
     /// Only P-CSCF-specific FQDNs from the retained provider/DHCP response;
     /// generic DNS search domains must never enter this list.
     pub domains: Vec<String>,
+    /// False only for an adapter whose pinned schema cannot report numeric
+    /// IPv6 P-CSCF. A granted IPv6 bearer must retain its original exact-address
+    /// observation as a supplement; a successful partial query is not absence.
+    pub ipv6_complete: bool,
     pub context_id: Option<u8>,
     pub source: &'static str,
 }

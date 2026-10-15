@@ -42,6 +42,11 @@ class BearerCapabilitiesBoundary(unittest.TestCase):
         verify = io[io.index('async fn verify_retained_wds_endpoint('):io.index('async fn verify(&self,')]
         self.assertIn('self.verify(&endpoint.control_device)', verify)
         self.assertNotIn('/sys/class/net', verify, 'retained netdev has moved to the worker')
+        native = (HW / 'cellular/backends/bearer.rs').read_text()
+        self.assertIn('ipv6_complete: false', native)
+        strategy = (IMS / 'cellular_ims/native_bearer.rs').read_text()
+        self.assertIn('if ipv6_granted && !discovery.ipv6_complete', strategy)
+        self.assertIn('Err(error) => Err(cellular_ims_error_from_ims_bearer(error))', strategy)
 
     def test_dhcp_is_opt_in_information_only_in_captured_worker(self):
         live = (IMS / 'cellular_ims/live.rs').read_text()
