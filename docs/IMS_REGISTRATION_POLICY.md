@@ -335,7 +335,7 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 - 原工作台详情内增加可选只读折叠区；旧响应无字段仍可显示。Bruno `get_ims_status` 是被动查询；既有 `get_vowifi_status?live=true` 保留原显式探测语义，不能把所有 GET 都称为无副作用。
 - R1 刷新423预算、R2普通WiFi等待均已软件验证；诊断字段绝不作为授权重试或保留租期的控制输入。真实网络与驱动硬件验收仍独立。
 
-### 显式承载要求与驱动能力（N8，已接线待 Actions）
+### 显式承载要求与驱动能力（N8，22646c8 已软件验证）
 
 - `CarrierProfileRecord.ims.bearer`与SIM覆写`ims_cellular.bearer`保存完整原子要求：`authentication.method`为`unspecified/none/pap/chap/pap_or_chap`，PAP/CHAP需显式用户名和密码；显式空密码与缺失不同。不从AKA或普通data APN借凭据。默认`unspecified`保留旧行为，`none`必须由实际adapter执行，不能等同未知。
 - `pcscf_via_pco=network_default/required/disabled`描述modem profile请求策略；只有自有profile、readback/回滚实现才可承诺。当前Native/MM均明确拒绝非default，不用reporting开关伪装实现。catalog的既有`pcscf_discovery`只是来源提示，不升级为强制写入。

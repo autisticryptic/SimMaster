@@ -6,7 +6,7 @@
 
 ## 当前基线与工作规则
 
-- 当前已验证源码基线为 `c3fb036`：R2 WiFi真实等待/原租期/计数/worker及撤销竞态通过两套Actions、双架构、各304项相关回归/四矩阵和官方制品核验；R1/N7及更早保护保持。前端输入与N7已验证的43单测/3browser相同，原证据独立复核。**继续 N8、相关扩展与最终固件复审，未部署**，见 [HANDOFF](HANDOFF.md)。
+- 当前已验证源码基线为 **`22646c8`**：N8承载需求/driver门禁、Native认证、原CID P-CSCF域名与原IPv6观察、worker DHCP信息请求、API/原UI脱敏和旧保存兼容；三工作流/双架构、各417项相关回归/86场景、46单测/4browser及官方制品/源码/截图已核验。R1/R2与此前保护保持，**相关扩展与最终固件复审未完成，未部署**，见 [HANDOFF](HANDOFF.md)。
 - 设备历史基线仍为全局兜底修复 `c174551`，已通过 Actions 和 410 原 Globe 配置的初始注册验收。
   `7bd` 的运营商专用补丁及测试仍保持由 `0502395` 撤销的状态；当前成功不能替代中国移动同卡验收。
 - **当前优先级是继续原 EC20 审查中的第二批协议补强，而不是把第一批当作整个委托结束。** 同卡/自然续期验收与停服时的 MM 重枚举/AT 超时调查独立保留，设备操作另需明确授权。
@@ -33,13 +33,13 @@
 - 已验证 AUTS/stale 与 423 的剩余限制：WiFi 初次认证后的 423 明确 unsupported；需要新安全上下文的受保护 stale 不重装旧 ESP；非 REGISTER 业务的响应认证/恢复需单独核对。
 - 蜂窝刷新 423→400/新鉴权后400的预算补漏已由 `b6a7888` 验证；后续需保持结构化门禁、Min-Expires来源和旧通道/租期/计数，不回到末次状态猜测。
 - R2 普通 WiFi 等待已由 `c3fb036` 软件验证，包含初次/刷新/注销/API门禁、同卡预算连续性、原租期保留和reg-event撤销竞态；实机仍未验收，不能由CI推断实际运营商接受情况。
-- N7/R1/R2 已完成 CI/制品闭环；继续 N8 承载能力/相关扩展 → 完整离线 EC20 复审，不能把“已有算法/helper”当成生产路径接通。
+- N1～N8、R1/R2 已完成软件 CI/制品闭环；继续相关扩展 → 完整离线 EC20 复审，不能把软件绿灯当实机验收或固件所有分支已确认。
 
 ## P1：原报告的传输与功能扩展（部分基础已具备）
 
 - **P-CSCF 传输已由 N6 验证。** worker 内 TCP/TLS、TCP/IPsec 四向选择器、原 authority 精确 TLS 身份、有界 DNS TCP/NAPTR D2T 接通；旧 UDP、来源/预算/跨 profile 防降级保持。TLS/IPsec 组合边界和实机验收仍须明确，不能把字段存在当作全组合支持。
 - **来源诊断已由 N7 软件验证。** 实际 profile/身份/domain/realm/端点、请求/授予族、报价/协商/响应认证、失败作用域和真实门禁已进入同源 API/原 GUI；epoch/serial 与弱 runtime 拒绝晚到写入。声明模板、收到的 Retry-After 与最近成功都不授予当前 readiness；实机未知值仍如实未知。
-- **N8 承载能力正在验证前接线。** 已保留catalog/override显式认证、PCO/DHCP需求并在profile准备和每次family dispatch前门禁；Native QMI支持PAP/CHAP/BOTH、MBIM支持PAP/CHAP，原retained WDS client读取P-CSCF地址/域名，opt-in DHCP只请求信息。新API/原UI只投影能力与凭据存在标志，旧保存不得清空认证。尚未Actions；通用PCO策略写入、旧MM认证变更和DHCP地址分配明确unsupported，不借普通data APN或猜凭据。
+- **N8承载门禁/有证据适配已由22646c8验证。** catalog/override要求在profile准备及每次family dispatch前验证；Native QMI支持PAP/CHAP/BOTH/none、MBIM支持PAP/CHAP/none，原WDS client只读IPv4/FQDN并保留原IPv6 exact-address观察，opt-in DHCP仅信息请求。API/原UI只投影能力和凭据存在标志，旧保存不清空认证。通用PCO策略写入、旧MM认证变更和DHCP地址分配仍unsupported；这些组合与实机验收不得由现有绿灯推断支持。
 - **EC20 离线 catalog 来源尚未接入。** 在独立 `carrier_Bundles` 侧维护版本绑定的 MCFG extractor、选择器及字段证据；未知 `qp_ims_*` raw bytes 不得猜为 ready。跨项目实施范围另行明确。
 - **EC20 原生 IMS 只读观测 provider 尚未接入。** IMSA/注册/业务状态观测需明确与主机软 IMS 的 owner/互斥；可能写 NV 的 URC 开关不归入只读采证。
 - **固件函数级确认尚未进行。** 原报告已有解包/容器/载荷证据和字符串锚点，但配置优先级、结构版本、算法与失败回退的实际分支仍待证实；需要 IDA 时必须由用户手动启动并选定分析文件。

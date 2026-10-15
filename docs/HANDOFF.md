@@ -10,16 +10,16 @@
 4. 2026-10-07 的 410 部署属于已结束的历史授权；本轮只实施 IMS 补全和 Actions 验证，**未部署、未访问设备，也不主动连接 IDA**。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：N8 承载能力已接线，待 Actions 验证
+## 当前：N8 承载能力已验证，继续扩展与固件复审
 
-N8 从 `577bd363` 接续：类型化APN认证/PCO/DHCP需求、driver前置门禁、Native QMI/MBIM认证、原WDS client只读P-CSCF域名与opt-in DHCP信息请求已接线；API/原工作台保留旧保存意图并脱敏凭据。当前321项静态/mock通过，**新增代码尚未编译/CI验证**；通用PCO策略写入、MM认证变更和DHCP地址分配不冒称支持，未操作设备/IDA。
+N8 **`22646c8df7f8d50c991d2b4910e49e28af8bee70`** 已通过 Build **38675465347**、Beta **38675465477**、Frontend **38675465467** 与双架构构建；两套官方测试ZIP各 **417项相关回归/86场景**、前端 **46单测/4browser**、17份源码指纹/摘要/原工作台截图已核验，报告`.local/evidence/ims-bearer-capabilities/verified-22646c8.json`。321静态/mock通过。认证需求/driver门禁、原CID P-CSCF地址/域名、保留原IPv6观察、opt-in DHCP信息请求、API脱敏/旧保存兼容均接通；browser首轮断言错误已修复留证。通用PCO策略写入、MM认证变更及DHCP地址分配仍明确unsupported，未部署/设备/IDA。
 
 R2 最终代码 **`c3fb0361853388ebe551f50657a8786a1155a877`** 已通过 [Build-Release 38520139107](https://github.com/autisticryptic/SimMaster/actions/runs/38520139107)、[Validate Beta 38520139336](https://github.com/autisticryptic/SimMaster/actions/runs/38520139336) 与 ARM64/AMD64；Release skipped。两套官方测试 ZIP 各逐名核验 **304 项相关回归**及四矩阵 86 场景，报告 `.local/evidence/ims-wifi-retry/verified-c3fb036.json`，316 项本机静态/mock 通过。前端输入与 N7 相同，旧 43单测/3browser 制品与源码已复核，不冒称本轮新跑 browser。未部署/程序包或实网验收。
 
 - WiFi 初次端点/头型、刷新、注销、profile batch/重连均执行同卡 not-before；端点地址、原 worker、租期和结构化失败与诊断分开。等待只保留到原截止，TCP死流/身份拒绝不因此保留。
 - API 按实际发送结果计失败轮次，轮询不增次数；清理保留已耗计数，只消费重建pending动作。换卡须正向确认，控制端口/worker变化不清等待。reg-event独立撤销serial防止晚到刷新重授旧ready。
 - 首轮过宽分类误关认证前404，已恢复原分类而保留真正的等待/认证后/423/死流门禁；旧测试未改且两套最终日志均通过，新增真实controller404回归。失败ZIP、annotations与`failure-closeout.json`保留。
-- **接着 N8：驱动声明的 APN PAP/CHAP、PCO 请求/FQDN、DHCP 能力与适配；然后相关 catalog/provider 和完整 EC20 固件复审。** 不按未知raw bytes猜能力，不凭当前CI冒称所有兜底完成。
+- **N8已完成软件验证；接着核定相关 catalog/provider 扩展并完整复审 EC20 固件。** 不按未知raw bytes猜能力，不凭当前CI冒称所有兜底和固件分支已确认。
 
 ## 已验证：R1 刷新预算
 
@@ -60,7 +60,7 @@ N5 代码 **`3d54aa87b1cc0ae5f2294991a46ad2ce43984e6a`** 已通过 [Build-Releas
 
 上一阶段 AUTS/stale/跨候选 423 在 `344308c` 已验证；两套 Actions（[38138978950](https://github.com/autisticryptic/SimMaster/actions/runs/38138978950)、[38138978978](https://github.com/autisticryptic/SimMaster/actions/runs/38138978978)）各核验 46 项相关回归和四矩阵。独立 AKA 来源、受保护 stale 不重装旧 ESP、AUTS 不冒充证明、423 尝试级预算均保持；WiFi 初次认证后 423 仍明确 unsupported。
 
-**完整补全任务尚未完成。** N4～N7 与 R1/R2 已验证；N8 承载能力、相关扩展与最终固件复审继续推进。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界，见[开发计划](DEVELOPMENT_PLAN.md)。
+**完整补全任务尚未完成。** N1～N8 与 R1/R2 已软件验证；相关扩展与最终固件复审继续推进。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界，见[开发计划](DEVELOPMENT_PLAN.md)。
 
 ## 第一批：ISIM、P-CSCF 与临时拒绝补全
 
