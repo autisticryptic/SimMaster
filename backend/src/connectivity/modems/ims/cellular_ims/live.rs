@@ -5042,6 +5042,13 @@ async fn refresh_live_registration(
             crate::connectivity::core::register::run_register_observed_with_budget(
                 &mut session.channel, &initial, &mut authenticator, &mut lease_budget,
             ).await;
+        // Every emitted transaction consumes its counters even when the
+        // post-response owner/material check rejects an otherwise valid 2xx.
+        // Preserve only the ORIGINAL association, not pending AKA/nextnonce.
+        session.next_register_cseq = advance_register_cseq(session.next_register_cseq, authenticator.last_cseq);
+        if let Some(authorization) = authenticator.refresh_authorization_after_failure() {
+            session.refresh_authorization = Some(authorization);
+        }
         if let Err(error) = verify_mm_task_bearer(runtime, session.native_bearer.as_mut()).await {
             authenticator.rollback_security(&mut session.channel).await;
             return lost_refresh_attempt(error);
@@ -5054,10 +5061,6 @@ async fn refresh_live_registration(
             authenticator.rollback_security(&mut session.channel).await;
             return lost_refresh_attempt(CellularImsError::new(error.code()));
         }
-        // RFC 3261 requires monotonically increasing REGISTER CSeq values for
-        // one Call-ID. A timeout still consumed the emitted CSeq.
-        session.next_register_cseq =
-            advance_register_cseq(session.next_register_cseq, authenticator.last_cseq);
         let registration = match registration_result {
             Ok(registration) => registration,
             Err(failure) => {

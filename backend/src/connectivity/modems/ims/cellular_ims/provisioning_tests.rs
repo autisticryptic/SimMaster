@@ -41,6 +41,7 @@ async fn same_card_ef_update_blocks_refresh_before_nonce_sa_or_wire_changes() {
 async fn ef_update_during_success_never_commits_new_lease_or_nextnonce() {
     let (mut session, runtime, server, _client) = fixture().await;
     let old = session.registration.clone();
+    let old_cseq = session.next_register_cseq;
     session.channel.reserve_security_ports_for_test(session.security_binding.port_s);
     let card = session.auth_binding.clone().unwrap(); let modem = session.device.modem_id.clone();
     let sender = tokio::spawn(async move {
@@ -57,6 +58,7 @@ async fn ef_update_during_success_never_commits_new_lease_or_nextnonce() {
     assert_eq!(session.registration, old);
     assert_eq!(session.refresh_authorization.as_ref().unwrap().challenge.nonce, "old-nonce");
     assert_eq!(session.refresh_authorization.as_ref().unwrap().nonce_count, 3);
+    assert_eq!(session.next_register_cseq, old_cseq + 1);
     quiet(&server).await;
 }
 
