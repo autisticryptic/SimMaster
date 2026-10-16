@@ -42,7 +42,12 @@ fn logical_endpoint(factory: &VowifiUnregisterFactory) -> SocketAddr {
 fn assert_zero_expiry(request: &[u8]) {
     assert!(request.starts_with(b"REGISTER "));
     assert_eq!(sip_frame::header_value(request, "Expires").as_deref(), Some("0"));
-    assert!(sip_frame::header_value(request, "Contact").unwrap().contains("expires=0"));
+    // RFC 3261 permits the binding expiry to come from the global Expires
+    // header. A Contact override is optional, but must not retain a lease.
+    let contact = sip_frame::header_value(request, "Contact").unwrap();
+    for expires in contact.split(';').filter_map(|part| part.trim().strip_prefix("expires=")) {
+        assert_eq!(expires.trim_matches('"'), "0");
+    }
     assert_eq!(sip_frame::header_value(request, "Security-Verify").as_deref(), Some(VERIFY));
 }
 
