@@ -243,6 +243,7 @@ jobs:
             connectivity::modems::ims::uicc_ims::tests \
             connectivity::modems::ims::vowifi::live::stale_tests \
             connectivity::modems::ims::vowifi::live::response_auth_tests \
+            connectivity::modems::ims::vowifi::live::response_auth_tests::initial_min_expires_tests \
             connectivity::modems::ims::vowifi::eap_aka::tests \
             connectivity::modems::ims::vowifi::live::live_identity::tests \
             connectivity::modems::ims::cellular_ims::register_retry::tests \

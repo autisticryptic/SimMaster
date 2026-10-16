@@ -5828,10 +5828,11 @@ async fn run_register_exchange_on_connected_stream(
     let mut authenticator = VowifiRegisterAuthenticator {
         line_id,
         profile,
-        gateway,
+        gateway: Some(gateway),
         context: &mut context,
         variant,
         last_security_server: None,
+        last_security_verify: None,
         resync_sent: false,
         last_error: None,
     };
@@ -5888,16 +5889,21 @@ async fn run_register_exchange_on_connected_stream(
 struct VowifiRegisterAuthenticator<'a> {
     line_id: &'a str,
     profile: &'static CarrierProfile,
-    gateway: &'a TunGatewayRuntime,
+    /// Needed only when a challenge installs a NEW gateway ESP policy.
+    /// An already retained protected channel or direct AKA exchange needs no
+    /// gateway mutation; missing support cannot trigger an unprotected fallback.
+    gateway: Option<&'a TunGatewayRuntime>,
     context: &'a mut LiveRegisterRequestContext,
     variant: LiveRegisterHeaderVariant,
     last_security_server: Option<(Vec<String>, Vec<LiveSecurityServerOffer>)>,
+    last_security_verify: Option<String>,
     resync_sent: bool,
     last_error: Option<LiveStageError>,
 }
 
 impl RegisterAuthenticator<SipChannel> for VowifiRegisterAuthenticator<'_> {
     fn validate_request(&self, request: &[u8]) -> Result<(), ImsError> {
+        self.context.verify_worker(self.line_id)?;
         validate_live_register_request(self.context.refresh_authorization.as_ref(), request)
     }
 
@@ -5952,7 +5958,13 @@ impl RegisterAuthenticator<SipChannel> for VowifiRegisterAuthenticator<'_> {
         .await;
 
         match exchange {
-            Ok(response) => Ok(Some(response.into_bytes())),
+            Ok(response) => {
+                // A protected 401/407/423 returns the ACTUAL channel rather
+                // than rebuilding its ESP mapping. Keep only that channel's
+                // verified security header for the shared lease retry builder.
+                self.last_security_verify = channel.security_verify().map(str::to_owned);
+                Ok(Some(response.into_bytes()))
+            }
             Err(error) => {
                 let registration_loss = classify_vowifi_register_error(error.reason.as_str());
                 let shared_code = live_digest_error_code(&error.reason)
@@ -5983,12 +5995,16 @@ impl RegisterAuthenticator<SipChannel> for VowifiRegisterAuthenticator<'_> {
         authenticated: bool,
     ) -> Result<Vec<u8>, ImsError> {
         if authenticated {
-            // Authenticated 423 retries are handled inside the adapter-owned
-            // exchange so the ESP-protected channel is reused; rebuilding over
-            // the plain channel here would drop the security association.
-            return Err(ImsError::new(
-                "ims_register_authenticated_min_expires_unsupported",
-            ));
+            self.context.verify_worker(self.line_id)?;
+            self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?
+                .verify(self.line_id).await.map_err(ImsError::new)?;
+            self.context.verify_worker(self.line_id)?;
+            let request = rebuild_initial_authenticated_register(
+                self.context, self.profile, self.variant, cseq, min_expires,
+                self.last_security_verify.as_deref(),
+            )?;
+            self.context.diagnostic_scope.offer(&request, self.context.refresh_authorization.as_ref()).await;
+            return Ok(request);
         }
         // Re-send the same initial shape (including its empty-AKA
         // Authorization, if any) with a lease that satisfies Min-Expires.
@@ -6157,18 +6173,46 @@ fn parse_register_min_expires(response: &str) -> Result<u32, RegisterMinExpiresF
     crate::connectivity::core::register::parse_min_expires(response.as_bytes())
 }
 
-/// Initial authenticated/ESP exchanges currently own a captured Authorization,
-/// not a mutable Digest request-proof context. Refuse 423 explicitly instead
-/// of sending that same nc with a new CSeq, or changing the protected channel.
-/// The registered refresh adapter does own credentials and rebuilds its proof.
-fn authenticated_min_expires_failure(response: &str) -> LiveStageError {
-    let reason = parse_register_min_expires(response)
-        .err().unwrap_or(RegisterMinExpiresFailure::Unsupported);
-    map_shared_register_failure(&RegisterFailure {
-        error: reason.error(true),
-        response: Some(response.as_bytes().to_vec()),
-        auth_rounds: 1,
-    })
+/// Rebuild only a proven, actually emitted authenticated request. The shared
+/// driver owns strict floor validation, the original two-round lease budget and
+/// CSeq ordering. No AKA, nonce reset or security policy installation happens.
+fn rebuild_initial_authenticated_register(
+    context: &mut LiveRegisterRequestContext,
+    profile: &'static CarrierProfile,
+    variant: LiveRegisterHeaderVariant,
+    cseq: u32,
+    min_expires: u32,
+    security_verify: Option<&str>,
+) -> Result<Vec<u8>, ImsError> {
+    if min_expires == 0 || context.register_expires(profile) == 0 {
+        return Err(RegisterMinExpiresFailure::Unsupported.error(true));
+    }
+    let uri = context.request_uri(profile, variant);
+    let username = context.identity.private_user.clone();
+    let authorization = context.refresh_authorization.as_mut()
+        .filter(|auth| auth.sent_challenge().is_some())
+        .ok_or_else(|| ImsError::new("digest_request_auth_context_missing"))?
+        .authorization(&username, &uri)?;
+    context.min_expires = Some(min_expires.max(context.register_expires(profile)));
+    let request = context.build_register_request_with_expires(
+        profile, variant, cseq, Some(&authorization), security_verify, context.register_expires(profile),
+    ).into_bytes();
+    validate_live_register_request(context.refresh_authorization.as_ref(), &request)?;
+    Ok(request)
+}
+
+/// All lease negotiation stays in the same shared exchange. Moving the live
+/// channel also preserves its receive pair, ESP sequence and replay window.
+fn retain_protected_register_response(
+    initial: &mut SipChannel, protected: SipChannel, status: u16,
+) -> bool {
+    if matches!(status, 401 | 407 | 423) {
+        retain_protected_register_channel(initial, protected);
+        true
+    } else {
+        protected.abort();
+        false
+    }
 }
 
 fn live_digest_error_code(reason: &str) -> Option<&'static str> {
@@ -6269,7 +6313,7 @@ async fn run_authenticated_register_exchange(
     line_id: &str,
     profile: &'static CarrierProfile,
     initial_channel: &mut SipChannel,
-    gateway: &TunGatewayRuntime,
+    gateway: Option<&TunGatewayRuntime>,
     context: &mut LiveRegisterRequestContext,
     challenge: &LiveDigestChallenge,
     variant: LiveRegisterHeaderVariant,
@@ -6318,6 +6362,7 @@ async fn run_authenticated_register_exchange(
     if let Some(offer) =
         selected_offer.filter(|_| challenge.nonce_kind == LiveDigestNonceKind::AkaChallenge)
     {
+        let gateway = gateway.ok_or_else(|| live_stage_error("ims_register_protected_gateway_missing"))?;
         initial_channel
             .shutdown()
             .await
@@ -6347,9 +6392,8 @@ async fn run_authenticated_register_exchange(
         let response = read_final_register_response(initial_channel, &authenticated).await?;
         let summary = ims::parse_sip_response(&response, &context.target.realm)
             .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
-        if summary.status_code == 423 {
-            return Err(authenticated_min_expires_failure(&response));
-        }
+        // Return 423 to the SAME shared driver and budget. It rebuilds a fresh
+        // Digest proof on this channel instead of re-entering authentication.
         if (200..300).contains(&summary.status_code) {
             validate_live_register_success(context.refresh_authorization.as_ref(), *resync_sent, response.as_bytes())
                 .map_err(|error| response_auth_error(error, response.as_bytes()))?;
@@ -6799,19 +6843,11 @@ async fn run_protected_authenticated_register_candidates(
                     context.channel_transferred = true;
                     return Ok(response);
                 }
-                if matches!(summary.status_code, 401 | 407) {
-                    // Hand the exact protected channel back to the shared
-                    // engine for its next bounded auth round. Keep the gateway
-                    // policy, ESP sequence and anti-replay state untouched.
-                    retain_protected_register_channel(initial_channel, protected_channel);
-                    return Ok(response);
-                }
-                protected_channel.abort();
-                if summary.status_code == 423 {
-                    // No retry on another ESP mapping or replay of the captured
-                    // Authorization with a new CSeq/old nc.
-                    return Err(authenticated_min_expires_failure(&response));
-                }
+                // A final 423 proves this protected mapping carried the
+                // exchange; never reinstall it or try another ESP candidate.
+                // The shared engine validates Min-Expires and consumes the
+                // existing budget, including any earlier pre-authentication 423.
+                retain_protected_register_response(initial_channel, protected_channel, summary.status_code);
                 return Ok(response);
             }
             Err(err) => {
@@ -12211,12 +12247,12 @@ mod tests {
             ("Min-Expires: 4294967296\r\n", RegisterMinExpiresFailure::Invalid),
             ("Min-Expires: 600\r\nMin-Expires: 600\r\n", RegisterMinExpiresFailure::Invalid),
             ("Min-Expires: 86401\r\n", RegisterMinExpiresFailure::Unsupported),
-            // A valid floor still needs a fresh Digest proof. The initial
-            // authenticated/ESP path explicitly refuses, never replays nc.
-            ("Min-Expires: 600\r\n", RegisterMinExpiresFailure::Unsupported),
         ] {
             let response = format!("SIP/2.0 423 Interval Too Brief\r\n{headers}\r\n");
-            let error = authenticated_min_expires_failure(&response);
+            assert_eq!(parse_register_min_expires(&response).unwrap_err(), reason);
+            let error = map_shared_register_failure(&RegisterFailure {
+                error: reason.error(true), response: Some(response.as_bytes().to_vec()), auth_rounds: 1,
+            });
             assert_eq!(error.reason, format!("{}:sip_status=423", reason.error(true).code()));
             assert_eq!(live_register_error_status(&error), Some(423));
             let metadata = error.register_failure.unwrap();

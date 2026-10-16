@@ -70,7 +70,7 @@ X2 `ca38391`新增 `backends::native_ims::tests`、`quectel::native_ims::{tests,
 ISIM/端点/恢复第一批另包含 `qmi_uim::isim::tests`、`isim_binding_tests`、`uicc_ims::tests`、
 `vowifi::live::live_identity::tests`、`pcsc::ims::tests`、`cellular_ims::pcscf::endpoint::tests`、
 `register_retry::tests` 和 `live::live_retry::tests`；实际刷新和 profile batch 的新增测试纳入原过滤器。
-REGISTER rspauth 另执行 `core::digest_aka::response_auth::tests`、`vowifi::live::response_auth_tests`，
+REGISTER rspauth 另执行 `core::digest_aka::response_auth::tests`、`vowifi::live::response_auth_tests`；R3首次认证后423另以非零过滤器执行其`initial_min_expires_tests`，必须核验实际VowifiRegisterAuthenticator/同通道/原预算和新proof，不用仅helper或旧CI代替。
 蜂窝测试位于原 `cellular_ims::live::refresh_tests` 过滤器下的 `response_auth_tests`；继续执行共享 REGISTER 及既有 AUTS/stale 回归。
 reg-event 执行 `core::reg_event::tests`、`cellular_ims::live::live_reg_event::tests`、
 `vowifi::operator::reg_event_tests`、`vowifi::live::reg_event_live::tests`；DNS TCP 另执行

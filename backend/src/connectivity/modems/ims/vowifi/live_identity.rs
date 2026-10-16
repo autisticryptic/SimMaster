@@ -9,6 +9,8 @@ pub(super) struct LiveImsSelection {
     device: LiveSimDevice,
     card: UiccCardBinding,
     aid: Vec<u8>,
+    #[cfg(test)]
+    test_aka: Option<(super::super::qmi_uim::UsimAkaApduResult, Arc<std::sync::atomic::AtomicUsize>)>,
     isim: bool,
     diagnostic_identity: crate::connectivity::core::registration_diagnostics::IdentityOrigin,
     diagnostic_domain: crate::connectivity::core::registration_diagnostics::FactSource,
@@ -70,7 +72,16 @@ impl LiveImsSelection {
         let device = self.device.clone();
         let rand = rand.to_vec();
         let autn = autn.to_vec();
+        #[cfg(test)]
+        let test_aka = self.test_aka.clone();
         uicc_ims::authenticate_bound_with(&self.card, &self.aid, || self.observe(line_id), |aid| async move {
+            // Inject only the card's result in no-device tests. The real
+            // before/after reader, slot, owner and material validation remains.
+            #[cfg(test)]
+            if let Some((aka, calls)) = test_aka {
+                calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                return Ok(aka);
+            }
             tokio::task::spawn_blocking(move || {
                 // TS 31.103 ISIM AKA and TS 31.102 USIM 3G AKA both use P2=81.
                 // No application fallback on an authentication error.
@@ -168,6 +179,8 @@ pub(super) async fn load(line_id: &str, profile: &'static CarrierProfile)
     let selected = Arc::new(LiveImsSelection {
         identity: LiveImsRegisterIdentity { shared: resolved.identity, shape: if isim { "isim" } else { "imsi_home_domain" } },
         target, device, card, aid: resolved.auth_aid, isim, diagnostic_identity, diagnostic_domain, diagnostic_realm,
+        #[cfg(test)]
+        test_aka: None,
     });
     selected.verify(line_id).await.map_err(live_stage_error)?;
     Ok(selected)
@@ -184,10 +197,20 @@ pub(super) fn selection_for_test(
     };
     register_line_sim_device(line_id, &device.qmi_device, device.uim_slot, &device.modem_path);
     uicc_ims::register_test_binding(&device.modem_path, card.clone());
-    Arc::new(LiveImsSelection { identity, target, device, card, aid: USIM_AID_PREFIX.to_vec(), isim: false,
+    Arc::new(LiveImsSelection { identity, target, device, card, aid: USIM_AID_PREFIX.to_vec(), test_aka: None, isim: false,
         diagnostic_identity: crate::connectivity::core::registration_diagnostics::IdentityOrigin::UsimDerived,
         diagnostic_domain: crate::connectivity::core::registration_diagnostics::FactSource::Unknown,
         diagnostic_realm: crate::connectivity::core::registration_diagnostics::FactSource::Unknown })
+}
+
+#[cfg(test)]
+pub(super) fn with_aka_for_test(
+    selected: &Arc<LiveImsSelection>, aka: super::super::qmi_uim::UsimAkaApduResult,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+) -> Arc<LiveImsSelection> {
+    let mut selected = (**selected).clone();
+    selected.test_aka = Some((aka, calls));
+    Arc::new(selected)
 }
 
 #[cfg(test)]

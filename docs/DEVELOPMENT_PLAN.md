@@ -30,7 +30,7 @@
 
 - reg-event 已实现并验证；仍需真实网络互通/设备验收。自定义或歧义 Contact 不猜绑定；不支持的订阅挑战、超时或 XML 缺口只停止/重同步观察，不伪造 REGISTER 丢失。
 - REGISTER rspauth 已验证；后续互通须单独验证真实服务器响应。现有范围仅 qop=auth/无 qop 和单一 Authorization scope，不宣称 auth-int、多重 origin/proxy 鉴权或非 REGISTER 业务已经支持。
-- 已验证 AUTS/stale 与 423 的剩余限制：WiFi 初次认证后的 423 明确 unsupported；需要新安全上下文的受保护 stale 不重装旧 ESP；非 REGISTER 业务的响应认证/恢复需单独核对。
+- **R3首次认证后423已接线待验证。** WiFi直接AKA和protected channel将423交回共享budget，重算nc/request-proof，不重装ESP、不重开候选；覆盖初始/鉴权共享预算、proxy/rspauth/stale/AUTS/零租期与worker。需要新安全上下文的受保护挑战仍明确交恢复层，非REGISTER业务恢复不混入本项。
 - 蜂窝刷新 423→400/新鉴权后400的预算补漏已由 `b6a7888` 验证；后续需保持结构化门禁、Min-Expires来源和旧通道/租期/计数，不回到末次状态猜测。
 - R2 普通 WiFi 等待已由 `c3fb036` 软件验证，包含初次/刷新/注销/API门禁、同卡预算连续性、原租期保留和reg-event撤销竞态；实机仍未验收，不能由CI推断实际运营商接受情况。
 - N1～N8、R1/R2已有软件CI/制品闭环；直接对照SimAdmin实际注册链与EC20注册/恢复证据做最终差异复核。仅补有依据的真实注册缺口，不再先做报告里的可选扩展。

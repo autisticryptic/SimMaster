@@ -124,7 +124,7 @@
 - AUTS 保留选定 qop/opaque，但不是有效鉴权证明；非法/重复 AUTS 或仅 AUTS 后直接 2xx 不能形成注册或确认注销。
 - stale 必须关联上一条已发送的同 scope 请求；同 RAND/AUTN 才复用绑定凭据，独立 `aka_origin` 不被 nextnonce 覆盖。已保护通道不因 stale 重装同 SPI/key 或退明文；需新安全上下文时明确恢复。
 - 蜂窝刷新三候选共用一个 `RegisterNegotiationBudget`，包括 423→400/415/420/421/494 后不再换头型。门禁必须使用 `RegisterFailureMetadata.permits_variant_fallback()`，不能只看最后 SIP 状态；新鉴权后的 400 也不得重新开启 AKA/头型预算。返回错误保留 budget 的 Min-Expires 来源，正常交换首包格式兼容及 423→2xx 仍保留。R1 已由 `b6a7888` 软件验证，实机互通仍独立。
-- 423 协商一旦开始，就关闭本次静态头型/profile/端点兼容扩张；无效/过大/不增长/耗尽的 floor 不能重开预算。零租期注销不协商正租期；WiFi 初次认证后 423 尚不支持，注册后 credential-aware 刷新仍支持。
+- 423协商一旦开始，就关闭本次静态头型/profile/端点兼容扩张；无效/过大/不增长/耗尽floor不能重开预算，零租期注销不协商正租期。R3（待Actions）将WiFi初次认证后的423交回同一共享驱动，原protected channel/接收配对不重建，使用实际凭据重算nc/proof；初始与鉴权共用两轮lease预算且不重置两轮AKA预算。AUTS不当有效凭据，成功先验rspauth再提交租期/nextnonce；注册后刷新旧逻辑保持。
 - `3509e15` 已接通并验证 rspauth：仅对实际生成的非空 Digest 证明捕获不可变请求上下文，发送前检查最终 URI/Authorization/opaque，2xx 发布前验证响应对应的 qop/nc/cnonce 和 rspauth。Authentication-Info/Proxy-Authentication-Info 不串用，重复/畸形/不匹配明确失败；缺少可选 rspauth 仍兼容，不把 nextnonce-only 冒充服务器证明已验。当前支持范围为既有 REGISTER 算法、qop=auth/无 qop 和单一鉴权 scope。
 - 响应认证失败不是传输失败或可换头型的协商提示；不能提交新的 nextnonce、租期、业务身份或安全上下文。失败保留已发送的原 nonce-count、回滚暂存状态；不放宽 AKA/ESP 算法门禁。本轮范围为 REGISTER，非 REGISTER 业务不自动宣称已支持。
 
