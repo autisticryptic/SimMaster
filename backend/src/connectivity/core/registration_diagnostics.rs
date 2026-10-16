@@ -163,6 +163,8 @@ impl FailureFact {
         }).unwrap_or(FailureScope::Unknown);
         if matches!(reason_code.as_deref(), Some("ims_uicc_binding_invalid" | "ims_uicc_binding_changed"))
         { scope = FailureScope::Ownership; }
+        if reason_code.as_deref().is_some_and(|reason| reason.starts_with("ims_uicc_provisioning_"))
+        { scope = FailureScope::Binding; }
         Self { scope, reason_code, sip_status: metadata.and_then(|meta| meta.sip_status),
             auth_stage: metadata.map(|meta| match meta.stage {
                 RegisterFailureStage::Initial => AuthStage::Initial, RegisterFailureStage::Authentication => AuthStage::Authentication,

@@ -334,6 +334,9 @@ jobs:
             connectivity::modems::ims::vowifi::live::reg_event_live::tests \
             connectivity::core::register::tests \
             connectivity::core::register_retry::unregister_tests \
+            connectivity::modems::ims::uicc_ims::provisioning::tests \
+            connectivity::modems::ims::cellular_ims::live::refresh_tests::provisioning_tests \
+            connectivity::modems::ims::vowifi::live::response_auth_tests::provisioning_tests \
             connectivity::modems::ims::cellular_ims::live::refresh_tests::unregister_retry_tests \
             connectivity::modems::ims::vowifi::live::response_auth_tests::retry_unregister_tests \
             connectivity::core::registration::tests \

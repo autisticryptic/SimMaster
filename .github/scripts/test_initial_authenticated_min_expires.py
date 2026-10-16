@@ -28,7 +28,7 @@ class InitialAuthenticatedLeaseRetry(unittest.TestCase):
         start = text.index('impl RegisterAuthenticator<SipChannel> for VowifiRegisterAuthenticator')
         adapter = text[start:text.index('fn live_digest_error_code(', start)]
         self.assertIn('self.context.verify_worker(self.line_id)?', adapter)
-        self.assertIn('.verify(self.line_id).await', adapter)
+        self.assertIn('.verify_registration(self.line_id).await', adapter)
         self.assertIn('self.last_security_verify.as_deref()', adapter)
 
     def test_actions_execute_real_initial_authenticator_regressions(self):

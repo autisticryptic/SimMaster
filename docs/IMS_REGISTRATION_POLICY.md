@@ -121,6 +121,7 @@
 
 ### REGISTER 鉴权、响应认证与重试边界
 
+- R5（待Actions）在现有只读QMI/native AT/PCSC接口上捕获应用列表与IMPI/DOMAIN/IMPU/P-CSCF的完整快照，两次读一致且前中后card/owner一致才接受。注册、AKA/stale、423、续期及注销边界复核；变化/不稳定/读取错误不当缺省、旧凭据或旧租期仍有效，成功响应在发布前再验。已收到临时失败的网络等待仍记到原订阅，不以同卡文件更新清空。不订阅或确认UICC REFRESH事件、不声称跨APDU硬件原子性；检测时点是注册过程边界，业务长期空闲间隔另需硬件事件支持。
 - AUTS 保留选定 qop/opaque，但不是有效鉴权证明；非法/重复 AUTS 或仅 AUTS 后直接 2xx 不能形成注册或确认注销。
 - stale 必须关联上一条已发送的同 scope 请求；同 RAND/AUTN 才复用绑定凭据，独立 `aka_origin` 不被 nextnonce 覆盖。已保护通道不因 stale 重装同 SPI/key 或退明文；需新安全上下文时明确恢复。
 - 蜂窝刷新三候选共用一个 `RegisterNegotiationBudget`，包括 423→400/415/420/421/494 后不再换头型。门禁必须使用 `RegisterFailureMetadata.permits_variant_fallback()`，不能只看最后 SIP 状态；新鉴权后的 400 也不得重新开启 AKA/头型预算。返回错误保留 budget 的 Min-Expires 来源，正常交换首包格式兼容及 423→2xx 仍保留。R1 已由 `b6a7888` 软件验证，实机互通仍独立。

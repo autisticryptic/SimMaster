@@ -80,6 +80,7 @@ N7 另执行 `core::registration_diagnostics::tests`、`cellular_ims::runtime::d
 `vowifi::live::diagnostics_live::tests`，实际 cellular/WiFi 刷新观察位于现有 response-auth/refresh 过滤器；
 原生承载 observer 测试在 `native_bearer::tests`，统一状态 HTTP 契约在私有 D-Bus 中运行。
 刷新预算补漏的 `refresh_budget_tests` 与 TCP EOF/423 回归位于既有 `cellular_ims::live::refresh_tests` 执行过滤器；新增测试仍须逐名核验，不用静态 Python 守卫替代生产交换。R1 `b6a7888` 的两套日志各257项相关回归/四矩阵和双架构已核验，前端未变沿用并复核 N7 browser 源码证据，不冒称每次后端提交都重跑浏览器。
+R5另执行 `uicc_ims::provisioning::tests`、`cellular_ims::live::refresh_tests::provisioning_tests`、`vowifi::live::response_auth_tests::provisioning_tests`；验证同卡变更/撕裂读取/读失败、实际REGISTER提交门禁、旧nonce/租期不升级及已收到等待保留，不将静态检查视为硬件事件支持。
 R4注销反馈（0351006已通过两套Actions/双架构、各488相关回归/86场景）另执行 `core::register_retry::unregister_tests`、`cellular_ims::live::refresh_tests::unregister_retry_tests`、`vowifi::live::response_auth_tests::retry_unregister_tests`；检查真实注销/清理/后继门禁与旧卡回包隔离，diagnostics hook不能写控制状态，静态守卫不代替Actions。
 R2 另执行 `vowifi::live::register_retry_live::tests`、`vowifi::runtime::retry_tests`，`response_auth_tests::retry_recovery_tests` 覆盖真实刷新及安装后的operator收包/到期，私有 D-Bus 另测 API 等待不改保存意图或重耗预算。核心等待下沉后保留 cellular 的旧测试过滤器名称和全部边界断言。R2最终 `c3fb036` 的两套日志各304项相关回归/四矩阵/官方摘要已核验，另逐名确认原认证前404回归未改且通过；不沿用中间 e06b0ed 结果代替新增撤销竞态保护。
 Frontend Checks 必须实际运行 `imsDiagnosticsFormat.test.ts` 和 `ims-execution-diagnostics.spec.ts`；

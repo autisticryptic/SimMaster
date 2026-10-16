@@ -42,6 +42,12 @@ impl VowifiUnregisterFactory {
                 retained_until: original_expiry.filter(|expiry| *expiry > Instant::now()),
             });
         }
+        if let Err(reason) = uicc.verify_registration(&self.line_id).await {
+            let error = ImsError::new(reason);
+            self.context.diagnostic_scope.core_failure(&error, FailureScope::Binding).await;
+            return Err(error.into());
+        }
+        self.context.verify_worker(&self.line_id)?;
         let mut auth = VowifiRefreshAuthenticator {
             factory: self, resync_sent: false,
             authorization: self.refresh_authorization.lock().unwrap_or_else(|error| error.into_inner()).clone(),
@@ -51,7 +57,11 @@ impl VowifiUnregisterFactory {
         self.context.diagnostic_scope.offer(&initial, auth.authorization.as_ref()).await;
         let mut budget = RegisterNegotiationBudget::default();
         let result = run_register_observed_with_budget(channel, &initial, &mut auth, &mut budget).await;
-        if let Err(reason) = uicc.verify(&self.line_id).await {
+        if let Err(reason) = uicc.verify_registration(&self.line_id).await {
+            if let Err(failure) = &result {
+                retries.observe(logical_endpoint, &budget.failure_metadata(failure)).await;
+                retries.pause_restart().await;
+            }
             let error = ImsError::new(reason);
             self.context.diagnostic_scope.core_failure(&error, FailureScope::Ownership).await;
             return Err(error.into());

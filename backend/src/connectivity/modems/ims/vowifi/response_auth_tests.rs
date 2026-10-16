@@ -7,6 +7,8 @@ mod retry_recovery_tests;
 mod retry_unregister_tests;
 #[path = "initial_min_expires_tests.rs"]
 mod initial_min_expires_tests;
+#[path = "provisioning_tests.rs"]
+mod provisioning_tests;
 use crate::connectivity::core::{
     digest_aka::{self, DigestRequestProof},
     register::run_unregister,

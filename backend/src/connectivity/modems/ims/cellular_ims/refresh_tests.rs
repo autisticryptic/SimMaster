@@ -9,6 +9,8 @@ mod stream_registration_tests;
 mod refresh_budget_tests;
 #[path = "unregister_retry_tests.rs"]
 mod unregister_retry_tests;
+#[path = "provisioning_tests.rs"]
+mod provisioning_tests;
 use super::*;
 use crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult;
 use tokio::net::UdpSocket;
@@ -159,6 +161,7 @@ fn authenticator(
         session.xfrm_worker.clone(),
     )
     .with_auth_binding(session.auth_binding.clone())
+    .with_provisioning(session.provisioning.clone())
     .with_worker_binding(session.worker_binding.clone())
     .with_security_mechanism(session.register_variant.security_mechanism)
 }

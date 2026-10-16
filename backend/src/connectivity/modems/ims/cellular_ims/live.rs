@@ -548,6 +548,7 @@ struct CellularImsLiveSession {
     device: CellularImsDeviceBinding,
     aka_aid: Vec<u8>,
     auth_binding: Option<UiccCardBinding>,
+    provisioning: uicc_ims::provisioning::UiccImsProvisioning,
     profile: &'static CarrierProfile,
     /// Owned access-specific values fixed when this session started. Refresh,
     /// SMS and voice must not re-read SimOverrideStore mid-session.
@@ -741,6 +742,7 @@ struct DeviceIdentity {
     isim_aid: Option<String>,
     isim_pcscf: Vec<String>,
     auth_binding: UiccCardBinding,
+    provisioning: uicc_ims::provisioning::UiccImsProvisioning,
     source: &'static str,
 }
 
@@ -1311,6 +1313,7 @@ struct CellularImsRegisterAuthenticator {
     required_security: bool,
     aka_aid: Vec<u8>,
     auth_binding: Option<UiccCardBinding>,
+    provisioning: Option<uicc_ims::provisioning::UiccImsProvisioning>,
     register_policy: sip::RegisterRequestPolicy,
     profile: &'static CarrierProfile,
     effective_ims: EffectiveImsProfile,
@@ -1382,6 +1385,7 @@ impl CellularImsRegisterAuthenticator {
             required_security: false,
             aka_aid,
             auth_binding: None,
+            provisioning: None,
             register_policy,
             profile,
             effective_ims,
@@ -1408,6 +1412,18 @@ impl CellularImsRegisterAuthenticator {
     fn with_auth_binding(mut self, binding: Option<UiccCardBinding>) -> Self {
         self.auth_binding = binding;
         self
+    }
+
+    fn with_provisioning(mut self, provisioning: uicc_ims::provisioning::UiccImsProvisioning) -> Self {
+        self.provisioning = Some(provisioning);
+        self
+    }
+
+    async fn verify_provisioning(&self) -> Result<(), ImsError> {
+        self.ensure_task_current()?;
+        let expected = self.provisioning.as_ref().ok_or_else(|| ImsError::new("ims_uicc_provisioning_invalid"))?;
+        verify_ims_registration_material(&self.device, self.auth_binding.as_ref(), expected).await?;
+        self.ensure_task_current()
     }
 
     fn with_required_security(mut self, required: bool) -> Self {
@@ -1839,6 +1855,7 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         channel: &mut CellularImsSipChannel,
     ) -> Result<(), ImsError> {
         self.ensure_task_current()?;
+        self.verify_provisioning().await?;
         self.runtime
             .update(|state| state.stage = CellularImsStage::IdentityAka)
             .await;
@@ -1931,7 +1948,7 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         .map_err(|_| ImsError::new(code::USIM_AKA_FAILED))?
         .map_err(to_ims_error)?;
 
-        verify_ims_card_binding(&self.device, self.auth_binding.as_ref()).await?;
+        self.verify_provisioning().await?;
         self.ensure_task_current()?;
         tracing::info!(
             res_length = aka.res.len(),
@@ -1951,6 +1968,7 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         cseq: u32,
     ) -> Result<Vec<u8>, ImsError> {
         self.ensure_task_current()?;
+        self.verify_provisioning().await?;
         self.runtime
             .update(|state| state.stage = CellularImsStage::RegisterAuthenticated)
             .await;
@@ -2024,6 +2042,7 @@ impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthent
         authenticated: bool,
     ) -> Result<Vec<u8>, ImsError> {
         self.ensure_task_current()?;
+        self.verify_provisioning().await?;
         if authenticated {
             // Keep the negotiated security context and challenge proof; only
             // the lease floor changes for the retry.
@@ -3719,12 +3738,13 @@ async fn connect_family(
             socket_worker,
         )
         .with_auth_binding(Some(device_identity.auth_binding.clone()))
+        .with_provisioning(device_identity.provisioning.clone())
         .with_worker_binding(worker_binding.clone())
         .with_required_security(fallback_state.requires_protection(profile))
         .with_security_mechanism(variant.security_mechanism);
         ensure_worker_binding_current(worker_binding)?;
         verify_mm_task_bearer(runtime, native_bearer.as_deref_mut()).await?;
-        verify_ims_card_binding(device, Some(&device_identity.auth_binding)).await
+        verify_ims_registration_material(device, Some(&device_identity.auth_binding), &device_identity.provisioning).await
             .map_err(|error| CellularImsError::new(error.code()))?;
         let registration_result =
             crate::connectivity::core::register::run_register_observed_with_budget(
@@ -3740,7 +3760,11 @@ async fn connect_family(
                 return Err(error);
             }
         }
-        if let Err(error) = verify_ims_card_binding(device, Some(&device_identity.auth_binding)).await {
+        if let Err(error) = verify_ims_registration_material(device, Some(&device_identity.auth_binding), &device_identity.provisioning).await {
+            if let Err(failure) = &registration_result {
+                endpoint_retries.lock().await.observe_failure(pcscf, &lease_budget.failure_metadata(failure), Instant::now());
+                endpoint_retries.lock().await.pause_restart(Instant::now());
+            }
             authenticator.rollback_security(&mut channel).await;
             return Err(CellularImsError::new(error.code()));
         }
@@ -4023,6 +4047,7 @@ async fn connect_family(
             device: device.clone(),
             aka_aid: device_identity.aka_aid.clone(),
             auth_binding: Some(device_identity.auth_binding.clone()),
+            provisioning: device_identity.provisioning.clone(),
             profile,
             effective_ims: device_identity.effective_ims.clone(),
             visited_network_header: device_identity.visited_network_header.clone(),
@@ -4122,7 +4147,7 @@ async fn unregister_live_session(
     {
         return UnregisterResult::AccessLost;
     }
-    if verify_ims_card_binding(&session.device, session.auth_binding.as_ref()).await.is_err()
+    if verify_ims_registration_material(&session.device, session.auth_binding.as_ref(), &session.provisioning).await.is_err()
         || !session.endpoint_retries.lock().await.check(session.pcscf, Instant::now()).is_allowed()
     {
         return UnregisterResult::AccessLost;
@@ -4192,12 +4217,16 @@ async fn unregister_live_session(
         session.xfrm_worker.clone(),
     )
     .with_auth_binding(session.auth_binding.clone())
+    .with_provisioning(session.provisioning.clone())
     .with_worker_binding(session.worker_binding.clone())
     .with_security_mechanism(session.register_variant.security_mechanism)
     .with_expires_seconds(0);
     runtime.observe_diagnostics(|state| state.facts.procedure = reg_diag::RegistrationProcedure::Unregister).await;
     match crate::connectivity::core::register::run_unregister_observed(&mut session.channel, &request, &mut authenticator).await {
         Ok(_) => {
+            if verify_ims_registration_material(&session.device, session.auth_binding.as_ref(), &session.provisioning).await.is_err() {
+                return UnregisterResult::AccessLost;
+            }
             runtime.observe_diagnostics(|state| state.facts.failure = None).await;
             UnregisterResult::Confirmed
         }
@@ -4806,7 +4835,7 @@ async fn refresh_live_registration(
             retry_after: None,
         };
     }
-    if let Err(error) = verify_ims_card_binding(&session.device, session.auth_binding.as_ref()).await {
+    if let Err(error) = verify_ims_registration_material(&session.device, session.auth_binding.as_ref(), &session.provisioning).await {
         let error = CellularImsError::new(error.code());
         runtime.observe_diagnostics(|state|
             super::runtime::observe_diagnostic_failure(state, &error, reg_diag::FailureScope::Ownership)).await;
@@ -5002,6 +5031,7 @@ async fn refresh_live_registration(
             session.xfrm_worker.clone(),
         )
         .with_auth_binding(session.auth_binding.clone())
+        .with_provisioning(session.provisioning.clone())
         .with_worker_binding(session.worker_binding.clone())
         .with_security_mechanism(variant.security_mechanism)
         .with_expires_seconds(refresh_expires);
@@ -5016,7 +5046,11 @@ async fn refresh_live_registration(
             authenticator.rollback_security(&mut session.channel).await;
             return lost_refresh_attempt(error);
         }
-        if let Err(error) = verify_ims_card_binding(&session.device, session.auth_binding.as_ref()).await {
+        if let Err(error) = verify_ims_registration_material(&session.device, session.auth_binding.as_ref(), &session.provisioning).await {
+            if let Err(failure) = &registration_result {
+                session.endpoint_retries.lock().await.observe_failure(session.pcscf, &lease_budget.failure_metadata(failure), Instant::now());
+                session.endpoint_retries.lock().await.pause_restart(Instant::now());
+            }
             authenticator.rollback_security(&mut session.channel).await;
             return lost_refresh_attempt(CellularImsError::new(error.code()));
         }
@@ -8092,9 +8126,11 @@ async fn load_device_identity(
         }).await.map_err(|_| CellularImsError::new("isim_read_task_failed"))?
           .map_err(CellularImsError::new)?)
     } else { None };
+    let provisioning = uicc_ims::provisioning::UiccImsProvisioning::new(applications.clone(), material)
+        .map_err(CellularImsError::new)?;
     let selected = uicc_ims::resolve_ims_identity(
         &imsi, &aka_aid,
-        applications.isim_aid.as_deref().zip(material.as_ref()),
+        applications.isim_aid.as_deref().zip(provisioning.material.as_ref()),
         &effective_ims.domain.value, &effective_ims.realm.value,
         resolved.origin != ProfileOrigin::Derived || sim_override.ims_cellular.domain.is_some(),
         resolved.origin != ProfileOrigin::Derived || sim_override.ims_cellular.realm.is_some(),
@@ -8170,6 +8206,7 @@ async fn load_device_identity(
         .await.map_err(CellularImsError::new)?;
     auth_binding.verify(&current).map_err(CellularImsError::new)?;
     if auth_binding.imsi != imsi { return Err(CellularImsError::new("ims_uicc_binding_changed")); }
+    provisioning.verify_bound(&auth_binding, &device.modem_id, QMI_PROXY_SOCKET).await.map_err(CellularImsError::new)?;
     Ok(DeviceIdentity {
         diagnostic_required_security: false,
         ims: selected.identity,
@@ -8184,7 +8221,16 @@ async fn load_device_identity(
         isim_aid,
         isim_pcscf: selected.isim_pcscf,
         auth_binding,
+        provisioning,
     })
+}
+
+async fn verify_ims_registration_material(
+    device: &CellularImsDeviceBinding, binding: Option<&UiccCardBinding>,
+    provisioning: &uicc_ims::provisioning::UiccImsProvisioning,
+) -> Result<(), ImsError> {
+    let expected = binding.ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?;
+    provisioning.verify_bound(expected, &device.modem_id, QMI_PROXY_SOCKET).await.map_err(ImsError::new)
 }
 
 async fn verify_ims_card_binding(
@@ -9884,6 +9930,7 @@ mod tests {
                 equipment_identifier: "490154203237518".into(),
             },
             aka_aid: Vec::new(),
+            provisioning: uicc_ims::provisioning::default_for_test("test", &test_card),
             auth_binding: Some(test_card),
             profile,
             effective_ims: resolve_effective_ims_profile(profile, None),

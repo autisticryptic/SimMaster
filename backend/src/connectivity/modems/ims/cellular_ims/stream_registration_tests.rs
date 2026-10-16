@@ -37,7 +37,7 @@ fn initial_auth(session: &CellularImsLiveSession, runtime: &CellularImsRuntime, 
         security.clone(), session.channel.route(), session.device.clone(), runtime.clone(), false,
         session.aka_aid.clone(), session.register_variant.policy, session.profile, session.effective_ims.clone(),
         None, None, None, None, Some(security), None, session.xfrm_worker.clone(),
-    ).with_auth_binding(session.auth_binding.clone()).with_worker_binding(session.worker_binding.clone())
+    ).with_auth_binding(session.auth_binding.clone()).with_provisioning(session.provisioning.clone()).with_worker_binding(session.worker_binding.clone())
 }
 
 async fn read_frame(socket: &mut TcpStream) -> Vec<u8> {

@@ -9,6 +9,7 @@ pub(super) struct LiveImsSelection {
     device: LiveSimDevice,
     card: UiccCardBinding,
     aid: Vec<u8>,
+    provisioning: uicc_ims::provisioning::UiccImsProvisioning,
     #[cfg(test)]
     test_aka: Option<(super::super::qmi_uim::UsimAkaApduResult, Arc<std::sync::atomic::AtomicUsize>)>,
     isim: bool,
@@ -54,9 +55,16 @@ impl LiveImsSelection {
         self.card.verify(&self.observe(line_id).await?)
     }
 
+    pub async fn verify_registration(&self, line_id: &str) -> Result<(), &'static str> {
+        self.verify_reader_mapping(line_id)?;
+        self.provisioning.verify_bound(&self.card, &self.device.modem_path,
+            &live_runtime_config().qmi_proxy_socket).await?;
+        self.verify_reader_mapping(line_id)
+    }
+
     pub async fn for_format(&self, line_id: &str, format: LiveRegisterIdentityFormat)
         -> Result<LiveImsRegisterIdentity, LiveStageError> {
-        self.verify(line_id).await.map_err(live_stage_error)?;
+        self.verify_registration(line_id).await.map_err(live_stage_error)?;
         let phone = if !self.isim && matches!(format, LiveRegisterIdentityFormat::MsisdnPhoneUri) {
             let conn = zbus::Connection::system().await.map_err(|_| live_stage_error("ims_identity_unavailable"))?;
             let phone = read_live_msisdn_candidate(line_id, &conn).await?;
@@ -68,13 +76,14 @@ impl LiveImsSelection {
 
     pub async fn authenticate(&self, line_id: &str, rand: &[u8], autn: &[u8])
         -> Result<super::super::qmi_uim::UsimAkaApduResult, &'static str> {
+        self.verify_registration(line_id).await?;
         let proxy = live_runtime_config().qmi_proxy_socket;
         let device = self.device.clone();
         let rand = rand.to_vec();
         let autn = autn.to_vec();
         #[cfg(test)]
         let test_aka = self.test_aka.clone();
-        uicc_ims::authenticate_bound_with(&self.card, &self.aid, || self.observe(line_id), |aid| async move {
+        let result = uicc_ims::authenticate_bound_with(&self.card, &self.aid, || self.observe(line_id), |aid| async move {
             // Inject only the card's result in no-device tests. The real
             // before/after reader, slot, owner and material validation remains.
             #[cfg(test)]
@@ -93,7 +102,9 @@ impl LiveImsSelection {
                     LIVE_SIM_AUTH_ATTEMPTS, LIVE_SIM_AUTH_TIMEOUT, LIVE_SIM_AUTH_RETRY_DELAY,
                 )
             }).await.map_err(|_| "sim_auth_runtime_failed")?
-        }).await
+        }).await;
+        self.verify_registration(line_id).await?;
+        result
     }
 }
 
@@ -135,25 +146,10 @@ pub(super) async fn load(line_id: &str, profile: &'static CarrierProfile)
     let endpoint = if device.pcsc_reader.is_empty() { &device.qmi_device } else { &device.pcsc_reader };
     let card = uicc_ims::capture_card_binding(endpoint, device.uim_slot, &device.modem_path)
         .await.map_err(live_stage_error)?;
-    let proxy = live_runtime_config().qmi_proxy_socket;
-    let reader = device.clone();
-    let (applications, material) = tokio::task::spawn_blocking(move || {
-        if !reader.pcsc_reader.is_empty() {
-            let (aids, material) = crate::hardware::devices::pcsc::read_ims_uicc(&reader.pcsc_reader)?;
-            return Ok((crate::connectivity::modems::ims::cellular_ims::identity::UiccApplications::from_aids(aids)?, material));
-        }
-        let applications = crate::connectivity::modems::ims::cellular_ims::identity::UiccApplications::from_aids(
-            super::super::qmi_uim::read_uicc_application_aids_via_proxy_reason(
-                &proxy, &reader.qmi_device, reader.uim_slot, Duration::from_secs(3),
-            )?
-        )?;
-        let material = applications.isim_aid.as_ref().map(|aid| {
-            super::super::qmi_uim::read_isim_ims_material_via_proxy_reason(
-                &proxy, &reader.qmi_device, reader.uim_slot, aid, Duration::from_secs(3),
-            )
-        }).transpose()?;
-        Ok::<_, &'static str>((applications, material))
-    }).await.map_err(|_| live_stage_error("isim_read_task_failed"))?.map_err(live_stage_error)?;
+    let provisioning = uicc_ims::provisioning::read_bound(&card, &device.modem_path,
+        &live_runtime_config().qmi_proxy_socket).await.map_err(live_stage_error)?;
+    let applications = &provisioning.applications;
+    let material = &provisioning.material;
     // One immutable settings snapshot supplies both the actual selection and
     // its source evidence; a concurrent override update cannot relabel it.
     let overrides = line_overrides(line_id);
@@ -178,7 +174,7 @@ pub(super) async fn load(line_id: &str, profile: &'static CarrierProfile)
     let diagnostic_realm = if overrides.ims_realm.is_some() { FactSource::SimOverride } else if isim && !explicit { FactSource::Isim } else { baseline };
     let selected = Arc::new(LiveImsSelection {
         identity: LiveImsRegisterIdentity { shared: resolved.identity, shape: if isim { "isim" } else { "imsi_home_domain" } },
-        target, device, card, aid: resolved.auth_aid, isim, diagnostic_identity, diagnostic_domain, diagnostic_realm,
+        target, device, card, aid: resolved.auth_aid, provisioning, isim, diagnostic_identity, diagnostic_domain, diagnostic_realm,
         #[cfg(test)]
         test_aka: None,
     });
@@ -197,7 +193,8 @@ pub(super) fn selection_for_test(
     };
     register_line_sim_device(line_id, &device.qmi_device, device.uim_slot, &device.modem_path);
     uicc_ims::register_test_binding(&device.modem_path, card.clone());
-    Arc::new(LiveImsSelection { identity, target, device, card, aid: USIM_AID_PREFIX.to_vec(), test_aka: None, isim: false,
+    let provisioning = uicc_ims::provisioning::default_for_test(&device.modem_path, &card);
+    Arc::new(LiveImsSelection { identity, target, device, card, aid: USIM_AID_PREFIX.to_vec(), provisioning, test_aka: None, isim: false,
         diagnostic_identity: crate::connectivity::core::registration_diagnostics::IdentityOrigin::UsimDerived,
         diagnostic_domain: crate::connectivity::core::registration_diagnostics::FactSource::Unknown,
         diagnostic_realm: crate::connectivity::core::registration_diagnostics::FactSource::Unknown })
@@ -211,6 +208,12 @@ pub(super) fn with_aka_for_test(
     let mut selected = (**selected).clone();
     selected.test_aka = Some((aka, calls));
     Arc::new(selected)
+}
+
+#[cfg(test)]
+pub(super) fn seed_provisioning_for_test(selected: &LiveImsSelection,
+    value: Result<uicc_ims::provisioning::UiccImsProvisioning, &'static str>) {
+    uicc_ims::provisioning::seed_result_for_test(&selected.device.modem_path, &selected.card, value);
 }
 
 #[cfg(test)]

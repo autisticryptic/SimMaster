@@ -216,6 +216,7 @@ impl RegisteredRefreshFailure {
             RegisterFailureKind::AuthenticationRejected | RegisterFailureKind::IdentityRejected | RegisterFailureKind::FlowFailed))
             || self.code().starts_with("ims_outbound_")
             || self.code().starts_with("digest_response_auth_")
+            || self.code().starts_with("ims_uicc_") || self.code().starts_with("isim_")
             || matches!(self.code(), "ims_uicc_binding_invalid" | "ims_uicc_binding_changed"
                 | "vowifi_runtime_ue_worker_generation_changed" | "vowifi_refresh_rejected" | "vowifi_refresh_security_update_required")
     }
@@ -264,6 +265,11 @@ pub(crate) trait RegisteredUnregister: Send + Sync {
     fn unregister_admitted<'a>(&'a self)
         -> futures_util::future::BoxFuture<'a, Result<Option<Box<dyn UnregisterFailureObserver>>, crate::connectivity::core::ImsError>> {
         Box::pin(async { Ok(None) })
+    }
+
+    /// Final acceptance rechecks subscription material after a network await.
+    fn unregister_accepted<'a>(&'a self) -> futures_util::future::BoxFuture<'a, Result<(), crate::connectivity::core::ImsError>> {
+        Box::pin(async { Ok(()) })
     }
 
     fn diagnostics_unregister_started<'a>(&'a self) -> futures_util::future::BoxFuture<'a, ()> { Box::pin(async {}) }
@@ -832,7 +838,14 @@ async fn unregister_registration(session: &mut VoiceSession) -> UnregisterResult
     };
     let mut authenticator = RegisteredUnregisterAdapter { factory: factory.clone() };
     match crate::connectivity::core::register::run_unregister_observed(&mut session.channel, &initial, &mut authenticator).await {
-        Ok(_) => { factory.diagnostics_unregister_finished(None, None, None).await; UnregisterResult::Confirmed }
+        Ok(_) => {
+            if let Err(error) = factory.unregister_accepted().await {
+                factory.diagnostics_unregister_finished(Some(error.code()), None, None).await;
+                return UnregisterResult::AccessLost;
+            }
+            factory.diagnostics_unregister_finished(None, None, None).await;
+            UnregisterResult::Confirmed
+        }
         Err(failure) => {
             let metadata = failure.metadata();
             let admission = match observer {

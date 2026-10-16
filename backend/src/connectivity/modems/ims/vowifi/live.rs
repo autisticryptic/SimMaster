@@ -4886,7 +4886,7 @@ async fn record_live_ims_channel(
         context.worker,
     )) as Arc<dyn OperatorSocketCreator>;
     let uicc = register_context.uicc.clone().ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?;
-    uicc.verify(line_id).await.map_err(live_stage_error)?;
+    uicc.verify_registration(line_id).await.map_err(live_stage_error)?;
     register_context.verify_worker(line_id).map_err(|error| live_stage_error(error.code()))?;
     reg_event_live::accepted_owner(line_id, &uicc).await?;
     xcap_binding_cache().lock().await.insert(
@@ -5201,7 +5201,7 @@ async fn run_register_exchange_over_tunnel(
         let registered = xcap_binding_cache().lock().await.get(line_id).cloned()
             .filter(|binding| std::ptr::eq(binding.profile, profile))
             .ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?;
-        registered.uicc.verify(line_id).await.map_err(live_stage_error)?;
+        registered.uicc.verify_registration(line_id).await.map_err(live_stage_error)?;
         registered.uicc
     } else {
         live_identity::load(line_id, profile).await?
@@ -5994,7 +5994,7 @@ impl RegisterAuthenticator<SipChannel> for VowifiRegisterAuthenticator<'_> {
         if authenticated {
             self.context.verify_worker(self.line_id)?;
             self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?
-                .verify(self.line_id).await.map_err(ImsError::new)?;
+                .verify_registration(self.line_id).await.map_err(ImsError::new)?;
             self.context.verify_worker(self.line_id)?;
             let request = rebuild_initial_authenticated_register(
                 self.context, self.profile, self.variant, cseq, min_expires,
@@ -6082,7 +6082,9 @@ fn preserve_min_expires_profile_stop(error: &mut LiveStageError) {
 }
 
 pub(crate) fn register_reason_blocks_profile_fallback(reason: &str) -> bool {
-    is_live_digest_authentication_failure(reason) || reason.split(':').any(|code| matches!(code,
+    is_live_digest_authentication_failure(reason)
+        || reason.split(':').any(|code| code.starts_with("ims_uicc_") || code.starts_with("isim_"))
+        || reason.split(':').any(|code| matches!(code,
         "vowifi_register_retry_deferred"
         | "ims_bearer_requirement_rejected"
         | "vowifi_register_retry_stopped"
@@ -6228,6 +6230,9 @@ fn is_live_digest_authentication_failure(reason: &str) -> bool {
 }
 
 fn classify_vowifi_register_error(reason: &str) -> RegistrationLossReason {
+    if reason.starts_with("ims_uicc_") || reason.starts_with("isim_") {
+        return RegistrationLossReason::AccessTransportLost;
+    }
     if reason.starts_with("ims_outbound_") || reason == "vowifi_refresh_security_update_required" {
         return RegistrationLossReason::AccessTransportLost;
     }
@@ -6285,7 +6290,7 @@ async fn run_retained_stale_register_exchange(
         }
     }
     context.uicc.as_ref().ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?
-        .verify(line_id).await.map_err(live_stage_error)?;
+        .verify_registration(line_id).await.map_err(live_stage_error)?;
     let mut authorization = previous.ok_or_else(|| live_stage_error("ims_digest_stale_without_context"))?
         .renewed(challenge).map_err(map_shared_digest_error)?;
     let header = authorization.authorization(&context.identity.private_user, &context.request_uri(profile, variant))
@@ -8839,7 +8844,7 @@ impl VowifiUnregisterFactory {
             // No AUTHENTICATE replay for unchanged RAND/AUTN, but card/owner
             // binding must still be current (also for synchronous unregister).
             self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?
-                .verify(&self.line_id).await.map_err(ImsError::new)?;
+                .verify_registration(&self.line_id).await.map_err(ImsError::new)?;
             let previous = previous.ok_or_else(|| ImsError::new("digest_stale_without_context"))?;
             self.context.verify_worker(&self.line_id)?;
             return Ok((Some(previous.renewed(&challenge)?), None));
@@ -8851,7 +8856,9 @@ impl VowifiUnregisterFactory {
                     self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?
                         .authenticate(&self.line_id, &challenge.rand, &challenge.autn)
                         .await
-                        .map_err(|_| ImsError::new("vowifi_refresh_aka_failed"))?;
+                        .map_err(|reason| ImsError::new(if reason.starts_with("ims_uicc_") || reason.starts_with("isim_") {
+                            reason
+                        } else { "vowifi_refresh_aka_failed" }))?;
                 self.context.verify_worker(&self.line_id)?;
                 if let Some(auts) = aka.auts.as_ref() {
                     let header = build_digest_resync_authorization_header(
@@ -8944,6 +8951,9 @@ impl RegisterAuthenticator<SipChannel> for VowifiRefreshAuthenticator<'_> {
         min_expires: u32,
         _authenticated: bool,
     ) -> Result<Vec<u8>, ImsError> {
+        self.factory.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?
+            .verify_registration(&self.factory.line_id).await.map_err(ImsError::new)?;
+        self.factory.context.verify_worker(&self.factory.line_id)?;
         self.expires = self.expires.max(min_expires);
         let request = self.request()?;
         self.factory.context.diagnostic_scope.offer(&request, self.authorization.as_ref()).await;
@@ -8970,6 +8980,8 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
             self.context.verify_worker(&self.line_id)?;
             let owner = self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?;
             let scope = register_retry_live::Scope::for_owner(&self.line_id, owner).await?;
+            owner.verify_registration(&self.line_id).await.map_err(ImsError::new)?;
+            self.context.verify_worker(&self.line_id)?;
             // This is the logical P-CSCF endpoint, not the negotiated ESP port.
             let endpoint = SocketAddr::new(self.context.route_addr, self.profile.ims.local_port);
             match scope.check(endpoint).await {
@@ -8981,6 +8993,14 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
                 crate::connectivity::core::register_retry::RetryAdmission::Deferred { .. } => Err(ImsError::new(register_retry_live::DEFERRED)),
                 crate::connectivity::core::register_retry::RetryAdmission::Stopped(_) => Err(ImsError::new(register_retry_live::STOPPED)),
             }
+        })
+    }
+
+    fn unregister_accepted<'a>(&'a self) -> futures_util::future::BoxFuture<'a, Result<(), ImsError>> {
+        Box::pin(async move {
+            self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?
+                .verify_registration(&self.line_id).await.map_err(ImsError::new)?;
+            self.context.verify_worker(&self.line_id)
         })
     }
 
@@ -9258,7 +9278,7 @@ async fn build_live_register_auth_material(
         // Cached keys avoid a repeated AUTHENTICATE, not subscription/reader
         // ownership checks. No stale proof may migrate to a newly inserted SIM.
         context.uicc.as_ref().ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?
-            .verify(line_id).await.map_err(live_stage_error)?;
+            .verify_registration(line_id).await.map_err(live_stage_error)?;
     }
     let digest_uri = context.request_uri(profile, variant);
     let cnonce = live_digest_cnonce()?;

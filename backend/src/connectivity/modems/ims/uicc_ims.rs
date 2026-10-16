@@ -3,6 +3,9 @@
 use crate::connectivity::core::context::ImsIdentity;
 use super::vowifi::qmi_uim::{isim, IsimImsMaterial, USIM_AID_PREFIX};
 
+#[path = "uicc_provisioning.rs"]
+pub mod provisioning;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImsIdentitySource { Isim, UsimDerived }
 
