@@ -123,7 +123,8 @@ test('native IMS observation is explicit, historical and independent of host rea
   await expect(panel.getByText('最近样本 · UT（补充业务，非视频）', { exact: true })).toBeVisible()
   await expect(panel).toContainText('不证明持久 NV 读取成功')
   expect(nativeRequests).toEqual([{ method: 'POST', path: '/api/modem/lines/line-a/native/ims/probe', body: {} }])
-  const sample = observations['line-a'].sample!
+  const sample = observations['line-a'].sample
+  if (!sample) throw new Error('native fixture sample missing')
   observations['line-a'] = { ...observations['line-a'], stale: true, state: 'stale', sample: { ...sample, registration: 'unknown_or_unreported' } }
   await panel.getByRole('button', { name: '读取缓存（不访问设备）', exact: true }).click()
   await expect(panel.getByText('未知或未报告（0，不能据此判断未注册）', { exact: true })).toBeVisible()
@@ -158,7 +159,9 @@ for (const blocked of ['cellular intent', 'wifi intent', 'read-only projection',
 
 test('native IMS ignores a late old-line probe response without auto-probing the new line', async ({ page }) => {
   const { nativeRequests, mutations, errors, observations } = await installNativeFixtures(page)
-  observations['line-b'] = { ...observations['line-b'], sample: { ...observations['line-b'].sample!, registration: 'limited' } }
+  const sample = observations['line-b'].sample
+  if (!sample) throw new Error('native fixture sample missing')
+  observations['line-b'] = { ...observations['line-b'], sample: { ...sample, registration: 'limited' } }
   let release!: () => void
   const held = new Promise<void>((resolve) => { release = resolve })
   await page.route('**/api/modem/lines/line-a/native/ims/probe', async (route) => {
@@ -200,7 +203,9 @@ test('native IMS rejects mismatched line and schema responses and suppresses unk
   await readCache.click()
   await expect(panel.getByRole('alert')).toContainText('响应不符合约定')
   await expect(panel.getByText('已注册（仅基带报告）', { exact: true })).toHaveCount(0)
-  observations['line-a'] = { ...nativeObservation('line-a'), sample: { ...nativeObservation('line-a').sample!, schema: 'SECRET_SCHEMA' } } as unknown as NativeImsObservationStatus
+  const malformed = nativeObservation('line-a')
+  if (!malformed.sample) throw new Error('native fixture sample missing')
+  observations['line-a'] = { ...malformed, sample: { ...malformed.sample, schema: 'SECRET_SCHEMA' } } as unknown as NativeImsObservationStatus
   await readCache.click()
   await expect(panel.getByRole('alert')).toContainText('响应不符合约定')
   await expect(panel.getByText('已注册（仅基带报告）', { exact: true })).toHaveCount(0)
