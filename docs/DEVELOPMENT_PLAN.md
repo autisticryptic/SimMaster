@@ -6,7 +6,7 @@
 
 ## 当前基线与工作规则
 
-- 当前已验证源码基线为 **`ca38391`**：X2原生IMS只读观测及此前N1～N8/R1/R2保护，通过三工作流/双架构、两套462项相关回归/86场景、49单测/12browser及官方ZIP/19源码/三图核验。用户已打开IDA取得部分汇编证据，**X1独立catalog范围和最终固件复审仍未完成，未部署**，见 [HANDOFF](HANDOFF.md)。
+- **用户已校正本轮范围：基于EC20固件分析补齐SimAdmin IMS注册逻辑并复核查漏，不修改独立carrier_Bundles。** catalog/原生诊断不是必做项或阻塞；X2已做的额外诊断不作为注册兜底成果继续扩展。最新已验证代码ca38391保留，注册相关基线/证据见[HANDOFF](HANDOFF.md)，未部署。
 - 设备历史基线仍为全局兜底修复 `c174551`，已通过 Actions 和 410 原 Globe 配置的初始注册验收。
   `7bd` 的运营商专用补丁及测试仍保持由 `0502395` 撤销的状态；当前成功不能替代中国移动同卡验收。
 - **当前优先级是继续原 EC20 审查中的第二批协议补强，而不是把第一批当作整个委托结束。** 同卡/自然续期验收与停服时的 MM 重枚举/AT 超时调查独立保留，设备操作另需明确授权。
@@ -33,18 +33,18 @@
 - 已验证 AUTS/stale 与 423 的剩余限制：WiFi 初次认证后的 423 明确 unsupported；需要新安全上下文的受保护 stale 不重装旧 ESP；非 REGISTER 业务的响应认证/恢复需单独核对。
 - 蜂窝刷新 423→400/新鉴权后400的预算补漏已由 `b6a7888` 验证；后续需保持结构化门禁、Min-Expires来源和旧通道/租期/计数，不回到末次状态猜测。
 - R2 普通 WiFi 等待已由 `c3fb036` 软件验证，包含初次/刷新/注销/API门禁、同卡预算连续性、原租期保留和reg-event撤销竞态；实机仍未验收，不能由CI推断实际运营商接受情况。
-- N1～N8、R1/R2 已完成软件 CI/制品闭环；继续相关扩展 → 完整离线 EC20 复审，不能把软件绿灯当实机验收或固件所有分支已确认。
+- N1～N8、R1/R2已有软件CI/制品闭环；直接对照SimAdmin实际注册链与EC20注册/恢复证据做最终差异复核。仅补有依据的真实注册缺口，不再先做报告里的可选扩展。
 
 ## P1：原报告的传输与功能扩展（部分基础已具备）
 
 - **P-CSCF 传输已由 N6 验证。** worker 内 TCP/TLS、TCP/IPsec 四向选择器、原 authority 精确 TLS 身份、有界 DNS TCP/NAPTR D2T 接通；旧 UDP、来源/预算/跨 profile 防降级保持。TLS/IPsec 组合边界和实机验收仍须明确，不能把字段存在当作全组合支持。
 - **来源诊断已由 N7 软件验证。** 实际 profile/身份/domain/realm/端点、请求/授予族、报价/协商/响应认证、失败作用域和真实门禁已进入同源 API/原 GUI；epoch/serial 与弱 runtime 拒绝晚到写入。声明模板、收到的 Retry-After 与最近成功都不授予当前 readiness；实机未知值仍如实未知。
 - **N8承载门禁/有证据适配已由22646c8验证。** catalog/override要求在profile准备及每次family dispatch前验证；Native QMI支持PAP/CHAP/BOTH/none、MBIM支持PAP/CHAP/none，原WDS client只读IPv4/FQDN并保留原IPv6 exact-address观察，opt-in DHCP仅信息请求。API/原UI只投影能力和凭据存在标志，旧保存不清空认证。通用PCO策略写入、旧MM认证变更和DHCP地址分配仍unsupported；这些组合与实机验收不得由现有绿灯推断支持。
-- **EC20 离线 catalog 来源尚未接入。** 在独立 `carrier_Bundles` 侧维护版本绑定的 MCFG extractor、选择器及字段证据；未知 `qp_ims_*` raw bytes 不得猜为 ready。跨项目实施范围另行明确。
-- **EC20原生IMS只读观测已由ca38391软件验证。** 三工作流/双架构、两套462项回归/86场景、49单测/12browser与官方摘要/源码/截图通过。显式POST单次probe、GET只取缓存；Native QMI/AT资格与同slot/ICCID/owner，主机LTE/WLAN意图/session/残留资源排他、取消持锁。六字段末项UT、零为未知，不授予主机readiness；未实机，独立catalog范围和最终复审继续。
+- **EC20离线catalog来源不属于本轮委托。** 原报告将它列为独立可选扩展；用户只要求本项目IMS注册逻辑，故不修改carrier_Bundles、不构建新库，也不把该项或跨项目许可列为阻塞。此前独立仓库未修改。
+- **EC20原生IMS只读观测是已做的额外诊断，不再扩展。** ca38391已有三工作流/双架构、462相关回归、49单测/12browser证据，但不等于注册兜底，也不能充当本轮IMS注册任务完成依据。本次不擅自回滚既有提交；后续回到注册执行逻辑。
 - **固件汇编级复核已推进，尚未完整闭环。** 用户手动加载的EC20分析ELF路径/SHA已核验，缺Hex-Rays以系统既有LLVM Hexagon-v5只读解码辅助；已确认regpriority字段/普通路径的零跳过与顺序、原生查询/写分支、non-IPSec日志的多重前提。未知packet/特殊mode/当前选择不猜结论，不能称全固件无遗漏。
 
-以上是原 EC20 审查范围的后续，不把项目所有 MEP/VoNR/E911 愿景都混称成本轮已承诺功能。QoS/precondition/UT 等已有业务基础也不能重报成完全缺失，仍需按配置与实测分开验收。
+本轮以用户明确的IMS注册逻辑补全为准，不将原报告的可选catalog/provider或项目MEP/VoNR/E911愿景扩大成必做；QoS/precondition/UT等既有业务也不重报成注册缺口。
 
 ## P0：全局注册兜底的剩余验收
 

@@ -10,8 +10,8 @@
 4. 2026-10-07的部署授权已结束；本轮**未部署、未访问设备或写NV**。用户已手动开启并确认EC20分析ELF，可做只读IDA/静态分析，不修改IDB或扩大设备授权。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：原生 IMS 只读观测已验证，继续 catalog 范围与最终复审
-X2 **`ca3839163bff4bb6f9def797a9aa045880564136`**通过Build38843520280、Beta38843520308、Frontend38843520256和双架构；两套官方ZIP各462项相关回归/86场景、49单测/12browser、19份源码及三张原界面截图已核验。NativeFleet同卡/owner/主机IMS排他、取消保护、零IO缓存和显式按钮不改变主机readiness；零未报告歧义与UT语义保持。首轮3处fixture非空断言lint失败已修复留证，325静态通过；未设备/NV/部署。X1范围和最终固件复审未完成。
+## 当前：回到 SimAdmin IMS 注册逻辑与固件查漏
+用户已纠正范围：本轮仅补齐SimAdmin IMS注册链，不修改独立`carrier_Bundles`，不把catalog或原生诊断当必做/阻塞。此前X2是额外诊断，虽已由ca38391验证，不能替代注册兜底成果，后续停止扩展。N1～N8/R1/R2既有验证保留；下一步对照EC20注册/恢复分支检查实际缺口，不擅自降级、部署或操作设备。
 
 N8 **`22646c8df7f8d50c991d2b4910e49e28af8bee70`** 已通过 Build **38675465347**、Beta **38675465477**、Frontend **38675465467** 与双架构构建；两套官方测试ZIP各 **417项相关回归/86场景**、前端 **46单测/4browser**、17份源码指纹/摘要/原工作台截图已核验，报告`.local/evidence/ims-bearer-capabilities/verified-22646c8.json`。321静态/mock通过。认证需求/driver门禁、原CID P-CSCF地址/域名、保留原IPv6观察、opt-in DHCP信息请求、API脱敏/旧保存兼容均接通；browser首轮断言错误已修复留证。通用PCO策略写入、MM认证变更及DHCP地址分配仍明确unsupported，未部署/设备/IDA。
 
@@ -20,7 +20,7 @@ R2 最终代码 **`c3fb0361853388ebe551f50657a8786a1155a877`** 已通过 [Build-
 - WiFi 初次端点/头型、刷新、注销、profile batch/重连均执行同卡 not-before；端点地址、原 worker、租期和结构化失败与诊断分开。等待只保留到原截止，TCP死流/身份拒绝不因此保留。
 - API 按实际发送结果计失败轮次，轮询不增次数；清理保留已耗计数，只消费重建pending动作。换卡须正向确认，控制端口/worker变化不清等待。reg-event独立撤销serial防止晚到刷新重授旧ready。
 - 首轮过宽分类误关认证前404，已恢复原分类而保留真正的等待/认证后/423/死流门禁；旧测试未改且两套最终日志均通过，新增真实controller404回归。失败ZIP、annotations与`failure-closeout.json`保留。
-- **N8已完成软件验证；接着核定相关 catalog/provider 扩展并完整复审 EC20 固件。** 不按未知raw bytes猜能力，不凭当前CI冒称所有兜底和固件分支已确认。
+- **直接继续SimAdmin注册逻辑与EC20相关分支的差异复核；独立catalog不在本轮范围。** 不按未知raw bytes猜能力，不凭子阶段CI冒称注册兜底及固件查漏全部完成。
 
 ## 已验证：R1 刷新预算
 
@@ -61,7 +61,7 @@ N5 代码 **`3d54aa87b1cc0ae5f2294991a46ad2ce43984e6a`** 已通过 [Build-Releas
 
 上一阶段 AUTS/stale/跨候选 423 在 `344308c` 已验证；两套 Actions（[38138978950](https://github.com/autisticryptic/SimMaster/actions/runs/38138978950)、[38138978978](https://github.com/autisticryptic/SimMaster/actions/runs/38138978978)）各核验 46 项相关回归和四矩阵。独立 AKA 来源、受保护 stale 不重装旧 ESP、AUTS 不冒充证明、423 尝试级预算均保持；WiFi 初次认证后 423 仍明确 unsupported。
 
-**完整补全任务尚未完成。** N1～N8、R1/R2及X2已软件验证；独立catalog范围和最终固件复审继续。用户已开启正确IDA目标，取得部分汇编证据但未把未知packet/特殊mode猜成完整结论；实机仍需独立授权，见[开发计划](DEVELOPMENT_PLAN.md)。
+**IMS注册补全的最终复核尚未完成。** N1～N8/R1/R2已有软件验证；X2是额外诊断，不能与注册兜底混称。X1已由用户明确排除且独立仓库未修改。只继续本项目注册相关代码与固件查漏，保留未知packet/特殊mode、未实机及设备授权边界。
 
 ## 第一批：ISIM、P-CSCF 与临时拒绝补全
 
