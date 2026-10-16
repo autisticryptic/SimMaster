@@ -5828,7 +5828,7 @@ async fn run_register_exchange_on_connected_stream(
     let mut authenticator = VowifiRegisterAuthenticator {
         line_id,
         profile,
-        gateway: Some(gateway),
+        gateway,
         context: &mut context,
         variant,
         last_security_server: None,
@@ -5889,10 +5889,7 @@ async fn run_register_exchange_on_connected_stream(
 struct VowifiRegisterAuthenticator<'a> {
     line_id: &'a str,
     profile: &'static CarrierProfile,
-    /// Needed only when a challenge installs a NEW gateway ESP policy.
-    /// An already retained protected channel or direct AKA exchange needs no
-    /// gateway mutation; missing support cannot trigger an unprotected fallback.
-    gateway: Option<&'a TunGatewayRuntime>,
+    gateway: &'a TunGatewayRuntime,
     context: &'a mut LiveRegisterRequestContext,
     variant: LiveRegisterHeaderVariant,
     last_security_server: Option<(Vec<String>, Vec<LiveSecurityServerOffer>)>,
@@ -6313,7 +6310,7 @@ async fn run_authenticated_register_exchange(
     line_id: &str,
     profile: &'static CarrierProfile,
     initial_channel: &mut SipChannel,
-    gateway: Option<&TunGatewayRuntime>,
+    gateway: &TunGatewayRuntime,
     context: &mut LiveRegisterRequestContext,
     challenge: &LiveDigestChallenge,
     variant: LiveRegisterHeaderVariant,
@@ -6362,7 +6359,6 @@ async fn run_authenticated_register_exchange(
     if let Some(offer) =
         selected_offer.filter(|_| challenge.nonce_kind == LiveDigestNonceKind::AkaChallenge)
     {
-        let gateway = gateway.ok_or_else(|| live_stage_error("ims_register_protected_gateway_missing"))?;
         initial_channel
             .shutdown()
             .await

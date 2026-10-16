@@ -214,6 +214,10 @@ pub(crate) struct TunGatewayRuntime {
     health: Arc<TunGatewayHealth>,
     ue_namespace: String,
     worker_binding: UeWorkerBinding,
+    #[cfg(test)]
+    test_no_tun: bool,
+    #[cfg(test)]
+    test_policy_installs: AtomicU32,
     #[cfg(target_os = "linux")]
     _tun_file: std::fs::File,
 }
@@ -227,7 +231,31 @@ impl Drop for TunGatewayRuntime {
 impl TunGatewayRuntime {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        if self.test_no_tun { return; }
         platform_shutdown_tun(&self.tun_name, &self.ue_namespace);
+    }
+
+    /// Only the in-memory production policy is exercised; no TUN is created,
+    /// configured or removed. The caller injects loopback sockets via a worker.
+    #[cfg(test)]
+    pub(crate) fn for_register_test(profile_id: &'static str, worker_binding: UeWorkerBinding) -> Self {
+        Self {
+            profile_id, tun_name: "lo".into(), inner_addr: "127.0.0.1".parse().unwrap(),
+            pcscf_addr: "127.0.0.1".parse().unwrap(), pcscf_addrs: vec![],
+            diagnostic_requested_family: Default::default(), diagnostic_granted_family: Default::default(),
+            diagnostic_pcscf_sources: vec![], started_at: Instant::now(),
+            ims_esp_policy: Arc::new(StdMutex::new(None)), shutdown: Arc::new(AtomicBool::new(false)),
+            health: Arc::new(TunGatewayHealth::new()), ue_namespace: worker_binding.namespace().as_str().into(),
+            worker_binding, test_no_tun: true, test_policy_installs: AtomicU32::new(0),
+            #[cfg(target_os = "linux")]
+            _tun_file: std::fs::File::open("/dev/null").unwrap(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_test_policy_installs(&self) -> u32 {
+        self.test_policy_installs.load(Ordering::Acquire)
     }
 
     /// Whether the detached ESP/TUN forwarders still consider this access leg
@@ -311,6 +339,8 @@ impl TunGatewayRuntime {
         &self,
         config: ImsEspPolicyConfig,
     ) -> Result<(), TunGatewayError> {
+        #[cfg(test)]
+        self.test_policy_installs.fetch_add(1, Ordering::AcqRel);
         if config.local_addr.is_ipv4() != config.remote_addr.is_ipv4() {
             return Err(tun_error("ims_esp_policy_address_family_mismatch"));
         }
@@ -1139,6 +1169,10 @@ mod imp {
             health,
             ue_namespace: config.ue_namespace,
             worker_binding: config.worker_binding,
+            #[cfg(test)]
+            test_no_tun: false,
+            #[cfg(test)]
+            test_policy_installs: AtomicU32::new(0),
             _tun_file: tun_file,
         }))
     }
