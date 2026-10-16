@@ -7,6 +7,8 @@ mod response_auth_tests;
 mod stream_registration_tests;
 #[path = "refresh_budget_tests.rs"]
 mod refresh_budget_tests;
+#[path = "unregister_retry_tests.rs"]
+mod unregister_retry_tests;
 use super::*;
 use crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult;
 use tokio::net::UdpSocket;

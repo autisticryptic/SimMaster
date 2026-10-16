@@ -53,6 +53,9 @@ impl Scope {
     pub(super) async fn observe(&self, endpoint: SocketAddr, metadata: &RegisterFailureMetadata) -> RetryAdmission {
         self.state.lock().await.observe_failure(endpoint, metadata, Instant::now())
     }
+    pub(super) async fn observe_unregister_failure(&self, endpoint: SocketAddr, metadata: &RegisterFailureMetadata) -> RetryAdmission {
+        self.state.lock().await.observe_unregister_failure(endpoint, metadata, Instant::now())
+    }
     pub(super) async fn pause_restart(&self) -> RetryAdmission {
         self.state.lock().await.pause_restart(Instant::now())
     }

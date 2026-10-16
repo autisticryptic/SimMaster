@@ -5,7 +5,8 @@
 
 ## 1.1.5 主线
 
-- R3（待Actions）：继续注册逻辑，补WiFi初次鉴权后的423重试；保留实际protected channel与ESP状态，将floor交回原共享预算并重算Digest nc/proof，原两轮AKA、零租期/AUTS/rspauth/失败止损不放宽。新增真实生产authenticator与loopback回归，不改独立库或扩诊断。
+- R4（待Actions）：补双接入注销新失败的恢复反馈，同订阅捕获状态/独立注销等待跨清理保留，控制与诊断分离，不重试注销、不延长租期、不影响新SIM；新增16项共享/生产路径回归。
+- R3 `31d09ff`已验证：补WiFi初次鉴权后的423重试，保留原protected channel/接收对与ESP状态，将floor交回共享预算并重算Digest nc/proof。两套Actions/双架构、各472相关回归/86场景含10项新真实authenticator/worker/gateway-policy测试及官方摘要通过，328静态/mock通过；前端未改，复核旧49单测/12browser制品而非重跑。首轮缺Security-Server的夹具失败已修复留证，不放宽安全要求，未设备/部署。
 - 用户校正范围：本轮只按EC20证据补齐SimAdmin IMS注册逻辑及最终查漏；独立carrier_Bundles未修改且不需修改，移出必做/阻塞。X2额外诊断不替代注册兜底，停止扩展；此次仅校正文档/任务，不擅自回滚功能。
 - X2 `ca38391`已验证：EC20单参数只读NativeFleet观测、same-SIM/owner/host排他、取消drain保护、零IO缓存、认证API和原工作台显式按钮；末项UT、零有valid-bit歧义，不变成主机ready。三工作流/双架构、两套各462相关回归/86场景、49单测/12browser、官方ZIP/19源码/三张截图及325静态通过。首轮3处fixture非空断言lint失败已修复留证，未设备/NV/部署，X1范围及最终复审继续。
 - N8 `22646c8` 已验证：显式承载需求/driver前置门禁、Native QMI/MBIM认证、原WDS CID P-CSCF地址/域名及保留原IPv6观察、worker opt-in DHCP信息请求、API/原UI脱敏和旧保存兼容。三工作流/双架构、各417项相关回归/86场景、46单测/4browser、官方ZIP/源码/截图和321静态/mock通过。首轮browser断言误命中说明文字已修复留证；通用PCO写入、MM认证变更与DHCP地址分配明确unsupported，未部署/设备/IDA，相关扩展与固件复审继续。

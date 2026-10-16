@@ -124,7 +124,7 @@
 - AUTS 保留选定 qop/opaque，但不是有效鉴权证明；非法/重复 AUTS 或仅 AUTS 后直接 2xx 不能形成注册或确认注销。
 - stale 必须关联上一条已发送的同 scope 请求；同 RAND/AUTN 才复用绑定凭据，独立 `aka_origin` 不被 nextnonce 覆盖。已保护通道不因 stale 重装同 SPI/key 或退明文；需新安全上下文时明确恢复。
 - 蜂窝刷新三候选共用一个 `RegisterNegotiationBudget`，包括 423→400/415/420/421/494 后不再换头型。门禁必须使用 `RegisterFailureMetadata.permits_variant_fallback()`，不能只看最后 SIP 状态；新鉴权后的 400 也不得重新开启 AKA/头型预算。返回错误保留 budget 的 Min-Expires 来源，正常交换首包格式兼容及 423→2xx 仍保留。R1 已由 `b6a7888` 软件验证，实机互通仍独立。
-- 423协商一旦开始，就关闭本次静态头型/profile/端点兼容扩张；无效/过大/不增长/耗尽floor不能重开预算，零租期注销不协商正租期。R3（待Actions）将WiFi初次认证后的423交回同一共享驱动，原protected channel/接收配对不重建，使用实际凭据重算nc/proof；初始与鉴权共用两轮lease预算且不重置两轮AKA预算。AUTS不当有效凭据，成功先验rspauth再提交租期/nextnonce；注册后刷新旧逻辑保持。
+- 423协商一旦开始，就关闭本次静态头型/profile/端点兼容扩张；无效/过大/不增长/耗尽floor不能重开预算，零租期注销不协商正租期。R3（31d09ff已软件验证）将WiFi初次认证后的423交回同一共享驱动，原protected channel/接收配对不重建，使用实际凭据重算nc/proof；初始与鉴权共用两轮lease预算且不重置两轮AKA预算。AUTS不当有效凭据，成功先验rspauth再提交租期/nextnonce；注册后刷新旧逻辑保持。
 - `3509e15` 已接通并验证 rspauth：仅对实际生成的非空 Digest 证明捕获不可变请求上下文，发送前检查最终 URI/Authorization/opaque，2xx 发布前验证响应对应的 qop/nc/cnonce 和 rspauth。Authentication-Info/Proxy-Authentication-Info 不串用，重复/畸形/不匹配明确失败；缺少可选 rspauth 仍兼容，不把 nextnonce-only 冒充服务器证明已验。当前支持范围为既有 REGISTER 算法、qop=auth/无 qop 和单一鉴权 scope。
 - 响应认证失败不是传输失败或可换头型的协商提示；不能提交新的 nextnonce、租期、业务身份或安全上下文。失败保留已发送的原 nonce-count、回滚暂存状态；不放宽 AKA/ESP 算法门禁。本轮范围为 REGISTER，非 REGISTER 业务不自动宣称已支持。
 
@@ -151,6 +151,7 @@
 - WiFi 初次等待键使用发现时的逻辑 P-CSCF 地址/端口，不使用后协商的 IPsec 端口；临时响应立即停止同端点头型阶梯，未开始新AKA时可选合格其他端点，认证/423后的止损保持。完整失败轮次之后，重启/profile/ESP重建先查同卡门禁。
 - WiFi operator 通过不可序列化的 `RegisterRecovery`/`RegisteredRefreshFailure` 传递真实 metadata、not-before、原 lease deadline 与是否实际发送；这些控制值独立于被动 diagnostics。等待只恢复本来已有的服务flags，到旧截止降readiness，不补发早到REGISTER；保留活动对话原排空逻辑。独立撤销serial在最终stage发布处重验，网络reg-event撤销后，旧刷新不能恢复绑定。
 - API 只计实际失败轮次，不把等待轮询计成新失败；耗尽后的重建动作也等门禁，清理只消费 pending 动作位，不清失败次数。新注册成功或正向确认换卡才清旧预算；有限scope/端点容量耗尽fail-closed。
+- R4（待Actions）还将注销本次新收到的失败反馈给下一批注册：`observe_unregister_failure`用独立等待槽合并原门禁，不因清理、较短其他端点或晚到success清除。蜂窝使用session原Arc，WiFi准入时返回transaction-owned observer，网络返回后不重新按line寻找新卡。诊断只投影metadata/admission，不承担控制副作用；正常200不新增等待，零租期423不转正租期，临时/非法/长等待沿用原策略。
 - WiFi 注册捕获原 worker binding，刷新/后续鉴权/注销核验原实例与代次；替换后的新worker不能被旧channel借用。TCP EOF/确定的连接错误按死流恢复，不能用旧租期包装成可重试UDP收包缺口。
 
 ## 6. 资费保护与业务路由
@@ -349,6 +350,21 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 ### 基带原生IMS观察（X2，ca38391已软件验证）
 
 独立认证`/api/modem/lines/{line_id}/native/ims/{status,probe}`与原工作台按钮只产生时间戳观测：GET零设备IO，POST显式一次只读；默认无自动probe。主机两接入关闭且无session/flow/cleanup才准入，try-lock不排队，取消必须保留原物理和host排他。driver资格与同卡/slot/owner前后校验，不清账本或改变连接意图。IMSA六字段含UT、零可能未报告；样本不改变软件SIP租期、业务readiness/计费，也不声称自主固件/host长期互斥。详见[原生后端](NATIVE_BACKEND_STATUS.md)。
+
+### EC20原报告注册缺口对照（有界静态复核）
+
+以原审查基线42057a6与当前31d09ff为对照，原报告第4节六项均已有生产实现；本次新增R4需单独Actions验证。证据等级不因CI而升级为完整固件调用图或实网成功。
+
+| 原报告项 | 生产入口 | 状态/保留边界 |
+|---|---|---|
+| P1-A ISIM材料 | `uicc_ims::resolve_ims_identity`、cellular `load_device_identity`、WiFi `live_identity` | 身份/AID同卡绑定；首个配置IMPU，不声明任意多IMPU注册 |
+| P1-B endpoint | `pcscf_endpoint`、`pcscf_dns_transport`、`bind_endpoint_in_worker` | UDP/TCP/TLS及有界DNS已接通；TTL元数据不等于持续迁移健康注册 |
+| P1-C 临时拒绝 | `EndpointRetryState`、cellular `connect_inner/refresh_live_registration`、WiFi `register_retry_live` | 初次/刷新已验证；本次发现注销新等待反馈缺口R4，修复待验证 |
+| P2-D reg-event | shared `reg_event`、cellular `live_reg_event`、WiFi operator | 仅相关绑定撤销readiness；订阅不支持不伪造注册失效 |
+| P2-E AUTS/stale/rspauth | `digest_aka`、`DigestRequestProof`、双接入authenticator | 先验后提交；单scope、auth/无qop，非REGISTER不扩称 |
+| P2-F 423预算 | `RegisterNegotiationBudget`、双接入候选与refresh | 初次/刷新共用原预算；R3初次protected AKA已补齐 |
+
+固件普通priority的00/02/03/01及条件non-IPSec构造分支已有汇编证据，但不能推导所有mode、设备当前NV/MBN或任意失败降级；不据此改用户覆写优先权。同卡ISIM EF热更新指示、运行中P-CSCF列表变化、未知packet及完整恢复图仍未确认，不把卡标识检查或静态TTL冒称覆盖。实机首次/自然续期/注销/故障恢复及MM重枚举另需授权；独立catalog和额外原生诊断不在此次注册补全范围。
 
 ## 10. 验证清单与验收标准
 

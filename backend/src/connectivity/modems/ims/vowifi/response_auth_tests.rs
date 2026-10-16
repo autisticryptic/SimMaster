@@ -3,6 +3,8 @@
 use super::*;
 #[path = "register_retry_refresh_tests.rs"]
 mod retry_recovery_tests;
+#[path = "register_retry_unregister_tests.rs"]
+mod retry_unregister_tests;
 #[path = "initial_min_expires_tests.rs"]
 mod initial_min_expires_tests;
 use crate::connectivity::core::{

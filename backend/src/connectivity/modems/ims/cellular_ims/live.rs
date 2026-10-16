@@ -4202,7 +4202,14 @@ async fn unregister_live_session(
             UnregisterResult::Confirmed
         }
         Err(failure) => {
-            runtime.observe_diagnostics(|state| state.failure(failure.error.code(), Some(failure.metadata()))).await;
+            let metadata = failure.metadata();
+            // The session retains the original subscription's Arc across the
+            // exchange. Cleanup or a replacement SIM cannot redirect this wait
+            // into a new scope, and diagnostics are not a control input.
+            let admission = session.endpoint_retries.lock().await.observe_unregister_failure(
+                session.pcscf, &metadata, Instant::now());
+            runtime.observe_diagnostics(|state| state.failure(failure.error.code(), Some(metadata))).await;
+            observe_retry_diagnostics(runtime, admission).await;
             if failure.response.is_some() { UnregisterResult::Rejected } else { UnregisterResult::AccessLost }
         }
     }

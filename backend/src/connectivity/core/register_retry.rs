@@ -43,6 +43,7 @@ pub(crate) struct EndpointRetryState {
     stopped: Option<RetryStopReason>,
     restart: Option<RetryAdmission>,
     registration_event_wait: Option<RetryAdmission>,
+    unregister_wait: Option<RetryAdmission>,
 }
 impl EndpointRetryState {
     /// After exhausting a discovery pass, prevent a new bearer/profile batch
@@ -63,12 +64,13 @@ impl EndpointRetryState {
         self.restart_admission(now)
     }
     pub(crate) fn restart_admission(&mut self, now: Instant) -> RetryAdmission {
-        for slot in [&mut self.restart, &mut self.registration_event_wait] {
+        for slot in [&mut self.restart, &mut self.registration_event_wait, &mut self.unregister_wait] {
             if slot.is_some_and(|admission| matches!(admission,
                 RetryAdmission::Deferred { not_before } if not_before <= now)) { *slot = None; }
         }
-        merge_admission(self.restart.unwrap_or(RetryAdmission::Allowed),
-            self.registration_event_wait.unwrap_or(RetryAdmission::Allowed))
+        merge_admission(merge_admission(self.restart.unwrap_or(RetryAdmission::Allowed),
+            self.registration_event_wait.unwrap_or(RetryAdmission::Allowed)),
+            self.unregister_wait.unwrap_or(RetryAdmission::Allowed))
     }
     /// A new success cannot erase other endpoints or subscription reg-events.
     pub(crate) fn registered(&mut self) { self.restart = None; }
@@ -107,6 +109,17 @@ impl EndpointRetryState {
             },
         };
         self.defer_delay(endpoint, delay, now)
+    }
+    /// Deregistration tears down the current pass: a newly learned wait must
+    /// gate its successor even after cleanup, an unrelated endpoint's shorter
+    /// wait, or a late success. The caller supplies the scope captured BEFORE
+    /// the exchange; this never restores a lease or retries Expires: 0.
+    pub(crate) fn observe_unregister_failure(&mut self, endpoint: SocketAddr,
+        failure: &RegisterFailureMetadata, now: Instant) -> RetryAdmission {
+        let admission = self.observe_failure(endpoint, failure, now);
+        let previous = self.restart_admission(now);
+        self.unregister_wait = Some(merge_admission(previous, admission));
+        self.restart_admission(now)
     }
     pub(crate) fn observe_registration_event(&mut self, endpoint: SocketAddr,
         retry_after_seconds: Option<u32>, now: Instant) -> RetryAdmission {
@@ -162,6 +175,10 @@ impl EndpointRetryState {
     #[cfg(test)]
     pub(crate) fn entry_count(&self) -> usize { self.entries.len() }
 }
+
+#[cfg(test)]
+#[path = "unregister_retry_tests.rs"]
+mod unregister_tests;
 
 fn merge_admission(first: RetryAdmission, second: RetryAdmission) -> RetryAdmission {
     match (first, second) {

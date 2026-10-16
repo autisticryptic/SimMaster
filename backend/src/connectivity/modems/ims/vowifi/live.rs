@@ -8951,14 +8951,33 @@ impl RegisterAuthenticator<SipChannel> for VowifiRefreshAuthenticator<'_> {
     }
 }
 
+struct VowifiUnregisterFailureObserver {
+    retries: register_retry_live::Scope,
+    endpoint: SocketAddr,
+}
+
+impl super::operator::UnregisterFailureObserver for VowifiUnregisterFailureObserver {
+    fn observe<'a>(&'a self, metadata: RegisterFailureMetadata)
+        -> futures_util::future::BoxFuture<'a, crate::connectivity::core::register_retry::RetryAdmission> {
+        Box::pin(async move { self.retries.observe_unregister_failure(self.endpoint, &metadata).await })
+    }
+}
+
 impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
-    fn unregister_admitted<'a>(&'a self) -> futures_util::future::BoxFuture<'a, Result<(), ImsError>> {
+    fn unregister_admitted<'a>(&'a self)
+        -> futures_util::future::BoxFuture<'a, Result<Option<Box<dyn super::operator::UnregisterFailureObserver>>, ImsError>> {
         Box::pin(async move {
             self.context.verify_worker(&self.line_id)?;
             let owner = self.context.uicc.as_ref().ok_or_else(|| ImsError::new("ims_uicc_binding_invalid"))?;
             let scope = register_retry_live::Scope::for_owner(&self.line_id, owner).await?;
-            match scope.check(SocketAddr::new(self.context.route_addr, self.profile.ims.local_port)).await {
-                crate::connectivity::core::register_retry::RetryAdmission::Allowed => Ok(()),
+            // This is the logical P-CSCF endpoint, not the negotiated ESP port.
+            let endpoint = SocketAddr::new(self.context.route_addr, self.profile.ims.local_port);
+            match scope.check(endpoint).await {
+                crate::connectivity::core::register_retry::RetryAdmission::Allowed => {
+                    let observer: Box<dyn super::operator::UnregisterFailureObserver> =
+                        Box::new(VowifiUnregisterFailureObserver { retries: scope, endpoint });
+                    Ok(Some(observer))
+                },
                 crate::connectivity::core::register_retry::RetryAdmission::Deferred { .. } => Err(ImsError::new(register_retry_live::DEFERRED)),
                 crate::connectivity::core::register_retry::RetryAdmission::Stopped(_) => Err(ImsError::new(register_retry_live::STOPPED)),
             }
@@ -8969,11 +8988,14 @@ impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
         Box::pin(self.context.diagnostic_scope.update(|state|
             state.facts.procedure = crate::connectivity::core::registration_diagnostics::RegistrationProcedure::Unregister))
     }
-    fn diagnostics_unregister_finished<'a>(&'a self, reason: Option<&'static str>, metadata: Option<RegisterFailureMetadata>)
-        -> futures_util::future::BoxFuture<'a, ()> {
-        Box::pin(self.context.diagnostic_scope.update(move |state| {
-            if let Some(reason) = reason { state.failure(reason, metadata); } else { state.facts.failure = None; }
-        }))
+    fn diagnostics_unregister_finished<'a>(&'a self, reason: Option<&'static str>, metadata: Option<RegisterFailureMetadata>,
+        admission: Option<crate::connectivity::core::register_retry::RetryAdmission>) -> futures_util::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.context.diagnostic_scope.update(move |state| {
+                if let Some(reason) = reason { state.failure(reason, metadata); } else { state.facts.failure = None; }
+            }).await;
+            if let Some(admission) = admission { self.context.diagnostic_scope.admission(admission).await; }
+        })
     }
 
     fn reg_event_owner_valid<'a>(&'a self) -> futures_util::future::BoxFuture<'a, Result<(), ImsError>> {
