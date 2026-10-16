@@ -10,8 +10,8 @@
 4. 2026-10-07的部署授权已结束；本轮**未部署、未访问设备或写NV**。用户已手动开启并确认EC20分析ELF，可做只读IDA/静态分析，不修改IDB或扩大设备授权。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：原生 IMS 只读观测已接线，待 Actions 验证
-X2从857a635接续：已确认EC20单参数QIMSCFG只读、三参数写EFS，六字段末项UT且零有缺失歧义；driver、同卡/owner/主机IMS排他、取消保护、零IO缓存、认证API及原工作台显式按钮已接线。325静态/mock通过，Rust/前端新回归尚未Actions，不能沿用N8绿灯；X1范围及最终固件复审未完成。
+## 当前：原生 IMS 只读观测已验证，继续 catalog 范围与最终复审
+X2 **`ca3839163bff4bb6f9def797a9aa045880564136`**通过Build38843520280、Beta38843520308、Frontend38843520256和双架构；两套官方ZIP各462项相关回归/86场景、49单测/12browser、19份源码及三张原界面截图已核验。NativeFleet同卡/owner/主机IMS排他、取消保护、零IO缓存和显式按钮不改变主机readiness；零未报告歧义与UT语义保持。首轮3处fixture非空断言lint失败已修复留证，325静态通过；未设备/NV/部署。X1范围和最终固件复审未完成。
 
 N8 **`22646c8df7f8d50c991d2b4910e49e28af8bee70`** 已通过 Build **38675465347**、Beta **38675465477**、Frontend **38675465467** 与双架构构建；两套官方测试ZIP各 **417项相关回归/86场景**、前端 **46单测/4browser**、17份源码指纹/摘要/原工作台截图已核验，报告`.local/evidence/ims-bearer-capabilities/verified-22646c8.json`。321静态/mock通过。认证需求/driver门禁、原CID P-CSCF地址/域名、保留原IPv6观察、opt-in DHCP信息请求、API脱敏/旧保存兼容均接通；browser首轮断言错误已修复留证。通用PCO策略写入、MM认证变更及DHCP地址分配仍明确unsupported，未部署/设备/IDA。
 
@@ -61,7 +61,7 @@ N5 代码 **`3d54aa87b1cc0ae5f2294991a46ad2ce43984e6a`** 已通过 [Build-Releas
 
 上一阶段 AUTS/stale/跨候选 423 在 `344308c` 已验证；两套 Actions（[38138978950](https://github.com/autisticryptic/SimMaster/actions/runs/38138978950)、[38138978978](https://github.com/autisticryptic/SimMaster/actions/runs/38138978978)）各核验 46 项相关回归和四矩阵。独立 AKA 来源、受保护 stale 不重装旧 ESP、AUTS 不冒充证明、423 尝试级预算均保持；WiFi 初次认证后 423 仍明确 unsupported。
 
-**完整补全任务尚未完成。** N1～N8 与 R1/R2 已软件验证；相关扩展与最终固件复审继续推进。跨项目 catalog/provider、IDA 与实机验收保持独立授权边界，见[开发计划](DEVELOPMENT_PLAN.md)。
+**完整补全任务尚未完成。** N1～N8、R1/R2及X2已软件验证；独立catalog范围和最终固件复审继续。用户已开启正确IDA目标，取得部分汇编证据但未把未知packet/特殊mode猜成完整结论；实机仍需独立授权，见[开发计划](DEVELOPMENT_PLAN.md)。
 
 ## 第一批：ISIM、P-CSCF 与临时拒绝补全
 

@@ -99,7 +99,7 @@ simadmin discover-native --sys-root /snapshot/sys --dev-root /snapshot/dev
 
 ## 5. AT 会话与事件
 
-### EC20原生IMS显式只读观测（X2，已接线待Actions）
+### EC20原生IMS显式只读观测（X2，ca38391已软件验证）
 
 - `GET /api/modem/lines/{line_id}/native/ims/status`只读进程内缓存/driver声明，无刷新、SIM、AT或worker操作；`POST .../probe`仅接受空对象，是独立的已认证用户触发，不自动轮询。
 - 实际provider是已注入的NativeFleet/NativeDevice，不从API切换后端或绕开MM。当前仅QMI primary-slot证明+明确AT口、报告型号/修订符合EC20CEFAGR08A03M4G资格；报告值不是固件密码学认证，其他修订明确不支持。
@@ -107,7 +107,7 @@ simadmin discover-native --sys-root /snapshot/sys --dev-root /snapshot/dev
 - 主机cellular/WiFi保存意图必须关闭，host activity/REGISTER/admission、会话、残留flow/cleanup和connect锁均须排他；busy不排队，不停止旧会话来取得准入。取消HTTP等待后后台任务仍持排他直到物理I/O结束。
 - 六字段为registration-reporting、service-reporting、registration、SMS、voice、UT（不是视频）；getter丢失optional-valid，零为`unknown_or_unreported`，不据此认定未注册。两次IMSA顺序读取不是原子快照，上报开关也只是reported值。
 - 缓存30秒后过期，失败不更新旧样本时间；同卡重现、绑定/worker/runtime/host epoch和本地维护状态变化会隐藏旧样本。每线路同一时刻一个probe，并有5秒点击冷却；样本不持久化，不输出身份/端口/原AT。
-- 原工作台仅native线路显示显式采样/缓存按钮；不自动请求，不改原主机IMS状态/路由/费用，也不等于对自主固件IMS的持久启停控制。compiled验证仅Actions，硬件/注册/业务仍未验收。
+- 原工作台仅native线路显示显式采样/缓存按钮；不自动请求，不改原主机IMS状态/路由/费用，也不等于对自主固件IMS的持久启停控制。ca38391三工作流/双架构、两套462项相关回归、49单测/12browser及官方制品/截图已核验；首轮3处测试fixture非空断言lint失败已修复留证。325静态通过，硬件/注册/业务仍未验收。
 
 - 命令、USSD、短信提交和被动读取共用 `at_session` 会话互斥锁，不另起抢读字符设备的线程。
   所有 IO 沿物理操作门执行，并在前后核验端口与代次。

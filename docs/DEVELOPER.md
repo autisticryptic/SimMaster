@@ -66,7 +66,7 @@ YAML写后重解析，保留未变注释；线路映射/业务历史不因重构
 新Rust测试必须加入执行过滤器；仅`cargo test --no-run`通过不表示执行过测试。
 N8 `22646c8` 三工作流/双架构、各417项后端相关回归/86矩阵场景、46单测/4原工作台browser及官方ZIP/源码/截图已核验。新增 `hardware::devices::ims_bearer_policy::tests`、`transport::capabilities::tests`、`backends::wds_pcscf::tests`/`io::tests::retained_wds_`，双接入profile/record/override与真实provider/family/worker/DHCP回归；私有D-Bus执行`http_router_tests::ims_bearer_`。首轮browser断言误命中说明文字已修复，后续IPv6部分schema补强也重新验证，失败证据保留。承载能力是driver声明，不是网络授予/readiness；PCO reporting不等于request-policy。存储保留显式凭据，Debug/API只暴露方法与存在标志，旧客户端遗漏不得清空。
 过滤器选中0条应失败；下载日志逐名核验新增回归，避免只看绿色workflow。
-X2新增 `backends::native_ims::tests`、`quectel::native_ims::{tests,serial_tests}`、`services::native_ims_observation::tests`，core排他/双接入idle回归及私有D-Bus的`http_router_tests::native_ims_observation_api_`必须实际执行；原工作台mock验证无自动probe/跨线回包/UT与零歧义，不连接设备。
+X2 `ca38391`新增 `backends::native_ims::tests`、`quectel::native_ims::{tests,serial_tests}`、`services::native_ims_observation::tests`、core排他/双接入idle及私有D-Bus的`http_router_tests::native_ims_observation_api_`已实际执行；三工作流/双架构、各462项后端相关回归/86场景、49单测/12browser和官方ZIP/19源码/三张原工作台截图已核验。首轮3处fixture非空断言lint失败已修复并保存，不连接设备。
 ISIM/端点/恢复第一批另包含 `qmi_uim::isim::tests`、`isim_binding_tests`、`uicc_ims::tests`、
 `vowifi::live::live_identity::tests`、`pcsc::ims::tests`、`cellular_ims::pcscf::endpoint::tests`、
 `register_retry::tests` 和 `live::live_retry::tests`；实际刷新和 profile batch 的新增测试纳入原过滤器。

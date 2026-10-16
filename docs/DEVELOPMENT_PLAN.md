@@ -6,7 +6,7 @@
 
 ## 当前基线与工作规则
 
-- 当前已验证源码基线为 **`22646c8`**：N8承载需求/driver门禁、Native认证、原CID P-CSCF域名与原IPv6观察、worker DHCP信息请求、API/原UI脱敏和旧保存兼容；三工作流/双架构、各417项相关回归/86场景、46单测/4browser及官方制品/源码/截图已核验。R1/R2与此前保护保持，**相关扩展与最终固件复审未完成，未部署**，见 [HANDOFF](HANDOFF.md)。
+- 当前已验证源码基线为 **`ca38391`**：X2原生IMS只读观测及此前N1～N8/R1/R2保护，通过三工作流/双架构、两套462项相关回归/86场景、49单测/12browser及官方ZIP/19源码/三图核验。用户已打开IDA取得部分汇编证据，**X1独立catalog范围和最终固件复审仍未完成，未部署**，见 [HANDOFF](HANDOFF.md)。
 - 设备历史基线仍为全局兜底修复 `c174551`，已通过 Actions 和 410 原 Globe 配置的初始注册验收。
   `7bd` 的运营商专用补丁及测试仍保持由 `0502395` 撤销的状态；当前成功不能替代中国移动同卡验收。
 - **当前优先级是继续原 EC20 审查中的第二批协议补强，而不是把第一批当作整个委托结束。** 同卡/自然续期验收与停服时的 MM 重枚举/AT 超时调查独立保留，设备操作另需明确授权。
@@ -41,7 +41,7 @@
 - **来源诊断已由 N7 软件验证。** 实际 profile/身份/domain/realm/端点、请求/授予族、报价/协商/响应认证、失败作用域和真实门禁已进入同源 API/原 GUI；epoch/serial 与弱 runtime 拒绝晚到写入。声明模板、收到的 Retry-After 与最近成功都不授予当前 readiness；实机未知值仍如实未知。
 - **N8承载门禁/有证据适配已由22646c8验证。** catalog/override要求在profile准备及每次family dispatch前验证；Native QMI支持PAP/CHAP/BOTH/none、MBIM支持PAP/CHAP/none，原WDS client只读IPv4/FQDN并保留原IPv6 exact-address观察，opt-in DHCP仅信息请求。API/原UI只投影能力和凭据存在标志，旧保存不清空认证。通用PCO策略写入、旧MM认证变更和DHCP地址分配仍unsupported；这些组合与实机验收不得由现有绿灯推断支持。
 - **EC20 离线 catalog 来源尚未接入。** 在独立 `carrier_Bundles` 侧维护版本绑定的 MCFG extractor、选择器及字段证据；未知 `qp_ims_*` raw bytes 不得猜为 ready。跨项目实施范围另行明确。
-- **EC20原生IMS只读观测已接线待Actions。** 显式POST单次probe、GET只取缓存；仅已拥有Native QMI/AT、资格匹配固件与同slot/ICCID/owner。主机LTE/WLAN意图及存活/残留资源必须排他，取消后不早释放门禁。六元组为上报标志/registration/SMS/voice/UT，零因valid-bit丢失仍未知，不授予主机readiness。实际设备互通仍需独立窗口。
+- **EC20原生IMS只读观测已由ca38391软件验证。** 三工作流/双架构、两套462项回归/86场景、49单测/12browser与官方摘要/源码/截图通过。显式POST单次probe、GET只取缓存；Native QMI/AT资格与同slot/ICCID/owner，主机LTE/WLAN意图/session/残留资源排他、取消持锁。六字段末项UT、零为未知，不授予主机readiness；未实机，独立catalog范围和最终复审继续。
 - **固件汇编级复核已推进，尚未完整闭环。** 用户手动加载的EC20分析ELF路径/SHA已核验，缺Hex-Rays以系统既有LLVM Hexagon-v5只读解码辅助；已确认regpriority字段/普通路径的零跳过与顺序、原生查询/写分支、non-IPSec日志的多重前提。未知packet/特殊mode/当前选择不猜结论，不能称全固件无遗漏。
 
 以上是原 EC20 审查范围的后续，不把项目所有 MEP/VoNR/E911 愿景都混称成本轮已承诺功能。QoS/precondition/UT 等已有业务基础也不能重报成完全缺失，仍需按配置与实测分开验收。

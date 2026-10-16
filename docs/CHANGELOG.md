@@ -5,7 +5,7 @@
 
 ## 1.1.5 主线
 
-- X2（待Actions）：基于已核实EC20单参数只读分支接入NativeFleet观测、same-SIM/owner/host活动排他、取消drain保护和零IO缓存；新增认证API及原工作台显式按钮。末项UT、零valid-bit歧义、资格/未知状态不变成主机ready；未设备/NV操作。服务辅助任务超时由主任务接手，325静态通过，新compiled/UI回归尚待执行。
+- X2 `ca38391`已验证：EC20单参数只读NativeFleet观测、same-SIM/owner/host排他、取消drain保护、零IO缓存、认证API和原工作台显式按钮；末项UT、零有valid-bit歧义，不变成主机ready。三工作流/双架构、两套各462相关回归/86场景、49单测/12browser、官方ZIP/19源码/三张截图及325静态通过。首轮3处fixture非空断言lint失败已修复留证，未设备/NV/部署，X1范围及最终复审继续。
 - N8 `22646c8` 已验证：显式承载需求/driver前置门禁、Native QMI/MBIM认证、原WDS CID P-CSCF地址/域名及保留原IPv6观察、worker opt-in DHCP信息请求、API/原UI脱敏和旧保存兼容。三工作流/双架构、各417项相关回归/86场景、46单测/4browser、官方ZIP/源码/截图和321静态/mock通过。首轮browser断言误命中说明文字已修复留证；通用PCO写入、MM认证变更与DHCP地址分配明确unsupported，未部署/设备/IDA，相关扩展与固件复审继续。
 - `c3fb036` 完成 R2 WiFi 普通 Retry-After 恢复：统一端点策略、同卡跨profile/worker等待与已耗计数、有效原租期/typed operator-API控制、注销门禁；TCP死流、原worker与reg-event撤销竞态有独立回归。两套Actions/双架构、各304项相关回归/四矩阵及官方摘要通过，316静态/mock通过。首轮误关旧认证前404兼容已恢复，旧测试不改且最终通过，失败证据保留。未部署，N8/相关扩展/固件复审继续。
 
