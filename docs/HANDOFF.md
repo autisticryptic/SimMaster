@@ -10,8 +10,8 @@
 4. 2026-10-07的部署授权已结束；本轮**未部署、未访问设备或写NV**。用户已手动开启并确认EC20分析ELF，可做只读IDA/静态分析，不修改IDB或扩大设备授权。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：R4注销等待反馈已接线待验证；R3已验证
-R4补回双接入注销新503/Retry-After到后续注册门禁的反馈；发送前捕获同订阅状态，清理/晚到成功不清等待，旧卡响应不影响新卡。新增16项共享/实际注销路径回归待Actions，不把源码接线当验证。
+## 当前：R4注销等待反馈已软件验证
+R4 **`0351006b79e4b83c93d39fb510c11516f256f44c`** 已通过 Build **38905460531**、Beta **38905460494** 和双架构；两套官方ZIP各 **488相关回归/86场景**含16项新真实注销/共享门禁测试，332静态/mock通过。发送前捕获同订阅状态，新503/Retry-After跨清理保留，晚到旧卡响应不写新卡；不重试注销或延长租期。首轮5项夹具误要求Contact独立expires已修正，失败原制品保留。报告`.local/evidence/ims-unregister-retry/verified-0351006.json`；前端未变，旧49单测/12browser制品重新核验而非重跑。
 R3 **`31d09ffd190a9dd79c15c7e9cf6a8fe58bce8d86`** 已通过 Build **38857492989**、Beta **38857493030** 与 ARM64/AMD64；两套官方ZIP各 **472项相关回归/86场景**，含10项新真实authenticator/worker/gateway-policy回归。初次AKA/ESP收到423交回原共享预算，保留保护通道/接收对并重算nc/proof，不重装SA。首轮缺Security-Server的测试夹具已修复留证，未放宽生产要求；328静态/mock通过。前端未改，复核ca38391的49单测/12browser制品，不冒称重跑。证据`.local/evidence/ims-initial-min-expires/verified-31d09ff.json`。仅继续本项目注册/固件查漏，不改独立catalog、扩诊断或操作设备。
 N8 **`22646c8df7f8d50c991d2b4910e49e28af8bee70`** 已通过 Build **38675465347**、Beta **38675465477**、Frontend **38675465467** 与双架构构建；两套官方测试ZIP各 **417项相关回归/86场景**、前端 **46单测/4browser**、17份源码指纹/摘要/原工作台截图已核验，报告`.local/evidence/ims-bearer-capabilities/verified-22646c8.json`。321静态/mock通过。认证需求/driver门禁、原CID P-CSCF地址/域名、保留原IPv6观察、opt-in DHCP信息请求、API脱敏/旧保存兼容均接通；browser首轮断言错误已修复留证。通用PCO策略写入、MM认证变更及DHCP地址分配仍明确unsupported，未部署/设备/IDA。
 
@@ -61,7 +61,7 @@ N5 代码 **`3d54aa87b1cc0ae5f2294991a46ad2ce43984e6a`** 已通过 [Build-Releas
 
 上一阶段 AUTS/stale/跨候选 423 在 `344308c` 已验证；两套 Actions（[38138978950](https://github.com/autisticryptic/SimMaster/actions/runs/38138978950)、[38138978978](https://github.com/autisticryptic/SimMaster/actions/runs/38138978978)）各核验 46 项相关回归和四矩阵。独立 AKA 来源、受保护 stale 不重装旧 ESP、AUTS 不冒充证明、423 尝试级预算均保持；WiFi初次认证后423已由R3在31d09ff重新验证，不沿用此旧结果。
 
-**IMS注册补全的最终复核尚未完成。** N1～N8/R1/R2/R3已有软件验证；X2是额外诊断，不能与注册兜底混称。X1已由用户明确排除且独立仓库未修改。只继续本项目注册相关代码与固件查漏，保留未知packet/特殊mode、未实机及设备授权边界。
+**原报告六项已完成本轮有界源码对照，完整固件运行分支与实机仍未确认。** N1～N8/R1～R4已有软件验证；EC20包SHA/25成员CRC、分析ELF、4MBN/506记录/373EFS重新核验。未知mode/packet、同卡EF热更新与运行中P-CSCF列表变化不假装已覆盖，见[协议对照表](IMS_REGISTRATION_POLICY.md#ec20原报告注册缺口对照有界静态复核)。X1独立catalog已排除，X2额外诊断不扩展；不以静态/CI推断设备开通或实机成功。
 
 ## 第一批：ISIM、P-CSCF 与临时拒绝补全
 

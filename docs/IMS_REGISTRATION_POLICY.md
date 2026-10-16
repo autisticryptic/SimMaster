@@ -151,7 +151,7 @@
 - WiFi 初次等待键使用发现时的逻辑 P-CSCF 地址/端口，不使用后协商的 IPsec 端口；临时响应立即停止同端点头型阶梯，未开始新AKA时可选合格其他端点，认证/423后的止损保持。完整失败轮次之后，重启/profile/ESP重建先查同卡门禁。
 - WiFi operator 通过不可序列化的 `RegisterRecovery`/`RegisteredRefreshFailure` 传递真实 metadata、not-before、原 lease deadline 与是否实际发送；这些控制值独立于被动 diagnostics。等待只恢复本来已有的服务flags，到旧截止降readiness，不补发早到REGISTER；保留活动对话原排空逻辑。独立撤销serial在最终stage发布处重验，网络reg-event撤销后，旧刷新不能恢复绑定。
 - API 只计实际失败轮次，不把等待轮询计成新失败；耗尽后的重建动作也等门禁，清理只消费 pending 动作位，不清失败次数。新注册成功或正向确认换卡才清旧预算；有限scope/端点容量耗尽fail-closed。
-- R4（待Actions）还将注销本次新收到的失败反馈给下一批注册：`observe_unregister_failure`用独立等待槽合并原门禁，不因清理、较短其他端点或晚到success清除。蜂窝使用session原Arc，WiFi准入时返回transaction-owned observer，网络返回后不重新按line寻找新卡。诊断只投影metadata/admission，不承担控制副作用；正常200不新增等待，零租期423不转正租期，临时/非法/长等待沿用原策略。
+- R4（0351006已软件验证）还将注销本次新收到的失败反馈给下一批注册：`observe_unregister_failure`用独立等待槽合并原门禁，不因清理、较短其他端点或晚到success清除。蜂窝使用session原Arc，WiFi准入时返回transaction-owned observer，网络返回后不重新按line寻找新卡。诊断只投影metadata/admission，不承担控制副作用；正常200不新增等待，零租期423不转正租期，临时/非法/长等待沿用原策略。
 - WiFi 注册捕获原 worker binding，刷新/后续鉴权/注销核验原实例与代次；替换后的新worker不能被旧channel借用。TCP EOF/确定的连接错误按死流恢复，不能用旧租期包装成可重试UDP收包缺口。
 
 ## 6. 资费保护与业务路由
@@ -353,13 +353,13 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 
 ### EC20原报告注册缺口对照（有界静态复核）
 
-以原审查基线42057a6与当前31d09ff为对照，原报告第4节六项均已有生产实现；本次新增R4需单独Actions验证。证据等级不因CI而升级为完整固件调用图或实网成功。
+以原审查基线42057a6与当前0351006为对照，原报告第4节六项均已有生产实现；复核新增R4也已单独Actions验证。证据等级不因CI而升级为完整固件调用图或实网成功。
 
 | 原报告项 | 生产入口 | 状态/保留边界 |
 |---|---|---|
 | P1-A ISIM材料 | `uicc_ims::resolve_ims_identity`、cellular `load_device_identity`、WiFi `live_identity` | 身份/AID同卡绑定；首个配置IMPU，不声明任意多IMPU注册 |
 | P1-B endpoint | `pcscf_endpoint`、`pcscf_dns_transport`、`bind_endpoint_in_worker` | UDP/TCP/TLS及有界DNS已接通；TTL元数据不等于持续迁移健康注册 |
-| P1-C 临时拒绝 | `EndpointRetryState`、cellular `connect_inner/refresh_live_registration`、WiFi `register_retry_live` | 初次/刷新已验证；本次发现注销新等待反馈缺口R4，修复待验证 |
+| P1-C 临时拒绝 | `EndpointRetryState`、cellular `connect_inner/refresh_live_registration`、WiFi `register_retry_live` | 初次/刷新已验证；本次发现注销新等待反馈缺口R4，0351006已修复验证 |
 | P2-D reg-event | shared `reg_event`、cellular `live_reg_event`、WiFi operator | 仅相关绑定撤销readiness；订阅不支持不伪造注册失效 |
 | P2-E AUTS/stale/rspauth | `digest_aka`、`DigestRequestProof`、双接入authenticator | 先验后提交；单scope、auth/无qop，非REGISTER不扩称 |
 | P2-F 423预算 | `RegisterNegotiationBudget`、双接入候选与refresh | 初次/刷新共用原预算；R3初次protected AKA已补齐 |
