@@ -117,6 +117,8 @@ impl BasebandWedgeState {
 
 pub struct LineRuntime {
     binding: Arc<RwLock<ModemBinding>>,
+    native_binding_revision: std::sync::atomic::AtomicU64,
+    pub(crate) native_ims_observation: Arc<crate::services::native_ims_observation::NativeImsObservation>,
     /// Per-UE identity for this line. Every access leg (VoLTE, VoWiFi, data
     /// proxy, trunk) resolves through this context, which owns the line's
     /// mandatory Linux network namespace.
@@ -261,6 +263,8 @@ impl LineRuntime {
         };
         Self {
             binding: Arc::new(RwLock::new(binding)),
+            native_binding_revision: std::sync::atomic::AtomicU64::new(0),
+            native_ims_observation: Arc::new(Default::default()),
             ue: RwLock::new(ue_context),
             ue_worker: UeWorkerHandle::for_line(&line_id, namespace),
             cellular_ims,
@@ -297,6 +301,16 @@ impl LineRuntime {
             .clone()
     }
 
+    pub(crate) fn native_observation_binding(&self) -> (ModemBinding, u64) {
+        let binding = self.binding.read().unwrap_or_else(|e| e.into_inner());
+        (binding.clone(), self.native_binding_revision.load(Ordering::Acquire))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_native_observation_test_binding(&self, binding: ModemBinding) {
+        self.replace_binding(binding);
+    }
+
     pub fn ue(&self) -> UeContext {
         self.ue
             .read()
@@ -305,10 +319,13 @@ impl LineRuntime {
     }
 
     fn replace_binding(&self, binding: ModemBinding) {
-        *self
-            .binding
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = binding;
+        {
+            let mut current = self.binding.write().unwrap_or_else(|e| e.into_inner());
+            if *current != binding {
+                self.native_binding_revision.fetch_add(1, Ordering::AcqRel);
+            }
+            *current = binding;
+        }
         let binding = self.binding();
         let mut ue = self
             .ue
@@ -630,6 +647,12 @@ pub struct LineRuntimeRegistry {
 }
 
 impl LineRuntimeRegistry {
+    /// Already injected and owned backend. Cloning it performs no discovery,
+    /// owner switching or implicit modem operation.
+    pub(crate) fn observation_provider(&self) -> Arc<dyn ModemObservationProvider> {
+        Arc::clone(&self.observations)
+    }
+
     /// Device driver selected once at process startup.
     pub fn device_kind(&self) -> DeviceKind {
         self.device_kind

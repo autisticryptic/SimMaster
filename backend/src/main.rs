@@ -1882,6 +1882,14 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
             get(get_line_network_controls_handler).options(options_handler),
         )
         .route(
+            "/api/modem/lines/{line_id}/native/ims/status",
+            get(api::native_ims_observation::status).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/native/ims/probe",
+            post(api::native_ims_observation::probe).options(options_handler),
+        )
+        .route(
             "/api/modem/lines/{line_id}/native/quectel/diagnostics",
             get(api::native_controls::quectel_diagnostics).options(options_handler),
         )
@@ -2659,6 +2667,13 @@ mod http_router_tests {
     async fn build_test_router_with_radio(
         radio: Option<Arc<dyn hardware::cellular::radio::ModemRadioControl>>,
     ) -> Option<TempState> {
+        build_test_router_with_observations(radio, None).await
+    }
+
+    async fn build_test_router_with_observations(
+        radio: Option<Arc<dyn hardware::cellular::radio::ModemRadioControl>>,
+        observations: Option<Arc<dyn hardware::cellular::observations::ModemObservationProvider>>,
+    ) -> Option<TempState> {
         let dbus_conn = match zbus::Connection::system().await {
             Ok(connection) => Arc::new(connection),
             Err(error) => {
@@ -2693,11 +2708,11 @@ mod http_router_tests {
         let line_registry = Arc::new(services::line_registry::LineRuntimeRegistry::with_config(
             Arc::clone(&config_manager),
             Arc::clone(&app_db),
-            Arc::new(
+            observations.unwrap_or_else(|| Arc::new(
                 hardware::cellular::mm_observations::ModemManagerObservations::new(Arc::clone(
                     &dbus_conn,
                 )),
-            ),
+            )),
         ));
         let esim_supervisor = Arc::new(EsimSupervisor::new(
             Arc::clone(&config_manager),
@@ -3124,6 +3139,84 @@ mod http_router_tests {
         let response: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(response["data"]["non_three_gpp"]["diagnostics"]["wait"]["status"], "waiting");
         assert!(!body.contains("register_recovery") && !body.contains("retained_until"));
+    }
+
+    #[tokio::test]
+    async fn native_ims_observation_api_is_explicit_authenticated_and_never_changes_host_readiness() {
+        use crate::services::native_ims_observation::tests::native_fixture;
+        let (provider, io, binding) = native_fixture();
+        let line_id = binding.line_id.clone();
+        let state = build_test_router_with_observations(None, Some(provider)).await
+            .expect("private D-Bus required; native IO is fully synthetic");
+        let line = state.app.line_registry.insert_control_test_line(binding).await;
+        state.config_manager.reconcile_line_profiles(&[line_id.clone()]).unwrap();
+        let before = serde_json::to_value(state.config_manager.get_line_profile(&line_id)).unwrap();
+        let served = serve(state.router.clone()).await;
+        let root = format!("/api/modem/lines/{line_id}/native/ims");
+        for (method, path) in [(reqwest::Method::GET, format!("{root}/status")), (reqwest::Method::POST, format!("{root}/probe"))] {
+            assert_eq!(send(&served, method, &path).await.0, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(io.calls.load(Ordering::Acquire), 0);
+        let cookie = authenticate(&served).await;
+        for _ in 0..3 {
+            let (status, body) = get_with_cookie(&served, &format!("{root}/status"), &cookie).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(result["data"]["state"], "not_probed");
+            assert!(result["data"]["sample"].is_null());
+        }
+        assert_eq!(io.calls.load(Ordering::Acquire), 0);
+        let (status, _, _) = post_json(&served, &format!("{root}/probe"), serde_json::json!({"command":"AT+CFUN=1"}), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(io.calls.load(Ordering::Acquire), 0);
+        let (status, _, body) = post_json(&served, &format!("{root}/probe"), serde_json::json!({}), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(result["data"]["state"], "observed");
+        assert_eq!(result["data"]["sample"]["registration"], "registered");
+        assert_eq!(result["data"]["sample"]["sms"], "unknown_or_unreported");
+        assert_eq!(result["data"]["sample"]["ut"], "available");
+        assert_eq!(result["data"]["sample_kind"], "sequential_not_atomic");
+        for secret in ["8900000000000000001", "QIMSCFG", "/dev/", "worker_generation", "hardware_key"] {
+            assert!(!body.contains(secret));
+        }
+        assert_eq!(io.calls.load(Ordering::Acquire), 7);
+        let (status, body) = get_with_cookie(&served, &format!("{root}/status"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        let cached: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(cached["data"]["observed_at"], result["data"]["observed_at"]);
+        assert_eq!(io.calls.load(Ordering::Acquire), 7);
+        assert_eq!(post_json(&served, &format!("{root}/probe"), serde_json::json!({}), Some(&cookie)).await.0, StatusCode::CONFLICT);
+        assert!(!line.cellular_ims.status().await.registered);
+        assert!(!line.vowifi.snapshot().await.live_readiness.ims_registered);
+        assert_eq!(serde_json::to_value(state.config_manager.get_line_profile(&line_id)).unwrap(), before);
+        state.config_manager.set_line_cellular_ims_connection_enabled(&line_id, true).unwrap();
+        assert_eq!(post_json(&served, &format!("{root}/probe"), serde_json::json!({}), Some(&cookie)).await.0, StatusCode::CONFLICT);
+        let (_, body) = get_with_cookie(&served, &format!("{root}/status"), &cookie).await;
+        let blocked: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(blocked["data"]["sample"].is_null());
+        assert_eq!(io.calls.load(Ordering::Acquire), 7);
+        let absent = "/api/modem/lines/line-ffffffffffffffffffffffffffffffff/native/ims";
+        assert_eq!(get_with_cookie(&served, &format!("{absent}/status"), &cookie).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(post_json(&served, &format!("{absent}/probe"), serde_json::json!({}), Some(&cookie)).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn native_ims_observation_api_does_not_fall_back_to_modemmanager_or_other_lines() {
+        let state = build_test_router().await.expect("private D-Bus required");
+        let binding = radio_test_binding(0xec2002, false);
+        let line_id = binding.line_id.clone();
+        state.app.line_registry.insert_control_test_line(binding).await;
+        let served = serve(state.router.clone()).await;
+        let cookie = authenticate(&served).await;
+        let root = format!("/api/modem/lines/{line_id}/native/ims");
+        let (status, body) = get_with_cookie(&served, &format!("{root}/status"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(result["data"]["adapter_available"], false);
+        assert!(result["data"]["sample"].is_null());
+        let (status, _, body) = post_json(&served, &format!("{root}/probe"), serde_json::json!({}), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
     }
 
     #[tokio::test]

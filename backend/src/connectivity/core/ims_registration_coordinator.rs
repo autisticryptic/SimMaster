@@ -9,12 +9,12 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock, RwLock, Weak},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, OnceLock, RwLock, Weak},
     time::{Duration, Instant},
 };
 
 use serde::Serialize;
-use tokio::sync::{Mutex as AsyncMutex, MutexGuard, RwLock as AsyncRwLock, RwLockReadGuard};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard, RwLock as AsyncRwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{
     ims_access::{
@@ -64,6 +64,10 @@ pub struct ImsRegistrationCoordinator {
     pub transition_lock: AsyncMutex<()>,
     admission: AsyncRwLock<ImsAccessDecision>,
     register_lock: AsyncMutex<()>,
+    /// A diagnostic probe excludes host bring-up without changing admission,
+    /// intent, a SIP lease, or recovery counters. Ordinary operation is read-only.
+    host_activity: AsyncRwLock<()>,
+    observation_epoch: AtomicU64,
     observation: RwLock<Observation>,
 }
 
@@ -74,6 +78,8 @@ impl Default for ImsRegistrationCoordinator {
             transition_lock: AsyncMutex::new(()),
             admission: AsyncRwLock::new(initial),
             register_lock: AsyncMutex::new(()),
+            host_activity: AsyncRwLock::new(()),
+            observation_epoch: AtomicU64::new(0),
             observation: RwLock::new(Observation {
                 applied: initial,
                 switch_deferred_for_call: false,
@@ -92,15 +98,53 @@ impl Default for ImsRegistrationCoordinator {
 /// using the same just-negotiated snapshot to start competing first flows.
 /// The read permit still drains before an access teardown.
 pub struct RegistrationPermit<'a> {
+    _activity: RwLockReadGuard<'a, ()>,
     _admission: RwLockReadGuard<'a, ImsAccessDecision>,
     _register: MutexGuard<'a, ()>,
 }
 
+/// Non-mutating admission for one explicit, bounded modem status observation.
+/// Service callers also hold transition/connect guards and verify no local
+/// access/session/teardown owns resources. This is not firmware IMS control.
+pub struct NativeImsObservationPermit<'a> {
+    _activity: RwLockWriteGuard<'a, ()>,
+    _register: MutexGuard<'a, ()>,
+    _admission: RwLockWriteGuard<'a, ImsAccessDecision>,
+}
+
 impl ImsRegistrationCoordinator {
+    pub async fn host_activity(&self) -> RwLockReadGuard<'_, ()> {
+        let guard = self.host_activity.read().await;
+        self.observation_epoch.fetch_add(1, Ordering::AcqRel);
+        guard
+    }
+
+    /// A private cache fence, not a subscriber identifier or a retry budget.
+    pub fn native_observation_epoch(&self) -> u64 {
+        self.observation_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn try_native_observation(&self) -> Result<NativeImsObservationPermit<'_>, &'static str> {
+        let activity = self.host_activity.try_write().map_err(|_| "native_ims_host_activity_busy")?;
+        let register = self.register_lock.try_lock().map_err(|_| "native_ims_host_registration_busy")?;
+        let admission = self.admission.try_write().map_err(|_| "native_ims_host_admission_busy")?;
+        if admission.cellular_registers || admission.wlan_registers {
+            return Err("native_ims_host_registration_enabled");
+        }
+        let observation = self.observation.read().unwrap_or_else(|e| e.into_inner());
+        // Even an expired/unproven flow can still own a socket, SA or draining
+        // dialog. Do not treat not-ready as proof of no owner.
+        if observation.cellular_flow.upgrade().is_some() || observation.wlan_flow.upgrade().is_some() {
+            return Err("native_ims_host_flow_owned");
+        }
+        Ok(NativeImsObservationPermit { _activity: activity, _register: register, _admission: admission })
+    }
+
     /// Caller owns transition_lock. Waits for an already admitted REGISTER;
     /// future attempts then see the new decision before touching the network.
     pub async fn publish(&self, decision: ImsAccessDecision) {
         *self.admission.write().await = decision;
+        self.observation_epoch.fetch_add(1, Ordering::AcqRel);
         let mut observation = self.observation.write().unwrap_or_else(|e| e.into_inner());
         observation.applied = decision;
         observation.switch_deferred_for_call = false;
@@ -115,6 +159,7 @@ impl ImsRegistrationCoordinator {
             ImsAccess::Wlan => admission.wlan_registers = false,
         }
         admission.code = "ims_access_registration_parked";
+        self.observation_epoch.fetch_add(1, Ordering::AcqRel);
         let mut observation = self.observation.write().unwrap_or_else(|e| e.into_inner());
         observation.applied = *admission;
         observation.switch_deferred_for_call = false;
@@ -124,6 +169,7 @@ impl ImsRegistrationCoordinator {
     /// A line never reconciled by its owner fails closed, including SMS/voice
     /// helpers and diagnostic stages which bypass the HTTP restore workflow.
     pub async fn admit(&self, access: ImsAccess) -> Result<RegistrationPermit<'_>, &'static str> {
+        let activity = self.host_activity().await;
         let register = self.register_lock.lock().await;
         let decision = self.admission.read().await;
         if !decision.permits(access) {
@@ -154,6 +200,7 @@ impl ImsRegistrationCoordinator {
             return Err("ims_access_registration_parked");
         }
         Ok(RegistrationPermit {
+            _activity: activity,
             _admission: decision,
             _register: register,
         })
@@ -447,6 +494,91 @@ pub fn for_line(line_id: &str) -> Arc<ImsRegistrationCoordinator> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_observation_is_nonmutating_and_excludes_direct_host_admission() {
+        let coordinator = ImsRegistrationCoordinator::default();
+        let desired = ImsAccessDecision::none("ims_access_not_reconciled");
+        let before = coordinator.status(ImsAccessPreference::CellularPreferred, desired);
+        let epoch = coordinator.native_observation_epoch();
+        let permit = coordinator.try_native_observation().unwrap();
+        assert!(coordinator.try_native_observation().is_err());
+        assert_eq!(coordinator.native_observation_epoch(), epoch);
+        assert_eq!(coordinator.status(ImsAccessPreference::CellularPreferred, desired), before);
+        assert!(tokio::time::timeout(Duration::from_millis(10), coordinator.admit(ImsAccess::Cellular)).await.is_err());
+        drop(permit);
+        assert!(coordinator.admit(ImsAccess::Cellular).await.is_err(), "read probe cannot authorize a host registration");
+        assert!(coordinator.native_observation_epoch() > epoch);
+    }
+
+    #[tokio::test]
+    async fn native_observation_refuses_ike_activity_without_changing_any_policy() {
+        let coordinator = ImsRegistrationCoordinator::default();
+        let activity = coordinator.host_activity().await;
+        assert!(coordinator.try_native_observation().is_err());
+        // try-native never queues a writer that deadlocks nested IKE/ESP guards.
+        let nested = tokio::time::timeout(Duration::from_millis(100), coordinator.host_activity()).await.unwrap();
+        drop(nested);
+        drop(activity);
+        assert!(coordinator.try_native_observation().is_ok());
+    }
+
+    #[tokio::test]
+    async fn native_observation_cannot_revoke_enabled_access_or_recovery_budget() {
+        let coordinator = ImsRegistrationCoordinator::default();
+        coordinator.publish(ImsAccessDecision::cellular_only("selected")).await;
+        coordinator.flow_failed(ImsAccess::Cellular);
+        let before = coordinator.observation.read().unwrap().recovery;
+        let epoch = coordinator.native_observation_epoch();
+        assert!(coordinator.try_native_observation().is_err());
+        assert_eq!(coordinator.observation.read().unwrap().recovery, before);
+        assert_eq!(coordinator.native_observation_epoch(), epoch);
+        coordinator.park(ImsAccess::Cellular).await;
+        assert!(coordinator.try_native_observation().is_ok());
+        assert_eq!(coordinator.observation.read().unwrap().recovery, before);
+    }
+
+    #[tokio::test]
+    async fn native_observation_rejects_unproven_retained_flow_until_owner_releases_it() {
+        use crate::connectivity::core::outbound::{OutboundFlow, tests::{register_request, register_success, INSTANCE}};
+        let line = "native-observation-retained-flow";
+        let coordinator = for_line(line);
+        let mut flow = OutboundFlow::default();
+        flow.configure(line, ImsAccess::Wlan, INSTANCE, true);
+        let request = flow.prepare(&register_request("native-owner", 1)).unwrap();
+        flow.registered(&register_success(&request, 30), false, 30).unwrap();
+        let lease = coordinator.observation.read().unwrap().wlan_flow.upgrade().unwrap();
+        lease.invalidate();
+        assert!(!lease.live());
+        assert!(coordinator.try_native_observation().is_err(), "not-ready is not unowned");
+        drop(flow);
+        assert!(coordinator.try_native_observation().is_err(), "another retained Arc still owns this flow");
+        drop(lease);
+        assert!(coordinator.try_native_observation().is_ok());
+    }
+
+    #[tokio::test]
+    async fn native_observation_blocks_policy_publication_then_releases_without_rewriting_it() {
+        let coordinator = Arc::new(ImsRegistrationCoordinator::default());
+        let permit = coordinator.try_native_observation().unwrap();
+        let other = coordinator.clone();
+        let change = tokio::spawn(async move { other.publish(ImsAccessDecision::wlan_only("requested")).await; });
+        tokio::task::yield_now().await;
+        assert!(!change.is_finished());
+        drop(permit);
+        change.await.unwrap();
+        assert!(coordinator.try_native_observation().is_err());
+        assert!(coordinator.admit(ImsAccess::Wlan).await.is_ok());
+    }
+
+    #[test]
+    fn native_observation_is_scoped_to_the_original_line_only() {
+        let first = for_line("native-observation-line-first");
+        let second = for_line("native-observation-line-second");
+        let _permit = first.try_native_observation().unwrap();
+        assert!(first.try_native_observation().is_err());
+        assert!(second.try_native_observation().is_ok());
+    }
 
     #[test]
     fn rejected_additional_flow_is_not_a_permanent_operator_blacklist() {

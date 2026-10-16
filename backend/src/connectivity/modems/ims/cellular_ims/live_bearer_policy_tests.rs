@@ -49,6 +49,31 @@ fn live_preparation_gate_checks_apn_credential_binding_before_driver() {
     assert_eq!(error.code(), code::BEARER_REQUIREMENTS_INVALID);
     assert_eq!(transport.0.load(Ordering::Acquire), 0);
 }
+#[tokio::test]
+async fn cellular_native_probe_idle_fences_locks_and_detached_cleanup() {
+    let live = CellularImsLiveHandle::new();
+    assert!(live.idle_for_native_ims_observation());
+    let session = live.session.lock().await;
+    assert!(!live.idle_for_native_ims_observation());
+    drop(session);
+    let failed = live.failed_bearer.lock().await;
+    assert!(!live.idle_for_native_ims_observation());
+    drop(failed);
+    let cleanup = NativeObservationCleanupFence::new(&live.native_observation_busy);
+    assert!(!live.idle_for_native_ims_observation(), "moving state out of a cache does not finish cleanup");
+    drop(cleanup);
+    assert!(live.idle_for_native_ims_observation());
+}
+
+#[tokio::test]
+async fn cellular_native_probe_refuses_listener_even_when_no_lease_is_ready() {
+    let live = CellularImsLiveHandle::new();
+    *live.listener.lock().await = Some(tokio::spawn(std::future::pending::<()>()));
+    assert!(!live.idle_for_native_ims_observation());
+    live.listener.lock().await.take().unwrap().abort();
+    assert!(live.idle_for_native_ims_observation());
+}
+
 #[test]
 fn live_preparation_gate_leaves_legacy_derived_requirements_unchanged() {
     let profile = profile();

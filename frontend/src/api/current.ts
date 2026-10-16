@@ -65,6 +65,7 @@ import type {
   ImsProfileSelectionConfig,
   CellularImsProfileSelectionResponse,
   NetworkInfo,
+  NativeImsObservationStatus,
   NetworkInterfacesResponse,
   NotificationConfig,
   NotificationLogsResponse,
@@ -678,6 +679,21 @@ class SimAdminCurrentAPI {
   async getLineImsStatus(lineId: string) {
     return request<ApiResponse<ImsSubsystemState>>(
       modemLinePath(lineId, '/ims/status'),
+    )
+  }
+
+  /** Cache only: does not query hardware. Called explicitly by the observation panel. */
+  async getNativeImsObservationStatus(lineId: string) {
+    return request<ApiResponse<NativeImsObservationStatus>>(
+      modemLinePath(lineId, '/native/ims/status'),
+    )
+  }
+
+  /** One explicit, read-only sample; never called by polling or intent controls. */
+  async probeNativeImsObservation(lineId: string) {
+    return request<ApiResponse<NativeImsObservationStatus>>(
+      modemLinePath(lineId, '/native/ims/probe'),
+      { method: 'POST', body: JSON.stringify({}) },
     )
   }
 

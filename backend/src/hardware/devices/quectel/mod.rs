@@ -6,6 +6,7 @@
 mod ec2x;
 mod eg600;
 pub mod maintenance;
+pub mod native_ims;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuectelFamily {

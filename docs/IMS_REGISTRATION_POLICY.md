@@ -346,6 +346,10 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 - 域名在原承载DNS解析并保留TLS authority。默认来源顺序不变；DHCP信息位于原PCO/profile/ISIM后、标准DNS前，其域名优先于地址。DHCP有总时限/消息/长度/事务与客户端标识门禁；IPv4仅接受直接服务端和client-ID echo，未知relay不猜信任。
 - API/原工作台只返回方法、凭据存在标志、来源和driver能力；Debug、profile详情、覆写和保存响应均不得回显用户名/密码。旧编辑器省略bearer字段时保留原存储；显式clear/replace与脱敏结果回写必须区分，不能把脱敏对象当有效凭据或混用别的SIM/profile。
 
+### 基带原生IMS观察（X2，待验证）
+
+独立认证`/api/modem/lines/{line_id}/native/ims/{status,probe}`与原工作台按钮只产生时间戳观测：GET零设备IO，POST显式一次只读；默认无自动probe。主机两接入关闭且无session/flow/cleanup才准入，try-lock不排队，取消必须保留原物理和host排他。driver资格与同卡/slot/owner前后校验，不清账本或改变连接意图。IMSA六字段含UT、零可能未报告；样本不改变软件SIP租期、业务readiness/计费，也不声称自主固件/host长期互斥。详见[原生后端](NATIVE_BACKEND_STATUS.md)。
+
 ## 10. 验证清单与验收标准
 
 构建/Rust/注册模拟仅走 GitHub Actions，流程见 [开发指南](DEVELOPER.md)。

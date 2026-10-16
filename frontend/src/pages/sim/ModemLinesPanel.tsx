@@ -1209,7 +1209,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Box>
                     </Box>
                     )}
-                    {!isReader && workbench && workbenchTab === 'ims' && line.profile.cellular_ims_connection_enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider">
+                    {!isReader && workbench && workbenchTab === 'ims' && (line.profile.cellular_ims_connection_enabled || line.modem.modem_path?.startsWith('native:')) && <Box mt={2} pt={2} borderTop={1} borderColor="divider">
                       <Box display="flex" alignItems="center" gap={0.75} mb={1.5}>
                         <CellTower color="action" fontSize="small" />
                         <Typography variant="subtitle2" fontWeight={700}>4G/5G 详情</Typography>

@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
-import type { ImsRegistrationDiagnostics } from '../src/api/contracts'
+import type { ImsRegistrationDiagnostics, NativeImsObservationStatus } from '../src/api/contracts'
 
 function facts(profileId: string, wifi: boolean): ImsRegistrationDiagnostics {
   return {
@@ -59,8 +59,162 @@ async function installFixtures(page: Page, includeDiagnostics: boolean) {
     if (['/api/trunk/lines', '/api/modem/line-controls'].includes(url.pathname)) return route.fulfill({ json: { status: 'ok', data: [] } })
     return route.fulfill({ json: { status: 'ok', data: { events: [], messages: [], records: [] } } })
   })
-  return { mutations, errors, wifi }
+  return { mutations, errors, wifi, lines }
 }
+
+function nativeObservation(lineId: string): NativeImsObservationStatus {
+  return { line_id: lineId, adapter_available: true, state: 'observed',
+    sample: { schema: 'ec20_ce_fag_v0803', registration_reporting: false, service_reporting: true,
+      registration: 'registered', sms: 'unknown_or_unreported', voice: 'limited', ut: 'available' },
+    observed_at: '2026-10-13T02:00:00Z', age_seconds: 5, stale: false, last_error: null,
+    sample_kind: 'sequential_not_atomic', purpose: 'modem_observation_not_host_ims_readiness' }
+}
+
+async function installNativeFixtures(page: Page) {
+  const fixture = await installFixtures(page, false)
+  fixture.lines.forEach((line) => {
+    line.modem.modem_path = `native:${line.modem.line_id}`
+    line.profile.airplane_mode_enabled = false
+    line.profile.cellular_ims_connection_enabled = false
+    line.profile.vowifi.enabled = false
+  })
+  fixture.wifi.forEach((line) => { line.config.enabled = false })
+  const nativeRequests: Array<{ method: string; path: string; body: unknown }> = []
+  const observations: Record<string, NativeImsObservationStatus> = {
+    'line-a': nativeObservation('line-a'), 'line-b': nativeObservation('line-b'),
+  }
+  page.on('request', (request) => {
+    const url = new URL(request.url())
+    if (url.pathname.includes('/native/ims/')) nativeRequests.push({ method: request.method(), path: url.pathname,
+      body: request.method() === 'POST' ? request.postDataJSON() : null })
+  })
+  await page.route('**/api/modem/lines/*/native/ims/*', (route) => {
+    const lineId = new URL(route.request().url()).pathname.split('/')[4]
+    return route.fulfill({ json: { status: 'ok', data: observations[lineId] } })
+  })
+  return { ...fixture, nativeRequests, observations }
+}
+
+async function openNativeDetails(page: Page) {
+  await page.getByRole('tab', { name: 'IMS 与 Trunk', exact: true }).click()
+  const panel = page.getByTestId('native-ims-observation')
+  await panel.locator('summary').click()
+  return panel
+}
+
+// Uses the original workbench and its existing isolated fixture, never a live proxy.
+test('native IMS observation is explicit, historical and independent of host readiness', async ({ page }, testInfo) => {
+  const { nativeRequests, mutations, errors, observations } = await installNativeFixtures(page)
+  await page.goto('/e2e/fixtures/lines.html')
+  await expect(page.getByTestId('selected-line')).toHaveText('line-a')
+  await expect(page.getByTestId('original-basic-info')).toBeVisible()
+  await expect(page.getByRole('checkbox', { name: '飞行模式' })).not.toBeChecked()
+  expect(nativeRequests).toEqual([])
+  const panel = await openNativeDetails(page)
+  await expect(panel).toContainText('并非原子快照')
+  await expect(panel).toContainText('服务器仍会核验固件资格与实时 owner')
+  expect(nativeRequests).toEqual([])
+  const hostRegistration = page.getByText('注册状态', { exact: true }).locator('..')
+  await expect(hostRegistration).toContainText('未注册')
+  await panel.getByRole('button', { name: '只读采样一次', exact: true }).click()
+  await expect(panel.getByText('已注册（仅基带报告）', { exact: true })).toBeVisible()
+  await expect(hostRegistration).toContainText('未注册')
+  await expect(panel.getByText('未知或未报告（0，不能据此判断不可用）', { exact: true })).toBeVisible()
+  await expect(panel.getByText('最近样本 · UT（补充业务，非视频）', { exact: true })).toBeVisible()
+  await expect(panel).toContainText('不证明持久 NV 读取成功')
+  expect(nativeRequests).toEqual([{ method: 'POST', path: '/api/modem/lines/line-a/native/ims/probe', body: {} }])
+  const sample = observations['line-a'].sample!
+  observations['line-a'] = { ...observations['line-a'], stale: true, state: 'stale', sample: { ...sample, registration: 'unknown_or_unreported' } }
+  await panel.getByRole('button', { name: '读取缓存（不访问设备）', exact: true }).click()
+  await expect(panel.getByText('未知或未报告（0，不能据此判断未注册）', { exact: true })).toBeVisible()
+  await expect(panel).toContainText('缓存已标记过期')
+  await expect(hostRegistration).toContainText('未注册')
+  expect(nativeRequests).toEqual([
+    { method: 'POST', path: '/api/modem/lines/line-a/native/ims/probe', body: {} },
+    { method: 'GET', path: '/api/modem/lines/line-a/native/ims/status', body: null },
+  ])
+  await page.screenshot({ path: testInfo.outputPath('original-workbench-native-ims-observation.png'), fullPage: true })
+  expect(mutations).toEqual([])
+  expect(errors).toEqual([])
+})
+
+for (const blocked of ['cellular intent', 'wifi intent', 'read-only projection', 'absent modem', 'airplane mode'] as const) {
+  test(`native IMS explicit probe is disabled for ${blocked}`, async ({ page }) => {
+    const { lines, wifi, nativeRequests, mutations, errors } = await installNativeFixtures(page)
+    if (blocked === 'cellular intent') lines[0].profile.cellular_ims_connection_enabled = true
+    if (blocked === 'wifi intent') { lines[0].profile.vowifi.enabled = true; wifi[0].config.enabled = true }
+    if (blocked === 'read-only projection') Object.assign(lines[0], { read_only: true })
+    if (blocked === 'absent modem') lines[0].modem.present = false
+    if (blocked === 'airplane mode') lines[0].profile.airplane_mode_enabled = true
+    await page.goto('/e2e/fixtures/lines.html')
+    const panel = await openNativeDetails(page)
+    await expect(panel.getByRole('button', { name: '只读采样一次', exact: true })).toBeDisabled()
+    await expect(page.getByTestId('selected-line')).toHaveText('line-a')
+    expect(nativeRequests).toEqual([])
+    expect(mutations).toEqual([])
+    expect(errors).toEqual([])
+  })
+}
+
+test('native IMS ignores a late old-line probe response without auto-probing the new line', async ({ page }) => {
+  const { nativeRequests, mutations, errors, observations } = await installNativeFixtures(page)
+  observations['line-b'] = { ...observations['line-b'], sample: { ...observations['line-b'].sample!, registration: 'limited' } }
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  await page.route('**/api/modem/lines/line-a/native/ims/probe', async (route) => {
+    await held
+    await route.fulfill({ json: { status: 'ok', data: nativeObservation('line-a') } })
+  })
+  await page.goto('/e2e/fixtures/lines.html')
+  const oldPanel = await openNativeDetails(page)
+  const sent = page.waitForRequest('**/api/modem/lines/line-a/native/ims/probe')
+  await oldPanel.getByRole('button', { name: '只读采样一次', exact: true }).click()
+  await sent
+  await expect(oldPanel.getByRole('button', { name: '只读采样一次', exact: true })).toBeDisabled()
+  await page.getByRole('button', { name: /测试槽2/ }).click()
+  await expect(page.getByTestId('selected-line')).toHaveText('line-b')
+  const panel = await openNativeDetails(page)
+  await expect(panel).toContainText('尚未读取本线路的观测记录')
+  expect(nativeRequests).toHaveLength(1)
+  await panel.getByRole('button', { name: '读取缓存（不访问设备）', exact: true }).click()
+  await expect(panel.getByText('受限（仅基带报告）', { exact: true })).toBeVisible()
+  const response = page.waitForResponse('**/api/modem/lines/line-a/native/ims/probe')
+  release()
+  await (await response).finished()
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  await expect(panel.getByText('受限（仅基带报告）', { exact: true })).toBeVisible()
+  await expect(panel.getByText('已注册（仅基带报告）', { exact: true })).toHaveCount(0)
+  expect(nativeRequests.filter(({ method }) => method === 'POST')).toEqual([
+    { method: 'POST', path: '/api/modem/lines/line-a/native/ims/probe', body: {} },
+  ])
+  expect(mutations).toEqual([])
+  expect(errors).toEqual([])
+})
+
+test('native IMS rejects mismatched line and schema responses and suppresses unknown errors', async ({ page }) => {
+  const { observations, nativeRequests, mutations, errors } = await installNativeFixtures(page)
+  await page.goto('/e2e/fixtures/lines.html')
+  const panel = await openNativeDetails(page)
+  const readCache = panel.getByRole('button', { name: '读取缓存（不访问设备）', exact: true })
+  observations['line-a'] = nativeObservation('line-b')
+  await readCache.click()
+  await expect(panel.getByRole('alert')).toContainText('响应不符合约定')
+  await expect(panel.getByText('已注册（仅基带报告）', { exact: true })).toHaveCount(0)
+  observations['line-a'] = { ...nativeObservation('line-a'), sample: { ...nativeObservation('line-a').sample!, schema: 'SECRET_SCHEMA' } } as unknown as NativeImsObservationStatus
+  await readCache.click()
+  await expect(panel.getByRole('alert')).toContainText('响应不符合约定')
+  await expect(panel.getByText('已注册（仅基带报告）', { exact: true })).toHaveCount(0)
+  await expect(page.locator('body')).not.toContainText('SECRET_SCHEMA')
+  await page.route('**/api/modem/lines/line-a/native/ims/status', (route) => route.fulfill({
+    status: 502, json: { status: 'error', message: 'AT+SECRET_IDENTITY' },
+  }))
+  await readCache.click()
+  await expect(panel.getByRole('alert')).toContainText('未识别错误')
+  await expect(page.locator('body')).not.toContainText('SECRET')
+  expect(nativeRequests.filter(({ method }) => method === 'POST')).toEqual([])
+  expect(mutations).toEqual([])
+  expect(errors).toEqual([])
+})
 
 test('execution facts render inside the original workbench without mutating saved controls or crossing lines', async ({ page }, testInfo) => {
   const { mutations, errors } = await installFixtures(page, true)
@@ -151,6 +305,7 @@ test('older API responses keep the workbench and do not claim detected ISIM was 
   await expect(page.getByText('已检测到应用，尚未确认选用', { exact: true })).toBeVisible()
   await expect(page.getByTestId('ims-diagnostics-cellular')).toHaveCount(0)
   await expect(page.getByTestId('ims-diagnostics-wifi')).toHaveCount(0)
+  await expect(page.getByTestId('native-ims-observation')).toHaveCount(0)
   await page.getByTestId('ims-bearer-capabilities').locator('summary').click()
   await expect(page.getByTestId('ims-bearer-capabilities')).toContainText('支持情况未知')
   await expect(page.locator('body')).not.toContainText('DO_NOT_RENDER')

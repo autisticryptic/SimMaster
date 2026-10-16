@@ -1,0 +1,19 @@
+meta {
+  name: Get cached modem-native IMS observation
+  type: http
+  seq: 180
+}
+
+get {
+  url: {{baseUrl}}/api/modem/lines/{{line_id}}/native/ims/status
+  body: none
+  auth: inherit
+}
+
+docs {
+  Authenticated cached read only. Does not discover hardware, send AT/QMI, enable URCs or alter host IMS.
+  adapter_available describes the installed native provider/topology, not firmware qualification or registration.
+  sample is sequential, timestamped modem evidence; registration_reporting/service_reporting are reported flags.
+  unknown_or_unreported (including raw zero) is not a definitive unregistered/unavailable state. Final service is UT, not video.
+  Cached samples are hidden after SIM/owner/host-access changes and stale after 30 seconds. They never grant SIP/business readiness.
+}

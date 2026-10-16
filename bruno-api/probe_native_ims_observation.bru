@@ -1,0 +1,25 @@
+meta {
+  name: Probe modem-native IMS once (read-only)
+  type: http
+  seq: 181
+}
+
+post {
+  url: {{baseUrl}}/api/modem/lines/{{line_id}}/native/ims/probe
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {}
+}
+
+docs {
+  Explicit user-triggered read-only probe, not a passive GET. Requires an already-owned native QMI controller with explicit AT endpoint,
+  qualified EC20-CE-FAG revision and positively matched slot/ICCID before and after the query.
+  Both host IMS enable intents and all host LTE/WLAN session/flow/cleanup ownership must be absent. The endpoint never disables them for you.
+  No URC/NV/profile/bearer changes; the exact one-argument QIMSCFG ims_status form is used once. No automatic retry or takeover.
+  Cancellation keeps the physical and host-exclusion guards until the bounded driver transaction finishes; repeated probes return busy.
+  401 unauthorized, 404 line missing, 409 busy/binding changed, 501 adapter/firmware unsupported, 503 observation unavailable, 502 malformed reply.
+  Only {} is accepted; callers cannot supply AT commands, SIM identities or enable flags. Modem observations never change host readiness or fees.
+}

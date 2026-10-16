@@ -14,6 +14,7 @@ pub mod io;
 pub mod management;
 pub mod messages;
 pub mod native;
+mod native_ims;
 pub mod protocol;
 pub mod qmi_proxy;
 pub mod recovery;

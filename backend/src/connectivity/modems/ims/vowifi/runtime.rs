@@ -207,6 +207,11 @@ impl VowifiRuntime {
         &self.access_network
     }
 
+    /// Local cache fencing only; this does not inspect or start an access.
+    pub(crate) fn native_observation_generation(&self) -> u64 {
+        self.live_generation.load(Ordering::Acquire)
+    }
+
     /// Read the SIM identity of the modem this runtime is bound to. A runtime
     /// created with `for_line` resolves its own modem from the line registry, so
     /// line B never matches a carrier profile from line A's card.

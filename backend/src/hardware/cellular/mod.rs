@@ -26,6 +26,7 @@ pub mod data_proxy;
 pub mod mm_observations;
 pub mod mm_radio;
 pub mod modem_manager;
+pub mod native_ims;
 pub mod observations;
 pub mod qmi_wds;
 pub mod radio;

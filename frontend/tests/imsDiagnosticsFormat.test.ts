@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import type { EffectiveImsBearerPolicy, ImsBearerCapabilities, ImsRegistrationDiagnostics } from '../src/api/contracts.ts'
-import { carrierBearerUnchanged, diagnosticIdentity, diagnosticSource, diagnosticTransport, imsBearerCapabilityRows, imsBearerRequirementRows, imsDiagnosticRows, withoutBearerUpdate } from '../src/pages/sim/imsDiagnosticsFormat.ts'
+import type { EffectiveImsBearerPolicy, ImsBearerCapabilities, ImsRegistrationDiagnostics, NativeImsObservationStatus } from '../src/api/contracts.ts'
+import { carrierBearerUnchanged, diagnosticIdentity, diagnosticSource, diagnosticTransport, imsBearerCapabilityRows, imsBearerRequirementRows, imsDiagnosticRows, nativeImsErrorMessage, nativeImsObservationRows, parseNativeImsObservation, withoutBearerUpdate } from '../src/pages/sim/imsDiagnosticsFormat.ts'
 
 void test('bearer support is passive capability, unknown is not unsupported or ready', () => {
   assert.ok(imsBearerCapabilityRows().every(({ value }) => value === '支持情况未知'))
@@ -108,4 +108,56 @@ void test('only documented fields and known labels are rendered, never raw secre
   assert.equal(diagnosticSource('constructor'), '未确认')
   assert.equal(diagnosticIdentity('__proto__'), '尚未确认')
   assert.equal(diagnosticTransport('toString'), '未确认')
+})
+
+function nativeObservation(): NativeImsObservationStatus {
+  return { line_id: 'line-a', adapter_available: true, state: 'observed',
+    sample: { schema: 'ec20_ce_fag_v0803', registration_reporting: false, service_reporting: true,
+      registration: 'unknown_or_unreported', sms: 'unknown_or_unreported', voice: 'limited', ut: 'available' },
+    observed_at: '2026-10-13T02:00:00Z', age_seconds: 5, stale: false, last_error: null,
+    sample_kind: 'sequential_not_atomic', purpose: 'modem_observation_not_host_ims_readiness' }
+}
+
+void test('native IMS zero remains unknown, UT is not video and flags are only historical reports', () => {
+  const data = nativeObservation()
+  const rows = nativeImsObservationRows(data)
+  const text = JSON.stringify(rows)
+  assert.match(text, /未知或未报告（0，不能据此判断未注册）/)
+  assert.match(text, /未知或未报告（0，不能据此判断不可用）/)
+  assert.match(text, /UT（补充业务，非视频）/)
+  assert.match(text, /false \/ true（仅返回标志，不证明持久 NV 读取成功）/)
+  assert.match(text, /不代表固件已通过资格确认/)
+  assert.match(text, /最近样本时间（历史记录）/)
+  assert.match(text, /未标记过期（不代表当前状态）/)
+  assert.doesNotMatch(text, /倒计时|5 秒/)
+  assert.equal(parseNativeImsObservation(data, 'line-a'), data)
+})
+
+void test('native IMS responses reject cross-line, incompatible schema and malformed sample fields', () => {
+  const data = nativeObservation()
+  assert.equal(parseNativeImsObservation(data, 'line-b'), null)
+  for (const sample of [{ ...data.sample, schema: 'future_schema' }, { ...data.sample, registration: 0 },
+    { ...data.sample, ut: 'video' }, { ...data.sample, service_reporting: 'false' }, []]) {
+    assert.equal(parseNativeImsObservation({ ...data, sample }, 'line-a'), null)
+  }
+  for (const change of [{ purpose: 'host_ready' }, { sample_kind: 'atomic' }, { state: 'constructor' },
+    { age_seconds: -1 }, { stale: 'false' }, { adapter_available: 'true' }]) {
+    assert.equal(parseNativeImsObservation({ ...data, ...change }, 'line-a'), null)
+  }
+  assert.equal(parseNativeImsObservation(null, 'line-a'), null)
+  assert.ok(parseNativeImsObservation({ ...data, sample: null, state: 'not_probed' }, 'line-a'))
+})
+
+void test('native IMS renders only safe error translations and never raw AT or identities', () => {
+  const messages = ['unsupported', 'busy', 'binding_changed', 'unavailable', 'malformed_response', 'firmware_not_qualified']
+    .map((code) => nativeImsErrorMessage(`native_ims_${code}`))
+  assert.equal(new Set(messages).size, 6)
+  assert.ok(messages.every((message) => message && !message.includes('未识别')))
+  for (const code of ['AT+SECRET_IDENTITY', '__proto__', 'constructor', 'native_ims_busy:SECRET']) {
+    assert.match(nativeImsErrorMessage(code) ?? '', /未识别错误/)
+    assert.doesNotMatch(nativeImsErrorMessage(code) ?? '', /SECRET|AT\+|__proto__|constructor/)
+  }
+  const data = { ...nativeObservation(), observed_at: 'SECRET_TIME', last_error: 'SECRET_AT', raw: 'SECRET_IDENTITY' }
+  assert.doesNotMatch(JSON.stringify(nativeImsObservationRows(data)), /SECRET/)
+  assert.equal(nativeImsErrorMessage(null), null)
 })

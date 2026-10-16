@@ -307,6 +307,20 @@ pub struct CellularImsLiveHandle {
     supplementary: Arc<StdRwLock<Option<Arc<SupplementaryRuntime>>>>,
     mt_sms: tokio::sync::broadcast::Sender<SmsMessage>,
     retry_scope: Arc<Mutex<live_retry::RetryScope>>,
+    native_observation_busy: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct NativeObservationCleanupFence(Arc<std::sync::atomic::AtomicUsize>);
+impl NativeObservationCleanupFence {
+    fn new(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(Arc::clone(counter))
+    }
+}
+impl Drop for NativeObservationCleanupFence {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl Default for CellularImsLiveHandle {
@@ -326,7 +340,18 @@ impl CellularImsLiveHandle {
             supplementary: Arc::new(StdRwLock::new(None)),
             mt_sms,
             retry_scope: Arc::new(Mutex::new(live_retry::RetryScope::default())),
+            native_observation_busy: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Local ownership only: no readiness inference, cleanup or hardware IO.
+    /// Caller holds the shared native-observation permit, preventing new starts.
+    pub fn idle_for_native_ims_observation(&self) -> bool {
+        let Ok(session) = self.session.try_lock() else { return false; };
+        let Ok(failed) = self.failed_bearer.try_lock() else { return false; };
+        let Ok(listener) = self.listener.try_lock() else { return false; };
+        session.is_none() && failed.is_none() && listener.is_none()
+            && self.native_observation_busy.load(std::sync::atomic::Ordering::Acquire) == 0
     }
 
     pub fn bind_supplementary(&self, runtime: Arc<SupplementaryRuntime>) {
@@ -5281,6 +5306,7 @@ async fn cleanup_live_session(live: &CellularImsLiveHandle) {
 }
 
 async fn cleanup_live_session_with_binding(live: &CellularImsLiveHandle, binding_current: bool) {
+    let _native_observation = NativeObservationCleanupFence::new(&live.native_observation_busy);
     live.operator.set_ready(false);
     let session = live.session.lock().await.take();
     if let Some(session) = session {
@@ -5343,6 +5369,7 @@ async fn cleanup_retained_failed_bearer_with_binding(
     live: &CellularImsLiveHandle,
     binding_current: bool,
 ) {
+    let _native_observation = NativeObservationCleanupFence::new(&live.native_observation_busy);
     let Some(retained) = live.failed_bearer.lock().await.take() else {
         return;
     };

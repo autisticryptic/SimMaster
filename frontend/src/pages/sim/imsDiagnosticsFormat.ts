@@ -1,4 +1,4 @@
-import type { ImsBearerCapabilities, ImsBearerPolicy, EffectiveImsBearerPolicy, ImsFactSource, ImsIpsecAlgorithms, ImsRegistrationDiagnostics } from '../../api/contracts.ts'
+import type { ImsBearerCapabilities, ImsBearerPolicy, EffectiveImsBearerPolicy, ImsFactSource, ImsIpsecAlgorithms, ImsRegistrationDiagnostics, NativeImsObservationStatus } from '../../api/contracts.ts'
 
 const sources: Record<ImsFactSource, string> = {
   unknown: '未确认', database: '自定义数据库', carrier_catalog: '只读运营商库', derived: '3GPP 标准派生',
@@ -91,6 +91,62 @@ export function imsBearerRequirementRows(policy?: EffectiveImsBearerPolicy | nul
     { label: '承载要求来源', value: lookup({ catalog: '运营商配置', sim_override: 'SIM 覆盖' }, policy.source, '未确认') },
     { label: '配置校验', value: policy.validation_error ? reasonCode(policy.validation_error) : '未报告配置错误（非就绪证明）' },
   ]
+}
+
+const nativeImsErrors: Record<string, string> = {
+  native_ims_unsupported: '此线路不支持原生 IMS 观测。',
+  native_ims_busy: '线路正被占用或已有观测进行中；未执行新采样。',
+  native_ims_binding_changed: 'SIM 或设备绑定已变化；请重新确认线路。',
+  native_ims_unavailable: '原生 IMS 观测暂不可用。',
+  native_ims_malformed_response: '原生 IMS 观测响应不符合约定；未展示样本。',
+  native_ims_firmware_not_qualified: '此固件未通过只读观测资格确认；未执行采样。',
+}
+export function nativeImsErrorMessage(code: unknown): string | null {
+  return code === null || code === undefined ? null
+    : lookup(nativeImsErrors, code, '原生 IMS 观测失败（未识别错误；不显示原始响应）。')
+}
+
+/** Reject incompatible/cross-line envelopes before storing or rendering them. */
+export function parseNativeImsObservation(value: unknown, lineId: string): NativeImsObservationStatus | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const data = value as Record<string, unknown>
+  if (data.line_id !== lineId || data.purpose !== 'modem_observation_not_host_ims_readiness'
+    || data.sample_kind !== 'sequential_not_atomic' || typeof data.adapter_available !== 'boolean'
+    || typeof data.stale !== 'boolean' || typeof data.state !== 'string'
+    || !['not_probed', 'probing', 'observed', 'stale', 'unavailable'].includes(data.state)
+    || (data.observed_at !== null && typeof data.observed_at !== 'string')
+    || (data.age_seconds !== null && !integer(data.age_seconds))
+    || (data.last_error !== null && typeof data.last_error !== 'string')) return null
+  if (data.sample !== null && data.sample !== undefined) {
+    if (typeof data.sample !== 'object' || Array.isArray(data.sample)) return null
+    const sample = data.sample as Record<string, unknown>
+    if (sample.schema !== 'ec20_ce_fag_v0803' || typeof sample.registration_reporting !== 'boolean'
+      || typeof sample.service_reporting !== 'boolean' || typeof sample.registration !== 'string'
+      || !['unknown_or_unreported', 'registering', 'registered', 'limited', 'unknown'].includes(sample.registration)
+      || !['sms', 'voice', 'ut'].every((key) => typeof sample[key] === 'string'
+        && ['unknown_or_unreported', 'limited', 'available', 'unknown'].includes(sample[key]))) return null
+  }
+  return data as unknown as NativeImsObservationStatus
+}
+
+export function nativeImsObservationRows(data: NativeImsObservationStatus): ImsDiagnosticRow[] {
+  const rows: ImsDiagnosticRow[] = [
+    { label: '缓存记录状态', value: lookup({ not_probed: '尚未采样', probing: '采样进行中', observed: '已缓存历史样本', stale: '缓存已标记过期', unavailable: '观测不可用' }, data.state, '未知') },
+    { label: '拓扑 / 已安装适配器', value: data.adapter_available ? '可用（不代表固件已通过资格确认）' : '不可用（不代表网络服务状态）' },
+    { label: '缓存过期标记（读取时）', value: data.stale ? '已标记过期' : '未标记过期（不代表当前状态）' },
+  ]
+  const sample = data.sample
+  if (!sample) return rows
+  const service = (value: unknown) => lookup({ unknown_or_unreported: '未知或未报告（0，不能据此判断不可用）', limited: '受限（仅样本报告）', available: '可用（仅样本报告）', unknown: '未知' }, value, '未知')
+  rows.push(
+    { label: '最近样本时间（历史记录）', value: time(data.observed_at) },
+    { label: '最近样本 · 基带 IMS 注册', value: lookup({ unknown_or_unreported: '未知或未报告（0，不能据此判断未注册）', registering: '注册中（仅基带报告）', registered: '已注册（仅基带报告）', limited: '受限（仅基带报告）', unknown: '未知' }, sample.registration, '未知') },
+    { label: '最近样本 · SMS', value: service(sample.sms) },
+    { label: '最近样本 · 语音', value: service(sample.voice) },
+    { label: '最近样本 · UT（补充业务，非视频）', value: service(sample.ut) },
+    { label: '最近样本 · 注册 / 服务报告标志', value: `${sample.registration_reporting ? 'true' : 'false'} / ${sample.service_reporting ? 'true' : 'false'}（仅返回标志，不证明持久 NV 读取成功）` },
+  )
+  return rows
 }
 
 export function imsDiagnosticRows(facts?: ImsRegistrationDiagnostics | null): ImsDiagnosticRow[] {

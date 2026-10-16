@@ -2954,6 +2954,8 @@ async fn run_live_ike_until_depth(
     depth: LiveProbeDepth,
     access_network: &ImsAccessNetworkRuntime,
 ) -> Result<LiveIkeSession, LiveStageError> {
+    let coordinator = crate::connectivity::core::ims_registration_coordinator::for_line(line_id);
+    let _host_activity = coordinator.host_activity().await;
     wait_for_vowifi_ue_dataplane_ready(line_id, LIVE_UE_DATAPLANE_READY_TIMEOUT).await?;
     let configured_ip_stack = live_ike_access(line_id, profile).ip_stack;
     let diagnostic_scope = diagnostics_live::Scope::for_profile(line_id, profile).await;
@@ -3548,6 +3550,8 @@ async fn run_live_esp_until(
     profile: &'static CarrierProfile,
     access_network: &ImsAccessNetworkRuntime,
 ) -> Result<(), LiveStageError> {
+    let coordinator = crate::connectivity::core::ims_registration_coordinator::for_line(line_id);
+    let _host_activity = coordinator.host_activity().await;
     if cached_tun_gateway_matches(line_id, profile).await {
         return Ok(());
     }
@@ -3587,6 +3591,26 @@ async fn run_live_esp_until(
 
 fn tun_gateway_cache() -> &'static Mutex<HashMap<String, Arc<TunGatewayRuntime>>> {
     LIVE_TUN_GATEWAY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Inspect ownership without creating caches, expiring entries or doing IO.
+/// New IKE/REGISTER/install/cleanup activity is fenced by the caller's shared
+/// coordinator permit. A cached/retained object is busy even when not ready.
+pub fn idle_for_native_ims_observation(line_id: &str) -> bool {
+    macro_rules! empty {
+        ($cache:ident) => {
+            if let Some(cache) = $cache.get() {
+                let Ok(entries) = cache.try_lock() else { return false; };
+                if entries.contains_key(line_id) { return false; }
+            }
+        };
+    }
+    empty!(LIVE_TUN_GATEWAY);
+    empty!(LIVE_IMS_REGISTER_READY);
+    empty!(LIVE_IMS_SECURITY_VERIFY);
+    empty!(LIVE_IMS_CHANNEL);
+    empty!(LIVE_XCAP_BINDING);
+    super::operator::idle_for_native_ims_observation(line_id)
 }
 
 /// Whether this line already has a gateway for this carrier profile.
@@ -4914,6 +4938,8 @@ async fn record_live_ims_channel(
 }
 
 async fn clear_live_ims_channel(line_id: &str, profile: &'static CarrierProfile) {
+    let coordinator = crate::connectivity::core::ims_registration_coordinator::for_line(line_id);
+    let _host_activity = coordinator.host_activity().await;
     super::operator::abort_profile(line_id, profile.meta.profile_id).await;
     let mut cache = ims_channel_cache().lock().await;
     if cache
@@ -4933,6 +4959,8 @@ async fn clear_live_ims_channel(line_id: &str, profile: &'static CarrierProfile)
 
 /// Tear down one line's live runtime, leaving every other line untouched.
 pub async fn clear_live_runtime_for_line(line_id: &str) {
+    let coordinator = crate::connectivity::core::ims_registration_coordinator::for_line(line_id);
+    let _host_activity = coordinator.host_activity().await;
     let unregister = super::operator::disconnect_line(line_id).await;
     info!(result = ?unregister, "VoWiFi explicit IMS unregister finished");
     if let Some(channel) = ims_channel_cache().lock().await.remove(line_id) {
@@ -4956,6 +4984,8 @@ pub async fn clear_live_runtime_for_line(line_id: &str) {
 }
 
 async fn clear_live_ims_session(line_id: &str, profile: &'static CarrierProfile) {
+    let coordinator = crate::connectivity::core::ims_registration_coordinator::for_line(line_id);
+    let _host_activity = coordinator.host_activity().await;
     clear_live_ims_channel(line_id, profile).await;
 
     let profile_id = profile.meta.profile_id;

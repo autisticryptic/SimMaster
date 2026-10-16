@@ -16,6 +16,7 @@ use crate::{
     hardware::{
         cellular::{
             bindings::{ModemBinding, SimIdentity},
+            native_ims::{NativeImsProbeError, NativeImsSample},
             observations::{ModemObservationProvider, ObservationError},
             radio::{ModemRadioControl, RadioError, RadioState},
         },
@@ -628,11 +629,11 @@ impl NativeDevice {
     pub(super) async fn verify_primary_slot_locked(&self) -> Result<(), NativeError> {
         if self.spec.protocol != NativeProtocol::Qmi { return Ok(()); }
         let text = self.io.execute(&self.request("--uim-get-card-status")).await?;
-        let slot = text.lines().find_map(|line| {
-            let value = line.trim().strip_prefix("Primary GW:")?.trim().strip_prefix("slot '")?;
-            value.split('\'').next()?.parse::<u8>().ok()
+        let mut rows = text.lines().filter_map(|line| line.trim().strip_prefix("Primary GW:"));
+        let slot = rows.next().and_then(|value| {
+            value.trim().strip_prefix("slot '")?.split_once('\'')?.0.parse::<u8>().ok()
         });
-        if slot == Some(self.spec.uim_slot) { Ok(()) }
+        if slot == Some(self.spec.uim_slot) && rows.next().is_none() { Ok(()) }
         else { Err(NativeError::OwnerConflict("native_primary_sim_slot_unconfirmed_or_mismatched".into())) }
     }
 
@@ -733,6 +734,35 @@ impl ModemObservationProvider for NativeFleet {
                 }
             }
             Ok(bindings)
+        })
+    }
+
+    fn supports_native_ims_probe(&self, binding: &ModemBinding) -> bool {
+        self.device(&binding.modem_path)
+            .is_ok_and(|device| device.supports_native_ims_binding(binding))
+    }
+
+    fn native_ims_probe_context(&self, binding: &ModemBinding) -> Option<u64> {
+        let device = self.device(&binding.modem_path).ok()?;
+        if !device.supports_native_ims_binding(binding) || device.ensure_sim_available().is_err() {
+            return None;
+        }
+        let ledger = device.sim_ledger.lock().unwrap_or_else(|e| e.into_inner());
+        if ledger.owner.is_some() || ledger.reconciliation_required { return None; }
+        Some(ledger.observation_generation())
+    }
+
+    fn probe_native_ims<'a>(
+        &'a self,
+        binding: &'a ModemBinding,
+    ) -> TransportFuture<'a, Result<NativeImsSample, NativeImsProbeError>> {
+        Box::pin(async move {
+            if !super::is_native_selector(&binding.modem_path) || binding.line_kind == "reader" {
+                return Err(NativeImsProbeError::Unsupported);
+            }
+            let device = self.device(&binding.modem_path)
+                .map_err(|_| NativeImsProbeError::BindingChanged)?;
+            device.probe_native_ims_binding(binding).await
         })
     }
 

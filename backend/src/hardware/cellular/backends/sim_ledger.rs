@@ -38,6 +38,12 @@ pub struct Ledger {
     serial: u64,
 }
 
+impl Ledger {
+    /// Private generation; changes on every SIM-channel owner admission, even
+    /// when an operation later closes without changing the visible SIM ID.
+    pub(super) fn observation_generation(&self) -> u64 { self.serial }
+}
+
 pub struct ChannelLease {
     device: Arc<NativeDevice>,
     serial: u64,

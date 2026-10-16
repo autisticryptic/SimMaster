@@ -366,6 +366,14 @@ pub fn subscribe_mt_sms_for_line(
     handle_for_line(line_id).mt_sms.subscribe()
 }
 
+pub fn idle_for_native_ims_observation(line_id: &str) -> bool {
+    let Some(registry) = HANDLES.get() else { return true; };
+    let handle = registry.read().unwrap_or_else(|e| e.into_inner()).get(line_id).cloned();
+    let Some(handle) = handle else { return true; };
+    let Ok(installed) = handle.installed.try_lock() else { return false; };
+    installed.is_none()
+}
+
 fn handle_for_line(line_id: &str) -> Arc<VowifiOperatorHandle> {
     let _ = operator_link_for_line(line_id);
     handles()
@@ -377,6 +385,8 @@ fn handle_for_line(line_id: &str) -> Arc<VowifiOperatorHandle> {
 }
 
 pub async fn install_registered_channel(context: RegisteredVoiceContext, channel: SipChannel) {
+    let coordinator = crate::connectivity::core::ims_registration_coordinator::for_line(&context.line_id);
+    let _host_activity = coordinator.host_activity().await;
     let handle = handle_for_line(&context.line_id);
     let mut installed = handle.installed.lock().await;
     let mut registration = RegisteredChannel { context, channel };
@@ -451,6 +461,8 @@ pub async fn install_registered_channel(context: RegisteredVoiceContext, channel
 }
 
 pub async fn disconnect_line(line_id: &str) -> UnregisterResult {
+    let coordinator = crate::connectivity::core::ims_registration_coordinator::for_line(line_id);
+    let _host_activity = coordinator.host_activity().await;
     let handle = handles()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -495,6 +507,8 @@ pub async fn disconnect_line(line_id: &str) -> UnregisterResult {
 }
 
 pub async fn abort_profile(line_id: &str, profile_id: &str) {
+    let coordinator = crate::connectivity::core::ims_registration_coordinator::for_line(line_id);
+    let _host_activity = coordinator.host_activity().await;
     let handle = handles()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

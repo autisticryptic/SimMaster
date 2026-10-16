@@ -41,8 +41,8 @@
 - **来源诊断已由 N7 软件验证。** 实际 profile/身份/domain/realm/端点、请求/授予族、报价/协商/响应认证、失败作用域和真实门禁已进入同源 API/原 GUI；epoch/serial 与弱 runtime 拒绝晚到写入。声明模板、收到的 Retry-After 与最近成功都不授予当前 readiness；实机未知值仍如实未知。
 - **N8承载门禁/有证据适配已由22646c8验证。** catalog/override要求在profile准备及每次family dispatch前验证；Native QMI支持PAP/CHAP/BOTH/none、MBIM支持PAP/CHAP/none，原WDS client只读IPv4/FQDN并保留原IPv6 exact-address观察，opt-in DHCP仅信息请求。API/原UI只投影能力和凭据存在标志，旧保存不清空认证。通用PCO策略写入、旧MM认证变更和DHCP地址分配仍unsupported；这些组合与实机验收不得由现有绿灯推断支持。
 - **EC20 离线 catalog 来源尚未接入。** 在独立 `carrier_Bundles` 侧维护版本绑定的 MCFG extractor、选择器及字段证据；未知 `qp_ims_*` raw bytes 不得猜为 ready。跨项目实施范围另行明确。
-- **EC20 原生 IMS 只读观测 provider 尚未接入。** IMSA/注册/业务状态观测需明确与主机软 IMS 的 owner/互斥；可能写 NV 的 URC 开关不归入只读采证。
-- **固件函数级确认尚未进行。** 原报告已有解包/容器/载荷证据和字符串锚点，但配置优先级、结构版本、算法与失败回退的实际分支仍待证实；需要 IDA 时必须由用户手动启动并选定分析文件。
+- **EC20原生IMS只读观测已接线待Actions。** 显式POST单次probe、GET只取缓存；仅已拥有Native QMI/AT、资格匹配固件与同slot/ICCID/owner。主机LTE/WLAN意图及存活/残留资源必须排他，取消后不早释放门禁。六元组为上报标志/registration/SMS/voice/UT，零因valid-bit丢失仍未知，不授予主机readiness。实际设备互通仍需独立窗口。
+- **固件汇编级复核已推进，尚未完整闭环。** 用户手动加载的EC20分析ELF路径/SHA已核验，缺Hex-Rays以系统既有LLVM Hexagon-v5只读解码辅助；已确认regpriority字段/普通路径的零跳过与顺序、原生查询/写分支、non-IPSec日志的多重前提。未知packet/特殊mode/当前选择不猜结论，不能称全固件无遗漏。
 
 以上是原 EC20 审查范围的后续，不把项目所有 MEP/VoNR/E911 愿景都混称成本轮已承诺功能。QoS/precondition/UT 等已有业务基础也不能重报成完全缺失，仍需按配置与实测分开验收。
 

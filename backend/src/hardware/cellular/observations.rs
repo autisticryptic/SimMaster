@@ -13,7 +13,10 @@ use crate::{
     hardware::devices::transport::TransportFuture,
 };
 
-use super::bindings::ModemBinding;
+use super::{
+    bindings::ModemBinding,
+    native_ims::{NativeImsProbeError, NativeImsSample},
+};
 
 /// Display evidence only, never an operational binding or a control selector.
 /// SIM presence is MM's cached observation, not an active card probe.
@@ -98,6 +101,28 @@ pub trait ModemObservationProvider: Send + Sync {
                 "voice_home_observation_unsupported".into(),
             ))
         })
+    }
+
+    /// Static adapter/endpoint availability only. No I/O, identification,
+    /// firmware qualification or current registration claim is permitted here.
+    fn supports_native_ims_probe(&self, _binding: &ModemBinding) -> bool {
+        false
+    }
+
+    /// Private local-context generation for cache fencing. No I/O. None means
+    /// unqualified controller lifetime, maintenance or SIM-channel uncertainty;
+    /// it must not turn a cached sample into current evidence.
+    fn native_ims_probe_context(&self, _binding: &ModemBinding) -> Option<u64> {
+        None
+    }
+
+    /// Explicit observation only; never called by discovery or cached GETs.
+    /// Caller must separately exclude host IMS ownership for the captured line.
+    fn probe_native_ims<'a>(
+        &'a self,
+        _binding: &'a ModemBinding,
+    ) -> TransportFuture<'a, Result<NativeImsSample, NativeImsProbeError>> {
+        Box::pin(async { Err(NativeImsProbeError::Unsupported) })
     }
 
     fn serving_access<'a>(

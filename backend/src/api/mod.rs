@@ -10,3 +10,4 @@ pub mod events;
 pub mod handlers;
 pub mod models;
 pub mod native_controls;
+pub mod native_ims_observation;

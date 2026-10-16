@@ -1221,6 +1221,35 @@ export interface AccessNetworkRuntimeStatus {
   last_error?: string | null
 }
 
+/** Read-only modem observations, never host IMS readiness or service routing input. */
+export interface NativeImsObservationSample {
+  schema: 'ec20_ce_fag_v0803'
+  /** Reported flags only; not proof of a successful persistent NV read. */
+  registration_reporting: boolean
+  service_reporting: boolean
+  registration: 'unknown_or_unreported' | 'registering' | 'registered' | 'limited' | 'unknown'
+  sms: NativeImsServiceObservation
+  voice: NativeImsServiceObservation
+  /** Supplementary services, not video. */
+  ut: NativeImsServiceObservation
+}
+
+export type NativeImsServiceObservation = 'unknown_or_unreported' | 'limited' | 'available' | 'unknown'
+
+export interface NativeImsObservationStatus {
+  line_id: string
+  /** Topology/installed adapter only, not firmware qualification. */
+  adapter_available: boolean
+  state: 'not_probed' | 'probing' | 'observed' | 'stale' | 'unavailable'
+  sample?: NativeImsObservationSample | null
+  observed_at: string | null
+  age_seconds: number | null
+  stale: boolean
+  last_error: string | null
+  sample_kind: 'sequential_not_atomic'
+  purpose: 'modem_observation_not_host_ims_readiness'
+}
+
 export interface LineRuntimeStatus {
   modem: ModemBinding
   cellular_ims: CellularImsRuntimeStatus

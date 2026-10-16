@@ -76,9 +76,7 @@ D-Bus connection，也不直接解析 MM 的错误字符串。
   连接，也不执行 Enable/Connect、切卡或修改开机策略。
 - 驻网 snapshot 的明确不可用会立即清除，瞬时查询失败按原 TTL 保留；
   对整个设备列表查询失败的既有策略暂不改变，不能混为同一种缓存策略。
-- 当前唯一生产实现仍是 MM；fake provider 只用于无硬件测试。这不是完整 MM 后端剥离，
-  也不是原生 QMI/MBIM/AT 已实现。设备控制、AT/UIM、短信/呼叫、bearer 及启动副作用
-  还需逐步迁移；飞行模式和冷启动离线保证需要独立策略及实机验证。
+- 默认生产实现仍是MM，显式实验native配置已注入`NativeFleet`，fake provider只供无硬件测试；这些不是完整MM剥离或所有原生组合的实机验收。X2新增default-unsupported的显式原生IMS probe及零IO context fence，缓存和主机readiness严格分离，详见原生后端手册。
 
 ## 1.1.5 第二阶段：射频观察与意图门
 
