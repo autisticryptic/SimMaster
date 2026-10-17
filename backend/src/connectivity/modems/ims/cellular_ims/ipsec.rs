@@ -19,7 +19,7 @@
 use std::net::IpAddr;
 
 use super::errors::{code, CellularImsError};
-use crate::services::ue_worker::{NetConfigOp, UeWorkerHandle};
+use crate::services::ue_worker::{NetConfigOp, UeWorkerBinding};
 
 /// The four-way port/SPI binding negotiated via SIP `Security-Client` /
 /// `Security-Server` (sec-agree). Each endpoint advertises its own protected
@@ -567,9 +567,11 @@ pub fn install_plan(plan: &XfrmInstallPlan) -> Result<(), CellularImsError> {
 /// is unnecessary and would make retries race with another session in the same
 /// namespace. The operation batch is therefore add-only; on a partial failure
 /// the installed entries are removed with best-effort delete operations.
+/// The caller MUST pass the binding captured for this registration, not a
+/// fresh binding from a respawnable handle. Install and rollback use one epoch.
 pub async fn install_plan_in_worker(
     plan: &XfrmInstallPlan,
-    worker: &UeWorkerHandle,
+    binding: &UeWorkerBinding,
 ) -> Result<(), CellularImsError> {
     let ops = plan
         .states
@@ -583,8 +585,12 @@ pub async fn install_plan_in_worker(
             best_effort: false,
         }))
         .collect();
-    let outcome = worker.apply_net_config(ops).await.map_err(|error| {
-        CellularImsError::with_detail(code::COMMAND_FAILED, format!("worker xfrm: {error}"))
+    let outcome = binding.apply_net_config(ops).await.map_err(|error| {
+        if !binding.is_current() {
+            CellularImsError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED)
+        } else {
+            CellularImsError::with_detail(code::COMMAND_FAILED, format!("worker xfrm: {error}"))
+        }
     })?;
     if outcome.ok {
         let port_summary = plan.states.first().map(|state| (state.sport, state.dport));
@@ -597,7 +603,7 @@ pub async fn install_plan_in_worker(
         );
         Ok(())
     } else {
-        uninstall_plan_in_worker(plan, worker).await;
+        uninstall_plan_in_worker(plan, binding).await;
         Err(CellularImsError::with_detail(
             code::COMMAND_FAILED,
             outcome
@@ -640,8 +646,9 @@ pub fn uninstall_plan(plan: &XfrmInstallPlan) {
 
 /// Remove only the entries represented by `plan` inside a UE worker namespace.
 /// All operations are best-effort so a dead namespace or an already removed
-/// SA cannot mask the caller's original registration failure.
-pub async fn uninstall_plan_in_worker(plan: &XfrmInstallPlan, worker: &UeWorkerHandle) {
+/// SA cannot mask the caller's original registration failure. Stale bindings
+/// are rejected by the enqueue gate; cleanup never binds the replacement epoch.
+pub async fn uninstall_plan_in_worker(plan: &XfrmInstallPlan, binding: &UeWorkerBinding) {
     let mut ops = Vec::with_capacity(plan.policies.len() + plan.states.len());
     for policy in plan.policies.iter().rev() {
         let mut delete = policy.clone();
@@ -674,8 +681,12 @@ pub async fn uninstall_plan_in_worker(plan: &XfrmInstallPlan, worker: &UeWorkerH
             best_effort: true,
         });
     }
-    let _ = worker.apply_net_config(ops).await;
+    let _ = binding.apply_net_config(ops).await;
 }
+
+#[cfg(test)]
+#[path = "ipsec_worker_tests.rs"]
+mod worker_tests;
 
 /// Best-effort teardown of all VoLTE xfrm state/policy.
 pub fn teardown() {

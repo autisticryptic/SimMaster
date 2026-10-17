@@ -779,6 +779,30 @@ impl UeWorkerHandle {
         });
     }
 
+    /// Test-only response control for generation changes during a real
+    /// net-config request. No kernel/network mutation is performed here.
+    #[cfg(test)]
+    pub(crate) async fn enable_test_net_config_handler<F, Fut>(&self, mut handler: F)
+    where
+        F: FnMut(Vec<NetConfigOp>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *self.core.tx.lock().unwrap() = Some(tx);
+        let core = Arc::clone(&self.core);
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                let UeWorkerMessage::NetConfigRequest { request_id, ops } = message else {
+                    panic!("unexpected request in net-config test responder");
+                };
+                let result = handler(ops).await;
+                let outcome = NetConfigOutcome { request_id, ok: result.is_ok(), output: vec![], error: result.err() };
+                let pending = core.pending.lock().unwrap().remove(&request_id);
+                if let Some(PendingRequest::NetConfig(sender)) = pending { let _ = sender.send(outcome); }
+            }
+        });
+    }
+
     /// Test-only socket control responder. Uses the real request correlation,
     /// generation checks and fd-to-Tokio conversion, without namespaces/devices.
     #[cfg(all(test, unix))]

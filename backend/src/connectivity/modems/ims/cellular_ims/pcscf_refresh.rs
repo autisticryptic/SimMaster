@@ -116,7 +116,7 @@ async fn reselect(session: &mut CellularImsLiveSession, runtime: &CellularImsRun
                 replacement.data_slot_mode = session.data_slot_mode;
                 let old = std::mem::replace(session, replacement);
                 for plan in old.xfrm_plan.iter().chain(old.retired_xfrm_plan.iter()) {
-                    if old.worker_binding.is_current() { ipsec::uninstall_plan_in_worker(plan, &old.xfrm_worker).await; }
+                    if old.worker_binding.is_current() { ipsec::uninstall_plan_in_worker(plan, &old.worker_binding).await; }
                 }
                 drop(old); // Only original sockets/old SAs, never its PDN.
                 retries.lock().await.registered();

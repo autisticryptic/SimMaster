@@ -365,6 +365,7 @@ jobs:
             connectivity::modems::ims::cellular_ims::channel::sip_stream \
             connectivity::modems::ims::cellular_ims::channel::stream_channel::tests \
             connectivity::modems::ims::cellular_ims::ipsec::tests \
+            connectivity::modems::ims::cellular_ims::ipsec::worker_tests \
             connectivity::modems::ims::cellular_ims::live::tests::refresh \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \
             connectivity::modems::ims::cellular_ims::security_agreement::tests \

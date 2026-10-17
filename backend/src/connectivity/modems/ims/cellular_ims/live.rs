@@ -1488,7 +1488,7 @@ impl CellularImsRegisterAuthenticator {
         channel.rollback_security();
         if let Some(plan) = self.xfrm_plan.take() {
             if self.worker_binding.is_current() {
-                ipsec::uninstall_plan_in_worker(&plan, &self.worker).await;
+                ipsec::uninstall_plan_in_worker(&plan, &self.worker_binding).await;
             } else {
                 tracing::warn!(
                     "Skipping tentative VoLTE XFRM cleanup on a stale UE worker generation"
@@ -1632,7 +1632,7 @@ impl CellularImsRegisterAuthenticator {
                 if route.transport == SipTransport::Udp { ipsec::XfrmTransport::Udp } else { ipsec::XfrmTransport::Tcp },
             )
             .map_err(to_ims_error)?;
-            ipsec::install_plan_in_worker(&plan, &self.worker)
+            ipsec::install_plan_in_worker(&plan, &self.worker_binding)
                 .await
                 .map_err(to_ims_error)?;
             let protected_send_route = ImsRoute {
@@ -1657,7 +1657,7 @@ impl CellularImsRegisterAuthenticator {
                 .await;
             if let Err(error) = activation {
                 if self.worker_binding.is_current() {
-                    ipsec::uninstall_plan_in_worker(&plan, &self.worker).await;
+                    ipsec::uninstall_plan_in_worker(&plan, &self.worker_binding).await;
                 } else {
                     tracing::warn!(
                         "Skipping VoLTE XFRM cleanup after security activation failure on a stale UE worker generation"
@@ -3789,7 +3789,7 @@ async fn connect_family(
                 log_cellular_ims_register_failure_metadata(variant, &failure, None);
                 if let Some(plan) = authenticator.xfrm_plan.as_ref() {
                     if authenticator.worker_binding.is_current() {
-                        ipsec::uninstall_plan_in_worker(plan, &authenticator.worker).await;
+                        ipsec::uninstall_plan_in_worker(plan, &authenticator.worker_binding).await;
                     } else {
                         tracing::warn!(
                             "Skipping failed VoLTE REGISTER XFRM cleanup bound to a stale UE worker generation"
@@ -3935,7 +3935,7 @@ async fn connect_family(
             Err(error) => {
                 if let Some(plan) = authenticator.xfrm_plan.as_ref() {
                     if authenticator.worker_binding.is_current() {
-                        ipsec::uninstall_plan_in_worker(plan, &authenticator.worker).await;
+                        ipsec::uninstall_plan_in_worker(plan, &authenticator.worker_binding).await;
                     }
                 }
                 return Err(map_channel_error(error));
@@ -4920,7 +4920,7 @@ async fn refresh_live_registration(
     let normal_protected_refresh = session.channel.security_verify().is_some();
     session.channel.discard_retired_security();
     if let Some(retired) = session.retired_xfrm_plan.take() {
-        ipsec::uninstall_plan_in_worker(&retired, &session.xfrm_worker).await;
+        ipsec::uninstall_plan_in_worker(&retired, &session.worker_binding).await;
     }
 
     // Refresh first retries the exact shape that registered, then drops PANI
@@ -5403,7 +5403,7 @@ async fn cleanup_live_session_with_binding(live: &CellularImsLiveHandle, binding
             .chain(session.retired_xfrm_plan.iter())
         {
             if session.worker_binding.is_current() {
-                ipsec::uninstall_plan_in_worker(plan, &session.xfrm_worker).await;
+                ipsec::uninstall_plan_in_worker(plan, &session.worker_binding).await;
             } else {
                 tracing::warn!("Skipping VoLTE XFRM cleanup bound to a stale UE worker generation");
             }
