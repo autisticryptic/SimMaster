@@ -19,6 +19,8 @@ mod security_hint;
 mod register_failure_diagnostics;
 #[path = "live_retry.rs"]
 mod live_retry;
+#[path = "pcscf_refresh.rs"]
+mod pcscf_refresh;
 #[path = "live_reg_event.rs"]
 mod live_reg_event;
 
@@ -517,6 +519,9 @@ struct CellularImsLiveSession {
     /// beta2-style AT IMS context retained until the WDS/SIP session ends.
     ims_profile_lease: Option<ImsProfileLease>,
     pcscf: SocketAddr,
+    selected_endpoint: PcscfEndpoint,
+    video_capability_enabled: bool,
+    dynamic_visited_network_fallback: bool,
     endpoint_retries: live_retry::SharedEndpointRetries,
     ip_family: &'static str,
     xfrm_plan: Option<XfrmInstallPlan>,
@@ -3263,6 +3268,7 @@ async fn connect_inner(
                             access_network_runtime,
                             &network_worker_binding,
                             native_bearer.as_mut(),
+                            None,
                         )
                         .await
                     }
@@ -3469,8 +3475,10 @@ async fn connect_family(
     access_network_runtime: &ImsAccessNetworkRuntime,
     worker_binding: &UeWorkerBinding,
     mut native_bearer: Option<&mut NativeImsBearer>,
+    retained: Option<&pcscf_refresh::RetainedSetup>,
 ) -> Result<CellularImsLiveSession, CellularImsError> {
     let pcscf = endpoint.socket;
+    let inherited_protection = retained.is_some_and(|setup| setup.require_protection);
     if endpoint.transport == PcscfTransport::Tls && device_identity.profile.ims.register.sec_agree_mode == "required" {
         // Authored required IMS-IPsec is not waived by TLS. Auto/supported
         // profiles may register over authenticated TLS when no IPsec selection
@@ -3521,31 +3529,34 @@ async fn connect_family(
         .await;
 
     let route = ImsRoute {
-        local_addr: SocketAddr::new(local_addr, CELLULAR_IMS_SIP_PORT),
+        local_addr: SocketAddr::new(local_addr, if retained.is_some() { 0 } else { CELLULAR_IMS_SIP_PORT }),
         pcscf_addr: pcscf,
         transport: endpoint.transport.sip_transport(),
     };
     let profile = device_identity.profile;
     let network_worker = worker.clone();
-    let media_worker = trunk_worker_for_bearer(&device.line_id, &bearer.interface)
-        .await
-        .ok_or_else(|| CellularImsError::new(code::RUNTIME_UE_WORKER_UNAVAILABLE))?;
-    let media_operator_creator = Arc::new(CellularImsWorkerOperatorSocketCreator {
-        worker: media_worker,
-    }) as Arc<dyn OperatorSocketCreator>;
+    let media_operator_creator = if let Some(setup) = retained {
+        setup.media_operator_creator.clone()
+    } else {
+        let media_worker = trunk_worker_for_bearer(&device.line_id, &bearer.interface)
+            .await.ok_or_else(|| CellularImsError::new(code::RUNTIME_UE_WORKER_UNAVAILABLE))?;
+        Arc::new(CellularImsWorkerOperatorSocketCreator { worker: media_worker }) as Arc<dyn OperatorSocketCreator>
+    };
     let sip_instance = sip_instance_for_profile(
         profile,
         &device_identity.ims,
         device_identity.effective_device_identity.imei.as_deref(),
     );
-    let sip_instance =
+    let sip_instance = if let Some(setup) = retained { setup.sip_instance.clone() } else {
         crate::connectivity::core::ims_registration_coordinator::for_line(&device.line_id)
-            .registration_instance(&sip_instance);
+            .registration_instance(&sip_instance)
+    };
     let access_network = (profile.ims.register.include_pani_initial
         || profile.ims.register.include_pani_authenticated
         || profile.ims.register.enable_cellular_network_info)
         .then(|| access_network_runtime.context(profile.ims.register.access_network_info))
         .flatten();
+    let access_network = retained.map(|setup| setup.access_network.clone()).unwrap_or(access_network);
     let requires_dynamic_pani = profile.ims.register.pani_identity_policy
         == AccessIdentityPolicy::RequiredDynamic
         && (profile.ims.register.include_pani_initial
@@ -3613,7 +3624,7 @@ async fn connect_family(
             ),
         };
         variant.policy.include_video_feature = video_capability_enabled;
-        if !candidate_history.record(variant, fallback_state.requires_protection(profile)) {
+        if !candidate_history.record(variant, inherited_protection || fallback_state.requires_protection(profile)) {
             continue;
         }
         candidate_attempts = candidate_attempts.saturating_add(1);
@@ -3740,7 +3751,7 @@ async fn connect_family(
         .with_auth_binding(Some(device_identity.auth_binding.clone()))
         .with_provisioning(device_identity.provisioning.clone())
         .with_worker_binding(worker_binding.clone())
-        .with_required_security(fallback_state.requires_protection(profile))
+        .with_required_security(inherited_protection || fallback_state.requires_protection(profile))
         .with_security_mechanism(variant.security_mechanism);
         ensure_worker_binding_current(worker_binding)?;
         verify_mm_task_bearer(runtime, native_bearer.as_deref_mut()).await?;
@@ -3767,6 +3778,10 @@ async fn connect_family(
             }
             authenticator.rollback_security(&mut channel).await;
             return Err(CellularImsError::new(error.code()));
+        }
+        if registration_result.as_ref().is_ok_and(|result| result.remaining_lifetime(authenticator.expires_seconds).is_zero()) {
+            authenticator.rollback_security(&mut channel).await;
+            return Err(CellularImsError::new("ims_register_lease_expired"));
         }
         let registration = match registration_result {
             Ok(registration) => registration,
@@ -3896,7 +3911,7 @@ async fn connect_family(
                 return Err(error);
             }
         };
-        if (device_identity.diagnostic_required_security || variant.security_mechanism.is_some()
+        if (inherited_protection || device_identity.diagnostic_required_security || variant.security_mechanism.is_some()
             || fallback_state.requires_protection(profile))
             && (authenticator.mode != RegistrationMode::Ipsec
                 || authenticator.xfrm_plan.is_none()
@@ -3958,7 +3973,7 @@ async fn connect_family(
             ImsRegistrationAccess::CellularIms,
             artifacts,
             authenticator.expires_seconds,
-        );
+        ).with_received_at(registration.received_at);
         let associated_uri = registered.default_associated_uri();
         let mut registered_identity = device_identity.ims.clone();
         if let Some(uri) = associated_uri {
@@ -4024,6 +4039,9 @@ async fn connect_family(
             registration: registered,
             bearer: bearer.clone(),
             pcscf,
+            selected_endpoint: endpoint.clone(),
+            video_capability_enabled,
+            dynamic_visited_network_fallback: device_identity.dynamic_visited_network_fallback,
             endpoint_retries: endpoint_retries.clone(),
             ip_family: ip_family_name(local_addr),
             xfrm_plan: authenticator.xfrm_plan,
@@ -4382,7 +4400,8 @@ async fn live_receive_loop(
             .as_ref()
             .map(|session| {
                 let protected = session.channel.security_verify().is_some();
-                let delay = scheduled_cellular_ims_refresh_delay(&session.registration.lease);
+                let delay = scheduled_cellular_ims_refresh_delay(&session.registration.lease)
+                    .saturating_sub(session.registration.registered_at.elapsed().unwrap_or(Duration::MAX)).max(Duration::from_secs(1));
                 tracing::info!(
                     refresh_after_seconds = delay.as_secs(),
                     network_refresh_after_seconds =
@@ -4539,7 +4558,8 @@ async fn live_receive_loop(
                             .as_ref()
                             .is_some_and(|session| session.channel.security_verify().is_some())
                     };
-                    let delay = scheduled_cellular_ims_refresh_delay(&registration.lease);
+                    let delay = scheduled_cellular_ims_refresh_delay(&registration.lease)
+                        .saturating_sub(registration.registered_at.elapsed().unwrap_or(Duration::MAX)).max(Duration::from_secs(1));
                     tracing::info!(
                         refresh_after_seconds = delay.as_secs(),
                         network_refresh_after_seconds = registration.lease.refresh_after.as_secs(),
@@ -4858,6 +4878,9 @@ async fn refresh_live_registration(
             .channel
             .sync_protected_advertised_port(session.security_binding.port_s);
     }
+    if let Some(attempt) = pcscf_refresh::refresh_if_changed(session, runtime, line_id).await {
+        return attempt;
+    }
     runtime
         .update(|state| state.stage = CellularImsStage::RegisterRefresh)
         .await;
@@ -5061,6 +5084,10 @@ async fn refresh_live_registration(
             authenticator.rollback_security(&mut session.channel).await;
             return lost_refresh_attempt(CellularImsError::new(error.code()));
         }
+        if registration_result.as_ref().is_ok_and(|result| result.remaining_lifetime(authenticator.expires_seconds).is_zero()) {
+            authenticator.rollback_security(&mut session.channel).await;
+            return lost_refresh_attempt(CellularImsError::new("ims_register_lease_expired"));
+        }
         let registration = match registration_result {
             Ok(registration) => registration,
             Err(failure) => {
@@ -5259,7 +5286,7 @@ async fn refresh_live_registration(
             ImsRegistrationAccess::CellularIms,
             artifacts,
             authenticator.expires_seconds,
-        );
+        ).with_received_at(registration.received_at);
         if let Some(uri) = registered.default_associated_uri() {
             session.identity.public_uri = uri.to_string();
         }
@@ -9906,6 +9933,10 @@ mod tests {
             pcscf_reporting_cid: None,
             ims_profile_lease: None,
             pcscf: pcscf_addr,
+            selected_endpoint: PcscfEndpoint { socket: pcscf_addr, source: super::super::pcscf::PcscfSource::Profile,
+                host: None, transport: PcscfTransport::Udp, tls_authority: None, ttl: None, srv_priority: None, srv_weight: None },
+            video_capability_enabled: false,
+            dynamic_visited_network_fallback: false,
             endpoint_retries: Arc::new(Mutex::new(super::super::register_retry::EndpointRetryState::default())),
             ip_family: "ipv4",
             xfrm_plan: None,

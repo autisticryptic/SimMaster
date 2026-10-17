@@ -4666,14 +4666,17 @@ async fn record_live_ims_register_ready(
     sms_capability_advertised: bool,
     registration: RegisteredImsContext,
 ) {
-    if reg_event_live::registration_revoked(line_id).await { return; }
+    if reg_event_live::registration_revoked(line_id).await || registration.remaining_lifetime().is_zero() { return; }
     let ttl = registration.lease.refresh_after;
+    let now = Instant::now();
+    let hard_deadline = now + registration.remaining_lifetime();
+    let refresh_deadline = hard_deadline.checked_sub(registration.lease.expires_after.saturating_sub(ttl)).unwrap_or(now);
     let expires_seconds = registration.lease.expires_seconds;
     ims_register_ready_cache().lock().await.insert(
         line_id.to_string(),
         LiveImsRegisterReady {
             profile_id: profile.meta.profile_id,
-            expires_at: Instant::now() + ttl,
+            expires_at: refresh_deadline,
             registration,
             sms_capability_advertised,
             receiver_transport: profile.sms.receiver_transport,
@@ -4874,7 +4877,7 @@ async fn record_live_ims_channel(
     next_register_cseq: u32,
 ) -> Result<(), LiveStageError> {
     let route = channel.route();
-    let expires_at = Instant::now() + registration.lease.expires_after;
+    let expires_at = Instant::now() + registration.remaining_lifetime();
     let expires_seconds = registration.lease.expires_seconds;
     let media_route_installer: Option<Arc<dyn super::operator::MediaRouteInstaller>> =
         cached_tun_gateway(line_id, profile)
@@ -4887,6 +4890,7 @@ async fn record_live_ims_channel(
     )) as Arc<dyn OperatorSocketCreator>;
     let uicc = register_context.uicc.clone().ok_or_else(|| live_stage_error("ims_uicc_binding_invalid"))?;
     uicc.verify_registration(line_id).await.map_err(live_stage_error)?;
+    if registration.remaining_lifetime().is_zero() { return Err(live_stage_error("ims_register_lease_expired")); }
     register_context.verify_worker(line_id).map_err(|error| live_stage_error(error.code()))?;
     reg_event_live::accepted_owner(line_id, &uicc).await?;
     xcap_binding_cache().lock().await.insert(
@@ -6088,6 +6092,7 @@ pub(crate) fn register_reason_blocks_profile_fallback(reason: &str) -> bool {
         "vowifi_register_retry_deferred"
         | "ims_bearer_requirement_rejected"
         | "vowifi_register_retry_stopped"
+        | "ims_register_lease_expired"
         | "ims_register_min_expires_negotiated"
         | "ims_register_authenticated_stop"
         | "ims_register_initial_min_expires_invalid"
@@ -6230,6 +6235,7 @@ fn is_live_digest_authentication_failure(reason: &str) -> bool {
 }
 
 fn classify_vowifi_register_error(reason: &str) -> RegistrationLossReason {
+    if reason == "ims_register_lease_expired" { return RegistrationLossReason::Expired; }
     if reason.starts_with("ims_uicc_") || reason.starts_with("isim_") {
         return RegistrationLossReason::AccessTransportLost;
     }

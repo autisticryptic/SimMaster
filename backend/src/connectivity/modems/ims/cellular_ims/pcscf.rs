@@ -998,6 +998,21 @@ pub async fn discover_pcscf_endpoints_with_discovery_in_worker(
     .await
 }
 
+/// Re-resolve ONLY a freshly observed PCO source. Never consult a changed
+/// environment, authored profile, ISIM or standard DNS as a silent substitute.
+pub async fn rediscover_retained_pco_in_worker(
+    settings: &ImsIpSettings, domains: &[String], home_domain: &str, local: IpAddr,
+    interface: &str, worker: &UeWorkerHandle, transport: PcscfTransport,
+) -> Result<Vec<PcscfEndpoint>, CellularImsError> {
+    let selection = endpoint::select_source_with_discovery(None, settings, None, &[], domains, None)?;
+    if !matches!(&selection, endpoint::Selection::Explicit(PcscfSource::BearerPco, _)) {
+        return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED));
+    }
+    endpoint::discover_with(selection, settings, home_domain, local,
+        |server, name, kind| async move { query_dns(local, server, &name, kind, interface, worker).await },
+        endpoint::DiscoveryLimits::for_transport(transport)).await
+}
+
 fn pcscf_srv_names(home_domain: &str) -> Vec<String> {
     // The current worker SIP channel is UDP. A TCP SRV target must never be
     // used as a UDP endpoint merely because it resolves to an IP address.

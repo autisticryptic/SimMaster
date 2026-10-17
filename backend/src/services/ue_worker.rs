@@ -809,6 +809,37 @@ impl UeWorkerHandle {
         });
     }
 
+    /// Combined synthetic responder for real registration/reselection tests.
+    /// Handles the normal request-id/FD/status protocol, never kernel routes.
+    #[cfg(all(test, unix))]
+    pub(crate) async fn enable_test_registration_io<F>(&self, snapshot: NetStatusSnapshot,
+        operations: Arc<std::sync::Mutex<Vec<NetConfigOp>>>, mut factory: F)
+    where F: FnMut(UeSocketSpec) -> std::io::Result<SocketFd> + Send + 'static {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *self.core.tx.lock().unwrap() = Some(tx);
+        let core = Arc::clone(&self.core);
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                match message {
+                    UeWorkerMessage::NetConfigRequest { request_id, ops } => {
+                        operations.lock().unwrap().extend(ops);
+                        if let Some(PendingRequest::NetConfig(sender)) = core.pending.lock().unwrap().remove(&request_id) {
+                            let _ = sender.send(NetConfigOutcome { request_id, ok: true, output: vec![], error: None });
+                        }
+                    }
+                    UeWorkerMessage::NetStatusRequest => { core.state.lock().unwrap().last_net_status = Some(snapshot.clone()); }
+                    UeWorkerMessage::SocketCreateRequest { request_id, spec } => {
+                        let (fd, error) = match factory(spec) { Ok(fd) => (Some(fd), None), Err(error) => (None, Some(error.to_string())) };
+                        if let Some(PendingRequest::Socket(sender)) = core.pending.lock().unwrap().remove(&request_id) {
+                            let _ = sender.send(SocketCreateOutcome { request_id, ok: error.is_none(), error, fd });
+                        }
+                    }
+                    _ => panic!("unexpected registration worker request"),
+                }
+            }
+        });
+    }
+
     #[cfg(test)]
     pub(crate) async fn advance_test_generation(&self) {
         let _guard = self.core.lifecycle.lock().await;

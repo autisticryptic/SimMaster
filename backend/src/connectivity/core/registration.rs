@@ -96,6 +96,15 @@ impl RegisteredImsContext {
         }
     }
 
+    pub fn with_received_at(mut self, received_at: SystemTime) -> Self {
+        self.registered_at = received_at;
+        self
+    }
+
+    pub fn remaining_lifetime(&self) -> Duration {
+        self.lease.expires_after.saturating_sub(self.registered_at.elapsed().unwrap_or(Duration::MAX))
+    }
+
     pub fn default_associated_uri(&self) -> Option<&str> {
         self.associated_uris.first().map(String::as_str)
     }
@@ -175,6 +184,26 @@ pub enum UnregisterResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_elapsed_time_is_not_a_new_registration_lifetime() {
+        let received = SystemTime::now() - Duration::from_secs(30);
+        let registration = RegisteredImsContext::from_response(ImsRegistrationAccess::CellularIms,
+            b"SIP/2.0 200 OK\r\nExpires: 120\r\n\r\n", 3600).with_received_at(received);
+        assert_eq!(registration.registered_at, received);
+        assert!(registration.remaining_lifetime() <= Duration::from_secs(90));
+        assert!(registration.remaining_lifetime() >= Duration::from_secs(89));
+        assert_eq!(registration.lease.expires_seconds, 120);
+    }
+
+    #[test]
+    fn expired_or_future_wall_clock_evidence_never_grants_remaining_lifetime() {
+        for received in [SystemTime::UNIX_EPOCH, SystemTime::now() + Duration::from_secs(60)] {
+            let registration = RegisteredImsContext::from_response(ImsRegistrationAccess::Vowifi,
+                b"SIP/2.0 200 OK\r\nExpires: 10\r\n\r\n", 3600).with_received_at(received);
+            assert_eq!(registration.remaining_lifetime(), Duration::ZERO);
+        }
+    }
 
     #[test]
     fn response_expiry_drives_the_shared_lease() {

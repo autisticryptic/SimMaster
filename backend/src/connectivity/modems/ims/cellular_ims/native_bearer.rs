@@ -166,6 +166,27 @@ impl NativeImsBearer {
         result
     }
 
+    /// Fresh observation on the ORIGINAL retained provider only. Unlike the
+    /// initial discovery helper this never opens a modem-wide fallback path.
+    /// None/partial/empty are observations, not evidence of endpoint removal.
+    pub async fn observe_pcscf_update(&mut self) -> Result<Option<ImsPcscfDiscovery>, CellularImsError> {
+        self.check_liveness()?;
+        if !self.worker_binding_is_current() { return Err(CellularImsError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED)); }
+        let result = self.handle.discover_pcscf().await;
+        self.check_liveness()?;
+        if !self.worker_binding_is_current() { return Err(CellularImsError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED)); }
+        result.map_err(cellular_ims_error_from_ims_bearer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_for_test(connection: BearerConnection, binding: UeWorkerBinding,
+        handle: Box<dyn ImsBearerHandle + Send>) -> Self {
+        Self { interface: connection.interface.clone(), connection,
+            provider_endpoint: "synthetic-retained-endpoint".into(), provider_session: "synthetic-retained-session".into(),
+            netdev_method: "test", interface_ownership: BearerInterfaceOwnership::WorkerNative, handle,
+            worker: Some(binding.worker().clone()), worker_binding: Some(binding), moved_to_worker: false }
+    }
+
     /// Move the dedicated native netdev into this line's UE namespace. The
     /// host-managed Internet interface is intentionally rejected. A device
     /// provider may use ModemManager as the control-plane owner of its own

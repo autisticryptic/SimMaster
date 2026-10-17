@@ -185,7 +185,7 @@ class ImsFallbackBoundaryTests(unittest.TestCase):
 
     def test_provider_failure_does_not_reenter_legacy_at_and_checks_after_each_await(self):
         text = (SRC / "cellular_ims/native_bearer.rs").read_text()
-        method = text[text.index("pub async fn discover_pcscf<"):text.index("pub async fn move_into_worker(")]
+        method = text[text.index("pub async fn discover_pcscf<"):text.index("pub async fn observe_pcscf_update(")]
         self.assertIn("Ok(None) => exact_at_fallback().await", method)
         self.assertIn("Err(error) => Err(cellular_ims_error_from_ims_bearer(error))", method)
         self.assertEqual(method.count("self.check_liveness()?"), 3)

@@ -240,6 +240,17 @@ pub struct RegisterResult {
     pub response: Vec<u8>,
     pub authenticated: bool,
     pub auth_rounds: u8,
+    /// Time the shared driver accepted the final response, before adapter
+    /// provisioning/provider validation. Such validation cannot renew a lease.
+    pub received_at: std::time::SystemTime,
+}
+impl RegisterResult {
+    pub fn remaining_lifetime(&self, default_expires: u32) -> Duration {
+        let expires = super::register_response::RegisterArtifacts::parse(&self.response)
+            .expires_seconds.unwrap_or(default_expires);
+        Duration::from_secs(u64::from(expires))
+            .saturating_sub(self.received_at.elapsed().unwrap_or(Duration::MAX))
+    }
 }
 
 /// Stage within the shared exchange, not the adapter's initial/refresh lifecycle.
@@ -490,6 +501,7 @@ where
                     response,
                     authenticated: auth_rounds > 0,
                     auth_rounds,
+                    received_at: std::time::SystemTime::now(),
                 })
             }
             401 | 407 if auth_rounds < MAX_AUTH_ROUNDS => {

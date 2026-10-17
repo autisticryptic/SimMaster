@@ -48,7 +48,7 @@ async fn protected_session() -> (
     protected_session_with_profile(Box::leak(Box::new(profile))).await
 }
 
-async fn protected_session_with_profile(
+pub(super) async fn protected_session_with_profile(
     profile: &'static CarrierProfile,
 ) -> (
     CellularImsLiveSession,

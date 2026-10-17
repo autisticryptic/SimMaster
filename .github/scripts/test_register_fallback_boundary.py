@@ -61,7 +61,7 @@ class RegisterFallbackBoundaryTests(unittest.TestCase):
 
     def test_confirmed_security_precedes_aka_and_candidates_deduplicate_before_budget(self):
         live = source(BASE / "live.rs")
-        self.assertIn(".with_required_security(fallback_state.requires_protection(profile))", live)
+        self.assertIn(".with_required_security(inherited_protection || fallback_state.requires_protection(profile))", live)
         initial = live.split("let mut fallback_state =", 1)[1]
         self.assertLess(initial.index("candidate_history.record("), initial.index("candidate_attempts.saturating_add(1)"))
         auth = live.split("async fn prepare_authenticated_channel(", 1)[1].split("async fn authenticated_request(", 1)[0]

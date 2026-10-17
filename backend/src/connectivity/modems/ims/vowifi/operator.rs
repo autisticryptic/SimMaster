@@ -218,6 +218,7 @@ impl RegisteredRefreshFailure {
             || self.code().starts_with("digest_response_auth_")
             || self.code().starts_with("ims_uicc_") || self.code().starts_with("isim_")
             || matches!(self.code(), "ims_uicc_binding_invalid" | "ims_uicc_binding_changed"
+                | "ims_register_lease_expired"
                 | "vowifi_runtime_ue_worker_generation_changed" | "vowifi_refresh_rejected" | "vowifi_refresh_security_update_required")
     }
 }
@@ -739,7 +740,7 @@ async fn run_session_with_initial_mwi_subscription(
                     None => Err(crate::connectivity::core::ImsError::new("vowifi_refresh_not_supported").into()),
                 };
                 if let Ok(registration) = &result {
-                    session.context.expires_at = Instant::now() + registration.lease.expires_after;
+                    session.context.expires_at = Instant::now() + registration.remaining_lifetime();
                     session.context.registration = registration.clone();
                     if let Some(uri) = registration.default_associated_uri() {
                         session.context.identity.public_uri = uri.to_string();

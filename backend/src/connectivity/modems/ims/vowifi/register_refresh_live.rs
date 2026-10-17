@@ -94,6 +94,7 @@ impl VowifiUnregisterFactory {
                 });
             }
         };
+        if result.remaining_lifetime(auth.expires).is_zero() { return Err(ImsError::new("ims_register_lease_expired").into()); }
         auth.validate_success(&result.response)?;
         if let Some(state) = auth.authorization.as_mut() { state.apply_success(&result.response)?; }
         retries.accepted(logical_endpoint).await?;
@@ -102,7 +103,8 @@ impl VowifiUnregisterFactory {
         if artifacts.expires_seconds == Some(0) { return Err(ImsError::new("vowifi_refresh_rejected").into()); }
         self.context.diagnostic_scope.accepted(channel.route(), channel.security_verify(), auth.authorization.as_ref(), &result.response).await;
         *self.refresh_authorization.lock().unwrap_or_else(|error| error.into_inner()) = auth.authorization;
-        let registration = RegisteredImsContext::from_artifacts(ImsRegistrationAccess::Vowifi, artifacts, auth.expires);
+        let registration = RegisteredImsContext::from_artifacts(ImsRegistrationAccess::Vowifi, artifacts, auth.expires)
+            .with_received_at(result.received_at);
         self.expires_seconds.store(registration.lease.expires_seconds, std::sync::atomic::Ordering::Relaxed);
         Ok(registration)
     }

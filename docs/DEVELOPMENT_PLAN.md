@@ -30,7 +30,8 @@
 
 - reg-event 已实现并验证；仍需真实网络互通/设备验收。自定义或歧义 Contact 不猜绑定；不支持的订阅挑战、超时或 XML 缺口只停止/重同步观察，不伪造 REGISTER 丢失。
 - REGISTER rspauth 已验证；后续互通须单独验证真实服务器响应。现有范围仅 qop=auth/无 qop 和单一 Authorization scope，不宣称 auth-int、多重 origin/proxy 鉴权或非 REGISTER 业务已经支持。
-- **R5同卡材料新鲜度已接线待Actions。** 现有只读QMI/native AT/PCSC在REGISTER/AKA/续期/注销边界做两次稳定快照，旧材料变化/读取失败不借USIM缺省或旧租期混过；同卡重建不清网络等待。R6原bearer P-CSCF动态复核随后推进，实机/REFRESH事件订阅与特殊mode不由本项推断。
+- **R6原承载PCO动态复核已接线待Actions。** 无活动对话的续期边界查询原provider；仅完整非空同族候选可触发重选，未知/部分IPv6不冒认撤销。原端点仍在则保留；确认替换在同PDN/worker新建REGISTER/SA并继承原IPsec/TLS，不借旧Digest，临时失败保留原截止/等待。非PCO、WiFi IKE来源和活动对话不自动套用这项策略；新增8生产回归及响应时刻租期保护待验证。
+- **R5同卡材料新鲜度已由6203511软件验证。** 现有只读QMI/native AT/PCSC在REGISTER/AKA/续期/注销边界做两次稳定快照，旧材料变化/读取失败不借USIM缺省或旧租期混过；同卡重建不清等待，已发送计数不回退。两工作流/双架构、各507相关回归/86场景含19新回归通过；R6继续。实机/REFRESH事件订阅与特殊mode不由本项推断。
 - **R4注销反馈已由0351006软件验证。** 双接入注销新收到临时拒绝/Retry-After写入发送前捕获的同订阅等待；清理和晚到成功不清等待，旧卡响应不影响新卡，诊断hook无控制副作用。两套Actions/双架构、各488相关回归/86场景含16项新回归通过；首轮可选Contact零租期夹具错误已修复留证。不新增注销重试或恢复旧租期。
 - **R3首次认证后423已由31d09ff软件验证。** WiFi直接Digest和protected AKA将423交回共享budget，重算nc/request-proof，不重装ESP、不重开候选；两套Actions/双架构、各472相关回归/86场景含10项新真实路径测试通过。需要新安全上下文的受保护挑战仍明确交恢复层，非REGISTER业务恢复不混入本项。
 - 蜂窝刷新 423→400/新鉴权后400的预算补漏已由 `b6a7888` 验证；后续需保持结构化门禁、Min-Expires来源和旧通道/租期/计数，不回到末次状态猜测。
