@@ -129,12 +129,13 @@
 - `3509e15` 已接通并验证 rspauth：仅对实际生成的非空 Digest 证明捕获不可变请求上下文，发送前检查最终 URI/Authorization/opaque，2xx 发布前验证响应对应的 qop/nc/cnonce 和 rspauth。Authentication-Info/Proxy-Authentication-Info 不串用，重复/畸形/不匹配明确失败；缺少可选 rspauth 仍兼容，不把 nextnonce-only 冒充服务器证明已验。当前支持范围为既有 REGISTER 算法、qop=auth/无 qop 和单一鉴权 scope。
 - 响应认证失败不是传输失败或可换头型的协商提示；不能提交新的 nextnonce、租期、业务身份或安全上下文。失败保留已发送的原 nonce-count、回滚暂存状态；不放宽 AKA/ESP 算法门禁。本轮范围为 REGISTER，非 REGISTER 业务不自动宣称已支持。
 
-### 运行中PCO端点复核（R6，待Actions）
+### 运行中PCO端点复核（R6，6672a64已软件验证）
 
 - 无活动对话的蜂窝续期边界查询原retained provider，前后保持SIM/owner/worker与承载绑定；不新增CID/PDN，不走modem-wide AT fallback。只有已选来源为BearerPco才启用，环境/profile/ISIM/DHCP/标准DNS与WiFi IKE来源不混用。
 - 完整且非空的当前族观察在原承载DNS内重解析；不跨来源降级。空结果、未实现、查询不可用或不完整IPv6不是端点撤销；DNS无新可用结果也不凭空废弃仍有效绑定。原逻辑socket/transport/TLS authority仍在列表时保留原通道与SA，顺序/TTL变化不触发重选。
 - 确认需要替换且无活动对话时，原PDN、worker、地址、SIM、profile和实例不变；用临时本地端口、新REGISTER/AKA/SA替换SIP绑定，继承旧IPsec-required/TLS身份约束，不复制旧Digest到新P-CSCF。成功移交原provider/profile句柄后只清旧SA/socket；不执行bearer网络清理，不把这次新注册计作自然续期。
 - 已开始鉴权/423或安全失败不重新展开端点；临时失败及候选等待保留到原租期截止，不能通过再发现清预算。活动对话维持原流并延后本项观察/重选，reg-event真实撤销仍独立立即生效。该项不是动态DNS缓存系统或基带PCO事件订阅。
+- 新注册成功后reg-event/MWI按新dialog重新建立，旧OPTIONS事务作废；临时重选失败时runtime仍显示实际保留的旧端点，失败候选只入执行诊断，不能在Registered状态展示未成功的目标。
 - 共享最终成功响应携带接收时刻；材料/provider复核后的新租期和调度仍从该时刻计算，已在验证过程中到期不能发布ready。网络给出的原始expires数值不被伪造。
 
 ### reg-event 观察与注册撤销
@@ -362,18 +363,18 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 
 ### EC20原报告注册缺口对照（有界静态复核）
 
-以原审查基线42057a6与当前0351006为对照，原报告第4节六项均已有生产实现；复核新增R4也已单独Actions验证。证据等级不因CI而升级为完整固件调用图或实网成功。
+以原审查基线42057a6与当前6672a64为对照，原报告第4节六项均已有生产实现；复核新增R4～R6也已单独Actions验证。证据等级不因CI而升级为完整固件调用图或实网成功。
 
 | 原报告项 | 生产入口 | 状态/保留边界 |
 |---|---|---|
-| P1-A ISIM材料 | `uicc_ims::resolve_ims_identity`、cellular `load_device_identity`、WiFi `live_identity` | 身份/AID同卡绑定；首个配置IMPU，不声明任意多IMPU注册 |
-| P1-B endpoint | `pcscf_endpoint`、`pcscf_dns_transport`、`bind_endpoint_in_worker` | UDP/TCP/TLS及有界DNS已接通；TTL元数据不等于持续迁移健康注册 |
+| P1-A ISIM材料 | `uicc_ims::resolve_ims_identity`、cellular `load_device_identity`、WiFi `live_identity` | 身份/AID同卡绑定，R5程序边界材料复核；首个配置IMPU，不声明任意多IMPU注册 |
+| P1-B endpoint | `pcscf_endpoint`、`pcscf_dns_transport`、`bind_endpoint_in_worker` | UDP/TCP/TLS及有界DNS已接通；R6补空闲原PCO复核/同PDN重选，TTL不是所有来源的动态缓存 |
 | P1-C 临时拒绝 | `EndpointRetryState`、cellular `connect_inner/refresh_live_registration`、WiFi `register_retry_live` | 初次/刷新已验证；本次发现注销新等待反馈缺口R4，0351006已修复验证 |
 | P2-D reg-event | shared `reg_event`、cellular `live_reg_event`、WiFi operator | 仅相关绑定撤销readiness；订阅不支持不伪造注册失效 |
 | P2-E AUTS/stale/rspauth | `digest_aka`、`DigestRequestProof`、双接入authenticator | 先验后提交；单scope、auth/无qop，非REGISTER不扩称 |
 | P2-F 423预算 | `RegisterNegotiationBudget`、双接入候选与refresh | 初次/刷新共用原预算；R3初次protected AKA已补齐 |
 
-固件普通priority的00/02/03/01及条件non-IPSec构造分支已有汇编证据，但不能推导所有mode、设备当前NV/MBN或任意失败降级；不据此改用户覆写优先权。同卡ISIM EF热更新指示、运行中P-CSCF列表变化、未知packet及完整恢复图仍未确认，不把卡标识检查或静态TTL冒称覆盖。实机首次/自然续期/注销/故障恢复及MM重枚举另需授权；独立catalog和额外原生诊断不在此次注册补全范围。
+固件普通priority的00/02/03/01及条件non-IPSec构造分支已有汇编证据，但不能推导所有mode、设备当前NV/MBN或任意失败降级。新离线分析定位`0xd051c950`的新列表成员比较及上下文/状态条件，支持保留仍在列表中的当前端点；`0xd06e573c`的ISIM Refresh标签属于文本到状态匹配，不是已还原的UICC事件处理。R5/R6已补程序边界的材料和PCO检查；实时指示、活动对话期间的主动迁移、其他来源动态DNS、未知packet/完整恢复图不自动宣称支持。实机首次/自然续期/注销/故障恢复及MM重枚举另需授权；独立catalog与额外原生诊断不在此次注册补全范围。
 
 ## 10. 验证清单与验收标准
 
