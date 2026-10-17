@@ -108,6 +108,10 @@ async fn same_bearer_reselection_uses_real_registration_and_never_reactivates_pd
     let mut f = fixture(false).await;
     let new_peer = tokio::net::UdpSocket::bind("127.0.0.2:5060").await.unwrap();
     let old_local = f.session.channel.route().local_addr;
+    let old_call_id = f.session.register_ids.call_id.clone();
+    f.session.mwi_subscription = Some(MwiSubscription { ids: SubscribeIds {
+        branch: "retired-branch".into(), from_tag: "retired-tag".into(), to_tag: None,
+        call_id: "retired-mwi".into(), cseq: 4 }, refresh_at: tokio::time::Instant::now() + Duration::from_secs(600), authenticated: false });
     let old_bearer = f.session.bearer.path.clone(); let old_instance = f.session.sip_instance.clone();
     let binding = f.session.worker_binding.clone();
     let sender = tokio::spawn(async move {
@@ -123,6 +127,8 @@ async fn same_bearer_reselection_uses_real_registration_and_never_reactivates_pd
     assert_eq!(f.session.pcscf, "127.0.0.2:5060".parse().unwrap());
     assert_eq!(f.session.bearer.path, old_bearer); assert_eq!(f.session.sip_instance, old_instance);
     assert!(f.session.worker_binding.matches(&binding));
+    assert_ne!(f.session.register_ids.call_id, old_call_id);
+    assert!(f.session.mwi_subscription.is_none(), "old subscription cannot follow the new registration");
     assert!(f.session.video_capability_enabled && f.session.dynamic_visited_network_fallback);
     assert_eq!(f.control.releases.load(Ordering::SeqCst), 0);
     assert_eq!(f.runtime.status().await.register_refresh_count, 0, "reselection is not natural renewal");
@@ -174,6 +180,7 @@ async fn temporary_new_peer_failure_keeps_old_lease_and_same_sim_retry_wait() {
     let result = refresh_if_changed(&mut f.session, &f.runtime, "volte-dialog-matrix").await.unwrap();
     let peer = sender.await.unwrap();
     assert_eq!(result.outcome, RegistrationRefreshResult::Retry); assert_eq!(f.session.registration, old);
+    assert_eq!(f.runtime.status().await.pcscf, Some(f.session.pcscf.to_string()), "runtime must not advertise the rejected peer as registered");
     assert!(!f.session.endpoint_retries.lock().await.restart_admission(Instant::now()).is_allowed());
     let again = refresh_if_changed(&mut f.session, &f.runtime, "volte-dialog-matrix").await.unwrap();
     assert_eq!(again.outcome, RegistrationRefreshResult::Retry);

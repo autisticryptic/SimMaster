@@ -25,6 +25,10 @@ class PcscfRefreshContract(unittest.TestCase):
         live=(BASE/'live.rs').read_text(encoding='utf-8')
         self.assertIn('pcscf_refresh::refresh_if_changed(session, runtime, line_id).await',live)
         self.assertIn('.with_required_security(inherited_protection ||',live)
+        after = live[live.index('if reselected {'):live.index('let protected = {', live.index('if reselected {'))]
+        self.assertIn('live_reg_event::poll(&live, &runtime).await', after)
+        self.assertIn('start_cellular_ims_mwi_subscription(&live).await', after)
+        self.assertIn('pending_options = None', after)
 
     def test_fresh_pco_never_falls_through_to_another_source(self):
         text=(BASE/'pcscf.rs').read_text(encoding='utf-8')

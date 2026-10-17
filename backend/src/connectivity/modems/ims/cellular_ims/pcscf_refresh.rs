@@ -80,7 +80,7 @@ async fn reselect(session: &mut CellularImsLiveSession, runtime: &CellularImsRun
     bearer: BearerConnection, candidates: Vec<PcscfEndpoint>) -> CellularImsRefreshAttempt {
     let retries = session.endpoint_retries.clone();
     let restart = retries.lock().await.restart_admission(Instant::now());
-    if !restart.is_allowed() { return wait_attempt(remaining_registration_lifetime(&session.registration), runtime, restart).await; }
+    if !restart.is_allowed() { return wait_attempt(remaining_registration_lifetime(&session.registration), session.pcscf, runtime, restart).await; }
     let Some(card) = session.auth_binding.clone() else {
         return lost_refresh_attempt(CellularImsError::new("ims_uicc_binding_invalid"));
     };
@@ -143,13 +143,16 @@ async fn reselect(session: &mut CellularImsLiveSession, runtime: &CellularImsRun
         }
     }
     let admission = retries.lock().await.pause_restart(Instant::now());
-    let mut attempt = wait_attempt(remaining_registration_lifetime(&session.registration), runtime, admission).await;
+    let mut attempt = wait_attempt(remaining_registration_lifetime(&session.registration), session.pcscf, runtime, admission).await;
     if last_error.is_some() { attempt.error = last_error; }
     attempt
 }
 
-async fn wait_attempt(remaining: Duration, runtime: &CellularImsRuntime,
+async fn wait_attempt(remaining: Duration, retained_endpoint: SocketAddr, runtime: &CellularImsRuntime,
     admission: super::super::register_retry::RetryAdmission) -> CellularImsRefreshAttempt {
+    // Attempt diagnostics may name the rejected candidate. The live runtime
+    // binding still names the OLD peer until a replacement actually succeeds.
+    runtime.update(|state| state.pcscf = Some(retained_endpoint.to_string())).await;
     observe_retry_diagnostics(runtime, admission).await;
     if remaining.is_zero() { return lost_refresh_attempt(CellularImsError::new("ims_pcscf_reselection_expired")); }
     let delay = admission.remaining(Instant::now()).unwrap_or(remaining).min(remaining).max(Duration::from_millis(1));

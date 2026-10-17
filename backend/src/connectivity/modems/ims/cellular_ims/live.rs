@@ -4541,17 +4541,28 @@ async fn live_receive_loop(
             continue;
         }
         if !reg_event_revoked && tokio::time::Instant::now() >= refresh_at {
-            let refresh_result = {
+            let (refresh_result, reselected) = {
                 let mut sessions = live.session.lock().await;
                 match sessions.as_mut() {
                     Some(session) => {
-                        refresh_live_registration(session, &runtime, &line_id, &database).await
+                        let previous = session.register_ids.call_id.clone();
+                        let result = refresh_live_registration(session, &runtime, &line_id, &database).await;
+                        (result, session.register_ids.call_id != previous)
                     }
                     None => break,
                 }
             };
             match refresh_result.outcome {
                 RegistrationRefreshResult::Refreshed(registration) => {
+                    if reselected {
+                        // Old advisory transactions/subscription dialogs belong
+                        // to the retired flow, never to its replacement peer.
+                        pending_options = None;
+                        options_failures = 0;
+                        options_due = tokio::time::Instant::now() + Duration::from_secs(5);
+                        live_reg_event::poll(&live, &runtime).await;
+                        start_cellular_ims_mwi_subscription(&live).await;
+                    }
                     let protected = {
                         let sessions = live.session.lock().await;
                         sessions
