@@ -27,7 +27,7 @@ impl std::fmt::Debug for Milenage {
 }
 
 fn encrypt(k: &Key, block: &[u8; 16]) -> [u8; 16] {
-    let cipher = Aes128::new(Key::from_slice(k).into());
+    let cipher = Aes128::new_from_slice(k).expect("AES-128 key length");
     let mut value = *block;
     cipher.encrypt_block((&mut value).into());
     value
