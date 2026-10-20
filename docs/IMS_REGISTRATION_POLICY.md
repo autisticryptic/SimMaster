@@ -140,7 +140,7 @@ R7（d373ffa已软件验证）将XFRM安装/部分失败回滚/旧SA退役/重�
 - 新注册成功后reg-event/MWI按新dialog重新建立，旧OPTIONS事务作废；临时重选失败时runtime仍显示实际保留的旧端点，失败候选只入执行诊断，不能在Registered状态展示未成功的目标。
 - 共享最终成功响应携带接收时刻；材料/provider复核后的新租期和调度仍从该时刻计算，已在验证过程中到期不能发布ready。网络给出的原始expires数值不被伪造。
 
-### ISIM 刷新订阅（R9，待Actions）
+### ISIM 刷新订阅（R9，e031849已软件验证）
 
 - 依据 libqmi 1.36.0 UIM schema：Refresh Register `0x002A`、Refresh Complete `0x002C`、Refresh indication `0x0033`；Stage `WAIT_FOR_OK=0 / START=1 / END_WITH_SUCCESS=2 / END_WITH_FAILURE=3`。
 - 每线路一个**独立只读** UIM client（不占用现有按需通道）：注册后订阅，清理时停止；modem 不支持或注册失败则返回 None，**退回 R5 边界快照**，不报错、不伪装支持。
@@ -148,8 +148,9 @@ R7（d373ffa已软件验证）将XFRM安装/部分失败回滚/旧SA退役/重�
 - `END_WITH_SUCCESS` 只是**提示**：必须重读 R5 的稳定快照并比对；变化或读取失败 → 置 `identity_stale`，**不立即换身份**；有活动通话时延后，通话排空后清理并按门禁重建。
 - `END_WITH_FAILURE` 与无关 session/AID 的通知一律不当作变化；不读卡、不改 NV、不发 URC 开关。
 - 该订阅只覆盖蜂窝接入；VoWiFi 仍使用 R5 的注册边界检查（后续可复用同一订阅）。
+- 验证：两工作流/双架构、各 529 项相关回归/86 场景；首轮仅测试断言缺少 `Debug`（E0369/E0277），生产代码未改。
 
-### 身份来源策略（R8，待Actions）
+### 身份来源策略（R8，e031849已软件验证）
 
 `profile.ims.identity_source` 从“声明标签”变为可执行策略，默认 `auto` 保持历史行为：
 
