@@ -88,6 +88,13 @@ impl LiveImsSelection {
     pub async fn authenticate(&self, line_id: &str, rand: &[u8], autn: &[u8])
         -> Result<super::super::qmi_uim::UsimAkaApduResult, &'static str> {
         self.verify_registration(line_id).await?;
+        if let Some(profile) = &self.virtual_usim {
+            // Five-code software USIM: compute the card-side AKA locally.
+            let out = profile.authenticate(rand, autn)?;
+            return Ok(super::super::qmi_uim::UsimAkaApduResult {
+                res: out.res, ck: out.ck, ik: out.ik, auts: out.auts,
+            });
+        }
         let proxy = live_runtime_config().qmi_proxy_socket;
         let device = self.device.clone();
         let rand = rand.to_vec();
@@ -189,7 +196,7 @@ pub(super) async fn load(line_id: &str, profile: &'static CarrierProfile)
     let diagnostic_realm = if overrides.ims_realm.is_some() { FactSource::SimOverride } else if isim && !explicit { FactSource::Isim } else { baseline };
     let selected = Arc::new(LiveImsSelection {
         identity: LiveImsRegisterIdentity { shared: resolved.identity, shape: if isim { "isim" } else { "imsi_home_domain" } },
-        target, device, card, aid: resolved.auth_aid, provisioning, isim, diagnostic_identity, diagnostic_domain, diagnostic_realm,
+        target, device, card, aid: resolved.auth_aid, provisioning, virtual_usim: None, isim, diagnostic_identity, diagnostic_domain, diagnostic_realm,
         #[cfg(test)]
         test_aka: None,
     });
