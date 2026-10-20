@@ -230,6 +230,7 @@ jobs:
             connectivity::modems::ims::cellular_ims::ipsec::tests \
             connectivity::modems::ims::cellular_ims::ipsec::worker_tests \
             connectivity::modems::ims::vowifi::qmi_uim::refresh::tests \
+            connectivity::modems::ims::virtual_sim::milenage::tests \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \
             connectivity::modems::ims::cellular_ims::security_agreement::tests \
             connectivity::modems::ims::cellular_ims::errors::tests \
