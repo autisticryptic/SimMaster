@@ -3169,6 +3169,28 @@ impl Database {
             )?;
         }
 
+        // Five-code virtual SIM: one master key row, one sealed profile per
+        // wlan_only line. Keys never leave this table in cleartext.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS virtual_sim_key (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                key BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS virtual_sim_profile (
+                line_id TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                sealed BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS auth_config (
                 key TEXT PRIMARY KEY,
