@@ -16728,7 +16728,7 @@ pub struct CreateVirtualSimRequest {
     pub msisdn: Option<String>,
 }
 
-fn parse_hex_key(value: &str) -> Result<crate::connectivity::modems::ims::milenage::Key, &'static str> {
+fn parse_hex_key(value: &str) -> Result<crate::connectivity::modems::ims::virtual_sim::milenage::Key, &'static str> {
     let text = value.trim();
     if text.len() != 32 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("ims_virtual_sim_key_invalid");

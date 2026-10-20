@@ -278,6 +278,31 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
   const [virtualSimProfiles, setVirtualSimProfiles] = useState<VirtualSimProfileView[]>([])
   const [virtualSimOpen, setVirtualSimOpen] = useState(false)
+
+  const refreshVirtualSimProfiles = useCallback(async () => {
+    try {
+      const response = await api.getVirtualSimProfiles()
+      setVirtualSimProfiles(response.data ?? [])
+    } catch {
+      setVirtualSimProfiles([])
+    }
+  }, [])
+
+  useEffect(() => {
+    void refreshVirtualSimProfiles()
+  }, [refreshVirtualSimProfiles])
+
+  const removeVirtualSimProfile = useCallback(
+    async (lineId: string) => {
+      try {
+        await api.deleteVirtualSimProfile(lineId)
+      } finally {
+        await refreshVirtualSimProfiles()
+      }
+    },
+    [refreshVirtualSimProfiles],
+  )
+
   const [vowifiEvents, setVowifiEvents] = useState<VowifiRuntimeEventEntry[]>([])
   const [activityMessages, setActivityMessages] = useState<SmsMessage[]>([])
   const [activityCalls, setActivityCalls] = useState<CallRecord[]>([])
@@ -770,30 +795,6 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   if (loading) {
     return <Box display="flex" justifyContent="center" alignItems="center" minHeight="35vh"><CircularProgress /></Box>
   }
-
-  const refreshVirtualSimProfiles = useCallback(async () => {
-    try {
-      const response = await api.getVirtualSimProfiles()
-      setVirtualSimProfiles(response.data ?? [])
-    } catch {
-      setVirtualSimProfiles([])
-    }
-  }, [])
-
-  useEffect(() => {
-    void refreshVirtualSimProfiles()
-  }, [refreshVirtualSimProfiles])
-
-  const removeVirtualSimProfile = useCallback(
-    async (lineId: string) => {
-      try {
-        await api.deleteVirtualSimProfile(lineId)
-      } finally {
-        await refreshVirtualSimProfiles()
-      }
-    },
-    [refreshVirtualSimProfiles],
-  )
 
   const renderLineList = () => (
     <Card sx={{ height: '100%', minHeight: { xs: 360, md: 560 }, maxHeight: { xs: 560, md: 'none' }, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
