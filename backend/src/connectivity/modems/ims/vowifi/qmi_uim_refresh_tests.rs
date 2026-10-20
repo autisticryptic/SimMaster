@@ -79,3 +79,130 @@ fn subscription_start_rejects_invalid_identity_inputs() {
     assert!(start("@qmi-proxy", "", 1, vec![]).is_none());
     assert!(start("@qmi-proxy", "/dev/cdc-wdm0", 0, vec![]).is_none());
 }
+
+/// End-to-end over a fake QMI proxy (abstract Unix socket). This exercises the
+/// real listener loop: proxy open -> allocate CID -> Refresh Register ->
+/// WAIT_FOR_OK vote -> END_WITH_SUCCESS event -> Release CID.
+#[cfg(unix)]
+mod end_to_end {
+    use super::super::super::{decode_qmi_frame, encode_qmi_message, QmiMessage, QmiTlv};
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+    use std::sync::atomic::AtomicUsize;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn unique_name() -> String {
+        format!("simadmin-refresh-e2e-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn bind(name: &str) -> UnixListener {
+        let address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        UnixListener::bind_addr(&address).unwrap()
+    }
+
+    fn read_frame(stream: &mut UnixStream) -> QmiMessage {
+        let mut header = [0u8; 3];
+        stream.read_exact(&mut header).unwrap();
+        let mut rest = vec![0u8; u16::from_le_bytes([header[1], header[2]]) as usize];
+        stream.read_exact(&mut rest).unwrap();
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(&rest);
+        decode_qmi_frame(&frame).unwrap()
+    }
+
+    fn send(stream: &mut UnixStream, message: QmiMessage) {
+        stream.write_all(&encode_qmi_message(&message).unwrap()).unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn ok() -> QmiTlv {
+        QmiTlv { tlv_type: 2, value: vec![0, 0, 0, 0] }
+    }
+
+    fn indication(stage: u8, client: u8) -> QmiMessage {
+        QmiMessage {
+            service: QMUX_UIM_SERVICE,
+            client_id: client,
+            transaction_id: 0,
+            message_id: QMI_UIM_REFRESH_INDICATION,
+            tlvs: vec![QmiTlv {
+                tlv_type: EVENT_TLV,
+                value: vec![stage, 0, SESSION_PRIMARY_GW, 2, 0xa0, 0x00],
+            }],
+        }
+    }
+
+    /// Returns the vote bytes we received for WAIT_FOR_OK.
+    fn fake_modem(listener: UnixListener, delay: Duration) -> Vec<u8> {
+        let (mut stream, _) = listener.accept().unwrap();
+        let open = read_frame(&mut stream);
+        assert_eq!(open.message_id, 0xff00, "first request must be proxy open");
+        send(&mut stream, QmiMessage { service: 0, client_id: 0, transaction_id: open.transaction_id,
+            message_id: open.message_id, tlvs: vec![ok()] });
+
+        let allocate = read_frame(&mut stream);
+        assert_eq!(allocate.message_id, 0x0022, "second request must allocate a UIM CID");
+        send(&mut stream, QmiMessage { service: 0, client_id: 0, transaction_id: allocate.transaction_id,
+            message_id: allocate.message_id,
+            tlvs: vec![QmiTlv { tlv_type: 1, value: vec![QMUX_UIM_SERVICE, 7] }, ok()] });
+
+        let register = read_frame(&mut stream);
+        assert_eq!(register.message_id, QMI_UIM_REFRESH_REGISTER);
+        assert_eq!(find_tlv(&register, SESSION_TLV), Some(&[SESSION_PRIMARY_GW, 2, 0xa0, 0x00][..]));
+        assert_eq!(find_tlv(&register, INFO_TLV), Some(&[1u8, 1, 0, 0][..]));
+        send(&mut stream, QmiMessage { service: QMUX_UIM_SERVICE, client_id: 7,
+            transaction_id: register.transaction_id, message_id: register.message_id, tlvs: vec![ok()] });
+
+        std::thread::sleep(delay);
+        send(&mut stream, indication(STAGE_WAIT_FOR_OK, 7));
+        let vote = read_frame(&mut stream);
+        assert_eq!(vote.message_id, QMI_UIM_REFRESH_COMPLETE);
+        let votes = find_tlv(&vote, INFO_TLV).expect("vote TLV").to_vec();
+        assert_eq!(find_tlv(&vote, SESSION_TLV), Some(&[SESSION_PRIMARY_GW, 2, 0xa0, 0x00][..]));
+
+        send(&mut stream, indication(STAGE_END_WITH_SUCCESS, 7));
+        let release = read_frame(&mut stream);
+        assert_eq!(release.message_id, 0x0023, "client must release its CID");
+        send(&mut stream, QmiMessage { service: 0, client_id: 0, transaction_id: release.transaction_id,
+            message_id: release.message_id, tlvs: vec![ok()] });
+        votes
+    }
+
+    fn wait_event(subscription: &mut RefreshSubscription, timeout: Duration) -> Option<RefreshEvent> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if let Some(event) = subscription.poll_event() { return Some(event); }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn idle_line_votes_ok_and_reports_completion_then_releases_the_client() {
+        let name = unique_name();
+        let listener = bind(&name);
+        let server = std::thread::spawn(move || fake_modem(listener, Duration::from_millis(50)));
+        let mut subscription = start(&format!("@{name}"), "/dev/fake-cdc-wdm0", 1, vec![0xa0, 0x00])
+            .expect("subscription starts");
+        assert_eq!(wait_event(&mut subscription, Duration::from_secs(5)), Some(RefreshEvent::Completed));
+        subscription.stop();
+        assert_eq!(server.join().unwrap(), vec![1u8], "idle line allows the refresh");
+    }
+
+    #[test]
+    fn in_flight_exchange_defers_the_refresh_vote() {
+        let name = unique_name();
+        let listener = bind(&name);
+        let server = std::thread::spawn(move || fake_modem(listener, Duration::from_millis(400)));
+        let mut subscription = start(&format!("@{name}"), "/dev/fake-cdc-wdm0", 1, vec![0xa0, 0x00])
+            .expect("subscription starts");
+        subscription.set_busy(true);
+        assert_eq!(wait_event(&mut subscription, Duration::from_secs(5)), Some(RefreshEvent::Completed));
+        subscription.set_busy(false);
+        subscription.stop();
+        assert_eq!(server.join().unwrap(), vec![0u8], "an in-flight REGISTER/AKA must defer");
+    }
+}

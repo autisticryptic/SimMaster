@@ -143,12 +143,12 @@ R7（d373ffa已软件验证）将XFRM安装/部分失败回滚/旧SA退役/重�
 ### ISIM 刷新订阅（R9，e031849已软件验证）
 
 - 依据 libqmi 1.36.0 UIM schema：Refresh Register `0x002A`、Refresh Complete `0x002C`、Refresh indication `0x0033`；Stage `WAIT_FOR_OK=0 / START=1 / END_WITH_SUCCESS=2 / END_WITH_FAILURE=3`。
-- 每线路一个**独立只读** UIM client（不占用现有按需通道）：注册后订阅，清理时停止；modem 不支持或注册失败则返回 None，**退回 R5 边界快照**，不报错、不伪装支持。
+- 每线路一个**独立只读** UIM client（不占用现有按需通道）：注册后订阅，清理时停止；注册失败或 modem 不支持时订阅线程自行退出、不产生事件，**退回 R5 边界快照**（不报错、不伪装支持）；`start()` 仅在参数无效或无法启动线程时返回 None。
 - `WAIT_FOR_OK`：注册/AKA 正在进行或有活动通话时投 **deny**，但最多 20 秒（避免长期阻塞运营商写卡）；其余投 OK。
 - `END_WITH_SUCCESS` 只是**提示**：必须重读 R5 的稳定快照并比对；变化或读取失败 → 置 `identity_stale`，**不立即换身份**；有活动通话时延后，通话排空后清理并按门禁重建。
 - `END_WITH_FAILURE` 与无关 session/AID 的通知一律不当作变化；不读卡、不改 NV、不发 URC 开关。
 - 该订阅只覆盖蜂窝接入；VoWiFi 仍使用 R5 的注册边界检查（后续可复用同一订阅）。
-- 验证：两工作流/双架构、各 540 项相关回归/86 场景；首轮仅测试断言缺少 `Debug`（E0369/E0277），生产代码未改。
+- 验证：两工作流/双架构、各 540 项相关回归/86 场景（含假 QMI proxy 端到端：proxy open→allocate CID→Register→投票→完成事件→Release CID）；首轮仅测试断言缺少 `Debug`（E0369/E0277），生产代码未改。
 
 ### 身份来源策略（R8，e031849已软件验证）
 
