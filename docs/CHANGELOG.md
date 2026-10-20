@@ -5,6 +5,7 @@
 
 ## 1.1.5 主线
 
+- R10（Milenage 核心，cec2aa9已验证）：新增 `virtual_sim/milenage.rs`（TS 35.206：f1/f1*、f2..f5、f5*、OP→OPc 推导、AUTN 校验、AUTS 生成），用 TS 35.207/35.208 Test Set 1 全部 8 个输出 + Rijndael 内核向量验证；两工作流/双架构、各 550 项相关回归/86 场景通过。密钥材料 Debug 全程脱敏，模块只用于主机侧 VoWiFi。
 - R9 `9f1625d`已验证：新增每线路只读 QMI UIM refresh 订阅（Register 0x002A / Complete 0x002C / indication 0x0033），忙时投 deny 最多 20 秒；完成仅作提示，重读 R5 快照后置 identity_stale 并等通话排空再按门禁重建；不支持时退回边界检查。同轮 Actions 验证通过（首轮仅测试断言缺 Debug，生产未改）。
 - R8 `9f1625d`已验证：`profile.ims.identity_source` 变为可执行策略：`auto`（默认，含旧标签）保持历史行为，`isim_required` 缺 ISIM 时失败关闭，`usim_derived` 忽略 ISIM 并走 USIM AKA；AID 随策略一致，旧 catalog 字符串不改变行为。两工作流/双架构、各 542 项相关回归/86 场景通过。
 - R7 `d373ffa`已验证：修复XFRM操作检查旧代次后又从可变worker handle捕获新代次的竞态，全部生产install/uninstall及失败回滚传递原UeWorkerBinding，原子enqueue和回包门禁拒绝跨代命令。两套Actions（Build-Release 38999487086、Validate Beta 38999487107）/双架构、各522相关回归/86场景含5项真实worker消息/代次回归，342静态/mock通过；双架构官方包SHA/meta/ELF/嵌入提交/全文件清单已只读核验，未解包执行。不改算法、精确选择器或设备；软件侧已确认缺口闭环，按用户要求停在实机验收前。
