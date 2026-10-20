@@ -21,8 +21,6 @@ pub use store::{open, seal, FiveCodes, MasterKey, OpMaterial};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use sqn::Sqn;
-use store::FiveCodes;
 
 /// Result of a card-side AKA run. `auts` is set only for resynchronisation.
 #[derive(Clone, PartialEq, Eq)]
