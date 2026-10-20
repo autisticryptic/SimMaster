@@ -202,9 +202,18 @@ fn run(
     cancel: Arc<AtomicBool>,
     events: tokio::sync::mpsc::UnboundedSender<RefreshEvent>,
 ) {
-    let Ok(mut connection) = QmiProxyConnection::connect(proxy_socket, Duration::from_secs(5)) else { return; };
-    if connection.proxy_open(device_path).is_err() { return; }
-    let Ok(client) = connection.allocate_uim_cid() else { return; };
+    let Ok(mut connection) = QmiProxyConnection::connect(proxy_socket, Duration::from_secs(5)) else {
+        #[cfg(test)] note_exit("connect");
+        return;
+    };
+    if connection.proxy_open(device_path).is_err() {
+        #[cfg(test)] note_exit("proxy_open");
+        return;
+    }
+    let Ok(client) = connection.allocate_uim_cid() else {
+        #[cfg(test)] note_exit("allocate");
+        return;
+    };
     let result = (|| -> Result<(), QmiUimError> {
         let request = QmiMessage {
             service: QMUX_UIM_SERVICE,
@@ -230,7 +239,10 @@ fn run(
                 Err(error) => return Err(error),
             }
         }
-        if !registered { return Ok(()); }
+        if !registered {
+            #[cfg(test)] note_exit("register");
+            return Ok(());
+        }
         connection.set_read_timeout(Some(READ_POLL))?;
         let mut voter = Voter::new(busy);
         while !cancel.load(Ordering::SeqCst) {
@@ -242,14 +254,29 @@ fn run(
         }
         Ok(())
     })();
-    if let Err(error) = result {
-        tracing::debug!(%error, "UIM refresh subscription ended");
+    match &result {
+        Ok(()) => { #[cfg(test)] note_exit("closed"); }
+        Err(error) => {
+            #[cfg(test)] note_exit("error");
+            tracing::debug!(%error, "UIM refresh subscription ended");
+        }
     }
     let _ = connection.release_uim_cid(client);
 }
 
 fn is_timeout(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+}
+
+#[cfg(test)]
+static TEST_EXIT: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+fn note_exit(reason: &'static str) {
+    *TEST_EXIT.lock().unwrap() = Some(reason);
+}
+#[cfg(test)]
+pub(crate) fn last_exit() -> Option<&'static str> {
+    *TEST_EXIT.lock().unwrap()
 }
 
 #[cfg(test)]

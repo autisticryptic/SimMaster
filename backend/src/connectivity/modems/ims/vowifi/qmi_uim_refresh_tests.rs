@@ -106,7 +106,10 @@ mod end_to_end {
     fn read_frame(stream: &mut UnixStream) -> QmiMessage {
         let mut header = [0u8; 3];
         stream.read_exact(&mut header).unwrap();
-        let mut rest = vec![0u8; u16::from_le_bytes([header[1], header[2]]) as usize];
+        // The QMUX length counts everything after the 3-byte prefix, so the
+        // remaining bytes are length-2 (same arithmetic as read_qmi_message).
+        let qmux_len = u16::from_le_bytes([header[1], header[2]]) as usize;
+        let mut rest = vec![0u8; qmux_len.saturating_sub(2)];
         stream.read_exact(&mut rest).unwrap();
         let mut frame = header.to_vec();
         frame.extend_from_slice(&rest);
@@ -187,7 +190,8 @@ mod end_to_end {
         let server = std::thread::spawn(move || fake_modem(listener, Duration::from_millis(50)));
         let mut subscription = start(&format!("@{name}"), "/dev/fake-cdc-wdm0", 1, vec![0xa0, 0x00])
             .expect("subscription starts");
-        assert_eq!(wait_event(&mut subscription, Duration::from_secs(5)), Some(RefreshEvent::Completed));
+        assert_eq!(wait_event(&mut subscription, Duration::from_secs(5)), Some(RefreshEvent::Completed),
+            "listener exit: {:?}", super::last_exit());
         subscription.stop();
         assert_eq!(server.join().unwrap(), vec![1u8], "idle line allows the refresh");
     }
@@ -200,7 +204,8 @@ mod end_to_end {
         let mut subscription = start(&format!("@{name}"), "/dev/fake-cdc-wdm0", 1, vec![0xa0, 0x00])
             .expect("subscription starts");
         subscription.set_busy(true);
-        assert_eq!(wait_event(&mut subscription, Duration::from_secs(5)), Some(RefreshEvent::Completed));
+        assert_eq!(wait_event(&mut subscription, Duration::from_secs(5)), Some(RefreshEvent::Completed),
+            "listener exit: {:?}", super::last_exit());
         subscription.set_busy(false);
         subscription.stop();
         assert_eq!(server.join().unwrap(), vec![0u8], "an in-flight REGISTER/AKA must defer");
