@@ -5,6 +5,7 @@
 
 ## 1.1.5 主线
 
+- R12（五码虚拟 SIM 接线，426c2a7 已验证）：DB 表 `virtual_sim_key`/`virtual_sim_profile`；`virtual_sim/db.rs` 主密钥自举、密封读写、删除、单事务全量重加密、启动 `install_all`；接口 `GET/POST /api/ims/virtual-sim`、`DELETE /api/ims/virtual-sim/{line_id}`、`POST /api/ims/virtual-sim/rotate`、`GET /api/non-3gpp/providers`（响应永不含 Ki/OPc）；前端线路卡片 `+` 新建 WLAN 线路、五码弹窗（接入类型下拉、OP/OPc 二选一、保存后清空密钥）、虚拟线路与模组线路同列表展示、主密钥轮换按钮。两工作流/双架构 + 前端 Playwright 全绿。
 - R11（virtual SIM 存储/接口，34100f7已验证）：`virtual_sim/sqn.rs`（48 位 SQN、严格新值校验、AUTS 用 next）、`virtual_sim/store.rs`（五码严格解析、OP/OPc 二选一并校验一致、AES-256-GCM 落库加密、AAD 绑定 profile 防止记录挪用、密钥轮换入口）、`non_3gpp_voice.rs`（非 3GPP 应用语音的**契约占位**，默认零注册）。两工作流/双架构、各 566 项相关回归/86 场景通过。
 - R10（Milenage 核心，cec2aa9已验证）：新增 `virtual_sim/milenage.rs`（TS 35.206：f1/f1*、f2..f5、f5*、OP→OPc 推导、AUTN 校验、AUTS 生成），用 TS 35.207/35.208 Test Set 1 全部 8 个输出 + Rijndael 内核向量验证；两工作流/双架构、各 550 项相关回归/86 场景通过。密钥材料 Debug 全程脱敏，模块只用于主机侧 VoWiFi。
 - R9 `9f1625d`已验证：新增每线路只读 QMI UIM refresh 订阅（Register 0x002A / Complete 0x002C / indication 0x0033），忙时投 deny 最多 20 秒；完成仅作提示，重读 R5 快照后置 identity_stale 并等通话排空再按门禁重建；不支持时退回边界检查。同轮 Actions 验证通过（首轮仅测试断言缺 Debug，生产未改）。

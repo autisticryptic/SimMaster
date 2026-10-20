@@ -18,7 +18,7 @@ import {
   Typography,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import { Add, CellTower, CheckCircle, ErrorOutline, FlightTakeoff, Lan, Refresh, Replay, RadioButtonUnchecked, History, SettingsEthernet, TravelExplore, Tune, Usb, Wifi } from '@mui/icons-material'
+import { Add, Autorenew, CellTower, CheckCircle, ErrorOutline, FlightTakeoff, Lan, Refresh, Replay, RadioButtonUnchecked, History, SettingsEthernet, TravelExplore, Tune, Usb, Wifi } from '@mui/icons-material'
 import {
   api,
   type LineNetworkControlsResponse,
@@ -555,6 +555,17 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     ].some((value) => value?.toLocaleLowerCase().includes(query)))
   }, [lineSearch, lines])
 
+  const filteredVirtualSimProfiles = useMemo(() => {
+    const query = lineSearch.trim().toLocaleLowerCase()
+    if (!query) return virtualSimProfiles
+    return virtualSimProfiles.filter((profile) => [
+      profile.line_id,
+      profile.profile_id,
+      profile.iccid_tail,
+      profile.imsi_prefix,
+    ].some((value) => value?.toLocaleLowerCase().includes(query)))
+  }, [lineSearch, virtualSimProfiles])
+
   const updateNetworkControl = (updated: LineNetworkControlsResponse) => {
     setNetworkControls((current) => current.map((item) => item.line_id === updated.line_id ? updated : item))
   }
@@ -800,7 +811,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     <Card sx={{ height: '100%', minHeight: { xs: 360, md: 560 }, maxHeight: { xs: 560, md: 'none' }, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
       <CardHeader
         title="线路"
-        subheader={`${lines.length} 条已发现 · ${presentCount} 条在线`}
+        subheader={`${lines.length + virtualSimProfiles.length} 条已发现 · ${presentCount + virtualSimProfiles.filter((profile) => profile.installed).length} 条在线`}
         titleTypographyProps={{ variant: 'subtitle1', fontWeight: 700 }}
         action={
           <Stack direction="row" spacing={0.5} alignItems="center">
@@ -809,52 +820,34 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                 <Add />
               </IconButton>
             </Tooltip>
+            {virtualSimProfiles.length > 0 ? (
+              <Tooltip title="轮换虚拟 SIM 主密钥">
+                <IconButton
+                  onClick={() => {
+                    if (!window.confirm('轮换主密钥会重新加密全部五码记录，期间无法读取。确认继续？')) return
+                    void (async () => {
+                      try {
+                        const response = await api.rotateVirtualSimKey()
+                        setSuccess(`已重新加密 ${response.data?.reencrypted ?? 0} 条五码记录`)
+                      } catch (err) {
+                        setError(err instanceof Error ? err.message : String(err))
+                      } finally {
+                        await refreshVirtualSimProfiles()
+                      }
+                    })()
+                  }}
+                  disabled={savingKey !== null}
+                >
+                  <Autorenew />
+                </IconButton>
+              </Tooltip>
+            ) : null}
             <Tooltip title="刷新线路状态"><IconButton onClick={() => void load()} disabled={savingKey !== null}><Refresh /></IconButton></Tooltip>
           </Stack>
         }
         sx={{ pb: 1.25, flexShrink: 0 }}
       />
       <CardContent sx={{ pt: 0, px: 1.25, flex: 1, minHeight: 0, overflowY: 'auto' }}>
-        {virtualSimProfiles.length > 0 ? (
-          <Box sx={{ mb: 1.25 }}>
-            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
-              虚拟 SIM 线路
-            </Typography>
-            <Stack spacing={0.5}>
-              {virtualSimProfiles.map((profile) => (
-                <Stack
-                  key={profile.line_id}
-                  direction="row"
-                  alignItems="center"
-                  spacing={1}
-                  sx={{ px: 1.25, py: 0.75, borderRadius: 1, bgcolor: 'action.hover' }}
-                >
-                  <Wifi fontSize="small" color="disabled" />
-                  <Box minWidth={0} flex={1}>
-                    <Typography variant="body2" noWrap>
-                      {profile.line_id}
-                    </Typography>
-                    <Typography variant="caption" color="text.secondary" noWrap>
-                      ICCID …{profile.iccid_tail} · IMSI {profile.imsi_prefix}… · {profile.op_kind.toUpperCase()}
-                    </Typography>
-                  </Box>
-                  <Chip
-                    size="small"
-                    label={profile.installed ? '已启用' : '未启用'}
-                    color={profile.installed ? 'success' : 'default'}
-                    variant="outlined"
-                  />
-                  <Tooltip title="删除该虚拟线路">
-                    <IconButton size="small" onClick={() => void removeVirtualSimProfile(profile.line_id)}>
-                      <ErrorOutline fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
-                </Stack>
-              ))}
-            </Stack>
-            <Divider sx={{ mt: 1.25 }} />
-          </Box>
-        ) : null}
         <Box
           component="input"
           value={lineSearch}
@@ -919,7 +912,45 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
               </Box>
             )
           })}
-          {filteredLines.length === 0 && <Typography variant="body2" color="text.secondary" sx={{ p: 1 }}>未找到匹配线路</Typography>}
+          {filteredVirtualSimProfiles.map((profile) => (
+            <Box
+              key={profile.line_id}
+              sx={{
+                border: '1px solid',
+                borderColor: 'divider',
+                borderRadius: 1.25,
+                px: 1.25,
+                py: 1.1,
+                '&:hover': { bgcolor: 'action.hover' },
+              }}
+            >
+              <Box display="flex" justifyContent="space-between" gap={1} alignItems="center">
+                <Typography variant="body2" fontWeight={700} noWrap>
+                  虚拟 SIM
+                </Typography>
+                <Stack direction="row" spacing={0.25} alignItems="center">
+                  <Chip
+                    size="small"
+                    label={profile.installed ? '就绪' : '未启用'}
+                    color={profile.installed ? 'success' : 'default'}
+                    sx={{ height: 19, fontSize: 10 }}
+                  />
+                  <Tooltip title="删除该虚拟线路">
+                    <IconButton size="small" onClick={() => void removeVirtualSimProfile(profile.line_id)}>
+                      <ErrorOutline fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                </Stack>
+              </Box>
+              <Typography variant="caption" color="text.secondary" display="block" noWrap>
+                五码 · {shortLineId(profile.line_id)}
+              </Typography>
+              <Typography variant="caption" color="text.disabled" display="block" noWrap>
+                ICCID …{profile.iccid_tail} · IMSI {profile.imsi_prefix}… · {profile.op_kind.toUpperCase()}
+              </Typography>
+            </Box>
+          ))}
+          {filteredLines.length === 0 && filteredVirtualSimProfiles.length === 0 && <Typography variant="body2" color="text.secondary" sx={{ p: 1 }}>未找到匹配线路</Typography>}
         </Stack>
       </CardContent>
     </Card>
