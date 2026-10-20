@@ -968,9 +968,14 @@ impl LineRuntimeRegistry {
         // Namespace, worker, and bearer operations are intentionally deferred
         // until after the lock is released so status/API readers stay usable
         // while one modem is slow or unavailable.
+        // Five-code lines have no modem to discover, but they are full lines:
+        // they need the same runtime, access policy and VoWiFi scheduling as a
+        // physical one. They are re-created here so a refresh never drops them.
+        let virtual_ids = crate::connectivity::modems::ims::virtual_sim::installed_line_ids();
         let discovered_ids = discovered
             .iter()
             .map(|binding| binding.line_id.clone())
+            .chain(virtual_ids.iter().cloned())
             .collect::<std::collections::HashSet<_>>();
         let (absent_lines, existing_lines, new_lines) = {
             let lines = self.lines.read().await;
@@ -999,6 +1004,27 @@ impl LineRuntimeRegistry {
                 ));
                 line.bind_voice_home_observer(Arc::clone(&self.observations));
                 new_lines.push((line_id, line));
+            }
+
+            for line_id in &virtual_ids {
+                if lines.contains_key(line_id) {
+                    continue;
+                }
+                let binding = virtual_line_binding(line_id);
+                let voice_policy = self
+                    .config_manager
+                    .as_ref()
+                    .map(|config| config.get_line_voice_path_policy(line_id))
+                    .unwrap_or_default();
+                let line = Arc::new(LineRuntime::new_for_device(
+                    binding,
+                    Arc::new(CellularImsRuntime::new()),
+                    CellularImsLiveHandle::new(),
+                    voice_policy,
+                    self.device_kind,
+                ));
+                line.bind_voice_home_observer(Arc::clone(&self.observations));
+                new_lines.push((line_id.clone(), line));
             }
 
             let absent_lines = lines
@@ -2292,5 +2318,33 @@ mod tests {
                 .mwi_capability
                 .supported
         );
+    }
+}
+
+/// Synthetic binding for a five-code line. It has no modem, no port and no
+/// reader; the identity comes from the software USIM, so only the fields that
+/// name and identify the line are set.
+fn virtual_line_binding(line_id: &str) -> ModemBinding {
+    let codes = crate::connectivity::modems::ims::virtual_sim::for_line(line_id);
+    let (iccid, imsi) = codes
+        .map(|profile| (profile.codes().iccid.clone(), profile.codes().imsi.clone()))
+        .unwrap_or_default();
+    ModemBinding {
+        line_id: line_id.to_string(),
+        line_kind: "virtual".to_string(),
+        display_order: 900,
+        slot_label: "虚拟 SIM".to_string(),
+        slot_source: "virtual".to_string(),
+        slot_stable: true,
+        manufacturer: "SimAdmin".to_string(),
+        model: "五码虚拟 SIM".to_string(),
+        device_family: "virtual".to_string(),
+        control_transport: "none".to_string(),
+        uim_slot: 1,
+        sim_iccid: iccid,
+        operator_id: imsi,
+        state: "ready".to_string(),
+        present: true,
+        ..Default::default()
     }
 }

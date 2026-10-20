@@ -8864,6 +8864,9 @@ pub async fn get_cellular_ims_lines_handler(
     for status in app.line_registry.statuses().await {
         lines.push(build_cellular_ims_line_response(&app, status).await);
     }
+    // Five-code lines are listed by the virtual SIM endpoint, which carries the
+    // key-free identity; keeping them here would show a modem that does not exist.
+    lines.retain(|line| line.modem.line_kind != "virtual");
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message("Success", lines).into()),
@@ -10727,6 +10730,7 @@ pub fn spawn_vowifi_auto_restore(app: AppState) {
             for line in present_lines.into_iter().filter(|line| {
                 line_vowifi_restore_enabled(
                     &app.config_manager.get_line_profile(&line.binding().line_id),
+                    &line.binding().line_id,
                 )
             }) {
                 let line_id = line.binding().line_id;
@@ -10742,8 +10746,11 @@ pub fn spawn_vowifi_auto_restore(app: AppState) {
     });
 }
 
-fn line_vowifi_restore_enabled(profile: &LineProfileConfig) -> bool {
-    profile.enabled && profile.vowifi.enabled
+fn line_vowifi_restore_enabled(profile: &LineProfileConfig, line_id: &str) -> bool {
+    // A five-code line has no cellular profile to configure, so its presence in
+    // the registry is the user's intent to run VoWiFi on it.
+    crate::connectivity::modems::ims::virtual_sim::is_virtual_line(line_id)
+        || (profile.enabled && profile.vowifi.enabled)
 }
 
 async fn schedule_vowifi_auto_restore(
@@ -16099,7 +16106,7 @@ mod tests {
         let mut offline = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
         offline.vowifi.enabled = true;
 
-        assert!(line_vowifi_restore_enabled(&offline));
+        assert!(line_vowifi_restore_enabled(&offline, "line-physical"));
     }
 
     #[test]
@@ -16149,7 +16156,7 @@ mod tests {
         airplane.airplane_mode_enabled = true;
         airplane.vowifi.enabled = true;
 
-        assert!(line_vowifi_restore_enabled(&airplane));
+        assert!(line_vowifi_restore_enabled(&airplane, "line-physical"));
     }
 
     #[test]
@@ -16158,7 +16165,7 @@ mod tests {
         disabled.enabled = false;
         disabled.vowifi.enabled = true;
 
-        assert!(!line_vowifi_restore_enabled(&disabled));
+        assert!(!line_vowifi_restore_enabled(&disabled, "line-physical"));
     }
 
     #[test]

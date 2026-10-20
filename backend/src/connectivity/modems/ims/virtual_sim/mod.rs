@@ -124,6 +124,19 @@ pub fn for_line(line_id: &str) -> Option<Arc<VirtualSim>> {
     registry().lock().ok()?.get(line_id).cloned()
 }
 
+/// Every line that currently owns an installed subscription.
+pub fn installed_line_ids() -> Vec<String> {
+    registry()
+        .lock()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Whether this line's identity comes from five codes rather than a card.
+pub fn is_virtual_line(line_id: &str) -> bool {
+    registry().lock().map(|map| map.contains_key(line_id)).unwrap_or(false)
+}
+
 pub fn remove_for_line(line_id: &str) -> bool {
     registry().lock().map(|mut map| map.remove(line_id).is_some()).unwrap_or(false)
 }
