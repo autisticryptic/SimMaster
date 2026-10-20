@@ -365,18 +365,26 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 
 ### EC20原报告注册缺口对照（有界静态复核）
 
-以原审查基线42057a6与当前6672a64为对照，原报告第4节六项均已有生产实现；复核新增R4～R6也已单独Actions验证。证据等级不因CI而升级为完整固件调用图或实网成功。
+以原审查基线42057a6与当前已验证代码d373ffa为对照。下表把**固件证据**、**实际补进SimAdmin的功能**和**提交**对齐；原报告第4节六项均已有生产实现，复核中额外发现的R3～R7也已单独Actions验证。证据等级不因CI而升级为完整固件调用图或实网成功。
 
-| 原报告项 | 生产入口 | 状态/保留边界 |
-|---|---|---|
-| P1-A ISIM材料 | `uicc_ims::resolve_ims_identity`、cellular `load_device_identity`、WiFi `live_identity` | 身份/AID同卡绑定，R5程序边界材料复核；首个配置IMPU，不声明任意多IMPU注册 |
-| P1-B endpoint | `pcscf_endpoint`、`pcscf_dns_transport`、`bind_endpoint_in_worker` | UDP/TCP/TLS及有界DNS已接通；R6补空闲原PCO复核/同PDN重选，TTL不是所有来源的动态缓存 |
-| P1-C 临时拒绝 | `EndpointRetryState`、cellular `connect_inner/refresh_live_registration`、WiFi `register_retry_live` | 初次/刷新已验证；本次发现注销新等待反馈缺口R4，0351006已修复验证 |
-| P2-D reg-event | shared `reg_event`、cellular `live_reg_event`、WiFi operator | 仅相关绑定撤销readiness；订阅不支持不伪造注册失效 |
-| P2-E AUTS/stale/rspauth | `digest_aka`、`DigestRequestProof`、双接入authenticator | 先验后提交；单scope、auth/无qop，非REGISTER不扩称 |
-| P2-F 423预算 | `RegisterNegotiationBudget`、双接入候选与refresh | 初次/刷新共用原预算；R3初次protected AKA已补齐 |
+| 固件证据/锚点 | 补齐的功能 | 提交 | 保留边界 |
+|---|---|---|---|
+| EF_IMPI/DOMAIN/IMPU/P-CSCF读取；ISIM失败后USIM派生分支 | 共享ISIM材料 resolver，身份+认证AID同卡选择，缺省才派生USIM | `5aaf3ea`（F1～F4）、`6203511`（R5） | 首个配置IMPU；不声明任意多IMPU注册 |
+| `PCSCFListHandler.cpp`、旧/新P-CSCF列表、`CheckRegisteredNodeInNewList` | 端点保留port/transport/source/TTL；有界A/AAAA/SRV/NAPTR；TCP/TLS与DNS TC→TCP | `5aaf3ea`、`6c0c140`（N6）、`6672a64`（R6） | TTL不是全来源动态缓存；仅原PCO来源在空闲续期复核 |
+| `Retry-After`、临时/永久/PDP失败/ISIM refresh 状态区分 | 结构化失败元数据、端点等待not-before、同卡跨profile/worker保留、注销失败反馈 | `5aaf3ea`、`c3fb036`（R2）、`b6a7888`（R1）、`0351006`（R4） | 进程内状态，非跨进程持久熔断器 |
+| `qpRegEventNotifyProcessor.cpp`、`application/reginfo+xml` | reg-event订阅/XML/version/partial-full，只按本绑定撤销降低readiness | `3d54aa8`（N5） | 不支持/歧义订阅只停止观察，不伪造注册丢失 |
+| 挑战/认证分支、AUTS与stale线索 | AUTS保留qop/opaque、stale独立AKA来源、rspauth先验后提交、首次鉴权后423重试 | `344308c`（N1～N3）、`3509e15`（N4）、`31d09ff`（R3） | 单scope、qop=auth/无qop；非REGISTER不扩称 |
+| 423/Min-Expires与候选恢复 | 一次交换共用租期预算，初始/鉴权/刷新连续，候选与头型止损 | `b6a7888`（R1）、`31d09ff`（R3） | 无效/不增长/超限floor不重开预算 |
+| `ims_status`/IMSA getter、regpriority字段、条件non-IPSec构造 | 原生只读观测（额外诊断）；来源诊断；安全要求继承 | `ca38391`（X2）、`ee9ee28`（N7）、`c174551` | 0值可能未报告；不从日志推导无条件明文降级 |
+| `qp_ims_reg_config_db` 0x9a..0x9d、四MBN `00 02 03 01` | 保留用户显式覆写与既有来源顺序，不复制固件优先级 | 文档/证据（未改策略） | 包内值≠设备当前NV/MBN选择 |
+| 承载/APN/PCO能力线索 | APN认证需求下发、driver能力门禁、WDS只读P-CSCF、opt-in DHCP信息请求 | `22646c8`（N8） | 通用PCO写入、MM认证变更、DHCP地址分配明确unsupported |
+| ISIM REFRESH开始/结束事件字符串 | 以现有只读QMI/AT/PCSC在注册边界做双次稳定快照复核 | `6203511`（R5） | 不是实时REFRESH事件订阅 |
+| 注册SA/端口/SPI与旧SA退役 | XFRM安装/回滚/退役/重选/清理固定原worker代次 | `d373ffa`（R7） | 不执行全局flush，不跨代操作 |
 
 固件普通priority的00/02/03/01及条件non-IPSec构造分支已有汇编证据，但不能推导所有mode、设备当前NV/MBN或任意失败降级。新离线分析定位`0xd051c950`的新列表成员比较及上下文/状态条件，支持保留仍在列表中的当前端点；`0xd06e573c`的ISIM Refresh标签属于文本到状态匹配，不是已还原的UICC事件处理。R5/R6已补程序边界的材料和PCO检查；实时指示、活动对话期间的主动迁移、其他来源动态DNS、未知packet/完整恢复图不自动宣称支持。实机首次/自然续期/注销/故障恢复及MM重枚举另需授权；独立catalog与额外原生诊断不在此次注册补全范围。
+
+更细的离线取证记录（不进仓库）：`.local/evidence/ims-ec20-extension-review/ida/FUNCTION_REVIEW.md`（`ims_status`分支、regpriority消费链、non-IPSec构造前提）、`.local/evidence/ims-pcscf-refresh/FIRMWARE_UPDATE_REVIEW.md`（P-CSCF成员比较、ISIM Refresh证据等级校正）。
+
 
 ## 10. 验证清单与验收标准
 
