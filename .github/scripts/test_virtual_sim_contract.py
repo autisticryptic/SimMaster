@@ -32,10 +32,10 @@ class VirtualSimContract(unittest.TestCase):
 
     def test_vectors_come_from_the_standard(self):
         tests = (VS/'milenage_tests.rs').read_text(encoding='utf-8')
-        for vector in ['465b5ce8b199b49faa9039792c26e45e', 'cd63cb71954a9c4e270f0bcda89d3b7f',
-                       'a54211d5e3ba50bf', 'b40ba9a3c58b2a05bbf0f5c1a5cc2c3a',
-                       'f769bcd75137d5d607f5f3d0f3dc6b3f', '4a9ffac354b34760',
-                       '0185e1339c2541ca', '451e8beca43b']:
+        for vector in ['465b5ce8b199b49faa5f0a2ee238a6bc', 'cd63cb71954a9f4e48a5994e37a02baf',
+                       'a54211d5e3ba50bf', 'b40ba9a3c58b2a05bbf0d987b21bf8cb',
+                       'f769bcd751044604127672711c6d3441', '4a9ffac354dfafb3',
+                       '01cfaf9ec4e871e9', '451e8beca43b', '9e2980c59739da67b136355e3cede6a2']:
             self.assertIn(vector, tests)
 
     def test_actions_run_the_module(self):
