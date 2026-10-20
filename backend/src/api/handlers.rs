@@ -16876,7 +16876,7 @@ pub async fn get_non_3gpp_providers_handler(
     let installed = non_3gpp_voice::registry().descriptors();
     let reserved = non_3gpp_voice::PLANNED_PROVIDERS
         .iter()
-        .filter(|&(id, _)| !installed.iter().any(|descriptor| descriptor.id == id))
+        .filter(|&&(id, _)| !installed.iter().any(|descriptor| descriptor.id == id))
         .map(|(id, label)| Non3gppProviderView {
             id: id.to_string(),
             label: label.to_string(),
