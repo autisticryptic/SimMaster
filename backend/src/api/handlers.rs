@@ -16873,6 +16873,17 @@ pub struct Non3gppProviderView {
 pub async fn get_non_3gpp_providers_handler(
 ) -> (StatusCode, Json<ApiResponse<Vec<Non3gppProviderView>>>) {
     use crate::connectivity::modems::ims::non_3gpp_voice;
+    let installed = non_3gpp_voice::registry().descriptors();
+    let reserved = non_3gpp_voice::PLANNED_PROVIDERS
+        .iter()
+        .filter(|&(id, _)| !installed.iter().any(|descriptor| descriptor.id == id))
+        .map(|(id, label)| Non3gppProviderView {
+            id: id.to_string(),
+            label: label.to_string(),
+            capabilities: vec!["voice".to_string()],
+            availability: "unsupported".to_string(),
+        })
+        .collect::<Vec<_>>();
     let providers = non_3gpp_voice::registry()
         .descriptors()
         .into_iter()
@@ -16886,6 +16897,7 @@ pub async fn get_non_3gpp_providers_handler(
                 .collect(),
             availability: "unknown".to_string(),
         })
+        .chain(reserved)
         .collect();
     (StatusCode::OK, Json(ApiResponse::success_with_message("ok", providers)))
 }

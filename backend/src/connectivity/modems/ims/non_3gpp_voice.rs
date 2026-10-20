@@ -55,6 +55,18 @@ pub enum ProviderAvailability {
 
 /// Runtime registry. Empty unless a provider is explicitly installed at
 /// startup; there is deliberately no auto-discovery.
+/// Providers named in the product plan that have no implementation yet.
+///
+/// They are listed here so the ids and labels are reserved: a future
+/// implementation keeps the same id, the UI keeps showing the same entry, and
+/// nothing has to guess a name. Listing them is not registration — they are
+/// reported as `Unsupported` and can never be selected for a call.
+pub const PLANNED_PROVIDERS: &[(&str, &str)] = &[
+    ("app_voice", "无忧行 / 应用语音"),
+    ("google_voice", "Google Voice"),
+    ("telegram_calls", "Telegram 通话"),
+];
+
 static REGISTRY: std::sync::OnceLock<ProviderRegistry> = std::sync::OnceLock::new();
 
 /// Process-wide registry used by the API. Empty until a provider is installed.

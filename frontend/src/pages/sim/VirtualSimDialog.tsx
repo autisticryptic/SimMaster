@@ -132,12 +132,9 @@ export default function VirtualSimDialog({ open, onClose, onSaved }: Props) {
               onChange={(event) => setAccessKind(event.target.value as AccessKind)}
             >
               <MenuItem value="five_codes">五码（虚拟 SIM）</MenuItem>
-              <MenuItem value="app_voice" disabled>
-                应用语音（无忧行 / Google Voice 等，未接入）
-              </MenuItem>
               {providers.map((provider) => (
                 <MenuItem key={provider.id} value={`provider:${provider.id}`} disabled>
-                  {provider.label}（未接入）
+                  {provider.label}（{provider.availability === 'unsupported' ? '接口已预留，未接入' : '未接入'}）
                 </MenuItem>
               ))}
             </Select>
