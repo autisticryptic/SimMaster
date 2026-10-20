@@ -9,6 +9,27 @@ pub mod provisioning;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImsIdentitySource { Isim, UsimDerived }
 
+/// Behavior (not just a label) for where the IMS identity comes from.
+/// `Auto` is the historical rule: use complete ISIM when valid, otherwise
+/// derive from IMSI. `RequireIsim` fails closed instead of deriving.
+/// `UsimDerived` ignores ISIM entirely (identity and its P-CSCF).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IdentitySourcePolicy { #[default] Auto, RequireIsim, UsimDerived }
+impl IdentitySourcePolicy {
+    /// Unknown/legacy catalog labels (e.g. `carrier_device_model`) stay `Auto`
+    /// so importing an old profile cannot silently change identity behavior.
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "isim_required" | "isim_only" => Self::RequireIsim,
+            "usim_derived" | "derived" | "derived_imsi" => Self::UsimDerived,
+            _ => Self::Auto,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Auto => "auto", Self::RequireIsim => "isim_required", Self::UsimDerived => "usim_derived" }
+    }
+}
+
 #[derive(Clone)]
 pub struct ResolvedImsIdentity {
     pub identity: ImsIdentity,
@@ -29,6 +50,7 @@ pub fn resolve_ims_identity(
     realm: &str,
     domain_explicit: bool,
     realm_explicit: bool,
+    policy: IdentitySourcePolicy,
 ) -> Result<ResolvedImsIdentity, &'static str> {
     if !(5..=16).contains(&imsi.len()) || !imsi.bytes().all(|b| b.is_ascii_digit())
         || !usim_aid.starts_with(USIM_AID_PREFIX) || usim_aid.len() > 16 {
@@ -47,6 +69,11 @@ pub fn resolve_ims_identity(
         source: ImsIdentitySource::UsimDerived,
         isim_pcscf: Vec::new(),
     };
+    if policy == IdentitySourcePolicy::UsimDerived {
+        // Explicit operator choice: never read identity or P-CSCF from ISIM,
+        // even when the card carries it. AKA keeps the USIM application.
+        return Ok(resolved);
+    }
     if let Some((aid, material)) = isim {
         isim::validate_isim_aid(aid)?;
         // Public material fields are constructible by adapters/tests. Revalidate
@@ -62,7 +89,12 @@ pub fn resolve_ims_identity(
             if !realm_explicit { resolved.realm = isim_domain.clone(); }
             resolved.auth_aid = aid.to_vec();
             resolved.source = ImsIdentitySource::Isim;
+        } else if policy == IdentitySourcePolicy::RequireIsim {
+            // Partial provisioning is not permission to derive silently.
+            return Err("ims_identity_isim_required_missing");
         }
+    } else if policy == IdentitySourcePolicy::RequireIsim {
+        return Err("ims_identity_isim_required_missing");
     }
     Ok(resolved)
 }

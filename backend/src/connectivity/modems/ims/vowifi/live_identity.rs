@@ -163,6 +163,7 @@ pub(super) async fn load(line_id: &str, profile: &'static CarrierProfile)
         &imsi, usim_aid, applications.isim_aid.as_deref().zip(material.as_ref()),
         &target.domain, &target.realm,
         explicit || overrides.ims_domain.is_some(), explicit || overrides.ims_realm.is_some(),
+        uicc_ims::IdentitySourcePolicy::parse(profile.ims.identity_source),
     ).map_err(live_stage_error)?;
     target.domain = resolved.identity.home_domain.clone();
     target.realm = resolved.realm;

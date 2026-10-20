@@ -7,8 +7,12 @@ fn configured() -> IsimImsMaterial {
     }
 }
 fn resolve(material: &IsimImsMaterial, explicit_domain: bool, explicit_realm: bool) -> ResolvedImsIdentity {
+    resolve_with(material, explicit_domain, explicit_realm, IdentitySourcePolicy::Auto).unwrap()
+}
+fn resolve_with(material: &IsimImsMaterial, explicit_domain: bool, explicit_realm: bool,
+    policy: IdentitySourcePolicy) -> Result<ResolvedImsIdentity, &'static str> {
     resolve_ims_identity("001010123456789", USIM_AID_PREFIX, Some((isim::ISIM_AID_PREFIX, material)),
-        "policy.example", "realm.example", explicit_domain, explicit_realm).unwrap()
+        "policy.example", "realm.example", explicit_domain, explicit_realm, policy)
 }
 #[test]
 fn isim_mm_single_slot_normalization_rejects_wrong_types_and_overflow() {
@@ -57,12 +61,10 @@ fn isim_unconfigured_and_partial_material_fall_back_only_to_usim() {
 #[test]
 fn isim_corrupt_public_material_is_not_silently_unprovisioned() {
     let mut material = configured(); material.impi = Some("alice@ims.example\r\nX:x".into());
-    assert!(resolve_ims_identity("001010123456789", USIM_AID_PREFIX,
-        Some((isim::ISIM_AID_PREFIX, &material)), "policy.example", "realm.example", false, false).is_err());
+    assert!(resolve_with(&material, false, false, IdentitySourcePolicy::Auto).is_err());
     // Invalid even when another required field is missing.
     material.domain = None;
-    assert!(resolve_ims_identity("001010123456789", USIM_AID_PREFIX,
-        Some((isim::ISIM_AID_PREFIX, &material)), "policy.example", "realm.example", false, false).is_err());
+    assert!(resolve_with(&material, false, false, IdentitySourcePolicy::Auto).is_err());
 }
 #[test]
 fn isim_binding_rejects_card_slot_endpoint_owner_and_imsi_changes() {
@@ -119,4 +121,49 @@ fn isim_auth_aid_is_not_the_eap_usim_application() {
     assert_eq!(apdu[3], 0x81); // Same AKA context, different selected application.
     assert_eq!(eap_aid.last(), Some(&2));
     assert_eq!(selected.auth_aid.last(), Some(&4));
+}
+
+#[test]
+fn identity_source_policy_parses_only_explicit_values() {
+    for (value, expected) in [
+        ("", IdentitySourcePolicy::Auto), ("auto", IdentitySourcePolicy::Auto),
+        // Legacy catalog labels keep the historical auto rule.
+        ("isim", IdentitySourcePolicy::Auto), ("carrier_device_model", IdentitySourcePolicy::Auto),
+        ("ISIM_REQUIRED", IdentitySourcePolicy::RequireIsim), ("isim_only", IdentitySourcePolicy::RequireIsim),
+        ("usim_derived", IdentitySourcePolicy::UsimDerived), ("derived", IdentitySourcePolicy::UsimDerived),
+        ("derived_imsi", IdentitySourcePolicy::UsimDerived), ("  usim_derived  ", IdentitySourcePolicy::UsimDerived),
+    ] {
+        assert_eq!(IdentitySourcePolicy::parse(value), expected, "{value:?}");
+    }
+    assert_eq!(IdentitySourcePolicy::Auto.as_str(), "auto");
+    assert_eq!(IdentitySourcePolicy::RequireIsim.as_str(), "isim_required");
+    assert_eq!(IdentitySourcePolicy::UsimDerived.as_str(), "usim_derived");
+}
+
+#[test]
+fn require_isim_fails_closed_instead_of_deriving() {
+    for material in [IsimImsMaterial::default(), IsimImsMaterial { impi: None, ..configured() },
+        IsimImsMaterial { domain: None, ..configured() }, IsimImsMaterial { impus: vec![], ..configured() }] {
+        assert_eq!(resolve_with(&material, false, false, IdentitySourcePolicy::RequireIsim),
+            Err("ims_identity_isim_required_missing"));
+    }
+    assert_eq!(resolve_ims_identity("001010123456789", USIM_AID_PREFIX, None,
+        "policy.example", "realm.example", false, false, IdentitySourcePolicy::RequireIsim),
+        Err("ims_identity_isim_required_missing"));
+    let selected = resolve_with(&configured(), false, false, IdentitySourcePolicy::RequireIsim).unwrap();
+    assert_eq!(selected.source, ImsIdentitySource::Isim);
+    assert_eq!(selected.auth_aid, isim::ISIM_AID_PREFIX);
+}
+
+#[test]
+fn usim_derived_ignores_complete_isim_and_keeps_the_usim_application() {
+    let selected = resolve_with(&configured(), false, false, IdentitySourcePolicy::UsimDerived).unwrap();
+    assert_eq!(selected.source, ImsIdentitySource::UsimDerived);
+    assert_eq!(selected.auth_aid, USIM_AID_PREFIX);
+    assert_eq!(selected.identity.private_user, "001010123456789@realm.example");
+    assert_eq!(selected.identity.public_uri, "sip:001010123456789@policy.example");
+    assert!(selected.isim_pcscf.is_empty(), "operator opted out of ISIM sources");
+    // Explicit profile domain/realm still win over derivation inputs.
+    let selected = resolve_with(&configured(), true, true, IdentitySourcePolicy::UsimDerived).unwrap();
+    assert_eq!(selected.realm, "realm.example");
 }

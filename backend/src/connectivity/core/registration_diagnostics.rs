@@ -51,7 +51,8 @@ pub enum IdentityOrigin { #[default] Unknown, Isim, UsimDerived, SimOverrideDeri
 pub enum IdentityPreference { #[default] Unknown, Isim, Derived, CarrierDeviceModel, Other }
 impl IdentityPreference {
     pub fn parse(value: &str) -> Self {
-        match value { "isim" => Self::Isim, "derived" | "derived_imsi" => Self::Derived,
+        match value { "isim" | "isim_required" | "isim_only" => Self::Isim,
+            "derived" | "derived_imsi" | "usim_derived" => Self::Derived,
             "carrier_device_model" => Self::CarrierDeviceModel, "" => Self::Unknown, _ => Self::Other }
     }
 }

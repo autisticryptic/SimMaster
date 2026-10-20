@@ -140,6 +140,20 @@ R7（d373ffa已软件验证）将XFRM安装/部分失败回滚/旧SA退役/重�
 - 新注册成功后reg-event/MWI按新dialog重新建立，旧OPTIONS事务作废；临时重选失败时runtime仍显示实际保留的旧端点，失败候选只入执行诊断，不能在Registered状态展示未成功的目标。
 - 共享最终成功响应携带接收时刻；材料/provider复核后的新租期和调度仍从该时刻计算，已在验证过程中到期不能发布ready。网络给出的原始expires数值不被伪造。
 
+### 身份来源策略（R8，待Actions）
+
+`profile.ims.identity_source` 从“声明标签”变为可执行策略，默认 `auto` 保持历史行为：
+
+| 取值 | 行为 |
+|---|---|
+| 空/`auto`/`isim`/`carrier_device_model`/其它旧标签 | `auto`：ISIM 完整合法就用 ISIM，否则 IMSI 派生 |
+| `isim_required`（或 `isim_only`） | 必须用 ISIM；缺失/部分配置 → `ims_identity_isim_required_missing` 失败关闭，不静默派生 |
+| `usim_derived`（或 `derived`/`derived_imsi`） | 忽略 ISIM：身份、ISIM P-CSCF 与 AKA 应用全部走 USIM |
+
+- AKA 应用必须随策略一致：ISIM 身份配 ISIM AID，派生身份配 USIM AID，避免“ISIM 身份 + USIM 密钥”。
+- 旧 catalog 里的任意字符串不会被当成行为，避免导入旧 profile 时悄悄换身份；诊断的 declared/actual 会如实显示新取值。
+- 仅用于“ISIM 有内容但运营商不期望使用”的场景，配错会发出网络不认的身份，需实网证据再启用。
+
 ### reg-event 观察与注册撤销
 
 - 只从已验证成功的最终 REGISTER 绑定构造观察器，不从业务默认身份或 profile 猜 AoR/Contact；同接入 owner/通道订阅 `Event: reg`。

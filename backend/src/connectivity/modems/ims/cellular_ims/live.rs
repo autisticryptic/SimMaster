@@ -8175,6 +8175,7 @@ async fn load_device_identity(
         &effective_ims.domain.value, &effective_ims.realm.value,
         resolved.origin != ProfileOrigin::Derived || sim_override.ims_cellular.domain.is_some(),
         resolved.origin != ProfileOrigin::Derived || sim_override.ims_cellular.realm.is_some(),
+        uicc_ims::IdentitySourcePolicy::parse(profile.ims.identity_source),
     ).map_err(CellularImsError::new)?;
     if selected.source == uicc_ims::ImsIdentitySource::Isim && resolved.origin == ProfileOrigin::Derived {
         if sim_override.ims_cellular.domain.is_none() {
