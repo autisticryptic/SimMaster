@@ -572,6 +572,12 @@ struct CellularImsLiveSession {
     voice_calls: HashMap<String, LiveVoiceCall>,
     mwi_subscription: Option<MwiSubscription>,
     reg_event: live_reg_event::Observer,
+    /// Supplementary QMI UIM refresh detector (None = modem does not support
+    /// it, or the line has no UICC binding; boundary checks still apply).
+    identity_refresh: Option<crate::connectivity::modems::ims::vowifi::qmi_uim::refresh::RefreshSubscription>,
+    /// Card provisioning changed while registered; do not re-register or renew
+    /// with the stale identity until calls drain and the gated rebuild runs.
+    identity_stale: bool,
     diagnostic_scope: Option<reg_diag::DiagnosticsToken>,
 }
 
@@ -4074,6 +4080,9 @@ async fn connect_family(
             voice_calls: HashMap::new(),
             mwi_subscription: None,
             reg_event: live_reg_event::Observer::default(),
+            identity_refresh: crate::connectivity::modems::ims::vowifi::qmi_uim::refresh::start(
+                QMI_PROXY_SOCKET, &device.qmi_device, device.uim_slot, device_identity.aka_aid.clone()),
+            identity_stale: false,
             diagnostic_scope: runtime.diagnostics_token(),
         });
     }
@@ -4447,10 +4456,34 @@ async fn live_receive_loop(
             cleanup_live_session_with_binding(&live, legacy_cleanup).await;
             break;
         }
+        // A QMI UIM refresh completion is only a hint: re-read the bounded
+        // snapshot and fail closed on change or read error. Calls drain first.
+        let refresh_event = {
+            let mut sessions = live.session.lock().await;
+            sessions.as_mut().and_then(|session| session.identity_refresh.as_mut())
+                .and_then(|refresh| refresh.poll_event())
+        };
+        if refresh_event == Some(crate::connectivity::modems::ims::vowifi::qmi_uim::refresh::RefreshEvent::Completed) {
+            let captured = {
+                let sessions = live.session.lock().await;
+                sessions.as_ref().map(|session| (session.device.clone(), session.auth_binding.clone(), session.provisioning.clone()))
+            };
+            let stale = match captured {
+                Some((device, binding, provisioning)) => verify_ims_registration_material(
+                    &device, binding.as_ref(), &provisioning,
+                ).await.is_err(),
+                None => false,
+            };
+            if stale {
+                let mut sessions = live.session.lock().await;
+                if let Some(session) = sessions.as_mut() { session.identity_stale = true; }
+                tracing::warn!(line_id = %line_id, "UIM refresh changed IMS provisioning; deferring re-registration");
+            }
+        }
         let (reg_event_revoked, calls_drained) = {
             let sessions = live.session.lock().await;
             let Some(session) = sessions.as_ref() else { break; };
-            (session.reg_event.revoked, session.voice_calls.is_empty())
+            (session.reg_event.revoked || session.identity_stale, session.voice_calls.is_empty())
         };
         if reg_event_revoked {
             pending_options = None;
@@ -4546,7 +4579,9 @@ async fn live_receive_loop(
                 match sessions.as_mut() {
                     Some(session) => {
                         let previous = session.register_ids.call_id.clone();
+                        if let Some(refresh) = session.identity_refresh.as_ref() { refresh.set_busy(true); }
                         let result = refresh_live_registration(session, &runtime, &line_id, &database).await;
+                        if let Some(refresh) = session.identity_refresh.as_ref() { refresh.set_busy(false); }
                         (result, session.register_ids.call_id != previous)
                     }
                     None => break,
@@ -9987,6 +10022,8 @@ mod tests {
             voice_calls: HashMap::new(),
             mwi_subscription: None,
             reg_event: live_reg_event::Observer::default(),
+            identity_refresh: None,
+            identity_stale: false,
             diagnostic_scope: None,
         });
         (live, Arc::new(CellularImsRuntime::new()), pcscf)

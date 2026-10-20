@@ -958,6 +958,26 @@ pub(crate) fn parse_fcp_file_size(data: &[u8]) -> Option<usize> {
     None
 }
 
+#[cfg(unix)]
+#[path = "qmi_uim_refresh.rs"]
+pub(crate) mod refresh;
+#[cfg(unix)]
+pub(crate) use refresh::{RefreshEvent, RefreshSubscription};
+
+/// Non-Unix placeholder: refresh subscription is a no-op there.
+#[cfg(not(unix))]
+pub(crate) mod refresh {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum RefreshEvent { Completed, Failed }
+    pub(crate) struct RefreshSubscription;
+    impl RefreshSubscription {
+        pub(crate) fn set_busy(&self, _busy: bool) {}
+        pub(crate) fn poll_event(&mut self) -> Option<RefreshEvent> { None }
+        pub(crate) fn stop(&mut self) {}
+    }
+    pub(crate) fn start(_proxy: &str, _device: &str, _slot: u8, _aid: Vec<u8>) -> Option<RefreshSubscription> { None }
+}
+
 #[path = "qmi_uim_isim.rs"]
 pub mod isim;
 pub use isim::IsimImsMaterial;
@@ -1810,6 +1830,24 @@ impl QmiProxyConnection {
         self.stream.write_all(frame)?;
         self.stream.flush()?;
         read_qmi_message(&mut self.stream)
+    }
+
+    /// Send one request without consuming a response (used by the refresh
+    /// listener, which demultiplexes indications itself).
+    fn send_message(&mut self, message: &QmiMessage) -> Result<(), QmiUimError> {
+        let frame = encode_qmi_message(message)?;
+        self.stream.write_all(&frame)?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    fn read_message(&mut self) -> Result<QmiMessage, QmiUimError> {
+        read_qmi_message(&mut self.stream)
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), QmiUimError> {
+        self.stream.set_read_timeout(timeout)?;
+        Ok(())
     }
 
     fn take_ctl_transaction(&mut self) -> u16 {

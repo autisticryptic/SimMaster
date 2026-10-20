@@ -5,6 +5,7 @@
 
 ## 1.1.5 主线
 
+- R9（待Actions）：新增每线路只读 QMI UIM refresh 订阅（Register 0x002A / Complete 0x002C / indication 0x0033），忙时投 deny 最多 20 秒；完成仅作提示，重读 R5 快照后置 identity_stale 并等通话排空再按门禁重建；不支持时退回边界检查。
 - R8（待Actions）：`profile.ims.identity_source` 变为可执行策略：`auto`（默认，含旧标签）保持历史行为，`isim_required` 缺 ISIM 时失败关闭，`usim_derived` 忽略 ISIM 并走 USIM AKA；AID 随策略一致，旧 catalog 字符串不改变行为。
 - R7 `d373ffa`已验证：修复XFRM操作检查旧代次后又从可变worker handle捕获新代次的竞态，全部生产install/uninstall及失败回滚传递原UeWorkerBinding，原子enqueue和回包门禁拒绝跨代命令。两套Actions（Build-Release 38999487086、Validate Beta 38999487107）/双架构、各522相关回归/86场景含5项真实worker消息/代次回归，342静态/mock通过；双架构官方包SHA/meta/ELF/嵌入提交/全文件清单已只读核验，未解包执行。不改算法、精确选择器或设备；软件侧已确认缺口闭环，按用户要求停在实机验收前。
 - R6 `6672a64`已验证：原retained provider PCO复核、固定来源重解析及空闲同PDN/worker注册级重选；不从空/partial结果推断撤销，不重激活承载，不借旧Digest或降级旧IPsec/TLS，临时失败保留旧到期/等待及实际旧端点，切换后重建观察器。两工作流/双架构、各517相关回归/86场景含8重选＋2时钟新回归、339静态通过；首轮2个结构守卫定位已精确修正，后续观察器/旧端点审查补强重新跑全套。响应时刻固定租期；新离线汇编进一步定位列表比较并校正ISIM状态标签证据等级，未设备/IDA/部署。
