@@ -78,7 +78,8 @@ impl Milenage {
             block[(i + 8) % 16] = rotated[i];
         }
         let temp = self.temp(rand);
-        let out = xor(&xor(&block, &temp), &self.opc);
+        // OUT1 = E_K(rot(IN1 xor OPc) xor TEMP) xor OPc
+        let out = xor(&encrypt(&self.k, &xor(&block, &temp)), &self.opc);
         let mut mac_a = [0u8; 8];
         let mut mac_s = [0u8; 8];
         mac_a.copy_from_slice(&out[..8]);
