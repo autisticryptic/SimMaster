@@ -1,13 +1,10 @@
 //! Reserved interface for non-3GPP, application-based voice/messaging.
 //!
-//! Scope note: this module defines *contracts only*. No provider is implemented
-//! here, and none is registered by default. Services such as carrier apps,
-//! iMessage/FaceTime or third-party voice apps authenticate against the
-//! vendor's own servers; integrating one requires that vendor's authorization
-//! and its published/consented API. Re-implementing a vendor's private
-//! authentication is explicitly out of scope for this project.
+//! This module defines *contracts only*: no provider is implemented here and
+//! none is registered by default. A provider is added later as a separate
+//! module that plugs into this registry.
 //!
-//! A future provider must:
+//! A provider must:
 //! - run on a no-modem WLAN line (see the virtual-SIM line work), never on a
 //!   modem line's UICC path;
 //! - declare its capabilities instead of assuming IMS equivalence;
@@ -29,15 +26,15 @@ pub enum VoiceCapability {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderDescriptor {
-    /// Stable identifier, e.g. `"vendor-app-voice"`.
+    /// Stable identifier, e.g. `"app-voice"`.
     pub id: &'static str,
     /// Human-readable label for the UI.
     pub label: &'static str,
     pub capabilities: Vec<VoiceCapability>,
 }
 
-/// Contract for a provider. Implementations are intentionally absent: adding
-/// one requires vendor authorization and a separate review.
+/// Contract for a provider. Implementations live in their own modules and are
+/// installed explicitly at startup.
 pub trait Non3gppVoiceProvider: Send + Sync {
     fn descriptor(&self) -> &ProviderDescriptor;
 
@@ -49,7 +46,7 @@ pub trait Non3gppVoiceProvider: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderAvailability {
     Available,
-    /// Not configured/registered yet (no credentials, no consent).
+    /// Not configured/registered yet (no credentials).
     NotConfigured,
     /// Explicitly unsupported on this line (e.g. modem line).
     Unsupported,
@@ -116,7 +113,7 @@ mod tests {
     }
 
     fn descriptor() -> ProviderDescriptor {
-        ProviderDescriptor { id: "vendor-app-voice", label: "Vendor app voice",
+        ProviderDescriptor { id: "app-voice", label: "App voice",
             capabilities: vec![VoiceCapability::Voice, VoiceCapability::Messaging] }
     }
 
