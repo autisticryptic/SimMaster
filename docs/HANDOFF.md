@@ -10,7 +10,10 @@
 4. 2026-10-07的部署授权已结束；本轮**未部署、未访问设备或写NV**。用户已手动开启并确认EC20分析ELF，可做只读IDA/静态分析，不修改IDB或扩大设备授权。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：注册软件收尾完成，按用户要求停在实机验收前
+## 当前：注册软件收尾完成；全球版 EM05-G 交叉复核无新机制
+
+对全球版 EM05-G（MDM9607，26 份 MBN / 2,905 条记录 / 2,097 EFS）做了只读交叉核对，目的是排除“EC20 是中国特供、机制可能不全”。结论：**注册机制无新增**，`Service UnAvailable` 14 类、P-CSCF 列表处理、423/Min-Expires/Retry-After、reg-event、non-IPSec 构造均同构；差异只在配置覆盖面（优先级 4 种取值、`IMS_enable` 00/01、新增 22 个媒体类 EFS 项）。两条新线索均属接口/数据层：基带存在真实 ISIM refresh 事件并经 QMI UIM 上报；Verizon/Jio 等使用非标准 ePDG 域名，需显式 catalog host。报告`.local/evidence/ims-em05-review/EM05_GLOBAL_REVIEW.md`，未连接 IDA/设备、未执行固件；后续实现待讨论。
+
 已验证代码 **`d373ffa3b311aa7ceeebcd988a2ec82b1910cf10`**：Build **38999487086**、Beta **38999487107**、ARM64/AMD64均成功；两套官方测试ZIP各 **522相关回归/86场景**，342静态/mock通过。报告`.local/evidence/ims-xfrm-worker-binding/verified-d373ffa.json`。
 - R7固定XFRM安装/回滚/旧SA退役/重选/清理的原worker binding；5项真实消息/排队/回包换代回归通过，旧命令不会被重新绑定到新进程。
 - R5同卡材料边界检查与R6同PDN PCO重选均保留：旧保护/计数/等待不丢，失败不伪造新端点已注册，切换后重建reg-event/MWI。R5首轮计数缺口已修复，完整历史见CHANGELOG及本地证据。
@@ -134,16 +137,13 @@ N5 代码 **`3d54aa87b1cc0ae5f2294991a46ad2ce43984e6a`** 已通过 [Build-Releas
 - 汇总：`.local/evidence/global-register-fallback/deployment-final.json`，最终复检 `final-live-check.json`。备份用于明确授权的回滚，不自动恢复旧数据库或账本。
 
 ## 剩余验收与历史基线
-
 - **当前原配置的初始注册未发现回归，但不能代替新会话自然续期、通话/音频或中国移动同卡验收。**
 - 中国移动实际 421 的完整安全参数仍缺失；不能据此认定缺算法、放宽 strict 或新增 MD5。
 - 用户给出的九月成功时间附近为 `7c6cf86 / 09edc03`；Cloudflare 文档明确成功样本是 46011，不能冒认中国移动。
 - 已确认 `39b387b` 改全局首包 Require/Proxy-Require，`bdffdef` 区分主动声明与 server-required；旧 generic 丢身份的问题因可达路径变化暴露。
 - `98d0e09` 的完整报价/strict 变化是独立线索，本轮没有猜测回退。历史原文检索见[历史摘要](archive/README.md)。
 - 停服导致 MM 重枚举/AT 超时需单独调查；当前正常新租约不是旧残留，不得重放旧清理命令。
-
 ## 固定入口
-
 - [开发与 Actions](DEVELOPER.md)、[未完成计划](DEVELOPMENT_PLAN.md)、[诊断](IMS_DIAGNOSTICS.md)。
 - [MM 生命周期](IMS_MM_EXACT_FAMILY_LEASE_DESIGN.md)、[运营商配置](CARRIER_PROFILES.md)、[文档导航](README.md)。
 - 独立 catalog `v0.3.1-catalog-v7` 已发布；本轮未重建、裁剪或替换设备库，未发布新的程序 Release。

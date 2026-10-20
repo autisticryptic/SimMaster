@@ -385,6 +385,16 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 
 更细的离线取证记录（不进仓库）：`.local/evidence/ims-ec20-extension-review/ida/FUNCTION_REVIEW.md`（`ims_status`分支、regpriority消费链、non-IPSec构造前提）、`.local/evidence/ims-pcscf-refresh/FIRMWARE_UPDATE_REVIEW.md`（P-CSCF成员比较、ISIM Refresh证据等级校正）。
 
+### 全球版 EM05-G 交叉复核（不改变注册结论）
+
+为排除“EC20 是中国大陆特供版、机制可能不全”的疑虑，对全球版 EM05-G（同为 MDM9607，26 份 MBN、2,905 条记录/2,097 个 EFS 载荷）做了只读交叉核对，结论是**没有 EC20 之外的新注册机制**：
+
+- `Service UnAvailable` 恢复分类 14 项逐条相同；`PCSCFListHandler`/`StorePCSCFList`/旧新列表比较、423/Min-Expires/Retry-After、reg-event、non-IPSec 构造均同构。
+- 差异在**配置覆盖面**：优先级字段有 4 种取值（`00020301` 主、T-Mobile `01030402`、Docomo `00020001`、SKT/KT/LGU `00030102`），`IMS_enable` 有 `00/01`；同一 1024B 结构在 26 份间有 92 个字节不同，且偏移与 EC20 不完全一致。**这反向印证了“不按固定偏移/运营商值硬编码”的做法。**
+- 新增 22 个 EFS 项均为媒体/补充业务/定位（`qp_ims_sip_config`、`qp_ims_param_config`、`qp_ims_vt_WLAN_media_capability`、`qipcall_evs_codec_config`、`qipcall_vice_config` 等），**无新增注册类配置**。
+- 两条值得记下的新线索（均属接口/数据层，不需继续解 Hexagon）：①基带存在真实 ISIM refresh 事件且经 QMI UIM 上报（`I_ISIM_REFRESH_COMPLETE_EVENT`、`qmi_uimi_refresh_complete`），可把 R5 从边界快照升级为事件驱动；②真实运营商使用非标准 ePDG 域名（Verizon `wo.vzwwo.com`、Jio `vowifi.jio.com`），只能靠显式 profile/catalog 提供，标准派生不支持。
+- 不据此实现任何写路径（PCO 策略写入仍缺自有 profile 回读证据），不声称已覆盖所有运营商的实网互通。详细报告：`.local/evidence/ims-em05-review/EM05_GLOBAL_REVIEW.md`。
+
 
 ## 10. 验证清单与验收标准
 
