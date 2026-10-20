@@ -11,5 +11,9 @@
 //! Non-goals: no ISO 7816 file system, no eUICC/EID handling, no modem APDU
 //! interception (the baseband's card traffic is not visible to the host).
 pub mod milenage;
+pub mod sqn;
+pub mod store;
 
 pub use milenage::{Milenage, AUTN_LEN, AUTS_LEN, KEY_LEN};
+pub use sqn::{Sqn, SQN_LEN};
+pub use store::{open, seal, FiveCodes, MasterKey, OpMaterial};

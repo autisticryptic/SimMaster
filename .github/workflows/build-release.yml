@@ -368,6 +368,8 @@ jobs:
             connectivity::modems::ims::cellular_ims::ipsec::worker_tests \
             connectivity::modems::ims::vowifi::qmi_uim::refresh::tests \
             connectivity::modems::ims::virtual_sim::milenage::tests \
+            connectivity::modems::ims::virtual_sim::sqn::tests \
+            connectivity::modems::ims::virtual_sim::store::tests \
             connectivity::modems::ims::cellular_ims::live::tests::refresh \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \
             connectivity::modems::ims::cellular_ims::security_agreement::tests \

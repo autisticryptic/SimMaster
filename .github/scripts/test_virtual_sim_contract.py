@@ -7,13 +7,26 @@ VS = ROOT/'backend/src/connectivity/modems/ims/virtual_sim'
 class VirtualSimContract(unittest.TestCase):
     def test_module_layout_and_scope(self):
         self.assertTrue((VS/'mod.rs').is_file())
-        self.assertTrue((VS/'milenage.rs').is_file())
+        for name in ['milenage.rs', 'sqn.rs', 'store.rs']:
+            self.assertTrue((VS/name).is_file(), name)
         doc = (VS/'mod.rs').read_text(encoding='utf-8')
         self.assertIn('VoWiFi only', doc)
         self.assertIn('never replaces a modem line', doc)
         self.assertIn('no ISO 7816 file system', doc)
         ims = (ROOT/'backend/src/connectivity/modems/ims/mod.rs').read_text(encoding='utf-8')
         self.assertIn('pub mod virtual_sim;', ims)
+
+    def test_sqn_rule_and_key_rotation_hooks(self):
+        sqn = (VS/'sqn.rs').read_text(encoding='utf-8')
+        self.assertIn('pub fn accepts(self, network: Self) -> bool', sqn)
+        self.assertIn('network.0 > self.0', sqn)
+        self.assertIn('MASK48', sqn)
+        store = (VS/'store.rs').read_text(encoding='utf-8')
+        # Master key is database-held by decision; encryption is at-rest only.
+        self.assertIn('AES_256_GCM', store)
+        self.assertIn('Aad::from(profile_id.as_bytes())', store)
+        self.assertIn('ims_virtual_sim_op_opc_mismatch', store)
+        self.assertIn('MasterKey(<redacted>)', store)
 
     def test_uses_standard_algorithms_only(self):
         text = (VS/'milenage.rs').read_text(encoding='utf-8')
