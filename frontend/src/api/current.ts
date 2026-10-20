@@ -151,6 +151,32 @@ function throwIfApiEnvelopeError(payload: unknown): void {
   }
 }
 
+export interface VirtualSimProfileView {
+  line_id: string
+  profile_id: string
+  iccid_tail: string
+  imsi_prefix: string
+  op_kind: string
+  has_msisdn: boolean
+  installed: boolean
+}
+
+export interface CreateVirtualSimInput {
+  iccid: string
+  imsi: string
+  ki: string
+  op?: string
+  opc?: string
+  msisdn?: string
+}
+
+export interface Non3gppProviderView {
+  id: string
+  label: string
+  capabilities: string[]
+  availability: string
+}
+
 async function request<T>(
   url: string,
   options: RequestOptions = {},
@@ -754,6 +780,33 @@ class SimAdminCurrentAPI {
 
   async getVowifiLines() {
     return request<ApiResponse<VowifiLineConfigResponse[]>>('/vowifi/lines')
+  }
+
+  async getVirtualSimProfiles() {
+    return request<ApiResponse<VirtualSimProfileView[]>>('/ims/virtual-sim')
+  }
+
+  async createVirtualSimProfile(input: CreateVirtualSimInput) {
+    return request<ApiResponse<VirtualSimProfileView>>('/ims/virtual-sim', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  }
+
+  async deleteVirtualSimProfile(lineId: string) {
+    return request<ApiResponse<null>>(`/ims/virtual-sim/${encodeURIComponent(lineId)}`, {
+      method: 'DELETE',
+    })
+  }
+
+  async rotateVirtualSimKey() {
+    return request<ApiResponse<{ reencrypted: number; skipped: number }>>('/ims/virtual-sim/rotate', {
+      method: 'POST',
+    })
+  }
+
+  async getNon3gppProviders() {
+    return request<ApiResponse<Non3gppProviderView[]>>('/non-3gpp/providers')
   }
 
   async getVowifiLine(lineId: string) {

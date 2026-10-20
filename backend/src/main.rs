@@ -1391,6 +1391,20 @@ async fn main() -> Result<()> {
     }
 
     // Build protected routes - 使用统一的 AppState
+    // Five-code subscriptions are installed before any line is served, so a
+    // virtual line never starts without its identity.
+    match app_state
+        .database
+        .with_conn(|conn| connectivity::modems::ims::virtual_sim::db::install_all(conn))
+    {
+        Ok((installed, failed)) if installed + failed > 0 => tracing::info!(
+            installed,
+            failed,
+            "five-code virtual SIM profiles loaded"
+        ),
+        Ok(_) => {}
+        Err(code) => tracing::warn!(code, "five-code virtual SIM profiles not loaded"),
+    }
     spawn_vowifi_auto_restore(app_state.clone());
     spawn_cellular_ims_auto_restore(app_state.clone());
 
@@ -2126,6 +2140,24 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
             get(list_vowifi_carrier_profiles_handler)
                 .put(upsert_vowifi_carrier_profile_handler)
                 .options(options_handler),
+        )
+        .route(
+            "/api/ims/virtual-sim",
+            get(get_virtual_sim_profiles_handler)
+                .post(create_virtual_sim_profile_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/ims/virtual-sim/rotate",
+            post(rotate_virtual_sim_key_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/virtual-sim/{line_id}",
+            delete(delete_virtual_sim_profile_handler).options(options_handler),
+        )
+        .route(
+            "/api/non-3gpp/providers",
+            get(get_non_3gpp_providers_handler).options(options_handler),
         )
         .route(
             "/api/vowifi/carrier-profiles/{profile_id}",

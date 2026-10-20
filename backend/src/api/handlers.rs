@@ -16698,3 +16698,187 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Five-code virtual SIM (WLAN-only lines)
+// ---------------------------------------------------------------------------
+
+/// A stored subscription as the UI sees it: identification only, never keys.
+#[derive(Debug, Default, Serialize)]
+pub struct VirtualSimProfileView {
+    pub line_id: String,
+    pub profile_id: String,
+    pub iccid_tail: String,
+    pub imsi_prefix: String,
+    pub op_kind: String,
+    pub has_msisdn: bool,
+    pub installed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateVirtualSimRequest {
+    pub iccid: String,
+    pub imsi: String,
+    pub ki: String,
+    #[serde(default)]
+    pub op: Option<String>,
+    #[serde(default)]
+    pub opc: Option<String>,
+    #[serde(default)]
+    pub msisdn: Option<String>,
+}
+
+fn parse_hex_key(value: &str) -> Result<crate::connectivity::modems::ims::milenage::Key, &'static str> {
+    let text = value.trim();
+    if text.len() != 32 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("ims_virtual_sim_key_invalid");
+    }
+    let mut key = [0u8; 16];
+    for index in 0..16 {
+        key[index] = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "ims_virtual_sim_key_invalid")?;
+    }
+    Ok(key)
+}
+
+fn virtual_line_id(iccid: &str) -> String { format!("virtual-{iccid}") }
+
+fn view_of(line_id: &str, codes: &crate::connectivity::modems::ims::virtual_sim::FiveCodes,
+    profile_id: &str) -> VirtualSimProfileView {
+    VirtualSimProfileView {
+        line_id: line_id.to_string(),
+        profile_id: profile_id.to_string(),
+        iccid_tail: codes.iccid.get(codes.iccid.len().saturating_sub(4)..).unwrap_or("").to_string(),
+        imsi_prefix: codes.imsi.get(..6.min(codes.imsi.len())).unwrap_or("").to_string(),
+        op_kind: if codes.is_opc() { "opc" } else { "op" }.to_string(),
+        has_msisdn: codes.msisdn.is_some(),
+        installed: crate::connectivity::modems::ims::virtual_sim::for_line(line_id).is_some(),
+    }
+}
+
+pub async fn get_virtual_sim_profiles_handler(
+    State(app): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<Vec<VirtualSimProfileView>>>) {
+    let stored = app.database.with_conn(|conn| {
+        let mut out = Vec::new();
+        for (line_id, profile_id) in
+            crate::connectivity::modems::ims::virtual_sim::db::list_profiles(conn)?
+        {
+            if let Some(codes) =
+                crate::connectivity::modems::ims::virtual_sim::db::open_profile(conn, &line_id)?
+            {
+                out.push(view_of(&line_id, &codes, &profile_id));
+            }
+        }
+        Ok(out)
+    });
+    match stored {
+        Ok(profiles) => (StatusCode::OK, Json(ApiResponse::success_with_message("ok", profiles))),
+        Err(code) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(code))),
+    }
+}
+
+pub async fn create_virtual_sim_profile_handler(
+    State(app): State<AppState>,
+    Json(request): Json<CreateVirtualSimRequest>,
+) -> (StatusCode, Json<ApiResponse<VirtualSimProfileView>>) {
+    use crate::connectivity::modems::ims::virtual_sim::{db, FiveCodes, OpMaterial, VirtualSim};
+    let key = match (request.op.as_deref(), request.opc.as_deref()) {
+        (Some(_), Some(_)) => Err("ims_virtual_sim_op_opc_conflict"),
+        (Some(op), None) => parse_hex_key(op).map(OpMaterial::Op),
+        (None, Some(opc)) => parse_hex_key(opc).map(OpMaterial::Opc),
+        (None, None) => Err("ims_virtual_sim_op_missing"),
+    };
+    let codes = key.and_then(|material| {
+        parse_hex_key(&request.ki).and_then(|ki| {
+            FiveCodes::new(
+                request.iccid.trim(), request.imsi.trim(), ki, material,
+                request.msisdn.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+            )
+        })
+    });
+    let codes = match codes {
+        Ok(codes) => codes,
+        Err(code) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(code))),
+    };
+    let line_id = virtual_line_id(&codes.iccid);
+    let stored = app.database.with_conn(|conn| db::store_profile(conn, &line_id, &codes.iccid, &codes));
+    if let Err(code) = stored {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(code)));
+    }
+    // Replace, so re-submitting the same ICCID updates instead of duplicating.
+    crate::connectivity::modems::ims::virtual_sim::remove_for_line(&line_id);
+    if let Err(code) =
+        crate::connectivity::modems::ims::virtual_sim::install_for_line(&line_id, VirtualSim::new(&codes.iccid, codes.clone()))
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(code)));
+    }
+    let view = view_of(&line_id, &codes, &codes.iccid);
+    (StatusCode::CREATED, Json(ApiResponse::success_with_message("created", view)))
+}
+
+pub async fn delete_virtual_sim_profile_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    use crate::connectivity::modems::ims::virtual_sim;
+    let removed = app.database.with_conn(|conn| virtual_sim::db::delete_profile(conn, &line_id));
+    match removed {
+        Ok(true) => {
+            virtual_sim::remove_for_line(&line_id);
+            (StatusCode::OK, Json(ApiResponse::success_with_message("deleted", ())))
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, Json(ApiResponse::error("ims_virtual_sim_profile_not_found"))),
+        Err(code) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(code))),
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct RotateVirtualSimResponse {
+    pub reencrypted: usize,
+    pub skipped: usize,
+}
+
+pub async fn rotate_virtual_sim_key_handler(
+    State(app): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<RotateVirtualSimResponse>>) {
+    use crate::connectivity::modems::ims::virtual_sim;
+    let rotated = app.database.with_conn(|conn| {
+        let (reencrypted, skipped) = virtual_sim::db::rotate_master_key(conn)?;
+        let (installed, failed) = virtual_sim::db::install_all(conn)?;
+        let _ = installed;
+        Ok(RotateVirtualSimResponse { reencrypted, skipped: skipped + failed })
+    });
+    match rotated {
+        Ok(report) => (StatusCode::OK, Json(ApiResponse::success_with_message("rotated", report))),
+        Err(code) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(code))),
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct Non3gppProviderView {
+    pub id: String,
+    pub label: String,
+    pub capabilities: Vec<String>,
+    pub availability: String,
+}
+
+pub async fn get_non_3gpp_providers_handler(
+) -> (StatusCode, Json<ApiResponse<Vec<Non3gppProviderView>>>) {
+    use crate::connectivity::modems::ims::non_3gpp_voice;
+    let providers = non_3gpp_voice::registry()
+        .descriptors()
+        .into_iter()
+        .map(|descriptor| Non3gppProviderView {
+            id: descriptor.id.to_string(),
+            label: descriptor.label.to_string(),
+            capabilities: descriptor
+                .capabilities
+                .iter()
+                .map(|capability| format!("{capability:?}").to_lowercase())
+                .collect(),
+            availability: "unknown".to_string(),
+        })
+        .collect();
+    (StatusCode::OK, Json(ApiResponse::success_with_message("ok", providers)))
+}

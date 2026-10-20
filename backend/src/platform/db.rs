@@ -3589,6 +3589,15 @@ impl Database {
         operation(&conn)
     }
 
+    /// Runs a closure with the shared connection. Callers must not hold it long.
+    pub(crate) fn with_conn<T>(
+        &self,
+        run: impl FnOnce(&Connection) -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        let conn = self.conn.lock().map_err(|_| "database_unavailable")?;
+        run(&conn)
+    }
+
     pub fn list_custom_carrier_profiles(&self) -> Result<Vec<CustomCarrierProfileEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(

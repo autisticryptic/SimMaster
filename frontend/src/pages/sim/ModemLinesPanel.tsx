@@ -18,7 +18,7 @@ import {
   Typography,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import { CellTower, CheckCircle, ErrorOutline, FlightTakeoff, Lan, Refresh, Replay, RadioButtonUnchecked, History, SettingsEthernet, TravelExplore, Tune, Usb, Wifi } from '@mui/icons-material'
+import { Add, CellTower, CheckCircle, ErrorOutline, FlightTakeoff, Lan, Refresh, Replay, RadioButtonUnchecked, History, SettingsEthernet, TravelExplore, Tune, Usb, Wifi } from '@mui/icons-material'
 import {
   api,
   type LineNetworkControlsResponse,
@@ -30,10 +30,12 @@ import {
   type CellularImsProfileSelectionResponse,
   type VowifiLineConfigResponse,
   type VowifiRuntimeEventEntry,
+  type VirtualSimProfileView,
 } from '../../api/current'
 import { maskedIccid, modemSlotLabel, modemSlotSourceLabel, shortLineId, stableModemSort } from '../../components/modemLineFormat'
 import TrunkProfileDialog from './TrunkProfileDialog'
 import VowifiLineDialog from './VowifiLineDialog'
+import VirtualSimDialog from './VirtualSimDialog'
 import DataProxyDialog from './DataProxyDialog'
 import CellularImsProfileDialog from './CellularImsProfileDialog'
 import { LineActivityLog, LineTrunkDetails, LineCellularImsDetails, LineVowifiDetails } from './LineRuntimeDetails'
@@ -274,6 +276,8 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   const [lines, setLines] = useState<CellularImsLineControlResponse[]>([])
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
+  const [virtualSimProfiles, setVirtualSimProfiles] = useState<VirtualSimProfileView[]>([])
+  const [virtualSimOpen, setVirtualSimOpen] = useState(false)
   const [vowifiEvents, setVowifiEvents] = useState<VowifiRuntimeEventEntry[]>([])
   const [activityMessages, setActivityMessages] = useState<SmsMessage[]>([])
   const [activityCalls, setActivityCalls] = useState<CallRecord[]>([])
@@ -767,16 +771,89 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     return <Box display="flex" justifyContent="center" alignItems="center" minHeight="35vh"><CircularProgress /></Box>
   }
 
+  const refreshVirtualSimProfiles = useCallback(async () => {
+    try {
+      const response = await api.getVirtualSimProfiles()
+      setVirtualSimProfiles(response.data ?? [])
+    } catch {
+      setVirtualSimProfiles([])
+    }
+  }, [])
+
+  useEffect(() => {
+    void refreshVirtualSimProfiles()
+  }, [refreshVirtualSimProfiles])
+
+  const removeVirtualSimProfile = useCallback(
+    async (lineId: string) => {
+      try {
+        await api.deleteVirtualSimProfile(lineId)
+      } finally {
+        await refreshVirtualSimProfiles()
+      }
+    },
+    [refreshVirtualSimProfiles],
+  )
+
   const renderLineList = () => (
     <Card sx={{ height: '100%', minHeight: { xs: 360, md: 560 }, maxHeight: { xs: 560, md: 'none' }, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
       <CardHeader
         title="线路"
         subheader={`${lines.length} 条已发现 · ${presentCount} 条在线`}
         titleTypographyProps={{ variant: 'subtitle1', fontWeight: 700 }}
-        action={<Tooltip title="刷新线路状态"><IconButton onClick={() => void load()} disabled={savingKey !== null}><Refresh /></IconButton></Tooltip>}
+        action={
+          <Stack direction="row" spacing={0.5} alignItems="center">
+            <Tooltip title="新建 WLAN 线路">
+              <IconButton onClick={() => setVirtualSimOpen(true)} disabled={savingKey !== null}>
+                <Add />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="刷新线路状态"><IconButton onClick={() => void load()} disabled={savingKey !== null}><Refresh /></IconButton></Tooltip>
+          </Stack>
+        }
         sx={{ pb: 1.25, flexShrink: 0 }}
       />
       <CardContent sx={{ pt: 0, px: 1.25, flex: 1, minHeight: 0, overflowY: 'auto' }}>
+        {virtualSimProfiles.length > 0 ? (
+          <Box sx={{ mb: 1.25 }}>
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
+              虚拟 SIM 线路
+            </Typography>
+            <Stack spacing={0.5}>
+              {virtualSimProfiles.map((profile) => (
+                <Stack
+                  key={profile.line_id}
+                  direction="row"
+                  alignItems="center"
+                  spacing={1}
+                  sx={{ px: 1.25, py: 0.75, borderRadius: 1, bgcolor: 'action.hover' }}
+                >
+                  <Wifi fontSize="small" color="disabled" />
+                  <Box minWidth={0} flex={1}>
+                    <Typography variant="body2" noWrap>
+                      {profile.line_id}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary" noWrap>
+                      ICCID …{profile.iccid_tail} · IMSI {profile.imsi_prefix}… · {profile.op_kind.toUpperCase()}
+                    </Typography>
+                  </Box>
+                  <Chip
+                    size="small"
+                    label={profile.installed ? '已启用' : '未启用'}
+                    color={profile.installed ? 'success' : 'default'}
+                    variant="outlined"
+                  />
+                  <Tooltip title="删除该虚拟线路">
+                    <IconButton size="small" onClick={() => void removeVirtualSimProfile(profile.line_id)}>
+                      <ErrorOutline fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                </Stack>
+              ))}
+            </Stack>
+            <Divider sx={{ mt: 1.25 }} />
+          </Box>
+        ) : null}
         <Box
           component="input"
           value={lineSearch}
@@ -1283,6 +1360,16 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
         line={editingVowifiLine}
         onClose={() => setEditingVowifiLine(null)}
         onSaved={handleVowifiSaved}
+      />
+      <VirtualSimDialog
+        open={virtualSimOpen}
+        onClose={() => setVirtualSimOpen(false)}
+        onSaved={(profile) => {
+          setVirtualSimProfiles((current) => [
+            ...current.filter((entry) => entry.line_id !== profile.line_id),
+            profile,
+          ])
+        }}
       />
       <CellularImsProfileDialog
         open={editingCellularImsProfileLineId !== null}

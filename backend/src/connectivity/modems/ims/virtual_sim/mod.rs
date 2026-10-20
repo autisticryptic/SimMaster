@@ -12,6 +12,7 @@
 //! interception (the baseband's card traffic is not visible to the host).
 pub mod milenage;
 pub mod sqn;
+pub mod db;
 pub mod store;
 
 pub use milenage::{Milenage, AUTN_LEN, AUTS_LEN, KEY_LEN};
@@ -131,6 +132,10 @@ pub fn remove_for_line(line_id: &str) -> bool {
 pub(crate) fn clear_for_test() {
     if let Ok(mut map) = registry().lock() { map.clear(); }
 }
+
+#[cfg(test)]
+#[path = "db_tests.rs"]
+mod db_tests;
 
 #[cfg(test)]
 #[path = "virtual_sim_tests.rs"]

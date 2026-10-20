@@ -233,6 +233,7 @@ jobs:
             connectivity::modems::ims::virtual_sim::milenage::tests \
             connectivity::modems::ims::virtual_sim::sqn::tests \
             connectivity::modems::ims::virtual_sim::store::tests \
+            connectivity::modems::ims::virtual_sim::db::tests \
             connectivity::modems::ims::virtual_sim::tests \
             connectivity::modems::ims::non_3gpp_voice::tests \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \

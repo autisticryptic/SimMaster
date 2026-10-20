@@ -55,6 +55,13 @@ pub enum ProviderAvailability {
 
 /// Runtime registry. Empty unless a provider is explicitly installed at
 /// startup; there is deliberately no auto-discovery.
+static REGISTRY: std::sync::OnceLock<ProviderRegistry> = std::sync::OnceLock::new();
+
+/// Process-wide registry used by the API. Empty until a provider is installed.
+pub fn registry() -> &'static ProviderRegistry {
+    REGISTRY.get_or_init(ProviderRegistry::new)
+}
+
 #[derive(Default)]
 pub struct ProviderRegistry {
     providers: RwLock<BTreeMap<&'static str, Box<dyn Non3gppVoiceProvider>>>,

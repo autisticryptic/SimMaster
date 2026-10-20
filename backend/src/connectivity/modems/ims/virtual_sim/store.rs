@@ -81,6 +81,9 @@ impl FiveCodes {
 
     pub fn ki(&self) -> &Key { &self.ki }
 
+    /// Whether the stored material is already OPc (no derivation needed).
+    pub fn is_opc(&self) -> bool { matches!(self.op, OpMaterial::Opc(_)) }
+
     /// Resolved OPc (deriving from OP when that is what was provisioned).
     pub fn opc(&self) -> Key {
         match self.op {
