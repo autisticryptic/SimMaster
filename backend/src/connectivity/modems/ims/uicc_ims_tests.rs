@@ -144,12 +144,12 @@ fn identity_source_policy_parses_only_explicit_values() {
 fn require_isim_fails_closed_instead_of_deriving() {
     for material in [IsimImsMaterial::default(), IsimImsMaterial { impi: None, ..configured() },
         IsimImsMaterial { domain: None, ..configured() }, IsimImsMaterial { impus: vec![], ..configured() }] {
-        assert_eq!(resolve_with(&material, false, false, IdentitySourcePolicy::RequireIsim),
-            Err("ims_identity_isim_required_missing"));
+        assert_eq!(resolve_with(&material, false, false, IdentitySourcePolicy::RequireIsim).err(),
+            Some("ims_identity_isim_required_missing"));
     }
     assert_eq!(resolve_ims_identity("001010123456789", USIM_AID_PREFIX, None,
-        "policy.example", "realm.example", false, false, IdentitySourcePolicy::RequireIsim),
-        Err("ims_identity_isim_required_missing"));
+        "policy.example", "realm.example", false, false, IdentitySourcePolicy::RequireIsim).err(),
+        Some("ims_identity_isim_required_missing"));
     let selected = resolve_with(&configured(), false, false, IdentitySourcePolicy::RequireIsim).unwrap();
     assert_eq!(selected.source, ImsIdentitySource::Isim);
     assert_eq!(selected.auth_aid, isim::ISIM_AID_PREFIX);
