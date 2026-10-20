@@ -31,7 +31,7 @@
 - reg-event 已实现并验证；仍需真实网络互通/设备验收。自定义或歧义 Contact 不猜绑定；不支持的订阅挑战、超时或 XML 缺口只停止/重同步观察，不伪造 REGISTER 丢失。
 - REGISTER rspauth 已验证；后续互通须单独验证真实服务器响应。现有范围仅 qop=auth/无 qop 和单一 Authorization scope，不宣称 auth-int、多重 origin/proxy 鉴权或非 REGISTER 业务已经支持。
 - **R9 ISIM刷新订阅已由e031849软件验证。** 独立只读 QMI UIM client 订阅 refresh（0x002A/0x002C/0x0033），忙时 deny≤20s；完成后重读 R5 快照，变化置 identity_stale，通话排空后重建；不支持则退回边界检查；仅蜂窝接入。同轮 Actions 验证通过。
-- **R8身份来源策略已由e031849软件验证。** `identity_source` 从声明标签变为行为开关：`auto`（默认，兼容旧标签）/`isim_required`（缺 ISIM 失败关闭）/`usim_derived`（忽略 ISIM，身份与 AKA 走 USIM）；AID 与策略一致，诊断如实。用于“ISIM 有内容但运营商不期望使用”的场景；两工作流/双架构、各 529 相关回归/86 场景通过。
+- **R8身份来源策略已由e031849软件验证。** `identity_source` 从声明标签变为行为开关：`auto`（默认，兼容旧标签）/`isim_required`（缺 ISIM 失败关闭）/`usim_derived`（忽略 ISIM，身份与 AKA 走 USIM）；AID 与策略一致，诊断如实。用于“ISIM 有内容但运营商不期望使用”的场景；两工作流/双架构、各 540 相关回归/86 场景通过。
 - **R7 XFRM原worker代次门禁已由d373ffa软件验证。** 安装、部分失败回滚、旧SA退役/重选/清理使用原捕获binding，不在检查后从handle重新bind；旧回包不能确认新进程成功或触发跨代删除。两套Actions/双架构、各522相关回归/86场景含5项实际worker队列/回包回归通过，342静态/mock通过；不改变算法/选择器或既有错误优先级。
 - **R6原承载PCO动态复核已由6672a64软件验证。** 无活动对话的续期边界查询原provider；仅完整非空同族候选可触发重选，未知/部分IPv6不冒认撤销。原端点仍在则保留；确认替换在同PDN/worker新建REGISTER/SA并继承原IPsec/TLS，不借旧Digest，临时失败保留原截止/等待和旧端点显示，切换后重建观察器。两工作流/双架构、各517相关回归/86场景含8重选＋2时钟新回归通过；非PCO、WiFi IKE来源和活动对话不自动套用该策略。
 - **R5同卡材料新鲜度已由6203511软件验证。** 现有只读QMI/native AT/PCSC在REGISTER/AKA/续期/注销边界做两次稳定快照，旧材料变化/读取失败不借USIM缺省或旧租期混过；同卡重建不清等待，已发送计数不回退。两工作流/双架构、各507相关回归/86场景含19新回归通过；R6已有后继验证。实机/REFRESH事件订阅与特殊mode不由本项推断。
