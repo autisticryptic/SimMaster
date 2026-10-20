@@ -21,6 +21,9 @@ test('blocked hardware stays in the original selectable workbench with saved con
     if (!url.pathname.startsWith('/api/')) return route.continue()
     requests.push({ path: url.pathname, method: request.method() })
     if (url.pathname === '/api/cellular-ims/lines') return route.fulfill({ json: { status: 'ok', data: lines } })
+    // The line card also lists five-code WLAN lines; blocked hardware must not
+    // turn that read into an operational call.
+    if (url.pathname === '/api/ims/virtual-sim') return route.fulfill({ json: { status: 'ok', data: [] } })
     return route.fulfill({ status: 503, json: { status: 'error', message: 'fixture blocks operational API' } })
   })
   await page.goto('/e2e/fixtures/lines.html')
@@ -39,6 +42,7 @@ test('blocked hardware stays in the original selectable workbench with saved con
   await expect(page.getByTestId('original-basic-info')).toBeVisible()
   await expect(page.getByText('物理硬件已发现 · 仅供查看')).toHaveCount(0)
   await expect(page.getByRole('button', { name: '刷新硬件清单' })).toHaveCount(0)
-  expect(requests.every((request) => request.path === '/api/cellular-ims/lines' && request.method === 'GET')).toBe(true)
+  const allowedReads = new Set(['/api/cellular-ims/lines', '/api/ims/virtual-sim'])
+  expect(requests.every((request) => allowedReads.has(request.path) && request.method === 'GET')).toBe(true)
   await page.screenshot({ path: testInfo.outputPath('original-workbench-blocked.png'), fullPage: true })
 })
