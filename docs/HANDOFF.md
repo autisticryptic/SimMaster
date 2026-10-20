@@ -10,8 +10,13 @@
 4. 2026-10-07的部署授权已结束；本轮**未部署、未访问设备或写NV**。用户已手动开启并确认EC20分析ELF，可做只读IDA/静态分析，不修改IDB或扩大设备授权。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：R7原worker代次XFRM门禁待Actions；R5/R6已验证
-R7修正先检查旧binding、后用可变handle重取代次的窗口：安装、部分失败回滚、旧SA退役、重选与会话清理统一传原UeWorkerBinding，enqueue/回包双重门禁不向新进程发送旧命令。新增5项真实worker消息回归待验证，未设备操作。此前最终代码 **`6672a6415b146f9d62391ba2cf60d28cd2867140`** 已通过 Build **38996290697**、Beta **38996290632** 和 ARM64/AMD64；两套官方ZIP各 **517相关回归/86场景**，339静态/mock通过。R5同卡材料边界复核（19新测试）与R6空闲同PDN PCO重选（8生产测试＋2租期时钟测试）已接通；旧保护/计数/等待保留，失败不把新端点显示成已注册，切换后重建reg-event/MWI观察器。证据`.local/evidence/ims-pcscf-refresh/verified-6672a64.json`；前端未变，旧49单测/12browser制品复核而非重跑。R5两工作流Build38920636568/Beta38920636586与双架构通过；两套官方ZIP各507相关回归/86场景含19新测试、335静态/mock通过，报告`.local/evidence/ims-provisioning/verified-6203511.json`。注册/AKA/续期/注销边界两次稳定读取及owner复核，变化/读取失败不复用旧身份或提交租期，已发送nc/CSeq和同卡等待保留；首轮晚到变更计数缺口按真实断言修复留证。不声明实时REFRESH事件；R6原bearer动态P-CSCF继续。R4 **`0351006b79e4b83c93d39fb510c11516f256f44c`** 已通过 Build **38905460531**、Beta **38905460494** 和双架构；两套官方ZIP各 **488相关回归/86场景**含16项新真实注销/共享门禁测试，332静态/mock通过。发送前捕获同订阅状态，新503/Retry-After跨清理保留，晚到旧卡响应不写新卡；不重试注销或延长租期。首轮5项夹具误要求Contact独立expires已修正，失败原制品保留。报告`.local/evidence/ims-unregister-retry/verified-0351006.json`；前端未变，旧49单测/12browser制品重新核验而非重跑。
+## 当前：注册软件收尾完成，按用户要求停在实机验收前
+已验证代码 **`d373ffa3b311aa7ceeebcd988a2ec82b1910cf10`**：Build **38999487086**、Beta **38999487107**、ARM64/AMD64均成功；两套官方测试ZIP各 **522相关回归/86场景**，342静态/mock通过。报告`.local/evidence/ims-xfrm-worker-binding/verified-d373ffa.json`。
+- R7固定XFRM安装/回滚/旧SA退役/重选/清理的原worker binding；5项真实消息/排队/回包换代回归通过，旧命令不会被重新绑定到新进程。
+- R5同卡材料边界检查与R6同PDN PCO重选均保留：旧保护/计数/等待不丢，失败不伪造新端点已注册，切换后重建reg-event/MWI。R5首轮计数缺口已修复，完整历史见CHANGELOG及本地证据。
+- 双架构官方程序包已只读校验ZIP/包SHA、meta/ELF/嵌入提交、全文件清单及同run前端与安装资源；没有解包执行、安装或部署。报告`ims-xfrm-worker-binding/packages-verified-d373ffa.json`。前端未改，原49单测/12browser制品复核而非重跑。
+- 截至本次核查，本轮已确认的软件缺口与有界离线复核已闭环；仅留实机注册/自然续期/恢复及MM重枚举现场复现。已明确不支持的扩展组合不升级为新必做项，不宣称全部固件模式等价。
+
 R3 **`31d09ffd190a9dd79c15c7e9cf6a8fe58bce8d86`** 已通过 Build **38857492989**、Beta **38857493030** 与 ARM64/AMD64；两套官方ZIP各 **472项相关回归/86场景**，含10项新真实authenticator/worker/gateway-policy回归。初次AKA/ESP收到423交回原共享预算，保留保护通道/接收对并重算nc/proof，不重装SA。首轮缺Security-Server的测试夹具已修复留证，未放宽生产要求；328静态/mock通过。前端未改，复核ca38391的49单测/12browser制品，不冒称重跑。证据`.local/evidence/ims-initial-min-expires/verified-31d09ff.json`。仅继续本项目注册/固件查漏，不改独立catalog、扩诊断或操作设备。
 N8 **`22646c8df7f8d50c991d2b4910e49e28af8bee70`** 已通过 Build **38675465347**、Beta **38675465477**、Frontend **38675465467** 与双架构构建；两套官方测试ZIP各 **417项相关回归/86场景**、前端 **46单测/4browser**、17份源码指纹/摘要/原工作台截图已核验，报告`.local/evidence/ims-bearer-capabilities/verified-22646c8.json`。321静态/mock通过。认证需求/driver门禁、原CID P-CSCF地址/域名、保留原IPv6观察、opt-in DHCP信息请求、API脱敏/旧保存兼容均接通；browser首轮断言错误已修复留证。通用PCO策略写入、MM认证变更及DHCP地址分配仍明确unsupported，未部署/设备/IDA。
 
@@ -20,14 +25,11 @@ R2 最终代码 **`c3fb0361853388ebe551f50657a8786a1155a877`** 已通过 [Build-
 - WiFi 初次端点/头型、刷新、注销、profile batch/重连均执行同卡 not-before；端点地址、原 worker、租期和结构化失败与诊断分开。等待只保留到原截止，TCP死流/身份拒绝不因此保留。
 - API 按实际发送结果计失败轮次，轮询不增次数；清理保留已耗计数，只消费重建pending动作。换卡须正向确认，控制端口/worker变化不清等待。reg-event独立撤销serial防止晚到刷新重授旧ready。
 - 首轮过宽分类误关认证前404，已恢复原分类而保留真正的等待/认证后/423/死流门禁；旧测试未改且两套最终日志均通过，新增真实controller404回归。失败ZIP、annotations与`failure-closeout.json`保留。
-- **直接继续SimAdmin注册逻辑与EC20相关分支的差异复核；独立catalog不在本轮范围。** 不按未知raw bytes猜能力，不凭子阶段CI冒称注册兜底及固件查漏全部完成。
-
 ## 已验证：R1 刷新预算
 
 R1 代码 **`b6a78884600684b2f4c2b31aa5f2f2b08621f4a2`** 已通过 [Build-Release 38502470702](https://github.com/autisticryptic/SimMaster/actions/runs/38502470702)、[Validate Beta 38502470703](https://github.com/autisticryptic/SimMaster/actions/runs/38502470703) 和双架构构建；Release skipped。两套官方测试 ZIP 各 **257 项相关回归**及四矩阵 86 场景已核验，报告 `.local/evidence/ims-refresh-budget/verified-b6a7888.json`。前端构建输入与 N7 相同，原 43 单测/3browser 证据重新校验但未冒称本轮重跑 browser；未部署。
 
 真实刷新三候选共用 423 协商预算，结构化失败阶段/kind/Retry-After/Min-Expires 决定是否还能换头型；423→格式拒绝、新鉴权后400不重开候选，返回错误保留前序协商依据。正常首包格式兼容、423→2xx、旧 SA/租期/nonce/CSeq、503 等待和 TCP 死流处理保持。7 项新生产回归与 311 项静态/mock 通过。
-
 ## 已验证：N7 同源执行诊断
 
 已验证代码 **`ee9ee28a5f5ba49111234a905d6188c90d5ea7cf`**：[Build-Release 38399859012](https://github.com/autisticryptic/SimMaster/actions/runs/38399859012)、[Validate Beta 38399859071](https://github.com/autisticryptic/SimMaster/actions/runs/38399859071)、[Frontend Checks 38399859035](https://github.com/autisticryptic/SimMaster/actions/runs/38399859035) 和 ARM64/AMD64 success，Release skipped。两套官方测试 ZIP 各逐名核验 **250 项相关回归**、四矩阵 86 场景；前端 **43 单测 / 3 原工作台 browser**（0 skip/flaky）、源码指纹与官方 SHA/截图均已核验。报告 `.local/evidence/ims-execution-diagnostics/verified-ee9ee28.json`，未部署、未验收程序包或实机。
@@ -37,7 +39,6 @@ R1 代码 **`b6a78884600684b2f4c2b31aa5f2f2b08621f4a2`** 已通过 [Build-Releas
 - 首轮 `ee2b440` 的错误类型 import、Child-SA 配置路径和 Node lint 失败已修正；第二轮 `e5f4387` 的 browser fixture 缺顶层 `line_id` 已按真实 DTO 修正，没有放宽断言。原 annotations/官方失败 ZIP 保留，308 项本机静态/mock 检查通过。
 
 此前 N6 **`6c0c140`** 已验证 worker 内 SIP TCP、四向 TCP/IPsec、TLS1.2/1.3 与精确原 authority DNS/IP SAN、有界 DNS TC→TCP/NAPTR D2T；旧 UDP 和跨 profile 防降级保持。TLS 不绕过 required-IPsec，不冒称私有 CA、mTLS 或新的反向 TLS/IPsec 组合已支持。
-
 ## 已验证：reg-event
 
 N5 代码 **`3d54aa87b1cc0ae5f2294991a46ad2ce43984e6a`** 已通过 [Build-Release 38204249021](https://github.com/autisticryptic/SimMaster/actions/runs/38204249021) 与 [Validate Beta 38204249122](https://github.com/autisticryptic/SimMaster/actions/runs/38204249122)、ARM64/AMD64 构建；Publish Release skipped。两套测试 ZIP 官方摘要、各 143 项相关回归和 86 矩阵场景已核验，报告 `.local/evidence/ims-reg-event/verified-3d54aa8.json`。
@@ -46,7 +47,6 @@ N5 代码 **`3d54aa87b1cc0ae5f2294991a46ad2ce43984e6a`** 已通过 [Build-Releas
 - 相关绑定被撤销时先 ACK，再降低本接入 readiness；保留活动对话排空，恢复等待不因同卡 profile/worker/端口重编号而清除，新 SIM 不继承旧等待。MWI/REFER 原路径保持。
 - 初轮 Send/XML 编译问题、第二轮测试夹具缺命令消费者均已修复，失败记录保留；未部署或访问设备。
 - N6 DNS 子阶段 `0c1fff8` 的 TC→TCP/NAPTR UDP 已随完整 N6 继续验证；当前 SIP TCP/TLS/D2T 状态以本页顶部的 `6c0c140` 为准，不再把 DNS 子阶段限制当作当前能力。
-
 ## 已验证：REGISTER 响应认证
 
 已验证代码 **`3509e15474592f001fffde35f302fd3b45719c5a`**，已推送 `simmaster/master`；生产改动来自 `7054111`，后两次提交仅修正新测试 fixture。
@@ -61,7 +61,7 @@ N5 代码 **`3d54aa87b1cc0ae5f2294991a46ad2ce43984e6a`** 已通过 [Build-Releas
 
 上一阶段 AUTS/stale/跨候选 423 在 `344308c` 已验证；两套 Actions（[38138978950](https://github.com/autisticryptic/SimMaster/actions/runs/38138978950)、[38138978978](https://github.com/autisticryptic/SimMaster/actions/runs/38138978978)）各核验 46 项相关回归和四矩阵。独立 AKA 来源、受保护 stale 不重装旧 ESP、AUTS 不冒充证明、423 尝试级预算均保持；WiFi初次认证后423已由R3在31d09ff重新验证，不沿用此旧结果。
 
-**原报告六项及后续R1～R6均有软件验证；不等于实机或全固件等价。** 新离线汇编已定位P-CSCF当前节点/新列表比较分支；ISIM Refresh锚点确认属于状态文本匹配，不能伪造事件接口。R5是注册边界材料检查，R6是空闲续期时原PCO观察；实时UICC/PCO指示、其他来源动态DNS、未知mode/packet不自动宣称支持。实机首次/自然续期/注销/故障恢复仍需设备窗口，X1独立catalog和X2额外诊断不扩展。见[协议对照表](IMS_REGISTRATION_POLICY.md#ec20原报告注册缺口对照有界静态复核)。
+**原报告六项及后续R1～R7均有软件验证；不等于实机或全固件等价。** 新离线汇编已定位P-CSCF当前节点/新列表比较分支；ISIM Refresh锚点确认属于状态文本匹配，不能伪造事件接口。R5是注册边界材料检查，R6是空闲续期时原PCO观察；实时UICC/PCO指示、其他来源动态DNS、未知mode/packet不自动宣称支持。实机首次/自然续期/注销/故障恢复仍需设备窗口，X1独立catalog和X2额外诊断不扩展。见[协议对照表](IMS_REGISTRATION_POLICY.md#ec20原报告注册缺口对照有界静态复核)。
 
 ## 第一批：ISIM、P-CSCF 与临时拒绝补全
 

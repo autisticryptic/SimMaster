@@ -80,7 +80,7 @@ N7 另执行 `core::registration_diagnostics::tests`、`cellular_ims::runtime::d
 `vowifi::live::diagnostics_live::tests`，实际 cellular/WiFi 刷新观察位于现有 response-auth/refresh 过滤器；
 原生承载 observer 测试在 `native_bearer::tests`，统一状态 HTTP 契约在私有 D-Bus 中运行。
 刷新预算补漏的 `refresh_budget_tests` 与 TCP EOF/423 回归位于既有 `cellular_ims::live::refresh_tests` 执行过滤器；新增测试仍须逐名核验，不用静态 Python 守卫替代生产交换。R1 `b6a7888` 的两套日志各257项相关回归/四矩阵和双架构已核验，前端未变沿用并复核 N7 browser 源码证据，不冒称每次后端提交都重跑浏览器。
-R7执行 `cellular_ims::ipsec::worker_tests`：原binding入队/回包代次、已过期binding零命令、FIFO生命周期锁窗口、旧响应不跨代回滚，以及同代部分失败原错误保留；测试仅使用真实worker消息协议的内存响应器，不执行内核XFRM。
+R7 `d373ffa`两工作流/双架构、各522相关回归/86场景已核验；执行 `cellular_ims::ipsec::worker_tests`：原binding入队/回包代次、已过期binding零命令、FIFO生命周期锁窗口、旧响应不跨代回滚，以及同代部分失败原错误保留；测试仅使用真实worker消息协议的内存响应器，不执行内核XFRM。
 R6 `6672a64`两工作流/双架构、各517相关回归/86场景已核验；执行 `cellular_ims::live::pcscf_refresh::tests`：真实provider/worker/REGISTER、无PDN重激活、旧保护继承、临时等待、partial/source/worker负例；共享lease测试验证响应后的复核不能重置租期时钟。
 R5另执行 `uicc_ims::provisioning::tests`、`cellular_ims::live::refresh_tests::provisioning_tests`、`vowifi::live::response_auth_tests::provisioning_tests`；验证同卡变更/撕裂读取/读失败、实际REGISTER提交门禁、旧nonce/租期不升级及已收到等待保留，不将静态检查视为硬件事件支持。
 R4注销反馈（0351006已通过两套Actions/双架构、各488相关回归/86场景）另执行 `core::register_retry::unregister_tests`、`cellular_ims::live::refresh_tests::unregister_retry_tests`、`vowifi::live::response_auth_tests::retry_unregister_tests`；检查真实注销/清理/后继门禁与旧卡回包隔离，diagnostics hook不能写控制状态，静态守卫不代替Actions。

@@ -119,7 +119,7 @@
 `hmac-sha1-96` 与 `hmac-sha-1-96` 可按同一完整性算法比较，但保留原始 Security-Verify；
 不因此接受 MD5、未报价加密或放宽 AES-only 限制。XFRM 清理仅限自有 UE worker，禁止全局 flush。
 
-R7（待Actions）将XFRM安装/部分失败回滚/旧SA退役/重选/会话清理的API限定为原`UeWorkerBinding`。不能“检查旧binding后再从handle重新bind”；原代次在enqueue的lifecycle锁内以及回包后均核验，旧操作不会落入重启后的进程。稳定代次的部分失败仍仅反向删除同一plan，并保留安装的原始失败原因，不以清理错误覆盖。
+R7（d373ffa已软件验证）将XFRM安装/部分失败回滚/旧SA退役/重选/会话清理的API限定为原`UeWorkerBinding`。不能“检查旧binding后再从handle重新bind”；原代次在enqueue的lifecycle锁内以及回包后均核验，旧操作不会落入重启后的进程。稳定代次的部分失败仍仅反向删除同一plan，并保留安装的原始失败原因，不以清理错误覆盖。
 
 ### REGISTER 鉴权、响应认证与重试边界
 
