@@ -28,6 +28,21 @@ class VirtualSimContract(unittest.TestCase):
         self.assertIn('ims_virtual_sim_op_opc_mismatch', store)
         self.assertIn('MasterKey(<redacted>)', store)
 
+    def test_wifi_identity_uses_the_software_usim_without_reading_the_card(self):
+        live = (ROOT/'backend/src/connectivity/modems/ims/vowifi/live_identity.rs').read_text(encoding='utf-8')
+        self.assertIn('virtual_sim::for_line(line_id)', live)
+        self.assertIn('return load_virtual(line_id, profile, virtual_usim);', live)
+        load_virtual = live[live.index('fn load_virtual('):live.index('#[cfg(test)]\npub(super) fn selection_for_test(')]
+        # No card I/O on this path.
+        for forbidden in ['capture_card_binding', 'read_isim', 'qmi_uim', 'spawn_blocking']:
+            self.assertNotIn(forbidden, load_virtual)
+        self.assertIn('IdentitySourcePolicy::UsimDerived', load_virtual)
+        self.assertIn('virtual:', load_virtual)
+        # AKA and verification branch on the software USIM.
+        self.assertIn('profile.authenticate(rand, autn)?', live)
+        self.assertIn('ims_virtual_sim_changed', live)
+        self.assertIn('if self.virtual_usim.is_some() { return self.verify(line_id).await; }', live)
+
     def test_uses_standard_algorithms_only(self):
         text = (VS/'milenage.rs').read_text(encoding='utf-8')
         self.assertIn('use aes::Aes128', text)

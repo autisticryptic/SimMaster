@@ -10,6 +10,8 @@ pub(super) struct LiveImsSelection {
     card: UiccCardBinding,
     aid: Vec<u8>,
     provisioning: uicc_ims::provisioning::UiccImsProvisioning,
+    /// Five-code software USIM. When set, the card is never read.
+    virtual_usim: Option<Arc<crate::connectivity::modems::ims::virtual_sim::VirtualSim>>,
     #[cfg(test)]
     test_aka: Option<(super::super::qmi_uim::UsimAkaApduResult, Arc<std::sync::atomic::AtomicUsize>)>,
     isim: bool,
@@ -52,10 +54,19 @@ impl LiveImsSelection {
     }
 
     pub async fn verify(&self, line_id: &str) -> Result<(), &'static str> {
+        if let Some(profile) = &self.virtual_usim {
+            // Configuration identity, not a card read: the line must still own
+            // the same installed profile.
+            return match crate::connectivity::modems::ims::virtual_sim::for_line(line_id) {
+                Some(current) if Arc::ptr_eq(&current, profile) => Ok(()),
+                _ => Err("ims_virtual_sim_changed"),
+            };
+        }
         self.card.verify(&self.observe(line_id).await?)
     }
 
     pub async fn verify_registration(&self, line_id: &str) -> Result<(), &'static str> {
+        if self.virtual_usim.is_some() { return self.verify(line_id).await; }
         self.verify_reader_mapping(line_id)?;
         self.provisioning.verify_bound(&self.card, &self.device.modem_path,
             &live_runtime_config().qmi_proxy_socket).await?;
@@ -142,6 +153,9 @@ fn format_identity(
 
 pub(super) async fn load(line_id: &str, profile: &'static CarrierProfile)
     -> Result<Arc<LiveImsSelection>, LiveStageError> {
+    if let Some(virtual_usim) = crate::connectivity::modems::ims::virtual_sim::for_line(line_id) {
+        return load_virtual(line_id, profile, virtual_usim);
+    }
     let device = sim_device_for_line(line_id);
     let endpoint = if device.pcsc_reader.is_empty() { &device.qmi_device } else { &device.pcsc_reader };
     let card = uicc_ims::capture_card_binding(endpoint, device.uim_slot, &device.modem_path)
@@ -183,6 +197,54 @@ pub(super) async fn load(line_id: &str, profile: &'static CarrierProfile)
     Ok(selected)
 }
 
+/// Identity for a five-code subscription: no reader, no QMI/PCSC read. The
+/// derived identity follows the same standard rules as a USIM without ISIM.
+fn load_virtual(line_id: &str, profile: &'static CarrierProfile,
+    virtual_usim: Arc<crate::connectivity::modems::ims::virtual_sim::VirtualSim>)
+    -> Result<Arc<LiveImsSelection>, LiveStageError> {
+    let overrides = line_overrides(line_id);
+    let mut target = live_ims_target_from_overrides(profile, overrides.clone());
+    let explicit = !profiles::is_standard_derived_profile(profile);
+    let imsi = virtual_usim.codes().imsi.clone();
+    if !imsi.starts_with(profile.meta.plmn) {
+        return Err(live_stage_error("ims_identity_profile_mismatch"));
+    }
+    let resolved = uicc_ims::resolve_ims_identity(
+        &imsi, USIM_AID_PREFIX, None, &target.domain, &target.realm,
+        explicit || overrides.ims_domain.is_some(), explicit || overrides.ims_realm.is_some(),
+        uicc_ims::IdentitySourcePolicy::UsimDerived,
+    ).map_err(live_stage_error)?;
+    target.domain = resolved.identity.home_domain.clone();
+    target.realm = resolved.realm;
+    let card = UiccCardBinding {
+        endpoint: format!("virtual:{}", virtual_usim.profile_id()),
+        slot: 1,
+        owner: "virtual".into(),
+        iccid: virtual_usim.codes().iccid.clone(),
+        imsi: imsi.clone(),
+    };
+    let provisioning = uicc_ims::provisioning::UiccImsProvisioning::new(
+        crate::connectivity::modems::ims::cellular_ims::identity::UiccApplications {
+            usim_aid: Some(USIM_AID_PREFIX.to_vec()), isim_aid: None,
+        }, None).map_err(live_stage_error)?;
+    use crate::connectivity::core::registration_diagnostics::{FactSource, IdentityOrigin};
+    Ok(Arc::new(LiveImsSelection {
+        identity: LiveImsRegisterIdentity { shared: resolved.identity, shape: "virtual_five_codes" },
+        target,
+        device: sim_device_for_line(line_id),
+        card,
+        aid: USIM_AID_PREFIX.to_vec(),
+        provisioning,
+        virtual_usim: Some(virtual_usim),
+        #[cfg(test)]
+        test_aka: None,
+        isim: false,
+        diagnostic_identity: IdentityOrigin::UsimDerived,
+        diagnostic_domain: FactSource::Unknown,
+        diagnostic_realm: FactSource::Unknown,
+    }))
+}
+
 #[cfg(test)]
 pub(super) fn selection_for_test(
     line_id: &str, identity: LiveImsRegisterIdentity, target: LiveImsTarget,
@@ -195,7 +257,7 @@ pub(super) fn selection_for_test(
     register_line_sim_device(line_id, &device.qmi_device, device.uim_slot, &device.modem_path);
     uicc_ims::register_test_binding(&device.modem_path, card.clone());
     let provisioning = uicc_ims::provisioning::default_for_test(&device.modem_path, &card);
-    Arc::new(LiveImsSelection { identity, target, device, card, aid: USIM_AID_PREFIX.to_vec(), provisioning, test_aka: None, isim: false,
+    Arc::new(LiveImsSelection { identity, target, device, card, aid: USIM_AID_PREFIX.to_vec(), provisioning, virtual_usim: None, test_aka: None, isim: false,
         diagnostic_identity: crate::connectivity::core::registration_diagnostics::IdentityOrigin::UsimDerived,
         diagnostic_domain: crate::connectivity::core::registration_diagnostics::FactSource::Unknown,
         diagnostic_realm: crate::connectivity::core::registration_diagnostics::FactSource::Unknown })
