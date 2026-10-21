@@ -855,7 +855,7 @@ function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse
                       loading={simLoading}
                       sensitive
                       showSensitive={showSensitive}
-                      value={simInfo?.iccid || 'N/A'}
+                      value={simInfo?.iccid || virtualCodes?.iccid || 'N/A'}
                     />
                   </Grid>
                   <Grid size={6}>
@@ -864,36 +864,22 @@ function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse
                       loading={simLoading}
                       sensitive
                       showSensitive={showSensitive}
-                      value={simInfo?.imsi || 'N/A'}
+                      value={simInfo?.imsi || virtualCodes?.imsi || 'N/A'}
                     />
                   </Grid>
-                  <Grid size={12}>
-                    <InfoField
-                      label="设备 IMEI"
-                      loading={deviceLoading}
-                      sensitive
-                      showSensitive={showSensitive}
-                      value={deviceInfo?.imei || 'N/A'}
-                    />
-                  </Grid>
+                  {line.modem.line_kind === 'virtual' ? null : (
+                    <Grid size={12}>
+                      <InfoField
+                        label="设备 IMEI"
+                        loading={deviceLoading}
+                        sensitive
+                        showSensitive={showSensitive}
+                        value={deviceInfo?.imei || 'N/A'}
+                      />
+                    </Grid>
+                  )}
                   {line.modem.line_kind === 'virtual' ? (
                     <>
-                      <Grid size={6}>
-                        <InfoField
-                          label="ICCID"
-                          sensitive
-                          showSensitive={showSensitive}
-                          value={virtualCodes?.iccid || 'N/A'}
-                        />
-                      </Grid>
-                      <Grid size={6}>
-                        <InfoField
-                          label="IMSI"
-                          sensitive
-                          showSensitive={showSensitive}
-                          value={virtualCodes?.imsi || 'N/A'}
-                        />
-                      </Grid>
                       <Grid size={6}>
                         <InfoField
                           label="Ki"

@@ -18,7 +18,7 @@ import {
   Typography,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import { Add, CellTower, CheckCircle, ErrorOutline, FlightTakeoff, Lan, Refresh, Replay, RadioButtonUnchecked, History, SettingsEthernet, TravelExplore, Tune, Usb, Wifi } from '@mui/icons-material'
+import { Add, CellTower, DeleteOutline, CheckCircle, ErrorOutline, FlightTakeoff, Lan, Refresh, Replay, RadioButtonUnchecked, History, SettingsEthernet, TravelExplore, Tune, Usb, Wifi } from '@mui/icons-material'
 import {
   api,
   type LineNetworkControlsResponse,
@@ -897,6 +897,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
             // with normal lines. Only controls that require a cellular radio or
             // ModemManager object are hidden.
             const isReader = line.modem.line_kind === 'reader'
+            const isVirtual = line.modem.line_kind === 'virtual'
             const overviewControls = !isReader ? (
               <Card component="fieldset" disabled={Boolean(line.read_only)} sx={{ m: 0, p: 0, border: 0, minWidth: 0, flex: 1, height: '100%', display: 'flex', flexDirection: 'column' }}>
                 <CardHeader
@@ -905,9 +906,9 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                   titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
                   sx={{ pb: 0.75 }}
                 />
-                <CardContent sx={{ pt: 0, pb: '8px !important', flex: 1 }}>
-                  <Stack divider={<Divider flexItem />}>
-                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: '188px minmax(0, 1fr) 180px' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
+                <CardContent sx={{ pt: 0, pb: '8px !important', flex: 1, display: 'flex' }}>
+                  <Stack divider={<Divider flexItem />} sx={{ flex: 1, justifyContent: 'space-between', width: '100%' }}>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: '188px minmax(0, 1fr) 180px' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15, flex: 1 }}>
                       <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
                         <FlightTakeoff color={airplaneEnabled ? 'warning' : 'action'} fontSize="small" />
                         <Typography variant="body2" fontWeight={700} noWrap>飞行模式</Typography>
@@ -929,7 +930,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Box>
                     </Box>
 
-                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: '188px minmax(0, 1fr) 180px' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: '188px minmax(0, 1fr) 180px' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15, flex: 1 }}>
                       <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
                         <TravelExplore color={network?.roaming.roaming_allowed ? 'info' : 'disabled'} fontSize="small" />
                         <Typography variant="body2" fontWeight={700} noWrap>漫游数据</Typography>
@@ -960,7 +961,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Box>
                     </Box>
 
-                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: '188px minmax(0, 1fr) 180px' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: '188px minmax(0, 1fr) 180px' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15, flex: 1 }}>
                       <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
                         <Lan color="action" fontSize="small" />
                         <Typography variant="body2" fontWeight={700} noWrap>数据连接</Typography>
@@ -997,7 +998,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Box>
                     </Box>
 
-                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: '188px minmax(0, 1fr) 180px' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: '188px minmax(0, 1fr) 180px' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15, flex: 1 }}>
                       <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
                         <Replay color="action" fontSize="small" />
                         <Typography variant="body2" fontWeight={700} noWrap>重启基带</Typography>
@@ -1031,12 +1032,16 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                 <Card variant="outlined" sx={{ height: '100%', opacity: line.modem.present ? 1 : 0.84 }}>
                   <CardHeader
                     avatar={isReader ? <Usb color={line.modem.present ? 'primary' : 'disabled'} /> : <CellTower color={line.modem.present ? 'primary' : 'disabled'} />}
-                    title={isReader
-                      ? `读卡器 ${line.modem.slot_label || ''} · 卡槽 ${line.modem.uim_slot}`.trim()
-                      : `${modemSlotLabel(line.modem, index)} · 卡槽 ${line.modem.uim_slot} · ${line.modem.manufacturer || '未知厂商'} ${line.modem.model || ''}`}
-                    subheader={isReader
-                      ? `线路 ${shortLineId(line.modem.line_id)} · ${line.modem.model || '独立读卡器'}`
-                      : `线路 ${shortLineId(line.modem.line_id)} · ModemManager ${line.modem.modem_id}`}
+                    title={isVirtual
+                      ? `虚拟 SIM · ${maskedIccid(line.modem.sim_iccid)}`
+                      : isReader
+                        ? `读卡器 ${line.modem.slot_label || ''} · 卡槽 ${line.modem.uim_slot}`.trim()
+                        : `${modemSlotLabel(line.modem, index)} · 卡槽 ${line.modem.uim_slot} · ${line.modem.manufacturer || '未知厂商'} ${line.modem.model || ''}`}
+                    subheader={isVirtual
+                      ? `线路 ${shortLineId(line.modem.line_id)} · 五码虚拟 SIM（无模组）`
+                      : isReader
+                        ? `线路 ${shortLineId(line.modem.line_id)} · ${line.modem.model || '独立读卡器'}`
+                        : `线路 ${shortLineId(line.modem.line_id)} · ModemManager ${line.modem.modem_id}`}
                     sx={{
                       alignItems: 'flex-start',
                       flexWrap: { xs: 'wrap', sm: 'nowrap' },
@@ -1046,10 +1051,39 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                     titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
                     action={
                       <Stack direction="row" spacing={0.75} mt={{ xs: 1, sm: 0.5 }} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
-                        <Chip size="small" label={line.modem.present ? '在线' : '离线'} color={line.modem.present ? 'success' : 'default'} variant="outlined" />
-                        {line.modem.slot_conflict && <Chip size="small" label="槽位冲突" color="error" />}
-                        <Chip size="small" label={modemSlotSourceLabel(line.modem.slot_source, line.modem.slot_stable)} color={line.modem.slot_stable ? 'success' : 'warning'} variant="outlined" />
-                        <Chip size="small" label={`主线路 · ${supplementalStatus.vowifi === 'pending' ? '读取中' : voiceAccessLabel(line, vowifiLine)}`} color={vowifiLine?.runtime_registered || line.runtime.registered ? 'primary' : 'default'} variant="outlined" />
+                        {isVirtual ? (
+                          <>
+                            <Chip size="small" label={line.modem.present ? '已启用' : '未启用'} color={line.modem.present ? 'success' : 'default'} variant="outlined" />
+                            <Chip size="small" label="虚拟 SIM" color="info" variant="outlined" />
+                            <Chip size="small" label={vowifiLine?.runtime_registered ? 'VoWiFi' : 'VoWiFi 待注册'} color={vowifiLine?.runtime_registered ? 'primary' : 'default'} variant="outlined" />
+                            <Tooltip title="删除该虚拟线路">
+                              <IconButton
+                                size="small"
+                                color="error"
+                                onClick={() => {
+                                  if (!window.confirm('删除这条虚拟线路及其五码记录？')) return
+                                  void (async () => {
+                                    try {
+                                      await api.deleteVirtualSimProfile(line.modem.line_id)
+                                      await load(true)
+                                    } catch (err) {
+                                      setError(err instanceof Error ? err.message : String(err))
+                                    }
+                                  })()
+                                }}
+                              >
+                                <DeleteOutline fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          </>
+                        ) : (
+                          <>
+                            <Chip size="small" label={line.modem.present ? '在线' : '离线'} color={line.modem.present ? 'success' : 'default'} variant="outlined" />
+                            {line.modem.slot_conflict && <Chip size="small" label="槽位冲突" color="error" />}
+                            <Chip size="small" label={modemSlotSourceLabel(line.modem.slot_source, line.modem.slot_stable)} color={line.modem.slot_stable ? 'success' : 'warning'} variant="outlined" />
+                            <Chip size="small" label={`主线路 · ${supplementalStatus.vowifi === 'pending' ? '读取中' : voiceAccessLabel(line, vowifiLine)}`} color={vowifiLine?.runtime_registered || line.runtime.registered ? 'primary' : 'default'} variant="outlined" />
+                          </>
+                        )}
                       </Stack>
                     }
                   />
