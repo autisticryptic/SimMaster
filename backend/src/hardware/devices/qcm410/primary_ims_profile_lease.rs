@@ -1060,6 +1060,17 @@ fn require_no_bearer_receipts() -> Result<(), String> {
     Ok(())
 }
 
+/// A process whose network namespace differs from ours is a UE worker, not a
+/// competing SimAdmin instance.
+fn runs_in_ue_namespace(pid: u32) -> bool {
+    let theirs = fs::read_link(format!("/proc/{pid}/ns/net"));
+    let ours = fs::read_link("/proc/self/ns/net");
+    match (theirs, ours) {
+        (Ok(theirs), Ok(ours)) => theirs != ours,
+        _ => false,
+    }
+}
+
 fn require_stopped() -> Result<(), String> {
     require_no_bearer_receipts()?;
     // Maintenance must not race any manager process, including beta8 started
@@ -1074,6 +1085,12 @@ fn require_stopped() -> Result<(), String> {
             continue;
         };
         if pid == std::process::id() {
+            continue;
+        }
+        // UE workers are this same binary re-executed inside a per-line network
+        // namespace. They are children of the service, not a second instance,
+        // and an orphaned worker must not block recovery of the physical line.
+        if runs_in_ue_namespace(pid) {
             continue;
         }
         if let Ok(exe) = fs::read_link(item.path().join("exe")) {
