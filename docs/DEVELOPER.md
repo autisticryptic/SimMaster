@@ -203,7 +203,9 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 | `hosting.enrollment_confirmed` | 自有账号已经开通托管的确认 | 导入参数不代替服务端开通 |
 
 旧 `UserCallAssetsEntity` / `callAccountSipPassword` 是另一存储线索，格式需单独核实，
-不能假定等价于新版 `voip_status`。不把完整凭据贴进聊天或提交 Git；目前无需用户提取。
+不能假定等价于新版 `voip_status`。已确认新版是 SharedPreferences 字符串中的 Base64 Java 序列化对象，
+经 `ObjectInputStream.readObject` 取出；不在主机上反序列化任意 Java 对象。内部 `sipPassword` 仍需解码。
+不把完整凭据贴进聊天或提交 Git；目前无需用户提取。
 
 ### 4. 托管调用链与实现进度
 
@@ -213,7 +215,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 - 来电：`JCCall`；接收消息：同一 `JCClient` 上的 `JCMessageChannel`，
   App 接收回调进入 Realm/未读/通知。短信发送和服务端计费流程尚未确认。
 
-当前模块 `connectivity::modems::ims::jegotrip` 已新增 **外部凭据和 SDK 适配契约**：
+当前模块 `connectivity::modems::ims::jegotrip` 已新增 **外部凭据和 SDK 适配契约**（d6381b3）：
 配置输入脱敏、两阶段登录/托管状态、每线路/每代回调归属、到期/撤销使 readiness 失效。
 
 `GET /api/non-3gpp/providers/app_voice/credential-contract` 只返回字段说明和实现边界，
@@ -230,5 +232,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 3. 对接来电、接收短信至现有 trunk/消息工作流；发送行为和资费独立，不继承 IMS 免费假设。
 4. 用户有可用参数后，另行授权验证过期、掉线、并发设备、真实收短信及双向通话。
 
-当前只有静态证据和契约测试；没有设备、服务端或资费验收。详细方法引用与二进制指纹保存在
+当前只有静态证据和契约测试；没有设备、服务端或资费验收。
+Build 39600992021、Beta 39600991953 的官方摘要测试 ZIP 各 14 项新测试逐名通过，ARM64/AMD64 构建成功；
+本机 361 项静态/mock 通过。不是真实 SDK 通信测试。详细方法引用与二进制指纹保存在
 私有 `.local/jegotrip/offline-static-analysis.md` / `verified-dex-call-paths.json`，不提交 APK、DEX 或 SDK 库。
