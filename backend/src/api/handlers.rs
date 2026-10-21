@@ -9598,11 +9598,14 @@ async fn line_ims_access_decision_assuming(
         binding.state.as_str(),
         "registered" | "connected" | "connecting"
     );
+    // A five-code line has no cellular leg at all, so its VoWiFi intent is the
+    // existence of the line rather than a stored cellular profile.
+    let virtual_line = crate::connectivity::modems::ims::virtual_sim::is_virtual_line(line_id);
     decide(ImsAccessInputs {
         cellular_enabled: profile.enabled
             && profile.cellular_ims_connection_enabled
             && !profile.airplane_mode_enabled,
-        wlan_enabled: profile.enabled && profile.vowifi.enabled,
+        wlan_enabled: virtual_line || (profile.enabled && profile.vowifi.enabled),
         cellular_available: binding.present
             && line
                 .ims_registration
