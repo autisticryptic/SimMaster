@@ -6,7 +6,7 @@
 
 ## 当前基线与工作规则
 
-- 应用provider本轮迁到 `connectivity/app_voice/providers/{jegotrip,google_voice,telegram,imessage}`；无忧行controller接SDK两阶段/注销/失败时序待CI，旧IMS import兼容。DEX/JNI参数已确认但Linux wire帧未还原；继续native `Mtc_CliLogin`/`Mtc_SmgwUpdateStatus`等分析，必要时用户手开IDA。不把接口调度当作已能收短信/接打电话；暂不部署。
+- 应用provider本轮迁到 `connectivity/app_voice/providers/{jegotrip,google_voice,telegram,imessage}`；无忧行controller接SDK两阶段/注销/失败时序由31d3739双架构及两套Actions各8项controller回归验证，旧IMS import兼容。DEX/JNI参数已确认但Linux wire帧未还原；继续native `Mtc_CliLogin`/`Mtc_SmgwUpdateStatus`等分析，必要时用户手开IDA。不把接口调度当作已能收短信/接打电话；暂不部署。
 
 - **新增无忧行托管任务（静态分析）**：先走手动导入自有 root 手机凭据路线，不做登录/绑定 UI。SDK phone token 与 SIP 网关密码已定位；契约模块 d6381b3 已通过两套 Actions 各14项新测试/双架构；Linux backend、持久化/provider 接线、收短信/接打电话、计费/续期/设备并发仍未完成，不注册虚假 provider。详细参数与阶段见 [勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)；本轮不部署、不访问设备或无忧行服务。
 

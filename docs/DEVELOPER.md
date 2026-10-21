@@ -231,9 +231,9 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 `registry.rs` 只共享能力/可用性接口，不共享登录、号码格式、信令、媒体或计费。IMS旧import保留re-export兼容。
 后3项当前仅声明，iMessage只声明消息能力，不假扮运营商或语音服务。
 
-无忧行 `controller.rs` 本轮新增真实 SDK 适配调用序列：外部凭据导入不连网，start提交login；
+无忧行 `controller.rs` 新增真实 SDK 适配调用序列（31d3739 已验证）：外部凭据导入不连网，start提交login；
 SDK成功回调后才submit托管status=4，注销status=3后logout；请求/回调各有界超时，旧owner/错阶段忽略，
-没有backend明确Unavailable。此处验证的是适配调度，不是SDK网络帧，API仍 `transport_implemented=false`。
+没有backend明确Unavailable。Build39626186439/Beta39626186611双架构成功，官方摘要测试ZIP各14原凭据+8controller+6registry测试逐名通过，363静态/mock成功。此处验证的是适配调度，不是SDK网络帧，API仍 `transport_implemented=false`。
 
 独立Linux wire实现需继续分析用户APK的 `libmtc.so`：`Mtc_CliLogin`、`Mtc_SmgwUpdateStatus`、
 `Mtc_SmgwSendMessage`、`Mtc_SgwDeliSipInvite`、`Mtc_CallAnswer`/`Mtc_CallTerm` 及其agent/序列化/TLS调用链。
