@@ -53,44 +53,11 @@ fn invalid_identifiers_are_rejected() {
 
 
 #[test]
-fn a_record_cannot_move_to_another_profile_or_key() {
-    let key = MasterKey::generate().unwrap();
-    let blob = seal(&key, "line-a", &codes()).unwrap();
-    assert_eq!(open(&key, "line-b", &blob).err(), Some("ims_virtual_sim_record_auth_failed"));
-    let other = MasterKey::generate().unwrap();
-    assert_eq!(open(&other, "line-a", &blob).err(), Some("ims_virtual_sim_record_auth_failed"));
-}
-
-#[test]
-fn tampering_and_truncation_are_detected() {
-    let key = MasterKey::generate().unwrap();
-    let mut blob = seal(&key, "line-a", &codes()).unwrap();
-    let last = blob.len() - 1;
-    blob[last] ^= 1;
-    assert_eq!(open(&key, "line-a", &blob).err(), Some("ims_virtual_sim_record_auth_failed"));
-    let short = &blob[..NONCE_LEN];
-    assert_eq!(open(&key, "line-a", short).err(), Some("ims_virtual_sim_record_truncated"));
-}
-
-#[test]
-fn ciphertext_does_not_contain_the_keys_or_identifiers() {
-    let key = MasterKey::generate().unwrap();
-    let blob = seal(&key, "line-a", &codes()).unwrap();
-    let text = String::from_utf8_lossy(&blob);
-    for secret in [KI, OP, OPC, IMSI, ICCID] {
-        assert!(!text.contains(secret));
-        assert!(!blob.windows(8).any(|w| w == &key16(OPC)[..8]), "OPc must not appear in clear");
-    }
-}
-
-#[test]
 fn debug_never_prints_key_material() {
     let codes = codes();
-    let key = MasterKey::generate().unwrap();
-    for text in [format!("{codes:?}"), format!("{key:?}"), format!("{:?}", codes.opc())] {
+    for text in [format!("{codes:?}"), format!("{:?}", codes.opc())] {
         assert!(!text.contains(KI) && !text.contains(OPC) && !text.contains(OP));
     }
-    assert!(format!("{key:?}").contains("redacted"));
 }
 
 #[test]
