@@ -16,17 +16,20 @@ class VirtualSimContract(unittest.TestCase):
         ims = (ROOT/'backend/src/connectivity/modems/ims/mod.rs').read_text(encoding='utf-8')
         self.assertIn('pub mod virtual_sim;', ims)
 
-    def test_sqn_rule_and_key_rotation_hooks(self):
+    def test_sqn_rule_and_plain_record_format(self):
         sqn = (VS/'sqn.rs').read_text(encoding='utf-8')
         self.assertIn('pub fn accepts(self, network: Self) -> bool', sqn)
         self.assertIn('network.0 > self.0', sqn)
         self.assertIn('MASK48', sqn)
         store = (VS/'store.rs').read_text(encoding='utf-8')
-        # Master key is database-held by decision; encryption is at-rest only.
-        self.assertIn('AES_256_GCM', store)
-        self.assertIn('Aad::from(profile_id.as_bytes())', store)
+        # Records are plaintext on the host by explicit decision; keys still
+        # never reach logs or the API.
+        self.assertNotIn('AES_256_GCM', store)
+        self.assertNotIn('MasterKey', store)
         self.assertIn('ims_virtual_sim_op_opc_mismatch', store)
-        self.assertIn('MasterKey(<redacted>)', store)
+        self.assertIn('fn encode(&self) -> Vec<u8>', store)
+        self.assertIn('ims_virtual_sim_record_version_unsupported', store)
+        self.assertIn('op_kind', store)
 
     def test_wifi_identity_uses_the_software_usim_without_reading_the_card(self):
         live = (ROOT/'backend/src/connectivity/modems/ims/vowifi/live_identity.rs').read_text(encoding='utf-8')
