@@ -2148,10 +2148,6 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
                 .options(options_handler),
         )
         .route(
-            "/api/ims/virtual-sim/rotate",
-            post(rotate_virtual_sim_key_handler).options(options_handler),
-        )
-        .route(
             "/api/ims/virtual-sim/{line_id}",
             delete(delete_virtual_sim_profile_handler).options(options_handler),
         )

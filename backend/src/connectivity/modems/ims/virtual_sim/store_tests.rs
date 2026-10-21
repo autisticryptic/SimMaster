@@ -51,14 +51,6 @@ fn invalid_identifiers_are_rejected() {
     assert_eq!(spaced.iccid, ICCID);
 }
 
-#[test]
-fn seal_and_open_round_trip_with_the_same_profile() {
-    let key = MasterKey::generate().unwrap();
-    let blob = seal(&key, "line-a", &codes()).unwrap();
-    let opened = open(&key, "line-a", &blob).unwrap();
-    assert_eq!(opened, codes());
-    assert_eq!(opened.opc(), key16(OPC));
-}
 
 #[test]
 fn a_record_cannot_move_to_another_profile_or_key() {

@@ -15,9 +15,9 @@ pub mod sqn;
 pub mod db;
 pub mod store;
 
-pub use milenage::{Milenage, AUTN_LEN, AUTS_LEN, KEY_LEN};
+pub use milenage::{Milenage, AUTN_LEN, AUTS_LEN};
 pub use sqn::{Sqn, SQN_LEN};
-pub use store::{open, seal, FiveCodes, MasterKey, OpMaterial};
+pub use store::{FiveCodes, OpMaterial};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

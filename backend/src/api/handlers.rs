@@ -8864,9 +8864,6 @@ pub async fn get_cellular_ims_lines_handler(
     for status in app.line_registry.statuses().await {
         lines.push(build_cellular_ims_line_response(&app, status).await);
     }
-    // Five-code lines are listed by the virtual SIM endpoint, which carries the
-    // key-free identity; keeping them here would show a modem that does not exist.
-    lines.retain(|line| line.modem.line_kind != "virtual");
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message("Success", lines).into()),
@@ -16836,28 +16833,6 @@ pub async fn delete_virtual_sim_profile_handler(
             (StatusCode::OK, Json(ApiResponse::success_with_message("deleted", ())))
         }
         Ok(false) => (StatusCode::NOT_FOUND, Json(ApiResponse::error("ims_virtual_sim_profile_not_found"))),
-        Err(code) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(code))),
-    }
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct RotateVirtualSimResponse {
-    pub reencrypted: usize,
-    pub skipped: usize,
-}
-
-pub async fn rotate_virtual_sim_key_handler(
-    State(app): State<AppState>,
-) -> (StatusCode, Json<ApiResponse<RotateVirtualSimResponse>>) {
-    use crate::connectivity::modems::ims::virtual_sim;
-    let rotated = app.database.with_conn(|conn| {
-        let (reencrypted, skipped) = virtual_sim::db::rotate_master_key(conn)?;
-        let (installed, failed) = virtual_sim::db::install_all(conn)?;
-        let _ = installed;
-        Ok(RotateVirtualSimResponse { reencrypted, skipped: skipped + failed })
-    });
-    match rotated {
-        Ok(report) => (StatusCode::OK, Json(ApiResponse::success_with_message("rotated", report))),
         Err(code) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(code))),
     }
 }

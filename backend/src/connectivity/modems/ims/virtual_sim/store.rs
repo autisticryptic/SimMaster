@@ -1,16 +1,10 @@
-//! Five-code storage: strict parsing plus at-rest encryption.
+//! Five-code storage: strict parsing and the on-disk record format.
 //!
-//! Threat model (explicit): the master key lives in the database, so this is
-//! obfuscation at rest, not protection against a host compromise. It keeps Ki
-//! and OPc out of dumps, logs and accidental exports, and gives one place to
-//! rotate the key (re-encrypt every record).
-use ring::aead;
-use ring::rand::{SecureRandom, SystemRandom};
-
+//! Records are stored as plaintext on the host by explicit product decision:
+//! the subscription data already lives on this machine, and decrypting on every
+//! read only added latency. Keys are still never logged or returned by the API.
 use super::milenage::{self, Key, Milenage};
 
-pub const KEY_LEN: usize = 32;
-const NONCE_LEN: usize = 12;
 const FORMAT: u8 = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -115,7 +109,7 @@ impl FiveCodes {
         Self::new(iccid, imsi, ki, material, msisdn)
     }
 
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = vec![FORMAT];
         for text in [Some(self.iccid.as_str()), Some(self.imsi.as_str()), self.msisdn.as_deref()] {
             match text {
@@ -134,7 +128,7 @@ impl FiveCodes {
         out
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
         let mut cursor = 0usize;
         let mut take = |len: usize| -> Result<&[u8], &'static str> {
             let slice = bytes.get(cursor..cursor + len).ok_or("ims_virtual_sim_record_truncated")?;
@@ -170,74 +164,6 @@ impl FiveCodes {
         Self::new(texts[0].as_deref().unwrap_or_default(), texts[1].as_deref().unwrap_or_default(),
             ki, material, texts[2].as_deref())
     }
-}
-
-/// Database-held master key. 32 random bytes, generated on first use.
-#[derive(Clone)]
-pub struct MasterKey([u8; KEY_LEN]);
-
-impl std::fmt::Debug for MasterKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("MasterKey(<redacted>)")
-    }
-}
-
-impl MasterKey {
-    pub fn generate() -> Result<Self, &'static str> {
-        let mut bytes = [0u8; KEY_LEN];
-        SystemRandom::new().fill(&mut bytes).map_err(|_| "ims_virtual_sim_random_failed")?;
-        Ok(Self(bytes))
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
-        if bytes.len() != KEY_LEN {
-            return Err("ims_virtual_sim_key_invalid");
-        }
-        let mut key = [0u8; KEY_LEN];
-        key.copy_from_slice(bytes);
-        Ok(Self(key))
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
-    fn aead(&self) -> Result<aead::LessSafeKey, &'static str> {
-        let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, &self.0)
-            .map_err(|_| "ims_virtual_sim_key_invalid")?;
-        Ok(aead::LessSafeKey::new(unbound))
-    }
-}
-
-/// `nonce || ciphertext+tag`, with the profile id bound as AAD so a record
-/// cannot be moved to another profile.
-pub fn seal(key: &MasterKey, profile_id: &str, codes: &FiveCodes) -> Result<Vec<u8>, &'static str> {
-    let mut nonce = [0u8; NONCE_LEN];
-    SystemRandom::new().fill(&mut nonce).map_err(|_| "ims_virtual_sim_random_failed")?;
-    let mut buffer = codes.encode();
-    key.aead()?
-        .seal_in_place_append_tag(aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::from(profile_id.as_bytes()), &mut buffer)
-        .map_err(|_| "ims_virtual_sim_seal_failed")?;
-    let mut out = Vec::with_capacity(NONCE_LEN + buffer.len());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&buffer);
-    Ok(out)
-}
-
-pub fn open(key: &MasterKey, profile_id: &str, blob: &[u8]) -> Result<FiveCodes, &'static str> {
-    if blob.len() <= NONCE_LEN {
-        return Err("ims_virtual_sim_record_truncated");
-    }
-    let (nonce, ciphertext) = blob.split_at(NONCE_LEN);
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    nonce_bytes.copy_from_slice(nonce);
-    let mut buffer = ciphertext.to_vec();
-    let plain = key.aead()?
-        .open_in_place(aead::Nonce::assume_unique_for_key(nonce_bytes),
-            aead::Aad::from(profile_id.as_bytes()), &mut buffer)
-        .map_err(|_| "ims_virtual_sim_record_auth_failed")?;
-    FiveCodes::decode(plain)
 }
 
 #[cfg(test)]

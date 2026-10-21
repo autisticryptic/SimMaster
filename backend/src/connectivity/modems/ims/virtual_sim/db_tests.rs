@@ -1,14 +1,14 @@
-//! Persistence round-trip: sealing, rotation and startup installation.
+//! Persistence round-trip for five-code records.
 use super::*;
 use crate::platform::db::Database;
 
 fn temp_database() -> (Database, std::path::PathBuf) {
-    let path = std::env::temp_dir().join(format!("simadmin-virtual-sim-{}", uuid_like()));
+    let path = std::env::temp_dir().join(format!("simadmin-virtual-sim-{}", unique()));
     let _ = std::fs::remove_file(&path);
     (Database::new(path.clone()).expect("database"), path)
 }
 
-fn uuid_like() -> String {
+fn unique() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -28,18 +28,6 @@ fn codes() -> FiveCodes {
 }
 
 #[test]
-fn the_master_key_is_created_once_and_reused() {
-    let (database, path) = temp_database();
-    database.with_conn(|conn| {
-        let first = db::load_or_create_master_key(conn)?;
-        let second = db::load_or_create_master_key(conn)?;
-        assert_eq!(first.as_bytes(), second.as_bytes());
-        Ok(())
-    }).unwrap();
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
 fn a_stored_profile_round_trips_and_deletes() {
     let (database, path) = temp_database();
     database.with_conn(|conn| {
@@ -55,16 +43,27 @@ fn a_stored_profile_round_trips_and_deletes() {
 }
 
 #[test]
-fn rotation_reencrypts_and_keeps_every_record_readable() {
+fn storing_again_replaces_the_previous_record() {
     let (database, path) = temp_database();
     database.with_conn(|conn| {
         db::store_profile(conn, "virtual-1", "profile-1", &codes())?;
-        let before = db::load_or_create_master_key(conn)?.as_bytes().to_vec();
-        let (reencrypted, skipped) = db::rotate_master_key(conn)?;
-        assert_eq!((reencrypted, skipped), (1, 0));
-        let after = db::load_or_create_master_key(conn)?.as_bytes().to_vec();
-        assert_ne!(before, after, "rotation must change the key");
-        assert_eq!(db::open_profile(conn, "virtual-1")?, Some(codes()));
+        let updated = FiveCodes::new("8944000000000000002", "001010987654321",
+            [9u8; 16], OpMaterial::Opc([7u8; 16]), None).unwrap();
+        db::store_profile(conn, "virtual-1", "profile-2", &updated)?;
+        assert_eq!(db::list_profiles(conn)?.len(), 1);
+        assert_eq!(db::open_profile(conn, "virtual-1")?, Some(updated));
+        Ok(())
+    }).unwrap();
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_corrupt_record_is_reported_instead_of_guessed() {
+    let (database, path) = temp_database();
+    database.with_conn(|conn| {
+        db::store_profile(conn, "virtual-1", "profile-1", &codes())?;
+        conn.execute("UPDATE virtual_sim_profile SET sealed = X'00' WHERE line_id = 'virtual-1'", []).unwrap();
+        assert!(db::open_profile(conn, "virtual-1").is_err());
         Ok(())
     }).unwrap();
     let _ = std::fs::remove_file(path);
@@ -84,22 +83,5 @@ fn startup_install_registers_each_line_and_reports_failures() {
     assert_eq!(installed.codes().imsi, codes().imsi);
     assert!(for_line("virtual-2").is_none());
     super::clear_for_test();
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn sealed_records_are_bound_to_their_profile_id() {
-    let (database, path) = temp_database();
-    database.with_conn(|conn| {
-        db::store_profile(conn, "virtual-1", "profile-1", &codes())?;
-        // Moving the blob to another profile id must not decrypt.
-        let blob: Vec<u8> = conn
-            .query_row("SELECT sealed FROM virtual_sim_profile WHERE line_id = 'virtual-1'", [], |row| row.get(0))
-            .unwrap();
-        let key = db::load_or_create_master_key(conn)?;
-        assert!(store::open(&key, "profile-2", &blob).is_err());
-        assert!(store::open(&key, "profile-1", &blob).is_ok());
-        Ok(())
-    }).unwrap();
     let _ = std::fs::remove_file(path);
 }
