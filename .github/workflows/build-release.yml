@@ -555,6 +555,52 @@ jobs:
       # early build-matrix release step that can bypass failed tests.
 
   # ==================== 3. 汇总所有架构并发布 Release ====================
+  # Public download path for device deployment: GitHub requires authentication to
+  # download Actions artifacts, but a raw branch is readable. One orphan branch,
+  # force-pushed, so history never accumulates binaries.
+  publish-ci-artifacts:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [prepare, build, check-tests]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download frontend
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist/www
+
+      - name: Pack frontend
+        run: |
+          cd dist
+          tar -czf frontend-dist.tar.gz www
+
+      - name: Publish to ci-artifacts branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp dist/*.tar.gz out/
+          printf '%s\n' "$SHA" > out/COMMIT
+          cd out
+          sha256sum ./*.tar.gz > SHA256SUMS.txt
+          git init -q -b ci-artifacts
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -q -m "ci build $SHA"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-artifacts
+
   release:
     name: Publish Release
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && needs.prepare.outputs.publish_release == 'true'
