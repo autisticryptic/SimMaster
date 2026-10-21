@@ -53,7 +53,7 @@ export default function VirtualSimDialog({ open, onClose, onSaved }: Props) {
   const [accessKind, setAccessKind] = useState<AccessKind>('five_codes')
   const [draft, setDraft] = useState<Draft>(emptyDraft)
   const [providers, setProviders] = useState<Non3gppProviderView[]>([])
-  const [existing, setExisting] = useState<VirtualSimProfileView[]>([])
+
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -70,14 +70,6 @@ export default function VirtualSimDialog({ open, onClose, onSaved }: Props) {
       })
       .catch(() => {
         if (!cancelled) setProviders([])
-      })
-    api
-      .getVirtualSimProfiles()
-      .then((response) => {
-        if (!cancelled) setExisting(response.data ?? [])
-      })
-      .catch(() => {
-        if (!cancelled) setExisting([])
       })
     return () => {
       cancelled = true
@@ -227,52 +219,7 @@ export default function VirtualSimDialog({ open, onClose, onSaved }: Props) {
             </Typography>
           </Box>
 
-          {existing.length > 0 ? (
-        <Box>
-          <Typography variant="subtitle2" sx={{ mb: 1 }}>
-            已存在的虚拟线路
-          </Typography>
-          <Stack spacing={0.5}>
-            {existing.map((profile) => (
-              <Stack
-                key={profile.line_id}
-                direction="row"
-                alignItems="center"
-                spacing={1}
-                sx={{ px: 1.25, py: 0.75, borderRadius: 1, bgcolor: 'action.hover' }}
-              >
-                <Box minWidth={0} flex={1}>
-                  <Typography variant="body2" noWrap>
-                    {profile.line_id}
-                  </Typography>
-                  <Typography variant="caption" color="text.secondary" noWrap>
-                    ICCID …{profile.iccid_tail} · IMSI {profile.imsi_prefix}… · {profile.op_kind.toUpperCase()}
-                  </Typography>
-                </Box>
-                <Button
-                  size="small"
-                  color="error"
-                  onClick={() => {
-                    void (async () => {
-                      try {
-                        await api.deleteVirtualSimProfile(profile.line_id)
-                        setExisting((current) => current.filter((entry) => entry.line_id !== profile.line_id))
-                        onSaved(profile)
-                      } catch (deleteError) {
-                        setError(describeError(deleteError))
-                      }
-                    })()
-                  }}
-                >
-                  删除
-                </Button>
-              </Stack>
-            ))}
-          </Stack>
-        </Box>
-      ) : null}
-
-      {error ? <Alert severity="error">{error}</Alert> : null}
+          {error ? <Alert severity="error">{error}</Alert> : null}
         </Stack>
       </DialogContent>
       <DialogActions>

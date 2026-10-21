@@ -1011,11 +1011,15 @@ impl LineRuntimeRegistry {
                     continue;
                 }
                 let binding = virtual_line_binding(line_id);
-                let voice_policy = self
-                    .config_manager
-                    .as_ref()
-                    .map(|config| config.get_line_voice_path_policy(line_id))
-                    .unwrap_or_default();
+                // No modem means no circuit-switched leg at all: only VoWiFi may
+                // be selected for this line.
+                let voice_policy = crate::platform::config::VoicePathPolicy {
+                    priority: vec![crate::platform::config::PathLayerConfig {
+                        kind: crate::platform::config::AccessPathKind::Vowifi,
+                        enabled: true,
+                    }],
+                    gateway_mode: true,
+                };
                 let line = Arc::new(LineRuntime::new_for_device(
                     binding,
                     Arc::new(CellularImsRuntime::new()),
@@ -1106,6 +1110,12 @@ impl LineRuntimeRegistry {
                 Self::publish_ue_context(line, &binding.line_id, prepared);
             }
             for line in &absent_lines {
+                // A five-code line only exists while its record exists; there is
+                // no hardware to wait for, so it is dropped instead of parked.
+                if line.binding().line_kind == "virtual" {
+                    lines.remove(&line.binding().line_id);
+                    continue;
+                }
                 line.mark_absent();
                 line.ims_access_network.clear("access_network_line_absent");
             }
