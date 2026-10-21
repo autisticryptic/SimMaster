@@ -161,6 +161,16 @@ export interface VirtualSimProfileView {
   installed: boolean
 }
 
+export interface VirtualSimDetailView {
+  line_id: string
+  iccid: string
+  imsi: string
+  ki: string
+  op_kind: string
+  op: string
+  msisdn: string | null
+}
+
 export interface CreateVirtualSimInput {
   iccid: string
   imsi: string
@@ -791,6 +801,12 @@ class SimAdminCurrentAPI {
       method: 'POST',
       body: JSON.stringify(input),
     })
+  }
+
+  async getVirtualSimDetail(lineId: string) {
+    return request<ApiResponse<VirtualSimDetailView>>(
+      `/ims/virtual-sim/${encodeURIComponent(lineId)}`,
+    )
   }
 
   async deleteVirtualSimProfile(lineId: string) {

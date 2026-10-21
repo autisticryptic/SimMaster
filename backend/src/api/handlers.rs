@@ -16782,6 +16782,49 @@ pub async fn get_virtual_sim_profiles_handler(
     }
 }
 
+/// Full record for one line. The UI shows these fields behind its own reveal
+/// toggle; nothing is logged and the response is never cached.
+#[derive(Debug, Default, Serialize)]
+pub struct VirtualSimDetailView {
+    pub line_id: String,
+    pub iccid: String,
+    pub imsi: String,
+    pub ki: String,
+    pub op_kind: String,
+    pub op: String,
+    pub msisdn: Option<String>,
+}
+
+fn hex_of(key: &[u8; 16]) -> String {
+    key.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub async fn get_virtual_sim_detail_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<VirtualSimDetailView>>) {
+    use crate::connectivity::modems::ims::virtual_sim::db;
+    let detail = app.database.with_conn(|conn| {
+        let Some(codes) = db::open_profile(conn, &line_id)? else {
+            return Err("ims_virtual_sim_profile_not_found");
+        };
+        let material = codes.raw_op();
+        Ok(VirtualSimDetailView {
+            line_id: line_id.clone(),
+            iccid: codes.iccid.clone(),
+            imsi: codes.imsi.clone(),
+            ki: hex_of(codes.ki()),
+            op_kind: if codes.is_opc() { "opc".to_string() } else { "op".to_string() },
+            op: hex_of(&material),
+            msisdn: codes.msisdn.clone(),
+        })
+    });
+    match detail {
+        Ok(view) => (StatusCode::OK, Json(ApiResponse::success_with_message("ok", view))),
+        Err(code) => (StatusCode::NOT_FOUND, Json(ApiResponse::error(code))),
+    }
+}
+
 pub async fn create_virtual_sim_profile_handler(
     State(app): State<AppState>,
     Json(request): Json<CreateVirtualSimRequest>,

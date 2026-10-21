@@ -45,7 +45,7 @@ import {
   Build,
 } from '@mui/icons-material'
 import { useSearchParams } from 'react-router-dom'
-import { api, type CellularImsLineControlResponse } from '../api/current'
+import { api, type CellularImsLineControlResponse, type VirtualSimDetailView } from '../api/current'
 import type { AutomationTarget, DeviceInfo, EsimReaderConfig, SimInfo } from '../api/types'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import GithubDownloadProxyControl from '../components/GithubDownloadProxyControl'
@@ -560,6 +560,28 @@ function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse
   const [deviceLoading, setDeviceLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showSensitive, setShowSensitive] = useState(false)
+  const [virtualCodes, setVirtualCodes] = useState<VirtualSimDetailView | null>(null)
+
+  // Five-code lines carry their own identity; the card shows it only when the
+  // user reveals sensitive fields.
+  useEffect(() => {
+    if (line.modem.line_kind !== 'virtual') {
+      setVirtualCodes(null)
+      return
+    }
+    let cancelled = false
+    api
+      .getVirtualSimDetail(line.modem.line_id)
+      .then((response) => {
+        if (!cancelled) setVirtualCodes(response.data ?? null)
+      })
+      .catch(() => {
+        if (!cancelled) setVirtualCodes(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [line.modem.line_id, line.modem.line_kind])
   const [simInfo, setSimInfo] = useState<SimInfo | null>(null)
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null)
   const loadVersion = useRef(0)
@@ -854,6 +876,50 @@ function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse
                       value={deviceInfo?.imei || 'N/A'}
                     />
                   </Grid>
+                  {line.modem.line_kind === 'virtual' ? (
+                    <>
+                      <Grid size={6}>
+                        <InfoField
+                          label="ICCID"
+                          sensitive
+                          showSensitive={showSensitive}
+                          value={virtualCodes?.iccid || 'N/A'}
+                        />
+                      </Grid>
+                      <Grid size={6}>
+                        <InfoField
+                          label="IMSI"
+                          sensitive
+                          showSensitive={showSensitive}
+                          value={virtualCodes?.imsi || 'N/A'}
+                        />
+                      </Grid>
+                      <Grid size={6}>
+                        <InfoField
+                          label="Ki"
+                          sensitive
+                          showSensitive={showSensitive}
+                          value={virtualCodes?.ki || 'N/A'}
+                        />
+                      </Grid>
+                      <Grid size={6}>
+                        <InfoField
+                          label={virtualCodes?.op_kind === 'op' ? 'OP' : 'OPc'}
+                          sensitive
+                          showSensitive={showSensitive}
+                          value={virtualCodes?.op || 'N/A'}
+                        />
+                      </Grid>
+                      <Grid size={12}>
+                        <InfoField
+                          label="MSISDN"
+                          sensitive
+                          showSensitive={showSensitive}
+                          value={virtualCodes?.msisdn || '未设置'}
+                        />
+                      </Grid>
+                    </>
+                  ) : null}
                 </Grid>
               </CardContent>
             </Card>

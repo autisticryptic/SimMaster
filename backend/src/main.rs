@@ -2149,7 +2149,9 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
         )
         .route(
             "/api/ims/virtual-sim/{line_id}",
-            delete(delete_virtual_sim_profile_handler).options(options_handler),
+            get(get_virtual_sim_detail_handler)
+                .delete(delete_virtual_sim_profile_handler)
+                .options(options_handler),
         )
         .route(
             "/api/non-3gpp/providers",
