@@ -5,7 +5,7 @@
 
 ## 1. 分支与编译约束
 
-- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::modems::ims::jegotrip::tests` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - 日常仅维护`master`，GitHub远端为`autisticryptic/SimMaster`（本地remote通常为`simmaster`）。
 - 不为每次验证长期留下分支。确需临时分支时，合并并确认提交已保留、CI通过后删除。
@@ -215,7 +215,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 - 来电：`JCCall`；接收消息：同一 `JCClient` 上的 `JCMessageChannel`，
   App 接收回调进入 Realm/未读/通知。短信发送和服务端计费流程尚未确认。
 
-当前模块 `connectivity::modems::ims::jegotrip` 已新增 **外部凭据和 SDK 适配契约**（d6381b3）：
+当前模块 `connectivity::app_voice::providers::jegotrip` 已新增 **外部凭据和 SDK 适配契约**（原 d6381b3，本轮迁目录）：
 配置输入脱敏、两阶段登录/托管状态、每线路/每代回调归属、到期/撤销使 readiness 失效。
 
 `GET /api/non-3gpp/providers/app_voice/credential-contract` 只返回字段说明和实现边界，
@@ -224,6 +224,21 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 **未实现** Linux SDK backend、凭据落库/API 导入、真实托管注册、收短信/接打电话、计费 UI。
 模块不是已可用 provider，不自动注册，不改变下拉框可用状态。Google Voice/Telegram 槽位保留。
 不能 dlopen APK 中 Android/AArch64 库冒充通用 Linux/AMD64 后端。
+
+## 应用通话 provider 目录与下一阶段
+
+`connectivity/app_voice/providers/` 下各 provider 独立目录：`jegotrip`、`google_voice`、`telegram`、`imessage`。
+`registry.rs` 只共享能力/可用性接口，不共享登录、号码格式、信令、媒体或计费。IMS旧import保留re-export兼容。
+后3项当前仅声明，iMessage只声明消息能力，不假扮运营商或语音服务。
+
+无忧行 `controller.rs` 本轮新增真实 SDK 适配调用序列：外部凭据导入不连网，start提交login；
+SDK成功回调后才submit托管status=4，注销status=3后logout；请求/回调各有界超时，旧owner/错阶段忽略，
+没有backend明确Unavailable。此处验证的是适配调度，不是SDK网络帧，API仍 `transport_implemented=false`。
+
+独立Linux wire实现需继续分析用户APK的 `libmtc.so`：`Mtc_CliLogin`、`Mtc_SmgwUpdateStatus`、
+`Mtc_SmgwSendMessage`、`Mtc_SgwDeliSipInvite`、`Mtc_CallAnswer`/`Mtc_CallTerm` 及其agent/序列化/TLS调用链。
+DEX已证明JNI参数但不含登录/托管网络封包。必要时用户手动打开IDA；本轮未连接IDA。
+准确导航符号/地址与JNI证据只留 `.local/jegotrip/next-native-analysis.md`，不硬编码到生产代码。
 
 ### 5. 下一阶段与验收条件
 

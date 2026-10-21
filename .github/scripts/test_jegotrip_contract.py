@@ -3,7 +3,8 @@ from pathlib import Path
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-MOD = ROOT / 'backend/src/connectivity/modems/ims/jegotrip'
+MOD = ROOT / 'backend/src/connectivity/app_voice/providers/jegotrip'
+APP = ROOT / 'backend/src/connectivity/app_voice'
 
 
 class JegotripContract(unittest.TestCase):
@@ -35,6 +36,28 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('self.phase == Phase::Hosted && self.incoming_call_channel', source)
         self.assertIn('pub fn outbound_authorized(&self) -> bool { false }', source)
 
+    def test_provider_directories_and_backward_compatible_aliases(self):
+        for name in ['jegotrip', 'google_voice', 'telegram', 'imessage']:
+            self.assertTrue((APP / 'providers' / name / 'mod.rs').is_file())
+        old = (ROOT / 'backend/src/connectivity/modems/ims/mod.rs').read_text(encoding='utf-8')
+        self.assertIn('pub use crate::connectivity::app_voice::providers::jegotrip;', old)
+        self.assertIn('registry as non_3gpp_voice', old)
+        self.assertFalse((ROOT / 'backend/src/connectivity/modems/ims/jegotrip').exists())
+        declarations = (APP / 'providers/mod.rs').read_text(encoding='utf-8')
+        self.assertIn('imessage::PROVIDER_ID => vec![VoiceCapability::Messaging]', declarations)
+
+    def test_controller_requires_a_backend_and_orders_sdk_stages(self):
+        source = (MOD / 'controller.rs').read_text(encoding='utf-8')
+        self.assertIn('backend: Option<Arc<dyn HostingBackend>>', source)
+        self.assertIn('backend.login(owner.clone(), request)', source)
+        self.assertIn('backend.update_status(owner.clone(), STATUS_REGISTER, request)', source)
+        self.assertIn('backend.update_status(owner.clone(), STATUS_UNREGISTER, request)', source)
+        self.assertIn('backend.logout(owner)', source)
+        self.assertIn('tokio::time::timeout', source)
+        for name in ['beta-validation.yml', 'build-release.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::controller::tests',
+                          (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
     def test_api_only_returns_metadata_and_tests_are_selected(self):
         main = (ROOT / 'backend/src/main.rs').read_text(encoding='utf-8')
         self.assertIn('/api/non-3gpp/providers/app_voice/credential-contract', main)
@@ -45,7 +68,7 @@ class JegotripContract(unittest.TestCase):
         for forbidden in ['State(', 'with_conn(', '.login(', 'install(', 'reqwest']:
             self.assertNotIn(forbidden, body)
         for name in ['beta-validation.yml', 'build-release.yml']:
-            self.assertIn('connectivity::modems::ims::jegotrip::tests',
+            self.assertIn('connectivity::app_voice::providers::jegotrip::tests',
                           (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
 
 

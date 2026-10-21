@@ -6,9 +6,12 @@
 //! HTTP/SIP transport is provided. A real backend must implement the SDK path
 //! before this provider can be installed as available.
 pub mod credentials;
+pub mod controller;
 pub mod session;
 
+// Keep the existing API/provider id stable while moving the implementation.
 pub const PROVIDER_ID: &str = "app_voice";
+pub const LABEL: &str = "无忧行 / 应用语音";
 
 #[cfg(test)]
 mod tests;

@@ -61,11 +61,7 @@ pub enum ProviderAvailability {
 /// implementation keeps the same id, the UI keeps showing the same entry, and
 /// nothing has to guess a name. Listing them is not registration — they are
 /// reported as `Unsupported` and can never be selected for a call.
-pub const PLANNED_PROVIDERS: &[(&str, &str)] = &[
-    ("app_voice", "无忧行 / 应用语音"),
-    ("google_voice", "Google Voice"),
-    ("telegram_calls", "Telegram 通话"),
-];
+pub const PLANNED_PROVIDERS: &[(&str, &str)] = super::providers::RESERVED;
 
 static REGISTRY: std::sync::OnceLock<ProviderRegistry> = std::sync::OnceLock::new();
 
@@ -153,6 +149,29 @@ mod tests {
         let empty = ProviderDescriptor { id: "", label: "x", capabilities: vec![] };
         assert_eq!(registry.install(Box::new(Stub(empty))).err(), Some("ims_non_3gpp_provider_invalid"));
         assert_eq!(registry.descriptors(), vec![descriptor()]);
+    }
+
+    #[test]
+    fn reserved_ids_are_unique_and_never_install_a_provider() {
+        let mut ids = std::collections::BTreeSet::new();
+        for &(id, label) in PLANNED_PROVIDERS {
+            assert!(!id.is_empty() && !label.is_empty());
+            assert!(ids.insert(id), "duplicate reserved provider id");
+        }
+        assert_eq!(ids.len(), 4);
+        assert!(ProviderRegistry::new().is_empty());
+    }
+
+    #[test]
+    fn imessage_is_not_advertised_as_voice() {
+        let capabilities = super::super::providers::reserved_capabilities("imessage");
+        assert_eq!(capabilities, vec![VoiceCapability::Messaging]);
+        assert!(!capabilities.contains(&VoiceCapability::Voice));
+    }
+
+    #[test]
+    fn unknown_provider_has_no_invented_capabilities() {
+        assert!(super::super::providers::reserved_capabilities("not-installed").is_empty());
     }
 
     #[test]

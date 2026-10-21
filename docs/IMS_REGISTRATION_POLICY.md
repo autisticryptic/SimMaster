@@ -7,6 +7,8 @@
 
 ## 1. 范围与当前边界
 
+- 应用接入位于 `connectivity/app_voice`，与 `modems/ims` 并列。无忧行/Google Voice/Telegram/iMessage分别实现，不能共享AKA/CS兜底/资费；旧import仅兼容。无忧行controller调度SDK不等于实现wire transport，iMessage不是语音运营商。
+
 - 无忧行托管与 IMS/AKA 分离：SDK 会话 token 和 SIM 托管网关密码是两层凭据，可以不实现 App 登录 UI，但不能省略服务授权/开通/到期检查；[静态证据和必要参数](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。目前 d6381b3 只有适配契约（两套 Actions 各14项新测试通过），没有可用 Linux transport，不能宣称通话/SMS 就绪或套用 IMS 资费。
 
 - 蜂窝 IMS 是语音、短信、补充业务共享的接入；VoLTE/VoNR 是语音能力，不是注册开关。

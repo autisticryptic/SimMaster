@@ -1,6 +1,6 @@
 use super::{credentials::*, session::*};
 
-fn imported() -> ImportedCredentials {
+pub(super) fn imported() -> ImportedCredentials {
     serde_json::from_value(serde_json::json!({
         "sdk": {
             "account_identity": "fixture-account",

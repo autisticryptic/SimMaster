@@ -15,8 +15,9 @@
 pub mod access_network;
 pub mod cellular_ims;
 pub mod effective_profile;
-pub mod jegotrip;
-pub mod non_3gpp_voice;
+// Compatibility imports for older callers. Implementations live outside IMS.
+pub use crate::connectivity::app_voice::providers::jegotrip;
+pub use crate::connectivity::app_voice::registry as non_3gpp_voice;
 pub mod profile_override;
 pub mod uicc_ims;
 pub mod virtual_sim;

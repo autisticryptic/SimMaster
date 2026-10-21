@@ -16899,21 +16899,21 @@ pub struct Non3gppProviderView {
 
 pub async fn get_jegotrip_credential_contract_handler() -> (
     StatusCode,
-    Json<ApiResponse<crate::connectivity::modems::ims::jegotrip::credentials::CredentialContract>>,
+    Json<ApiResponse<crate::connectivity::app_voice::providers::jegotrip::credentials::CredentialContract>>,
 ) {
     // Static metadata only. No SDK initialization, account credentials or network I/O.
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
             "ok",
-            crate::connectivity::modems::ims::jegotrip::credentials::contract(),
+            crate::connectivity::app_voice::providers::jegotrip::credentials::contract(),
         )),
     )
 }
 
 pub async fn get_non_3gpp_providers_handler(
 ) -> (StatusCode, Json<ApiResponse<Vec<Non3gppProviderView>>>) {
-    use crate::connectivity::modems::ims::non_3gpp_voice;
+    use crate::connectivity::app_voice::registry as non_3gpp_voice;
     let installed = non_3gpp_voice::registry().descriptors();
     let reserved = non_3gpp_voice::PLANNED_PROVIDERS
         .iter()
@@ -16921,7 +16921,8 @@ pub async fn get_non_3gpp_providers_handler(
         .map(|(id, label)| Non3gppProviderView {
             id: id.to_string(),
             label: label.to_string(),
-            capabilities: vec!["voice".to_string()],
+            capabilities: crate::connectivity::app_voice::providers::reserved_capabilities(id)
+                .iter().map(|capability| format!("{capability:?}").to_lowercase()).collect(),
             availability: "unsupported".to_string(),
         })
         .collect::<Vec<_>>();

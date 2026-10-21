@@ -8,9 +8,13 @@
 //!     soft-stack ([`modems::ims`], VoLTE + VoWiFi); future turnkey chip
 //!     drivers (Quectel, UNISOC) become sibling units under `modems`.
 //!
+//!   - [`app_voice`] — application-specific providers (Jegotrip, Google Voice,
+//!     Telegram, iMessage); no SIM AKA, shared account credentials or IMS tariffs.
+//!
 //! Dependency direction is one-way: `modems` depends on `core`, never the
 //! reverse. This is the seam a future workspace split follows — `core` becomes a
 //! shared crate compiled into the binary, each `modems` unit an independent crate.
 
+pub mod app_voice;
 pub mod core;
 pub mod modems;

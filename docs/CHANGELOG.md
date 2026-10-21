@@ -5,6 +5,8 @@
 
 ## 1.1.5 主线
 
+- 应用通话目录隔离（本轮待CI）：无忧行迁至 `connectivity/app_voice/providers/jegotrip/`，Google Voice/Telegram/iMessage 各自独立目录；共享 registry 不共享账号/协议，旧 IMS import 用 re-export 兼容。无忧行新增 controller 调用 SDK 登录→托管注册→注销/退出，有限超时/回调归属/停止后换凭据；没有Linux wire backend不授ready。iMessage仅消息声明，所有未实现provider仍unsupported。本轮静态分析未访问设备/服务端。
+
 - 无忧行静态复核（d6381b3 已验证）：撤销“无 SIP 字符串即私有协议”和 `libmsc.so` 媒体栈推断；嵌套 DEX 证实 JusTalk SDK 会话使用 phone token，托管网关另用 `SipNumber`/`SipPwd` 等五字段。新增 `jegotrip` 外部凭据与两阶段 SDK 适配契约、归属/撤销/到期测试，元数据 API 明确 `transport_implemented=false`；登录 UI 暂缓，Linux backend/真实收短信和接打电话仍未实现。本轮无设备/服务端操作；两套 Actions/ARM64/AMD64 成功，官方摘要测试 ZIP 各 14 项新契约回归逐名成功，361 静态/mock 通过。见 [勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - R13（无模组线路 + 预留应用语音接口，417bfcb 已验证）：`LineRuntimeRegistry::refresh` 为每条已安装五码线路注入 `line_kind="virtual"` 的 `LineRuntime`（无 modem/port/reader），`virtual_line_binding` 只填身份字段；虚拟线路因此复用既有 VoWiFi 自动恢复、访问决策与诊断链路，且 `/api/cellular-ims/lines` 过滤掉它们避免重复展示；`non_3gpp_voice::PLANNED_PROVIDERS` 预留 `app_voice`/`google_voice`/`telegram_calls` 三个 id 与标签，接口返回 `unsupported`，不注册、不可选。

@@ -82,6 +82,7 @@ pub enum Phase {
     SdkLoginPending,
     SdkLoggedIn,
     HostingPending,
+    UnhostingPending,
     Hosted,
     CredentialExpired,
     AuthenticationFailed,
@@ -224,6 +225,26 @@ impl HostingSession {
             let owner = AttemptOwner { line_id: self.line_id.clone(), generation: self.generation };
             self.on_failure(&owner, BackendFailure::Expired);
         }
+    }
+
+    /// Retire login/hosting callbacks before teardown is submitted. The caller
+    /// still needs the gateway parameters to send STATUS_UNREGISTER.
+    pub fn begin_unhosting(&mut self) -> Result<(AttemptOwner, GatewayRegistration<'_>), &'static str> {
+        let owner = self.next_owner()?;
+        self.invalidate();
+        self.phase = Phase::UnhostingPending;
+        let hosting = &self.credentials.as_ref().ok_or("jegotrip_credentials_required")?.hosting;
+        Ok((owner, GatewayRegistration {
+            authname_prefix: hosting.authname_prefix.expose_to_backend(),
+            channel_id: hosting.channel_id.expose_to_backend(),
+            delete_int_code: &hosting.delete_int_code,
+            sip_number: hosting.sip_number.expose_to_backend(),
+            sip_password: hosting.sip_password.expose_to_backend(),
+        }))
+    }
+
+    pub fn current_owner(&self) -> AttemptOwner {
+        AttemptOwner { line_id: self.line_id.clone(), generation: self.generation }
     }
 
     pub fn clear(&mut self) -> Result<(), &'static str> {
