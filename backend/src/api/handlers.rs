@@ -3604,6 +3604,12 @@ async fn reconcile_line_data_health(
         return;
     };
     let binding = line.binding();
+    // A five-code line has no modem to poll: ModemManager has no object for it,
+    // so asking for its state every tick would only log an error.
+    if binding.line_kind == "virtual" {
+        watchdog.reset();
+        return;
+    }
     let profile = app.config_manager.get_line_profile(&binding.line_id);
     if !binding.present || !profile.enabled || profile.airplane_mode_enabled {
         watchdog.reset();
