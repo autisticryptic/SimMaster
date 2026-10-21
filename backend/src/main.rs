@@ -2154,6 +2154,10 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
                 .options(options_handler),
         )
         .route(
+            "/api/non-3gpp/providers/app_voice/credential-contract",
+            get(get_jegotrip_credential_contract_handler).options(options_handler),
+        )
+        .route(
             "/api/non-3gpp/providers",
             get(get_non_3gpp_providers_handler).options(options_handler),
         )

@@ -5,6 +5,8 @@
 
 ## 1. 分支与编译约束
 
+- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::modems::ims::jegotrip::tests` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+
 - 日常仅维护`master`，GitHub远端为`autisticryptic/SimMaster`（本地remote通常为`simmaster`）。
 - 不为每次验证长期留下分支。确需临时分支时，合并并确认提交已保留、CI通过后删除。
 - 不force-push主分支，不清理未知用户工作，不提交私有SIM材料、日志或凭据。
@@ -147,3 +149,86 @@ python3 -B offline-registration-sim/run.py --fallback --report offline-registrat
 [docs/README](README.md)列出固定主题入口。新事实更新相应手册和简短HANDOFF；
 历史验证只写[历史摘要](archive/README.md)，详细原始材料留Git历史及`.local`。
 不继续新增日期命名的多份“当前交接”、重复Prompt模板或逐工具调用流水账。
+
+
+## 无忧行托管：静态证据、凭据与实现边界
+
+本页只描述用户提供的 APK 静态分析，不代表已经连接无忧行、注册成功或收发过业务。
+目标是让 SimAdmin 接入托管收短信和接打电话；登录/号码绑定界面暂缓，由用户从自己的
+root 手机取得现有凭据。计费独立于 IMS；接电话/收短信免费是用户给定需求，非实网验证。
+
+### 1. 纠正旧勘察结论
+
+此前“没有 SIP 字符串，所以是私有协议”结论撤销；`libmsc.so` 也不是已确认的通话媒体库。
+
+- APK ZIP 内只有一个 `classes.dex`，但该文件内有多个合法 DEX：外层只有壳类，
+  App 类在嵌套 DEX，Juphoon SDK 类在另一嵌套 DEX。只看外层漏掉真实调用链。
+- `libidss-cn.so` 有保护/变换代码迹象，不能从名字认定为 IMS 信令栈。
+- `libmsc.so` 导出 `MSPLogin` / `QISRSessionBegin` / `QTTSSessionBegin`：是 iFLYTEK 语音模块，
+  其中 DTLS 字符串不构成无忧行媒体协议证据。
+- `libmtc.so` 是 JusTalk/Lemon SDK，依赖 `libzmf.so` 及 Android 系统库；
+  `Mtc_SgwDeliSipInvite`、`Mtc_SgwDeliSipSendMsg`、`receiveSipMESSAGE` 等正向证实 **SIP 网关支持**。
+  这不等于普通 SIP 客户端可以直接连服务器；REGISTER、鉴权、SBC/realm 和传输仍未确认。
+- HTTP 业务调用还出现 `requestWithEncrypt`，不能仅凭 JS 可读就认定控制面无需签名/解密。
+
+### 2. App 登录与托管是否强绑定
+
+**UI 可以分离，服务凭据不能省略。**
+
+普通 App 路径 `JustalkManager.login()` 先检查 `SysApplication.isLogin()`，再读取号码身份、
+`VoipStatus.sipPassword` 和 phone token。真正的 `JCClient.login(username, password)` 第二个参数
+是 **getPhoneToken()**，不是解码后的 SIP 密码。
+
+SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK 登录参数。
+另有 `loginUnLoginApp` 使用 `CallUserInfo.cstToken`，但已见调用用途包括免费/紧急呼叫；
+不能把它解释为“未登录也能无条件托管本人 SIM”。
+
+因此 SimAdmin 可以设计为“导入现有凭据 → SDK 会话 → 托管网关注册”，不实现登录 UI。
+是否实际可用仍取决于服务端托管开通、凭据有效性、设备/会话绑定以及续期。
+
+### 3. 手动取得的必要参数（只列名字，不提供用户或 App 内置值）
+
+| 参数 | 静态来源 | 用途 |
+|---|---|---|
+| `sdk.account_identity` | `getAreaCodeMobileNum` | SDK 会话身份，保留原区号格式 |
+| `sdk.phone_login_token` | SharedPreferences `wyx_phone_login_token` / `wyx_phone_login_token_key`；另一路 `CallUserInfo.cstToken` | SDK 登录凭据，不是 App 密码或 `SipPwd` |
+| `sdk.application_key` | `JCClient.create` 参数 | 匹配 SDK 应用配置 |
+| `sdk.server_address` | `config_key_server_address` | SDK 服务端配置，不要猜作 SIP SBC |
+| `sdk.root_der_base64` / `sdk.tls_only` | `config_key_root_der` / `config_key_use_tls_only` | 匹配部署信任与 TLS 策略 |
+| `sdk.device_id`（如已配置） | `config_key_device_id` | 保留原配置，设备绑定语义待验证 |
+| `sdk.expires_at_unix_seconds`（若已知） | 后续确认的 token 到期信息 | 未知时留空，不虚构永久有效 |
+| `hosting.sip_number` | `SipNumber` / `getAreaCodeMobileNum` | 被托管号码 |
+| `hosting.sip_password` | `voip_status.sipPassword` 经 `decryptThreeDESECB` 后 | 网关 `SipPwd`，不能直接拿缓存密文替代 |
+| `hosting.authname_prefix` / `hosting.channel_id` / `hosting.delete_int_code` | `AuthnamePrefix` / `ChannelId` / `DeleteIntCode` | 原部署网关参数，观察到均为字符串 |
+| `hosting.enrollment_confirmed` | 自有账号已经开通托管的确认 | 导入参数不代替服务端开通 |
+
+旧 `UserCallAssetsEntity` / `callAccountSipPassword` 是另一存储线索，格式需单独核实，
+不能假定等价于新版 `voip_status`。不把完整凭据贴进聊天或提交 Git；目前无需用户提取。
+
+### 4. 托管调用链与实现进度
+
+- SDK 登录：`JustalkManager → JCClientImpl → MtcEngine → Mtc_CliLogin`。
+- 托管注册：`RegisterTimer → JCAccount.updateStatus → Mtc_SmgwUpdateStatus`；
+  `STATUS_REGISTER=4`，`STATUS_UNREGISTER=3`。网关 JSON 是以上五个大小写准确的字段。
+- 来电：`JCCall`；接收消息：同一 `JCClient` 上的 `JCMessageChannel`，
+  App 接收回调进入 Realm/未读/通知。短信发送和服务端计费流程尚未确认。
+
+当前模块 `connectivity::modems::ims::jegotrip` 已新增 **外部凭据和 SDK 适配契约**：
+配置输入脱敏、两阶段登录/托管状态、每线路/每代回调归属、到期/撤销使 readiness 失效。
+
+`GET /api/non-3gpp/providers/app_voice/credential-contract` 只返回字段说明和实现边界，
+不初始化 SDK、不读取账号、不发送网络请求；明确 `transport_implemented=false`。
+
+**未实现** Linux SDK backend、凭据落库/API 导入、真实托管注册、收短信/接打电话、计费 UI。
+模块不是已可用 provider，不自动注册，不改变下拉框可用状态。Google Voice/Telegram 槽位保留。
+不能 dlopen APK 中 Android/AArch64 库冒充通用 Linux/AMD64 后端。
+
+### 5. 下一阶段与验收条件
+
+1. 继续确认 SDK 外线登录/网关帧、通知、注销、续期以及 Linux 兼容的实现路径。
+2. 实现完整 backend 后才接入凭据持久化、线路配置和 provider 注册。
+3. 对接来电、接收短信至现有 trunk/消息工作流；发送行为和资费独立，不继承 IMS 免费假设。
+4. 用户有可用参数后，另行授权验证过期、掉线、并发设备、真实收短信及双向通话。
+
+当前只有静态证据和契约测试；没有设备、服务端或资费验收。详细方法引用与二进制指纹保存在
+私有 `.local/jegotrip/offline-static-analysis.md` / `verified-dex-call-paths.json`，不提交 APK、DEX 或 SDK 库。

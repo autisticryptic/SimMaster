@@ -16897,6 +16897,20 @@ pub struct Non3gppProviderView {
     pub availability: String,
 }
 
+pub async fn get_jegotrip_credential_contract_handler() -> (
+    StatusCode,
+    Json<ApiResponse<crate::connectivity::modems::ims::jegotrip::credentials::CredentialContract>>,
+) {
+    // Static metadata only. No SDK initialization, account credentials or network I/O.
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "ok",
+            crate::connectivity::modems::ims::jegotrip::credentials::contract(),
+        )),
+    )
+}
+
 pub async fn get_non_3gpp_providers_handler(
 ) -> (StatusCode, Json<ApiResponse<Vec<Non3gppProviderView>>>) {
     use crate::connectivity::modems::ims::non_3gpp_voice;

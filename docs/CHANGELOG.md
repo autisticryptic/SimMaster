@@ -5,6 +5,8 @@
 
 ## 1.1.5 主线
 
+- 无忧行静态复核（本轮待 CI）：撤销“无 SIP 字符串即私有协议”和 `libmsc.so` 媒体栈推断；嵌套 DEX 证实 JusTalk SDK 会话使用 phone token，托管网关另用 `SipNumber`/`SipPwd` 等五字段。新增 `jegotrip` 外部凭据与两阶段 SDK 适配契约、归属/撤销/到期测试，元数据 API 明确 `transport_implemented=false`；登录 UI 暂缓，Linux backend/真实收短信和接打电话仍未实现。本轮无设备/服务端操作。见 [勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+
 - R13（无模组线路 + 预留应用语音接口，417bfcb 已验证）：`LineRuntimeRegistry::refresh` 为每条已安装五码线路注入 `line_kind="virtual"` 的 `LineRuntime`（无 modem/port/reader），`virtual_line_binding` 只填身份字段；虚拟线路因此复用既有 VoWiFi 自动恢复、访问决策与诊断链路，且 `/api/cellular-ims/lines` 过滤掉它们避免重复展示；`non_3gpp_voice::PLANNED_PROVIDERS` 预留 `app_voice`/`google_voice`/`telegram_calls` 三个 id 与标签，接口返回 `unsupported`，不注册、不可选。
 - R12（五码虚拟 SIM 接线，426c2a7 已验证）：DB 表 `virtual_sim_key`/`virtual_sim_profile`；`virtual_sim/db.rs` 主密钥自举、密封读写、删除、单事务全量重加密、启动 `install_all`；接口 `GET/POST /api/ims/virtual-sim`、`DELETE /api/ims/virtual-sim/{line_id}`、`POST /api/ims/virtual-sim/rotate`、`GET /api/non-3gpp/providers`（响应永不含 Ki/OPc）；前端线路卡片 `+` 新建 WLAN 线路、五码弹窗（接入类型下拉、OP/OPc 二选一、保存后清空密钥）、虚拟线路与模组线路同列表展示、主密钥轮换按钮。两工作流/双架构 + 前端 Playwright 全绿。
 - R11（virtual SIM 存储/接口，34100f7已验证）：`virtual_sim/sqn.rs`（48 位 SQN、严格新值校验、AUTS 用 next）、`virtual_sim/store.rs`（五码严格解析、OP/OPc 二选一并校验一致、AES-256-GCM 落库加密、AAD 绑定 profile 防止记录挪用、密钥轮换入口）、`non_3gpp_voice.rs`（非 3GPP 应用语音的**契约占位**，默认零注册）。两工作流/双架构、各 566 项相关回归/86 场景通过。

@@ -235,6 +235,7 @@ jobs:
             connectivity::modems::ims::virtual_sim::store::tests \
             connectivity::modems::ims::virtual_sim::db_tests \
             connectivity::modems::ims::virtual_sim::tests \
+            connectivity::modems::ims::jegotrip::tests \
             connectivity::modems::ims::non_3gpp_voice::tests \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \
             connectivity::modems::ims::cellular_ims::security_agreement::tests \
