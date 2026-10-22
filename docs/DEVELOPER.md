@@ -247,7 +247,7 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 - controller在通知到达时检查凭据到期和monotonic deadline，过期优先、重复tick不改变原因；同名线路删除/重建有独立incarnation。先拒绝旧/未ready来源，再有界复制原始body/from/time字节，不lossy转UTF-8、不猜3GPP TPDU。发送成功、status2成功或ReconnectOk都不能确认本次托管或授予通道ready。
 - 两套Actions显式选中17凭据/会话、19controller、9codec、10native事件共55项回归由Build39747922739/Beta39747922813双架构通过，官方SHA测试ZIP逐名及四矩阵86场景核验；本机365静态/mock通过，报告`.local/jegotrip/verified-native-1d8d042.json`。不实现ARC/TLS完整封包、token续期、真实收短信或通话；provider仍不可用。静态证据只留`.local/jegotrip/ida-mcp-first-pass.md`，不提交APK/SDK库或运行偏移。
 
-### RPC封装、批次与结果（已实现待Actions）
+### RPC封装、批次与结果（5d4bbb0已验证）
 
 后续IDA构造函数/流长度/输入工厂/汇编交叉确认：type0字节必须在版本号前，不能只写BE16版本；1d8d042的55项CI通过不能证明原错误前缀等价于SDK，已独立留证并修正测试。请求参数有版本1/0，result stream不重复版本；terminal错误字符串必读，非空错误即使boolean=true也拒绝，后继可选property map保持脱敏。
 
@@ -255,7 +255,7 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 - `rpc_envelope.rs`：request为type0+positive call id+metadata+method+raw args；reply为type0+原call id+result code+raw result。均无socket/握手或readiness副作用。
 - `rpc_batch.rs`：`swapCalls.AccountEntry.Account`入参使用**loginSession返回**的user id/ARC session token、六个原顺序opaque词、signed int32索引request/result maps；外层bool/code不能代替每个托管结果，也不自动重试。`rpc_login.rs`只编码native已提供的两字符串/map并检验非空返回id/token，不猜输入身份/密码推导、expiry或刷新。
 - `rpc_pending.rs`：prepare记录原owner/注册或注销operation、单连接递增id与独立receive scope；reply仅完成原pending一次，旧连接/retired/duplicate/注销回包不确认注册，非零/坏result撤ready。controller回归串联实际encoder→envelope→tracker→ack→独立messages channel→原byte消息，仍为mock不是公网互通。
-- 95模块回归待两套Actions逐名核验（17session/20controller/12arguments/10native/8stream/6envelope/9batch/6login/7pending），366静态/mock通过。新`.local/jegotrip/ida-mcp-rpc-transport.md`记录原函数/构造/排序/结果/下层TLS取证，不提交库或偏移。
+- 95模块回归由Build39767535250/Beta39767535255两套Actions/双架构及官方SHA测试ZIP逐名核验（17session/20controller/12arguments/10native/8stream/6envelope/9batch/6login/7pending），四矩阵86场景通过，366静态/mock通过。报告`.local/jegotrip/verified-native-5d4bbb0.json`，只读核验器`verify_native_ci.py`不运行本机Rust。新`.local/jegotrip/ida-mcp-rpc-transport.md`记录原函数/构造/排序/结果/下层TLS取证，不提交库或偏移。
 
 已定位外层FF-FF/NetStream及`DataKeyTls=6`包装；TLS对象被嵌入自有帧，不能把TcpStream+rustls直接宣称兼容。压缩、分片、身份/auth/provisioning、batch epoch/ack/dedup/通知与业务尚需还原；provider/元数据仍明确不可用，本轮无设备/服务端/部署。
 

@@ -5,7 +5,7 @@
 
 ## 1.1.5 主线
 
-- 无忧行RPC封装/批次（已实现待Actions）：继续只读IDA定位type0流标记，修正1d8d042漏字节夹具；补Common request/reply、signed int32索引swapCalls请求/响应批次、loginSession入参/返回及terminal错误footer。原提交owner/operation与连接scope追踪精确reply，旧/重复/注销回包不授新hosting；消息与binary __magic原字节保留，解析长度/count/重复/trailing有界。95项模块回归待CI，366静态/mock通过。不能用通用TLS socket直接替代外层NetStream/FF-FF/DataKeyTls封装，ARC认证/续期与真实业务仍未实现，provider不启用，无部署。
+- 无忧行RPC封装/批次（5d4bbb0已验证）：继续只读IDA定位type0流标记，修正1d8d042漏字节夹具；补Common request/reply、signed int32索引swapCalls请求/响应批次、loginSession入参/返回及terminal错误footer。原提交owner/operation与连接scope追踪精确reply，旧/重复/注销回包不授新hosting；消息与binary __magic原字节保留，解析长度/count/重复/trailing有界。95项模块回归由Build39767535250/Beta39767535255及双架构通过，官方SHA测试ZIP逐名/四矩阵86场景核验；366静态/mock通过。不能用通用TLS socket直接替代外层NetStream/FF-FF/DataKeyTls封装，ARC认证/续期与真实业务仍未实现，provider不启用，无部署。
 
 - 无忧行原生适配（1d8d042已验证，stream前缀随后校正）：只读IDA确认托管参数的二进制版本/字节串/map排序及本地完成通知/cookie；新增RPC argument编码、字节保真的收消息适配，注册/注销同名通知按提交时operation隔离，重建同名线路用独立incarnation，交付边界检查过期/超时且过期优先。55项模块回归由Build39747922739/Beta39747922813两套Actions及双架构通过，官方摘要ZIP逐名核验、四矩阵86场景通过；365静态/mock通过；参数不是完整ARC/TLS帧，不启用provider、不声称真实托管/短信/通话可用；本轮未部署/访问设备或服务端。
 
