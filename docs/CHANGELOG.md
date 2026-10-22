@@ -5,7 +5,7 @@
 
 ## 1.1.5 主线
 
-- 无忧行ARC会话/packet子阶段（待Actions）：只读IDA纠正login/swap第二串为原选SDK session ID；phone token写metadata `pwd`、返回ARC token写`token`、SipPwd另用，不混四份材料。新增getAppConfigs、owned login/auth/swap及Common有界分片/FF FF 06 carrier、offline协议组合；一次绑定原ARC tracker/私有owned batch回包/terminal scope，错连接同序号不重绑，登录退休/失败清partial，ForceFlag保持0/ENC拒绝。139 Rust为源码清单尚未执行，两套filter已加入；368本机静态/mock通过。Router/NetStream/NetSsl socket/完整packet边界、可信TLS/部署解密/调度/网络入站/真实短信通话仍未实现，provider不启用，无设备/服务端/部署；不把子阶段或CI当整个任务完成。
+- 无忧行ARC会话/packet子阶段（684ef73已验证）：只读IDA纠正login/swap第二串为原选SDK session ID；phone token写metadata `pwd`、返回ARC token写`token`、SipPwd另用，不混四份材料。新增getAppConfigs、owned login/auth/swap及Common有界分片/FF FF 06 carrier、offline协议组合；一次绑定原ARC tracker/私有owned batch回包/terminal scope，错连接同序号不重绑，登录退休/失败清partial，ForceFlag保持0/ENC拒绝。Build39812859460/Beta39812859585实际各139模块回归与ARM64/AMD64成功；官方SHA测试ZIP精确逐名/四矩阵86场景核验，368本机静态/mock通过，Release skipped。Router/NetStream/NetSsl socket/完整packet边界、可信TLS/部署解密/调度/网络入站/真实短信通话仍未实现，provider不启用，无设备/服务端/部署；不把子阶段或CI当整个任务完成。
 
 - 无忧行RPC封装/批次（5d4bbb0已验证）：继续只读IDA定位type0流标记，修正1d8d042漏字节夹具；补Common request/reply、signed int32索引swapCalls请求/响应批次、loginSession入参/返回及terminal错误footer。原提交owner/operation与连接scope追踪精确reply，旧/重复/注销回包不授新hosting；消息与binary __magic原字节保留，解析长度/count/重复/trailing有界。95项模块回归由Build39767535250/Beta39767535255及双架构通过，官方SHA测试ZIP逐名/四矩阵86场景核验；366静态/mock通过。不能用通用TLS socket直接替代外层NetStream/FF-FF/DataKeyTls封装，ARC认证/续期与真实业务仍未实现，provider不启用，无部署。
 

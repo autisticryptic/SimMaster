@@ -260,7 +260,7 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 
 已定位外层FF-FF/NetStream及`DataKeyTls=6`包装；TLS对象被嵌入自有帧，不能把TcpStream+rustls直接宣称兼容。下层socket/路由/信任/握手/provisioning与真实业务仍未接通。
 
-### ARC会话与Common分片（已实现offline子阶段，尚待Actions验证）
+### ARC会话与Common分片（684ef73已验证offline子阶段）
 
 - 四份材料严格分层：导入phone token是login Common metadata `pwd`；原选session ID是login/swap方法第二串；login返回ARC token是后续metadata `token`；托管另用SipPwd。`SdkCredentials`可选字段缺失保持缺失，ARC层必须显式提供，≤127字节且不接受控制字符；不借device ID/密码或内置默认值替代。
 - `rpc_bootstrap.rs`只编解码getAppConfigs：true/zero code、opaque properties、AccountEntry/AccountAlive/UserEntry及footer；仅AccountEntry必须非空，不猜端点、TLS信任或到期。`rpc_login.rs`按native colon-first身份归一化且要求显式domain，不虚构账号种类。
@@ -268,7 +268,7 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 - 只读审查发现独立scope交接可误用另一ARC的同序号结果，已补私有构造`OwnedBatchReply`捕获原owner/scope；每ARC一次领取`HostingRpcTracker`并在提交前绑定，失败/退休/关闭/drop共享terminal scope使pending和留存旧reply失效。nested托管必须在swapCalls内；direct-envelope helper仅offline/mock，不能当native送socket路径。
 - `transport_packets.rs`纯codec需要一个**完整下层packet**：Common request0/reply1/ping2/release4/pong14；TLS模式分片阈值16382，首片BE32写原payload长度，分割length+4且末两片平衡。FF FF 06仅包装opaque TLS bytes；压缩Bzip2、legacy XOR/Kx/降级、非法fragment/oversize拒绝，组装错误永久关闭。不是任意TCP read或TLS read的分界器。
 - `arc_protocol.rs`只offline组合RPC与plaintext packet；先scope核验再parse，借用reply同步交付，controls不授登录/hosting，release/未实现server request关闭，login退休/失败清理partial buffer。需真正受信TLS引擎提供已确认的plaintext packet边界，不把carrier或控制码当成功。
-- 当前源码清单139 Rust（18凭据/21controller/12arguments/10native/8stream/6envelope/10batch/7login/13pending/6bootstrap/11arc session/10packets/7protocol）；**尚未执行通过**。两工作流新增四module filter；本机368静态/mock通过，`verify_native_ci.py`只下载官方SHA绑定ZIP逐名核验，不运行本机Rust。来源/私有review/evidence留`.local/jegotrip/`。
+- 代码`684ef73cdfdde2bed1c262a95bd6e871c14a6bd3`已由Build39812859460/Beta39812859585实际各139模块回归（18凭据/21controller/12arguments/10native/8stream/6envelope/10batch/7login/13pending/6bootstrap/11arc session/10packets/7protocol）、ARM64/AMD64构建验证，Release skipped；两套官方SHA绑定测试ZIP逐名精确139及四矩阵86场景通过，本机368静态/mock通过。新四module filter实际执行，报告`.local/jegotrip/verified-native-684ef73.json`；`verify_native_ci.py`只下载/核验，不运行本机Rust。保留compile dead-code/unused warnings如实，未接真实backend不消除unsupported声明。来源与私有review/evidence留`.local/jegotrip/`。
 - 下一项真实backend仍包括Router/NetStream/NetSsl socket与完整boundary、部署参数解密/可信端点、batch epoch/ACK/dedup调度、server-object入站、持久化/provider/runtime/API/trunk/SMS/calls/media/计费/续期/并发。`transport_implemented=false`/provider unsupported/外发授权false不变，本轮无设备或服务端访问。
 
 ### 5. 下一阶段与验收条件
