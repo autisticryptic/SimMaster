@@ -185,6 +185,41 @@ fn unverified_outbound_traffic_is_never_implicitly_authorized() {
 }
 
 #[test]
+fn expiry_is_idempotent_and_retires_the_original_owner_only_once() {
+    let mut session = HostingSession::new("line-a".into());
+    let owner = registered(&mut session);
+    session.on_channels(&owner, true, true);
+    session.check_expiry(200);
+    let expired_owner = session.current_owner();
+    assert_ne!(expired_owner, owner);
+    session.check_expiry(201);
+    session.check_expiry(u64::MAX);
+    assert_eq!(session.current_owner(), expired_owner);
+    assert_eq!(session.phase(), Phase::CredentialExpired);
+    assert!(!session.on_failure(&expired_owner, BackendFailure::Disconnected));
+    assert!(!session.on_channels(&owner, true, true));
+}
+
+#[test]
+fn a_notification_cannot_fail_an_imported_but_not_started_session() {
+    let mut session = HostingSession::new("line-a".into());
+    let owner = session.import(imported(), 100).unwrap();
+    assert!(!session.on_failure(&owner, BackendFailure::Disconnected));
+    assert_eq!(session.phase(), Phase::CredentialsImported);
+    assert_eq!(session.current_owner(), owner);
+}
+
+#[test]
+fn owner_debug_redacts_line_identity_and_recreated_sessions_are_distinct() {
+    let mut first = HostingSession::new("fixture-private-line".into());
+    let mut second = HostingSession::new("fixture-private-line".into());
+    let a = first.import(imported(), 100).unwrap();
+    let b = second.import(imported(), 100).unwrap();
+    assert_ne!(a, b);
+    assert!(!format!("{a:?}").contains("fixture-private-line"));
+}
+
+#[test]
 fn android_cached_password_field_cannot_silently_replace_the_decoded_password() {
     let mut value = serde_json::to_value(serde_json::json!({
         "sipPassword": "ciphertext", "sip_number": "fixture-number",

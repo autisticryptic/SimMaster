@@ -14,6 +14,7 @@ pub struct HostingController {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerFailure {
     Credentials(&'static str),
+    Notification(&'static str),
     Backend(BackendFailure),
     Timeout,
 }
@@ -74,8 +75,11 @@ impl HostingController {
     }
 
     /// Returns false for an old owner or a callback for the wrong stage.
-    pub async fn on_callback(&mut self, owner: &AttemptOwner, callback: Callback)
+    /// `now` is supplied by the scheduler's Unix clock; expiry and monotonic
+    /// deadlines are checked on delivery, not only during periodic polling.
+    pub async fn on_callback(&mut self, owner: &AttemptOwner, callback: Callback, now: u64)
         -> Result<bool, ControllerFailure> {
+        self.tick(now, Instant::now());
         match callback {
             Callback::SdkLogin { success } => {
                 if !self.session.on_sdk_login(owner, success) { return Ok(false); }
@@ -113,9 +117,36 @@ impl HostingController {
         }
     }
 
-    /// Called by a scheduler. Known expiry and missing callback revoke readiness.
+    /// Native notifications arrive from the local SDK adapter, not HTTP callers.
+    /// The owner and operation must be captured at submission. Messages preserve
+    /// bytes and must belong to a hosted ready channel; reject stale input before
+    /// decoding/copying so unrelated malformed notifications have no effect.
+    pub async fn on_native_notification(&mut self, owner: &AttemptOwner,
+        notification: super::native_events::NativeNotification<'_>, now: u64)
+        -> Result<Option<super::native_events::IncomingMessage>, ControllerFailure> {
+        use super::native_events::{decode, NativeEvent};
+        self.tick(now, Instant::now());
+        if !self.session.owns(owner) { return Ok(None); }
+        if notification.name == "MtcSmgwMessageRecvNotification"
+            && !self.session.accepts_incoming_message(owner) { return Ok(None); }
+        match decode(notification).map_err(ControllerFailure::Notification)? {
+            Some(NativeEvent::Callback(callback)) => {
+                self.on_callback(owner, callback, now).await?;
+                Ok(None)
+            }
+            Some(NativeEvent::IncomingMessage(message)) => Ok(Some(message)),
+            None => Ok(None),
+        }
+    }
+
+    /// Called by a scheduler and by callback/message delivery. Expiry takes
+    /// precedence over a simultaneous callback timeout and is idempotent.
     pub fn tick(&mut self, now: u64, monotonic_now: Instant) {
         self.session.check_expiry(now);
+        if !matches!(self.session.phase(), Phase::SdkLoginPending | Phase::HostingPending) {
+            self.pending_deadline = None;
+            return;
+        }
         if self.pending_deadline.is_some_and(|at| monotonic_now >= at) {
             let owner = self.session.current_owner();
             self.session.on_failure(&owner, BackendFailure::Disconnected);

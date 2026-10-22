@@ -237,6 +237,8 @@ jobs:
             connectivity::modems::ims::virtual_sim::tests \
             connectivity::app_voice::providers::jegotrip::tests \
             connectivity::app_voice::providers::jegotrip::controller::tests \
+            connectivity::app_voice::providers::jegotrip::rpc_arguments::tests \
+            connectivity::app_voice::providers::jegotrip::native_events::tests \
             connectivity::app_voice::registry::tests \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \
             connectivity::modems::ims::cellular_ims::security_agreement::tests \

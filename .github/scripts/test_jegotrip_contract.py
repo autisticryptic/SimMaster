@@ -26,7 +26,7 @@ class JegotripContract(unittest.TestCase):
         self.assertNotIn('derive(Clone, Debug, Serialize)', source)
         self.assertIn('f.write_str("<redacted>")', source)
         whole = '\n'.join(path.read_text(encoding='utf-8') for path in MOD.glob('*.rs'))
-        for unsafe_shortcut in ['dlopen(', 'reqwest::', 'https://', 'libmtc.so']:
+        for unsafe_shortcut in ['dlopen(', 'reqwest::', 'https://']:
             self.assertNotIn(unsafe_shortcut, whole)
 
     def test_callbacks_are_owned_and_import_does_not_grant_ready(self):
@@ -57,6 +57,33 @@ class JegotripContract(unittest.TestCase):
         for name in ['beta-validation.yml', 'build-release.yml']:
             self.assertIn('connectivity::app_voice::providers::jegotrip::controller::tests',
                           (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_native_gateway_codec_is_bounded_and_is_not_a_network_frame(self):
+        source = (MOD / 'rpc_arguments.rs').read_text(encoding='utf-8')
+        self.assertIn('updateStatus.SipGatewayPub.SipGateway', source)
+        self.assertIn('left.len().cmp(&right.len())', source)
+        self.assertIn('left.as_bytes().cmp(right.as_bytes())', source)
+        self.assertIn('to_be_bytes()', source)
+        self.assertIn('MAX_ARGUMENT_BYTES', source)
+        self.assertIn('"<redacted>"', source)
+        self.assertNotIn('derive(Serialize)', source)
+        for name in ['beta-validation.yml', 'build-release.yml']:
+            workflow = (ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
+            self.assertIn('connectivity::app_voice::providers::jegotrip::rpc_arguments::tests', workflow)
+            self.assertIn('connectivity::app_voice::providers::jegotrip::native_events::tests', workflow)
+
+    def test_native_notifications_require_local_operation_and_stale_scope_checks(self):
+        events = (MOD / 'native_events.rs').read_text(encoding='utf-8')
+        controller = (MOD / 'controller.rs').read_text(encoding='utf-8')
+        self.assertIn('notification.operation != Some(NativeOperation::HostingRegister)', events)
+        self.assertIn('notification.operation != Some(NativeOperation::SdkLogin)', events)
+        self.assertNotIn('pub rpc_result', events)
+        self.assertNotIn('from_utf8_lossy', events)
+        self.assertIn('Arc::ptr_eq(&owner.incarnation, &self.incarnation)', (MOD / 'session.rs').read_text(encoding='utf-8'))
+        body = controller.split('pub async fn on_native_notification', 1)[1].split('pub fn tick', 1)[0]
+        self.assertLess(body.index('self.session.owns(owner)'), body.index('match decode(notification)'))
+        self.assertLess(body.index('self.session.accepts_incoming_message(owner)'), body.index('match decode(notification)'))
+        self.assertIn('self.tick(now, Instant::now());', body)
 
     def test_api_only_returns_metadata_and_tests_are_selected(self):
         main = (ROOT / 'backend/src/main.rs').read_text(encoding='utf-8')

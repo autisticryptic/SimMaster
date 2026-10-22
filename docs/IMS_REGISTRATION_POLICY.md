@@ -424,6 +424,16 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 - 不据此实现任何写路径（PCO 策略写入仍缺自有 profile 回读证据），不声称已覆盖所有运营商的实网互通。详细报告：`.local/evidence/ims-em05-review/EM05_GLOBAL_REVIEW.md`。
 
 
+## 非3GPP应用通话与IMS的边界
+
+无忧行位于 `connectivity/app_voice/providers/jegotrip/`，不借用3GPP REGISTER/EAP-AKA或五码身份。
+已证实的 `updateStatus.SipGatewayPub.SipGateway` 参数编码仅为ObjectAgent入参，不是网络帧；
+只有完整ARC会话/认证/受信任传输和RPC结果分发还原后，才能启用真实backend。
+本地完成通知必须绑定提交时owner/operation（注册/注销通知名相同），不能凭名字或发送返回0认定托管成功。
+过期/超时与同名线路重建隔离保持；接收消息暂保留有界字节，未验证编码不lossy解码。
+登录、网关ack和通道ready分别检查；未确认发送路由/计费不默认授权外发，ReconnectOk不重授托管。
+本轮参数/native适配待Actions，真实短信/接打电话/provider仍未实现；详细证据与测试见[开发指南](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+
 ## 10. 验证清单与验收标准
 
 构建/Rust/注册模拟仅走 GitHub Actions，流程见 [开发指南](DEVELOPER.md)。

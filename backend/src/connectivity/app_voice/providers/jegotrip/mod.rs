@@ -7,6 +7,8 @@
 //! before this provider can be installed as available.
 pub mod credentials;
 pub mod controller;
+pub mod native_events;
+pub mod rpc_arguments;
 pub mod session;
 
 // Keep the existing API/provider id stable while moving the implementation.

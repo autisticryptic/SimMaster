@@ -5,7 +5,7 @@
 //! backends never return Available and imported credentials never grant readiness.
 use super::credentials::{ImportedCredentials, Secret};
 use serde::Serialize;
-use std::{fmt, future::Future, pin::Pin};
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 pub const STATUS_REGISTER: i32 = 4;
 pub const STATUS_UNREGISTER: i32 = 3;
@@ -69,10 +69,29 @@ pub trait HostingBackend: Send + Sync {
     fn logout(&self, owner: AttemptOwner) -> BackendFuture<'_>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Captured when an SDK operation is submitted, never recreated on receipt.
+/// The incarnation prevents callbacks from a deleted/recreated line from matching
+/// a new controller which happens to use the same line id and generation.
+#[derive(Clone)]
 pub struct AttemptOwner {
     line_id: String,
     generation: u64,
+    incarnation: Arc<()>,
+}
+
+impl PartialEq for AttemptOwner {
+    fn eq(&self, other: &Self) -> bool {
+        self.line_id == other.line_id && self.generation == other.generation
+            && Arc::ptr_eq(&self.incarnation, &other.incarnation)
+    }
+}
+
+impl Eq for AttemptOwner {}
+
+impl fmt::Debug for AttemptOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AttemptOwner").field("generation", &self.generation).finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +112,7 @@ pub enum Phase {
 pub struct HostingSession {
     line_id: String,
     generation: u64,
+    incarnation: Arc<()>,
     credentials: Option<ImportedCredentials>,
     phase: Phase,
     incoming_call_channel: bool,
@@ -111,7 +131,7 @@ impl fmt::Debug for HostingSession {
 
 impl HostingSession {
     pub fn new(line_id: String) -> Self {
-        Self { line_id, generation: 0, credentials: None, phase: Phase::Unconfigured,
+        Self { line_id, generation: 0, incarnation: Arc::new(()), credentials: None, phase: Phase::Unconfigured,
             incoming_call_channel: false, incoming_message_channel: false }
     }
 
@@ -121,8 +141,14 @@ impl HostingSession {
     }
 
     fn next_owner(&mut self) -> Result<AttemptOwner, &'static str> {
-        self.generation = self.generation.checked_add(1).ok_or("jegotrip_generation_exhausted")?;
-        Ok(AttemptOwner { line_id: self.line_id.clone(), generation: self.generation })
+        let Some(next) = self.generation.checked_add(1) else {
+            self.invalidate();
+            self.credentials = None;
+            self.phase = Phase::Unconfigured;
+            return Err("jegotrip_generation_exhausted");
+        };
+        self.generation = next;
+        Ok(self.current_owner())
     }
 
     pub fn import(&mut self, credentials: ImportedCredentials, now: u64) -> Result<AttemptOwner, &'static str> {
@@ -148,8 +174,9 @@ impl HostingSession {
         Ok(owner)
     }
 
-    fn owns(&self, owner: &AttemptOwner) -> bool {
+    pub(super) fn owns(&self, owner: &AttemptOwner) -> bool {
         owner.line_id == self.line_id && owner.generation == self.generation
+            && Arc::ptr_eq(&owner.incarnation, &self.incarnation)
     }
 
     pub fn login_request(&self, owner: &AttemptOwner) -> Result<SdkLoginRequest<'_>, &'static str> {
@@ -206,7 +233,10 @@ impl HostingSession {
     }
 
     pub fn on_failure(&mut self, owner: &AttemptOwner, reason: BackendFailure) -> bool {
-        if !self.owns(owner) { return false; }
+        if !self.owns(owner) || !matches!(self.phase, Phase::SdkLoginPending
+            | Phase::SdkLoggedIn | Phase::HostingPending | Phase::Hosted | Phase::UnhostingPending) {
+            return false;
+        }
         self.phase = match reason {
             BackendFailure::Expired => Phase::CredentialExpired,
             BackendFailure::AuthenticationRejected | BackendFailure::HostingRejected => Phase::AuthenticationFailed,
@@ -220,10 +250,13 @@ impl HostingSession {
     }
 
     pub fn check_expiry(&mut self, now: u64) {
-        if self.credentials.as_ref().and_then(|c| c.sdk.expires_at_unix_seconds)
-            .is_some_and(|at| at <= now) {
-            let owner = AttemptOwner { line_id: self.line_id.clone(), generation: self.generation };
-            self.on_failure(&owner, BackendFailure::Expired);
+        if self.phase != Phase::CredentialExpired
+            && self.credentials.as_ref().and_then(|c| c.sdk.expires_at_unix_seconds)
+                .is_some_and(|at| at <= now) {
+            self.invalidate();
+            self.phase = Phase::CredentialExpired;
+            if let Some(next) = self.generation.checked_add(1) { self.generation = next; }
+            else { self.credentials = None; }
         }
     }
 
@@ -244,7 +277,8 @@ impl HostingSession {
     }
 
     pub fn current_owner(&self) -> AttemptOwner {
-        AttemptOwner { line_id: self.line_id.clone(), generation: self.generation }
+        AttemptOwner { line_id: self.line_id.clone(), generation: self.generation,
+            incarnation: self.incarnation.clone() }
     }
 
     pub fn clear(&mut self) -> Result<(), &'static str> {
@@ -258,6 +292,9 @@ impl HostingSession {
     pub fn phase(&self) -> Phase { self.phase }
     pub fn incoming_call_ready(&self) -> bool { self.phase == Phase::Hosted && self.incoming_call_channel }
     pub fn incoming_message_ready(&self) -> bool { self.phase == Phase::Hosted && self.incoming_message_channel }
+    pub fn accepts_incoming_message(&self, owner: &AttemptOwner) -> bool {
+        self.owns(owner) && self.incoming_message_ready()
+    }
     /// Provider tariffs differ from IMS; outbound SMS capability is unverified.
     /// Import/registration must not silently authorize billable outbound traffic.
     pub fn outbound_authorized(&self) -> bool { false }

@@ -5,7 +5,7 @@
 
 ## 1. 分支与编译约束
 
-- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - 日常仅维护`master`，GitHub远端为`autisticryptic/SimMaster`（本地remote通常为`simmaster`）。
 - 不为每次验证长期留下分支。确需临时分支时，合并并确认提交已保留、CI通过后删除。
@@ -237,8 +237,15 @@ SDK成功回调后才submit托管status=4，注销status=3后logout；请求/回
 
 独立Linux wire实现需继续分析用户APK的 `libmtc.so`：`Mtc_CliLogin`、`Mtc_SmgwUpdateStatus`、
 `Mtc_SmgwSendMessage`、`Mtc_SgwDeliSipInvite`、`Mtc_CallAnswer`/`Mtc_CallTerm` 及其agent/序列化/TLS调用链。
-DEX已证明JNI参数但不含登录/托管网络封包。必要时用户手动打开IDA；本轮未连接IDA。
+DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开并确认目标 `libmtc.so`，本轮通过MCP仅只读分析，未修改IDB或执行库。
 准确导航符号/地址与JNI证据只留 `.local/jegotrip/next-native-analysis.md`，不硬编码到生产代码。
+
+### 原生参数编码与通知适配（已实现待Actions）
+
+- `rpc_arguments.rs` 实现 `updateStatus.SipGatewayPub.SipGateway` 的参数：BE16版本1/0、真实SDK UE URI的BE32字节长度、BE32 map计数及键/值字节串；map按键字节长度再按字节排序，不能用Rust默认词典序代替。原SDK五字段及string `SipFlag=4/3`保留；128KiB/NUL/空凭据检查是本地安全边界，不冒认服务器协议限制，Debug脱敏。
+- `native_events.rs` 接受可信backend已解码的**本地SDK通知**，不接受API或未认证网络帧。native `updateStatus`先验证RPC结果为0和返回boolean为true，才发Ok通知；通知本身没有另一个boolean字段。注册/注销共享通知名，必须用提交时cookie捕获的owner和本地operation分开，不能收到通知才重绑当前owner。
+- controller在通知到达时检查凭据到期和monotonic deadline，过期优先、重复tick不改变原因；同名线路删除/重建有独立incarnation。先拒绝旧/未ready来源，再有界复制原始body/from/time字节，不lossy转UTF-8、不猜3GPP TPDU。发送成功、status2成功或ReconnectOk都不能确认本次托管或授予通道ready。
+- 两套Actions显式选中17凭据/会话、19controller、9codec、10native事件共55项回归；本机365静态/mock通过，Rust执行待CI。不实现ARC/TLS完整封包、token续期、真实收短信或通话；provider仍不可用。静态证据只留`.local/jegotrip/ida-mcp-first-pass.md`，不提交APK/SDK库或运行偏移。
 
 ### 5. 下一阶段与验收条件
 
