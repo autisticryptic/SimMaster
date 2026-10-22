@@ -60,17 +60,21 @@ impl fmt::Debug for BatchReply<'_> {
     }
 }
 
-/// Both user id and token must come from the successful native loginSession
-/// result. The returned ARC token is not the imported phone-login token/SipPwd.
-pub fn encode_swap_calls(user_id: &[u8], session_token: &[u8], payload: &BatchPayload<'_>)
+/// `user_id` comes from a successful loginSession reply. The second argument is
+/// the originally selected SDK session id (Mtc_CliApplySessId), NOT the returned
+/// ARC auth token. The returned token belongs in the Common RPC metadata `token`.
+/// The byte layout was correct before this distinction was recovered, but naming
+/// the second string `session_token` would cause a real backend to send the wrong
+/// value. No default deployment/session id is invented here.
+pub fn encode_swap_calls(user_id: &[u8], selected_session_id: &[u8], payload: &BatchPayload<'_>)
     -> Result<RpcBytes, CodecError> {
-    if user_id.is_empty() || session_token.is_empty() { return Err(CodecError::InvalidField); }
+    if user_id.is_empty() || selected_session_id.is_empty() { return Err(CodecError::InvalidField); }
     if payload.requests.len() > MAX_MAP_ENTRIES || payload.results.len() > MAX_MAP_ENTRIES {
         return Err(CodecError::TooLarge);
     }
     let mut writer = Writer::versioned()?;
     writer.bytes(user_id)?;
-    writer.bytes(session_token)?;
+    writer.bytes(selected_session_id)?;
     for field in payload.fields { writer.u32(field)?; }
     writer.u32(payload.requests.len() as u32)?;
     // The native request/result map comparator is signed int32, not u32.

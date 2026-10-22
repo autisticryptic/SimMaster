@@ -49,8 +49,26 @@ fn sdk_login_uses_phone_token_not_the_gateway_password() {
     let owner = session.begin_login(100).unwrap();
     let login = session.login_request(&owner).unwrap();
     assert_eq!(login.phone_login_token, "fixture-session-token");
+    assert_eq!(login.selected_session_id, None);
     assert_ne!(login.phone_login_token, "fixture-gateway-password");
     assert!(session.begin_hosting(&owner).is_err());
+}
+
+#[test]
+fn selected_sdk_session_id_is_optional_preserved_and_never_replaced_by_an_auth_token() {
+    let mut credentials = imported();
+    credentials.sdk.selected_session_id = Some(serde_json::from_str("\"fixture-selected-session-id\"").unwrap());
+    let mut session = HostingSession::new("line-a".into());
+    session.import(credentials.clone(), 100).unwrap();
+    let owner = session.begin_login(100).unwrap();
+    let login = session.login_request(&owner).unwrap();
+    assert_eq!(login.selected_session_id, Some("fixture-selected-session-id"));
+    assert_ne!(login.selected_session_id, Some(login.phone_login_token));
+    assert!(!format!("{credentials:?}").contains("fixture-selected-session-id"));
+    credentials.sdk.selected_session_id = Some(serde_json::from_str("\"\"").unwrap());
+    assert_eq!(credentials.validate(100).err(), Some("jegotrip_session_identity_invalid"));
+    credentials.sdk.selected_session_id = Some(serde_json::from_value(serde_json::json!("s".repeat(128))).unwrap());
+    assert_eq!(credentials.validate(100).err(), Some("jegotrip_session_identity_invalid"));
 }
 
 #[test]

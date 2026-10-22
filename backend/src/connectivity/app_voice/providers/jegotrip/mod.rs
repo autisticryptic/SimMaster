@@ -5,16 +5,20 @@
 //! layers, neither is IMS AKA. No Android library is loaded here and no guessed
 //! HTTP/SIP transport is provided. A real backend must implement the SDK path
 //! before this provider can be installed as available.
+pub mod arc_protocol;
+pub mod arc_session;
 pub mod credentials;
 pub mod controller;
 pub mod native_events;
 pub mod rpc_arguments;
 pub mod rpc_batch;
+pub mod rpc_bootstrap;
 pub mod rpc_envelope;
 pub mod rpc_login;
 pub mod rpc_pending;
 pub mod rpc_stream;
 pub mod session;
+pub mod transport_packets;
 
 // Keep the existing API/provider id stable while moving the implementation.
 pub const PROVIDER_ID: &str = "app_voice";

@@ -11,10 +11,12 @@ fn payload<'a>() -> BatchPayload<'a> {
 }
 
 fn reply_bytes(success: bool) -> Vec<u8> {
-    let bytes = encode_swap_calls(b"user", b"token", &payload()).unwrap();
+    let selected_session_id = b"session-id";
+    let bytes = encode_swap_calls(b"user", selected_session_id, &payload()).unwrap();
     // Result stream only has type marker + bool, not the request's versions.
     let mut result = vec![0, u8::from(success)];
-    result.extend_from_slice(&bytes.expose_to_transport()[22..]);
+    let header_length = 5 + 4 + b"user".len() + 4 + selected_session_id.len();
+    result.extend_from_slice(&bytes.expose_to_transport()[header_length..]);
     result.extend_from_slice(&[0; 8]); // main property count0 + terminal empty reason.
     result
 }
@@ -114,13 +116,25 @@ fn batch_encode_requires_session_identity_and_has_local_entry_bounds() {
 }
 
 #[test]
-fn batch_debug_does_not_reveal_session_token_method_metadata_or_contents() {
+fn batch_debug_does_not_reveal_session_selector_method_metadata_or_contents() {
     let mut payload = payload();
     payload.requests.get_mut(&-2).unwrap().method = b"fixture-private-method";
     payload.requests.get_mut(&-2).unwrap().arguments = b"fixture-private-message";
-    let bytes = encode_swap_calls(b"fixture-private-user", b"fixture-private-token", &payload).unwrap();
+    let bytes = encode_swap_calls(b"fixture-private-user", b"fixture-private-session-id", &payload).unwrap();
     assert!(!format!("{payload:?}").contains("fixture"));
     assert!(!format!("{bytes:?}").contains("fixture"));
     assert!(!format!("{:?}", payload.requests[&-2]).contains("fixture"));
     assert!(!format!("{:?}", payload.results[&3]).contains("fixture"));
+}
+
+#[test]
+fn swap_arguments_use_the_selected_session_id_not_the_returned_auth_token() {
+    let bytes = encode_swap_calls(b"returned-user", b"selected-session", &payload()).unwrap();
+    let mut reader = Reader::versioned(bytes.expose_to_transport()).unwrap();
+    assert_eq!(reader.bytes().unwrap(), b"returned-user");
+    assert_eq!(reader.bytes().unwrap(), b"selected-session");
+    assert_eq!(read_payload(&mut reader).unwrap().fields, payload().fields);
+    reader.finish().unwrap();
+    assert!(!bytes.expose_to_transport().windows(b"returned-auth-token".len())
+        .any(|value| value == b"returned-auth-token"));
 }

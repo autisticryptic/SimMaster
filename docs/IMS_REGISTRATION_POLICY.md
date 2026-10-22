@@ -430,6 +430,7 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 已证实的 `updateStatus.SipGatewayPub.SipGateway` 参数编码包含type0流标记和版本1/0，仅为ObjectAgent入参，不是网络帧；
 Common请求/回包与swapCalls批次已补有界codec及原提交/连接scope关联（5d4bbb0已由95模块回归/双架构/官方SHA核验），返回码/terminal错误与各层boolean独立检查，结果流不重复版本。
 只有完整ARC会话/认证/受信任传输和RPC结果分发还原后，才能启用真实backend。
+当前owned ARC/packet子阶段尚待新Actions：phone token是metadata `pwd`，原选SDK session ID是login/swap第二方法串，返回ARC token属于metadata `token`，SipPwd另用；旧5d4bbb0形状测试不证明选值正确。nested托管只由原ARC owner/scope的私有owned batch交付给一次绑定tracker，失败/关闭/drop撤销scope，不按收到时当前线路重绑。Common分片/FF FF 06只是完整packet pure codec，需可信TLS提供已确认边界，不能用原始TCP read或carrier授ready；Router/NetStream/NetSsl socket/provisioning/调度/入站/业务仍缺，139 Rust仅源码清单/368静态mock不是互通。
 本地完成通知必须绑定提交时owner/operation（注册/注销通知名相同），不能凭名字或发送返回0认定托管成功。
 过期/超时与同名线路重建隔离保持；接收消息暂保留有界字节，未验证编码不lossy解码。
 登录、网关ack和通道ready分别检查；未确认发送路由/计费不默认授权外发，ReconnectOk不重授托管。

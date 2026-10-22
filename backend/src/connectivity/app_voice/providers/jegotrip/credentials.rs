@@ -25,6 +25,9 @@ pub struct SdkCredentials {
     pub server_address: Secret,
     /// Preserve the configured device identity; do not invent a new one.
     pub device_id: Option<Secret>,
+    /// Originally selected Mtc_CliApplySessId input, not an auth token. Absent
+    /// values remain absent; only a future native/wire backend needs this stage.
+    pub selected_session_id: Option<Secret>,
     pub root_der_base64: Secret,
     pub tls_only: bool,
     /// Unknown expiry stays unknown; it must not be reported as permanent.
@@ -69,6 +72,9 @@ impl ImportedCredentials {
         if self.sdk.device_id.as_ref().is_some_and(|id| {
             id.0.is_empty() || id.0.len() > 1024 || id.0.chars().any(char::is_control)
         }) { return Err("jegotrip_device_identity_invalid"); }
+        if self.sdk.selected_session_id.as_ref().is_some_and(|id| {
+            id.0.is_empty() || id.0.len() > 127 || id.0.chars().any(char::is_control)
+        }) { return Err("jegotrip_session_identity_invalid"); }
         if self.hosting.delete_int_code.is_empty()
             || self.hosting.delete_int_code.len() > 32
             || self.hosting.delete_int_code.chars().any(char::is_control)
@@ -118,6 +124,7 @@ pub fn contract() -> CredentialContract {
             ParameterContract { field: "sdk.application_key", source: "JCClient.create configuration", purpose: "SDK application", secret: true },
             ParameterContract { field: "sdk.server_address", source: "config_key_server_address", purpose: "SDK server, not an inferred SIP SBC", secret: true },
             ParameterContract { field: "sdk.device_id (optional)", source: "config_key_device_id", purpose: "Preserve the original device binding if configured", secret: true },
+            ParameterContract { field: "sdk.selected_session_id (optional)", source: "Mtc_CliApplySessId / verified SDK session configuration", purpose: "Login/swap method session selector, distinct from phone token and returned ARC metadata token; no invented default", secret: true },
             ParameterContract { field: "sdk.expires_at_unix_seconds (optional)", source: "Verified token expiry, if known", purpose: "Unknown expiry must remain unknown", secret: false },
             ParameterContract { field: "sdk.root_der_base64", source: "config_key_root_der", purpose: "Deployment TLS trust", secret: true },
             ParameterContract { field: "sdk.tls_only", source: "config_key_use_tls_only", purpose: "TLS required", secret: false },

@@ -1,9 +1,9 @@
 //! Recovered AccountEntry loginSession argument/result boundary, not login auth.
 //!
-//! The two input strings and deployment map must come from the verified ARC
-//! identity/auth/provisioning path. Never guess them from an imported token or
-//! substitute the hosting SipPwd. TLS/endpoint/auth discovery is not implemented.
-use super::rpc_stream::{read_footer, CodecError, Reader, RpcBytes, RpcFooter, RpcProperty, Writer};
+//! The second input string is the originally selected SDK session id, not the
+//! password or returned ARC auth token. The phone-login token is carried by the
+//! per-call `pwd` metadata. TLS/endpoint/provisioning discovery is still separate.
+use super::rpc_stream::{read_footer, CodecError, Reader, RpcBytes, RpcFooter, RpcProperty, Writer, MAX_FIELD_BYTES};
 use std::fmt;
 
 pub const LOGIN_SESSION_METHOD: &str = "loginSession.AccountEntry.Account";
@@ -21,14 +21,53 @@ impl fmt::Debug for LoginSessionResult<'_> {
     }
 }
 
-pub fn encode_login_session(normalized_identity: &[u8], native_session_argument: &[u8],
+pub struct NormalizedIdentity(Vec<u8>);
+
+impl NormalizedIdentity {
+    pub fn expose_to_backend(&self) -> &[u8] { &self.0 }
+}
+
+impl fmt::Debug for NormalizedIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("NormalizedIdentity(<redacted>)") }
+}
+
+/// Matches native identity normalization without choosing an identity type or
+/// inventing a deployment domain. `typed_identity` must be captured from the
+/// native identity stage. Already-normalized colon-containing inputs follow the
+/// same native colon-first branch; they are not silently stripped or rewritten.
+pub fn normalize_session_identity(typed_identity: &[u8], domain_name: &[u8])
+    -> Result<NormalizedIdentity, CodecError> {
+    if typed_identity.is_empty() || typed_identity.len() > MAX_FIELD_BYTES
+        || typed_identity.iter().any(|byte| byte.is_ascii_control()) {
+        return Err(CodecError::InvalidField);
+    }
+    let typed = typed_identity.iter().position(|&byte| byte == b':').is_some_and(|position| position > 0);
+    if !typed && typed_identity[0] == b'[' { return Ok(NormalizedIdentity(typed_identity.to_vec())); }
+    if domain_name.is_empty() || domain_name.len() > MAX_FIELD_BYTES
+        || domain_name.iter().any(|byte| byte.is_ascii_control())
+        || domain_name.windows(4).any(|bytes| bytes == b"ENC(") {
+        return Err(CodecError::InvalidField);
+    }
+    let size = typed_identity.len().checked_add(domain_name.len()).and_then(|size| size.checked_add(if typed { 3 } else { 7 }))
+        .ok_or(CodecError::TooLarge)?;
+    if size > MAX_FIELD_BYTES { return Err(CodecError::TooLarge); }
+    let mut identity = Vec::with_capacity(size);
+    identity.extend_from_slice(if typed { b"[".as_slice() } else { b"[uid:".as_slice() });
+    identity.extend_from_slice(typed_identity);
+    identity.push(b'@');
+    identity.extend_from_slice(domain_name);
+    identity.push(b']');
+    Ok(NormalizedIdentity(identity))
+}
+
+pub fn encode_login_session(normalized_identity: &[u8], selected_session_id: &[u8],
     deployment_properties: &[RpcProperty<'_>]) -> Result<RpcBytes, CodecError> {
-    if normalized_identity.is_empty() || native_session_argument.is_empty() {
+    if normalized_identity.is_empty() || selected_session_id.is_empty() {
         return Err(CodecError::InvalidField);
     }
     let mut writer = Writer::versioned()?;
     writer.bytes(normalized_identity)?;
-    writer.bytes(native_session_argument)?;
+    writer.bytes(selected_session_id)?;
     writer.properties(deployment_properties)?;
     Ok(writer.finish())
 }

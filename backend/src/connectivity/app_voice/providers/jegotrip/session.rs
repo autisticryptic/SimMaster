@@ -16,6 +16,7 @@ pub struct SdkLoginRequest<'a> {
     pub application_key: &'a str,
     pub server_address: &'a str,
     pub device_id: Option<&'a str>,
+    pub selected_session_id: Option<&'a str>,
     pub root_der_base64: &'a str,
     pub tls_only: bool,
 }
@@ -190,6 +191,7 @@ impl HostingSession {
             application_key: sdk.application_key.expose_to_backend(),
             server_address: sdk.server_address.expose_to_backend(),
             device_id: sdk.device_id.as_ref().map(Secret::expose_to_backend),
+            selected_session_id: sdk.selected_session_id.as_ref().map(Secret::expose_to_backend),
             root_der_base64: sdk.root_der_base64.expose_to_backend(),
             tls_only: sdk.tls_only,
         })

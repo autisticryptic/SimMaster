@@ -6,7 +6,7 @@
 
 ## 当前基线与工作规则
 
-- 本轮继续用户已开启的 `libmtc.so` 只读IDA：原生适配1d8d042有55项CI/双架构证据，但参数stream漏type0字节由后续构造/读流汇编定位并修正；RPC封装/批次/loginSession/result footer及精确回包scope已由5d4bbb0两套Actions/双架构/官方SHA测试ZIP/95模块回归/四矩阵86场景核验（366静态/mock）。剩余是ARC身份/鉴权/部署参数来源、NetStream与TLS外层封装、batch调度/dedup/通知、真实短信和通话/provider接线；不把helper或CI当作完整客户端，暂不部署。
+- 本轮继续用户已开启的 `libmtc.so` 只读IDA：5d4bbb0有两套Actions/双架构/官方SHA测试ZIP/95模块回归/四矩阵86场景中间证据；其swap第二串已发现应为原选SDK session ID而非返回ARC token，后者属于metadata `token`，phone token属于`pwd`、SipPwd另用。当前新增getAppConfigs、owned ARC login/swap、Common分片/FF FF 06 carrier和原owner/scope nested hosting接线（139 Rust源码清单尚待两套Actions，368本机静态/mock）；不把codec/CI当完整客户端。剩余重点为Router/NetStream/NetSsl socket/packet边界与可信TLS握手、ENC provisioning/端点、batch ACK/dedup调度、网络入站对象和真实短信/通话、provider/runtime/persistence/API/trunk/计费/续期/并发；暂不部署、不访问设备或服务。
 
 - 应用provider本轮迁到 `connectivity/app_voice/providers/{jegotrip,google_voice,telegram,imessage}`；无忧行controller接SDK两阶段/注销/失败时序由31d3739双架构及两套Actions各8项controller回归验证，旧IMS import兼容。DEX/JNI参数已确认但Linux wire帧未还原；继续native `Mtc_CliLogin`/`Mtc_SmgwUpdateStatus`等分析，必要时用户手开IDA。不把接口调度当作已能收短信/接打电话；暂不部署。
 

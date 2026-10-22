@@ -9,8 +9,8 @@
 4. 2026-10-07的部署授权已结束；本轮**未部署、未访问设备或写NV**。用户已手动开启并确认当前 `libmtc.so` 分析ELF，可做只读IDA/静态分析，不修改IDB或扩大设备授权。
 5. 私有 eSIM 报告、诊断日志、JSONL、凭据和 `.local` 不提交，不清理未知用户数据。
 
-## 当前：无忧行RPC封装/批次已验证（完整wire transport未完成）
-- 用户要求替代手机端托管：登录/绑定 UI 暂缓，导入自有root手机参数；各家保持 `app_voice/providers/` 独立。1d8d042两套Actions/双架构/55项原生适配回归已核验；后续只读IDA发现其stream前缀漏type0字节，已修正并独立留证（CI不等于协议等价）。本轮补RPC request/reply、signed序号swapCalls批次、loginSession入参/返回与terminal错误footer、提交时owner/operation/连接scope关联；95项模块回归由5d4bbb0 Build39767535250/Beta39767535255两套Actions及ARM64/AMD64通过，官方摘要测试ZIP逐名/四矩阵86场景已核验；366静态/mock通过。保留二进制metadata/消息、过期优先/同名重建隔离；发送/外层batch成功不授托管或通道ready。ARC鉴权、外层NetStream/TLS封装与业务未接通，provider不启用，无设备/服务端/部署。见[开发指南](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)，证据`.local/jegotrip/ida-mcp-rpc-transport.md`。
+## 当前：无忧行ARC会话/分片子阶段待Actions验证（真实backend未接通）
+- 用户要求替代手机端托管：登录/绑定 UI 暂缓，导入自有root手机参数；provider各家独立。前一5d4bbb0两套Actions/双架构/95项RPC回归保留为中间证据；新只读IDA纠正swap第二串：必须为原选SDK session ID，返回ARC token只放metadata `token`，phone token放`pwd`，SipPwd另用。新增getAppConfigs、owned ARC login/swap、Common有界分片/FF FF 06 carrier与offline组合；nested hosting tracker一次绑定原ARC owner/scope，失败/关闭/drop撤销旧scope，错连接同序号不得重绑ACK；登录/托管ACK/通道ready仍独立。139项Rust为源码清单尚未执行，368本机静态/mock通过；仅在两套Actions执行编译/回归。Router/NetStream socket、TLS信任/握手/packet边界、ENC provisioning、batch ACK/dedup调度/网络入站/真实短信通话未实现，provider不启用，无设备/服务端/部署。HANDOFF保持150行；详见[开发指南](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)与`.local/jegotrip/ida-mcp-rpc-transport.md`。
 - **R8/R9（9f1625d已验证）**：`identity_source` 变为行为开关——`auto`（默认，旧标签不变）/`isim_required`（缺 ISIM 失败关闭）/`usim_derived`（忽略 ISIM，走 USIM AKA）；新增每线路只读 QMI UIM refresh 订阅（0x002A/0x002C/0x0033），忙时 deny≤20s，完成后重读 R5 快照，变化置 identity_stale 并等通话排空再重建；不支持则退回边界检查。两工作流/双架构、各 542 项相关回归/86 场景通过。
 对全球版 EM05-G（MDM9607，26 份 MBN / 2,905 条记录 / 2,097 EFS）做了只读交叉核对，目的是排除“EC20 是中国特供、机制可能不全”。结论：**注册机制无新增**，`Service UnAvailable` 14 类、P-CSCF 列表处理、423/Min-Expires/Retry-After、reg-event、non-IPSec 构造均同构；差异只在配置覆盖面（优先级 4 种取值、`IMS_enable` 00/01、新增 22 个媒体类 EFS 项）。两条新线索均属接口/数据层：基带存在真实 ISIM refresh 事件并经 QMI UIM 上报；Verizon/Jio 等使用非标准 ePDG 域名，需显式 catalog host。报告`.local/evidence/ims-em05-review/EM05_GLOBAL_REVIEW.md`，未连接 IDA/设备、未执行固件；后续实现待讨论。
 

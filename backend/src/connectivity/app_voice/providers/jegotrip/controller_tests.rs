@@ -341,3 +341,75 @@ async fn native_reconnect_success_alone_cannot_restore_hosting_or_channels() {
     assert!(!controller.incoming_call_ready());
     assert!(!controller.incoming_message_ready());
 }
+
+#[tokio::test]
+async fn arc_login_fragmented_swap_reply_drives_only_original_nested_hosting_ack() {
+    use crate::connectivity::app_voice::providers::jegotrip::{
+        arc_protocol::{ArcProtocol, ProtocolEvent}, arc_session::{ArcLoginInputs, ArcReply},
+        rpc_batch::BatchPayload,
+        transport_packets::{encode_call_packets, CallKind},
+    };
+    use std::collections::BTreeMap;
+    let backend = MockBackend::new(false);
+    let mut controller = HostingController::new("line-a".into(), Some(backend));
+    let credentials = imported();
+    controller.import(credentials.clone(), 100).unwrap();
+    let owner = controller.start(100).await.unwrap();
+    let mut protocol = ArcProtocol::new(owner.clone()); let scope = protocol.connection_scope();
+    let login = protocol.prepare_login(ArcLoginInputs {
+        typed_identity: b"username:fixture", domain_name: b"fixture.invalid", selected_session_id: b"fixture-selector",
+        phone_login_token: credentials.sdk.phone_login_token.expose_to_backend().as_bytes(),
+        application_key: credentials.sdk.application_key.expose_to_backend().as_bytes(),
+        domain_id: b"fixture-domain", application_id: b"fixture-app", device_info_cc: b"", client_properties: &[],
+    }, &[]).unwrap();
+    let common_reply = |id: i32, result: &[u8]| {
+        let mut bytes = vec![0]; bytes.extend_from_slice(&id.to_be_bytes()); bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&(result.len() as u32).to_be_bytes()); bytes.extend_from_slice(result); bytes
+    };
+    let mut result = vec![0, 1];
+    for value in [b"fixture-returned-user".as_slice(), b"fixture-returned-auth".as_slice()] {
+        result.extend_from_slice(&(value.len() as u32).to_be_bytes()); result.extend_from_slice(value);
+    }
+    result.extend_from_slice(&[0; 8]);
+    let mut callback = None;
+    for packet in encode_call_packets(CallKind::Reply, &common_reply(login.call_id, &result), 8).unwrap() {
+        protocol.on_plaintext_packet(&owner, &scope, packet.expose_to_transport(), |event| {
+            if let ProtocolEvent::Reply(ArcReply::Login(value)) = event { callback = Some(value); }
+        }).unwrap();
+    }
+    let callback = callback.unwrap();
+    controller.on_callback(&callback.owner, callback.callback, 100).await.unwrap();
+    assert_eq!(controller.phase(), Phase::HostingPending);
+    assert!(!controller.incoming_message_ready());
+    let hosting = &credentials.hosting;
+    let registration = GatewayRegistration { authname_prefix: hosting.authname_prefix.expose_to_backend(),
+        channel_id: hosting.channel_id.expose_to_backend(), delete_int_code: &hosting.delete_int_code,
+        sip_number: hosting.sip_number.expose_to_backend(), sip_password: hosting.sip_password.expose_to_backend() };
+    let mut tracker = protocol.take_hosting_tracker().unwrap();
+    let hosting_call = tracker.prepare_batch_update_status(owner.clone(), "fixture-uri", STATUS_REGISTER, &registration).unwrap();
+    let payload = BatchPayload { fields: [0; 6], requests: BTreeMap::from([
+        (hosting_call.sequence, hosting_call.as_batch_request(&[]))]), results: BTreeMap::new() };
+    let swap = protocol.prepare_swap_calls(&payload, &[]).unwrap();
+    let mut result = vec![0, 1]; result.extend_from_slice(&[0; 24]); result.extend_from_slice(&[0; 4]);
+    result.extend_from_slice(&1u32.to_be_bytes()); result.extend_from_slice(&hosting_call.sequence.to_be_bytes());
+    result.extend_from_slice(&[0; 4]); result.extend_from_slice(&6u32.to_be_bytes());
+    result.extend_from_slice(&[0, 1, 0, 0, 0, 0]); result.extend_from_slice(&[0; 8]);
+    let mut callbacks = Vec::new();
+    for packet in encode_call_packets(CallKind::Reply, &common_reply(swap.call_id, &result), 8).unwrap() {
+        protocol.on_plaintext_packet(&owner, &scope, packet.expose_to_transport(), |event| {
+            if let ProtocolEvent::Reply(ArcReply::Swap(value)) = event {
+                callbacks.extend(tracker.on_batch_reply(&value).unwrap());
+            }
+        }).unwrap();
+    }
+    assert_eq!(callbacks.len(), 1);
+    let callback = callbacks.remove(0); assert_eq!(callback.owner, owner);
+    controller.on_callback(&callback.owner, callback.callback, 100).await.unwrap();
+    assert_eq!(controller.phase(), Phase::Hosted);
+    assert!(!controller.incoming_message_ready());
+    controller.on_callback(&owner, Callback::Channels { calls: false, messages: true }, 100).await.unwrap();
+    let message = NativeNotification { name: "MtcSmgwMessageRecvNotification", operation: None,
+        message: Some(&[0xff, 0, 1]), from: None, time: None };
+    assert_eq!(controller.on_native_notification(&owner, message, 100).await.unwrap().unwrap().body, &[0xff, 0, 1]);
+    assert!(!controller.outbound_authorized());
+}

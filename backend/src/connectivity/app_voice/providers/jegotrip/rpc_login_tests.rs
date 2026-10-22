@@ -63,9 +63,22 @@ fn login_result_truncation_wrong_stream_and_trailing_bytes_fail_closed() {
 }
 
 #[test]
-fn login_argument_builder_never_fills_missing_native_auth_or_deployment_identity() {
-    assert_eq!(encode_login_session(b"", b"native-session-argument", &[]).err(), Some(CodecError::InvalidField));
+fn login_argument_builder_never_fills_missing_session_selector_or_deployment_identity() {
+    assert_eq!(encode_login_session(b"", b"selected-session-id", &[]).err(), Some(CodecError::InvalidField));
     assert_eq!(encode_login_session(b"native-identity", b"", &[]).err(), Some(CodecError::InvalidField));
     let duplicate = [RpcProperty { key: b"DeviceId", value: b"a" }, RpcProperty { key: b"DeviceId", value: b"b" }];
     assert_eq!(encode_login_session(b"i", b"s", &duplicate).err(), Some(CodecError::DuplicateKey));
+}
+
+#[test]
+fn native_identity_normalization_preserves_type_and_requires_explicit_domain() {
+    assert_eq!(normalize_session_identity(b"username:fixture", b"domain.invalid").unwrap().expose_to_backend(),
+        b"[username:fixture@domain.invalid]");
+    assert_eq!(normalize_session_identity(b"fixture", b"domain.invalid").unwrap().expose_to_backend(),
+        b"[uid:fixture@domain.invalid]");
+    assert_eq!(normalize_session_identity(b"[fixture]", b"").unwrap().expose_to_backend(), b"[fixture]");
+    assert_eq!(normalize_session_identity(b"username:fixture", b"").err(), Some(CodecError::InvalidField));
+    assert_eq!(normalize_session_identity(b"fixture", b"ENC(unresolved)").err(), Some(CodecError::InvalidField));
+    assert_eq!(normalize_session_identity(b"fixture\n", b"domain.invalid").err(), Some(CodecError::InvalidField));
+    assert!(!format!("{:?}", normalize_session_identity(b"fixture", b"domain.invalid").unwrap()).contains("fixture"));
 }

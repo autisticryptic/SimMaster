@@ -101,6 +101,58 @@ class JegotripContract(unittest.TestCase):
                 self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests',
                               (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
 
+    def test_arc_session_preserves_selected_id_password_and_metadata_token_layers(self):
+        source = (MOD / 'arc_session.rs').read_text(encoding='utf-8')
+        self.assertIn('encode_swap_calls(&auth.user_id, &auth.selected_session_id, payload)', source)
+        self.assertIn('RpcProperty { key: b"pwd", value: inputs.phone_login_token }', source)
+        self.assertIn('RpcProperty { key: b"token", value: &auth.token }', source)
+        self.assertIn('field.key == b"ForceFlag" && field.value != b"0"', source)
+        self.assertIn('self.connection.matches(connection)', source)
+        self.assertIn('self.pending.remove(&reply.call_id)', source)
+        self.assertIn('PendingKind::Login', source)
+        self.assertIn('decode_login_session_result', source)
+        self.assertIn('self.authentication = None', source)
+        self.assertNotIn('session.current_owner()', source)
+        batch = (MOD / 'rpc_batch.rs').read_text(encoding='utf-8')
+        self.assertIn('writer.bytes(selected_session_id)?', batch)
+        self.assertNotIn('writer.bytes(session_token)?', batch)
+        for module in ['rpc_bootstrap', 'arc_session', 'transport_packets', 'arc_protocol']:
+            self.assertIn(f'pub mod {module};', (MOD / 'mod.rs').read_text(encoding='utf-8'))
+            for name in ['beta-validation.yml', 'build-release.yml']:
+                self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests',
+                              (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_transport_packets_do_not_claim_tls_or_raw_tcp_message_boundaries(self):
+        source = (MOD / 'transport_packets.rs').read_text(encoding='utf-8')
+        self.assertIn('&[0xff, 0xff, DATA_KEY_TLS]', source)
+        self.assertIn('(payload.len() as u32).to_be_bytes()', source)
+        self.assertIn('remaining.len() / 2', source)
+        self.assertIn('TransportError::UnsupportedCompression', source)
+        self.assertIn('if result.is_err() { self.close(); }', source)
+        self.assertNotIn('from_utf8_lossy', source)
+        self.assertNotIn('rustls::', source)
+        protocol = (MOD / 'arc_protocol.rs').read_text(encoding='utf-8')
+        body = protocol.split('pub fn on_plaintext_packet', 1)[1]
+        self.assertLess(body.index('self.rpc.accepts_scope(owner, connection)'), body.index('self.assembler.on_packet(packet)'))
+        self.assertIn('CallKind::Request => { self.close();', body)
+        self.assertNotIn('impl HostingBackend', protocol)
+        tracker = (MOD / 'rpc_pending.rs').read_text(encoding='utf-8')
+        self.assertIn('Delivery::Batch', tracker)
+        self.assertIn('Delivery::Envelope', tracker)
+        self.assertIn('request.operation != NativeOperation::HostingRegister', tracker)
+        self.assertIn('batch.matches(owner, &self.connection)', tracker)
+        self.assertIn('self.batch_owner.as_ref() != Some(&owner)', tracker)
+        self.assertIn('if !self.connection.is_open()', tracker)
+        self.assertIn('Arc<AtomicBool>', tracker)
+        self.assertNotIn('connection: &RpcConnectionScope, reply: &BatchReply', tracker)
+        arc = (MOD / 'arc_session.rs').read_text(encoding='utf-8')
+        self.assertIn('Swap(OwnedBatchReply', arc)
+        self.assertIn('self.hosting_tracker_taken', arc)
+        self.assertIn('inputs.selected_session_id.len() > 127', arc)
+        self.assertIn('self.connection.close();', arc)
+        self.assertIn('impl Drop for ArcRpcSession', arc)
+        self.assertIn('if self.rpc.phase() == ArcPhase::Closed { self.assembler.close(); }', protocol)
+
     def test_native_notifications_require_local_operation_and_stale_scope_checks(self):
         events = (MOD / 'native_events.rs').read_text(encoding='utf-8')
         controller = (MOD / 'controller.rs').read_text(encoding='utf-8')

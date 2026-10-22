@@ -381,6 +381,10 @@ jobs:
             connectivity::app_voice::providers::jegotrip::rpc_batch::tests \
             connectivity::app_voice::providers::jegotrip::rpc_login::tests \
             connectivity::app_voice::providers::jegotrip::rpc_pending::tests \
+            connectivity::app_voice::providers::jegotrip::rpc_bootstrap::tests \
+            connectivity::app_voice::providers::jegotrip::arc_session::tests \
+            connectivity::app_voice::providers::jegotrip::transport_packets::tests \
+            connectivity::app_voice::providers::jegotrip::arc_protocol::tests \
             connectivity::app_voice::registry::tests \
             connectivity::modems::ims::cellular_ims::live::tests::refresh \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \

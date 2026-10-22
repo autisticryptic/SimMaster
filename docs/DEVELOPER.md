@@ -5,7 +5,7 @@
 
 ## 1. 分支与编译约束
 
-- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests,rpc_bootstrap::tests,arc_session::tests,transport_packets::tests,arc_protocol::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - 日常仅维护`master`，GitHub远端为`autisticryptic/SimMaster`（本地remote通常为`simmaster`）。
 - 不为每次验证长期留下分支。确需临时分支时，合并并确认提交已保留、CI通过后删除。
@@ -196,6 +196,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 | `sdk.server_address` | `config_key_server_address` | SDK 服务端配置，不要猜作 SIP SBC |
 | `sdk.root_der_base64` / `sdk.tls_only` | `config_key_root_der` / `config_key_use_tls_only` | 匹配部署信任与 TLS 策略 |
 | `sdk.device_id`（如已配置） | `config_key_device_id` | 保留原配置，设备绑定语义待验证 |
+| `sdk.selected_session_id`（如已配置） | `Mtc_CliApplySessId` / 原SDK会话配置 | login/swap方法第二串；不是phone token或返回ARC auth token，≤127字节，缺失不编造默认值 |
 | `sdk.expires_at_unix_seconds`（若已知） | 后续确认的 token 到期信息 | 未知时留空，不虚构永久有效 |
 | `hosting.sip_number` | `SipNumber` / `getAreaCodeMobileNum` | 被托管号码 |
 | `hosting.sip_password` | `voip_status.sipPassword` 经 `decryptThreeDESECB` 后 | 网关 `SipPwd`，不能直接拿缓存密文替代 |
@@ -253,11 +254,22 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 
 - `rpc_stream.rs`：type0/BE16/BE32、有界byte string/metadata map、长度优先键排序、重复/截断/trailing拒绝；binary `__magic`不套UTF-8/NUL政策。128KiB流/64KiB字段/128entry为本地安全政策，不是假服务器限制。
 - `rpc_envelope.rs`：request为type0+positive call id+metadata+method+raw args；reply为type0+原call id+result code+raw result。均无socket/握手或readiness副作用。
-- `rpc_batch.rs`：`swapCalls.AccountEntry.Account`入参使用**loginSession返回**的user id/ARC session token、六个原顺序opaque词、signed int32索引request/result maps；外层bool/code不能代替每个托管结果，也不自动重试。`rpc_login.rs`只编码native已提供的两字符串/map并检验非空返回id/token，不猜输入身份/密码推导、expiry或刷新。
+- `rpc_batch.rs`：`swapCalls.AccountEntry.Account`入参使用loginSession返回的user id与**原选SDK session ID**、六个原顺序opaque词、signed int32索引request/result maps；返回ARC auth token属于metadata `token`，不是第二方法串。5d4bbb0此串旧名称/fixture误导已在本轮纠正，其CI只验证旧形状不证明选值正确；外层bool/code不能代替每个托管结果，也不自动重试。`rpc_login.rs`检验非空返回id/token，不猜expiry或刷新。
 - `rpc_pending.rs`：prepare记录原owner/注册或注销operation、单连接递增id与独立receive scope；reply仅完成原pending一次，旧连接/retired/duplicate/注销回包不确认注册，非零/坏result撤ready。controller回归串联实际encoder→envelope→tracker→ack→独立messages channel→原byte消息，仍为mock不是公网互通。
 - 95模块回归由Build39767535250/Beta39767535255两套Actions/双架构及官方SHA测试ZIP逐名核验（17session/20controller/12arguments/10native/8stream/6envelope/9batch/6login/7pending），四矩阵86场景通过，366静态/mock通过。报告`.local/jegotrip/verified-native-5d4bbb0.json`，只读核验器`verify_native_ci.py`不运行本机Rust。新`.local/jegotrip/ida-mcp-rpc-transport.md`记录原函数/构造/排序/结果/下层TLS取证，不提交库或偏移。
 
-已定位外层FF-FF/NetStream及`DataKeyTls=6`包装；TLS对象被嵌入自有帧，不能把TcpStream+rustls直接宣称兼容。压缩、分片、身份/auth/provisioning、batch epoch/ack/dedup/通知与业务尚需还原；provider/元数据仍明确不可用，本轮无设备/服务端/部署。
+已定位外层FF-FF/NetStream及`DataKeyTls=6`包装；TLS对象被嵌入自有帧，不能把TcpStream+rustls直接宣称兼容。下层socket/路由/信任/握手/provisioning与真实业务仍未接通。
+
+### ARC会话与Common分片（已实现offline子阶段，尚待Actions验证）
+
+- 四份材料严格分层：导入phone token是login Common metadata `pwd`；原选session ID是login/swap方法第二串；login返回ARC token是后续metadata `token`；托管另用SipPwd。`SdkCredentials`可选字段缺失保持缺失，ARC层必须显式提供，≤127字节且不接受控制字符；不借device ID/密码或内置默认值替代。
+- `rpc_bootstrap.rs`只编解码getAppConfigs：true/zero code、opaque properties、AccountEntry/AccountAlive/UserEntry及footer；仅AccountEntry必须非空，不猜端点、TLS信任或到期。`rpc_login.rs`按native colon-first身份归一化且要求显式domain，不虚构账号种类。
+- `arc_session.rs`拥有原owner/连接scope、递增不复用call id、login/auth/close状态。原配置覆盖`__appKey`/`__domain`/`__app`/`DeviceInfo.CC`，phone/auth metadata不能由caller覆盖，未解ENC材料拒绝，ForceFlag保持0，不做设备强制接管。只匹配成功login才发SdkLogin，bootstrap不授auth，失败batch不交付nested结果。
+- 只读审查发现独立scope交接可误用另一ARC的同序号结果，已补私有构造`OwnedBatchReply`捕获原owner/scope；每ARC一次领取`HostingRpcTracker`并在提交前绑定，失败/退休/关闭/drop共享terminal scope使pending和留存旧reply失效。nested托管必须在swapCalls内；direct-envelope helper仅offline/mock，不能当native送socket路径。
+- `transport_packets.rs`纯codec需要一个**完整下层packet**：Common request0/reply1/ping2/release4/pong14；TLS模式分片阈值16382，首片BE32写原payload长度，分割length+4且末两片平衡。FF FF 06仅包装opaque TLS bytes；压缩Bzip2、legacy XOR/Kx/降级、非法fragment/oversize拒绝，组装错误永久关闭。不是任意TCP read或TLS read的分界器。
+- `arc_protocol.rs`只offline组合RPC与plaintext packet；先scope核验再parse，借用reply同步交付，controls不授登录/hosting，release/未实现server request关闭，login退休/失败清理partial buffer。需真正受信TLS引擎提供已确认的plaintext packet边界，不把carrier或控制码当成功。
+- 当前源码清单139 Rust（18凭据/21controller/12arguments/10native/8stream/6envelope/10batch/7login/13pending/6bootstrap/11arc session/10packets/7protocol）；**尚未执行通过**。两工作流新增四module filter；本机368静态/mock通过，`verify_native_ci.py`只下载官方SHA绑定ZIP逐名核验，不运行本机Rust。来源/私有review/evidence留`.local/jegotrip/`。
+- 下一项真实backend仍包括Router/NetStream/NetSsl socket与完整boundary、部署参数解密/可信端点、batch epoch/ACK/dedup调度、server-object入站、持久化/provider/runtime/API/trunk/SMS/calls/media/计费/续期/并发。`transport_implemented=false`/provider unsupported/外发授权false不变，本轮无设备或服务端访问。
 
 ### 5. 下一阶段与验收条件
 
@@ -266,7 +278,7 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 3. 对接来电、接收短信至现有 trunk/消息工作流；发送行为和资费独立，不继承 IMS 免费假设。
 4. 用户有可用参数后，另行授权验证过期、掉线、并发设备、真实收短信及双向通话。
 
-当前只有静态证据和契约测试；没有设备、服务端或资费验收。
+当前有静态证据、契约及offline codec/owned协议测试，但没有设备、服务端或资费验收。
 Build 39600992021、Beta 39600991953 的官方摘要测试 ZIP 各 14 项新测试逐名通过，ARM64/AMD64 构建成功；
 本机 361 项静态/mock 通过。不是真实 SDK 通信测试。详细方法引用与二进制指纹保存在
 私有 `.local/jegotrip/offline-static-analysis.md` / `verified-dex-call-paths.json`，不提交 APK、DEX 或 SDK 库。
