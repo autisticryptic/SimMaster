@@ -60,6 +60,16 @@ pub fn decode_request(bytes: &[u8]) -> Result<RpcRequest<'_>, CodecError> {
     Ok(RpcRequest { call_id, metadata, method, arguments })
 }
 
+/// Common result envelope; method-specific stream includes its terminal footer.
+pub fn encode_reply(call_id: i32, result_code: u32, result_stream: &[u8]) -> Result<RpcBytes, CodecError> {
+    require_call_id(call_id)?;
+    let mut writer = Writer::new();
+    writer.i32(call_id)?;
+    writer.u32(result_code)?;
+    writer.bytes(result_stream)?;
+    Ok(writer.finish())
+}
+
 /// Nonzero result codes are preserved; callers must never treat them as success.
 pub fn decode_reply(bytes: &[u8]) -> Result<RpcReply<'_>, CodecError> {
     let mut reader = Reader::new(bytes)?;

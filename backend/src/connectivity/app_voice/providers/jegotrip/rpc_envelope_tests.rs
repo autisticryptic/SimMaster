@@ -1,4 +1,17 @@
 use super::*;
+
+#[test]
+fn reply_encoder_independent_fixture_preserves_code_and_nested_terminal_stream() {
+    let bytes = encode_reply(7, 0, &[0, 1, 0, 0, 0, 0]).unwrap();
+    assert_eq!(bytes.expose_to_transport(), &[0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 0]);
+    let reply = decode_reply(bytes.expose_to_transport()).unwrap();
+    assert_eq!(reply.call_id, 7); assert_eq!(reply.result_code, 0); assert_eq!(reply.result_stream, &[0, 1, 0, 0, 0, 0]);
+    assert_eq!(encode_reply(0, 0, b"result").err(), Some(CodecError::InvalidCallId));
+    assert_eq!(encode_reply(1, 2, &vec![0; super::super::rpc_stream::MAX_FIELD_BYTES + 1]).err(), Some(CodecError::TooLarge));
+    let bytes = encode_reply(1, 2, &[0, 0xff]).unwrap();
+    assert_eq!(decode_reply(bytes.expose_to_transport()).unwrap().result_code, 2);
+}
+
 use crate::connectivity::app_voice::providers::jegotrip::{
     rpc_arguments::{encode_update_status, UPDATE_STATUS_METHOD},
     session::{GatewayRegistration, STATUS_REGISTER},

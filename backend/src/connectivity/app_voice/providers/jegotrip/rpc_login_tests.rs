@@ -79,6 +79,7 @@ fn native_identity_normalization_preserves_type_and_requires_explicit_domain() {
     assert_eq!(normalize_session_identity(b"[fixture]", b"").unwrap().expose_to_backend(), b"[fixture]");
     assert_eq!(normalize_session_identity(b"username:fixture", b"").err(), Some(CodecError::InvalidField));
     assert_eq!(normalize_session_identity(b"fixture", b"ENC(unresolved)").err(), Some(CodecError::InvalidField));
+    assert_eq!(normalize_session_identity(b"ENC(unresolved)", b"domain.invalid").err(), Some(CodecError::InvalidField));
     assert_eq!(normalize_session_identity(b"fixture\n", b"domain.invalid").err(), Some(CodecError::InvalidField));
     assert!(!format!("{:?}", normalize_session_identity(b"fixture", b"domain.invalid").unwrap()).contains("fixture"));
 }

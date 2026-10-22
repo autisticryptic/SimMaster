@@ -430,6 +430,7 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 已证实的 `updateStatus.SipGatewayPub.SipGateway` 参数编码包含type0流标记和版本1/0，仅为ObjectAgent入参，不是网络帧；
 Common请求/回包与swapCalls批次已补有界codec及原提交/连接scope关联（5d4bbb0已由95模块回归/双架构/官方SHA核验），返回码/terminal错误与各层boolean独立检查，结果流不重复版本。
 只有完整ARC会话/认证/受信任传输和RPC结果分发还原后，才能启用真实backend。
+用户暂无配置但允许继续offline；本轮新增原native六词/32history45s/ACK/2048dedup状态机和configured recvOnlineMessage dispatch，尚待Actions。ACK只移transport history，不授hosting；queued未submitted/取消snapshot不确认业务，原ticket借用完成且一次消费，peer reset/旧序号不重开dedup。object/domain/receiver-kind只取显式原binding，不猜公网SMS类型；direct/batch入站不授ready/不落库、不在consumer确认前ACK。172 Rust仅清单/370静态mock不代表互通，socket/TLS完整boundary/provisioning/通话媒体/业务接线仍未完成。
 当前owned ARC/packet子阶段684ef73已通过Build39812859460/Beta39812859585/双架构、官方SHA ZIP逐名139回归/四矩阵86场景核验；phone token是metadata `pwd`，原选SDK session ID是login/swap第二方法串，返回ARC token属于metadata `token`，SipPwd另用；旧5d4bbb0形状测试不证明选值正确。nested托管只由原ARC owner/scope的私有owned batch交付给一次绑定tracker，失败/关闭/drop撤销scope，不按收到时当前线路重绑。Common分片/FF FF 06只是完整packet pure codec，需可信TLS提供已确认边界，不能用原始TCP read或carrier授ready；Router/NetStream/NetSsl socket/provisioning/调度/入站/业务仍缺，368静态/mock和139 offline回归不是互通。
 本地完成通知必须绑定提交时owner/operation（注册/注销通知名相同），不能凭名字或发送返回0认定托管成功。
 过期/超时与同名线路重建隔离保持；接收消息暂保留有界字节，未验证编码不lossy解码。

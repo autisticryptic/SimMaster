@@ -36,10 +36,18 @@ struct PendingRequest {
 
 pub struct PreparedHostingCall {
     pub sequence: i32,
+    submission_sequence: i32,
+    owner: AttemptOwner,
+    connection: RpcConnectionScope,
     arguments: RpcBytes,
 }
 
 impl PreparedHostingCall {
+    pub(super) fn matches(&self, owner: &AttemptOwner, connection: &RpcConnectionScope) -> bool {
+        self.sequence == self.submission_sequence && &self.owner == owner
+            && self.connection.matches(connection) && self.connection.is_open()
+    }
+
     pub fn as_batch_request<'a>(&'a self, metadata: &[RpcProperty<'a>]) -> BatchRequest<'a> {
         BatchRequest { method: UPDATE_STATUS_METHOD.as_bytes(),
             arguments: self.arguments.expose_to_transport(), metadata: metadata.to_vec() }
@@ -84,6 +92,9 @@ impl HostingRpcTracker {
     /// Capture this when the authenticated connection installs its receive task.
     /// A stale task cannot feed bytes into a new connection's correlation map.
     pub fn connection_scope(&self) -> RpcConnectionScope { self.connection.clone() }
+    pub(super) fn batch_owner(&self) -> Result<AttemptOwner, CodecError> {
+        self.batch_owner.clone().filter(|_| self.connection.is_open()).ok_or(CodecError::InvalidField)
+    }
 
     /// Common-envelope helper retained for offline codec/mock callers. The
     /// native ARC hosting path uses prepare_batch_update_status instead: it
@@ -130,8 +141,9 @@ impl HostingRpcTracker {
             .map_err(|code| if code == "jegotrip_rpc_arguments_too_large" { CodecError::TooLarge }
                 else { CodecError::InvalidField })?;
         self.next_id = sequence.checked_add(1);
-        self.pending.insert(sequence, PendingRequest { owner, operation, delivery: Delivery::Batch });
-        Ok(PreparedHostingCall { sequence, arguments })
+        self.pending.insert(sequence, PendingRequest { owner: owner.clone(), operation, delivery: Delivery::Batch });
+        Ok(PreparedHostingCall { sequence, submission_sequence: sequence, owner,
+            connection: self.connection.clone(), arguments })
     }
 
     /// Accept only a successfully decoded original outer batch carrying the ARC
@@ -143,6 +155,9 @@ impl HostingRpcTracker {
         if !self.connection.is_open() { self.pending.clear(); return Ok(vec![]); }
         let owner = self.batch_owner.as_ref().ok_or(CodecError::InvalidField)?;
         if !batch.matches(owner, &self.connection) { return Ok(vec![]); }
+        // Scheduled batches must pass validated ACK/epoch/dedup processing first;
+        // a raw matched outer result cannot bypass that state machine.
+        if batch.is_scheduled() { return Err(CodecError::InvalidField); }
         let reply = batch.reply();
         if !reply.success || !reply.footer.reason.is_empty() {
             self.pending.clear();
@@ -161,6 +176,27 @@ impl HostingRpcTracker {
         }
         Ok(callbacks)
     }
+
+    pub(super) fn on_scheduled_delivery(&mut self, delivery: &super::batch_scheduler::BatchDelivery)
+        -> Vec<OwnedRpcCallback> {
+        if !self.connection.is_open() { self.pending.clear(); return vec![]; }
+        let Some(owner) = self.batch_owner.as_ref() else { return vec![]; };
+        if !delivery.matches(owner, &self.connection) { return vec![]; }
+        let mut callbacks = Vec::new();
+        for (sequence, result) in delivery.results() {
+            if !self.pending.get(&sequence).is_some_and(|p| p.delivery == Delivery::Batch) { continue; }
+            let Some(request) = self.pending.remove(&sequence) else { continue; };
+            if request.operation != NativeOperation::HostingRegister { continue; }
+            let callback = match decode_update_status_result(result.result_code, result.result_stream) {
+                Ok((success, _)) => Callback::HostingAck { success },
+                Err(_) => Callback::Failure(BackendFailure::HostingRejected),
+            };
+            callbacks.push(OwnedRpcCallback { owner: request.owner, callback });
+        }
+        callbacks
+    }
+
+    pub(super) fn retire_all(&mut self) { self.pending.clear(); }
 
     /// Submission errors/timeouts must retire the originally captured request.
     pub fn retire_request(&mut self, id: i32) { self.pending.remove(&id); }

@@ -5,7 +5,7 @@
 
 ## 1. 分支与编译约束
 
-- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests,rpc_bootstrap::tests,arc_session::tests,transport_packets::tests,arc_protocol::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests,rpc_bootstrap::tests,arc_session::tests,transport_packets::tests,arc_protocol::tests,batch_scheduler::tests,rpc_incoming::tests,offline_backend::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - 日常仅维护`master`，GitHub远端为`autisticryptic/SimMaster`（本地remote通常为`simmaster`）。
 - 不为每次验证长期留下分支。确需临时分支时，合并并确认提交已保留、CI通过后删除。
@@ -270,6 +270,19 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 - `arc_protocol.rs`只offline组合RPC与plaintext packet；先scope核验再parse，借用reply同步交付，controls不授登录/hosting，release/未实现server request关闭，login退休/失败清理partial buffer。需真正受信TLS引擎提供已确认的plaintext packet边界，不把carrier或控制码当成功。
 - 代码`684ef73cdfdde2bed1c262a95bd6e871c14a6bd3`已由Build39812859460/Beta39812859585实际各139模块回归（18凭据/21controller/12arguments/10native/8stream/6envelope/10batch/7login/13pending/6bootstrap/11arc session/10packets/7protocol）、ARM64/AMD64构建验证，Release skipped；两套官方SHA绑定测试ZIP逐名精确139及四矩阵86场景通过，本机368静态/mock通过。新四module filter实际执行，报告`.local/jegotrip/verified-native-684ef73.json`；`verify_native_ci.py`只下载/核验，不运行本机Rust。保留compile dead-code/unused warnings如实，未接真实backend不消除unsupported声明。来源与私有review/evidence留`.local/jegotrip/`。
 - 下一项真实backend仍包括Router/NetStream/NetSsl socket与完整boundary、部署参数解密/可信端点、batch epoch/ACK/dedup调度、server-object入站、持久化/provider/runtime/API/trunk/SMS/calls/media/计费/续期/并发。`transport_implemented=false`/provider unsupported/外发授权false不变，本轮无设备或服务端访问。
+
+### 离线批次调度与入站消息（已实现待Actions，非真实backend）
+
+用户当前没有可提供的实网配置，要求继续离线/理论完善。该授权不包括部署、访问手机/服务端、拨号或短信发送；缺少配置不是停止静态还原的理由，但也不是用默认值虚构可用性。
+
+- `batch_scheduler.rs`六词已由native发送/解析/初始化/回包交叉还原为本地incarnation、exclusive next batch、保留批次bitmap、peer incarnation/next/bitmap；ACK bit对应`next-1-bit`。32批/45s保留且重发原嵌套序号/bytes，ACK只删transport history，原hosting结果/通道ready另验。不会在本机启动loop或连接。
+- 2048序号/64词ring去重按32stride滑动；本地安全子集忽略before-base旧序号、拒绝非正/wrap、peer incarnation变化失败关闭，不复制native unsigned-negative跳转reset导致旧业务重放。native retention丢旧history，本实现显式失败关闭而非默默丢单或声称完成；本地entry/128KiB保留总量与snapshot/serial/seq耗尽均有界。
+- 原ARC只领取一个scheduler；scheduled snapshot携原owner/scope/identity、active+encoded状态，未编码不commit、已取消旧snapshot不能提交或编码、编码后取消关闭scope。单次prepare期间不变更working maps；queued但未submitted请求不得被无关poll结果确认。scheduled回包须通过ACK/epoch校验与原submitted sequence过滤后才交tracker，不可由raw外层bool绕过。
+- `rpc_incoming.rs`确认`recvOnlineMessage.MessageReceiver.Client`为版本stream＋receiver-kind byte string＋property map＋raw stream；返回type0/bool/terminal footer。仅安装原显式object/domain/receiver-kind且不接受wildcard；未知method/缺receiver不猜响应，unsupported关闭。sender/time原byte保留，`Sip.MessageGw.Oid`不自动改全局gateway，不能凭此认定所有消息均SMS。
+- `arc_protocol.rs`可处理明确配置的direct server request；需要同scope已auth、精确id/domain、binary `__magic`，正call id不复用。bounded magic缓存不evict/replay，压力关闭；原私有ticket由consumer确认后才编结果。native双180s magic窗口/所有wildcard/别名/并发尚不声明等价。TCP read/TLS read仍不是已确定packet边界。
+- `offline_backend.rs`只组合已有ARC/packet→scheduler→原hosting callback/入站ticket，**不实现HostingBackend或启用provider**。direct/batch message票据都绑定原scope，私有payload/ticket配对、借用completion重试、消费一次；收到消息不授channel、不写DB，不在消费成功前ACK。新回归覆盖login/pwd/token、nested ACK与message、invalid ACK不得交hosting、dedup、wrongscope/无配置/未知method、退役ticket。
+- 当前172 Rust为源码清单（新增17scheduler/7incoming/8offline＋1reply encoder），尚未编译/执行；两Actions新增3suite filter，本机370静态/mock通过。审查6超时只返回ticket-by-value回压丢失的部分发现，已借用修复与回归；不能算完整审查或互通证据。私有`.local/jegotrip/batch-inbound-offline-evidence.md`保存原函数/汇编，未执行目标库。
+- 仍需下层Router/NetStream/NetSsl socket及完整boundary、受信TLS/ENC provisioning/端点、业务kind/SMS可靠分类/入站落库/线路API/provider/trunk/call-media/费用/续期/并发；未把这些未实现项降为“只剩实机”。`transport_implemented=false`、provider unsupported、outbound false保持，只有明确支持子集通过Actions后才能报offline完成。
 
 ### 5. 下一阶段与验收条件
 

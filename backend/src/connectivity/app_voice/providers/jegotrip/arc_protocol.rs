@@ -3,22 +3,26 @@
 //! This is an offline protocol engine for a future Linux backend, NOT a
 //! HostingBackend/provider. The caller must supply verified routing/config and
 //! TLS plaintext packet boundaries. Socket, bootstrap routes, trust/handshake,
-//! batch epoch scheduling and incoming-object dispatch are still separate.
+//! configured incoming-message dispatch are offline only, not wire readiness.
 use super::{
+    batch_scheduler::{BatchError, BatchScheduler, ScheduledBatch},
     arc_session::{ArcLoginInputs, ArcPhase, ArcReply, ArcRpcSession},
     rpc_batch::BatchPayload,
+    rpc_envelope::{decode_request, encode_reply},
+    rpc_incoming::{IncomingBinding, IncomingDispatcher, encode_online_message_result},
     rpc_pending::{HostingRpcTracker, RpcConnectionScope},
     rpc_stream::{CodecError, RpcProperty},
     session::AttemptOwner,
     transport_packets::{encode_call_packets, CallAssembler, CallKind, TransportBytes, TransportError, TLS_FRAGMENT_THRESHOLD},
 };
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProtocolError { Rpc(CodecError), Transport(TransportError) }
+pub enum ProtocolError { Rpc(CodecError), Transport(TransportError), Batch(BatchError) }
 
 impl From<CodecError> for ProtocolError { fn from(error: CodecError) -> Self { Self::Rpc(error) } }
 impl From<TransportError> for ProtocolError { fn from(error: TransportError) -> Self { Self::Transport(error) } }
+impl From<BatchError> for ProtocolError { fn from(error: BatchError) -> Self { Self::Batch(error) } }
 
 pub struct OwnedCallPackets { pub call_id: i32, pub packets: Vec<TransportBytes> }
 
@@ -32,9 +36,45 @@ impl fmt::Debug for OwnedCallPackets {
 pub enum ProtocolEvent<'a> {
     Reply(ArcReply<'a>),
     Control(CallKind),
+    Incoming(IncomingProtocolMessage),
+    OutgoingReply(OwnedCallPackets),
 }
 
-pub struct ArcProtocol { rpc: ArcRpcSession, assembler: CallAssembler }
+pub struct DirectReplyTicket { owner: AttemptOwner, connection: RpcConnectionScope, call_id: i32 }
+
+impl DirectReplyTicket {
+    pub fn is_open(&self) -> bool { self.connection.is_open() }
+}
+
+impl fmt::Debug for DirectReplyTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("DirectReplyTicket(<redacted>)") }
+}
+
+pub struct IncomingProtocolMessage {
+    owner: AttemptOwner,
+    message: super::native_events::IncomingMessage,
+    reply: DirectReplyTicket,
+}
+
+impl IncomingProtocolMessage {
+    pub fn owner(&self) -> &AttemptOwner { &self.owner }
+    pub fn message(&self) -> &super::native_events::IncomingMessage { &self.message }
+    pub fn reply_ticket(&self) -> &DirectReplyTicket { &self.reply }
+    pub fn into_parts(self) -> (AttemptOwner, super::native_events::IncomingMessage, DirectReplyTicket) {
+        (self.owner, self.message, self.reply)
+    }
+}
+
+impl fmt::Debug for IncomingProtocolMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("IncomingProtocolMessage(<redacted>)") }
+}
+
+struct PendingDirect { magic: Vec<u8> }
+
+pub struct ArcProtocol {
+    rpc: ArcRpcSession, assembler: CallAssembler, incoming: Option<IncomingDispatcher>,
+    direct_pending: BTreeMap<i32, PendingDirect>, direct_seen: BTreeMap<i32, Vec<u8>>, direct_last_id: i32,
+}
 
 impl fmt::Debug for ArcProtocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("ArcProtocol(<redacted>)") }
@@ -42,7 +82,8 @@ impl fmt::Debug for ArcProtocol {
 
 impl ArcProtocol {
     pub fn new(owner: AttemptOwner) -> Self {
-        Self { rpc: ArcRpcSession::new(owner), assembler: CallAssembler::default() }
+        Self { rpc: ArcRpcSession::new(owner), assembler: CallAssembler::default(), incoming: None,
+            direct_pending: BTreeMap::new(), direct_seen: BTreeMap::new(), direct_last_id: 0 }
     }
 
     pub fn connection_scope(&self) -> RpcConnectionScope { self.rpc.connection_scope() }
@@ -54,7 +95,25 @@ impl ArcProtocol {
         self.rpc.retire_request(id);
         if self.rpc.phase() == ArcPhase::Closed { self.assembler.close(); }
     }
-    pub fn close(&mut self) { self.rpc.close(); self.assembler.close(); }
+    pub fn close(&mut self) {
+        self.rpc.close(); self.assembler.close(); self.incoming = None; self.direct_pending.clear(); self.direct_seen.clear();
+    }
+
+    pub fn take_batch_scheduler(&mut self, incarnation: u32) -> Result<BatchScheduler, ProtocolError> {
+        Ok(self.rpc.take_batch_scheduler(incarnation)?)
+    }
+
+    pub fn install_incoming(&mut self, binding: IncomingBinding<'_>) -> Result<(), ProtocolError> {
+        if self.incoming.is_some() { return Err(CodecError::InvalidField.into()); }
+        self.incoming = Some(self.rpc.incoming_dispatcher(binding)?);
+        Ok(())
+    }
+
+    pub fn prepare_scheduled_swap(&mut self, batch: &ScheduledBatch, routing: &[RpcProperty<'_>])
+        -> Result<OwnedCallPackets, ProtocolError> {
+        let (id, bytes) = self.rpc.prepare_scheduled_swap(batch, routing)?;
+        self.packets(id, bytes.expose_to_transport())
+    }
 
     fn packets(&mut self, id: i32, bytes: &[u8]) -> Result<OwnedCallPackets, ProtocolError> {
         match encode_call_packets(CallKind::Request, bytes, TLS_FRAGMENT_THRESHOLD) {
@@ -85,11 +144,13 @@ impl ArcProtocol {
     /// raw TCP/HTTP/API or a native notification. Old scopes are rejected before
     /// decoding/copying, so stale input cannot poison a newer fragment assembly.
     /// Reply contents are passed synchronously to avoid storing borrowed data or
-    /// assigning their owner on receipt. Unimplemented server requests close the
-    /// engine; this cannot be used as an inbound-SMS endpoint.
+    /// assigning their owner on receipt. Without an explicitly configured
+    /// original receiver binding, server requests fail closed. This method is
+    /// not a public inbound-SMS endpoint or a raw TCP/TLS read decoder.
     pub fn on_plaintext_packet<F>(&mut self, owner: &AttemptOwner, connection: &RpcConnectionScope,
         packet: &[u8], deliver: F) -> Result<bool, ProtocolError>
         where F: for<'a> FnOnce(ProtocolEvent<'a>) {
+        if self.rpc.phase() == ArcPhase::Closed { self.close(); return Ok(false); }
         if !self.rpc.accepts_scope(owner, connection) { return Ok(false); }
         let message = match self.assembler.on_packet(packet) {
             Ok(Some(message)) => message,
@@ -99,14 +160,14 @@ impl ArcProtocol {
         match message.kind {
             CallKind::Reply => match self.rpc.on_reply(owner, connection, message.payload.expose_to_transport()) {
                 Ok(Some(reply)) => {
-                    if self.rpc.phase() == ArcPhase::Closed { self.assembler.close(); }
+                    if self.rpc.phase() == ArcPhase::Closed { self.close(); }
                     deliver(ProtocolEvent::Reply(reply));
                     Ok(true)
                 }
                 Ok(None) => Ok(false),
                 Err(error) => { self.close(); Err(error.into()) }
             },
-            CallKind::Request => { self.close(); Err(TransportError::UnsupportedKind.into()) },
+            CallKind::Request => self.incoming_request(owner, connection, message.payload.expose_to_transport(), deliver),
             kind => {
                 if kind == CallKind::Release { self.close(); }
                 deliver(ProtocolEvent::Control(kind));
@@ -114,6 +175,76 @@ impl ArcProtocol {
             }
         }
     }
+
+    /// The input is a complete trusted plaintext call packet; direct server IDs
+    /// must be monotonic/non-reused in this subset. Binary magic duplicates are
+    /// stopped before inbox delivery. No accepted reply is emitted until the
+    /// local consumer explicitly completes its original ticket.
+    fn incoming_request<F>(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope, bytes: &[u8], deliver: F)
+        -> Result<bool, ProtocolError> where F: for<'a> FnOnce(ProtocolEvent<'a>) {
+        if self.rpc.phase() != ArcPhase::Authenticated || self.incoming.is_none() {
+            self.close(); return Err(TransportError::UnsupportedKind.into());
+        }
+        let request = match decode_request(bytes) { Ok(request) => request, Err(error) => { self.close(); return Err(error.into()); } };
+        if request.method != super::rpc_incoming::ONLINE_MESSAGE_METHOD.as_bytes() {
+            self.close(); return Err(TransportError::UnsupportedKind.into());
+        }
+        if self.direct_pending.contains_key(&request.call_id) || self.direct_seen.contains_key(&request.call_id) { return Ok(false); }
+        if request.call_id <= self.direct_last_id { self.close(); return Err(CodecError::InvalidCallId.into()); }
+        let Some(magic) = request.metadata.iter().find(|p| p.key == b"__magic").map(|p| p.value) else {
+            self.close(); return Err(CodecError::InvalidField.into());
+        };
+        if magic.is_empty() { self.close(); return Err(CodecError::InvalidField.into()); }
+        if self.direct_pending.values().any(|p| p.magic == magic) || self.direct_seen.values().any(|prior| prior == magic) {
+            return Ok(false);
+        }
+        let retained_bytes = self.direct_pending.values().map(|p| p.magic.len()).sum::<usize>()
+            + self.direct_seen.values().map(Vec::len).sum::<usize>();
+        if self.direct_pending.len() + self.direct_seen.len() >= super::rpc_stream::MAX_MAP_ENTRIES
+            || magic.len() > 1024
+            || retained_bytes + magic.len() > super::rpc_stream::MAX_STREAM_BYTES {
+            self.close(); return Err(CodecError::TooLarge.into());
+        }
+        let decoded = match self.incoming.as_ref().ok_or(CodecError::InvalidField)?.on_direct_request(owner, scope, &request) {
+            Ok(value) => value, Err(error) => { self.close(); return Err(error.into()); }
+        };
+        self.direct_last_id = request.call_id;
+        if let Some(message) = decoded {
+            self.direct_pending.insert(request.call_id, PendingDirect { magic: magic.to_vec() });
+            let original_owner = self.rpc.owner().clone();
+            deliver(ProtocolEvent::Incoming(IncomingProtocolMessage { owner: original_owner.clone(), message,
+                reply: DirectReplyTicket { owner: original_owner, connection: self.rpc.connection_scope(), call_id: request.call_id } }));
+        } else {
+            let result = encode_online_message_result(false)?;
+            let reply = encode_reply(request.call_id, 0, result.expose_to_transport())?;
+            let packets = encode_call_packets(CallKind::Reply, reply.expose_to_transport(), TLS_FRAGMENT_THRESHOLD)?;
+            self.record_direct(request.call_id, magic.to_vec());
+            deliver(ProtocolEvent::OutgoingReply(OwnedCallPackets { call_id: request.call_id, packets }));
+        }
+        Ok(true)
+    }
+
+    fn record_direct(&mut self, id: i32, magic: Vec<u8>) {
+        self.direct_seen.insert(id, magic);
+        // No eviction/replay shortcut. Capacity pressure terminates the scope
+        // before another inbox event, rather than forgetting duplicate keys.
+    }
+
+    pub fn complete_incoming(&mut self, ticket: &DirectReplyTicket, accepted: bool)
+        -> Result<Option<OwnedCallPackets>, ProtocolError> {
+        if self.rpc.phase() == ArcPhase::Closed { self.close(); return Ok(None); }
+        if !self.rpc.accepts_scope(&ticket.owner, &ticket.connection) { return Ok(None); }
+        let Some(pending) = self.direct_pending.remove(&ticket.call_id) else { return Ok(None); };
+        let result = encode_online_message_result(accepted)?;
+        let reply = encode_reply(ticket.call_id, 0, result.expose_to_transport())?;
+        let packets = encode_call_packets(CallKind::Reply, reply.expose_to_transport(), TLS_FRAGMENT_THRESHOLD)?;
+        self.record_direct(ticket.call_id, pending.magic);
+        Ok(Some(OwnedCallPackets { call_id: ticket.call_id, packets }))
+    }
+}
+
+impl Drop for ArcProtocol {
+    fn drop(&mut self) { self.close(); }
 }
 
 #[cfg(test)]

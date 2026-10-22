@@ -91,6 +91,7 @@ impl Writer {
         Ok(())
     }
 
+    pub fn boolean(&mut self, value: bool) -> Result<(), CodecError> { self.append(&[u8::from(value)]) }
     pub fn u16(&mut self, value: u16) -> Result<(), CodecError> { self.append(&value.to_be_bytes()) }
     pub fn u32(&mut self, value: u32) -> Result<(), CodecError> { self.append(&value.to_be_bytes()) }
     pub fn i32(&mut self, value: i32) -> Result<(), CodecError> { self.append(&value.to_be_bytes()) }

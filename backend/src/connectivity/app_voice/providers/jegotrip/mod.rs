@@ -5,15 +5,18 @@
 //! layers, neither is IMS AKA. No Android library is loaded here and no guessed
 //! HTTP/SIP transport is provided. A real backend must implement the SDK path
 //! before this provider can be installed as available.
+pub mod batch_scheduler;
 pub mod arc_protocol;
 pub mod arc_session;
 pub mod credentials;
 pub mod controller;
+pub mod offline_backend;
 pub mod native_events;
 pub mod rpc_arguments;
 pub mod rpc_batch;
 pub mod rpc_bootstrap;
 pub mod rpc_envelope;
+pub mod rpc_incoming;
 pub mod rpc_login;
 pub mod rpc_pending;
 pub mod rpc_stream;

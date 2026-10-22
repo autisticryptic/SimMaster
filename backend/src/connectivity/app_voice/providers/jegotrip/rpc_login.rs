@@ -38,7 +38,8 @@ impl fmt::Debug for NormalizedIdentity {
 pub fn normalize_session_identity(typed_identity: &[u8], domain_name: &[u8])
     -> Result<NormalizedIdentity, CodecError> {
     if typed_identity.is_empty() || typed_identity.len() > MAX_FIELD_BYTES
-        || typed_identity.iter().any(|byte| byte.is_ascii_control()) {
+        || typed_identity.iter().any(|byte| byte.is_ascii_control())
+        || typed_identity.windows(4).any(|bytes| bytes == b"ENC(") {
         return Err(CodecError::InvalidField);
     }
     let typed = typed_identity.iter().position(|&byte| byte == b':').is_some_and(|position| position > 0);

@@ -5,6 +5,7 @@
 //! and decoded deployment properties; this module never guesses endpoints,
 //! decrypts ENC values, resolves addresses, takes over a device or grants channels.
 use super::{
+    batch_scheduler::{BatchError, BatchScheduler, ScheduledBatch},
     controller::Callback,
     rpc_batch::{decode_swap_calls_reply, encode_swap_calls, BatchPayload, BatchReply, SWAP_CALLS_METHOD},
     rpc_bootstrap::{decode_get_app_configs_result, encode_get_app_configs, AppConfigsResult, GET_APP_CONFIGS_METHOD},
@@ -14,7 +15,7 @@ use super::{
     rpc_stream::{CodecError, RpcBytes, RpcProperty, MAX_FIELD_BYTES, MAX_MAP_ENTRIES},
     session::{AttemptOwner, BackendFailure},
 };
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArcPhase { Initial, LoginPending, Authenticated, Closed }
@@ -43,7 +44,9 @@ struct ArcAuthentication { user_id: Vec<u8>, selected_session_id: Vec<u8>, token
 #[derive(Clone, Copy)]
 enum PendingKind { Bootstrap, Login, Swap }
 
-struct PendingRpc { kind: PendingKind, selected_session_id: Option<Vec<u8>> }
+struct PendingRpc {
+    kind: PendingKind, selected_session_id: Option<Vec<u8>>, scheduler: Option<Arc<()>>,
+}
 
 /// Input bytes cannot become callbacks for a different owner or connection.
 /// Missing/retired ids are ignored, allocation never reuses a call id.
@@ -55,6 +58,7 @@ pub struct ArcRpcSession {
     pending: BTreeMap<i32, PendingRpc>,
     authentication: Option<ArcAuthentication>,
     hosting_tracker_taken: bool,
+    batch_scheduler_taken: bool,
 }
 
 impl fmt::Debug for ArcRpcSession {
@@ -72,12 +76,17 @@ pub struct OwnedBatchReply<'a> {
     connection: RpcConnectionScope,
     call_id: i32,
     reply: BatchReply<'a>,
+    scheduler: Option<Arc<()>>,
 }
 
 impl<'a> OwnedBatchReply<'a> {
     pub fn owner(&self) -> &AttemptOwner { &self.owner }
     pub fn call_id(&self) -> i32 { self.call_id }
     pub fn reply(&self) -> &BatchReply<'a> { &self.reply }
+    pub(super) fn is_scheduled(&self) -> bool { self.scheduler.is_some() }
+    pub(super) fn matches_scheduler(&self, scheduler: &Arc<()>) -> bool {
+        self.scheduler.as_ref().is_some_and(|original| Arc::ptr_eq(original, scheduler))
+    }
     pub(super) fn matches(&self, owner: &AttemptOwner, connection: &RpcConnectionScope) -> bool {
         &self.owner == owner && self.connection.matches(connection) && self.connection.is_open()
     }
@@ -101,23 +110,44 @@ impl fmt::Debug for ArcReply<'_> {
 impl ArcRpcSession {
     pub fn new(owner: AttemptOwner) -> Self {
         Self { owner, connection: RpcConnectionScope::fresh(), phase: ArcPhase::Initial,
-            next_id: Some(1), pending: BTreeMap::new(), authentication: None, hosting_tracker_taken: false }
+            next_id: Some(1), pending: BTreeMap::new(), authentication: None, hosting_tracker_taken: false,
+            batch_scheduler_taken: false }
     }
 
     pub fn connection_scope(&self) -> RpcConnectionScope { self.connection.clone() }
-    pub fn phase(&self) -> ArcPhase { self.phase }
+    pub fn phase(&self) -> ArcPhase {
+        if self.connection.is_open() { self.phase } else { ArcPhase::Closed }
+    }
+    pub(super) fn owner(&self) -> &AttemptOwner { &self.owner }
 
     /// One tracker per ARC incarnation keeps nested sequences unique and binds
     /// owner/connection at construction, never when a batch arrives.
     pub fn take_hosting_tracker(&mut self) -> Result<HostingRpcTracker, CodecError> {
-        if self.phase == ArcPhase::Closed || self.hosting_tracker_taken { return Err(CodecError::InvalidField); }
+        if self.phase() == ArcPhase::Closed || self.hosting_tracker_taken { return Err(CodecError::InvalidField); }
         self.hosting_tracker_taken = true;
         Ok(HostingRpcTracker::for_arc_session(self.owner.clone(), self.connection.clone()))
     }
 
+    pub fn incoming_dispatcher(&self, binding: super::rpc_incoming::IncomingBinding<'_>)
+        -> Result<super::rpc_incoming::IncomingDispatcher, CodecError> {
+        if self.phase() != ArcPhase::Authenticated { return Err(CodecError::InvalidField); }
+        super::rpc_incoming::IncomingDispatcher::for_arc_session(self.owner.clone(), self.connection.clone(), binding)
+    }
+
+    /// Enable exactly one owned scheduler before any raw swap submission. The
+    /// nonzero incarnation is generated/imported locally, never a credential or
+    /// endpoint default. Configuring this engine performs no network operation.
+    pub fn take_batch_scheduler(&mut self, incarnation: u32) -> Result<BatchScheduler, BatchError> {
+        if self.phase() != ArcPhase::Authenticated || self.batch_scheduler_taken
+            || self.pending.values().any(|p| matches!(p.kind, PendingKind::Swap)) { return Err(BatchError::Scope); }
+        let scheduler = BatchScheduler::for_arc_session(self.owner.clone(), self.connection.clone(), incarnation)?;
+        self.batch_scheduler_taken = true;
+        Ok(scheduler)
+    }
+
     fn allocate(&mut self, metadata: &[RpcProperty<'_>], method: &[u8], arguments: &[u8],
         pending: PendingRpc) -> Result<(i32, RpcBytes), CodecError> {
-        if self.phase == ArcPhase::Closed { return Err(CodecError::InvalidField); }
+        if self.phase() == ArcPhase::Closed { return Err(CodecError::InvalidField); }
         if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
         let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
         let bytes = encode_request(id, metadata, method, arguments)?;
@@ -134,7 +164,7 @@ impl ArcRpcSession {
         reject_auth_keys(routing)?;
         let arguments = encode_get_app_configs(application_key)?;
         self.allocate(routing, GET_APP_CONFIGS_METHOD.as_bytes(), arguments.expose_to_transport(),
-            PendingRpc { kind: PendingKind::Bootstrap, selected_session_id: None })
+            PendingRpc { kind: PendingKind::Bootstrap, selected_session_id: None, scheduler: None })
     }
 
     /// The imported phone token is per-call metadata `pwd`, not a method string
@@ -174,14 +204,31 @@ impl ArcRpcSession {
         metadata.push(RpcProperty { key: b"pwd", value: inputs.phone_login_token });
         let selected_session_id = inputs.selected_session_id.to_vec();
         let prepared = self.allocate(&metadata, LOGIN_SESSION_METHOD.as_bytes(), arguments.expose_to_transport(),
-            PendingRpc { kind: PendingKind::Login, selected_session_id: Some(selected_session_id) })?;
+            PendingRpc { kind: PendingKind::Login, selected_session_id: Some(selected_session_id), scheduler: None })?;
         self.phase = ArcPhase::LoginPending;
         Ok(prepared)
     }
 
     pub fn prepare_swap_calls(&mut self, payload: &BatchPayload<'_>, routing: &[RpcProperty<'_>])
         -> Result<(i32, RpcBytes), CodecError> {
-        if self.phase != ArcPhase::Authenticated { return Err(CodecError::InvalidField); }
+        if self.batch_scheduler_taken { return Err(CodecError::InvalidField); }
+        self.prepare_swap(payload, routing, None)
+    }
+
+    pub fn prepare_scheduled_swap(&mut self, batch: &ScheduledBatch, routing: &[RpcProperty<'_>])
+        -> Result<(i32, RpcBytes), CodecError> {
+        if !self.batch_scheduler_taken || !batch.matches(&self.owner, &self.connection) || batch.is_encoded() {
+            return Err(CodecError::InvalidField);
+        }
+        let result = self.prepare_swap(&batch.payload(), routing, Some(batch.identity()))?;
+        batch.mark_encoded();
+        Ok(result)
+    }
+
+    fn prepare_swap(&mut self, payload: &BatchPayload<'_>, routing: &[RpcProperty<'_>], scheduler: Option<Arc<()>>)
+        -> Result<(i32, RpcBytes), CodecError> {
+        if self.phase() != ArcPhase::Authenticated { return Err(CodecError::InvalidField); }
+        if scheduler.is_some() && payload.fields[0] == 0 { return Err(CodecError::InvalidField); }
         reject_auth_keys(routing)?;
         let auth = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
         let arguments = encode_swap_calls(&auth.user_id, &auth.selected_session_id, payload)?;
@@ -191,7 +238,7 @@ impl ArcRpcSession {
         if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
         let bytes = encode_request(id, &metadata, SWAP_CALLS_METHOD.as_bytes(), arguments.expose_to_transport())?;
         self.next_id = id.checked_add(1);
-        self.pending.insert(id, PendingRpc { kind: PendingKind::Swap, selected_session_id: None });
+        self.pending.insert(id, PendingRpc { kind: PendingKind::Swap, selected_session_id: None, scheduler });
         Ok((id, bytes))
     }
 
@@ -250,6 +297,7 @@ impl ArcRpcSession {
             PendingKind::Swap => match decode_swap_calls_reply(reply.result_code, reply.result_stream) {
                 Ok(result) if result.success => ArcReply::Swap(OwnedBatchReply {
                     owner: self.owner.clone(), connection: self.connection.clone(), call_id: reply.call_id, reply: result,
+                    scheduler: pending.scheduler,
                 }),
                 _ => self.failure(),
             },
