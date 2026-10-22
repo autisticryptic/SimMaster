@@ -1,38 +1,16 @@
 //! RPC argument format verified from the selected native SDK in read-only IDA.
 //!
 //! This is only the versioned argument payload passed to ObjectAgent, not a
-//! network frame or SIP message. ARC session/batch framing remains unimplemented.
-use super::session::{GatewayRegistration, STATUS_REGISTER, STATUS_UNREGISTER};
-use std::fmt;
+//! network frame or SIP message. ARC connection/TLS framing remains unimplemented.
+use super::{rpc_stream::{read_footer, CodecError, Reader, RpcFooter, RpcProperty, Writer},
+    session::{GatewayRegistration, STATUS_REGISTER, STATUS_UNREGISTER}};
 
 pub const UPDATE_STATUS_METHOD: &str = "updateStatus.SipGatewayPub.SipGateway";
 pub const DEFAULT_GATEWAY_OBJECT: &str = "#SipGateway";
-const MAX_ARGUMENT_BYTES: usize = 128 * 1024;
+pub use super::rpc_stream::{RpcBytes as RpcArguments, MAX_STREAM_BYTES as MAX_ARGUMENT_BYTES};
 
-/// A payload contains credentials: no Serialize/Display or byte-dumping Debug.
-pub struct RpcArguments(Vec<u8>);
-
-impl RpcArguments {
-    pub fn expose_to_transport(&self) -> &[u8] { &self.0 }
-}
-
-impl fmt::Debug for RpcArguments {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RpcArguments").field("byte_length", &self.0.len())
-            .field("data", &"<redacted>").finish()
-    }
-}
-
-fn put_string(out: &mut Vec<u8>, value: &str) -> Result<(), &'static str> {
-    let bytes = value.as_bytes();
-    if bytes.contains(&0) { return Err("jegotrip_rpc_string_invalid"); }
-    let length = u32::try_from(bytes.len()).map_err(|_| "jegotrip_rpc_arguments_too_large")?;
-    let next = out.len().checked_add(4).and_then(|size| size.checked_add(bytes.len()))
-        .ok_or("jegotrip_rpc_arguments_too_large")?;
-    if next > MAX_ARGUMENT_BYTES { return Err("jegotrip_rpc_arguments_too_large"); }
-    out.extend_from_slice(&length.to_be_bytes());
-    out.extend_from_slice(bytes);
-    Ok(())
+fn validate_string(value: &str) -> Result<(), &'static str> {
+    if value.as_bytes().contains(&0) { Err("jegotrip_rpc_string_invalid") } else { Ok(()) }
 }
 
 /// `current_user_uri` is the SDK's actual Mtc_UeGetUri, not a guessed sip: URI.
@@ -45,7 +23,7 @@ pub fn encode_update_status(current_user_uri: &str, status: i32,
         return Err("jegotrip_hosting_status_unsupported");
     }
     let status = status.to_string();
-    let mut fields = [
+    let fields = [
         ("SipFlag", status.as_str()),
         ("AuthnamePrefix", credentials.authname_prefix),
         ("ChannelId", credentials.channel_id),
@@ -56,20 +34,29 @@ pub fn encode_update_status(current_user_uri: &str, status: i32,
     if fields.iter().any(|(_, value)| value.is_empty()) {
         return Err("jegotrip_rpc_credential_missing");
     }
-    fields.sort_by(|(left, _), (right, _)| left.len().cmp(&right.len())
-        .then_with(|| left.as_bytes().cmp(right.as_bytes())));
-    // Bounds/NUL rejection are local adapter policies, not inferred remote
-    // protocol restrictions. Never serialize an unvalidated empty credential.
-    let mut out = Vec::new();
-    out.extend_from_slice(&1u16.to_be_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes());
-    put_string(&mut out, current_user_uri)?;
-    out.extend_from_slice(&(fields.len() as u32).to_be_bytes());
-    for (key, value) in fields {
-        put_string(&mut out, key)?;
-        put_string(&mut out, value)?;
-    }
-    Ok(RpcArguments(out))
+    validate_string(current_user_uri)?;
+    for (_, value) in &fields { validate_string(value)?; }
+    let fields: Vec<_> = fields.iter().map(|(key, value)| RpcProperty {
+        key: key.as_bytes(), value: value.as_bytes(),
+    }).collect();
+    let mut writer = Writer::versioned().map_err(CodecError::code)?;
+    writer.bytes(current_user_uri.as_bytes()).map_err(CodecError::code)?;
+    writer.properties(&fields).map_err(CodecError::code)?;
+    Ok(writer.finish())
+}
+
+/// The result is already correlated to updateStatus, not merely a matching
+/// notification name. Native success requires RPC result zero AND bool true.
+/// It is still only a gateway acknowledgement, not channel readiness.
+pub fn decode_update_status_result(result_code: u32, bytes: &[u8])
+    -> Result<(bool, RpcFooter<'_>), CodecError> {
+    if result_code != 0 { return Err(CodecError::RemoteFailure); }
+    let mut reader = Reader::new(bytes)?;
+    let success = reader.boolean()?;
+    let footer = read_footer(&mut reader)?;
+    reader.finish()?;
+    if !footer.reason.is_empty() { return Err(CodecError::RemoteFailure); }
+    Ok((success, footer))
 }
 
 #[cfg(test)]

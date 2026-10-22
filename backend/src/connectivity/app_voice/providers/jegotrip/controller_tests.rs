@@ -298,6 +298,37 @@ async fn callback_deadline_is_checked_even_when_scheduler_has_not_ticked() {
 }
 
 #[tokio::test]
+async fn correlated_rpc_reply_drives_hosting_ack_but_not_message_readiness() {
+    use crate::connectivity::app_voice::providers::jegotrip::rpc_pending::HostingRpcTracker;
+    let mut controller = HostingController::new("line-a".into(), Some(MockBackend::new(false)));
+    controller.import(imported(), 100).unwrap();
+    let owner = controller.start(100).await.unwrap();
+    controller.on_callback(&owner, Callback::SdkLogin { success: true }, 100).await.unwrap();
+    let mut tracker = HostingRpcTracker::new();
+    let connection = tracker.connection_scope();
+    let registration = GatewayRegistration { authname_prefix: "prefix", channel_id: "channel",
+        delete_int_code: "1", sip_number: "number", sip_password: "password" };
+    let (id, _) = tracker.prepare_update_status(owner.clone(), "actual-sdk-uri", STATUS_REGISTER,
+        &registration, &[]).unwrap();
+    let mut bytes = vec![0];
+    bytes.extend_from_slice(&id.to_be_bytes());
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&6u32.to_be_bytes());
+    bytes.extend_from_slice(&[0, 1, 0, 0, 0, 0]);
+    let completed = tracker.on_reply(&connection, &bytes).unwrap().unwrap();
+    assert!(controller.on_callback(&completed.owner, completed.callback, 100).await.unwrap());
+    assert_eq!(controller.phase(), Phase::Hosted);
+    assert!(!controller.incoming_message_ready());
+    assert!(tracker.on_reply(&connection, &bytes).unwrap().is_none());
+    controller.on_callback(&owner, Callback::Channels { calls: false, messages: true }, 100).await.unwrap();
+    let mut n = notification("MtcSmgwMessageRecvNotification", None);
+    n.message = Some(&[0, 0xff, 0]);
+    let received = controller.on_native_notification(&owner, n, 100).await.unwrap().unwrap();
+    assert_eq!(received.body, [0, 0xff, 0]);
+    assert!(!controller.outbound_authorized());
+}
+
+#[tokio::test]
 async fn native_reconnect_success_alone_cannot_restore_hosting_or_channels() {
     let mut controller = HostingController::new("line-a".into(), Some(MockBackend::new(false)));
     let owner = hosted(&mut controller).await;

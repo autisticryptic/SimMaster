@@ -9,6 +9,11 @@ pub mod credentials;
 pub mod controller;
 pub mod native_events;
 pub mod rpc_arguments;
+pub mod rpc_batch;
+pub mod rpc_envelope;
+pub mod rpc_login;
+pub mod rpc_pending;
+pub mod rpc_stream;
 pub mod session;
 
 // Keep the existing API/provider id stable while moving the implementation.

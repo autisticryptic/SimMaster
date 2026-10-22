@@ -5,7 +5,7 @@
 
 ## 1. 分支与编译约束
 
-- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - 日常仅维护`master`，GitHub远端为`autisticryptic/SimMaster`（本地remote通常为`simmaster`）。
 - 不为每次验证长期留下分支。确需临时分支时，合并并确认提交已保留、CI通过后删除。
@@ -240,12 +240,24 @@ SDK成功回调后才submit托管status=4，注销status=3后logout；请求/回
 DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开并确认目标 `libmtc.so`，本轮通过MCP仅只读分析，未修改IDB或执行库。
 准确导航符号/地址与JNI证据只留 `.local/jegotrip/next-native-analysis.md`，不硬编码到生产代码。
 
-### 原生参数编码与通知适配（已实现待Actions）
+### 原生参数编码与通知适配（1d8d042已验证，type0前缀后续修正）
 
-- `rpc_arguments.rs` 实现 `updateStatus.SipGatewayPub.SipGateway` 的参数：BE16版本1/0、真实SDK UE URI的BE32字节长度、BE32 map计数及键/值字节串；map按键字节长度再按字节排序，不能用Rust默认词典序代替。原SDK五字段及string `SipFlag=4/3`保留；128KiB/NUL/空凭据检查是本地安全边界，不冒认服务器协议限制，Debug脱敏。
+- `rpc_arguments.rs` 实现 `updateStatus.SipGatewayPub.SipGateway` 的参数：type0流标记、BE16版本1/0、真实SDK UE URI的BE32字节长度、BE32 map计数及键/值字节串；map按键字节长度再按字节排序，不能用Rust默认词典序代替。原SDK五字段及string `SipFlag=4/3`保留；128KiB/NUL/空凭据检查是本地安全边界，不冒认服务器协议限制，Debug脱敏。
 - `native_events.rs` 接受可信backend已解码的**本地SDK通知**，不接受API或未认证网络帧。native `updateStatus`先验证RPC结果为0和返回boolean为true，才发Ok通知；通知本身没有另一个boolean字段。注册/注销共享通知名，必须用提交时cookie捕获的owner和本地operation分开，不能收到通知才重绑当前owner。
 - controller在通知到达时检查凭据到期和monotonic deadline，过期优先、重复tick不改变原因；同名线路删除/重建有独立incarnation。先拒绝旧/未ready来源，再有界复制原始body/from/time字节，不lossy转UTF-8、不猜3GPP TPDU。发送成功、status2成功或ReconnectOk都不能确认本次托管或授予通道ready。
-- 两套Actions显式选中17凭据/会话、19controller、9codec、10native事件共55项回归；本机365静态/mock通过，Rust执行待CI。不实现ARC/TLS完整封包、token续期、真实收短信或通话；provider仍不可用。静态证据只留`.local/jegotrip/ida-mcp-first-pass.md`，不提交APK/SDK库或运行偏移。
+- 两套Actions显式选中17凭据/会话、19controller、9codec、10native事件共55项回归由Build39747922739/Beta39747922813双架构通过，官方SHA测试ZIP逐名及四矩阵86场景核验；本机365静态/mock通过，报告`.local/jegotrip/verified-native-1d8d042.json`。不实现ARC/TLS完整封包、token续期、真实收短信或通话；provider仍不可用。静态证据只留`.local/jegotrip/ida-mcp-first-pass.md`，不提交APK/SDK库或运行偏移。
+
+### RPC封装、批次与结果（已实现待Actions）
+
+后续IDA构造函数/流长度/输入工厂/汇编交叉确认：type0字节必须在版本号前，不能只写BE16版本；1d8d042的55项CI通过不能证明原错误前缀等价于SDK，已独立留证并修正测试。请求参数有版本1/0，result stream不重复版本；terminal错误字符串必读，非空错误即使boolean=true也拒绝，后继可选property map保持脱敏。
+
+- `rpc_stream.rs`：type0/BE16/BE32、有界byte string/metadata map、长度优先键排序、重复/截断/trailing拒绝；binary `__magic`不套UTF-8/NUL政策。128KiB流/64KiB字段/128entry为本地安全政策，不是假服务器限制。
+- `rpc_envelope.rs`：request为type0+positive call id+metadata+method+raw args；reply为type0+原call id+result code+raw result。均无socket/握手或readiness副作用。
+- `rpc_batch.rs`：`swapCalls.AccountEntry.Account`入参使用**loginSession返回**的user id/ARC session token、六个原顺序opaque词、signed int32索引request/result maps；外层bool/code不能代替每个托管结果，也不自动重试。`rpc_login.rs`只编码native已提供的两字符串/map并检验非空返回id/token，不猜输入身份/密码推导、expiry或刷新。
+- `rpc_pending.rs`：prepare记录原owner/注册或注销operation、单连接递增id与独立receive scope；reply仅完成原pending一次，旧连接/retired/duplicate/注销回包不确认注册，非零/坏result撤ready。controller回归串联实际encoder→envelope→tracker→ack→独立messages channel→原byte消息，仍为mock不是公网互通。
+- 95模块回归待两套Actions逐名核验（17session/20controller/12arguments/10native/8stream/6envelope/9batch/6login/7pending），366静态/mock通过。新`.local/jegotrip/ida-mcp-rpc-transport.md`记录原函数/构造/排序/结果/下层TLS取证，不提交库或偏移。
+
+已定位外层FF-FF/NetStream及`DataKeyTls=6`包装；TLS对象被嵌入自有帧，不能把TcpStream+rustls直接宣称兼容。压缩、分片、身份/auth/provisioning、batch epoch/ack/dedup/通知与业务尚需还原；provider/元数据仍明确不可用，本轮无设备/服务端/部署。
 
 ### 5. 下一阶段与验收条件
 

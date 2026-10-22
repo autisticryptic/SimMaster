@@ -61,16 +61,45 @@ class JegotripContract(unittest.TestCase):
     def test_native_gateway_codec_is_bounded_and_is_not_a_network_frame(self):
         source = (MOD / 'rpc_arguments.rs').read_text(encoding='utf-8')
         self.assertIn('updateStatus.SipGatewayPub.SipGateway', source)
-        self.assertIn('left.len().cmp(&right.len())', source)
-        self.assertIn('left.as_bytes().cmp(right.as_bytes())', source)
-        self.assertIn('to_be_bytes()', source)
+        stream = (MOD / 'rpc_stream.rs').read_text(encoding='utf-8')
+        self.assertIn('left.len().cmp(&right.len())', stream)
+        self.assertIn('left.cmp(right)', stream)
+        self.assertIn('to_be_bytes()', stream)
         self.assertIn('MAX_ARGUMENT_BYTES', source)
-        self.assertIn('"<redacted>"', source)
-        self.assertNotIn('derive(Serialize)', source)
+        self.assertIn('"<redacted>"', stream)
+        self.assertNotIn('derive(Serialize)', source + stream)
         for name in ['beta-validation.yml', 'build-release.yml']:
             workflow = (ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
             self.assertIn('connectivity::app_voice::providers::jegotrip::rpc_arguments::tests', workflow)
             self.assertIn('connectivity::app_voice::providers::jegotrip::native_events::tests', workflow)
+
+    def test_rpc_stream_envelopes_and_batches_keep_type_marker_and_bound_parsers(self):
+        stream = (MOD / 'rpc_stream.rs').read_text(encoding='utf-8')
+        self.assertIn('Self(vec![STREAM_DATA])', stream)
+        self.assertIn('MAX_FIELD_BYTES', stream)
+        self.assertIn('MAX_MAP_ENTRIES', stream)
+        self.assertIn('CodecError::DuplicateKey', stream)
+        self.assertIn('reader.bytes()?', stream)
+        arguments = (MOD / 'rpc_arguments.rs').read_text(encoding='utf-8')
+        self.assertIn('Writer::versioned()', arguments)
+        envelope = (MOD / 'rpc_envelope.rs').read_text(encoding='utf-8')
+        self.assertIn('Reader::new(bytes)?', envelope)
+        self.assertIn('reader.finish()?', envelope)
+        batch = (MOD / 'rpc_batch.rs').read_text(encoding='utf-8')
+        self.assertIn('swapCalls.AccountEntry.Account', batch)
+        self.assertIn('BTreeMap<i32, BatchRequest', batch)
+        self.assertIn('if result_code != 0', batch)
+        self.assertIn('read_footer(&mut reader)?', batch)
+        pending = (MOD / 'rpc_pending.rs').read_text(encoding='utf-8')
+        self.assertIn('Arc::ptr_eq(&self.connection.0, &connection.0)', pending)
+        self.assertIn('self.pending.remove(&reply.call_id)', pending)
+        self.assertIn('request.operation != NativeOperation::HostingRegister', pending)
+        self.assertIn('id.checked_add(1)', pending)
+        self.assertNotIn('session.current_owner()', pending)
+        for module in ['rpc_stream', 'rpc_envelope', 'rpc_batch', 'rpc_login', 'rpc_pending']:
+            for name in ['beta-validation.yml', 'build-release.yml']:
+                self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests',
+                              (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
 
     def test_native_notifications_require_local_operation_and_stale_scope_checks(self):
         events = (MOD / 'native_events.rs').read_text(encoding='utf-8')

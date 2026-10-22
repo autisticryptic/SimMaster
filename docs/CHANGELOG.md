@@ -5,7 +5,9 @@
 
 ## 1.1.5 主线
 
-- 无忧行原生适配（已实现待Actions）：只读IDA确认托管参数的二进制版本/字节串/map排序及本地完成通知/cookie；新增RPC argument编码、字节保真的收消息适配，注册/注销同名通知按提交时operation隔离，重建同名线路用独立incarnation，交付边界检查过期/超时且过期优先。55项模块回归纳入两套Actions，365静态/mock通过；参数不是完整ARC/TLS帧，不启用provider、不声称真实托管/短信/通话可用；本轮未部署/访问设备或服务端。
+- 无忧行RPC封装/批次（已实现待Actions）：继续只读IDA定位type0流标记，修正1d8d042漏字节夹具；补Common request/reply、signed int32索引swapCalls请求/响应批次、loginSession入参/返回及terminal错误footer。原提交owner/operation与连接scope追踪精确reply，旧/重复/注销回包不授新hosting；消息与binary __magic原字节保留，解析长度/count/重复/trailing有界。95项模块回归待CI，366静态/mock通过。不能用通用TLS socket直接替代外层NetStream/FF-FF/DataKeyTls封装，ARC认证/续期与真实业务仍未实现，provider不启用，无部署。
+
+- 无忧行原生适配（1d8d042已验证，stream前缀随后校正）：只读IDA确认托管参数的二进制版本/字节串/map排序及本地完成通知/cookie；新增RPC argument编码、字节保真的收消息适配，注册/注销同名通知按提交时operation隔离，重建同名线路用独立incarnation，交付边界检查过期/超时且过期优先。55项模块回归由Build39747922739/Beta39747922813两套Actions及双架构通过，官方摘要ZIP逐名核验、四矩阵86场景通过；365静态/mock通过；参数不是完整ARC/TLS帧，不启用provider、不声称真实托管/短信/通话可用；本轮未部署/访问设备或服务端。
 
 - 应用通话目录隔离（31d3739 已验证）：无忧行迁至 `connectivity/app_voice/providers/jegotrip/`，Google Voice/Telegram/iMessage 各自独立目录；共享 registry 不共享账号/协议，旧 IMS import 用 re-export 兼容。无忧行新增 controller 调用 SDK 登录→托管注册→注销/退出，有限超时/回调归属/停止后换凭据；没有Linux wire backend不授ready。iMessage仅消息声明，所有未实现provider仍unsupported。本轮静态分析未访问设备/服务端；Build39626186439/Beta39626186611双架构成功，官方摘要测试ZIP各14原凭据+8controller+6registry测试逐名通过，363静态/mock成功。
 
