@@ -5,7 +5,7 @@
 
 ## 1. 分支与编译约束
 
-- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests,rpc_bootstrap::tests,arc_session::tests,transport_packets::tests,arc_protocol::tests,batch_scheduler::tests,rpc_incoming::tests,offline_backend::tests,packet_stream::tests,router_packets::tests,packet_transport::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests,rpc_bootstrap::tests,arc_session::tests,transport_packets::tests,arc_protocol::tests,batch_scheduler::tests,rpc_incoming::tests,offline_backend::tests,packet_stream::tests,router_packets::tests,packet_transport::tests,tls_engine::tests,tls_plaintext::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - 日常仅维护`master`，GitHub远端为`autisticryptic/SimMaster`（本地remote通常为`simmaster`）。
 - 不为每次验证长期留下分支。确需临时分支时，合并并确认提交已保留、CI通过后删除。
@@ -294,6 +294,16 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 - SHA一致本地ELF/FDE/ARM64证明原sender/receiver/BE32排序，不执行库；IDA MCP当前WinError10061，不自行启动/加载或改IDB。TLS辅助任务超时仅留反汇编，main独立核验；完成的source review无本机构建、broker一个坏event如实保留；主代理随后补发协调消息因同时带recipient/requestId被工具拒绝，未送达，不算额外确认。mode3直接SSL_write Common packet且SSL_read可pipeline记录，**无内层BE32**，不把任意rustls reader当packet。
 - 新10stream/11router/14owned-transport＋1offline组合回归由`902f4f54042e76e4ed330efedaa23f892106895e`两Actions实际执行：Build39912321845/Beta39912321855/ARM64+AMD64成功，Release skipped；官方SHA ZIP精确各208模块回归及四矩阵86场景核验，373 Python静态/mock通过，三新suite非零过滤器实际执行。报告`.local/jegotrip/verified-native-902f4f5.json`；Build12483402678 SHA256`164a41f41893f87bdf89f28506ae68fb9eaae8dde34cdca8b1fc7c3aeae064ff`、Beta12483058183 SHA256`5cecd81e3155a5ead18686d5e60c01a511885f9b96498016688500ef820c0fa6`。保留55条compile warnings（14 Jegotrip关联节选）不掩盖offline接口尚未live接线。证据`.local/jegotrip/resume-network-framing-evidence.md`；无本机编译，本步ELF资料足够，后续只有确需IDA才告知用户具体文件。
 - 剩余真实socket/NetStream/runtime、受信TLS/ENC provisioning/端点、record-aware明文边界、SMS可靠分类及落库/provider/API/trunk/call-media/费用/续期/并发；provider unsupported、transport_implemented=false/outbound=false保持，无设备/服务/部署。
+
+### 可信TLS与Common明文流（已实现待Actions，非完整backend）
+
+- `tls_engine.rs`只操作内存rustls ClientConnection，不开socket/查DNS/接服务。显式imported base64 DER root（≤16384bytes）、原authority及SNI策略，stock chain/time/signature/EKU/name验证后额外exact DNS/IP SAN；无系统/public roots fallback、mTLS/weakTLS、earlydata或session resumption。握手只提供wire输出，TLS verified不发SDK/hosting/channel callback，验证前encrypt_packets拒绝。
+- `tls_plaintext.rs`按原type0 request/reply字段计数/长度自定界；native mode3固定16382、N+4末两块平衡chunk plan，独立fixture覆盖record/任意read split/coalescing、binary metadata、非法counts/trailing等。无猜内层BE32，未知compression/另threshold/kind失败关闭；既有CallAssembler和完整envelope重复key/id/bounds仍执行。
+- 标准cipher record缓存跨carrier，先有界type/version/BE16record length，再交真实rustls验证；inner plaintext再次独立分界。writer一完整native packet≤16383一次write，rustls max_fragment_size包含5-byte header已按源码校正；handshake output也由bounded Write控制上限，不以rustls application bufferlimit当全部内存上限。EOF/close_notify/坏cipher/非法明文关闭原scope，无恢复明文。
+- 原ARC一次TLS或raw PacketTransport slot；私有VerifiedPlaintextPackets才能交OfflineBackend新接线，错scope/旧owner在parse前拒绝。不夸大snapshot可撤销性，live writer/TLS actor final-consume/close/取消排空仍需实现；固定handshake(≤60s)与整体partial(≤30s)deadline，流量不重开计时，回退monotonic钟关闭，非SDK token寿命/续期推断。
+- shared `core/tls_identity.rs`仅提升可见性，算法与旧SIP helper完全一致；旧sip_tls_identity wrapper保留两原测试名/路径，额外shared两测试加入Actions。新10plaintext/19TLS=237 Jegotrip源码清单，376Python/static/mock通过，待两Actions/双架构/官方SHA精确回归及原86矩阵；不运行本机Rust/openssl peer。Actions测试进程生成临时证书并做真实内存TLS握手，不提交私钥/root材料。
+- 两辅助设计/source review480s超时无结果不算验证，main独立核对原ELF与rustlsAPI；首次本机静态wholeprovider HTTPS禁令命中非法authority fixture，改中性scheme保留负例；fixture原ARC过早drop/非Clone concat/吞reader errors已主代理修正，原失败保留`.local/jegotrip/static-tls-first.log`。证据`.local/jegotrip/tls-offline-evidence.md`，本步不需要用户IDA。
+- 仍无live socket/NetStream/全Router控制/可靠调度，ENC provisioning/端点导入/credential落库/API/provider/trunk/SMS分类/通话媒体/费用续期并发，transport_implemented=false/providerunsupported/outboundfalse保持；本阶段不能冒称全部无忧行已复刻。
 
 ### 5. 下一阶段与验收条件
 

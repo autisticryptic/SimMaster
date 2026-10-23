@@ -439,6 +439,8 @@ Common请求/回包与swapCalls批次已补有界codec及原提交/连接scope�
 
 下层PacketSender使用BE32原packet长度，Router另有8-byte header/opaque routing与part2+3平衡分片；本轮有界codec/原ARC transport已由902f4f5 Build39912321845/Beta39912321855/双架构、官方SHA ZIP各208模块回归/86矩阵核验，373静态/mock通过，Release skipped。只支持显式原stream route与exact独立TX/RX，无猜测反向地址/端点或证书，未知控制/扩展/旧scope/序号wrap拒绝；输出是opaque TLS，不是已认证RPC。close仅阻止新的access，不能撤销此前借出/复制的bytes；live writer/TLS需另有串行最终消费、取消排空协议。mode3无内层BE32，任意SSL/rustls plaintext read仍不构成Common packet边界，真实socket/可信TLS/provisioning/业务接线仍未完成。
 
+当前tls_engine/tls_plaintext扩展已实现待Actions：显式原root/authority/exactSAN，TLS1.2/1.3真实内存引擎，验证前不发送应用数据；原Common长度/固定mode3分片自定界，禁止假内层BE32/read-as-packet。固定握手/partial deadline与EOF关闭原scope，private verified packets不借另一路；237 Rust仅源码清单/376静态mock，sharedSAN旧SIP算法不变。TLS verified仍不授SDK/hosting/channels，不同于电话短信业务或完整socketruntime，ENC provisioning/端点/provider/媒体/费用仍未实现。
+
 ## 10. 验证清单与验收标准
 
 构建/Rust/注册模拟仅走 GitHub Actions，流程见 [开发指南](DEVELOPER.md)。

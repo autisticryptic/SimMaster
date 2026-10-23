@@ -11,6 +11,7 @@ use super::{
     rpc_incoming::{encode_online_message_result, IncomingBinding, IncomingDispatcher},
     rpc_pending::{HostingRpcTracker, OwnedRpcCallback, RpcConnectionScope},
     packet_transport::{OwnedPacketTransport, PacketRoute},
+    tls_engine::{TlsEngine, TlsError, TlsParameters, VerifiedPlaintextPackets},
     rpc_stream::{CodecError, RpcProperty},
     session::{AttemptOwner, GatewayRegistration},
 };
@@ -67,6 +68,17 @@ impl OfflineBackend {
     /// trusted TLS engine must still establish actual plaintext packet boundaries.
     pub fn take_packet_transport(&mut self, route: PacketRoute<'_>) -> Result<OwnedPacketTransport, ProtocolError> {
         self.protocol.take_packet_transport(route)
+    }
+    pub fn take_tls_engine(&mut self, route: PacketRoute<'_>, parameters: TlsParameters<'_>, now: std::time::Instant)
+        -> Result<TlsEngine, TlsError> { self.protocol.take_tls_engine(route, parameters, now) }
+    /// Only privately constructed, TLS-verified original-scope packets enter
+    /// this path; opaque carriers cannot construct this delivery capability.
+    pub fn on_verified_plaintext(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope,
+        plaintext: VerifiedPlaintextPackets, now_ms: u64) -> Result<Vec<OfflineEvent>, ProtocolError> {
+        let Some(packets) = plaintext.packets_for(owner, scope) else { return Ok(vec![]); };
+        let mut events = Vec::new();
+        for packet in packets { events.extend(self.on_plaintext_packet(owner, scope, packet.expose_to_transport(), now_ms)?); }
+        Ok(events)
     }
     pub fn close(&mut self) {
         self.protocol.close(); if let Some(s) = &mut self.scheduler { s.close(); }

@@ -46,6 +46,7 @@ pub mod sip_frame;
 pub mod sip_message;
 pub mod sms_codec;
 pub mod supplementary;
+pub(crate) mod tls_identity;
 pub mod ut;
 pub mod voice;
 

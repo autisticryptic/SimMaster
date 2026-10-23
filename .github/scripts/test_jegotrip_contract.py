@@ -257,6 +257,62 @@ class JegotripContract(unittest.TestCase):
         for filename in ['arc_protocol.rs', 'offline_backend.rs']:
             self.assertIn('pub fn take_packet_transport', (MOD / filename).read_text(encoding='utf-8'))
 
+    def test_tls_plaintext_uses_native_self_delimiting_envelopes_not_record_read_boundaries(self):
+        source = (MOD / 'tls_plaintext.rs').read_text(encoding='utf-8')
+        self.assertIn('NO added inner length prefix', source)
+        self.assertIn('u32::from_be_bytes', source)
+        self.assertIn('MAX_MAP_ENTRIES', source)
+        self.assertIn('MAX_FIELD_BYTES', source)
+        self.assertIn('TLS_FRAGMENT_THRESHOLD', source)
+        self.assertIn('remaining / 2', source)
+        self.assertIn('decode_request(message.payload', source)
+        self.assertIn('decode_reply(message.payload', source)
+        self.assertIn('if result.is_err() { self.close(); }', source)
+        self.assertNotIn('from_utf8_lossy', source)
+        self.assertNotIn('rustls::', source)
+        for module in ['tls_plaintext', 'tls_engine']:
+            for name in ['beta-validation.yml', 'build-release.yml']:
+                self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests',
+                              (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_tls_engine_requires_imported_root_original_authority_and_real_verification(self):
+        source = (MOD / 'tls_engine.rs').read_text(encoding='utf-8')
+        self.assertIn('roots.add(CertificateDer::from(der))', source)
+        self.assertIn('with_root_certificates(roots).with_no_client_auth()', source)
+        self.assertIn('config.enable_early_data = false', source)
+        self.assertIn('Resumption::disabled()', source)
+        self.assertIn('config.enable_sni = parameters.enable_sni', source)
+        self.assertIn('has_exact_identity(peer.as_ref(), &self.authority)', source)
+        self.assertIn('connection.process_new_packets()', source)
+        self.assertIn('self.phase != TlsPhase::Verified', source)
+        self.assertIn('self.plaintext.on_bytes(&plaintext[..count])', source)
+        self.assertIn('self.transport.has_partial()', source)
+        self.assertIn('self.partial_deadline.is_none()', source)
+        self.assertIn('now >= self.handshake_deadline', source)
+        self.assertIn('pub struct VerifiedPlaintextPackets { owner:', source)
+        body = source.split('pub fn on_wire_bytes', 1)[1].split('fn receive', 1)[0]
+        self.assertLess(body.index('self.accepts(owner, scope)'), body.index('self.receive(bytes, timing, now)'))
+        for forbidden in ['dangerous()', 'with_custom_certificate_verifier', 'WebPkiServerVerifier::builder',
+                          'webpki_roots::', 'TcpStream', 'reqwest::', 'connect(', 'key_log =', 'from_utf8_lossy']:
+            self.assertNotIn(forbidden, source)
+        backend = (MOD / 'offline_backend.rs').read_text(encoding='utf-8')
+        self.assertIn('pub fn on_verified_plaintext', backend)
+        self.assertIn('plaintext.packets_for(owner, scope)', backend)
+        self.assertIn('self.protocol.take_tls_engine', backend)
+        self.assertNotIn('Callback::Channels', source)
+
+    def test_tls_shared_exact_identity_retains_existing_sip_path_without_new_downgrade(self):
+        identity = ROOT / 'backend/src/connectivity/core/tls_identity.rs'
+        self.assertIn('value.eq_ignore_ascii_case(dns.as_bytes())', identity.read_text(encoding='utf-8'))
+        self.assertIn('certificate.len() > 262_144', identity.read_text(encoding='utf-8'))
+        wrapper = (ROOT / 'backend/src/connectivity/modems/ims/cellular_ims/sip_tls_identity.rs').read_text(encoding='utf-8')
+        self.assertIn('crate::connectivity::core::tls_identity::has_exact_identity', wrapper)
+        for test in ['sip_identity_rejects_wildcard_cn_guesses_and_wrong_san_types',
+                     'sip_identity_der_is_bounded_and_never_accepts_truncated_certificates']:
+            self.assertIn(test, wrapper)
+        for name in ['beta-validation.yml', 'build-release.yml']:
+            self.assertIn('connectivity::core::tls_identity::tests', (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
     def test_native_notifications_require_local_operation_and_stale_scope_checks(self):
         events = (MOD / 'native_events.rs').read_text(encoding='utf-8')
         controller = (MOD / 'controller.rs').read_text(encoding='utf-8')

@@ -7,6 +7,7 @@
 use super::{
     batch_scheduler::{BatchError, BatchScheduler, ScheduledBatch},
     packet_transport::{OwnedPacketTransport, PacketRoute},
+    tls_engine::{TlsEngine, TlsError, TlsParameters},
     controller::Callback,
     rpc_batch::{decode_swap_calls_reply, encode_swap_calls, BatchPayload, BatchReply, SWAP_CALLS_METHOD},
     rpc_bootstrap::{decode_get_app_configs_result, encode_get_app_configs, AppConfigsResult, GET_APP_CONFIGS_METHOD},
@@ -133,6 +134,17 @@ impl ArcRpcSession {
         let transport = OwnedPacketTransport::for_arc_session(self.owner.clone(), self.connection.clone(), route)?;
         self.packet_transport_taken = true;
         Ok(transport)
+    }
+
+    /// Takes the same one-time transport slot, now with a trusted TLS engine.
+    /// Configuration failure emits no TLS/wire data and does not claim auth.
+    pub fn take_tls_engine(&mut self, route: PacketRoute<'_>, parameters: TlsParameters<'_>, now: std::time::Instant)
+        -> Result<TlsEngine, TlsError> {
+        if self.phase() == ArcPhase::Closed { return Err(TlsError::Closed); }
+        if self.packet_transport_taken { return Err(TlsError::InvalidConfiguration); }
+        let engine = TlsEngine::for_arc_session(self.owner.clone(), self.connection.clone(), route, parameters, now)?;
+        self.packet_transport_taken = true;
+        Ok(engine)
     }
 
     /// One tracker per ARC incarnation keeps nested sequences unique and binds

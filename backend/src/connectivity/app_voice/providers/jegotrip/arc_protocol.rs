@@ -12,6 +12,7 @@ use super::{
     rpc_incoming::{IncomingBinding, IncomingDispatcher, encode_online_message_result},
     rpc_pending::{HostingRpcTracker, RpcConnectionScope},
     packet_transport::{OwnedPacketTransport, PacketRoute},
+    tls_engine::{TlsEngine, TlsError, TlsParameters},
     rpc_stream::{CodecError, RpcProperty},
     session::AttemptOwner,
     transport_packets::{encode_call_packets, CallAssembler, CallKind, TransportBytes, TransportError, TLS_FRAGMENT_THRESHOLD},
@@ -92,6 +93,8 @@ impl ArcProtocol {
     pub fn take_packet_transport(&mut self, route: PacketRoute<'_>) -> Result<OwnedPacketTransport, ProtocolError> {
         Ok(self.rpc.take_packet_transport(route)?)
     }
+    pub fn take_tls_engine(&mut self, route: PacketRoute<'_>, parameters: TlsParameters<'_>, now: std::time::Instant)
+        -> Result<TlsEngine, TlsError> { self.rpc.take_tls_engine(route, parameters, now) }
     pub fn take_hosting_tracker(&mut self) -> Result<HostingRpcTracker, ProtocolError> {
         Ok(self.rpc.take_hosting_tracker()?)
     }

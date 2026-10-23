@@ -25,6 +25,8 @@ pub mod rpc_pending;
 pub mod rpc_stream;
 pub mod session;
 pub mod transport_packets;
+pub mod tls_engine;
+pub mod tls_plaintext;
 
 // Keep the existing API/provider id stable while moving the implementation.
 pub const PROVIDER_ID: &str = "app_voice";

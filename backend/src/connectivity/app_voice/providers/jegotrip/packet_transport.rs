@@ -126,6 +126,7 @@ impl OwnedPacketTransport {
     fn accepts(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
         &self.owner == owner && self.connection.matches(scope) && self.connection.is_open()
     }
+    pub fn has_partial(&self) -> bool { self.decoder.has_partial() || self.router.has_partial() }
     pub fn close(&mut self) { self.connection.close(); self.decoder.close(); self.router.close(); }
 
     /// Failed local encoding emits nothing and consumes no Router sequence.

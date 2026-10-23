@@ -179,6 +179,7 @@ impl fmt::Debug for RouterPacketAssembler {
 }
 
 impl RouterPacketAssembler {
+    pub fn has_partial(&self) -> bool { self.partial.is_some() }
     pub fn close(&mut self) { self.partial = None; self.closed = true; }
     pub fn on_packet(&mut self, bytes: &[u8]) -> Result<Option<RouterMessage>, TransportError> {
         if self.closed { return Err(TransportError::Closed); }
