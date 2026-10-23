@@ -6,6 +6,7 @@
 //! key exchange, certificate policy, legacy XOR or provider is enabled here.
 use super::rpc_stream::MAX_STREAM_BYTES;
 use std::fmt;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Native mode-3 fragment threshold, not a deployment endpoint or secret.
 pub const TLS_FRAGMENT_THRESHOLD: usize = 16_382;
@@ -48,6 +49,23 @@ pub struct TransportBytes(Vec<u8>);
 impl TransportBytes {
     pub(super) fn from_bytes(bytes: Vec<u8>) -> Self { Self(bytes) }
     pub fn expose_to_transport(&self) -> &[u8] { &self.0 }
+}
+
+impl Drop for TransportBytes { fn drop(&mut self) { self.0.zeroize(); } }
+
+/// Grow a retained byte buffer without freeing an unwiped old allocation.
+/// The new capacity is geometric and bounded, avoiding tiny-fragment O(n²)
+/// growth. This cannot revoke caller-owned/previously borrowed byte copies.
+pub(super) fn extend_wiping(buffer: &mut Vec<u8>, input: &[u8], limit: usize) -> Result<(), TransportError> {
+    if input.len() > limit.saturating_sub(buffer.len()) || buffer.len() > limit { return Err(TransportError::TooLarge); }
+    let needed = buffer.len() + input.len();
+    if needed > buffer.capacity() {
+        let capacity = needed.checked_next_power_of_two().unwrap_or(limit).min(limit);
+        let mut replacement = Vec::with_capacity(capacity);
+        replacement.extend_from_slice(buffer);
+        buffer.zeroize(); *buffer = replacement;
+    }
+    buffer.extend_from_slice(input); Ok(())
 }
 
 impl fmt::Debug for TransportBytes {
@@ -101,7 +119,7 @@ pub fn encode_call_packets(kind: CallKind, payload: &[u8], threshold: usize)
         bytes.extend_from_slice(payload);
         return Ok(vec![TransportBytes(bytes)]);
     }
-    let mut full = Vec::with_capacity(payload.len() + 4);
+    let mut full = Zeroizing::new(Vec::with_capacity(payload.len() + 4));
     full.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     full.extend_from_slice(payload);
     let mut remaining = full.as_slice();
@@ -144,6 +162,7 @@ pub fn decode_tls_carrier(packet: &[u8]) -> Result<&[u8], TransportError> {
 }
 
 struct PartialMessage { kind: CallKind, expected: usize, bytes: Vec<u8> }
+impl Drop for PartialMessage { fn drop(&mut self) { self.bytes.zeroize(); } }
 
 /// Connection-local fragment state. Malformed input poisons the instance;
 /// callers must create a new connection, never reset/replay on the old scope.
@@ -179,8 +198,8 @@ impl CallAssembler {
             }
             partial.bytes.extend_from_slice(body);
             if partial.bytes.len() != partial.expected { return Ok(None); }
-            let partial = self.partial.take().ok_or(TransportError::InvalidFragment)?;
-            return Ok(Some(CallMessage { kind: partial.kind, payload: TransportBytes(partial.bytes) }));
+            let mut partial = self.partial.take().ok_or(TransportError::InvalidFragment)?;
+            return Ok(Some(CallMessage { kind: partial.kind, payload: TransportBytes(std::mem::take(&mut partial.bytes)) }));
         }
         if self.partial.is_some() { return Err(TransportError::InvalidFragment); }
         let kind = CallKind::from_byte(header & 0x0f)?;
@@ -196,7 +215,8 @@ impl CallAssembler {
         if expected == 0 || initial.is_empty() || initial.len() >= expected {
             return Err(TransportError::InvalidFragment);
         }
-        self.partial = Some(PartialMessage { kind, expected, bytes: initial.to_vec() });
+        let mut bytes = Vec::with_capacity(expected); bytes.extend_from_slice(initial);
+        self.partial = Some(PartialMessage { kind, expected, bytes });
         Ok(None)
     }
 }

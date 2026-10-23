@@ -118,6 +118,26 @@ fn local_packet_limits_and_invalid_fragment_thresholds_are_explicit() {
 }
 
 #[test]
+fn retained_buffer_growth_is_geometric_bounded_and_does_not_revoke_caller_copies() {
+    let mut bytes=vec![1,2];let caller_copy=bytes.clone();extend_wiping(&mut bytes,&[3,4,5],8).unwrap();
+    assert_eq!(bytes,[1,2,3,4,5]);assert!(bytes.capacity()>=5 && bytes.capacity()<=8);assert_eq!(caller_copy,[1,2]);
+    assert_eq!(extend_wiping(&mut bytes,&[6,7,8,9],8).err(),Some(TransportError::TooLarge));assert_eq!(bytes,[1,2,3,4,5]);
+    assert_eq!(extend_wiping(&mut bytes,&[],4).err(),Some(TransportError::TooLarge));
+}
+
+#[test]
+fn original_call_fragment_buffer_reserves_announced_bound_without_partial_reallocation() {
+    let packets=encode_call_packets(CallKind::Request,b"fixture-private-data",8).unwrap();let mut assembler=CallAssembler::default();
+    assembler.on_packet(packets[0].expose_to_transport()).unwrap();let partial=assembler.partial.as_ref().unwrap();
+    assert!(partial.bytes.capacity()>=partial.expected);let original=partial.bytes.as_ptr();
+    for (index,packet) in packets.iter().enumerate().skip(1) {
+        let result=assembler.on_packet(packet.expose_to_transport()).unwrap();
+        if index+1<packets.len() { assert_eq!(assembler.partial.as_ref().unwrap().bytes.as_ptr(),original); }
+        else { assert_eq!(result.unwrap().payload.expose_to_transport().as_ptr(),original); }
+    }
+}
+
+#[test]
 fn debug_never_contains_carrier_contents_or_partial_plaintext() {
     let packets = encode_call_packets(CallKind::Request, b"fixture-private-data", 8).unwrap();
     let mut receiver = CallAssembler::default();

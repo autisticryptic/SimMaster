@@ -5,6 +5,8 @@
 
 ## 1.1.5 主线
 
+- 无忧行Router/Channel原生边界（草稿待Actions）：用户手开原libmtc.so/base0/MCP SHA匹配，只读decompile恢复kind2/3/2048-bit stats不drop duplicate、16bit邻片乱序wrap及8/10Header/SACK/gap31/BE16/FE-FF records；新增数据codec，oldstrict/TLS/actor与unsupported/outboundfalse保持。source315＋4待Actions，383static/mock首PASS待最新cleanup复跑；read-only sourceinspection两retention/wipe缺口main修，非编译/实网signoff。TransportBytes/PartialMessageDropzeroize、bounded几何realloc前wipe、原announcedsize预reserve，不撤销caller复制；未移植nativeXOR/Kx/resume或错误replay，无IDB写/target执行/设备服务/本机Rust。完整timing/liveNetStream/provider/provision/persistAPI/SMSmediafees仍未完。
+
 - 无忧行完整backend实施计划已细化为路由/可信connector/真实HostingBackend/独立app-account持久化API/SMS耐久ACK/调用媒体Trunk/独立费用续期并发/Actions验收八步。主线程FDE静态确认Router D68010→D66270状态/时间窗口与kind3控制、16-bit乱序片配对，但完整NetStream生命周期/回调及Smgw分类媒体仍缺，当前需用户手动开现有libmtc.so只读IDA补证据；不猜重传/receiver-kind/directSIP/费用，不启provider。此次仅规划/静态复核，无新backend源码或本机Rust/设备服务/IDB写，既有ed6fb33验证不冒称新成果；详情见固定DEVELOPMENT_PLAN。
 
 - 无忧行部署配置/引用（`ed6fb33`已验证）：只读ELF证实PBE salt8/DES-CBC/PKCS5＋1000MD5，callerexplicit不同Client/Common keycontext无SDKdefault/auth，facet/id/adapter-locator/semicolon -h/-p仅rawTCP候选不猜root/alias/proxy。私有原matchedbootstrap owner/scope/config，actorTLS配置event非SDK/hosting；Dropzeroize包括ownedconfig/reference/Secret/authPending，partialreview3findings main修(grouped$/retainedwipe/确定padding负例)，非fullsignoff。Build39983918744/Beta39983918718/ARM64+AMD64成功，官方SHA ZIP各281＋4SAN/SIP及86矩阵逐项核验，381静态mock通过、Release skip、57warnings/17Jegotrip excerpts保留；DESchecksum/manualLock已--locked Actions通过，无本机Rust/target/设备服务部署，provider/outbound不支持，fullRouter/provision/endpointbinding/persistence/SMSmedia费用续期并发未完成。

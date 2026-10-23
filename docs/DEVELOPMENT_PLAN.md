@@ -6,6 +6,8 @@
 
 ## 当前基线与工作规则
 
+- 用户已手动开原SHA libmtc.so/只读IDA；native_router/channel边界草稿新增kind2/3/2048-bit bookkeeping/u16双向邻片、8/10hdr/LSB ACK/gap31/BE16/FE-FF records，source315＋4SIP待Actions，383static/mock首PASS待最新cleanup修后复跑。源审查job_mvledrqc_9两问题main已修（allinput半片expiry、ownedDrop/几何grow-before-wipe/预reserve精确join），非编译signoff。仅协议数据primitives未Roottrust/socket/provider/authready，fulltiming/NetStream/provision/connector/HostingBackend/独立account persistAPI/SMS/callmedia/trunk/费用并发仍按八步继续；不把旧ed6绿灯替新验证，不IDB写/target或设备服务/本机Rust。
+
 - 当前部署/config/reference/ownedbootstrap子阶段`ed6fb33`已由Build39983918744/Beta39983918718/ARM64+AMD64验证，官方SHA ZIP各281＋4old/sharedSIP及86矩阵逐项核验，381静态mock通过、Release skip；57warnings/17Jegotrip excerpts保留。salt8DES-CBC-PKCS5/1000MD5仅配置unwrap，explicitClient/Reference contextkey，无SDKdefault/auth；facet/id/adapter-locator/explicit -h/-p是候选数据，私有originalowner/scopebootstrap与actor配置event不改TLStrust/授ready。partialreview3issues main修、dropwipe/确定padding负例，非fullreview；仍fullRouterNetStream/provision/可信endpointconnector/providerpersistAPI/SMSmedia费用续期并发未接通。无本机Rust/设备服务部署，该已验证解码子阶段未使用IDA，unsupported/outboundfalse。
 
 - 原会话transport_actor已由cd0684e Build39958776382/Beta39958776314/双架构、官方SHA ZIP各251模块回归＋4sharedSIP/86矩阵验证，378静态mock通过，Release skipped：caller-provided AsyncIO单actor/共享pollgate+Notify、取消/部分write关闭丢IO、JoinHandle确认drain，精确原metadata/私有borrowed票据/真实RPCpendingdeadline，无dial/provider。251实际离线回归不是实网，不报真实托管；下一仍fullRouter/NetStream/ENC端点/persistenceproviderAPItrunk/SMSclasscallmedia/费用续期并发。

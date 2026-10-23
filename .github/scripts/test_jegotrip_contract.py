@@ -423,6 +423,47 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('impl Drop for BootstrapDeployment', plan)
         self.assertIn('value.zeroize()', plan)
 
+    def test_native_router_controls_are_data_only_and_duplicate_bookkeeping_is_not_delivery(self):
+        source = (MOD / 'native_router.rs').read_text(encoding='utf-8')
+        self.assertIn('packet_kind > 3', source)
+        self.assertIn('header.packet_kind != 2', source)
+        self.assertIn('header.packet_kind != 3', source)
+        self.assertIn('sequence.wrapping_sub(512)', source)
+        self.assertIn('distance > 1023', source)
+        self.assertIn('ReceiveObservation::Duplicate', source)
+        self.assertIn('header.sequence.wrapping_add(1)', source)
+        self.assertIn('header.sequence.wrapping_sub(1)', source)
+        self.assertIn('HALF_AGE', source)
+        self.assertIn('self.halves.clear()', source)
+        self.assertIn('impl Drop for Half', source)
+        for forbidden in ['Callback::', 'TcpStream', 'login(', 'success: true', 'unsafe {']:
+            self.assertNotIn(forbidden, source)
+
+    def test_native_channel_framing_and_record_markers_do_not_sniff_tls_or_grant_auth(self):
+        source = (MOD / 'native_channel.rs').read_text(encoding='utf-8')
+        self.assertIn('const BASE_HEADER: usize = 8', source)
+        self.assertIn('HeaderMode::Timestamped { 2 }', source)
+        self.assertIn('PacketKind::from_bits(header[2] >> 5)', source)
+        self.assertIn('header[3] & 0x7f', source)
+        self.assertIn('packet.inclusive_ack', source)
+        self.assertIn('1 << (bit & 7)', source)
+        self.assertIn('0xfe | 0xff', source)
+        self.assertIn('u16::from_be_bytes([prefix[0],prefix[1]])', source)
+        self.assertIn('self.partial.zeroize()', source)
+        self.assertIn('extend_wiping(&mut self.partial', source)
+        buffers = (MOD / 'transport_packets.rs').read_text(encoding='utf-8')
+        self.assertIn('impl Drop for TransportBytes', buffers)
+        self.assertIn('buffer.zeroize(); *buffer = replacement', buffers)
+        self.assertIn('Vec::with_capacity(expected)', buffers)
+        self.assertIn('finish_eof', source)
+        for forbidden in ['Callback::', 'TcpStream', 'TlsEngine', 'success: true', 'DEAA7C', 'unsafe {']:
+            self.assertNotIn(forbidden, source)
+        for module in ['native_router', 'native_channel']:
+            self.assertIn(f'pub mod {module};', (MOD / 'mod.rs').read_text(encoding='utf-8'))
+            for name in ['beta-validation.yml', 'build-release.yml']:
+                self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests',
+                              (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
     def test_native_notifications_require_local_operation_and_stale_scope_checks(self):
         events = (MOD / 'native_events.rs').read_text(encoding='utf-8')
         controller = (MOD / 'controller.rs').read_text(encoding='utf-8')

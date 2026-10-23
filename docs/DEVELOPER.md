@@ -332,6 +332,12 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 
 原SHA ELF的新 FDE 静态结果：D68010 receive→D66270 window/时间反馈/reset，D6429C构造kind3/part1，part2/3邻片按16-bit环绕配对；D66270重复位仅退出自身统计，caller不直接drop payload，不能猜完整重传/stream-ready状态。NetStream类型/定时器/间接receiver控制流与Smgw kind/编码及DeliSip媒体回调仍缺，故需用户手动打开现有`.local/jegotrip/libmtc.so`/base0/既有IDA MCP，先只读D68010/D66270/D63960/D4FA54及NetStream vtable/timer，随后52C574/523EC0。未自行IDA加载/IDB修改/target执行，本轮没有新backend源码或Rust执行，仍unsupported/outboundfalse。证据`backend-implementation-plan.md`/`backend-native-function-frontier.json`；两subagent encrypted-content400无结论，非review/非IDA理由。
 
+### Router/Channel 原生边界（代码草稿待Actions）
+
+用户已手动开原SHA libmtc.so，MCPmetadata确认base0；只读decompile/FDE核对后新增`native_router.rs`与`native_channel.rs`。前者kind2/3控制+原2048-bit seq统计、不drop duplicate DATA/u16双向邻片wrap与局部缓存；后者显式basic8或timestamp2+8、seq/flags/LSB ACK/mask/preceding-data gap31、Skip16bitruns与ChannelFrag BE16/FE-FF record，未接完整liveNetStream/congestion/FEC/路由选路/可信endpointconnector。旧orderedcodec、原TLS/actor/SDK认证保持，不启provider/ready，原NativeXOR/Kx/resume/requeue取消bytes分支不迁入Linux。
+
+新15router/17channel＋2原buffer回归=315 source inventory＋4sharedSIP待Actions，383Pythonstatic/mock首PASS待最新cleanup后复跑。Read-only sourceinspectionjob_mvledrqc_9查四文件发现whole/control保留过期半片及discarded/growingbuffer未wipe，main已allinputexpire、TransportBytes/PartialMessage Dropzeroize、bounded几何extend_wiping新capacity复制后wipe旧分配/预reserve/精确join与回归；没有读取freedmemory/unsafe或夸大撤销callercopy。完整sourceinspection不等于compilepass/实网。原metadata/xrefs/decompile/ASM仅read-only，不改IDB、不执行target或本机Rust。证据`.local/jegotrip/native-router-channel-evidence.md`。
+
 ### 5. 下一阶段与验收条件
 
 1. 继续确认 SDK 外线登录/网关帧、通知、注销、续期以及 Linux 兼容的实现路径。

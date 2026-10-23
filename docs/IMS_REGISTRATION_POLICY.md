@@ -447,6 +447,8 @@ Common请求/回包与swapCalls批次已补有界codec及原提交/连接scope�
 
 无忧行应用账号 backend 的实施不能混用上述 IMS/CS 的 access、SIM/PDU 或免费 WLAN 规则：现有 registry/API 为 metadata-only，真实 app-account 归属、durable message promotion后 consumer ACK 与独立费用/授权须接线。目前完整 Router/NetStream 控制/重传/生命周期及 Smgw/call-media 分类缺原生类型/控制流证据，需用户手动对现有 libmtc.so 做只读 IDA；仅计划与FDE静态定位，不授 provider/channel/outbound ready。顺序与当前关口见[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)。
 
+原SHA只读IDA已由用户手动打开并核验metadata；当前Router/Channel草稿仅kind2/3数据controls/2048-bit stats（重复不drop DATA）/u16邻片及8/10hdr/SACK/gap31/BE16 FE-FF record，不替TLS/SDK/hosting/channel、IAM/计费或SIM定义。315源码回归待Actions，383本机static/mock首PASS待最新buffer清理复跑；源inspection两owned-retention/wipe问题已修，drop/grow前清零不撤销callercopy。完整NetStream/endpointbinding/HostingBackend/app-account persistAPI/SMS/callmedia/trunk/费用续期并发仍缺，unsupported/outboundfalse，未IDB写/target/设备服务/本机Rust。
+
 ## 10. 验证清单与验收标准
 
 构建/Rust/注册模拟仅走 GitHub Actions，流程见 [开发指南](DEVELOPER.md)。
