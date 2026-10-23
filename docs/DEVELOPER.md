@@ -243,14 +243,14 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 
 ### 原生参数编码与通知适配（1d8d042已验证，type0前缀后续修正）
 
-- `rpc_arguments.rs` 实现 `updateStatus.SipGatewayPub.SipGateway` 的参数：type0流标记、BE16版本1/0、真实SDK UE URI的BE32字节长度、BE32 map计数及键/值字节串；map按键字节长度再按字节排序，不能用Rust默认词典序代替。原SDK五字段及string `SipFlag=4/3`保留；128KiB/NUL/空凭据检查是本地安全边界，不冒认服务器协议限制，Debug脱敏。
+- `rpc_arguments.rs` 实现 `updateStatus.SipGatewayPub.SipGateway` 的参数：type0流标记、BE16版本表计数1/唯一版本0（不是major/minor）、真实SDK UE URI的BE32字节长度、BE32 map计数及键/值字节串；map按键字节长度再按字节排序，不能用Rust默认词典序代替。原SDK五字段及string `SipFlag=4/3`保留；128KiB/NUL/空凭据检查是本地安全边界，不冒认服务器协议限制，Debug脱敏。
 - `native_events.rs` 接受可信backend已解码的**本地SDK通知**，不接受API或未认证网络帧。native `updateStatus`先验证RPC结果为0和返回boolean为true，才发Ok通知；通知本身没有另一个boolean字段。注册/注销共享通知名，必须用提交时cookie捕获的owner和本地operation分开，不能收到通知才重绑当前owner。
 - controller在通知到达时检查凭据到期和monotonic deadline，过期优先、重复tick不改变原因；同名线路删除/重建有独立incarnation。先拒绝旧/未ready来源，再有界复制原始body/from/time字节，不lossy转UTF-8、不猜3GPP TPDU。发送成功、status2成功或ReconnectOk都不能确认本次托管或授予通道ready。
 - 两套Actions显式选中17凭据/会话、19controller、9codec、10native事件共55项回归由Build39747922739/Beta39747922813双架构通过，官方SHA测试ZIP逐名及四矩阵86场景核验；本机365静态/mock通过，报告`.local/jegotrip/verified-native-1d8d042.json`。不实现ARC/TLS完整封包、token续期、真实收短信或通话；provider仍不可用。静态证据只留`.local/jegotrip/ida-mcp-first-pass.md`，不提交APK/SDK库或运行偏移。
 
 ### RPC封装、批次与结果（5d4bbb0已验证）
 
-后续IDA构造函数/流长度/输入工厂/汇编交叉确认：type0字节必须在版本号前，不能只写BE16版本；1d8d042的55项CI通过不能证明原错误前缀等价于SDK，已独立留证并修正测试。请求参数有版本1/0，result stream不重复版本；terminal错误字符串必读，非空错误即使boolean=true也拒绝，后继可选property map保持脱敏。
+后续IDA构造函数/流长度/输入工厂/汇编交叉确认：type0字节必须在版本号前，不能只写BE16版本；1d8d042的55项CI通过不能证明原错误前缀等价于SDK，已独立留证并修正测试。请求参数前缀为版本表计数1/唯一版本0（原major/minor名称已纠正，字节不变），result stream不重复表；terminal错误字符串必读，非空错误即使boolean=true也拒绝，后继可选property map保持脱敏。
 
 - `rpc_stream.rs`：type0/BE16/BE32、有界byte string/metadata map、长度优先键排序、重复/截断/trailing拒绝；binary `__magic`不套UTF-8/NUL政策。128KiB流/64KiB字段/128entry为本地安全政策，不是假服务器限制。
 - `rpc_envelope.rs`：request为type0+positive call id+metadata+method+raw args；reply为type0+原call id+result code+raw result。均无socket/握手或readiness副作用。
@@ -271,7 +271,7 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 - 代码`684ef73cdfdde2bed1c262a95bd6e871c14a6bd3`已由Build39812859460/Beta39812859585实际各139模块回归（18凭据/21controller/12arguments/10native/8stream/6envelope/10batch/7login/13pending/6bootstrap/11arc session/10packets/7protocol）、ARM64/AMD64构建验证，Release skipped；两套官方SHA绑定测试ZIP逐名精确139及四矩阵86场景通过，本机368静态/mock通过。新四module filter实际执行，报告`.local/jegotrip/verified-native-684ef73.json`；`verify_native_ci.py`只下载/核验，不运行本机Rust。保留compile dead-code/unused warnings如实，未接真实backend不消除unsupported声明。来源与私有review/evidence留`.local/jegotrip/`。
 - 下一项真实backend仍包括Router/NetStream/NetSsl socket与完整boundary、部署参数解密/可信端点、batch epoch/ACK/dedup调度、server-object入站、持久化/provider/runtime/API/trunk/SMS/calls/media/计费/续期/并发。`transport_implemented=false`/provider unsupported/外发授权false不变，本轮无设备或服务端访问。
 
-### 离线批次调度与入站消息（已实现待Actions，非真实backend）
+### 离线批次调度与入站消息（8efcd49已验证，非真实backend）
 
 用户当前没有可提供的实网配置，要求继续离线/理论完善。该授权不包括部署、访问手机/服务端、拨号或短信发送；缺少配置不是停止静态还原的理由，但也不是用默认值虚构可用性。
 
@@ -281,7 +281,8 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 - `rpc_incoming.rs`确认`recvOnlineMessage.MessageReceiver.Client`为版本stream＋receiver-kind byte string＋property map＋raw stream；返回type0/bool/terminal footer。仅安装原显式object/domain/receiver-kind且不接受wildcard；未知method/缺receiver不猜响应，unsupported关闭。sender/time原byte保留，`Sip.MessageGw.Oid`不自动改全局gateway，不能凭此认定所有消息均SMS。
 - `arc_protocol.rs`可处理明确配置的direct server request；需要同scope已auth、精确id/domain、binary `__magic`，正call id不复用。bounded magic缓存不evict/replay，压力关闭；原私有ticket由consumer确认后才编结果。native双180s magic窗口/所有wildcard/别名/并发尚不声明等价。TCP read/TLS read仍不是已确定packet边界。
 - `offline_backend.rs`只组合已有ARC/packet→scheduler→原hosting callback/入站ticket，**不实现HostingBackend或启用provider**。direct/batch message票据都绑定原scope，私有payload/ticket配对、借用completion重试、消费一次；收到消息不授channel、不写DB，不在消费成功前ACK。新回归覆盖login/pwd/token、nested ACK与message、invalid ACK不得交hosting、dedup、wrongscope/无配置/未知method、退役ticket。
-- 当前172 Rust为源码清单（新增17scheduler/7incoming/8offline＋1reply encoder），尚未编译/执行；两Actions新增3suite filter，本机370静态/mock通过。审查6超时只返回ticket-by-value回压丢失的部分发现，已借用修复与回归；不能算完整审查或互通证据。私有`.local/jegotrip/batch-inbound-offline-evidence.md`保存原函数/汇编，未执行目标库。
+- `8efcd49c7befe3e6395f7b97834bcdb57e3f393f`已由Build39834770425/Beta39834770520实际各172 Jegotrip模块回归、ARM64/AMD64验证，Release skipped；官方SHA绑定测试ZIP逐名172及四矩阵86场景核验（新增17scheduler/7incoming/8offline＋1reply encoder），370本机静态/mock通过，新3suite过滤器实际执行。报告`.local/jegotrip/verified-native-8efcd49.json`，保持原warnings证据、不冒称完整backend。审查6超时只返回ticket-by-value回压丢失的部分发现，已借用修复并Actions回归；不能算完整审查或互通证据。私有`.local/jegotrip/batch-inbound-offline-evidence.md`保存原函数/汇编，未执行目标库。
+- 补充语义复核：type0后BE16 `1,0`由native版本表解析器明确为计数1/唯一方法版本0；不是major/minor pair。旧shape/139通过证据保留，本轮字节不改，只纠正注释与手册；unsupported版本/多版本表仍failclosed，不把形状正确当所有版本互通。
 - 仍需下层Router/NetStream/NetSsl socket及完整boundary、受信TLS/ENC provisioning/端点、业务kind/SMS可靠分类/入站落库/线路API/provider/trunk/call-media/费用/续期/并发；未把这些未实现项降为“只剩实机”。`transport_implemented=false`、provider unsupported、outbound false保持，只有明确支持子集通过Actions后才能报offline完成。
 
 ### 5. 下一阶段与验收条件
