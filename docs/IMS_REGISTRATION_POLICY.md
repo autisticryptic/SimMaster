@@ -437,7 +437,7 @@ Common请求/回包与swapCalls批次已补有界codec及原提交/连接scope�
 登录、网关ack和通道ready分别检查；未确认发送路由/计费不默认授权外发，ReconnectOk不重授托管。
 原native适配1d8d042两套Actions/双架构/55项模块回归已核验，后续type0修正/RPC扩展5d4bbb0由两套Actions/双架构/95项模块回归及官方SHA/四矩阵86场景核验；真实短信/接打电话/provider仍未实现；详细证据与测试见[开发指南](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
-下层PacketSender使用BE32原packet长度，Router另有8-byte header/opaque routing与part2+3平衡分片；本轮有界codec/原ARC transport已实现待Actions（208 Rust仅清单/373静态mock）。只支持显式原stream route与exact独立TX/RX，无猜测反向地址/端点或证书，未知控制/扩展/旧scope/序号wrap拒绝；输出是opaque TLS，不是已认证RPC。close仅阻止新的access，不能撤销此前借出/复制的bytes；live writer/TLS需另有串行最终消费、取消排空协议。mode3无内层BE32，任意SSL/rustls plaintext read仍不构成Common packet边界，真实socket/可信TLS/provisioning/业务接线仍未完成。
+下层PacketSender使用BE32原packet长度，Router另有8-byte header/opaque routing与part2+3平衡分片；本轮有界codec/原ARC transport已由902f4f5 Build39912321845/Beta39912321855/双架构、官方SHA ZIP各208模块回归/86矩阵核验，373静态/mock通过，Release skipped。只支持显式原stream route与exact独立TX/RX，无猜测反向地址/端点或证书，未知控制/扩展/旧scope/序号wrap拒绝；输出是opaque TLS，不是已认证RPC。close仅阻止新的access，不能撤销此前借出/复制的bytes；live writer/TLS需另有串行最终消费、取消排空协议。mode3无内层BE32，任意SSL/rustls plaintext read仍不构成Common packet边界，真实socket/可信TLS/provisioning/业务接线仍未完成。
 
 ## 10. 验证清单与验收标准
 
