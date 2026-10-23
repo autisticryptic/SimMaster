@@ -5,7 +5,7 @@
 
 ## 1. 分支与编译约束
 
-- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests,rpc_bootstrap::tests,arc_session::tests,transport_packets::tests,arc_protocol::tests,batch_scheduler::tests,rpc_incoming::tests,offline_backend::tests,packet_stream::tests,router_packets::tests,packet_transport::tests,tls_engine::tests,tls_plaintext::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests,rpc_bootstrap::tests,arc_session::tests,transport_packets::tests,arc_protocol::tests,batch_scheduler::tests,rpc_incoming::tests,offline_backend::tests,packet_stream::tests,router_packets::tests,packet_transport::tests,tls_engine::tests,tls_plaintext::tests,transport_actor::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - 日常仅维护`master`，GitHub远端为`autisticryptic/SimMaster`（本地remote通常为`simmaster`）。
 - 不为每次验证长期留下分支。确需临时分支时，合并并确认提交已保留、CI通过后删除。
@@ -304,6 +304,16 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 - shared `core/tls_identity.rs`仅提升可见性，算法与旧SIP helper完全一致；旧sip_tls_identity wrapper保留两原测试名/路径，额外shared两测试加入Actions。新10plaintext/19TLS已实际执行，共237 Jegotrip；`784cd3c861be50b04bd80a7d8091de19d3d7a12e`由Build39937771208/Beta39937771426/双架构成功，官方SHA精确237＋2sharedSAN/2原SIP及86矩阵核验，376Python/static/mock通过，Release skipped。报告`.local/jegotrip/verified-native-784cd3c.json`；Build12495390365 SHA256`5b4efa48b61531db90c96872b47944714a21bebc159f095f6fcacd5bfd6ccf2b`、Beta12494633662 SHA256`d9e878a3a4d43609f060522a52a78a916de97bde65100cc7671ce488dd7fbfec`。57compile warnings/16Jegotrip节选留证，不运行本机Rust/openssl peer。Actions测试进程生成临时证书并做真实内存TLS握手，不提交私钥/root材料。
 - 两辅助设计/source review480s超时无结果不算验证，main独立核对原ELF与rustlsAPI；首次本机静态wholeprovider HTTPS禁令命中非法authority fixture，改中性scheme保留负例；fixture原ARC过早drop/非Clone concat/吞reader errors已主代理修正，原失败保留`.local/jegotrip/static-tls-first.log`。证据`.local/jegotrip/tls-offline-evidence.md`，本步不需要用户IDA。
 - 仍无live socket/NetStream/全Router控制/可靠调度，ENC provisioning/端点导入/credential落库/API/provider/trunk/SMS分类/通话媒体/费用续期并发，transport_implemented=false/providerunsupported/outboundfalse保持；本阶段不能冒称全部无忧行已复刻。
+
+### 原会话IO actor与关闭门禁（已实现待Actions）
+
+- `transport_actor.rs`仅start caller-provided `AsyncRead+AsyncWrite+Unpin+Send`，不开TCP/不DNS/dial，不是installed HostingBackend。单actor拥有原IO+TLS+OfflineBackend，32command/128event及128KiB参数/有界wiregroup；原metadata/route/owner不在收包时重绑，TLSverified/sentreceipt不是登录/hosting/channel确认。
+- RpcConnectionScope保留ArcAtomicBool身份，加sharedMutex<()>+Notify。close在gate内终止；write/flush每次NONBLOCKINGpoll同gate核验，Pending释放再重新检查，无await/阻塞poll/reentrantclose可放锁内。毒化终止、Notify enable-before-check防wake丢失；不宣称已kernel接受字节可召回，snapshot仍不可撤销，只新的actorpoll被阻断。
+- sendpartial按原cipher帧offset续写，不重新encrypt/分配businessid；commandoneshotcancel/eventconsumerdrop/close/IOTLSRPC deadline选择terminal、IO对象drop/原ARC清理/queuecompletion丢弃。RuntimeCloseReceipt io_released只有原JoinHandle真正结束，取消closeawait不先takehandle，后继可再等待原cleanup；不把atomicfalse当硬件或远端注销完成。
+- receive实际TLS验证→Common→原batch/hostingcallback或消息，pendingdeadline按原ARC是否pending退休，不靠ACK/control。originalconsumer完成private ticket，borrowedAPI+内部capturedcopy不会队列满丢票，pendingconsume仍一次；hosting元数据与outerrouting分别显式传入，不默认空object/domain或guessedkind。deadline(≤30sIO/60sRPC)包含TLSpartial，timerMissedTickSkip不重开计时。
+- 新14actor tests用duplex+内存rustls核查真实login/原callback/hostingbatch+directbinarymessageconsumerreply、gate与close换poll/offset/poison/wake/cancel/DropGuard/IOrelease/queuepressure等。251Rust当前仅清单＋4shared/retainedSIP待Actions；378Python/staticmock通过，无本机Rust/target/openssl执行。
+- review辅助300s超时返回partial两项test编译缺口（共享fixture可见性、future借用temporaryarray），main均修复并独立补真实metadata/deadline/cancel/ticket语义；不是完整review。一次WSLBashE_UNEXPECTED未执行即失败，后继同cwd复试正常，无目标/设备操作；原证据`.local/jegotrip/actor-offline-evidence.md`。本步无需IDA。
+- 仍缺fullRouter/NetStream可靠控制/outoforder/MTU与ENC provisioning端点、provider/persistence/API/trunk/SMS可靠classification/callmedia/费用续期并发；transport_implemented=false/providerunsupported/outboundfalse不变。callerIOactor测试不能升级为真实Linux公网互通或完整托管可用。
 
 ### 5. 下一阶段与验收条件
 

@@ -441,6 +441,8 @@ Common请求/回包与swapCalls批次已补有界codec及原提交/连接scope�
 
 当前tls_engine/tls_plaintext扩展已由784cd3c两Actions/双架构/官方SHA各237回归＋4shared/retainedSIP及86矩阵验证：显式原root/authority/exactSAN，TLS1.2/1.3真实内存引擎，验证前不发送应用数据；原Common长度/固定mode3分片自定界，禁止假内层BE32/read-as-packet。固定握手/partial deadline与EOF关闭原scope，private verified packets不借另一路；237实际离线回归/376静态mock并非实网，sharedSAN旧SIP算法不变。TLS verified仍不授SDK/hosting/channels，不同于电话短信业务或完整socketruntime，ENC provisioning/端点/provider/媒体/费用仍未实现。
 
+原IO actor扩展已实现待Actions：共享scopepollgate串行close和nonblocking write/flush每次poll，Pending后重核，不从既有snapshot假定livepermission；commandcancel/IOdeadline/EOF关闭并丢原IO，JoinHandle才确认release，已接受字节不撤回。原borrowedticket consumer/metadata/pendingRPC退休，无dial/connect/provider，251源码清单/378静态mock非实网。全Router/NetStream/ENC端点/SMSmedia/persistence业务仍未实现。
+
 ## 10. 验证清单与验收标准
 
 构建/Rust/注册模拟仅走 GitHub Actions，流程见 [开发指南](DEVELOPER.md)。

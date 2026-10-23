@@ -46,6 +46,12 @@ pub struct DirectReplyTicket { owner: AttemptOwner, connection: RpcConnectionSco
 
 impl DirectReplyTicket {
     pub fn is_open(&self) -> bool { self.connection.is_open() }
+    pub(super) fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
+        &self.owner == owner && self.connection.matches(scope) && self.connection.is_open()
+    }
+    pub(super) fn captured_copy(&self) -> Self {
+        Self { owner: self.owner.clone(), connection: self.connection.clone(), call_id: self.call_id }
+    }
 }
 
 impl fmt::Debug for DirectReplyTicket {
@@ -90,6 +96,7 @@ impl ArcProtocol {
 
     pub fn connection_scope(&self) -> RpcConnectionScope { self.rpc.connection_scope() }
     pub fn phase(&self) -> ArcPhase { self.rpc.phase() }
+    pub(super) fn is_pending(&self, id: i32) -> bool { self.rpc.is_pending(id) }
     pub fn take_packet_transport(&mut self, route: PacketRoute<'_>) -> Result<OwnedPacketTransport, ProtocolError> {
         Ok(self.rpc.take_packet_transport(route)?)
     }

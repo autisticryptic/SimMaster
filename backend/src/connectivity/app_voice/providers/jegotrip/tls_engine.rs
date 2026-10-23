@@ -177,6 +177,13 @@ impl TlsEngine {
             phase: TlsPhase::Handshaking, records: CipherRecords::default(), plaintext: PlaintextPacketDecoder::default(),
             handshake_deadline, partial_deadline: None, partial_timeout: parameters.partial_timeout, last_now: now })
     }
+    pub(super) fn next_deadline(&self) -> Option<Instant> {
+        let handshake = (self.phase() == TlsPhase::Handshaking).then_some(self.handshake_deadline);
+        match (handshake, self.partial_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)), (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
+    }
     pub fn phase(&self) -> TlsPhase { if self.scope.is_open() { self.phase } else { TlsPhase::Closed } }
     fn accepts(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
         &self.owner == owner && self.scope.matches(scope) && self.scope.is_open()
@@ -350,4 +357,4 @@ fn valid_authority(authority: &str) -> bool {
 
 #[cfg(test)]
 #[path = "tls_engine_tests.rs"]
-mod tests;
+pub(crate) mod tests;

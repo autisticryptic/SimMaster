@@ -122,6 +122,7 @@ impl ArcRpcSession {
     pub fn phase(&self) -> ArcPhase {
         if self.connection.is_open() { self.phase } else { ArcPhase::Closed }
     }
+    pub(super) fn is_pending(&self, id: i32) -> bool { self.pending.contains_key(&id) }
     pub(super) fn owner(&self) -> &AttemptOwner { &self.owner }
 
     /// One explicitly configured lower PacketSender transport per ARC. It only

@@ -5,6 +5,8 @@
 
 ## 1.1.5 主线
 
+- 无忧行IO actor（待Actions）：只消费caller-provided非阻塞AsyncIO，不dial/connect/installprovider。原TLS+ARC单actor、共享close/write-pollgate/Notify、command/events字节有界、IO/RPC/TLS期限、partial/cancel关闭不重放/丢IO与JoinHandle确认；原metadata/ticketconsumer接线，不从write成功授SDK/hosting。251 Rust仅清单，378Python/staticmock通过，14新actor过滤器进两workflow；超时reviewpartial指出两test编译缺口已修但不是全审查。仍缺原全Router/NetStream控制、ENC部署/端点/provider持久化APItrunk/SMSclass/通话media/费用续期并发，不设备服务部署，本机Rust仍禁。
+
 - 无忧行可信TLS/明文流（784cd3c已验证）：rustls TLS1.2/1.3显式importedroot/原authority+exactSAN，无earlydata/resumption/额外trust兜底；只有真握手成功才加密login。Common原envelope长度和native mode3 canonical16382分片定义明文边界，不加猜测BE32，不把SSL/rustls read当packet。原ARC一次TLS或rawtransport、private verified packets/固定handshake与cipher/carrier/plaintext partial deadline/EOF隔离；共享exactSAN保持原SIP算法/测试路径。Build39937771208/Beta39937771426/ARM64+AMD64 success，官方SHA ZIP各237 Jegotrip回归＋2sharedSAN/2retainedSIP及原四矩阵86场景核验，376静态/mock通过，Release skipped；两辅助review超时没有成功确认，main独立审查，原静态fixture命中guard失败留证修复。不启provider、不设备服务部署/本机编译，live socket/NetStream/关闭消费排他/ENC部署/短信分类落库与通话媒体/费用续期并发仍缺。
 
 - 无忧行下层离线传输（902f4f5已验证）：静态还原PacketSender四字节BE32原packet长度、缓存分流与Router独立8-byte头/opaque routing/有序两半。新增packet_stream/router_packets/packet_transport，绑定一次原ARC及exact独立TX/RX；有界长度/帧数/EOF、错scope先拒绝、错误/关闭共享终止，carrier不交RPC/不授ready。Build39912321845/Beta39912321855及ARM64/AMD64成功，官方SHA ZIP逐名精确各208模块回归/四矩阵86场景核验，373 Python静态/mock通过，Release skipped。只读review发现close不能撤销旧borrowed bytes，已更正checked snapshot并实际回归，未来live writer/TLS消费/取消排他未实现。IDA MCP拒绝连接但ELF静态材料够用，确需后续IDA才告知用户；辅助TLS研究超时不算完成review。socket/runtime/可信TLS与plaintext边界/provisioning/SMS业务/media/provider仍未实现，无部署/设备/服务端/本机编译。

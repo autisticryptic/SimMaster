@@ -11,10 +11,10 @@ use std::{path::PathBuf, process::{Command, Stdio}, sync::atomic::{AtomicU64, Or
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
-struct Certificates { directory: PathBuf, root: String, certificate: CertificateDer<'static>, key: Vec<u8> }
+pub(crate) struct Certificates { directory: PathBuf, pub(crate) root: String, certificate: CertificateDer<'static>, key: Vec<u8> }
 impl Drop for Certificates { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.directory); } }
 impl Certificates {
-    fn generate(san: &str) -> Self {
+    pub(crate) fn generate(san: &str) -> Self {
         let directory = std::env::temp_dir().join(format!("simadmin-jegotrip-tls-{}-{}", std::process::id(), NEXT_TEST.fetch_add(1, Ordering::Relaxed)));
         std::fs::create_dir(&directory).unwrap();
         let run = |arguments: &[&str]| {
@@ -28,7 +28,7 @@ impl Certificates {
         let der = std::fs::read(directory.join("cert.der")).unwrap(); let root = STANDARD.encode(&der);
         Self { certificate: CertificateDer::from(der), key: std::fs::read(directory.join("key.der")).unwrap(), root, directory }
     }
-    fn server(&self, version: &'static rustls::SupportedProtocolVersion) -> rustls::ServerConnection {
+    pub(crate) fn server(&self, version: &'static rustls::SupportedProtocolVersion) -> rustls::ServerConnection {
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_protocol_versions(&[version]).unwrap().with_no_client_auth()
             .with_single_cert(vec![self.certificate.clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key.clone()))).unwrap();

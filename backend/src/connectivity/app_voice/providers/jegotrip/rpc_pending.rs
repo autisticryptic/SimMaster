@@ -13,16 +13,46 @@ use super::{
     rpc_stream::{CodecError, RpcBytes, RpcProperty, MAX_MAP_ENTRIES},
     session::{AttemptOwner, BackendFailure, GatewayRegistration, STATUS_REGISTER, STATUS_UNREGISTER},
 };
-use std::{collections::BTreeMap, sync::{atomic::{AtomicBool, Ordering}, Arc}};
+use std::{collections::BTreeMap, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
 
 #[derive(Clone)]
-pub struct RpcConnectionScope(Arc<AtomicBool>);
+pub struct RpcConnectionScope(Arc<AtomicBool>, Arc<Mutex<()>>, Arc<tokio::sync::Notify>);
 
 impl RpcConnectionScope {
-    pub(super) fn fresh() -> Self { Self(Arc::new(AtomicBool::new(true))) }
+    pub(super) fn fresh() -> Self {
+        Self(Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(())), Arc::new(tokio::sync::Notify::new()))
+    }
     pub(super) fn matches(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
     pub(super) fn is_open(&self) -> bool { self.0.load(Ordering::Acquire) }
-    pub(super) fn close(&self) { self.0.store(false, Ordering::Release); }
+    pub(super) fn close(&self) {
+        // Serializes terminal close with one NONBLOCKING IO poll. Already
+        // accepted/kernel-buffered bytes cannot be recalled by this gate.
+        let _gate = self.1.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.0.store(false, Ordering::Release); self.2.notify_waiters();
+    }
+    /// No await, blocking IO, callbacks or reentrant close are permitted inside
+    /// this closure. The actor releases the gate on Pending and rechecks before
+    /// every new write/flush poll, not only when borrowing a byte snapshot.
+    pub(super) fn with_io_gate<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
+        let _gate = match self.1.lock() {
+            Ok(gate) => gate,
+            Err(poisoned) => {
+                let _gate = poisoned.into_inner();
+                self.0.store(false, Ordering::Release); self.2.notify_waiters();
+                return None;
+            }
+        };
+        if !self.is_open() { return None; }
+        Some(operation())
+    }
+    pub(super) async fn closed(&self) {
+        loop {
+            let notified = self.2.notified(); tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.is_open() { return; }
+            notified.await;
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

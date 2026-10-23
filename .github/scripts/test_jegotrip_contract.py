@@ -313,6 +313,46 @@ class JegotripContract(unittest.TestCase):
         for name in ['beta-validation.yml', 'build-release.yml']:
             self.assertIn('connectivity::core::tls_identity::tests', (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
 
+    def test_actor_has_original_scope_poll_gate_and_no_network_dial_or_provider(self):
+        source = (MOD / 'transport_actor.rs').read_text(encoding='utf-8')
+        self.assertIn('AsyncRead + AsyncWrite + Unpin + Send', source)
+        self.assertIn('self.backend.on_verified_plaintext', source)
+        self.assertIn('self.pending.retain(|id, _| self.backend.is_pending(*id))', source)
+        self.assertIn('scope.with_io_gate(|| Pin::new(&mut *io).poll_write', source)
+        self.assertIn('scope.with_io_gate(|| Pin::new(&mut *io).poll_flush', source)
+        self.assertIn('_ = scope.closed()', source)
+        self.assertIn('_ = completion.closed()', source)
+        self.assertIn('self.commands.try_send', source)
+        self.assertIn('self.events.try_send', source)
+        self.assertIn('self.io = None; self.commands.close()', source)
+        self.assertIn('pub fn io_released(&self)', source)
+        self.assertIn('self.task.as_mut()', source)
+        self.assertNotIn('self.task.take()', source)
+        self.assertIn('ticket: &ServerRequestTicket', source)
+        self.assertIn('ticket: &DirectReplyTicket', source)
+        self.assertIn('pub mod transport_actor;', (MOD / 'mod.rs').read_text(encoding='utf-8'))
+        for forbidden in ['TcpStream', 'connect(', 'reqwest::', 'impl HostingBackend', 'Callback::Channels', 'from_utf8_lossy']:
+            self.assertNotIn(forbidden, source)
+        for name in ['beta-validation.yml', 'build-release.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::transport_actor::tests',
+                          (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_close_gate_is_shared_terminal_and_poll_leases_are_not_async_locks(self):
+        source = (MOD / 'rpc_pending.rs').read_text(encoding='utf-8')
+        self.assertIn('Arc<Mutex<()>>', source)
+        self.assertIn('Arc<tokio::sync::Notify>', source)
+        gate = source.split('pub(super) fn with_io_gate', 1)[1].split('pub(super) async fn closed', 1)[0]
+        self.assertIn('if !self.is_open() { return None; }', gate)
+        self.assertIn('self.0.store(false, Ordering::Release)', gate)
+        self.assertNotIn('.await', gate)
+        self.assertIn('notified.as_mut().enable()', source)
+        self.assertIn('if !self.is_open() { return; }', source)
+        actor = (MOD / 'transport_actor.rs').read_text(encoding='utf-8')
+        self.assertIn('tokio::time::MissedTickBehavior::Skip', actor)
+        self.assertIn('self.tls.next_deadline()', actor)
+        self.assertIn('count > frame.len() - offset', actor)
+        self.assertIn('RuntimeError::Cancelled', actor)
+
     def test_native_notifications_require_local_operation_and_stale_scope_checks(self):
         events = (MOD / 'native_events.rs').read_text(encoding='utf-8')
         controller = (MOD / 'controller.rs').read_text(encoding='utf-8')

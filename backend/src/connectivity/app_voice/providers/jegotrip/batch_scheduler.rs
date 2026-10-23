@@ -147,6 +147,12 @@ impl ServerRequestTicket {
     pub fn sequence(&self) -> i32 { self.sequence }
     pub fn owner(&self) -> &AttemptOwner { &self.owner }
     pub fn is_open(&self) -> bool { self.connection.is_open() }
+    /// Private duplication for a queued original-runtime completion only. The
+    /// scheduler's pending ticket map still permits exactly one completion.
+    pub(super) fn captured_copy(&self) -> Self {
+        Self { owner: self.owner.clone(), connection: self.connection.clone(), scheduler: self.scheduler.clone(),
+            peer_incarnation: self.peer_incarnation, sequence: self.sequence }
+    }
     pub(super) fn matches(&self, owner: &AttemptOwner, connection: &RpcConnectionScope) -> bool {
         &self.owner == owner && self.connection.matches(connection) && self.connection.is_open()
     }

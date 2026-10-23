@@ -63,6 +63,7 @@ impl OfflineBackend {
         Self { protocol, tracker, scheduler: None, dispatcher: None, swaps: BTreeMap::new() }
     }
     pub fn phase(&self) -> ArcPhase { self.protocol.phase() }
+    pub(super) fn is_pending(&self, id: i32) -> bool { self.protocol.is_pending(id) }
     pub fn connection_scope(&self) -> RpcConnectionScope { self.protocol.connection_scope() }
     /// Opaque lower stream adapter, not a raw-bytes-to-RPC shortcut. A future
     /// trusted TLS engine must still establish actual plaintext packet boundaries.
