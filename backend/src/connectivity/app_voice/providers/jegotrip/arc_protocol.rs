@@ -148,6 +148,12 @@ impl ArcProtocol {
         self.packets(id, bytes.expose_to_transport())
     }
 
+    pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
+        let (id, bytes) = self.rpc.prepare_logout(routing)?;
+        self.incoming = None; self.direct_pending.clear(); self.direct_seen.clear();
+        self.packets(id, bytes.expose_to_transport())
+    }
+
     pub fn prepare_swap_calls(&mut self, payload: &BatchPayload<'_>, routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> {
         let (id, bytes) = self.rpc.prepare_swap_calls(payload, routing)?;
@@ -181,6 +187,7 @@ impl ArcProtocol {
                 Ok(None) => Ok(false),
                 Err(error) => { self.close(); Err(error.into()) }
             },
+            CallKind::Request if matches!(self.rpc.phase(), ArcPhase::LogoutPending | ArcPhase::LoggedOut) => Ok(false),
             CallKind::Request => self.incoming_request(owner, connection, message.payload.expose_to_transport(), deliver),
             kind => {
                 if kind == CallKind::Release { self.close(); }

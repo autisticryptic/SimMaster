@@ -1,6 +1,6 @@
 use super::*;
 
-fn p(sequence:u16)->ChannelPacket<'static> { ChannelPacket { timestamp:None,sequence,kind:PacketKind::Data,data_gap:0,
+fn p<'a>(sequence:u16)->ChannelPacket<'a> { ChannelPacket { timestamp:None,sequence,kind:PacketKind::Data,data_gap:0,
     ack_sequence:0,delivered_sequence:0,inclusive_ack:false,ack_mask:&[],body:&[] } }
 
 #[test]
@@ -74,7 +74,45 @@ fn native_start_skip_continuation_counts_and_unknown_run_types_fail_explicitly()
     packet.kind=PacketKind::Probe;assert!(starting_sequence(&packet).unwrap().is_none());
     packet.kind=PacketKind::Skip;packet.body=&[0x80,0x20,0,0x10];assert_eq!(starting_sequence(&packet).unwrap(),Some(52));
     packet.sequence=0;packet.body=&[0,1];assert_eq!(starting_sequence(&packet).unwrap(),Some(65535));
-    for raw in [b"".as_slice(),&[0],&[0x80,1],&[0x40,0],&[0,1,0,1]] { packet.body=raw;assert!(starting_sequence(&packet).is_err()); }
+    for raw in [b"".as_slice(),&[0],&[0x80,1],&[0x40,0],&[0xc0,1]] { packet.body=raw;assert!(starting_sequence(&packet).is_err()); }
+}
+
+#[test]
+fn retransmitted_data_keeps_original_sequence_body_and_does_not_start_an_incarnation() {
+    let mut packet=p(101);packet.kind=PacketKind::Skip;packet.body=&[0x40,0x02,0xff,1,2];
+    let decoded=original_packet(&packet).unwrap();assert_eq!(decoded.sequence,99);assert_eq!(decoded.kind,PacketKind::Data);
+    assert_eq!(decoded.body,&[0xff,1,2]);assert!(starting_sequence(&packet).unwrap().is_none());
+}
+
+#[test]
+fn retransmitted_start_with_application_payload_terminates_descriptor_chain_not_data() {
+    let mut packet=p(101);packet.kind=PacketKind::Skip;packet.body=&[0,2,0xff,1,2];
+    let decoded=original_packet(&packet).unwrap();assert_eq!(decoded.sequence,99);assert_eq!(decoded.kind,PacketKind::Start);
+    assert_eq!(decoded.body,&[0xff,1,2]);assert_eq!(starting_sequence(&packet).unwrap(),Some(99));
+}
+
+#[test]
+fn nested_native_retransmission_unwraps_both_u16_distances_in_original_order() {
+    let mut packet=p(1);packet.body=b"\xfffixture";
+    let body1=retransmission_body(&packet,5).unwrap();let mut sent1=p(5);sent1.kind=PacketKind::Skip;sent1.body=body1.expose_to_transport();
+    let body2=retransmission_body(&sent1,10).unwrap();let mut sent2=p(10);sent2.kind=PacketKind::Skip;sent2.body=body2.expose_to_transport();
+    assert_eq!(body2.expose_to_transport(),[b"\x80\x05\x40\x04".as_slice(),packet.body].concat());
+    let original=original_packet(&sent2).unwrap();assert_eq!(original.sequence,1);assert_eq!(original.kind,PacketKind::Data);assert_eq!(original.body,packet.body);
+}
+
+#[test]
+fn retransmission_wrap_preserves_original_sequence_without_replaying_a_different_frame() {
+    let mut packet=p(65535);packet.body=b"\xffdata";let body=retransmission_body(&packet,1).unwrap();
+    let mut resent=p(1);resent.kind=PacketKind::Skip;resent.body=body.expose_to_transport();
+    assert_eq!(original_packet(&resent).unwrap().sequence,65535);assert_eq!(original_packet(&resent).unwrap().body,packet.body);
+}
+
+#[test]
+fn unsupported_zero_oversized_or_truncated_retransmission_descriptors_fail_boundedly() {
+    let packet=p(1);assert!(retransmission_body(&packet,1).is_err());assert!(retransmission_body(&packet,0x4001).is_err());
+    let mut packet=p(1);packet.kind=PacketKind::Probe;assert!(retransmission_body(&packet,2).is_err());packet.kind=PacketKind::Skip;
+    for body in [b"\x40".as_slice(),b"\0\0",b"\x80\x01",b"\xc0\x01"] {packet.body=body;assert!(original_packet(&packet).is_err());}
+    let chain=b"\x80\x01".repeat(101);packet.body=&chain;assert!(original_packet(&packet).is_err());
 }
 
 #[test]

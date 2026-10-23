@@ -338,6 +338,14 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 
 新15router/17channel＋2原buffer回归=315 source inventory＋4sharedSIP待Actions，383Pythonstatic/mock首PASS待最新cleanup后复跑。Read-only sourceinspectionjob_mvledrqc_9查四文件发现whole/control保留过期半片及discarded/growingbuffer未wipe，main已allinputexpire、TransportBytes/PartialMessage Dropzeroize、bounded几何extend_wiping新capacity复制后wipe旧分配/预reserve/精确join与回归；没有读取freedmemory/unsafe或夸大撤销callercopy。完整sourceinspection不等于compilepass/实网。原metadata/xrefs/decompile/ASM仅read-only，不改IDB、不执行target或本机Rust。证据`.local/jegotrip/native-router-channel-evidence.md`。
 
+### 原会话注销/命令归属（最新源码待Actions）
+
+`65fad23`的Router/Channel315＋4sharedSIP/86已由Build40017848477/Beta40017848512/ARM64 AMD64/官方SHA ZIP逐名通过，383static/mock，Release skip；firstcompile59warnings/19Jegotrip excerpts保留。Build artifact12529631549 SHA`36b35b7688cf86d205bc41300dc44b38c2b20ad1fd35732283c0e8b6a3ebe3e1`，Beta12529671078 SHA`138fdbbdddb77e2911cc0ab0fc473434847a6771e1f6bc16eeb8d4364b560237`。这只是原生边界，不是完整backend。
+
+最新native-teardown源码：F556A0/F537FC已补DATA/Start含payload与nestedSkip descriptor，旧subset不可将正常DATA retransmit当malformed incarnation；nativeMtc receiver510E3C+510464明确登记kind字符串`Sip.Request`，JCNotify/JCMessageChannel/Realm直接text/可选millis，未把UUID当remoteID/猜PDU/复制日期fallback。正常logoutSession使用returneduser+原selectedid两个method字符串、metadata token，结果external0/boolean/footer，不是close或physicalsubmit。新增rpc_logout、ARCLogoutPending→LoggedOut私有原owner/scope/callID匹配reply、actor originaloneshot等servertrue再Drop IO，owningRuntimeHandle.logout再Join才io_released；Clone RuntimeCommands只有原命令引用不能换scope/复制任务或宣告release。Logout wait取消立即originalpollgateclose，不重放，invalidowner/authrouting在closeguard前拒绝。Controller callbackscope已退休仍用backend_owner原IO注销/退役；failure/expiry/timeout同步retire，失败cleanup留原owner可重等、禁止重启/重导入与unregisterreplay；Drop retire不是releaseproof。Actor capturedProperty/Login/Binding/Gateway与bootstrapkey清零，callercopies/kernelbytes不撤回。
+
+最新341source＋4SIP待两Actions；384Pythonstatic/mock已过，原literallogout(owner) guard误报更正clone并加强originalowner/cleanup retained校验，失败log保留。Source review辅助job_mvlgqiog_a因Azure differentresource400失败无findings，main独立查类型/域，不称fullsignoff。真实Backend/可信connector/原生STATUS3逻辑ACK（tracker仍丢结果）、accountline/秘密持久化API/inbox消费ACK/SMS/callmedia/trunk/独立费用续期并发尚未完整，不授provider。证据`.local/jegotrip/native-teardown-evidence.md`，no targetexec/IDB/device-service/localRust。
+
 ### 5. 下一阶段与验收条件
 
 1. 继续确认 SDK 外线登录/网关帧、通知、注销、续期以及 Linux 兼容的实现路径。

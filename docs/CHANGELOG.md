@@ -5,6 +5,8 @@
 
 ## 1.1.5 主线
 
+- 原会话SDK teardown groundwork（341源码回归待Actions）：65fad23路由/Channel315＋4/86已由Build40017848477/Beta40017848512/双架构/officialSHA核验，继续原SHA只读IDA证实native logoutSession twoStrings(userid/原selector)/tokenmetadata/0boolfooter、正常DATA/Start带payload重传；新增私有logoutreply/actor等semantic ACK再Join确认ioRelease/原commands-only clone，controller originalbackend_owner跨callback retirement/expiry/failure与cleanup retry，未启动凭据不注销。capturedcommandSecret Dropzeroize，384Pythonstatic/mock通过，review辅助Azure400无结论非signoff，无本机Rust/IDB写/target/device-service。完整Backend/STATUS3逻辑ACK/provider/persist/API/SMS/media/费用续期并发仍继续，unsupported/outboundfalse。
+
 - 无忧行Router/Channel原生边界（草稿待Actions）：用户手开原libmtc.so/base0/MCP SHA匹配，只读decompile恢复kind2/3/2048-bit stats不drop duplicate、16bit邻片乱序wrap及8/10Header/SACK/gap31/BE16/FE-FF records；新增数据codec，oldstrict/TLS/actor与unsupported/outboundfalse保持。source315＋4待Actions，383static/mock首PASS待最新cleanup复跑；read-only sourceinspection两retention/wipe缺口main修，非编译/实网signoff。TransportBytes/PartialMessageDropzeroize、bounded几何realloc前wipe、原announcedsize预reserve，不撤销caller复制；未移植nativeXOR/Kx/resume或错误replay，无IDB写/target执行/设备服务/本机Rust。完整timing/liveNetStream/provider/provision/persistAPI/SMSmediafees仍未完。
 
 - 无忧行完整backend实施计划已细化为路由/可信connector/真实HostingBackend/独立app-account持久化API/SMS耐久ACK/调用媒体Trunk/独立费用续期并发/Actions验收八步。主线程FDE静态确认Router D68010→D66270状态/时间窗口与kind3控制、16-bit乱序片配对，但完整NetStream生命周期/回调及Smgw分类媒体仍缺，当前需用户手动开现有libmtc.so只读IDA补证据；不猜重传/receiver-kind/directSIP/费用，不启provider。此次仅规划/静态复核，无新backend源码或本机Rust/设备服务/IDB写，既有ed6fb33验证不冒称新成果；详情见固定DEVELOPMENT_PLAN。

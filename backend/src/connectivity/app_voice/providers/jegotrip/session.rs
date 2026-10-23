@@ -67,6 +67,10 @@ pub trait HostingBackend: Send + Sync {
     fn login<'a>(&'a self, owner: AttemptOwner, request: SdkLoginRequest<'a>) -> BackendFuture<'a>;
     fn update_status<'a>(&'a self, owner: AttemptOwner, status: i32,
         registration: GatewayRegistration<'a>) -> BackendFuture<'a>;
+    /// Synchronously retire new IO/commands for the ORIGINAL attempt. This is
+    /// not an IO-release receipt: logout/close still awaits actual teardown.
+    /// Legacy offline test adapters have no IO to retire.
+    fn retire(&self, _owner: &AttemptOwner) {}
     fn logout(&self, owner: AttemptOwner) -> BackendFuture<'_>;
 }
 
@@ -265,7 +269,8 @@ impl HostingSession {
     /// Retire login/hosting callbacks before teardown is submitted. The caller
     /// still needs the gateway parameters to send STATUS_UNREGISTER.
     pub fn begin_unhosting(&mut self) -> Result<(AttemptOwner, GatewayRegistration<'_>), &'static str> {
-        let owner = self.next_owner()?;
+        let owner = self.current_owner();
+        self.next_owner()?;
         self.invalidate();
         self.phase = Phase::UnhostingPending;
         let hosting = &self.credentials.as_ref().ok_or("jegotrip_credentials_required")?.hosting;

@@ -13,6 +13,7 @@ use super::{
     rpc_bootstrap::{decode_get_app_configs_result, encode_get_app_configs, AppConfigsResult, GET_APP_CONFIGS_METHOD},
     rpc_envelope::{decode_reply, encode_request},
     rpc_login::{decode_login_session_result, encode_login_session, normalize_session_identity, LOGIN_SESSION_METHOD},
+    rpc_logout::{encode_logout_session, decode_logout_result, LOGOUT_SESSION_METHOD},
     rpc_pending::{HostingRpcTracker, OwnedRpcCallback, RpcConnectionScope},
     rpc_stream::{CodecError, RpcBytes, RpcFooter, RpcProperty, MAX_FIELD_BYTES, MAX_MAP_ENTRIES},
     session::{AttemptOwner, BackendFailure},
@@ -22,7 +23,7 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 use zeroize::Zeroize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ArcPhase { Initial, LoginPending, Authenticated, Closed }
+pub enum ArcPhase { Initial, LoginPending, Authenticated, LogoutPending, LoggedOut, Closed }
 
 /// All references/values are captured from the original SDK configuration.
 /// Requiring a selected id is deliberate: this adapter does not invent the
@@ -49,7 +50,7 @@ impl Drop for ArcAuthentication {
 }
 
 #[derive(Clone, Copy)]
-enum PendingKind { Bootstrap, Login, Swap }
+enum PendingKind { Bootstrap, Login, Swap, Logout }
 
 struct PendingRpc {
     kind: PendingKind, selected_session_id: Option<Vec<u8>>, scheduler: Option<Arc<()>>,
@@ -146,8 +147,21 @@ impl fmt::Debug for OwnedBootstrapReply {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("OwnedBootstrapReply(<redacted>)") }
 }
 
+/// Matched terminal logout result from this original ARC. Not a physical IO
+/// release receipt; the transport actor must still end and drop its original IO.
+pub struct OwnedLogoutReply { owner: AttemptOwner, connection: RpcConnectionScope, call_id: i32, accepted: bool }
+impl OwnedLogoutReply {
+    pub fn call_id(&self) -> i32 { self.call_id }
+    pub fn accepted(&self) -> bool { self.accepted }
+    pub(super) fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
+        &self.owner == owner && self.connection.matches(scope) && self.connection.is_open()
+    }
+}
+impl fmt::Debug for OwnedLogoutReply { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("OwnedLogoutReply(<redacted>)") } }
+
 pub enum ArcReply<'a> {
     Bootstrap(OwnedBootstrapReply),
+    Logout(OwnedLogoutReply),
     Login(OwnedRpcCallback),
     Swap(OwnedBatchReply<'a>),
     Failure(OwnedRpcCallback),
@@ -283,6 +297,22 @@ impl ArcRpcSession {
         Ok(prepared)
     }
 
+    /// Submit on ORIGINAL authenticated user/selected session/auth token only.
+    /// Preparing a valid logout retires other pending operations without reusing
+    /// IDs; invalid input must leave authentication and pending state untouched.
+    pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<(i32, RpcBytes), CodecError> {
+        if self.phase() != ArcPhase::Authenticated { return Err(CodecError::InvalidField); }
+        reject_auth_keys(routing)?;
+        let auth = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
+        let arguments = encode_logout_session(&auth.user_id, &auth.selected_session_id)?;
+        let mut metadata = routing.to_vec(); metadata.push(RpcProperty { key: b"token", value: &auth.token });
+        let bytes = encode_request(self.next_id.ok_or(CodecError::InvalidCallId)?, &metadata, LOGOUT_SESSION_METHOD.as_bytes(), arguments.expose_to_transport())?;
+        let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
+        self.next_id = id.checked_add(1); self.pending.clear();
+        self.pending.insert(id, PendingRpc { kind: PendingKind::Logout, selected_session_id: None, scheduler: None });
+        self.phase = ArcPhase::LogoutPending; Ok((id, bytes))
+    }
+
     pub fn prepare_swap_calls(&mut self, payload: &BatchPayload<'_>, routing: &[RpcProperty<'_>])
         -> Result<(i32, RpcBytes), CodecError> {
         if self.batch_scheduler_taken { return Err(CodecError::InvalidField); }
@@ -319,7 +349,7 @@ impl ArcRpcSession {
     /// Retire timeouts explicitly. A submitted login may have changed remote
     /// state, so cancelling it closes this incarnation rather than reopening it.
     pub fn retire_request(&mut self, id: i32) {
-        if self.pending.remove(&id).is_some_and(|pending| matches!(pending.kind, PendingKind::Login)) {
+        if self.pending.remove(&id).is_some_and(|pending| matches!(pending.kind, PendingKind::Login | PendingKind::Logout)) {
             self.close();
         }
     }
@@ -368,6 +398,13 @@ impl ArcRpcSession {
                         selected_session_id, token: result.session_token.to_vec() });
                     self.phase = ArcPhase::Authenticated;
                     ArcReply::Login(OwnedRpcCallback { owner: self.owner.clone(), callback: Callback::SdkLogin { success: true } })
+                }
+                _ => self.failure(),
+            },
+            PendingKind::Logout => match decode_logout_result(reply.result_code, reply.result_stream) {
+                Ok(result) if self.phase == ArcPhase::LogoutPending => {
+                    self.authentication = None; self.phase = ArcPhase::LoggedOut;
+                    ArcReply::Logout(OwnedLogoutReply { owner: self.owner.clone(), connection: self.connection.clone(), call_id: reply.call_id, accepted: result.accepted })
                 }
                 _ => self.failure(),
             },

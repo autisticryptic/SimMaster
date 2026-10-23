@@ -91,24 +91,46 @@ pub fn previous_data<'a>(packet: &ChannelPacket<'a>) -> Result<(u16, &'a [u8]), 
     Ok((u16::from_be_bytes([previous[0],previous[1]]), &packet.body[2..]))
 }
 
-/// Native Skip runs areBE16 words: high2bits2 continues subtracting the low14
-/// count, high2bits0 terminates with the preceding channel incarnation seq.
-/// Unknown run kinds, empty/truncated runs and noncanonical trailing words fail.
-pub fn starting_sequence(packet: &ChannelPacket<'_>) -> Result<Option<u16>, TransportError> {
-    if packet.kind == PacketKind::Start { return Ok(Some(packet.sequence)); }
-    if packet.kind != PacketKind::Skip { return Ok(None); }
-    let mut sequence = packet.sequence;
-    if packet.body.is_empty() || packet.body.len() % 2 != 0 || packet.body.len() > 4096 { return Err(TransportError::InvalidPacket); }
-    let total = packet.body.len() / 2;
-    for (index, word) in packet.body.chunks_exact(2).enumerate() {
-        let value = u16::from_be_bytes([word[0],word[1]]);
-        match value >> 14 {
-            2 if index + 1 < total => sequence = sequence.wrapping_sub(value & 0x3fff),
-            0 if index + 1 == total => return Ok(Some(sequence.wrapping_sub(value & 0x3fff))),
-            _ => return Err(TransportError::InvalidPacket),
-        }
+/// Expand a native retransmission: each BE16 descriptor names its previous
+/// packet kind (high2) and u16 backwards distance(low14). Re-sent Skip packets
+/// add another descriptor; Start/Data terminate and retain the original body.
+/// This reconstructs DATA ONLY; the caller must retain original live ownership
+/// and must never use it to replay cancelled work on a replacement connection.
+pub fn original_packet<'a>(packet: &ChannelPacket<'a>) -> Result<ChannelPacket<'a>, TransportError> {
+    let mut kind = packet.kind; let mut sequence = packet.sequence; let mut body = packet.body;
+    let mut descriptors = 0;
+    while kind == PacketKind::Skip {
+        descriptors += 1;
+        if descriptors > 100 { return Err(TransportError::TooLarge); } // local retention/cpu bound
+        let word = body.get(..2).ok_or(TransportError::Truncated)?;
+        let value = u16::from_be_bytes([word[0],word[1]]); let delta = value & 0x3fff;
+        if delta == 0 { return Err(TransportError::InvalidPacket); }
+        sequence = sequence.wrapping_sub(delta); body = &body[2..];
+        kind = match value >> 14 { 0 => PacketKind::Start, 1 => PacketKind::Data, 2 => PacketKind::Skip,
+            _ => return Err(TransportError::UnsupportedKind) };
     }
-    Err(TransportError::InvalidPacket)
+    Ok(ChannelPacket { timestamp: packet.timestamp, sequence, kind, data_gap: packet.data_gap,
+        ack_sequence: packet.ack_sequence, delivered_sequence: packet.delivered_sequence,
+        inclusive_ack: packet.inclusive_ack, ack_mask: packet.ack_mask, body })
+}
+
+/// Add precisely one native retransmission descriptor to original Start/Data/
+/// Skip bytes. A later live frame uses a NEW channel sequence but still names
+/// the SAME pending original data. No callback/ticket or replacement IO bound.
+pub fn retransmission_body(original: &ChannelPacket<'_>, new_sequence: u16) -> Result<TransportBytes, TransportError> {
+    if !matches!(original.kind, PacketKind::Start | PacketKind::Data | PacketKind::Skip) { return Err(TransportError::UnsupportedKind); }
+    let delta = new_sequence.wrapping_sub(original.sequence);
+    if delta == 0 || delta >= 0x4000 || original.body.len() > MAX_NETWORK_PACKET_BYTES - 2 { return Err(TransportError::InvalidPacket); }
+    let mut body = Vec::with_capacity(original.body.len() + 2);
+    body.extend_from_slice(&(delta | (u16::from(original.kind.bits()) << 14)).to_be_bytes()); body.extend_from_slice(original.body);
+    Ok(TransportBytes::from_bytes(body))
+}
+
+/// A native Start, including one wrapped in retransmission descriptors, names
+/// the receive incarnation. A retransmitted DATA does NOT start/reset a stream.
+pub fn starting_sequence(packet: &ChannelPacket<'_>) -> Result<Option<u16>, TransportError> {
+    let original = original_packet(packet)?;
+    if original.kind == PacketKind::Start { Ok(Some(original.sequence)) } else { Ok(None) }
 }
 
 pub struct Records { partial: Vec<u8>, closed: bool }

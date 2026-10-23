@@ -112,7 +112,7 @@ async fn cancelling_original_command_during_send_terminates_and_releases_actor_i
     let (io, bytes, _, _, dropped) = poll_io(true);
     let (_commands, commands) = mpsc::channel(MAX_COMMANDS); let (events, _events) = mpsc::channel(MAX_EVENTS);
     let mut actor = Actor { io: Some(io), owner: original, scope: scope.clone(), backend, tls, commands, events,
-        policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new() };
+        policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new(), logout_pending: None };
     let (mut completion, receiver) = oneshot::channel();
     {
         let sending = actor.send_wire(&wire, Some(&mut completion)); tokio::pin!(sending);
@@ -280,6 +280,76 @@ async fn real_duplex_batch_ack_is_not_hosting_success_and_original_message_compl
     assert!(hosting); let ticket = ticket.unwrap(); runtime.complete_direct(&original, &scope, &ticket, true).await.unwrap();
     assert!(runtime.complete_direct(&original, &scope, &ticket, true).await.is_err());
     assert!(runtime.close().await.io_released()); received.await.unwrap();
+}
+
+#[tokio::test]
+async fn command_only_clones_preserve_original_owner_and_do_not_own_release_receipts() {
+    let cert=Certificates::generate("DNS:fixture.invalid");let original=owner();let (io,bytes,_,_,dropped)=poll_io(true);
+    let (mut runtime,_events)=start(io,original.clone(),PacketRoute::DirectTlsCarrier,parameters(&cert.root),policy(),None).unwrap();
+    let scope=runtime.connection_scope();let commands=runtime.command_handle();let another=commands.clone();drop(another);assert!(scope.is_open());
+    assert_eq!(commands.login(&owner(),&scope,login(),&[]).await.err(),Some(RuntimeError::Scope));
+    assert_eq!(commands.login(&original,&RpcConnectionScope::fresh(),login(),&[]).await.err(),Some(RuntimeError::Scope));
+    assert_eq!(runtime.commands.capacity(),MAX_COMMANDS);assert!(bytes.lock().unwrap().is_empty());
+    commands.request_close();assert!(!scope.is_open());assert!(runtime.close().await.io_released());assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn owning_actor_drop_invalidates_surviving_command_clones_without_io_rebinding() {
+    let cert=Certificates::generate("DNS:fixture.invalid");let original=owner();let (io,_,_,_,dropped)=poll_io(true);
+    let (runtime,_events)=start(io,original.clone(),PacketRoute::DirectTlsCarrier,parameters(&cert.root),policy(),None).unwrap();
+    let scope=runtime.connection_scope();let commands=runtime.command_handle();drop(runtime);
+    assert!(!scope.is_open());assert_eq!(commands.poll(&original,&scope,&[]).await.err(),Some(RuntimeError::Scope));
+    tokio::time::timeout(Duration::from_secs(1),async{while !dropped.load(Ordering::SeqCst){tokio::task::yield_now().await;}}).await.unwrap();
+}
+
+#[tokio::test]
+async fn real_tls_logout_has_original_selector_semantic_result_and_join_confirmed_release() {
+    for accepted in [true,false] {
+        let cert=Certificates::generate("DNS:fixture.invalid");let original=owner();let (client,server)=tokio::io::duplex(65_536);
+        let (mut runtime,mut events)=start(client,original.clone(),PacketRoute::DirectTlsCarrier,parameters(&cert.root),policy(),None).unwrap();let scope=runtime.connection_scope();
+        let mut peer=Peer{io:server,server:cert.server(&rustls::version::TLS13),network:PacketStreamDecoder::default(),plaintext:super::super::tls_plaintext::PlaintextPacketDecoder::default(),assembler:CallAssembler::default(),received:std::collections::VecDeque::new()};
+        let server=tokio::spawn(async move {
+            let message=peer.receive().await.unwrap();let request=decode_request(message.payload.expose_to_transport()).unwrap();peer.send_reply(request.call_id,&login_result()).await;
+            let message=peer.receive().await.unwrap();let request=decode_request(message.payload.expose_to_transport()).unwrap();
+            assert_eq!(request.method,super::super::rpc_logout::LOGOUT_SESSION_METHOD.as_bytes());
+            assert!(request.metadata.iter().any(|p|p.key==b"token"));assert!(!request.metadata.iter().any(|p|p.key==b"pwd"));
+            let mut arguments=super::super::rpc_stream::Reader::versioned(request.arguments).unwrap();assert_eq!(arguments.bytes().unwrap(),b"fixture-user");
+            assert_eq!(arguments.bytes().unwrap(),b"fixture-selector");arguments.finish().unwrap();
+            peer.send_reply(request.call_id,&[0,u8::from(accepted),0,0,0,0]).await;
+            while peer.io.read(&mut[0;1024]).await.unwrap()!=0 {}
+        });
+        let commands=runtime.command_handle();
+        tokio::time::timeout(Duration::from_secs(2),async{loop{match commands.login(&original,&scope,login(),&[]).await {
+            Ok(_)=>break,Err(RuntimeError::Tls(TlsError::NotReady))=>tokio::time::sleep(Duration::from_millis(5)).await,Err(e)=>panic!("login {e:?}"),
+        }}}).await.unwrap();
+        let event=tokio::time::timeout(Duration::from_secs(2),events.recv()).await.unwrap().unwrap();assert!(matches!(&event.events_for(&original,&scope).unwrap()[0],OfflineEvent::Callback(_)));
+        assert_eq!(commands.logout(&owner(),&scope,&[]).await.err(),Some(RuntimeError::Scope));assert!(scope.is_open());
+        assert_eq!(commands.logout(&original,&scope,&[RpcProperty{key:b"token",value:b"foreign"}]).await.err(),Some(RuntimeError::InvalidConfiguration));assert!(scope.is_open());
+        let result=tokio::time::timeout(Duration::from_secs(2),runtime.logout(&original,&scope,&[])).await.unwrap();
+        if accepted {let receipt=result.unwrap();assert!(receipt.io_released());assert_eq!(receipt.reason,RuntimeError::LoggedOut);} else {assert_eq!(result.err(),Some(RuntimeError::Protocol));}
+        assert!(!scope.is_open());server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cancelling_native_logout_reply_wait_retires_original_poll_gate_without_replaying_rpc() {
+    let cert=Certificates::generate("DNS:fixture.invalid");let original=owner();let (client,server)=tokio::io::duplex(65_536);
+    let (mut runtime,mut events)=start(client,original.clone(),PacketRoute::DirectTlsCarrier,parameters(&cert.root),policy(),None).unwrap();let scope=runtime.connection_scope();
+    let mut peer=Peer{io:server,server:cert.server(&rustls::version::TLS13),network:PacketStreamDecoder::default(),plaintext:super::super::tls_plaintext::PlaintextPacketDecoder::default(),assembler:CallAssembler::default(),received:std::collections::VecDeque::new()};
+    let (submitted,received)=oneshot::channel();let server=tokio::spawn(async move {
+        let message=peer.receive().await.unwrap();let request=decode_request(message.payload.expose_to_transport()).unwrap();peer.send_reply(request.call_id,&login_result()).await;
+        let message=peer.receive().await.unwrap();let request=decode_request(message.payload.expose_to_transport()).unwrap();assert_eq!(request.method,super::super::rpc_logout::LOGOUT_SESSION_METHOD.as_bytes());submitted.send(()).unwrap();
+        while peer.io.read(&mut[0;1024]).await.unwrap()!=0 {}
+    });
+    let commands=runtime.command_handle();tokio::time::timeout(Duration::from_secs(2),async{loop{match commands.login(&original,&scope,login(),&[]).await {
+        Ok(_)=>break,Err(RuntimeError::Tls(TlsError::NotReady))=>tokio::time::sleep(Duration::from_millis(5)).await,Err(e)=>panic!("login {e:?}"),
+    }}}).await.unwrap();let _event=tokio::time::timeout(Duration::from_secs(2),events.recv()).await.unwrap().unwrap();
+    {
+        let logging_out=commands.logout(&original,&scope,&[]);tokio::pin!(logging_out);
+        tokio::select! { result=logging_out.as_mut()=>panic!("no logout reply: {result:?}"),_ = received=>{} }
+        assert!(scope.is_open());
+    }
+    assert!(!scope.is_open());assert!(runtime.close().await.io_released());server.await.unwrap();
 }
 
 #[tokio::test]

@@ -449,6 +449,8 @@ Common请求/回包与swapCalls批次已补有界codec及原提交/连接scope�
 
 原SHA只读IDA已由用户手动打开并核验metadata；当前Router/Channel草稿仅kind2/3数据controls/2048-bit stats（重复不drop DATA）/u16邻片及8/10hdr/SACK/gap31/BE16 FE-FF record，不替TLS/SDK/hosting/channel、IAM/计费或SIM定义。315源码回归待Actions，383本机static/mock首PASS待最新buffer清理复跑；源inspection两owned-retention/wipe问题已修，drop/grow前清零不撤销callercopy。完整NetStream/endpointbinding/HostingBackend/app-account persistAPI/SMS/callmedia/trunk/费用续期并发仍缺，unsupported/outboundfalse，未IDB写/target/设备服务/本机Rust。
 
+315原生Router/Channel65fad23已由Build40017848477/Beta40017848512/双架构/officialSHA ZIP315＋4/86验证，383static/mock/Release skip，59warnings/19Jegotrip excerpts保留；最新originalowner SDKlogout/cancel/clonecommand/typedDATA-retransmit341源码回归待Actions、384Pythonstatic/mock通过。Owner callback退休不转移原IO，private matchedlogout0/true/footer仅serveraccepted，Actor结束+Join才release，false/cancel不重放、失败cleanup保留原owner。capturedcommandSecrets/原buffers Dropwipe，不撤销callercopy/kernelbytes。不将`Sip.Request`登记/text证据自动套用RTP/SDK费用/renewal/provider或IMS免费WLAN，完整backend/STATUS3 ACK/persist/API/SMSmedia仍继续；无IDB写/target/设备服务/本机Rust。
+
 ## 10. 验证清单与验收标准
 
 构建/Rust/注册模拟仅走 GitHub Actions，流程见 [开发指南](DEVELOPER.md)。

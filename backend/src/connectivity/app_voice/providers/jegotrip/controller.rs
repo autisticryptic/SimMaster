@@ -7,6 +7,8 @@ use std::{sync::Arc, time::{Duration, Instant}};
 pub struct HostingController {
     session: HostingSession,
     backend: Option<Arc<dyn HostingBackend>>,
+    // Retained original IO owner even after the session retires its callbacks.
+    backend_owner: Option<AttemptOwner>,
     pending_deadline: Option<Instant>,
     operation_timeout: Duration,
 }
@@ -29,7 +31,7 @@ pub enum Callback {
 
 impl HostingController {
     pub fn new(line_id: String, backend: Option<Arc<dyn HostingBackend>>) -> Self {
-        Self { session: HostingSession::new(line_id), backend, pending_deadline: None,
+        Self { session: HostingSession::new(line_id), backend, backend_owner: None, pending_deadline: None,
             operation_timeout: Duration::from_secs(30) }
     }
 
@@ -37,7 +39,7 @@ impl HostingController {
     /// Active credentials must be stopped before replacement.
     pub fn import(&mut self, credentials: ImportedCredentials, now: u64)
         -> Result<(), ControllerFailure> {
-        if !matches!(self.session.phase(), Phase::Unconfigured | Phase::CredentialsImported
+        if self.backend_owner.is_some() || !matches!(self.session.phase(), Phase::Unconfigured | Phase::CredentialsImported
             | Phase::CredentialExpired | Phase::AuthenticationFailed | Phase::Disconnected) {
             return Err(ControllerFailure::Credentials("jegotrip_stop_before_replace"));
         }
@@ -52,9 +54,12 @@ impl HostingController {
             | Phase::AuthenticationFailed | Phase::Disconnected) {
             return Err(ControllerFailure::Credentials("jegotrip_start_state_invalid"));
         }
+        if self.backend_owner.is_some() { return Err(ControllerFailure::Credentials("jegotrip_stop_before_start")); }
         let backend = self.backend.clone()
             .ok_or(ControllerFailure::Backend(BackendFailure::Unavailable))?;
         let owner = self.session.begin_login(now).map_err(ControllerFailure::Credentials)?;
+        self.backend_owner = Some(owner.clone());
+        self.pending_deadline = Some(Instant::now() + self.operation_timeout);
         let request = self.session.login_request(&owner).map_err(ControllerFailure::Credentials)?;
         let result = tokio::time::timeout(self.operation_timeout,
             backend.login(owner.clone(), request)).await;
@@ -65,10 +70,12 @@ impl HostingController {
             }
             Ok(Err(reason)) => {
                 self.session.on_failure(&owner, reason);
+                backend.retire(&owner);
                 Err(ControllerFailure::Backend(reason))
             }
             Err(_) => {
                 self.session.on_failure(&owner, BackendFailure::Disconnected);
+                backend.retire(&owner);
                 Err(ControllerFailure::Timeout)
             }
         }
@@ -84,20 +91,23 @@ impl HostingController {
             Callback::SdkLogin { success } => {
                 if !self.session.on_sdk_login(owner, success) { return Ok(false); }
                 self.pending_deadline = None;
-                if !success { return Ok(true); }
+                if !success { self.retire_backend(); return Ok(true); }
                 let backend = self.backend.clone()
                     .ok_or(ControllerFailure::Backend(BackendFailure::Unavailable))?;
                 let request = self.session.begin_hosting(owner).map_err(ControllerFailure::Credentials)?;
+                self.pending_deadline = Some(Instant::now() + self.operation_timeout);
                 let result = tokio::time::timeout(self.operation_timeout,
                     backend.update_status(owner.clone(), STATUS_REGISTER, request)).await;
                 match result {
                     Ok(Ok(())) => self.pending_deadline = Some(Instant::now() + self.operation_timeout),
                     Ok(Err(reason)) => {
                         self.session.on_failure(owner, reason);
+                        backend.retire(owner);
                         return Err(ControllerFailure::Backend(reason));
                     }
                     Err(_) => {
                         self.session.on_failure(owner, BackendFailure::Disconnected);
+                        backend.retire(owner);
                         return Err(ControllerFailure::Timeout);
                     }
                 }
@@ -105,13 +115,13 @@ impl HostingController {
             }
             Callback::HostingAck { success } => {
                 let accepted = self.session.on_hosting_ack(owner, success);
-                if accepted { self.pending_deadline = None; }
+                if accepted { self.pending_deadline = None; if !success { self.retire_backend(); } }
                 Ok(accepted)
             }
             Callback::Channels { calls, messages } => Ok(self.session.on_channels(owner, calls, messages)),
             Callback::Failure(reason) => {
                 let accepted = self.session.on_failure(owner, reason);
-                if accepted { self.pending_deadline = None; }
+                if accepted { self.pending_deadline = None; self.retire_backend(); }
                 Ok(accepted)
             }
         }
@@ -145,39 +155,54 @@ impl HostingController {
         self.session.check_expiry(now);
         if !matches!(self.session.phase(), Phase::SdkLoginPending | Phase::HostingPending) {
             self.pending_deadline = None;
+            if matches!(self.session.phase(), Phase::CredentialExpired | Phase::AuthenticationFailed | Phase::Disconnected) { self.retire_backend(); }
             return;
         }
         if self.pending_deadline.is_some_and(|at| monotonic_now >= at) {
             let owner = self.session.current_owner();
             self.session.on_failure(&owner, BackendFailure::Disconnected);
             self.pending_deadline = None;
+            self.retire_backend();
         }
     }
 
-    /// Stop always retires the old callback owner. Failed unregister still runs
-    /// logout; a failed network teardown is returned, never reported as success.
+    fn retire_backend(&self) {
+        if let (Some(backend), Some(owner)) = (&self.backend, &self.backend_owner) { backend.retire(owner); }
+    }
+
+    /// Retire callback admission first, but issue teardown on the ORIGINAL
+    /// captured backend/IO owner. Imports and already failed/logged-out sessions
+    /// do not invent gateway unregister operations. Failed unregister still
+    /// waits for original logout; cancellation retains owner for another wait.
     pub async fn stop(&mut self) -> Result<(), ControllerFailure> {
         self.pending_deadline = None;
-        let backend = self.backend.clone();
-        let mut failure = None;
-        if let Some(backend) = backend {
-            if self.session.phase() != Phase::Unconfigured {
-                let (owner, request) = self.session.begin_unhosting()
-                    .map_err(ControllerFailure::Credentials)?;
-                match tokio::time::timeout(self.operation_timeout,
-                    backend.update_status(owner.clone(), STATUS_UNREGISTER, request)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(reason)) => failure = Some(ControllerFailure::Backend(reason)),
-                    Err(_) => failure = Some(ControllerFailure::Timeout),
+        let phase = self.session.phase(); let backend = self.backend.clone(); let original = self.backend_owner.clone();
+        let mut released = original.is_none(); let mut failure = None;
+        if phase != Phase::Unconfigured {
+            match self.session.begin_unhosting() {
+                Ok((_, request)) => {
+                    if matches!(phase, Phase::SdkLoggedIn | Phase::HostingPending | Phase::Hosted) {
+                        if let (Some(backend), Some(owner)) = (&backend, &original) {
+                            match tokio::time::timeout(self.operation_timeout, backend.update_status(owner.clone(), STATUS_UNREGISTER, request)).await {
+                                Ok(Ok(())) => {},
+                                Ok(Err(reason)) => { backend.retire(owner); failure = Some(ControllerFailure::Backend(reason)); }
+                                Err(_) => { backend.retire(owner); failure = Some(ControllerFailure::Timeout); },
+                            }
+                        }
+                    }
                 }
-                match tokio::time::timeout(self.operation_timeout, backend.logout(owner)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(reason)) => { failure.get_or_insert(ControllerFailure::Backend(reason)); }
-                    Err(_) => { failure.get_or_insert(ControllerFailure::Timeout); }
-                }
+                Err(reason) => { failure = Some(ControllerFailure::Credentials(reason)); }
             }
         }
-        self.session.clear().map_err(ControllerFailure::Credentials)?;
+        if let (Some(backend), Some(owner)) = (backend, original) {
+            match tokio::time::timeout(self.operation_timeout, backend.logout(owner.clone())).await {
+                Ok(Ok(())) => { released = true; },
+                Ok(Err(reason)) => { backend.retire(&owner); failure.get_or_insert(ControllerFailure::Backend(reason)); }
+                Err(_) => { backend.retire(&owner); failure.get_or_insert(ControllerFailure::Timeout); }
+            }
+        }
+        if released { self.backend_owner = None; }
+        if let Err(reason) = self.session.clear() { failure.get_or_insert(ControllerFailure::Credentials(reason)); }
         failure.map_or(Ok(()), Err)
     }
 
@@ -185,6 +210,10 @@ impl HostingController {
     pub fn incoming_call_ready(&self) -> bool { self.session.incoming_call_ready() }
     pub fn incoming_message_ready(&self) -> bool { self.session.incoming_message_ready() }
     pub fn outbound_authorized(&self) -> bool { self.session.outbound_authorized() }
+}
+
+impl Drop for HostingController {
+    fn drop(&mut self) { self.retire_backend(); }
 }
 
 #[cfg(test)]

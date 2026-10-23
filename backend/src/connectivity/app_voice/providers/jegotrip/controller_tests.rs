@@ -53,6 +53,96 @@ async fn hosted(controller: &mut HostingController) -> AttemptOwner {
     owner
 }
 
+struct OriginalOwnerBackend {
+    owner: Mutex<Option<AttemptOwner>>,
+    operations: Mutex<Vec<(i32,AttemptOwner)>>,
+    fail_logout: std::sync::atomic::AtomicBool,
+    blocked_login: bool,
+}
+impl OriginalOwnerBackend {
+    fn new(blocked_login:bool)->Arc<Self> { Arc::new(Self { owner:Mutex::new(None),operations:Mutex::new(Vec::new()),
+        fail_logout:std::sync::atomic::AtomicBool::new(false),blocked_login }) }
+}
+impl HostingBackend for OriginalOwnerBackend {
+    fn login<'a>(&'a self, owner:AttemptOwner, _:SdkLoginRequest<'a>)->BackendFuture<'a> {
+        *self.owner.lock().unwrap()=Some(owner.clone());self.operations.lock().unwrap().push((1,owner));
+        Box::pin(async move { if self.blocked_login { std::future::pending::<()>().await; } Ok(()) })
+    }
+    fn update_status<'a>(&'a self,owner:AttemptOwner,status:i32,_:GatewayRegistration<'a>)->BackendFuture<'a> {
+        Box::pin(async move {
+            if self.owner.lock().unwrap().as_ref()!=Some(&owner) { return Err(BackendFailure::Disconnected); }
+            self.operations.lock().unwrap().push((status,owner));Ok(())
+        })
+    }
+    fn retire(&self,owner:&AttemptOwner) {
+        assert_eq!(self.owner.lock().unwrap().as_ref(),Some(owner),"only original backend may retire");
+        self.operations.lock().unwrap().push((-1,owner.clone()));
+    }
+    fn logout(&self,owner:AttemptOwner)->BackendFuture<'_> {
+        Box::pin(async move {
+            if self.owner.lock().unwrap().as_ref()!=Some(&owner) { return Err(BackendFailure::Disconnected); }
+            self.operations.lock().unwrap().push((0,owner));
+            if self.fail_logout.load(std::sync::atomic::Ordering::Acquire) { Err(BackendFailure::Disconnected) }
+            else { *self.owner.lock().unwrap()=None;Ok(()) }
+        })
+    }
+}
+
+#[tokio::test]
+async fn teardown_keeps_original_transport_owner_after_callback_generation_is_retired() {
+    let backend=OriginalOwnerBackend::new(false);let mut controller=HostingController::new("line-a".into(),Some(backend.clone()));
+    let original=hosted(&mut controller).await;controller.stop().await.unwrap();
+    let calls=backend.operations.lock().unwrap();assert!(calls.iter().any(|(op,owner)| *op==STATUS_UNREGISTER && owner==&original));
+    assert!(calls.iter().any(|(op,owner)| *op==0 && owner==&original));
+    assert_ne!(controller.session.current_owner(),original);assert!(controller.backend_owner.is_none());
+}
+
+#[tokio::test]
+async fn authentication_failure_and_expiry_retire_original_io_and_cleanup_without_unconfigured_unregister() {
+    for expire in [false,true] {
+        let backend=OriginalOwnerBackend::new(false);let mut controller=HostingController::new("line-a".into(),Some(backend.clone()));
+        controller.import(imported(),100).unwrap();let owner=controller.start(100).await.unwrap();
+        if expire { controller.tick(200,Instant::now()); } else { controller.on_callback(&owner,Callback::SdkLogin{success:false},100).await.unwrap(); }
+        assert!(backend.operations.lock().unwrap().iter().any(|(op,o)| *op==-1 && o==&owner));
+        controller.stop().await.unwrap();let calls=backend.operations.lock().unwrap();
+        assert!(!calls.iter().any(|(op,_)| *op==STATUS_UNREGISTER));assert!(calls.iter().any(|(op,o)| *op==0 && o==&owner));
+    }
+}
+
+#[tokio::test]
+async fn failed_logout_retains_original_backend_owner_until_retry_confirmed_then_allows_reimport() {
+    let backend=OriginalOwnerBackend::new(false);let mut controller=HostingController::new("line-a".into(),Some(backend.clone()));
+    let owner=hosted(&mut controller).await;backend.fail_logout.store(true,std::sync::atomic::Ordering::Release);
+    assert!(controller.stop().await.is_err());assert_eq!(controller.phase(),Phase::Unconfigured);assert_eq!(controller.backend_owner.as_ref(),Some(&owner));
+    assert!(controller.import(imported(),100).is_err());
+    backend.fail_logout.store(false,std::sync::atomic::Ordering::Release);controller.stop().await.unwrap();
+    assert!(controller.backend_owner.is_none());controller.import(imported(),100).unwrap();
+    assert_eq!(backend.operations.lock().unwrap().iter().filter(|(op,_)| *op==STATUS_UNREGISTER).count(),1,"retry must not replay unregistration");
+}
+
+#[tokio::test]
+async fn cancelled_login_submission_wait_retains_bounded_deadline_and_original_cleanup_owner() {
+    let backend=OriginalOwnerBackend::new(true);let mut controller=HostingController::new("line-a".into(),Some(backend.clone()));controller.import(imported(),100).unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(5),controller.start(100)).await.is_err());
+    let owner=controller.backend_owner.clone().unwrap();assert!(controller.pending_deadline.is_some());
+    controller.tick(100,Instant::now()+Duration::from_secs(31));assert_eq!(controller.phase(),Phase::Disconnected);
+    assert!(backend.operations.lock().unwrap().iter().any(|(op,o)| *op==-1 && o==&owner));
+    controller.stop().await.unwrap();assert!(controller.backend_owner.is_none());
+}
+
+#[tokio::test]
+async fn dropping_controller_retires_original_command_scope_without_inventing_unregister_ack() {
+    let backend=OriginalOwnerBackend::new(false);let mut controller=HostingController::new("line-a".into(),Some(backend.clone()));
+    controller.import(imported(),100).unwrap();let owner=controller.start(100).await.unwrap();drop(controller);
+    let calls=backend.operations.lock().unwrap();assert!(calls.iter().any(|(op,o)| *op==-1 && o==&owner));assert!(!calls.iter().any(|(op,_)| *op==STATUS_UNREGISTER));
+}
+
+#[tokio::test]
+async fn credentials_without_started_backend_do_not_submit_unregistration_or_logout() {
+    let backend=OriginalOwnerBackend::new(false);let mut controller=HostingController::new("line-a".into(),Some(backend.clone()));controller.import(imported(),100).unwrap();
+    controller.stop().await.unwrap();assert!(backend.operations.lock().unwrap().is_empty());assert_eq!(controller.phase(),Phase::Unconfigured);
+}
+
 #[tokio::test]
 async fn native_message_requires_hosting_channel_and_rejects_old_owner_after_stop() {
     let backend = MockBackend::new(false);

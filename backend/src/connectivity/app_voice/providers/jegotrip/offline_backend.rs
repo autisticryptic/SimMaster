@@ -5,7 +5,7 @@
 //! provider registration or message/call readiness is supplied by this engine.
 use super::{
     arc_protocol::{ArcProtocol, IncomingProtocolMessage, OwnedCallPackets, ProtocolError, ProtocolEvent},
-    arc_session::{ArcLoginInputs, ArcPhase, ArcReply, OwnedBootstrapReply},
+    arc_session::{ArcLoginInputs, ArcPhase, ArcReply, OwnedBootstrapReply, OwnedLogoutReply},
     batch_scheduler::{BatchScheduler, ServerRequestTicket},
     native_events::IncomingMessage,
     rpc_incoming::{encode_online_message_result, IncomingBinding, IncomingDispatcher},
@@ -31,6 +31,7 @@ impl fmt::Debug for ScheduledIncomingMessage {
 
 pub enum OfflineEvent {
     Bootstrap(OwnedBootstrapReply),
+    Logout(OwnedLogoutReply),
     Callback(OwnedRpcCallback),
     Message(ScheduledIncomingMessage),
     DirectMessage(IncomingProtocolMessage),
@@ -89,6 +90,7 @@ impl OfflineBackend {
     }
     pub fn prepare_login(&mut self, inputs: ArcLoginInputs<'_>, routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_login(inputs, routing) }
+    pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_logout(routing) }
     pub fn prepare_bootstrap(&mut self, key: &[u8], routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_bootstrap(key, routing) }
 
@@ -186,6 +188,7 @@ impl OfflineBackend {
                         }
                     }
                 }
+                ProtocolEvent::Reply(ArcReply::Logout(reply)) => events.push(OfflineEvent::Logout(reply)),
                 ProtocolEvent::Reply(ArcReply::Bootstrap(configuration)) => events.push(OfflineEvent::Bootstrap(configuration)),
                 ProtocolEvent::Control(kind) => events.push(OfflineEvent::Control(kind)),
                 ProtocolEvent::Incoming(message) => events.push(OfflineEvent::DirectMessage(message)),

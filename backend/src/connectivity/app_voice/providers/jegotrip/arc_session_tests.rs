@@ -44,6 +44,46 @@ fn authenticated() -> (ArcRpcSession, AttemptOwner, RpcConnectionScope) {
 }
 
 #[test]
+fn original_logout_uses_returned_user_selected_id_and_auth_token_without_credential_rebinding() {
+    let (mut rpc,owner,scope)=authenticated();let (id,bytes)=rpc.prepare_logout(&[RpcProperty{key:b"id",value:b"#original-account"}]).unwrap();
+    let request=decode_request(bytes.expose_to_transport()).unwrap();assert_eq!(request.method,LOGOUT_SESSION_METHOD.as_bytes());
+    assert_eq!(request.metadata.iter().find(|p|p.key==b"token").unwrap().value,b"fixture-returned-auth-token");assert!(!request.metadata.iter().any(|p|p.key==b"pwd"));
+    let mut reader=Reader::versioned(request.arguments).unwrap();assert_eq!(reader.bytes().unwrap(),b"fixture-returned-user");
+    assert_eq!(reader.bytes().unwrap(),b"fixture-selected-session");reader.finish().unwrap();assert_eq!(rpc.phase(),ArcPhase::LogoutPending);
+    let receipt=match rpc.on_reply(&owner,&scope,&reply(id,b"\0\x01\0\0\0\0")).unwrap().unwrap() { ArcReply::Logout(receipt)=>receipt,_=>panic!("logout result") };
+    assert!(receipt.matches(&owner,&scope));assert!(receipt.accepted());assert_eq!(receipt.call_id(),id);assert_eq!(rpc.phase(),ArcPhase::LoggedOut);
+    assert!(rpc.authentication.is_none());assert!(rpc.prepare_logout(&[]).is_err());assert!(!format!("{receipt:?}").contains("fixture"));
+}
+
+#[test]
+fn invalid_logout_does_not_retire_original_pending_swap_but_valid_logout_does() {
+    let (mut rpc,owner,scope)=authenticated();let payload=BatchPayload{fields:[0;6],requests:BTreeMap::new(),results:BTreeMap::new()};
+    let (swap,_) = rpc.prepare_swap_calls(&payload,&[]).unwrap();assert!(rpc.prepare_logout(&[RpcProperty{key:b"token",value:b"foreign"}]).is_err());
+    assert!(rpc.is_pending(swap));assert_eq!(rpc.phase(),ArcPhase::Authenticated);
+    let (logout,_) = rpc.prepare_logout(&[]).unwrap();assert!(!rpc.is_pending(swap));assert!(rpc.is_pending(logout));
+    assert!(rpc.on_reply(&owner,&scope,&reply(swap,b"bad old swap")).unwrap().is_none());assert_eq!(rpc.phase(),ArcPhase::LogoutPending);
+}
+
+#[test]
+fn logout_requires_authenticated_original_scope_and_unknown_stale_replies_cannot_complete_it() {
+    let mut initial=ArcRpcSession::new(owner());assert!(initial.prepare_logout(&[]).is_err());
+    let (mut rpc,original,scope)=authenticated();let (id,_) = rpc.prepare_logout(&[]).unwrap();
+    assert!(rpc.on_reply(&owner(),&scope,b"bad").unwrap().is_none());
+    assert!(rpc.on_reply(&original,&RpcConnectionScope::fresh(),b"bad").unwrap().is_none());
+    assert!(rpc.on_reply(&original,&scope,&reply(id+1,b"\0\x01\0\0\0\0")).unwrap().is_none());assert_eq!(rpc.phase(),ArcPhase::LogoutPending);
+    rpc.retire_request(id);assert_eq!(rpc.phase(),ArcPhase::Closed);assert!(!scope.is_open());
+}
+
+#[test]
+fn false_logout_result_is_not_a_success_receipt_and_malformed_logout_is_terminal() {
+    let (mut rpc,owner,scope)=authenticated();let (id,_) = rpc.prepare_logout(&[]).unwrap();
+    let receipt=match rpc.on_reply(&owner,&scope,&reply(id,b"\0\0\0\0\0\0")).unwrap().unwrap() { ArcReply::Logout(receipt)=>receipt,_=>panic!("logout") };
+    assert!(!receipt.accepted());assert_eq!(rpc.phase(),ArcPhase::LoggedOut);assert!(rpc.authentication.is_none());
+    let (mut rpc,owner,scope)=authenticated();let (id,_) = rpc.prepare_logout(&[]).unwrap();
+    assert!(matches!(rpc.on_reply(&owner,&scope,&reply(id,b"\0\x01\0")).unwrap(),Some(ArcReply::Failure(_))));assert_eq!(rpc.phase(),ArcPhase::Closed);
+}
+
+#[test]
 fn login_keeps_password_selected_session_and_returned_token_in_distinct_layers() {
     let owner = owner(); let mut rpc = ArcRpcSession::new(owner.clone()); let scope = rpc.connection_scope();
     let routing = [RpcProperty { key: b"id", value: b"#fixture" }, RpcProperty { key: b"__magic", value: &[0, 0xff] }];

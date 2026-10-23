@@ -52,7 +52,14 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('backend.login(owner.clone(), request)', source)
         self.assertIn('backend.update_status(owner.clone(), STATUS_REGISTER, request)', source)
         self.assertIn('backend.update_status(owner.clone(), STATUS_UNREGISTER, request)', source)
-        self.assertIn('backend.logout(owner)', source)
+        self.assertIn('backend.logout(owner.clone())', source)
+        self.assertIn('backend_owner: Option<AttemptOwner>', source)
+        self.assertIn('let original = self.backend_owner.clone()', source)
+        self.assertIn('if released { self.backend_owner = None; }', source)
+        self.assertIn('backend.retire(&owner)', source)
+        session = (MOD / 'session.rs').read_text(encoding='utf-8')
+        teardown = session.split('pub fn begin_unhosting', 1)[1].split('pub fn current_owner', 1)[0]
+        self.assertLess(teardown.index('self.current_owner()'), teardown.index('self.next_owner()?'))
         self.assertIn('tokio::time::timeout', source)
         for name in ['beta-validation.yml', 'build-release.yml']:
             self.assertIn('connectivity::app_voice::providers::jegotrip::controller::tests',
@@ -463,6 +470,28 @@ class JegotripContract(unittest.TestCase):
             for name in ['beta-validation.yml', 'build-release.yml']:
                 self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests',
                               (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_original_logout_is_native_semantic_completion_not_submission_or_new_owner(self):
+        source = (MOD / 'rpc_logout.rs').read_text(encoding='utf-8')
+        self.assertIn('logoutSession.AccountEntry.Account', source)
+        self.assertIn('writer.bytes(user_id)', source)
+        self.assertIn('writer.bytes(selected_session_id)', source)
+        self.assertIn('read_footer(&mut reader)', source)
+        arc = (MOD / 'arc_session.rs').read_text(encoding='utf-8')
+        self.assertIn('LogoutPending', arc)
+        self.assertIn('OwnedLogoutReply', arc)
+        self.assertIn('self.authentication = None; self.phase = ArcPhase::LoggedOut', arc)
+        actor = (MOD / 'transport_actor.rs').read_text(encoding='utf-8')
+        self.assertIn('RuntimeCommands', actor)
+        self.assertIn('LogoutRetirement', actor)
+        self.assertIn('reply.call_id() == pending.id && reply.accepted()', actor)
+        self.assertIn('RuntimeError::LoggedOut', actor)
+        self.assertIn('let receipt = self.close().await', actor)
+        for secret in ['Property', 'Login', 'Binding', 'Gateway']:
+            self.assertIn(f'impl Drop for {secret}', actor)
+        for name in ['beta-validation.yml', 'build-release.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::rpc_logout::tests',
+                          (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
 
     def test_native_notifications_require_local_operation_and_stale_scope_checks(self):
         events = (MOD / 'native_events.rs').read_text(encoding='utf-8')

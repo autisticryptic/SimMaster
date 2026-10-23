@@ -21,6 +21,7 @@ pub mod rpc_bootstrap;
 pub mod rpc_envelope;
 pub mod rpc_incoming;
 pub mod rpc_login;
+pub mod rpc_logout;
 pub mod rpc_pending;
 pub mod rpc_stream;
 pub mod session;
