@@ -1,6 +1,7 @@
 //! User-supplied credentials; account-login UI and server authorization differ.
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use zeroize::Zeroize;
 
 /// Never formatted as cleartext, even in validation diagnostics.
 #[derive(Clone, Deserialize)]
@@ -10,6 +11,8 @@ pub struct Secret(String);
 impl Secret {
     pub fn expose_to_backend(&self) -> &str { &self.0 }
 }
+
+impl Drop for Secret { fn drop(&mut self) { self.0.zeroize(); } }
 
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("<redacted>") }
@@ -29,6 +32,10 @@ pub struct SdkCredentials {
     /// values remain absent; only a future native/wire backend needs this stage.
     pub selected_session_id: Option<Secret>,
     pub root_der_base64: Secret,
+    /// Legacy configuration unwrap only. Client-property and reference keys
+    /// are independent optional imports, never pwd/token/SipPwd substitutes.
+    pub client_config_decode_key: Option<Secret>,
+    pub reference_decode_key: Option<Secret>,
     pub tls_only: bool,
     /// Unknown expiry stays unknown; it must not be reported as permanent.
     pub expires_at_unix_seconds: Option<u64>,
@@ -79,6 +86,12 @@ impl ImportedCredentials {
             || self.hosting.delete_int_code.len() > 32
             || self.hosting.delete_int_code.chars().any(char::is_control)
         { return Err("jegotrip_gateway_policy_invalid"); }
+        for key in [&self.sdk.client_config_decode_key, &self.sdk.reference_decode_key].into_iter().flatten() {
+            let value = key.expose_to_backend();
+            if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
+                return Err("jegotrip_config_decode_key_invalid");
+            }
+        }
         if !self.sdk.tls_only { return Err("jegotrip_tls_required"); }
         if !self.hosting.enrollment_confirmed { return Err("jegotrip_hosting_enrollment_required"); }
         if self.sdk.expires_at_unix_seconds.is_some_and(|at| at <= now_unix_seconds) {
@@ -127,6 +140,8 @@ pub fn contract() -> CredentialContract {
             ParameterContract { field: "sdk.selected_session_id (optional)", source: "Mtc_CliApplySessId / verified SDK session configuration", purpose: "Login/swap method session selector, distinct from phone token and returned ARC metadata token; no invented default", secret: true },
             ParameterContract { field: "sdk.expires_at_unix_seconds (optional)", source: "Verified token expiry, if known", purpose: "Unknown expiry must remain unknown", secret: false },
             ParameterContract { field: "sdk.root_der_base64", source: "config_key_root_der", purpose: "Deployment TLS trust", secret: true },
+            ParameterContract { field: "sdk.client_config_decode_key (optional)", source: "Original Client PBE configuration context", purpose: "Unwrap Client property ENC values only; no built-in default, not account authentication", secret: true },
+            ParameterContract { field: "sdk.reference_decode_key (optional)", source: "Original Common reference PBE context", purpose: "Unwrap reference ENC values only; distinct from Client key/pwd/token/SipPwd and no trust proof", secret: true },
             ParameterContract { field: "sdk.tls_only", source: "config_key_use_tls_only", purpose: "TLS required", secret: false },
             ParameterContract { field: "hosting.sip_number", source: "SipNumber / getAreaCodeMobileNum", purpose: "Hosted number", secret: true },
             ParameterContract { field: "hosting.sip_password", source: "voip_status.sipPassword after decryptThreeDESECB; legacy callAccountSipPassword requires format check", purpose: "SipPwd gateway credential, distinct from SDK token", secret: true },

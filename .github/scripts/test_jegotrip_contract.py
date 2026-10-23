@@ -353,6 +353,76 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('count > frame.len() - offset', actor)
         self.assertIn('RuntimeError::Cancelled', actor)
 
+    def test_legacy_config_unwrap_requires_explicit_context_and_does_not_weaken_tls(self):
+        source = (MOD / 'legacy_config.rs').read_text(encoding='utf-8')
+        self.assertIn('pub fn supplied(bytes: &[u8])', source)
+        self.assertIn('for _ in 0..999', source)
+        self.assertIn('md5::compute(&material[..])', source)
+        self.assertIn('raw.len() < 16 || raw.len() % 8 != 0', source)
+        self.assertIn('decrypt_padded_mut::<Pkcs7>', source)
+        self.assertIn('Zeroizing', source)
+        self.assertIn('key.ok_or(ConfigError::KeyRequired)', source)
+        self.assertIn('ConfigError::MultipleEnvelopes', source)
+        self.assertIn('WEAK_KEYS.iter().any', source)
+        self.assertNotIn('derive(Serialize)', source)
+        self.assertNotIn('pub const PASSWORD', source)
+        self.assertNotIn('root_der', source)
+        for source_file in ['tls_engine.rs', 'session.rs', 'transport_packets.rs']:
+            self.assertNotIn('des::', (MOD / source_file).read_text(encoding='utf-8'))
+        cargo = (ROOT / 'backend/Cargo.toml').read_text(encoding='utf-8')
+        self.assertIn('des = { version = "0.8.1", features = ["zeroize"] }', cargo)
+
+    def test_reference_and_deployment_are_bounded_data_not_guessed_transport_authorities(self):
+        source = (MOD / 'object_reference.rs').read_text(encoding='utf-8')
+        self.assertIn('ReferenceTarget::Adapter', source)
+        self.assertIn('ReferenceTarget::Direct', source)
+        self.assertIn('bytes.split(|&b| b == b\';\').peekable()', source)
+        self.assertIn('e.scheme == b"tcp"', source)
+        self.assertIn('NoDirectEndpoints', source)
+        self.assertIn('fn adapter_target', source)
+        self.assertIn("b'$' if groups.is_empty()", source)
+        self.assertIn('impl Drop for ObjectReference', source)
+        self.assertIn('impl Drop for ReferenceTarget', source)
+        self.assertIn('impl Drop for ReferenceEndpoint', source)
+        self.assertIn('self.identity.zeroize()', source)
+        self.assertIn('MAX_ENDPOINTS', source)
+        self.assertIn('MAX_COMPONENTS', source)
+        self.assertIn('MAX_GROUP_DEPTH', source)
+        plan = (MOD / 'deployment.rs').read_text(encoding='utf-8')
+        body = plan.split('pub fn from_reply', 1)[1]
+        self.assertLess(body.index('reply.material_for(owner, scope)'), body.index('decode_configuration(material.account_entry'))
+        for forbidden in ['TcpStream', 'connect(', 'with_root_certificates', 'Callback::', 'lookup_ip', 'derive(Serialize)']:
+            self.assertNotIn(forbidden, source + plan)
+        for module in ['legacy_config', 'object_reference', 'deployment']:
+            self.assertIn(f'pub mod {module};', (MOD / 'mod.rs').read_text(encoding='utf-8'))
+            for name in ['beta-validation.yml', 'build-release.yml']:
+                self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests',
+                              (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_bootstrap_delivery_has_original_provenance_and_actor_does_not_grant_sdk_success(self):
+        arc = (MOD / 'arc_session.rs').read_text(encoding='utf-8')
+        self.assertIn('pub struct OwnedBootstrapReply', arc)
+        self.assertIn('impl Drop for OwnedBootstrapReply', arc)
+        self.assertIn('self.account_entry.zeroize()', arc)
+        self.assertIn('Bootstrap(OwnedBootstrapReply)', arc)
+        self.assertIn('!self.connection.matches(scope) || !self.connection.is_open()', arc)
+        self.assertIn('call_id: reply.call_id', arc)
+        self.assertNotIn('Bootstrap(AppConfigsResult', arc)
+        engine = (MOD / 'offline_backend.rs').read_text(encoding='utf-8')
+        self.assertIn('events.push(OfflineEvent::Bootstrap(configuration))', engine)
+        actor = (MOD / 'transport_actor.rs').read_text(encoding='utf-8')
+        self.assertIn('pub async fn bootstrap(', actor)
+        self.assertIn('Operation::Bootstrap(key, routing) => self.backend.prepare_bootstrap', actor)
+        self.assertNotIn('Callback::SdkLogin { success: true }', actor)
+        credentials = (MOD / 'credentials.rs').read_text(encoding='utf-8')
+        self.assertIn('pub client_config_decode_key: Option<Secret>', credentials)
+        self.assertIn('pub reference_decode_key: Option<Secret>', credentials)
+        self.assertIn('jegotrip_config_decode_key_invalid', credentials)
+        self.assertIn('impl Drop for Secret', credentials)
+        plan = (MOD / 'deployment.rs').read_text(encoding='utf-8')
+        self.assertIn('impl Drop for BootstrapDeployment', plan)
+        self.assertIn('value.zeroize()', plan)
+
     def test_native_notifications_require_local_operation_and_stale_scope_checks(self):
         events = (MOD / 'native_events.rs').read_text(encoding='utf-8')
         controller = (MOD / 'controller.rs').read_text(encoding='utf-8')

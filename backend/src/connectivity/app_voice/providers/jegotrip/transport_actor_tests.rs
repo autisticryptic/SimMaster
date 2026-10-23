@@ -283,6 +283,50 @@ async fn real_duplex_batch_ack_is_not_hosting_success_and_original_message_compl
 }
 
 #[tokio::test]
+async fn actor_bootstrap_result_is_original_owned_configuration_not_login_or_transport_authorization() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let original = owner(); let (client, server) = tokio::io::duplex(65_536);
+    let (mut runtime, mut events) = start(client, original.clone(), PacketRoute::DirectTlsCarrier, parameters(&cert.root), policy(), None).unwrap(); let scope = runtime.connection_scope();
+    let mut peer = Peer { io: server, server: cert.server(&rustls::version::TLS13), network: PacketStreamDecoder::default(),
+        plaintext: super::super::tls_plaintext::PlaintextPacketDecoder::default(), assembler: CallAssembler::default(), received: std::collections::VecDeque::new() };
+    let password = b"fixture-reference-context";
+    let entry = super::super::legacy_config::tests::fixture_envelope(b"#fixture-account:tcp -h fixture.invalid -p 443;", password, [3; 8]);
+    let received = tokio::spawn(async move {
+        let message = peer.receive().await.unwrap(); let request = decode_request(message.payload.expose_to_transport()).unwrap();
+        assert_eq!(request.method, super::super::rpc_bootstrap::GET_APP_CONFIGS_METHOD.as_bytes());
+        assert!(!request.metadata.iter().any(|p| p.key == b"pwd" || p.key == b"token"));
+        let mut r = super::super::rpc_stream::Reader::versioned(request.arguments).unwrap(); assert_eq!(r.bytes().unwrap(), b"fixture-bootstrap-key"); r.finish().unwrap();
+        let mut result = Writer::new(); result.boolean(true).unwrap(); result.properties(&[RpcProperty { key: b"DomainName", value: b"fixture.invalid" }]).unwrap();
+        for value in [entry.as_slice(), b"", b"", b""] { result.bytes(value).unwrap(); } let result = result.finish();
+        peer.send_reply(request.call_id, result.expose_to_transport()).await;
+        let message = peer.receive().await.unwrap(); let request = decode_request(message.payload.expose_to_transport()).unwrap();
+        assert_eq!(request.method, super::super::rpc_login::LOGIN_SESSION_METHOD.as_bytes());
+        peer.send_reply(request.call_id, &login_result()).await;
+        while peer.io.read(&mut [0; 1024]).await.unwrap() != 0 {}
+    });
+    let receipt = tokio::time::timeout(Duration::from_secs(2), async { loop {
+        match runtime.bootstrap(&original, &scope, b"fixture-bootstrap-key", &[]).await {
+            Ok(receipt) => break receipt,
+            Err(RuntimeError::Tls(TlsError::NotReady)) => tokio::time::sleep(Duration::from_millis(5)).await,
+            Err(error) => panic!("bootstrap submission {error:?}"),
+        }
+    }}).await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap();
+    let result = match event.into_events(&original, &scope).unwrap().into_iter().next().unwrap() {
+        OfflineEvent::Bootstrap(result) => result, _ => panic!("configuration, not callback, required"),
+    };
+    assert_eq!(result.call_id(), receipt.call_id.unwrap());
+    let key = super::super::legacy_config::ConfigDecodeKey::supplied(password).unwrap();
+    let deployment = super::super::deployment::BootstrapDeployment::from_reply(&result, &original, &scope, Some(&key)).unwrap();
+    assert_eq!(deployment.raw_tcp_candidates_for(&original, &scope).unwrap()[0].host(), b"fixture.invalid");
+    assert!(deployment.property_for(&original, &scope, b"missing", None).unwrap().is_none());
+    assert!(super::super::deployment::BootstrapDeployment::from_reply(&result, &original, &RpcConnectionScope::fresh(), Some(&key)).is_err());
+    runtime.login(&original, &scope, login(), &[]).await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap();
+    assert!(matches!(&event.events_for(&original, &scope).unwrap()[0], OfflineEvent::Callback(c) if c.callback == (Callback::SdkLogin { success: true })));
+    assert!(runtime.close().await.io_released()); received.await.unwrap(); assert!(deployment.account_reference_for(&original, &scope).is_none());
+}
+
+#[tokio::test]
 async fn real_duplex_tls_actor_login_keeps_transport_receipt_and_owned_sdk_callback_distinct() {
     let cert = Certificates::generate("DNS:fixture.invalid"); let original = owner(); let (client, server) = tokio::io::duplex(65_536);
     let (mut runtime, mut events) = start(client, original.clone(), PacketRoute::DirectTlsCarrier, parameters(&cert.root), policy(), None).unwrap(); let scope = runtime.connection_scope();

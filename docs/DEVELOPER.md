@@ -5,7 +5,7 @@
 
 ## 1. 分支与编译约束
 
-- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests,rpc_bootstrap::tests,arc_session::tests,transport_packets::tests,arc_protocol::tests,batch_scheduler::tests,rpc_incoming::tests,offline_backend::tests,packet_stream::tests,router_packets::tests,packet_transport::tests,tls_engine::tests,tls_plaintext::tests,transport_actor::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests,rpc_bootstrap::tests,arc_session::tests,transport_packets::tests,arc_protocol::tests,batch_scheduler::tests,rpc_incoming::tests,offline_backend::tests,packet_stream::tests,router_packets::tests,packet_transport::tests,tls_engine::tests,tls_plaintext::tests,transport_actor::tests,legacy_config::tests,object_reference::tests,deployment::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - 日常仅维护`master`，GitHub远端为`autisticryptic/SimMaster`（本地remote通常为`simmaster`）。
 - 不为每次验证长期留下分支。确需临时分支时，合并并确认提交已保留、CI通过后删除。
@@ -197,6 +197,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 | `sdk.root_der_base64` / `sdk.tls_only` | `config_key_root_der` / `config_key_use_tls_only` | 匹配部署信任与 TLS 策略 |
 | `sdk.device_id`（如已配置） | `config_key_device_id` | 保留原配置，设备绑定语义待验证 |
 | `sdk.selected_session_id`（如已配置） | `Mtc_CliApplySessId` / 原SDK会话配置 | login/swap方法第二串；不是phone token或返回ARC auth token，≤127字节，缺失不编造默认值 |
+| `sdk.client_config_decode_key` / `sdk.reference_decode_key`（可选） | 原Client属性PBE配置 / 原Common对象引用PBE上下文 | 仅ENC配置unwrap，二者不合并/不当pwd/token/SipPwd或auth证明，缺失保持缺失，不复制内置值 |
 | `sdk.expires_at_unix_seconds`（若已知） | 后续确认的 token 到期信息 | 未知时留空，不虚构永久有效 |
 | `hosting.sip_number` | `SipNumber` / `getAreaCodeMobileNum` | 被托管号码 |
 | `hosting.sip_password` | `voip_status.sipPassword` 经 `decryptThreeDESECB` 后 | 网关 `SipPwd`，不能直接拿缓存密文替代 |
@@ -314,6 +315,16 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 - 新14actor tests用duplex+内存rustls核查真实login/原callback/hostingbatch+directbinarymessageconsumerreply、gate与close换poll/offset/poison/wake/cancel/DropGuard/IOrelease/queuepressure等。`cd0684e9a0e2c54203082f5050c1aefd328ea549`由Build39958776382/Beta39958776314/ARM64+AMD64成功，官方SHA ZIP精确各251模块回归＋4shared/retainedSIP及86矩阵核验，378Python/staticmock通过，Release skipped。报告`.local/jegotrip/verified-native-cd0684e.json`；Build12503962642 SHA256`b2c81e95d910f4b9c49203b4d1cf14852f3924e60a8699972512583bcde429f8` / Beta12503744444 SHA256`4e6bc26934f8b462d141ae3a68ee6a1e6313665c6bc1e0e8bc169a7ffeaaf3fe`，保留59compilewarnings/18Jegotrip节选；无本机Rust/target/openssl执行。
 - review辅助300s超时返回partial两项test编译缺口（共享fixture可见性、future借用temporaryarray），main均修复并独立补真实metadata/deadline/cancel/ticket语义；不是完整review。一次WSLBashE_UNEXPECTED未执行即失败，后继同cwd复试正常，无目标/设备操作；原证据`.local/jegotrip/actor-offline-evidence.md`。本步无需IDA。
 - 仍缺fullRouter/NetStream可靠控制/outoforder/MTU与ENC provisioning端点、provider/persistence/API/trunk/SMS可靠classification/callmedia/费用续期并发；transport_implemented=false/providerunsupported/outboundfalse不变。callerIOactor测试不能升级为真实Linux公网互通或完整托管可用。
+
+### 部署ENC与原会话bootstrap引用（已实现待Actions）
+
+- `legacy_config.rs`据native Pbe salt8||DESCBC+PKCS5/no-newlineBase64，MD5(password||salt)再999digest轮，first8oddDESkey/last8IV。仅配置legacyunwrap，非TLS/SIP密码算法/授权；两个contextkey显式输入，无builtin/password替代。Malformed/oversize/notmultiple8/重复嵌套/wrongpadding失败，不复制native弱key -2未检查unsafe分支或静默cipherfallback。CBC无MAC，wrongkey可以偶然通过pad，不能凭decode成功信任引用/账号。
+- RustCrypto des0.8.1只该codec使用，包官方checksum`ffdd80ce8ce993de27e9f063a444a4d53ce8e8db4c1f00cc03af5ad5a9867a1e`经archive与registry比对；existingcipher0.4.4启zeroize/锁已有zeroize1.9直接使用。手工lock由metadata核验，真正--locked编译仅Actions。不增加OpenSSL生产链接或弱TLScipher，密钥/digest/raw/解码buffer、ownedreference/bootstrap/plan/Secret/auth与pendingselector均drop-timezeroize。
+- `object_reference.rs`recoverfacet slash identity、@adapter$locator或:semicolon endpoint/explicit -h/-p。Groups []/{} /<>、boundeddepth，grouped$只在外层split/两field校验，未知native groupedlocator runtime不宣称等价；quote/backslash/hiddencontrol/proxy/range/hb/z/substitution默认不猜。地址支持原DNS/IP字面值，parse_scheme保留但仅rawtcp兼容当前innerTLS PacketSender；tls/udp/http/tlsp/svarc未降级。未安装root/替authority/dial。
+- `OwnedBootstrapReply`只能matched getAppConfigs originalpendingid/owner/scope+zero/true/footer成功构造；裸AppConfigs codec不能伪造cap。properties/AccountEntry/Alive/User/footer私有copy/Debugredacted/Dropwipe，material_for oldscope拒绝；snapshot不被scopeclose物理撤销。OfflineBackend转交Bootstrap配置event；actor新增explicit bootstrap命令在TLSverified后实际提交，receipt非login ACK，未知字段不授channel。
+- `deployment.rs`先原scope再decodeAccountEntry(Common key context)，parse候选；Client属性按需另key decode，missing留空；原Alive/User引用独立非deliveryready。候选是数据，后续真实connector还需原importedendpoint/authority/root/provision binding，不从plaintext成功替换当前IO。两optional Secret字段兼容旧imports，≤4096bytes/不empty/control、不注册可用provider。
+- 新9PBE/12reference/8deployment＋1actorbootstrap=281 Rust仅源码清单＋4shared/retainedSIP待两Actions/双架构/官方SHA。381Pythonstaticmock通过；Actions only独立OpenSSL DES-CBC oracle/公开NIST块和固定MD5KDFfixture、deterministicinterior-padding/pad0/pad9、真实内存TLS bootstrap→privateconfig→explicitlogin回归，不执行APK库/设备服务。本步ELF/FDE足够，无需用户IDA。
+- Read-only review辅助partial后provider ratelimit，3findings已main修（group$拆成未闭合fields、retainedownedcopieswipe、padding负例不足），不计fullreview/compilepass。InitialstaticFDE absent脚本失败改boundeddecode，批处理timeout只留partialfile非验证；证据`.local/jegotrip/deployment-offline-evidence.md`。fullRouterNetStream/provision/rsaAuth/endpointtrustconnector/providerpersistAPI/SMSclass/trunk/callmedia/费用续期并发仍未完成，unsupported/outboundfalse。
 
 ### 5. 下一阶段与验收条件
 

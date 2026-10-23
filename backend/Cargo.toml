@@ -32,6 +32,9 @@ num-bigint = "0.4"
 num-traits = "0.2"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
+# Legacy APK ENC configuration unwrap ONLY; never a TLS/SIP/auth fallback.
+des = { version = "0.8.1", features = ["zeroize"] }
+zeroize = "1.9"
 regex-automata = "0.4.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

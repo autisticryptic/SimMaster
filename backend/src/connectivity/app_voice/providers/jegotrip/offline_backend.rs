@@ -5,7 +5,7 @@
 //! provider registration or message/call readiness is supplied by this engine.
 use super::{
     arc_protocol::{ArcProtocol, IncomingProtocolMessage, OwnedCallPackets, ProtocolError, ProtocolEvent},
-    arc_session::{ArcLoginInputs, ArcPhase, ArcReply},
+    arc_session::{ArcLoginInputs, ArcPhase, ArcReply, OwnedBootstrapReply},
     batch_scheduler::{BatchScheduler, ServerRequestTicket},
     native_events::IncomingMessage,
     rpc_incoming::{encode_online_message_result, IncomingBinding, IncomingDispatcher},
@@ -30,6 +30,7 @@ impl fmt::Debug for ScheduledIncomingMessage {
 }
 
 pub enum OfflineEvent {
+    Bootstrap(OwnedBootstrapReply),
     Callback(OwnedRpcCallback),
     Message(ScheduledIncomingMessage),
     DirectMessage(IncomingProtocolMessage),
@@ -185,7 +186,7 @@ impl OfflineBackend {
                         }
                     }
                 }
-                ProtocolEvent::Reply(ArcReply::Bootstrap(_)) => {},
+                ProtocolEvent::Reply(ArcReply::Bootstrap(configuration)) => events.push(OfflineEvent::Bootstrap(configuration)),
                 ProtocolEvent::Control(kind) => events.push(OfflineEvent::Control(kind)),
                 ProtocolEvent::Incoming(message) => events.push(OfflineEvent::DirectMessage(message)),
                 ProtocolEvent::OutgoingReply(reply) => events.push(OfflineEvent::Outgoing(reply)),

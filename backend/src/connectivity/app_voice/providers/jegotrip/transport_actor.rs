@@ -116,7 +116,7 @@ impl Gateway {
 }
 
 enum Operation {
-    Login(Login, Vec<Property>), Configure(u32, Option<Binding>),
+    Login(Login, Vec<Property>), Bootstrap(Vec<u8>, Vec<Property>), Configure(u32, Option<Binding>),
     Swap(Vec<Property>, Option<Gateway>), CompleteBatch(ServerRequestTicket, bool), CompleteDirect(DirectReplyTicket, bool),
 }
 impl Operation {
@@ -125,6 +125,7 @@ impl Operation {
             Self::Login(login, routing) => [&login.identity, &login.domain, &login.selector, &login.phone, &login.key,
                 &login.domain_id, &login.application_id, &login.cc].iter().map(|v| v.len()).sum::<usize>()
                 + login.properties.iter().chain(routing).map(|p| p.key.len() + p.value.len()).sum::<usize>(),
+            Self::Bootstrap(key, routing) => key.len() + routing.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>(),
             Self::Configure(_, incoming) => incoming.as_ref().map_or(0, |b| b.object.len() + b.domain.len() + b.receiver.len()),
             Self::Swap(routing, gateway) => routing.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()
                 + gateway.as_ref().map_or(0, |g| g.uri.len() + g.prefix.len() + g.channel.len() + g.int_code.len() + g.number.len() + g.password.len()
@@ -196,6 +197,15 @@ impl RuntimeHandle {
         -> Result<RuntimeReceipt, RuntimeError> {
         if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
         self.submit(owner, scope, Operation::Login(Login::capture(inputs)?, Property::capture(routing)?)).await
+    }
+    pub async fn bootstrap(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, application_key: &[u8], routing: &[RpcProperty<'_>])
+        -> Result<RuntimeReceipt, RuntimeError> {
+        if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
+        if application_key.is_empty() || application_key.len() > super::rpc_stream::MAX_FIELD_BYTES
+            || application_key.iter().any(u8::is_ascii_control) || application_key.windows(4).any(|v| v == b"ENC(") {
+            return Err(RuntimeError::InvalidConfiguration);
+        }
+        self.submit(owner, scope, Operation::Bootstrap(application_key.to_vec(), Property::capture(routing)?)).await
     }
     pub async fn configure(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, incarnation: u32, incoming: Option<IncomingBinding<'_>>)
         -> Result<RuntimeReceipt, RuntimeError> {
@@ -332,7 +342,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if self.tls.phase() != TlsPhase::Verified {
             let _ = command.completion.send(Err(RuntimeError::Tls(TlsError::NotReady))); return Ok(());
         }
-        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Swap(_, _)) {
+        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
         let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _));
@@ -357,6 +367,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 Ok(Some(packets)) => Ok(packets),
                 _ => { let _ = command.completion.send(Err(RuntimeError::Protocol)); return Ok(()); }
             },
+            Operation::Bootstrap(key, routing) => self.backend.prepare_bootstrap(&key, &borrowed(&routing)),
             Operation::Login(login, routing) => {
                 let properties = borrowed(&login.properties); let routing = borrowed(&routing);
                 self.backend.prepare_login(login.inputs(&properties), &routing)

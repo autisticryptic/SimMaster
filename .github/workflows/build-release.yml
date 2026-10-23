@@ -394,6 +394,9 @@ jobs:
             connectivity::app_voice::providers::jegotrip::tls_plaintext::tests \
             connectivity::app_voice::providers::jegotrip::tls_engine::tests \
             connectivity::app_voice::providers::jegotrip::transport_actor::tests \
+            connectivity::app_voice::providers::jegotrip::legacy_config::tests \
+            connectivity::app_voice::providers::jegotrip::object_reference::tests \
+            connectivity::app_voice::providers::jegotrip::deployment::tests \
             connectivity::core::tls_identity::tests \
             connectivity::app_voice::registry::tests \
             connectivity::modems::ims::cellular_ims::live::tests::refresh \

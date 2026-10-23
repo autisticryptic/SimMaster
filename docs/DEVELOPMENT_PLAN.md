@@ -6,6 +6,8 @@
 
 ## 当前基线与工作规则
 
+- 当前部署/config/reference/ownedbootstrap子阶段已实现待Actions：salt8DES-CBC-PKCS5/1000MD5仅配置unwrap，explicitClient/Reference contextkey，不复制SDKdefaults/不作auth；原facet/id/adapter-locator/explicit -h/-p endpoint解析，私有原owner/scopebootstrap与actor配置event，不改TLStrust/不授ready。281sourceRust＋4old/sharedSIP待CI，381静态mock通过；partialreview3issues已修，dropwipe与确定padding负例，仍fullRouterNetStream/provision/可信endpoint/providerpersistAPI/SMSmedia费用并发未接通。无本机Rust/设备服务部署/当前IDA需求。
+
 - 原会话transport_actor已由cd0684e Build39958776382/Beta39958776314/双架构、官方SHA ZIP各251模块回归＋4sharedSIP/86矩阵验证，378静态mock通过，Release skipped：caller-provided AsyncIO单actor/共享pollgate+Notify、取消/部分write关闭丢IO、JoinHandle确认drain，精确原metadata/私有borrowed票据/真实RPCpendingdeadline，无dial/provider。251实际离线回归不是实网，不报真实托管；下一仍fullRouter/NetStream/ENC端点/persistenceproviderAPItrunk/SMSclasscallmedia/费用续期并发。
 
 - 当前可信TLS/明文流扩展已由784cd3c Build39937771208/Beta39937771426/双架构验证，官方SHA ZIP各237模块回归＋2sharedSAN/2原SIP及86矩阵核验，376静态/mock通过，Release skipped：显式importedroot/originalauthority/exactSAN、TLS1.2/1.3内存引擎/验证前无login，Common按self-delimiting envelope/canonical16382分片，不猜额外BE32或read边界；固定handshake/partial deadline/EOF、原ARC一次slot/private verified scope。已验证237 Jegotrip＋2sharedSAN及原SIP测试，不把绿灯替代实网。无socket/live actor/ENC provisioning/短信媒体/provider业务，尚不能标全部backend；这批不需要用户IDA。

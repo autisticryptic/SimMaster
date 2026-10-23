@@ -335,6 +335,7 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
+ "zeroize",
 ]
 
 [[package]]
@@ -476,6 +477,15 @@ name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
+name = "des"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffdd80ce8ce993de27e9f063a444a4d53ce8e8db4c1f00cc03af5ad5a9867a1e"
+dependencies = [
+ "cipher",
+]
 
 [[package]]
 name = "displaydoc"
@@ -1907,6 +1917,7 @@ dependencies = [
  "cbc",
  "chrono",
  "clap",
+ "des",
  "futures-util",
  "hickory-resolver",
  "lazy_static",
@@ -1933,6 +1944,7 @@ dependencies = [
  "webpki-roots",
  "yaml-edit",
  "zbus",
+ "zeroize",
  "zip",
 ]
 

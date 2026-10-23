@@ -14,11 +14,12 @@ use super::{
     rpc_envelope::{decode_reply, encode_request},
     rpc_login::{decode_login_session_result, encode_login_session, normalize_session_identity, LOGIN_SESSION_METHOD},
     rpc_pending::{HostingRpcTracker, OwnedRpcCallback, RpcConnectionScope},
-    rpc_stream::{CodecError, RpcBytes, RpcProperty, MAX_FIELD_BYTES, MAX_MAP_ENTRIES},
+    rpc_stream::{CodecError, RpcBytes, RpcFooter, RpcProperty, MAX_FIELD_BYTES, MAX_MAP_ENTRIES},
     session::{AttemptOwner, BackendFailure},
     transport_packets::TransportError,
 };
 use std::{collections::BTreeMap, fmt, sync::Arc};
+use zeroize::Zeroize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArcPhase { Initial, LoginPending, Authenticated, Closed }
@@ -43,12 +44,18 @@ impl fmt::Debug for ArcLoginInputs<'_> {
 }
 
 struct ArcAuthentication { user_id: Vec<u8>, selected_session_id: Vec<u8>, token: Vec<u8> }
+impl Drop for ArcAuthentication {
+    fn drop(&mut self) { self.user_id.zeroize(); self.selected_session_id.zeroize(); self.token.zeroize(); }
+}
 
 #[derive(Clone, Copy)]
 enum PendingKind { Bootstrap, Login, Swap }
 
 struct PendingRpc {
     kind: PendingKind, selected_session_id: Option<Vec<u8>>, scheduler: Option<Arc<()>>,
+}
+impl Drop for PendingRpc {
+    fn drop(&mut self) { if let Some(selector) = &mut self.selected_session_id { selector.zeroize(); } }
 }
 
 /// Input bytes cannot become callbacks for a different owner or connection.
@@ -100,8 +107,47 @@ impl fmt::Debug for OwnedBatchReply<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("OwnedBatchReply(<redacted>)") }
 }
 
+/// Successfully matched bootstrap result with immutable original provenance.
+/// Merely decoding getAppConfigs bytes cannot construct this delivery object.
+/// Configuration/references stay private and never grant TLS/SDK/channel ready.
+pub struct OwnedBootstrapReply {
+    owner: AttemptOwner,
+    connection: RpcConnectionScope,
+    call_id: i32,
+    properties: Vec<(Vec<u8>, Vec<u8>)>,
+    account_entry: Vec<u8>,
+    account_alive: Vec<u8>,
+    user_entry: Vec<u8>,
+    footer_properties: Vec<(Vec<u8>, Vec<u8>)>,
+}
+impl OwnedBootstrapReply {
+    pub fn owner(&self) -> &AttemptOwner { &self.owner }
+    pub fn call_id(&self) -> i32 { self.call_id }
+    /// Checked snapshot of only this matched result. Closing/dropping the ARC
+    /// prevents new access, not revocation of already borrowed/copied bytes.
+    pub fn material_for(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Option<AppConfigsResult<'_>> {
+        if &self.owner != owner || !self.connection.matches(scope) || !self.connection.is_open() { return None; }
+        fn fields(properties: &[(Vec<u8>, Vec<u8>)]) -> Vec<RpcProperty<'_>> {
+            properties.iter().map(|(key, value)| RpcProperty { key, value }).collect()
+        }
+        Some(AppConfigsResult { properties: fields(&self.properties), account_entry: &self.account_entry,
+            account_alive: &self.account_alive, user_entry: &self.user_entry,
+            footer: RpcFooter { reason: &[], properties: fields(&self.footer_properties) } })
+    }
+}
+impl Drop for OwnedBootstrapReply {
+    fn drop(&mut self) {
+        for (key, value) in self.properties.iter_mut().chain(self.footer_properties.iter_mut()) { key.zeroize(); value.zeroize(); }
+        self.properties.clear(); self.footer_properties.clear();
+        self.account_entry.zeroize(); self.account_alive.zeroize(); self.user_entry.zeroize();
+    }
+}
+impl fmt::Debug for OwnedBootstrapReply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("OwnedBootstrapReply(<redacted>)") }
+}
+
 pub enum ArcReply<'a> {
-    Bootstrap(AppConfigsResult<'a>),
+    Bootstrap(OwnedBootstrapReply),
     Login(OwnedRpcCallback),
     Swap(OwnedBatchReply<'a>),
     Failure(OwnedRpcCallback),
@@ -306,15 +352,18 @@ impl ArcRpcSession {
             Ok(reply) => reply,
             Err(error) => { self.close(); return Err(error); }
         };
-        let Some(pending) = self.pending.remove(&reply.call_id) else { return Ok(None); };
+        let Some(mut pending) = self.pending.remove(&reply.call_id) else { return Ok(None); };
         let result = match pending.kind {
             PendingKind::Bootstrap => match decode_get_app_configs_result(reply.result_code, reply.result_stream) {
-                Ok(result) => ArcReply::Bootstrap(result),
+                Ok(result) => ArcReply::Bootstrap(OwnedBootstrapReply { owner: self.owner.clone(), connection: self.connection.clone(),
+                    call_id: reply.call_id, properties: result.properties.iter().map(|p| (p.key.to_vec(), p.value.to_vec())).collect(),
+                    account_entry: result.account_entry.to_vec(), account_alive: result.account_alive.to_vec(), user_entry: result.user_entry.to_vec(),
+                    footer_properties: result.footer.properties.iter().map(|p| (p.key.to_vec(), p.value.to_vec())).collect() }),
                 Err(_) => self.failure(),
             },
             PendingKind::Login => match decode_login_session_result(reply.result_code, reply.result_stream) {
                 Ok(result) if self.phase == ArcPhase::LoginPending => {
-                    let Some(selected_session_id) = pending.selected_session_id else { return Ok(Some(self.failure())); };
+                    let Some(selected_session_id) = pending.selected_session_id.take() else { return Ok(Some(self.failure())); };
                     self.authentication = Some(ArcAuthentication { user_id: result.user_id.to_vec(),
                         selected_session_id, token: result.session_token.to_vec() });
                     self.phase = ArcPhase::Authenticated;
@@ -325,7 +374,7 @@ impl ArcRpcSession {
             PendingKind::Swap => match decode_swap_calls_reply(reply.result_code, reply.result_stream) {
                 Ok(result) if result.success => ArcReply::Swap(OwnedBatchReply {
                     owner: self.owner.clone(), connection: self.connection.clone(), call_id: reply.call_id, reply: result,
-                    scheduler: pending.scheduler,
+                    scheduler: pending.scheduler.take(),
                 }),
                 _ => self.failure(),
             },
