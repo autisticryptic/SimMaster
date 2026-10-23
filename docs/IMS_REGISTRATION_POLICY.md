@@ -443,7 +443,7 @@ Common请求/回包与swapCalls批次已补有界codec及原提交/连接scope�
 
 原IO actor扩展已由cd0684e两Actions/双架构/官方SHA各251回归＋4sharedSIP/86矩阵核验：共享scopepollgate串行close和nonblocking write/flush每次poll，Pending后重核，不从既有snapshot假定livepermission；commandcancel/IOdeadline/EOF关闭并丢原IO，JoinHandle才确认release，已接受字节不撤回。原borrowedticket consumer/metadata/pendingRPC退休，无dial/connect/provider，251实际离线回归/378静态mock非实网。全Router/NetStream/ENC端点/SMSmedia/persistence业务仍未实现。
 
-部署/config unwrap与引用解析已实现待Actions：ENC旧salt8DES-CBC/PKCS5/1000MD5无MAC、不构成auth，explicit独立Client/Common key，缺key/坏wrapper不fallbackSDKdefaults。ObjectRef可为facet/id/@adapter$locator或direct endpoint，rawTCP候选不改变TLSroot/authority/ready。私有bootstrap配置原pendingID/owner/scope先验，actorTLS getAppConfigs返回配置event；ownedSecret/config/引用/authPending drop-timezeroize，不夸大scopeclose即时撤销borrowedcopy。281source回归/381静态mock非实网，fullRouterNetStream/provision/endpointbinding/persistenceprovider/SMSmedia/费用仍缺。
+部署/config unwrap与引用解析`ed6fb33`已验证：Build39983918744/Beta39983918718/双架构、官方SHA ZIP各281＋4SAN/SIP及86矩阵核验，381静态mock，Release skip，57warnings/17Jegotrip excerpts保留。ENC salt8DES-CBC/PKCS5/1000MD5无MAC非auth，explicit独立Client/Common key不fallbackSDKdefault；ObjectRef rawTCP候选不改变TLSroot/authority/ready。私有originalpendingID/owner/scope先验，actorTLS bootstrap返回配置event；ownedSecret/config/引用/authPending drop-timezeroize，scopeclose不即时撤销borrowedcopy。partialreview3findings main修但非fullreview/实网；仍fullRouterNetStream/provision/endpointbinding/persistenceprovider/SMSmedia/费用缺口，unsupported/outboundfalse，无本机Rust/设备服务部署/当前IDA需求。
 
 ## 10. 验证清单与验收标准
 
