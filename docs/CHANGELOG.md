@@ -5,7 +5,7 @@
 
 ## 1.1.5 主线
 
-- 无忧行IO actor（待Actions）：只消费caller-provided非阻塞AsyncIO，不dial/connect/installprovider。原TLS+ARC单actor、共享close/write-pollgate/Notify、command/events字节有界、IO/RPC/TLS期限、partial/cancel关闭不重放/丢IO与JoinHandle确认；原metadata/ticketconsumer接线，不从write成功授SDK/hosting。251 Rust仅清单，378Python/staticmock通过，14新actor过滤器进两workflow；超时reviewpartial指出两test编译缺口已修但不是全审查。仍缺原全Router/NetStream控制、ENC部署/端点/provider持久化APItrunk/SMSclass/通话media/费用续期并发，不设备服务部署，本机Rust仍禁。
+- 无忧行IO actor（cd0684e已验证）：只消费caller-provided非阻塞AsyncIO，不dial/connect/installprovider。原TLS+ARC单actor、共享close/write-pollgate/Notify、command/events字节有界、IO/RPC/TLS期限、partial/cancel关闭不重放/丢IO与JoinHandle确认；原metadata/ticketconsumer接线，不从write成功授SDK/hosting。Build39958776382/Beta39958776314/ARM64+AMD64 success，官方SHA ZIP各251回归＋4sharedretainedSIP/86矩阵核验，378Python/staticmock通过，Release skipped；14新actor实际执行，超时reviewpartial指出两test编译缺口已修但不是全审查。仍缺原全Router/NetStream控制、ENC部署/端点/provider持久化APItrunk/SMSclass/通话media/费用续期并发，不设备服务部署，本机Rust仍禁。
 
 - 无忧行可信TLS/明文流（784cd3c已验证）：rustls TLS1.2/1.3显式importedroot/原authority+exactSAN，无earlydata/resumption/额外trust兜底；只有真握手成功才加密login。Common原envelope长度和native mode3 canonical16382分片定义明文边界，不加猜测BE32，不把SSL/rustls read当packet。原ARC一次TLS或rawtransport、private verified packets/固定handshake与cipher/carrier/plaintext partial deadline/EOF隔离；共享exactSAN保持原SIP算法/测试路径。Build39937771208/Beta39937771426/ARM64+AMD64 success，官方SHA ZIP各237 Jegotrip回归＋2sharedSAN/2retainedSIP及原四矩阵86场景核验，376静态/mock通过，Release skipped；两辅助review超时没有成功确认，main独立审查，原静态fixture命中guard失败留证修复。不启provider、不设备服务部署/本机编译，live socket/NetStream/关闭消费排他/ENC部署/短信分类落库与通话媒体/费用续期并发仍缺。
 

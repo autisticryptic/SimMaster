@@ -305,13 +305,13 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 - 两辅助设计/source review480s超时无结果不算验证，main独立核对原ELF与rustlsAPI；首次本机静态wholeprovider HTTPS禁令命中非法authority fixture，改中性scheme保留负例；fixture原ARC过早drop/非Clone concat/吞reader errors已主代理修正，原失败保留`.local/jegotrip/static-tls-first.log`。证据`.local/jegotrip/tls-offline-evidence.md`，本步不需要用户IDA。
 - 仍无live socket/NetStream/全Router控制/可靠调度，ENC provisioning/端点导入/credential落库/API/provider/trunk/SMS分类/通话媒体/费用续期并发，transport_implemented=false/providerunsupported/outboundfalse保持；本阶段不能冒称全部无忧行已复刻。
 
-### 原会话IO actor与关闭门禁（已实现待Actions）
+### 原会话IO actor与关闭门禁（cd0684e已验证，非完整backend）
 
 - `transport_actor.rs`仅start caller-provided `AsyncRead+AsyncWrite+Unpin+Send`，不开TCP/不DNS/dial，不是installed HostingBackend。单actor拥有原IO+TLS+OfflineBackend，32command/128event及128KiB参数/有界wiregroup；原metadata/route/owner不在收包时重绑，TLSverified/sentreceipt不是登录/hosting/channel确认。
 - RpcConnectionScope保留ArcAtomicBool身份，加sharedMutex<()>+Notify。close在gate内终止；write/flush每次NONBLOCKINGpoll同gate核验，Pending释放再重新检查，无await/阻塞poll/reentrantclose可放锁内。毒化终止、Notify enable-before-check防wake丢失；不宣称已kernel接受字节可召回，snapshot仍不可撤销，只新的actorpoll被阻断。
 - sendpartial按原cipher帧offset续写，不重新encrypt/分配businessid；commandoneshotcancel/eventconsumerdrop/close/IOTLSRPC deadline选择terminal、IO对象drop/原ARC清理/queuecompletion丢弃。RuntimeCloseReceipt io_released只有原JoinHandle真正结束，取消closeawait不先takehandle，后继可再等待原cleanup；不把atomicfalse当硬件或远端注销完成。
 - receive实际TLS验证→Common→原batch/hostingcallback或消息，pendingdeadline按原ARC是否pending退休，不靠ACK/control。originalconsumer完成private ticket，borrowedAPI+内部capturedcopy不会队列满丢票，pendingconsume仍一次；hosting元数据与outerrouting分别显式传入，不默认空object/domain或guessedkind。deadline(≤30sIO/60sRPC)包含TLSpartial，timerMissedTickSkip不重开计时。
-- 新14actor tests用duplex+内存rustls核查真实login/原callback/hostingbatch+directbinarymessageconsumerreply、gate与close换poll/offset/poison/wake/cancel/DropGuard/IOrelease/queuepressure等。251Rust当前仅清单＋4shared/retainedSIP待Actions；378Python/staticmock通过，无本机Rust/target/openssl执行。
+- 新14actor tests用duplex+内存rustls核查真实login/原callback/hostingbatch+directbinarymessageconsumerreply、gate与close换poll/offset/poison/wake/cancel/DropGuard/IOrelease/queuepressure等。`cd0684e9a0e2c54203082f5050c1aefd328ea549`由Build39958776382/Beta39958776314/ARM64+AMD64成功，官方SHA ZIP精确各251模块回归＋4shared/retainedSIP及86矩阵核验，378Python/staticmock通过，Release skipped。报告`.local/jegotrip/verified-native-cd0684e.json`；Build12503962642 SHA256`b2c81e95d910f4b9c49203b4d1cf14852f3924e60a8699972512583bcde429f8` / Beta12503744444 SHA256`4e6bc26934f8b462d141ae3a68ee6a1e6313665c6bc1e0e8bc169a7ffeaaf3fe`，保留59compilewarnings/18Jegotrip节选；无本机Rust/target/openssl执行。
 - review辅助300s超时返回partial两项test编译缺口（共享fixture可见性、future借用temporaryarray），main均修复并独立补真实metadata/deadline/cancel/ticket语义；不是完整review。一次WSLBashE_UNEXPECTED未执行即失败，后继同cwd复试正常，无目标/设备操作；原证据`.local/jegotrip/actor-offline-evidence.md`。本步无需IDA。
 - 仍缺fullRouter/NetStream可靠控制/outoforder/MTU与ENC provisioning端点、provider/persistence/API/trunk/SMS可靠classification/callmedia/费用续期并发；transport_implemented=false/providerunsupported/outboundfalse不变。callerIOactor测试不能升级为真实Linux公网互通或完整托管可用。
 
