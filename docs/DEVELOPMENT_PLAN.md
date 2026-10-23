@@ -6,6 +6,8 @@
 
 ## 当前基线与工作规则
 
+- 本轮续接PacketSender/Router offline扩展：SHA绑定ELF/FDE/ARM64静态证实下层BE32原packet长度，并新增有界stream decoder、Router8-byte/opaque无扩展routing/有序平衡两片及一次原ARC transport；208 Rust仅清单待Actions，373本机静态/mock通过。IDA MCP拒绝连接，不自行启动/加载；数据仍是opaque TLS，不能直接交ARC或授ready。未知route/控制/扩展/顺序wrap拒绝；既有borrowed/copy snapshot不可由close撤销，live writer/TLS取消/消费排他仍未实现。下一重点是可信TLS与record-aware plaintext边界、真实socket/NetStream/ENC provisioning，继而SMS分类落库/provider/API/trunk/call-media/费用续期并发，不用缺配置伪造默认值或仅剩实机。证据`.local/jegotrip/resume-network-framing-evidence.md`。
+
 - 用户暂无实网配置，最新要求继续离线/理论完善无忧行剩余内容。当前已还原并实现有界六词/ACK/32history/45s/2048dedup scheduler、exact configured recvOnlineMessage与offline组合；8efcd49已由Build39834770425/Beta39834770520/ARM64+AMD64及官方SHA ZIP逐名各172模块回归/四矩阵86场景核验，370静态/mock通过。不猜端点/trust/receiver-kind或计费，不授provider/外发；剩余下层网络/完整boundary/ENC部署、SMS分类/落库/provider/API/trunk/call-media/续期/并发仍是真实实现缺口，不能改写成只剩实机验收。
 
 - 本轮继续用户已开启的 `libmtc.so` 只读IDA：5d4bbb0有两套Actions/双架构/官方SHA测试ZIP/95模块回归/四矩阵86场景中间证据；其swap第二串已发现应为原选SDK session ID而非返回ARC token，后者属于metadata `token`，phone token属于`pwd`、SipPwd另用。当前新增getAppConfigs、owned ARC login/swap、Common分片/FF FF 06 carrier和原owner/scope nested hosting接线已由684ef73 Build39812859460/Beta39812859585/双架构、官方SHA测试ZIP逐名139模块回归/四矩阵86场景核验，368本机静态/mock通过；不把offline协议子阶段/CI当完整客户端。剩余重点为Router/NetStream/NetSsl socket/packet边界与可信TLS握手、ENC provisioning/端点、batch ACK/dedup调度、网络入站对象和真实短信/通话、provider/runtime/persistence/API/trunk/计费/续期/并发；暂不部署、不访问设备或服务。

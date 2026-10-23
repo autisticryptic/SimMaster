@@ -75,8 +75,9 @@ pub(super) struct Writer(Vec<u8>);
 impl Writer {
     pub fn new() -> Self { Self(vec![STREAM_DATA]) }
 
-    /// Produces a new type-0 method argument stream, with major/minor words.
-    /// Result streams do not repeat those version words.
+    /// Produces the supported native method-version list: BE16 count=1 followed
+    /// by one BE16 method version=0. These words are not a major/minor pair;
+    /// result streams do not repeat the list prefix.
     pub fn versioned() -> Result<Self, CodecError> {
         let mut writer = Self::new();
         writer.u16(1)?;
@@ -133,6 +134,8 @@ impl<'a> Reader<'a> {
 
     pub fn versioned(bytes: &'a [u8]) -> Result<Self, CodecError> {
         let mut reader = Self::new(bytes)?;
+        // This adapter supports exactly the one-entry native method-version
+        // list [0], not guessed alternate list lengths or revisions.
         if reader.u16()? != 1 || reader.u16()? != 0 { return Err(CodecError::UnsupportedVersion); }
         Ok(reader)
     }

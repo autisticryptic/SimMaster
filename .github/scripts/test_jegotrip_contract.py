@@ -202,6 +202,61 @@ class JegotripContract(unittest.TestCase):
         self.assertNotIn('Callback::Channels', engine)
         self.assertNotIn('Callback::HostingAck { success: true }', engine)
 
+    def test_packet_stream_has_native_length_prefix_and_bounded_split_coalesced_eof(self):
+        source = (MOD / 'packet_stream.rs').read_text(encoding='utf-8')
+        self.assertIn('(packet.len() as u32).to_be_bytes()', source)
+        self.assertIn('u32::from_be_bytes(self.prefix)', source)
+        self.assertIn('MAX_NETWORK_PACKET_BYTES', source)
+        self.assertIn('MAX_PACKETS_PER_INPUT', source)
+        self.assertIn('if expected == 0', source)
+        self.assertIn('if self.partial.len() != expected { break; }', source)
+        self.assertIn('std::mem::take(&mut self.partial)', source)
+        self.assertIn('if result.is_err() { self.close(); }', source)
+        self.assertIn('pub fn finish_eof', source)
+        self.assertNotIn('from_utf8_lossy', source)
+        self.assertNotIn('std::net', source)
+        for module in ['packet_stream', 'router_packets', 'packet_transport']:
+            self.assertIn(f'pub mod {module};', (MOD / 'mod.rs').read_text(encoding='utf-8'))
+            for name in ['beta-validation.yml', 'build-release.yml']:
+                self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests',
+                              (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_router_header_routing_and_two_half_subset_never_guess_endpoints(self):
+        source = (MOD / 'router_packets.rs').read_text(encoding='utf-8')
+        self.assertIn('[2, 6, 8, 12, 8, 12, 14, 18]', source)
+        self.assertIn('bytes[7] & 0x88 != 0', source)
+        self.assertIn('header.packet_kind | (header.fragment_part << 4)', source)
+        self.assertIn('flags & !3 != 0 || address1_mask & 2 != 0', source)
+        self.assertIn('header.sequence.checked_add(1)', source)
+        self.assertIn('body.len() / 2', source)
+        self.assertIn('original.header.packet_kind != header.packet_kind', source)
+        self.assertIn('TransportError::UnsupportedRoute', source)
+        self.assertIn('if result.is_err() { self.close(); }', source)
+        self.assertNotIn('from_utf8_lossy', source)
+        for forbidden in ['SocketAddr', 'ToSocketAddrs', 'TcpStream', 'rustls::', 'impl HostingBackend']:
+            self.assertNotIn(forbidden, source)
+
+    def test_packet_transport_captures_original_arc_and_routes_before_tls_not_rpc(self):
+        source = (MOD / 'packet_transport.rs').read_text(encoding='utf-8')
+        receive = source.split('pub fn on_bytes', 1)[1].split('fn consume', 1)[0]
+        self.assertLess(receive.index('self.accepts(owner, scope)'), receive.index('self.consume(bytes)'))
+        self.assertIn('self.connection.matches(scope) && self.connection.is_open()', source)
+        self.assertIn('OwnedWireFrames', source)
+        self.assertIn('OwnedTlsInput', source)
+        self.assertIn('decode_tls_carrier(body.payload)', source)
+        self.assertIn('if !receive.matches(&body)', source)
+        self.assertIn('last_received.is_some_and(|last| header.sequence <= last)', source)
+        self.assertIn('impl Drop for OwnedPacketTransport', source)
+        self.assertIn('self.connection.close(); self.decoder.close(); self.router.close();', source)
+        for forbidden in ['Callback::', 'on_plaintext_packet(', 'decode_reply(', 'decode_request(',
+                          'rustls::', 'TcpStream', 'impl HostingBackend', 'from_utf8_lossy']:
+            self.assertNotIn(forbidden, source)
+        arc = (MOD / 'arc_session.rs').read_text(encoding='utf-8')
+        self.assertIn('if self.packet_transport_taken', arc)
+        self.assertIn('self.owner.clone(), self.connection.clone(), route', arc)
+        for filename in ['arc_protocol.rs', 'offline_backend.rs']:
+            self.assertIn('pub fn take_packet_transport', (MOD / filename).read_text(encoding='utf-8'))
+
     def test_native_notifications_require_local_operation_and_stale_scope_checks(self):
         events = (MOD / 'native_events.rs').read_text(encoding='utf-8')
         controller = (MOD / 'controller.rs').read_text(encoding='utf-8')

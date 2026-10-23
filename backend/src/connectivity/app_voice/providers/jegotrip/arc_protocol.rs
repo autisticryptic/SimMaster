@@ -11,6 +11,7 @@ use super::{
     rpc_envelope::{decode_request, encode_reply},
     rpc_incoming::{IncomingBinding, IncomingDispatcher, encode_online_message_result},
     rpc_pending::{HostingRpcTracker, RpcConnectionScope},
+    packet_transport::{OwnedPacketTransport, PacketRoute},
     rpc_stream::{CodecError, RpcProperty},
     session::AttemptOwner,
     transport_packets::{encode_call_packets, CallAssembler, CallKind, TransportBytes, TransportError, TLS_FRAGMENT_THRESHOLD},
@@ -88,6 +89,9 @@ impl ArcProtocol {
 
     pub fn connection_scope(&self) -> RpcConnectionScope { self.rpc.connection_scope() }
     pub fn phase(&self) -> ArcPhase { self.rpc.phase() }
+    pub fn take_packet_transport(&mut self, route: PacketRoute<'_>) -> Result<OwnedPacketTransport, ProtocolError> {
+        Ok(self.rpc.take_packet_transport(route)?)
+    }
     pub fn take_hosting_tracker(&mut self) -> Result<HostingRpcTracker, ProtocolError> {
         Ok(self.rpc.take_hosting_tracker()?)
     }

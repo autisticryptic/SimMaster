@@ -6,6 +6,7 @@
 //! decrypts ENC values, resolves addresses, takes over a device or grants channels.
 use super::{
     batch_scheduler::{BatchError, BatchScheduler, ScheduledBatch},
+    packet_transport::{OwnedPacketTransport, PacketRoute},
     controller::Callback,
     rpc_batch::{decode_swap_calls_reply, encode_swap_calls, BatchPayload, BatchReply, SWAP_CALLS_METHOD},
     rpc_bootstrap::{decode_get_app_configs_result, encode_get_app_configs, AppConfigsResult, GET_APP_CONFIGS_METHOD},
@@ -14,6 +15,7 @@ use super::{
     rpc_pending::{HostingRpcTracker, OwnedRpcCallback, RpcConnectionScope},
     rpc_stream::{CodecError, RpcBytes, RpcProperty, MAX_FIELD_BYTES, MAX_MAP_ENTRIES},
     session::{AttemptOwner, BackendFailure},
+    transport_packets::TransportError,
 };
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
@@ -59,6 +61,7 @@ pub struct ArcRpcSession {
     authentication: Option<ArcAuthentication>,
     hosting_tracker_taken: bool,
     batch_scheduler_taken: bool,
+    packet_transport_taken: bool,
 }
 
 impl fmt::Debug for ArcRpcSession {
@@ -111,7 +114,7 @@ impl ArcRpcSession {
     pub fn new(owner: AttemptOwner) -> Self {
         Self { owner, connection: RpcConnectionScope::fresh(), phase: ArcPhase::Initial,
             next_id: Some(1), pending: BTreeMap::new(), authentication: None, hosting_tracker_taken: false,
-            batch_scheduler_taken: false }
+            batch_scheduler_taken: false, packet_transport_taken: false }
     }
 
     pub fn connection_scope(&self) -> RpcConnectionScope { self.connection.clone() }
@@ -119,6 +122,18 @@ impl ArcRpcSession {
         if self.connection.is_open() { self.phase } else { ArcPhase::Closed }
     }
     pub(super) fn owner(&self) -> &AttemptOwner { &self.owner }
+
+    /// One explicitly configured lower PacketSender transport per ARC. It only
+    /// frames opaque TLS bytes; taking it does not authenticate or grant ready.
+    /// Capture errors do not consume this slot, and no current scope is accepted
+    /// from a caller who might accidentally bind another session's transport.
+    pub fn take_packet_transport(&mut self, route: PacketRoute<'_>) -> Result<OwnedPacketTransport, TransportError> {
+        if self.phase() == ArcPhase::Closed { return Err(TransportError::Closed); }
+        if self.packet_transport_taken { return Err(TransportError::InvalidPacket); }
+        let transport = OwnedPacketTransport::for_arc_session(self.owner.clone(), self.connection.clone(), route)?;
+        self.packet_transport_taken = true;
+        Ok(transport)
+    }
 
     /// One tracker per ARC incarnation keeps nested sequences unique and binds
     /// owner/connection at construction, never when a batch arrives.

@@ -24,6 +24,7 @@ pub enum TransportError {
     InvalidFragment,
     UnsupportedKind,
     UnsupportedCompression,
+    UnsupportedRoute,
     Closed,
 }
 
@@ -36,6 +37,7 @@ impl TransportError {
             Self::InvalidFragment => "jegotrip_transport_fragment_invalid",
             Self::UnsupportedKind => "jegotrip_transport_kind_unsupported",
             Self::UnsupportedCompression => "jegotrip_transport_compression_unsupported",
+            Self::UnsupportedRoute => "jegotrip_transport_route_unsupported",
             Self::Closed => "jegotrip_transport_closed",
         }
     }
@@ -44,6 +46,7 @@ impl TransportError {
 pub struct TransportBytes(Vec<u8>);
 
 impl TransportBytes {
+    pub(super) fn from_bytes(bytes: Vec<u8>) -> Self { Self(bytes) }
     pub fn expose_to_transport(&self) -> &[u8] { &self.0 }
 }
 

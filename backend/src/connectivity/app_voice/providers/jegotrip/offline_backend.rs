@@ -10,6 +10,7 @@ use super::{
     native_events::IncomingMessage,
     rpc_incoming::{encode_online_message_result, IncomingBinding, IncomingDispatcher},
     rpc_pending::{HostingRpcTracker, OwnedRpcCallback, RpcConnectionScope},
+    packet_transport::{OwnedPacketTransport, PacketRoute},
     rpc_stream::{CodecError, RpcProperty},
     session::{AttemptOwner, GatewayRegistration},
 };
@@ -62,6 +63,11 @@ impl OfflineBackend {
     }
     pub fn phase(&self) -> ArcPhase { self.protocol.phase() }
     pub fn connection_scope(&self) -> RpcConnectionScope { self.protocol.connection_scope() }
+    /// Opaque lower stream adapter, not a raw-bytes-to-RPC shortcut. A future
+    /// trusted TLS engine must still establish actual plaintext packet boundaries.
+    pub fn take_packet_transport(&mut self, route: PacketRoute<'_>) -> Result<OwnedPacketTransport, ProtocolError> {
+        self.protocol.take_packet_transport(route)
+    }
     pub fn close(&mut self) {
         self.protocol.close(); if let Some(s) = &mut self.scheduler { s.close(); }
         self.tracker.retire_all();

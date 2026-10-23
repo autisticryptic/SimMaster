@@ -102,7 +102,7 @@ fn field_size_and_total_size_limits_are_independently_enforced() {
 #[test]
 fn update_status_result_requires_zero_rpc_code_and_preserves_false_ack() {
     // Type0, bool true, mandatory empty footer reason string. Native result
-    // streams do not repeat the request's major/minor version words.
+    // streams do not repeat the request's one-entry method-version list.
     let accepted = [0, 1, 0, 0, 0, 0];
     assert!(decode_update_status_result(0, &accepted).unwrap().0);
     let mut rejected = accepted;

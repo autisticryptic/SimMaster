@@ -5,6 +5,8 @@
 
 ## 1.1.5 主线
 
+- 无忧行下层离线传输（待Actions）：静态还原PacketSender四字节BE32原packet长度、缓存分流与Router独立8-byte头/opaque routing/有序两半。新增packet_stream/router_packets/packet_transport，绑定一次原ARC及exact独立TX/RX；有界长度/帧数/EOF、错scope先拒绝、错误/关闭共享终止，carrier不交RPC/不授ready。208 Rust仅源码清单，373 Python静态/mock通过，三新suite入两Actions。只读review发现close不能撤销旧borrowed bytes，已更正为checked snapshot并补回归，未来live writer/TLS消费/取消排他未实现。IDA MCP拒绝连接，使用hash一致本地ELF，辅助TLS研究超时不作为完成证据。socket/runtime/可信TLS与plaintext边界/provisioning/SMS业务/media/provider仍未实现，无部署/设备/服务端。
+
 - 无忧行离线调度/入站扩展（8efcd49已验证）：用户暂无实网参数，继续只读native还原六词local/peer incarnation+exclusive next+bitmap、32批/45s history、2048去重/原server响应ticket。新增owned scheduler、配置式recvOnlineMessage codec/dispatcher与OfflineBackend组合，未提交/取消snapshot不伪ACK、queued未submitted不被poll结果完成，票据借用回压重试/一次消费、original owner/scope和无ready副作用。Build39834770425/Beta39834770520实际各172模块回归/ARM64+AMD64成功，官方SHA测试ZIP逐名/四矩阵86场景核验，370本机静态/mock通过，Release skipped。type0后BE16两字语义补正为计数1/唯一方法版本0而非major/minor，字节不变。未接socket/可信TLS/完整boundary/provisioning/短信分类落库/通话媒体/API/provider/计费续期并发，provider关闭；不是实网互通或完整理论完成。
 
 - 无忧行ARC会话/packet子阶段（684ef73已验证）：只读IDA纠正login/swap第二串为原选SDK session ID；phone token写metadata `pwd`、返回ARC token写`token`、SipPwd另用，不混四份材料。新增getAppConfigs、owned login/auth/swap及Common有界分片/FF FF 06 carrier、offline协议组合；一次绑定原ARC tracker/私有owned batch回包/terminal scope，错连接同序号不重绑，登录退休/失败清partial，ForceFlag保持0/ENC拒绝。Build39812859460/Beta39812859585实际各139模块回归与ARM64/AMD64成功；官方SHA测试ZIP精确逐名/四矩阵86场景核验，368本机静态/mock通过，Release skipped。Router/NetStream/NetSsl socket/完整packet边界、可信TLS/部署解密/调度/网络入站/真实短信通话仍未实现，provider不启用，无设备/服务端/部署；不把子阶段或CI当整个任务完成。

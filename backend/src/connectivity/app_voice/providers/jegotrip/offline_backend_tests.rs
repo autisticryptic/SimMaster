@@ -175,6 +175,30 @@ fn unsupported_nested_methods_or_unconfigured_receiver_close_without_boolean_suc
 }
 
 #[test]
+fn lower_stream_transport_is_owned_but_cannot_turn_carrier_bytes_into_hosting_or_inbox_events() {
+    let (mut engine, original, scope) = setup(true);
+    let mut transport = engine.take_packet_transport(super::super::packet_transport::PacketRoute::DirectTlsCarrier).unwrap();
+    assert!(engine.take_packet_transport(super::super::packet_transport::PacketRoute::DirectTlsCarrier).is_err());
+    let sequence = engine.queue_hosting(original.clone(), "fixture-uri", STATUS_REGISTER, &registration(), &[]).unwrap();
+    let swap = engine.prepare_swap(1, &[]).unwrap();
+    let response = batch_response(swap.call_id, peer(), &[], &[(sequence, &[0, 1, 0, 0, 0, 0])]);
+    let wire = transport.encode_tls_bytes(&original, &scope, response.expose_to_transport(), None).unwrap().unwrap();
+    let tls = transport.on_bytes(&original, &scope, wire.frames_for(&original, &scope).unwrap()[0].expose_to_transport()).unwrap();
+    assert_eq!(tls[0].bytes_for_tls(&original, &scope), Some(response.expose_to_transport()));
+    assert_eq!(engine.phase(), ArcPhase::Authenticated);
+    // Only the separate explicitly trusted plaintext packet path can dispatch
+    // the original nested result; parsing an opaque carrier never does that.
+    let callbacks = feed(&mut engine, &original, &scope, response.expose_to_transport(), CallKind::Reply, 2).unwrap();
+    assert_eq!(callbacks.len(), 1);
+    assert!(matches!(&callbacks[0], OfflineEvent::Callback(c) if c.owner == original && c.callback == (Callback::HostingAck { success: true })));
+    assert!(transport.on_bytes(&original, &scope, &[0, 0, 0, 0]).is_err());
+    assert_eq!(engine.phase(), ArcPhase::Closed);
+    assert!(tls[0].bytes_for_tls(&original, &scope).is_none());
+    assert!(engine.prepare_swap(3, &[]).is_err());
+    assert!(feed(&mut engine, &original, &scope, response.expose_to_transport(), CallKind::Reply, 3).unwrap().is_empty());
+}
+
+#[test]
 fn incoming_unknown_kind_returns_false_not_success_and_closed_ticket_cannot_complete() {
     let (mut engine, original, scope) = setup(true); let args = message_arguments(b"other-kind", b"body");
     let routing = [RpcProperty { key: b"id", value: b"#fixture-client" }, RpcProperty { key: b"domain", value: b"fixture-domain" }, RpcProperty { key: b"__magic", value: &[0, 2] }];

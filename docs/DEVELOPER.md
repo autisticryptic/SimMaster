@@ -5,7 +5,7 @@
 
 ## 1. 分支与编译约束
 
-- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests,rpc_bootstrap::tests,arc_session::tests,transport_packets::tests,arc_protocol::tests,batch_scheduler::tests,rpc_incoming::tests,offline_backend::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests,rpc_bootstrap::tests,arc_session::tests,transport_packets::tests,arc_protocol::tests,batch_scheduler::tests,rpc_incoming::tests,offline_backend::tests,packet_stream::tests,router_packets::tests,packet_transport::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - 日常仅维护`master`，GitHub远端为`autisticryptic/SimMaster`（本地remote通常为`simmaster`）。
 - 不为每次验证长期留下分支。确需临时分支时，合并并确认提交已保留、CI通过后删除。
@@ -284,6 +284,16 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 - `8efcd49c7befe3e6395f7b97834bcdb57e3f393f`已由Build39834770425/Beta39834770520实际各172 Jegotrip模块回归、ARM64/AMD64验证，Release skipped；官方SHA绑定测试ZIP逐名172及四矩阵86场景核验（新增17scheduler/7incoming/8offline＋1reply encoder），370本机静态/mock通过，新3suite过滤器实际执行。报告`.local/jegotrip/verified-native-8efcd49.json`，保持原warnings证据、不冒称完整backend。审查6超时只返回ticket-by-value回压丢失的部分发现，已借用修复并Actions回归；不能算完整审查或互通证据。私有`.local/jegotrip/batch-inbound-offline-evidence.md`保存原函数/汇编，未执行目标库。
 - 补充语义复核：type0后BE16 `1,0`由native版本表解析器明确为计数1/唯一方法版本0；不是major/minor pair。旧shape/139通过证据保留，本轮字节不改，只纠正注释与手册；unsupported版本/多版本表仍failclosed，不把形状正确当所有版本互通。
 - 仍需下层Router/NetStream/NetSsl socket及完整boundary、受信TLS/ENC provisioning/端点、业务kind/SMS可靠分类/入站落库/线路API/provider/trunk/call-media/费用/续期/并发；未把这些未实现项降为“只剩实机”。`transport_implemented=false`、provider unsupported、outbound false保持，只有明确支持子集通过Actions后才能报offline完成。
+
+### 下层PacketSender与Router安全子集（已实现待Actions）
+
+- `packet_stream.rs`实现native PacketSender route的BE32原packet byte length（不是长度+4），接收缓存跨任意split/coalesced input并按精确长度循环拆包。零/超限长度、超过128帧/单input上限、EOF partial显式失败；每次调用的后段错误不交付该次前段输出。128KiB加固定routing overhead为本地政策，不冒称native64MiB或服务器协商。
+- `router_packets.rs`独立8-byte头的三BE16词/byte6/kind-part位、opaque tag/低2flags/path words/两address；地址按mask固定长度，无解析公网端点/猜反向source-destination。正常part1、过MTU严格比较后的floor/ceil两半part2/3独立相邻序号；本地只支持一个有序pair，未知控制/扩展/TLV/legacy decoration/out-of-order/wrap拒绝，非全部native可靠调度。
+- `packet_transport.rs`由原ARC一次领取，显式选择direct FF FF 06或Router path，TX/RX绑定分别捕获并精确匹配。输入先owner/scope核验再parse，完成Router重组/route后只输出opaque TLS bytes；不调用on_plaintext_packet/RPC/controller/DB，frame/carrier不授auth/channel。错误/EOF/drop关闭原共享scope，不重绑新同名session。
+- `frames_for`/`bytes_for_tls`是checked snapshot，不是可撤销IO lease：close只阻止新access，旧borrowed/copied bytes仍可读。只读review指出旧说明过强，已补明确回归；真实writer/TLS actor必须串行final-consume与close/取消排空，不跨await拿旧snapshot。本模块没有该live队列或socket能力。
+- SHA一致本地ELF/FDE/ARM64证明原sender/receiver/BE32排序，不执行库；IDA MCP当前WinError10061，不自行启动/加载或改IDB。TLS辅助任务超时仅留反汇编，main独立核验；完成的source review无本机构建、broker一个坏event如实保留；主代理随后补发协调消息因同时带recipient/requestId被工具拒绝，未送达，不算额外确认。mode3直接SSL_write Common packet且SSL_read可pipeline记录，**无内层BE32**，不把任意rustls reader当packet。
+- 新10stream/11router/14owned-transport＋1offline组合回归，当前208 Rust仅清单待两Actions编译执行；373 Python静态/mock通过，三suite非零过滤器已入两workflow。证据`.local/jegotrip/resume-network-framing-evidence.md`，构建结果后补，未通过前不标完成。
+- 剩余真实socket/NetStream/runtime、受信TLS/ENC provisioning/端点、record-aware明文边界、SMS可靠分类及落库/provider/API/trunk/call-media/费用/续期/并发；provider unsupported、transport_implemented=false/outbound=false保持，无设备/服务/部署。
 
 ### 5. 下一阶段与验收条件
 
