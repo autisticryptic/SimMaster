@@ -6,7 +6,7 @@
 
 ## 当前基线与工作规则
 
-- 当前部署/config/reference/ownedbootstrap子阶段`ed6fb33`已由Build39983918744/Beta39983918718/ARM64+AMD64验证，官方SHA ZIP各281＋4old/sharedSIP及86矩阵逐项核验，381静态mock通过、Release skip；57warnings/17Jegotrip excerpts保留。salt8DES-CBC-PKCS5/1000MD5仅配置unwrap，explicitClient/Reference contextkey，无SDKdefault/auth；facet/id/adapter-locator/explicit -h/-p是候选数据，私有originalowner/scopebootstrap与actor配置event不改TLStrust/授ready。partialreview3issues main修、dropwipe/确定padding负例，非fullreview；仍fullRouterNetStream/provision/可信endpointconnector/providerpersistAPI/SMSmedia费用续期并发未接通。无本机Rust/设备服务部署/当前IDA需求，unsupported/outboundfalse。
+- 当前部署/config/reference/ownedbootstrap子阶段`ed6fb33`已由Build39983918744/Beta39983918718/ARM64+AMD64验证，官方SHA ZIP各281＋4old/sharedSIP及86矩阵逐项核验，381静态mock通过、Release skip；57warnings/17Jegotrip excerpts保留。salt8DES-CBC-PKCS5/1000MD5仅配置unwrap，explicitClient/Reference contextkey，无SDKdefault/auth；facet/id/adapter-locator/explicit -h/-p是候选数据，私有originalowner/scopebootstrap与actor配置event不改TLStrust/授ready。partialreview3issues main修、dropwipe/确定padding负例，非fullreview；仍fullRouterNetStream/provision/可信endpointconnector/providerpersistAPI/SMSmedia费用续期并发未接通。无本机Rust/设备服务部署，该已验证解码子阶段未使用IDA，unsupported/outboundfalse。
 
 - 原会话transport_actor已由cd0684e Build39958776382/Beta39958776314/双架构、官方SHA ZIP各251模块回归＋4sharedSIP/86矩阵验证，378静态mock通过，Release skipped：caller-provided AsyncIO单actor/共享pollgate+Notify、取消/部分write关闭丢IO、JoinHandle确认drain，精确原metadata/私有borrowed票据/真实RPCpendingdeadline，无dial/provider。251实际离线回归不是实网，不报真实托管；下一仍fullRouter/NetStream/ENC端点/persistenceproviderAPItrunk/SMSclasscallmedia/费用续期并发。
 
@@ -33,6 +33,27 @@
   不自动发短信/拨号；用户取消的测试窗口自动回滚机制不得擅自恢复。
 - 验证、构建、CI 与部署均按当前明确授权及 [开发者指南](DEVELOPER.md) 执行；
   旧文档中的测试命令、设备窗口或凭据用途不能自动延续为新授权。
+
+## P0：无忧行 backend 的实施顺序与原生证据关口
+
+用户要求持续规划并完成 backend，仅完成或确实需要手动 IDA 时汇报。当前源码仍为已验证 `ed6fb33`，不把部署解码和 caller-IO actor 当作完整客户端。实施顺序：
+
+| 顺序 | 必须交付的实际行为 | 不能用什么替代 |
+| --- | --- | --- |
+| 1 | Router/NetStream 控制、序号环绕/乱序、缓存清退、重传/MTU/路径与真实流生命周期 | 当前仅有序 part2/3、原样 header 或接上 TcpStream |
+| 2 | 原导入/匹配 bootstrap 的 endpoint-authority-root 绑定、分连接 scope 与原 attempt 生命周期 | 从解密成功猜地址/根、复用旧 scope、替换活动 TLS IO |
+| 3 | 真正 HostingBackend 及 bounded event pump，SDK/hosting/channel ACK 分层、注销/取消/超时原归属 | submission receipt、模拟 callback 或仅安装 descriptor |
+| 4 | 独立 app-account line、私有凭据/配置持久化和脱敏管理 API、启动/停止/重建隔离 | 伪造 ICCID/五码/UICC、重启恢复 cached ready |
+| 5 | 核实 receiver-kind/消息编码和 SMS 分类；私有 durable inbox、SMS/event 原子提交后原 consumer ACK | generic recvOnlineMessage 字节按猜测 UTF-8/PDU 落 SMS，提前 ACK |
+| 6 | 真实邀请/应答/挂机/SDP/RTP/SRTP 与 per-account Trunk OperatorLink、独立 access/cost policy | 冒充 VoWiFi/普通 SIP REGISTER、hosting ACK 当 media-ready |
+| 7 | 独立费用/授权、已核实生命周期/续期与设备并发、普通失败恢复 | 将 app 通话/短信当 IMS 免费，force takeover、猜 TTL/renewal endpoint |
+| 8 | 两套 Actions/双架构、官方 SHA ZIP 精确清单/原86矩阵/旧SIP、固定手册与私有证据 | 静态、子agent 或 CI 绿灯充当实网完成 |
+
+已核对 `app_voice/registry` 仅 descriptor/availability、API 仅 metadata；`line_registry` 只注册真实 modem/reader/五码虚拟 SIM；SMS/voice/trunk 的 `AccessPathKind` 仅三种 3GPP/CS 路径。后端接线必须新增独立 app-account 归属，不把原 IMS/WLAN 免费规则套用应用收费。原 native PDU inbox 的 commit-before-ACK 模式可借鉴，不能伪造 SIM/PDU scope。
+
+**当前确需用户手动 IDA 的具体关口**：已对原 SHA ELF 做 FDE 有界静态复核，Router receiver `D68010` 调 `D66270`（2048-bit window/时间反馈/状态重置），`D6429C` 发送 kind3/part1，part2/3 在 16-bit 环绕下双向寻找邻片；重复位仅退出统计更新，调用者并未直接 drop payload。不能凭这些局部分支发明完整 ACK/重传/NetStream ready/lifecycle。现有无完整 NetStream 类型/控制流与 timer/callback 解编译，Rust 仍拒绝控制 kind2/3。随后还需核实 `Mtc_SgwDeliSipInvite` 与 Smgw receiver 注册/消息编码/媒体回调，不猜 direct SIP 或短信类型。
+
+只需用户打开现有 `.local/jegotrip/libmtc.so`（base0、原 SHA），等待分析并启用既有 IDA MCP；不需另开 APK/其他库、不运行设备/服务。仅只读 decompile/disassembly/xrefs/vtable，不编辑 IDB、不自行启动/加载。详尽源文件映射、验收与局限保存在 `.local/jegotrip/backend-implementation-plan.md`、`backend-native-function-frontier.json`。两只读 subagent 因 provider encrypted-content400失败无结论，主线程独立复核；该错误不是 IDA 必要性的理由。当前无新 Rust/backend 实现或 provider 启用，完整任务保持 open。
 
 ## P0：第一批补全的交付核验
 

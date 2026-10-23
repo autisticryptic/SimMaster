@@ -5,6 +5,8 @@
 
 ## 1.1.5 主线
 
+- 无忧行完整backend实施计划已细化为路由/可信connector/真实HostingBackend/独立app-account持久化API/SMS耐久ACK/调用媒体Trunk/独立费用续期并发/Actions验收八步。主线程FDE静态确认Router D68010→D66270状态/时间窗口与kind3控制、16-bit乱序片配对，但完整NetStream生命周期/回调及Smgw分类媒体仍缺，当前需用户手动开现有libmtc.so只读IDA补证据；不猜重传/receiver-kind/directSIP/费用，不启provider。此次仅规划/静态复核，无新backend源码或本机Rust/设备服务/IDB写，既有ed6fb33验证不冒称新成果；详情见固定DEVELOPMENT_PLAN。
+
 - 无忧行部署配置/引用（`ed6fb33`已验证）：只读ELF证实PBE salt8/DES-CBC/PKCS5＋1000MD5，callerexplicit不同Client/Common keycontext无SDKdefault/auth，facet/id/adapter-locator/semicolon -h/-p仅rawTCP候选不猜root/alias/proxy。私有原matchedbootstrap owner/scope/config，actorTLS配置event非SDK/hosting；Dropzeroize包括ownedconfig/reference/Secret/authPending，partialreview3findings main修(grouped$/retainedwipe/确定padding负例)，非fullsignoff。Build39983918744/Beta39983918718/ARM64+AMD64成功，官方SHA ZIP各281＋4SAN/SIP及86矩阵逐项核验，381静态mock通过、Release skip、57warnings/17Jegotrip excerpts保留；DESchecksum/manualLock已--locked Actions通过，无本机Rust/target/设备服务部署，provider/outbound不支持，fullRouter/provision/endpointbinding/persistence/SMSmedia费用续期并发未完成。
 
 - 无忧行IO actor（cd0684e已验证）：只消费caller-provided非阻塞AsyncIO，不dial/connect/installprovider。原TLS+ARC单actor、共享close/write-pollgate/Notify、command/events字节有界、IO/RPC/TLS期限、partial/cancel关闭不重放/丢IO与JoinHandle确认；原metadata/ticketconsumer接线，不从write成功授SDK/hosting。Build39958776382/Beta39958776314/ARM64+AMD64 success，官方SHA ZIP各251回归＋4sharedretainedSIP/86矩阵核验，378Python/staticmock通过，Release skipped；14新actor实际执行，超时reviewpartial指出两test编译缺口已修但不是全审查。仍缺原全Router/NetStream控制、ENC部署/端点/provider持久化APItrunk/SMSclass/通话media/费用续期并发，不设备服务部署，本机Rust仍禁。

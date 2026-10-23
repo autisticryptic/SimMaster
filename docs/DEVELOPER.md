@@ -326,6 +326,12 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 - 新9PBE/12reference/8deployment＋1actorbootstrap=281回归＋4shared/retainedSIP由Build39983918744/Beta39983918718/ARM64+AMD64成功，官方SHA ZIP逐名及四矩阵86场景核验。381Pythonstaticmock通过；独立OpenSSL DES-CBC oracle/公开NIST块/固定MD5KDF/确定interior-padding与pad0/pad9/内存真实TLS bootstrap→privateconfig→explicitlogin全部仅Actions运行，manual lock已--locked验证，无本机Rust/target/设备服务。本步ELF/FDE足够，无需用户IDA；Release skip、57compilewarnings/17Jegotrip excerpts保留，报告`.local/jegotrip/verified-native-ed6fb33.json`，Build artifact12515211829 SHA`c93507de3d304f3373cb280dad5392169630d17e953adee39b248b80a9a9a6db`，Beta12514343458 SHA`41ece8747963e9e75b60bcb88350e67db6ed1d101b744a867c0446ba1af45c4c`。
 - Read-only review辅助partial后provider ratelimit，3findings已main修（group$拆成未闭合fields、retainedownedcopieswipe、padding负例不足），不计fullreview/compilepass。InitialstaticFDE absent脚本失败改boundeddecode，批处理timeout只留partialfile非验证；证据`.local/jegotrip/deployment-offline-evidence.md`。fullRouterNetStream/provision/rsaAuth/endpointtrustconnector/providerpersistAPI/SMSclass/trunk/callmedia/费用续期并发仍未完成，unsupported/outboundfalse。
 
+### 完整 backend 的下一实施关口（尚未实现）
+
+按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)先补真实 Router/NetStream，再 trusted connector/HostingBackend/event pump、独立 app-account line/private persistence/API、verified SMS 分类/commit-before-ACK、calls/media/trunk、独立费用/续期/并发。主线程已核对现有空 providerregistry、metadata-only API、仅 modem/reader/五码的 lineRegistry 与 IMS/CS-only access/cost rules；应用账号不伪装 UICC/PDU 或免费 VoWiFi。
+
+原SHA ELF的新 FDE 静态结果：D68010 receive→D66270 window/时间反馈/reset，D6429C构造kind3/part1，part2/3邻片按16-bit环绕配对；D66270重复位仅退出自身统计，caller不直接drop payload，不能猜完整重传/stream-ready状态。NetStream类型/定时器/间接receiver控制流与Smgw kind/编码及DeliSip媒体回调仍缺，故需用户手动打开现有`.local/jegotrip/libmtc.so`/base0/既有IDA MCP，先只读D68010/D66270/D63960/D4FA54及NetStream vtable/timer，随后52C574/523EC0。未自行IDA加载/IDB修改/target执行，本轮没有新backend源码或Rust执行，仍unsupported/outboundfalse。证据`backend-implementation-plan.md`/`backend-native-function-frontier.json`；两subagent encrypted-content400无结论，非review/非IDA理由。
+
 ### 5. 下一阶段与验收条件
 
 1. 继续确认 SDK 外线登录/网关帧、通知、注销、续期以及 Linux 兼容的实现路径。

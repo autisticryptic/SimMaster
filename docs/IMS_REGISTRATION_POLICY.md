@@ -443,7 +443,9 @@ Common请求/回包与swapCalls批次已补有界codec及原提交/连接scope�
 
 原IO actor扩展已由cd0684e两Actions/双架构/官方SHA各251回归＋4sharedSIP/86矩阵核验：共享scopepollgate串行close和nonblocking write/flush每次poll，Pending后重核，不从既有snapshot假定livepermission；commandcancel/IOdeadline/EOF关闭并丢原IO，JoinHandle才确认release，已接受字节不撤回。原borrowedticket consumer/metadata/pendingRPC退休，无dial/connect/provider，251实际离线回归/378静态mock非实网。全Router/NetStream/ENC端点/SMSmedia/persistence业务仍未实现。
 
-部署/config unwrap与引用解析`ed6fb33`已验证：Build39983918744/Beta39983918718/双架构、官方SHA ZIP各281＋4SAN/SIP及86矩阵核验，381静态mock，Release skip，57warnings/17Jegotrip excerpts保留。ENC salt8DES-CBC/PKCS5/1000MD5无MAC非auth，explicit独立Client/Common key不fallbackSDKdefault；ObjectRef rawTCP候选不改变TLSroot/authority/ready。私有originalpendingID/owner/scope先验，actorTLS bootstrap返回配置event；ownedSecret/config/引用/authPending drop-timezeroize，scopeclose不即时撤销borrowedcopy。partialreview3findings main修但非fullreview/实网；仍fullRouterNetStream/provision/endpointbinding/persistenceprovider/SMSmedia/费用缺口，unsupported/outboundfalse，无本机Rust/设备服务部署/当前IDA需求。
+部署/config unwrap与引用解析`ed6fb33`已验证：Build39983918744/Beta39983918718/双架构、官方SHA ZIP各281＋4SAN/SIP及86矩阵核验，381静态mock，Release skip，57warnings/17Jegotrip excerpts保留。ENC salt8DES-CBC/PKCS5/1000MD5无MAC非auth，explicit独立Client/Common key不fallbackSDKdefault；ObjectRef rawTCP候选不改变TLSroot/authority/ready。私有originalpendingID/owner/scope先验，actorTLS bootstrap返回配置event；ownedSecret/config/引用/authPending drop-timezeroize，scopeclose不即时撤销borrowedcopy。partialreview3findings main修但非fullreview/实网；仍fullRouterNetStream/provision/endpointbinding/persistenceprovider/SMSmedia/费用缺口，unsupported/outboundfalse，无本机Rust/设备服务部署，该已验证解码子阶段未使用IDA。
+
+无忧行应用账号 backend 的实施不能混用上述 IMS/CS 的 access、SIM/PDU 或免费 WLAN 规则：现有 registry/API 为 metadata-only，真实 app-account 归属、durable message promotion后 consumer ACK 与独立费用/授权须接线。目前完整 Router/NetStream 控制/重传/生命周期及 Smgw/call-media 分类缺原生类型/控制流证据，需用户手动对现有 libmtc.so 做只读 IDA；仅计划与FDE静态定位，不授 provider/channel/outbound ready。顺序与当前关口见[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)。
 
 ## 10. 验证清单与验收标准
 
