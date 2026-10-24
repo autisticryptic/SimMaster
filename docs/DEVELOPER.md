@@ -328,7 +328,7 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 
 ### 完整 backend 的下一实施关口（持续）
 
-按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)继续完整Router/NetStream、正常provision/locator与原可信映射。显式HostingBackend、独立app-account与generic耐久入站已由d666f10验证，精确Smgw文本→共享SMS history/event在`0390692`验证；不能重复称未实现，也不能升级为所有编码/通知外发/call/media/trunk可用。global provider/Channels仍false，应用账号不伪装UICC/PDU/免费VoWiFi。本文本阶段已重新实际核对原IDA同libmtc.so/base0/SHA，复用23日志并只读补JSON字符串路径，不需要用户重开；后续只为真实缺失函数/类型请求，不自行加载或改IDB。
+按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)继续完整Router/NetStream、正常provision/locator与原可信映射。独立账号、Smgw文本/持久通知和原run释放回收已由`c55f773`验证，不重复称缺少，但不等于默认native或call/media/trunk可用。global provider/Channels/paidoutbound仍false，应用账号不伪装UICC/PDU/免费VoWiFi。本轮已实际核对原IDA同SHA/base0并只读追踪bootstrap/accept/locator注册边界，见`native-provision-call-frontier.md`；不自行加载或改IDB，当前无需用户重开。
 
 ### Router/Channel 原生边界（`65fad23`已验证）
 
@@ -391,9 +391,23 @@ Build40114399262/Beta40114399090/ARM64 AMD64成功、Release skipped；官方SHA
 
 Build40121560400/Beta40121560403/ARM64 AMD64 success、Release skipped，官方SHA测试ZIP各精确**471 Jegotrip＋8真实HTTP/auth＋4共享/原SIP＋7DNS/原86矩阵**核验，403本机static/mock；56warnings/16节选保留。Build12571244585 SHA`e1e05f44630b3d9ad89d4cbe8e65a7d3da287453b18a5dfcd19543980d9c0064`，Beta12571179295 SHA`148a0c7935d930ec83c03ac385df8493511c1c98cf413cc8397f795e0a5b61b9`。新增8parser/14SQL/4原native peer＋2真实HTTP，覆盖分类拒绝、同事务失败无ACK、sender/received时间、跨账号/删除tombstone、原共享SMS/API与三路外发拒绝；本阶段两Actions首次通过，不把前445成绩当新471。证据`verified-native-0390692.json`、`smgw-text-classification-evidence.md`、`smgw-text-implementation-evidence.md`。无本机Rust/前端/peer/注册模拟，无实际设备/无忧行服务/部署/NV/目标执行/IDB写，未知文件不清理。
 
-1. 继续确认正常SDK provisioning/locator、完整NetStream/Router控制和可信原连接映射。
-2. 在已验证精确Smgw文本history/event上完成通知外发、历史保留与必要其他消息编码，不提前授global provider/Channels。
-3. 对接真实call/media/trunk；发送与资费、续期/设备并发独立，不继承IMS免费假设。
+### 原run回收、持久通知计划及关机（`c55f773`已验证）
+
+- `account_runs.rs`在IO前登记原line/revision/run nonce，raw事务/回执标记都要求原run仍live。scope.close、phase、PID/年龄、direct_submitted/batch_queued都不是释放证明。原controller/actor真实释放后，释放controller锁，再取消并await原consumer Join；句柄留在原run的async slot。私有`RunQuiescence`才允许一个IMMEDIATE事务写released fence并回收该run的已投影envelope；失败不设finalized，replace/delete/restart继续阻断，取消重等不丢Join。
+- SMS和时间来源不随私有envelope删除；detached投影随后删SMS时清除，已删tombstone在原run结束后回收。未知raw及对应fence、无结束证明的legacy/orphan保留，不造进程退出证明。128unknown/pending、512所有identity/账号、2048全局/16MiB有界；原direct pending+seen128及batch规则不改。解决正常结束run后的终身堆积，不是单连接无限消息、自动重连或崩溃恢复。共享SMS用户历史政策另行处理。
+- `account_notifications.rs`与service adapter在**SQL外**捕获配置，纯snapshot按现有SMS规则/模板/quiet policy生成已渲染目标；queue计划或skip决定与raw/SMS/event同事务commit后原ACK。无目的地明确skipped，旧历史legacy不追溯转发，原投递重复不重规划。app-account上下文不查modem/own number；label为应用消息而非CS。模板膨胀分配前有界检查，原替换顺序不变。
+- 每SMS最多8目标/256KiB计划、单body128KiB；完整rule/channel配置canonical SHA256冻结目的地/认证/策略。序列化临时有界zeroizing、不输出配置。dispatch只取一次当前配置并核对指纹；同channel-id改目的地/停用/修改规则取消旧job，不把旧内容转投新对象。
+- 私有queue限2048条/16MiB、4任务工作池与每channel单claim，generation CAS约束完成/重试/取消，最多5次尝试/24h到期；rate/quiet延迟不消耗发送尝试。周期扫描不依赖broadcast/已裁剪event。pending可恢复处理，未知旧sending不擅自接管，uncertain/expired不当成功；有限重试可能重复，**不承诺远端exactly-once或跨设备全局并发**，原legacy通知worker不冒称已重写。
+- 删除SMS/账号取消并清queued payload，旧finalizer不复活；已admitted发送不可召回，SQLite/WAL/备份无物理擦除保证。`GET /api/non-3gpp/accounts/{line_id}/notifications?limit=1..128`沿既有认证/no-store，只回本地job/SMS id、状态/尝试/期限，不回正文或目的地指纹。成功日志仅原line/rule/channel id与通用label，不写sender/正文/远端响应/凭据。
+- Main保留通知worker和账号shutdown任务句柄；shutdown拒绝新start、取消pending start、等待原actor/consumer及持久fence；超时明确unconfirmed，不伪造release。通知只由已提交job和用户配置触发，不自动开始SDK会话。UI/globalprovider/Channels/paid SDK outbound不启用。
+
+前ecebec1回收子阶段由Build40128580374/Beta40128580295/双架构/官方SHA核验484＋8HTTP；最新c55f773由Build40135247656/Beta40135247579/ARM64 AMD64 success、Release skipped，官方SHA测试ZIP各**499 Jegotrip＋31 service（17原模板/规则＋14应用planner）＋10真实HTTP/auth＋4SIP＋7DNS/86**核验；406static/mock，58warnings/19节选保留。Build12575949542 SHA`d0988aaf163e3580c03297a0af22e3170147ead1701f0a5f5fd0807221eabca7`，Beta12576518726 SHA`10f748d2e262d6e9414d463fdadb3b57faa4fe89c0036e3bf09191f44f053f60`。首7bc018b main两处Duration缺导入令测试/双架构E0433，c55仅补全std::time路径，原失败两ZIP/annotations保留、断言不减。
+
+只读helper建议和2个service文件源码贡献都不是执行signoff；main独立审阅/接线、补边界测试与Actions。原IDA新增证实DomainId/AppId的Client解码、原DomainName，以及`accept.CallServerEx.CallEx`原64bit id/属性与版本重试；Locator string注册的3不当wire版本。`native-provision-call-frontier.md`记录后续，仍缺完整默认native/媒体/费用、跨进程owner恢复和共享SMS历史政策，不是只剩实机。无本机Rust/设备服务/部署/NV/target执行/IDB写、未知数据未清理。
+
+1. 继续正常SDK provisioning/locator、完整NetStream/Router控制及可信原连接映射。
+2. 补有依据的orphan进程恢复、共享SMS历史政策和必要其他编码，不提前授globalprovider/Channels。
+3. 对接真实call/media/trunk；发送/资费、续期/设备并发独立，不继承IMS免费假设。
 4. 用户有可用参数后，另行授权验证过期、掉线、并发设备、真实收短信及双向通话。
 
 当前有静态证据、契约及offline codec/owned协议测试，但没有设备、服务端或资费验收。
