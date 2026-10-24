@@ -328,7 +328,7 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 
 ### 完整 backend 的下一实施关口（持续）
 
-按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)继续完整Router/NetStream、正常provision/locator与原可信映射。显式profile HostingBackend/event pump、独立app-account私有配置/API和generic durable inbox已在`d666f10`验证，不能继续把它们写成未实现，也不能升级为已分类SMS/call/media/trunk。global provider仍未安装，应用账号不伪装UICC/PDU或免费VoWiFi。先复用23日志139次只读调用和原SHA ELF/FDE；24轮同libmtc.so/base0已核对，本次存储/inbox无新IDA调用或手动打开需求。下一真正缺函数/类型时再实时核对MCP，不自行加载或改IDB。
+按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)继续完整Router/NetStream、正常provision/locator与原可信映射。显式HostingBackend、独立app-account与generic耐久入站已由d666f10验证，精确Smgw文本→共享SMS history/event在`0390692`验证；不能重复称未实现，也不能升级为所有编码/通知外发/call/media/trunk可用。global provider/Channels仍false，应用账号不伪装UICC/PDU/免费VoWiFi。本文本阶段已重新实际核对原IDA同libmtc.so/base0/SHA，复用23日志并只读补JSON字符串路径，不需要用户重开；后续只为真实缺失函数/类型请求，不自行加载或改IDB。
 
 ### Router/Channel 原生边界（`65fad23`已验证）
 
@@ -380,9 +380,20 @@ Build40114399262/Beta40114399090/ARM64 AMD64成功、Release skipped；官方SHA
 
 前账号阶段3b7356d为423＋5HTTP/core76493e3为442＋6HTTP，各有独立两Actions/SHA证据。首d5e26a2 E0753/E0624仅修测试include注释/私有scope观察；第二b309c0f core421通过但3HTTP因错误provider id返回501，已纠正真实schema/fixture并加迁移回归，四份失败ZIP/annotations全部保留，未削断言。源码贡献辅助partial限流、只读review Azure资源400没有结论；main独立复核/Actions不冒充完整review或实网。无本机Rust/前端/peer/注册模拟，无设备/真实服务/部署/NV/IDA写；未改UI，仍需SMS可靠分类/业务promotion、默认native路径、媒体/Trunk、独立费用续期并发。
 
+### 已证实的 Smgw 文本接收与共享SMS历史（`0390692`已验证）
+
+- 原SHA/base0只读IDA确认`510E3C`登记精确`Sip.Request`，`524104/524110→523EC0`将原body、`Sip.Message.From/Time`装入type5 JSON字符串；新追踪`585608/250BF4/61DFF4/24F738`是保留字节/JSON转义，不是PDU/base64解码。原DEX `JCNotify→JCMessageChannel→Realm`将text/userId/sentTime放入短信history；本地randomUUID不是remote id，`Sip.MessageGw.Oid`的native全局副作用不复制到Linux跨账号路由。
+- `smgw_text.rs`只识别**原捕获receiver精确Sip.Request**的严格UTF8、明确非空有效sender与可选十进制Unix毫秒。保留Unicode/换行及看似hex/base64/JSON的原文字，不二次解码；其他receiver、无sender、非法UTF8/控制/时间保留unclassified。时间限1970..9999普通RFC3339，实际缺失时用本次原receive timestamp排序并明确`timestamp_source=received`、`sent_at_unix_millis=null`，不伪造send time或复制Android历史日期改now的行为。
+- `account_sms.rs`再次核对原raw id/line/revision/receiver/body/sender/time及当前账号版本，只在原raw事务内写共享`sms_messages`与`app_voice_sms_projection`、脱敏`sms.received`；transport=`app_voice`、独立app-account line、pdu=NULL/local sms_id。raw＋generic event＋SMS＋SMS event全部commit后原consumer回复；任一SQL/event失败整体回滚，不把raw-only算SMS成功。相同原投递不重复history/event。
+- `GET /api/non-3gpp/accounts/{line_id}/messages?limit=1..128`经过认证/no-store，只回已分类文本与sender/时间源；generic raw与凭据不导出。既有SMS列表/conversation/statistics按本app line工作；SMS通道kind=app_account、availablefalse、不编造ICCID/物理槽位身份。UI未改，interactive/automation/trunk SMS发送都在IMS/CS lookup前拒绝`app_account_outbound_unsupported`，不继承VoWiFi免费策略。
+- 原SMS删除/清空的SQL trigger同时清除对应private raw的逻辑body/from/time列，并保留原scope digest/receiver tombstone；原票据相同retry不复活用户删除的内容，异内容仍冲突，其他line/transport不受影响。删除账号清private envelope而保留共享SMS history，用户可再通过原SMS API删除。**这不是SQLite空闲页/WAL/备份的物理擦除保证**。
+- 本阶段仅history/持久事件接线，**通知外发worker尚未接入**；provider/Channels/paidoutbound仍false。128inbox/账号、2048总量与16MiB政策仍含已分类/删除tombstone，历史压缩/清理仍需完成；无已证实远程delivery id，不能承诺跨新run/重连全局exactly-once。默认native路径、真实calls/media/trunk、独立费用/续期/设备并发继续open。
+
+Build40121560400/Beta40121560403/ARM64 AMD64 success、Release skipped，官方SHA测试ZIP各精确**471 Jegotrip＋8真实HTTP/auth＋4共享/原SIP＋7DNS/原86矩阵**核验，403本机static/mock；56warnings/16节选保留。Build12571244585 SHA`e1e05f44630b3d9ad89d4cbe8e65a7d3da287453b18a5dfcd19543980d9c0064`，Beta12571179295 SHA`148a0c7935d930ec83c03ac385df8493511c1c98cf413cc8397f795e0a5b61b9`。新增8parser/14SQL/4原native peer＋2真实HTTP，覆盖分类拒绝、同事务失败无ACK、sender/received时间、跨账号/删除tombstone、原共享SMS/API与三路外发拒绝；本阶段两Actions首次通过，不把前445成绩当新471。证据`verified-native-0390692.json`、`smgw-text-classification-evidence.md`、`smgw-text-implementation-evidence.md`。无本机Rust/前端/peer/注册模拟，无实际设备/无忧行服务/部署/NV/目标执行/IDB写，未知文件不清理。
+
 1. 继续确认正常SDK provisioning/locator、完整NetStream/Router控制和可信原连接映射。
-2. 在已验证独立账号与generic inbox上补原消息分类/业务promotion，不能提前安装可用provider或Channels。
-3. 对接真实来电、接收短信至trunk/消息工作流；发送行为和资费独立，不继承IMS免费假设。
+2. 在已验证精确Smgw文本history/event上完成通知外发、历史保留与必要其他消息编码，不提前授global provider/Channels。
+3. 对接真实call/media/trunk；发送与资费、续期/设备并发独立，不继承IMS免费假设。
 4. 用户有可用参数后，另行授权验证过期、掉线、并发设备、真实收短信及双向通话。
 
 当前有静态证据、契约及offline codec/owned协议测试，但没有设备、服务端或资费验收。

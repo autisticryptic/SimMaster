@@ -6,7 +6,9 @@
 
 ## 当前基线与工作规则
 
-- **当前代码 `d666f10` 已验证**：Build40114399262/Beta40114399090/双架构success，官方SHA测试ZIP各445 Jegotrip＋6真实HTTP/auth＋4共享/原SIP＋7DNS/原86矩阵，401static/mock；Release skipped，56warnings/16节选保留。独立app-account私有配置/即时事务cap64/CAS、脱敏CRUD/start/stop及原scope/Join清理接通；generic body/sender/time与原receiver binding、revision/run nonce/协议序号私有入站，raw＋脱敏事件原子commit后回复原ticket，限额/去重/回压与marker失败不replay。旧receiver缺失保持unknown，不猜SMS/PDU，不授provider/channel/外发。前423账号阶段及442inbox核心有独立证据，两轮失败夹具/provider-id修复ZIP保留；REST403以官方网页digest/job状态和原REST成功元数据严格核验，非只看绿灯。证据`.local/jegotrip/verified-native-d666f10.json`及`app-inbox-implementation-evidence.md`。
+- **当前代码 `0390692` 已验证**：Build40121560400/Beta40121560403/双架构success，官方SHA测试ZIP各471 Jegotrip＋8真实HTTP/auth＋4共享/原SIP＋7DNS/原86矩阵，403static/mock、56warnings/16节选，Release skipped。已证实原Sip.Request Smgw文本可进入app_voice独立线路的共享SMS history：严格UTF8/sender/可选millis，raw＋SMS＋双脱敏event同事务commit后原consumer回执，sender/received时间源明确；其他kind/非法编码时间不猜。SMS删除清逻辑raw副本且原票据retry不复活，existing SMS读/删与新增认证messages API接通，三路外发在IMS/CS前拒绝。global provider/Channels仍false，通知外发/历史清理、默认native路径、call/media/Trunk、独立费用续期并发仍open。原IDA已实时metadata确认同SHA/base0并只读核实JSON/DEX文本路径，无用户手动操作需求；没有本机Rust/设备服务/部署或IDB写。
+
+- **前独立账号/耐久入站代码 `d666f10` 已验证**：Build40114399262/Beta40114399090/双架构success，官方SHA测试ZIP各445 Jegotrip＋6真实HTTP/auth＋4共享/原SIP＋7DNS/原86矩阵，401static/mock；Release skipped，56warnings/16节选保留。独立app-account私有配置/即时事务cap64/CAS、脱敏CRUD/start/stop及原scope/Join清理接通；generic body/sender/time与原receiver binding、revision/run nonce/协议序号私有入站，raw＋脱敏事件原子commit后回复原ticket，限额/去重/回压与marker失败不replay。旧receiver缺失保持unknown，不猜SMS/PDU，不授provider/channel/外发。前423账号阶段及442inbox核心有独立证据，两轮失败夹具/provider-id修复ZIP保留；REST403以官方网页digest/job状态和原REST成功元数据严格核验，非只看绿灯。证据`.local/jegotrip/verified-native-d666f10.json`及`app-inbox-implementation-evidence.md`。
 
 - **前显式驱动代码 `d593551` 已验证**（实现9809ae7，首E0618 callback fixture shadow修复）：Build40057801164/Beta40057801104、ARM64/AMD64成功，官方SHA测试ZIP各精确394 Jegotrip＋4共享/原SIP＋7原DNS/原86矩阵通过；391static/mock，57warnings/17Jegotrip excerpts保留，Release skipped。真实RuntimeConnector/PreparedRuntime/NativeHostingBackend原owner/physical scope接线、shared Hickory prepared DNS与逐poll gate、owned callback/poll/semantic unregister/SDKlogout/Join cleanup已实现，仅显式 supplied DirectTlsCarrier profile。不是默认SDK自动provision/locator、全Router/NetStream/媒体或已安装provider；Channels/外发仍false。状态及首失败见`.local/jegotrip/runtime-backend-implementation-evidence.md`。
 
@@ -44,7 +46,7 @@
 
 ## P0：无忧行 backend 的实施顺序与原生证据关口
 
-用户要求持续规划并完成 backend，仅完成或确实需要手动 IDA 时汇报。当前已验证代码为 `d666f10`；独立账号/显式profile runtime/通用消息耐久入站已交付，但不是完整默认SDK客户端或已分类SMS/通话媒体。后续不重做已验证存储/API，实施顺序与边界：
+用户要求持续规划并完成 backend，仅完成或确实需要手动 IDA 时汇报。当前已验证代码为 `0390692`；独立账号/显式profile runtime/通用耐久入站与精确Smgw文本投影已交付，但不是完整默认SDK客户端、所有SMS编码或通话媒体。后续不重做已验证存储/API/文本路径，实施顺序与边界：
 
 | 顺序 | 必须交付的实际行为 | 不能用什么替代 |
 | --- | --- | --- |
@@ -57,11 +59,11 @@
 | 7 | 独立费用/授权、已核实生命周期/续期与设备并发、普通失败恢复 | 将 app 通话/短信当 IMS 免费，force takeover、猜 TTL/renewal endpoint |
 | 8 | 两套 Actions/双架构、官方 SHA ZIP 精确清单/原86矩阵/旧SIP、固定手册与私有证据 | 静态、子agent 或 CI 绿灯充当实网完成 |
 
-**步骤3的显式profile路径与步骤4已验证；步骤5只完成generic耐久入站基础。** `app_voice_accounts`与原SIM/五码表隔离，`/api/non-3gpp/accounts`管理独立账号并显式启动真实native driver；启动不恢复网络状态、旧owner清理后才换配置。私有消息附原receiver object/domain/kind与原账号版本，commit-before-consumer-reply已有真实native/SQL/HTTP回归，但所有generic字节仍unclassified，不进入SMS/通知或媒体ready。`app_voice/registry`仅descriptor/availability，仍未安装可用provider；原`line_registry`只管理modem/reader/五码，应用线路不借UICC、CS或VoWiFi免费的access/cost规则。下一优先恢复正常provision/locator/完整NetStream及可信映射、可靠SMS分类/业务promotion、call/media/trunk和独立费用续期设备并发。
+**步骤3的显式profile路径、步骤4与步骤5的精确Smgw文本子集已验证。** `app_voice_accounts`与SIM/五码表隔离，`/api/non-3gpp/accounts`显式管理原native driver；启动不恢复网络状态、原IO释放后才换配置。私有消息保留原receiver binding/版本；只有原Sip.Request＋strict UTF8/有效sender/time可在同一原子事务投影SMS/event，其他数据仍unclassified。新增`.../{line_id}/messages`与既有SMS查询/删除接通；SMS通道availablefalse且local/automation/trunk发送在IMS/CS lookup前一律拒绝，不授Channels/global provider。**仍未闭环**：通知外发worker与历史保留/压缩（128inbox/账号仍含已分类/删除tombstone）、没有已证实remote id的跨重连去重，完整默认provision/locator/NetStream/Router/Channel、真实call/media/trunk、独立费用/续期/设备并发。不得把本文本history/event子集标为全部消息业务或整个backend完成。
 
 **剩余原生关口**：Router数据controls/16-bit邻片/2048-bit统计与Channel header/SACK/record/retransmit descriptor已有证据及codec；原会话SDK logout和STATUS3 semantic ACK已验证。完整NetStream ready/时序/选路/重传生命周期、正常provision到endpoint-authority-root绑定、业务channel及call/media仍需闭环，不能用codec存在或ACK成功替代。原Smgw登记`Sip.Request`、SDK/app text/可选millis已确认；不能把所有generic消息或本地UUID自动当SMS类别/remote delivery ID，更不猜PDU/direct SIP/RTP/费用。
 
-此前用户已打开原SHA/base0的`.local/jegotrip/libmtc.so`。23日志保存139次只读MCP调用，包含NetStream构造/回调、Channel和SipGateway代理；先整理并复用已有结果/FDE，再针对真实missing函数/类型决定是否需用户恢复同文件MCP。24轮已成功lazyconnect核对原目标；当前账号/inbox阶段未新调用IDA，不冒称此刻插件在线，也无需为存储/API请求用户操作；后续再实时复核，不自行启动/加载/改IDB。八步计划及精确FDE metadata在`.local/jegotrip/backend-implementation-plan.md`、`backend-native-function-frontier.json`；最新验证为`verified-native-d666f10.json`。本轮源码贡献辅助partial限流、只读review Azure400无结论，main独立复核/Actions，不当完整review或IDA理由。完整backend保持open、provider unsupported、outboundfalse。
+此前用户已打开原SHA/base0的`.local/jegotrip/libmtc.so`。23日志保存139次只读MCP调用，包含NetStream构造/回调、Channel和SipGateway代理；先整理并复用已有结果/FDE。账号/inbox阶段不需要新IDA；随后本文本阶段已**实际**lazyconnect/get_metadata再次核对同原SHA/base0，只读新decompile验证Sip.Request回调及type5 JSON字符串序列化，结合原DEX确认text/userId/sentTime，见`smgw-text-classification-evidence.md`。现无需用户重开，不自行启动/加载/改IDB；新的missing函数/类型再按实证决定。八步原生边界仍见`.local/jegotrip/backend-implementation-plan.md`，最新验证`verified-native-0390692.json`；源码贡献辅助partial/失败review不算全审查或IDA理由。完整backend保持open、provider/Channels/outboundfalse。
 
 ## P0：第一批补全的交付核验
 
