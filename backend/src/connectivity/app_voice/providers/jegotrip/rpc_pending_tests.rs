@@ -56,6 +56,18 @@ fn stale_unknown_or_retired_unregistration_reply_does_not_consume_other_original
 }
 
 #[test]
+fn original_unregistration_negative_and_malformed_results_keep_distinct_failure_kinds() {
+    for (code, bytes, rejected) in [(0, b"\0\0\0\0\0\0".as_slice(), true),
+        (1, b"\0\x01\0\0\0\0", true), (0, b"\0", false)] {
+        let original = owner(); let mut tracker = HostingRpcTracker::new(); let scope = tracker.connection_scope();
+        let (id, _) = tracker.prepare_update_status(original.clone(), "uri", STATUS_UNREGISTER, &registration(), &[]).unwrap();
+        assert!(tracker.on_reply(&scope, &reply(id, code, bytes)).unwrap().is_none());
+        let result = tracker.take_unhosting_replies().pop().unwrap();
+        assert!(result.matches(&original, &scope)); assert!(!result.accepted()); assert_eq!(result.rejected(), rejected);
+    }
+}
+
+#[test]
 fn undelivered_unregistration_completion_is_cleared_by_original_retirement_or_scope_close() {
     for retirement in 0..4 {
         let original = owner(); let mut tracker = HostingRpcTracker::new(); let scope = tracker.connection_scope();

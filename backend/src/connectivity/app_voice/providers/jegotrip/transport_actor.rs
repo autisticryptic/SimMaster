@@ -27,7 +27,7 @@ const MAX_PARAMETER_BYTES: usize = 128 * 1024;
 const MAX_PENDING_RPC: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuntimeError { Scope, InvalidConfiguration, Backpressure, Closed, Cancelled, Timeout, Io, Protocol, LoggedOut, Tls(TlsError) }
+pub enum RuntimeError { Scope, InvalidConfiguration, Backpressure, Closed, Cancelled, Timeout, Io, Protocol, UnregistrationRejected, LoggedOut, Tls(TlsError) }
 impl From<TlsError> for RuntimeError { fn from(error: TlsError) -> Self { Self::Tls(error) } }
 
 pub struct RuntimePolicy { pub io_timeout: Duration, pub rpc_timeout: Duration }
@@ -163,7 +163,13 @@ impl RuntimeReceipt {
     /// transport submission; unregister/logout waits also require the original
     /// semantic result. None of these receipts grants a new connection or IO.
     pub fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
-        &self.owner == owner && self.scope.matches(scope) && self.scope.is_open()
+        self.submitted_on(owner, scope) && self.scope.is_open()
+    }
+    /// Historical submission correlation only, never a readiness/open-IO
+    /// lease. A fast negative SDK reply may close ARC before its sender's
+    /// submission receipt is observed; the terminal callback carries failure.
+    pub(super) fn submitted_on(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
+        &self.owner == owner && self.scope.matches(scope)
     }
 }
 impl fmt::Debug for RuntimeReceipt {
@@ -179,6 +185,30 @@ impl RuntimeEvent {
     }
     pub fn into_events(self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Option<Vec<OfflineEvent>> {
         if &self.owner == owner && self.scope.matches(scope) && self.scope.is_open() { Some(self.events) } else { None }
+    }
+    pub(super) fn terminal_failure(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Option<super::session::BackendFailure> {
+        if &self.owner != owner || !self.scope.matches(scope) { return None; }
+        self.events.iter().find_map(|event| match event {
+            OfflineEvent::Callback(callback) if &callback.owner == owner => match callback.callback {
+                super::controller::Callback::SdkLogin { success: false } => Some(super::session::BackendFailure::AuthenticationRejected),
+                super::controller::Callback::HostingAck { success: false } => Some(super::session::BackendFailure::HostingRejected),
+                super::controller::Callback::Failure(reason) => Some(reason),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+    /// Closed ARC failures must retain their ORIGINAL reason. This narrow path
+    /// accepts only private actor-produced negative callbacks; it cannot expose
+    /// messages, bootstrap data, a positive ACK or channel readiness after close.
+    pub(super) fn into_terminal_callback(self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Option<super::rpc_pending::OwnedRpcCallback> {
+        if &self.owner != owner || !self.scope.matches(scope) { return None; }
+        self.events.into_iter().find_map(|event| match event {
+            OfflineEvent::Callback(callback) if &callback.owner == owner
+                && matches!(callback.callback, super::controller::Callback::SdkLogin { success: false }
+                    | super::controller::Callback::HostingAck { success: false } | super::controller::Callback::Failure(_)) => Some(callback),
+            _ => None,
+        })
     }
 }
 impl fmt::Debug for RuntimeEvent {
@@ -351,19 +381,55 @@ impl RuntimeHandle {
 }
 impl Drop for RuntimeHandle { fn drop(&mut self) { self.scope.close(); } }
 
+/// Prepare original ARC/TLS ownership BEFORE DNS/connect. This scope is the
+/// same one later attached to the IO actor; cancellation cannot mint a new
+/// actor scope or leave a detached connection/login waiting in the background.
+pub struct PreparedRuntime {
+    owner: AttemptOwner, scope: RpcConnectionScope, backend: Option<OfflineBackend>, tls: Option<TlsEngine>,
+    policy: Option<RuntimePolicy>, timing: Option<RouterTiming>, start: Instant, attached: bool,
+}
+impl fmt::Debug for PreparedRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("PreparedRuntime(<redacted>)") }
+}
+impl Drop for PreparedRuntime {
+    fn drop(&mut self) { if !self.attached { self.scope.close(); } }
+}
+impl PreparedRuntime {
+    pub fn connection_scope(&self) -> RpcConnectionScope { self.scope.clone() }
+    /// Consumes exactly the original prepared scope. All original TLS deadlines
+    /// include connection setup time; attach does not reset the clock or trust.
+    pub fn attach<I>(mut self, io: I) -> Result<(RuntimeHandle, mpsc::Receiver<RuntimeEvent>), RuntimeError>
+        where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+        if !self.scope.is_open() { return Err(RuntimeError::Scope); }
+        let mut tls = self.tls.take().ok_or(RuntimeError::Closed)?;
+        if !tls.tick(&self.owner, &self.scope, Instant::now())? { return Err(RuntimeError::Closed); }
+        let backend = self.backend.take().ok_or(RuntimeError::Closed)?;
+        let policy = self.policy.take().ok_or(RuntimeError::Closed)?;
+        let (commands_tx, commands_rx) = mpsc::channel(MAX_COMMANDS); let (events_tx, events_rx) = mpsc::channel(MAX_EVENTS);
+        let owner = self.owner.clone(); let scope = self.scope.clone();
+        let actor = Actor { io: Some(io), owner: owner.clone(), scope: scope.clone(), backend, tls, commands: commands_rx,
+            events: events_tx, policy, timing: self.timing, start: self.start, pending: std::collections::BTreeMap::new(),
+            logout_pending: None, unhosting_pending: None };
+        self.attached = true;
+        let task = tokio::spawn(actor.run());
+        Ok((RuntimeHandle { owner, scope, commands: commands_tx, task: Some(task) }, events_rx))
+    }
+}
+
+pub fn prepare(owner: AttemptOwner, route: PacketRoute<'_>, tls_parameters: TlsParameters<'_>,
+    policy: RuntimePolicy, timing: Option<RouterTiming>) -> Result<PreparedRuntime, RuntimeError> {
+    if !policy.valid() { return Err(RuntimeError::InvalidConfiguration); }
+    let start = Instant::now(); let mut backend = OfflineBackend::new(owner.clone()); let scope = backend.connection_scope();
+    let tls = backend.take_tls_engine(route, tls_parameters, start)?;
+    Ok(PreparedRuntime { owner, scope, backend: Some(backend), tls: Some(tls), policy: Some(policy), timing, start, attached: false })
+}
+
 /// Start only on caller-provided nonblocking IO, never a guessed network target.
 /// This low-level runtime is not installed as a ready HostingBackend/provider.
 pub fn start<I>(io: I, owner: AttemptOwner, route: PacketRoute<'_>, tls_parameters: TlsParameters<'_>,
     policy: RuntimePolicy, timing: Option<RouterTiming>) -> Result<(RuntimeHandle, mpsc::Receiver<RuntimeEvent>), RuntimeError>
     where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
-    if !policy.valid() { return Err(RuntimeError::InvalidConfiguration); }
-    let start = Instant::now(); let mut backend = OfflineBackend::new(owner.clone()); let scope = backend.connection_scope();
-    let tls = backend.take_tls_engine(route, tls_parameters, start)?;
-    let (commands_tx, commands_rx) = mpsc::channel(MAX_COMMANDS); let (events_tx, events_rx) = mpsc::channel(MAX_EVENTS);
-    let actor = Actor { io: Some(io), owner: owner.clone(), scope: scope.clone(), backend, tls, commands: commands_rx,
-        events: events_tx, policy, timing, start, pending: std::collections::BTreeMap::new(), logout_pending: None, unhosting_pending: None };
-    let task = tokio::spawn(actor.run());
-    Ok((RuntimeHandle { owner, scope, commands: commands_tx, task: Some(task) }, events_rx))
+    prepare(owner, route, tls_parameters, policy, timing)?.attach(io)
 }
 
 struct Actor<I> {
@@ -461,8 +527,9 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                     // expired result cannot turn this original wait into Ok.
                     if *unhosting_accepted { return Err(RuntimeError::Protocol); }
                     if Instant::now() >= pending.deadline { return Err(RuntimeError::Timeout); }
+                    if !reply.matches(&self.owner, &self.scope) || reply.sequence() != pending.sequence { return Err(RuntimeError::Protocol); }
                     let accepted = reply.matches(&self.owner, &self.scope) && reply.sequence() == pending.sequence && reply.accepted();
-                    if !accepted { return Err(RuntimeError::Protocol); }
+                    if !accepted { return Err(if reply.rejected() { RuntimeError::UnregistrationRejected } else { RuntimeError::Protocol }); }
                     *unhosting_accepted = true;
                 }
                 OfflineEvent::Logout(reply) => {

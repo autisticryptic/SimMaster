@@ -348,6 +348,68 @@ class JegotripContract(unittest.TestCase):
             self.assertIn('connectivity::app_voice::providers::jegotrip::transport_actor::tests',
                           (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
 
+    def test_prepared_runtime_captures_original_scope_before_connect_and_keeps_tls_deadline(self):
+        actor = (MOD / 'transport_actor.rs').read_text(encoding='utf-8')
+        self.assertIn('pub struct PreparedRuntime', actor)
+        self.assertIn('if !self.attached { self.scope.close(); }', actor)
+        prepare = actor.split('pub fn prepare(', 1)[1].split('pub fn start<', 1)[0]
+        self.assertIn('let scope = backend.connection_scope()', prepare)
+        self.assertIn('backend.take_tls_engine', prepare)
+        attach = actor.split('pub fn attach<I>', 1)[1].split('pub fn prepare(', 1)[0]
+        self.assertIn('tls.tick(&self.owner, &self.scope, Instant::now())', attach)
+        self.assertIn('scope: scope.clone()', attach)
+        self.assertNotIn('OfflineBackend::new', attach)
+        self.assertNotIn('RpcConnectionScope::fresh', attach)
+
+    def test_native_connector_requires_exact_original_scope_profile_authority_and_root(self):
+        connector = (MOD / 'runtime_connector.rs').read_text(encoding='utf-8')
+        self.assertIn('pub struct ConnectedIo', connector)
+        self.assertIn('self.scope.matches(scope)', connector)
+        self.assertIn('self.root.as_str() != input.root_der_base64', connector)
+        self.assertIn('self.enable_sni != input.enable_sni', connector)
+        self.assertIn('reference.direct_raw_tcp()', connector)
+        self.assertIn('if !same_authority(host, input.authority)', connector)
+        self.assertIn('scope.with_io_gate(|| future.as_mut().poll(context))', connector)
+        self.assertIn('poll_scoped(scope, TcpStream::connect(address))', connector)
+        self.assertIn('MAX_RESOLVED_RESULTS', connector)
+        self.assertIn('_ = scope.closed()', connector)
+        for forbidden in ['with_custom_certificate_verifier', 'Callback::', 'session.current_owner()', 'force_takeover', 'from_utf8_lossy']:
+            self.assertNotIn(forbidden, connector)
+        for name in ['beta-validation.yml', 'build-release.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::runtime_connector::tests',
+                          (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_runtime_backend_owns_original_io_callbacks_and_cleanup_without_channel_guesses(self):
+        backend = (MOD / 'runtime_backend.rs').read_text(encoding='utf-8')
+        self.assertIn('impl HostingBackend for NativeHostingBackend', backend)
+        self.assertIn('transport_actor::prepare(owner.clone()', backend)
+        self.assertIn('connected.into_original_io(&attempt.owner, &attempt.scope, input)', backend)
+        self.assertIn('if !submitted.submitted_on(&attempt.owner, &attempt.scope)', backend)
+        self.assertIn('handle.close().await', backend)
+        self.assertIn('release.io_released()', backend)
+        self.assertIn('if lock(&attempt.state).released { return Ok(()); }', backend)
+        self.assertIn('state.unregister_result', backend)
+        self.assertIn('state.logout_started = true', backend)
+        self.assertIn('attempt.poll_work.lock().await', backend)
+        self.assertIn('terminal_after_runtime_close', backend)
+        self.assertIn('event.terminal_failure(&attempt.owner, &attempt.scope)', backend)
+        self.assertNotIn('Callback::Channels { calls: true', backend)
+        self.assertNotIn('Callback::HostingAck { success: true }', backend)
+        for name in ['beta-validation.yml', 'build-release.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::runtime_backend::tests',
+                          (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_connector_uses_prepared_pure_rust_dns_not_system_hostname_fallback(self):
+        connector = (MOD / 'runtime_connector.rs').read_text(encoding='utf-8')
+        self.assertIn('prepare_socket_addrs(target.host.as_str(), target.port)', connector)
+        self.assertIn('poll_scoped(scope, lookup.resolve())', connector)
+        dns = (ROOT / 'backend/src/platform/dns.rs').read_text(encoding='utf-8')
+        self.assertIn('pub(crate) enum PreparedSocketLookup', dns)
+        self.assertIn('prepare_socket_addrs(host, port)?.resolve().await', dns)
+        prepare = dns.split('pub(crate) fn prepare_socket_addrs(', 1)[1].split('pub async fn resolve_socket_addrs(', 1)[0]
+        self.assertIn('Hosts::from_system()', prepare)
+        self.assertNotIn('.await', prepare)
+
     def test_close_gate_is_shared_terminal_and_poll_leases_are_not_async_locks(self):
         source = (MOD / 'rpc_pending.rs').read_text(encoding='utf-8')
         self.assertIn('Arc<Mutex<()>>', source)

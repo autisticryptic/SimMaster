@@ -93,10 +93,12 @@ impl std::fmt::Debug for PreparedHostingCall {
 
 /// Privately matched unregister result from one original pending operation.
 /// It is never a Hosted/channel callback and cannot complete another register.
-pub struct OwnedUnhostingReply { owner: AttemptOwner, connection: RpcConnectionScope, sequence: i32, accepted: bool }
+pub struct OwnedUnhostingReply { owner: AttemptOwner, connection: RpcConnectionScope, sequence: i32, accepted: bool, rejected: bool }
 impl OwnedUnhostingReply {
     pub fn sequence(&self) -> i32 { self.sequence }
     pub fn accepted(&self) -> bool { self.accepted }
+    /// Distinguish a decoded native negative/remote failure from malformed data.
+    pub(super) fn rejected(&self) -> bool { self.rejected }
     pub(super) fn matches(&self, owner: &AttemptOwner, connection: &RpcConnectionScope) -> bool {
         &self.owner == owner && self.connection.matches(connection) && self.connection.is_open()
     }
@@ -232,8 +234,10 @@ impl HostingRpcTracker {
     fn status_completed(&mut self, request: PendingRequest, sequence: i32, code: u32, bytes: &[u8]) -> Option<OwnedRpcCallback> {
         if request.operation == NativeOperation::HostingUnregister {
             if self.unhosting.len() >= MAX_MAP_ENTRIES { self.connection.close(); self.pending.clear(); self.unhosting.clear(); return None; }
-            let accepted = decode_update_status_result(code, bytes).is_ok_and(|(accepted, _)| accepted);
-            self.unhosting.push(OwnedUnhostingReply { owner: request.owner, connection: self.connection.clone(), sequence, accepted });
+            let outcome = decode_update_status_result(code, bytes);
+            let accepted = outcome.as_ref().is_ok_and(|(accepted, _)| *accepted);
+            let rejected = matches!(outcome, Ok((false, _)) | Err(CodecError::RemoteFailure));
+            self.unhosting.push(OwnedUnhostingReply { owner: request.owner, connection: self.connection.clone(), sequence, accepted, rejected });
             None
         } else if request.operation == NativeOperation::HostingRegister {
             let callback = match decode_update_status_result(code, bytes) { Ok((success, _)) => Callback::HostingAck { success },

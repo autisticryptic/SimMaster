@@ -49,6 +49,88 @@ fn poll_io(pending: bool) -> (PollIo, Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>, Arc<
     (PollIo { data: data.clone(), limit: 3, pending: pending.clone(), wake: wake.clone(), dropped: dropped.clone() }, data, pending, wake, dropped)
 }
 
+#[test]
+fn closed_actor_events_retain_only_original_negative_callback_reason_not_ready() {
+    use super::super::{rpc_pending::OwnedRpcCallback, session::BackendFailure};
+    let original = owner();
+    for (callback, expected) in [(Callback::SdkLogin { success: false }, BackendFailure::AuthenticationRejected),
+        (Callback::HostingAck { success: false }, BackendFailure::HostingRejected),
+        (Callback::Failure(BackendFailure::Expired), BackendFailure::Expired)] {
+        let scope = RpcConnectionScope::fresh();
+        let event = RuntimeEvent { owner: original.clone(), scope: scope.clone(),
+            events: vec![OfflineEvent::Callback(OwnedRpcCallback { owner: original.clone(), callback })] };
+        scope.close(); assert!(event.events_for(&original, &scope).is_none());
+        assert_eq!(event.terminal_failure(&original, &scope), Some(expected));
+        assert_eq!(event.terminal_failure(&owner(), &scope), None);
+        assert_eq!(event.terminal_failure(&original, &RpcConnectionScope::fresh()), None);
+        assert_eq!(event.into_terminal_callback(&original, &scope).unwrap().callback, callback);
+    }
+}
+
+#[test]
+fn terminal_actor_extraction_never_reopens_positive_acks_channels_or_other_owners() {
+    use super::super::rpc_pending::OwnedRpcCallback;
+    let original = owner(); let scope = RpcConnectionScope::fresh(); scope.close();
+    for callback in [Callback::SdkLogin { success: true }, Callback::HostingAck { success: true },
+        Callback::Channels { calls: true, messages: true }] {
+        let event = RuntimeEvent { owner: original.clone(), scope: scope.clone(),
+            events: vec![OfflineEvent::Callback(OwnedRpcCallback { owner: original.clone(), callback })] };
+        assert_eq!(event.terminal_failure(&original, &scope), None);
+        assert!(event.into_terminal_callback(&original, &scope).is_none());
+    }
+    let event = RuntimeEvent { owner: original.clone(), scope: scope.clone(), events: vec![OfflineEvent::Callback(
+        OwnedRpcCallback { owner: owner(), callback: Callback::SdkLogin { success: false } })] };
+    assert_eq!(event.terminal_failure(&original, &scope), None); assert!(event.into_terminal_callback(&original, &scope).is_none());
+}
+
+#[test]
+fn historical_submission_correlation_after_close_is_not_an_open_io_or_ready_receipt() {
+    let original = owner(); let scope = RpcConnectionScope::fresh();
+    let receipt = RuntimeReceipt { owner: original.clone(), scope: scope.clone(), call_id: Some(1) };
+    assert!(receipt.matches(&original, &scope)); scope.close();
+    assert!(!receipt.matches(&original, &scope)); assert!(receipt.submitted_on(&original, &scope));
+    assert!(!receipt.submitted_on(&owner(), &scope)); assert!(!receipt.submitted_on(&original, &RpcConnectionScope::fresh()));
+}
+
+#[test]
+fn cancelled_prepared_runtime_retires_original_scope_before_any_io_exists() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let original = owner();
+    let prepared = prepare(original, PacketRoute::DirectTlsCarrier, parameters(&cert.root), policy(), None).unwrap();
+    let scope = prepared.connection_scope(); assert!(scope.is_open());
+    drop(prepared); assert!(!scope.is_open());
+}
+
+#[tokio::test]
+async fn attaching_io_preserves_prepared_original_scope_and_does_not_close_it_on_seed_drop() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let original = owner();
+    let prepared = prepare(original, PacketRoute::DirectTlsCarrier, parameters(&cert.root), policy(), None).unwrap();
+    let scope = prepared.connection_scope(); let (io, bytes, _, _, dropped) = poll_io(true);
+    let (mut runtime, _events) = prepared.attach(io).unwrap();
+    assert!(runtime.connection_scope().matches(&scope)); assert!(scope.is_open());
+    let receipt = runtime.close().await; assert!(receipt.io_released()); assert!(!scope.is_open());
+    assert!(dropped.load(Ordering::SeqCst)); assert!(bytes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn connecting_time_is_not_removed_from_prepared_tls_deadline_at_attach() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let original = owner(); let mut tls = parameters(&cert.root);
+    tls.handshake_timeout = Duration::from_millis(20);
+    let prepared = prepare(original, PacketRoute::DirectTlsCarrier, tls, policy(), None).unwrap();
+    let scope = prepared.connection_scope(); let (io, bytes, _, _, dropped) = poll_io(false);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(prepared.attach(io).err(), Some(RuntimeError::Tls(TlsError::Timeout)));
+    assert!(!scope.is_open()); assert!(dropped.load(Ordering::SeqCst)); assert!(bytes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn retired_prepared_scope_refuses_attach_and_drops_supplied_io_without_writes() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let original = owner();
+    let prepared = prepare(original, PacketRoute::DirectTlsCarrier, parameters(&cert.root), policy(), None).unwrap();
+    let scope = prepared.connection_scope(); scope.close(); let (io, bytes, _, _, dropped) = poll_io(false);
+    assert_eq!(prepared.attach(io).err(), Some(RuntimeError::Scope));
+    assert!(dropped.load(Ordering::SeqCst)); assert!(bytes.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn write_poll_gate_preserves_offsets_and_checks_original_scope_at_every_submission() {
     let (mut io, bytes, _, _, _) = poll_io(false); let scope = RpcConnectionScope::fresh();

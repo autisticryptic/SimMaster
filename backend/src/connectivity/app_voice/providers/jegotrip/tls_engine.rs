@@ -346,7 +346,7 @@ impl TlsEngine {
 }
 impl Drop for TlsEngine { fn drop(&mut self) { self.close(); } }
 
-fn valid_authority(authority: &str) -> bool {
+pub(super) fn valid_authority(authority: &str) -> bool {
     if authority.is_empty() || authority.len() > 253 || authority.bytes().any(|b| b <= 32 || b >= 127) { return false; }
     if authority.parse::<std::net::IpAddr>().is_ok() { return true; }
     if authority.ends_with('.') { return false; }

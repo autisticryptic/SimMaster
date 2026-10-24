@@ -60,22 +60,40 @@ fn hosts_addresses(hosts: &Hosts, host: &str, port: u16) -> io::Result<Vec<Socke
     Ok(addresses)
 }
 
-/// Resolve numbers without I/O, hosts through Hickory's parser, then names
-/// through the CURRENT system configuration. This function adds no public DNS.
-pub async fn resolve_socket_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+/// File/configuration preparation is separate from polling the network future.
+/// A caller that serializes scope retirement with nonblocking IO polls can do
+/// these synchronous system reads BEFORE taking its poll gate. Nothing global
+/// is cached and the resolver still belongs to the original caller context.
+pub(crate) enum PreparedSocketLookup {
+    Addresses(Vec<SocketAddr>),
+    Name { resolver: TokioResolver, host: String, port: u16 },
+}
+impl PreparedSocketLookup {
+    pub(crate) async fn resolve(self) -> io::Result<Vec<SocketAddr>> {
+        match self {
+            Self::Addresses(addresses) => Ok(addresses),
+            Self::Name { resolver, host, port } => lookup(&resolver, &host, port, LOOKUP_TIMEOUT).await,
+        }
+    }
+}
+pub(crate) fn prepare_socket_addrs(host: &str, port: u16) -> io::Result<PreparedSocketLookup> {
     let host = host_name(host)?;
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(vec![SocketAddr::new(ip, port)]);
+        return Ok(PreparedSocketLookup::Addresses(vec![SocketAddr::new(ip, port)]));
     }
     let hosts = Hosts::from_system().unwrap_or_default();
     let addresses = hosts_addresses(&hosts, host, port)?;
-    if !addresses.is_empty() {
-        return Ok(addresses);
-    }
+    if !addresses.is_empty() { return Ok(PreparedSocketLookup::Addresses(addresses)); }
     let mut builder = TokioResolver::builder_tokio()
         .map_err(|error| io::Error::other(format!("dns_system_config_failed:{error}")))?;
     configure_system_options(builder.options_mut());
-    lookup(&builder.build(), host, port, LOOKUP_TIMEOUT).await
+    Ok(PreparedSocketLookup::Name { resolver: builder.build(), host: host.to_owned(), port })
+}
+
+/// Resolve numbers without I/O, hosts through Hickory's parser, then names
+/// through the CURRENT system configuration. This function adds no public DNS.
+pub async fn resolve_socket_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    prepare_socket_addrs(host, port)?.resolve().await
 }
 
 fn configure_system_options(options: &mut ResolverOpts) {
