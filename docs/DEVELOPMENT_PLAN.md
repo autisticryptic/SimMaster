@@ -6,9 +6,9 @@
 
 ## 当前基线与工作规则
 
-- 315原生Router/Channel边界由65fad23 Build40017848477/Beta40017848512/双架构及官方SHA ZIP各315＋4/86验证，383static/mock、Release skip、59warnings/19Jegotrip excerpts保留。继续手动原SHA只读IDA，F556A0/F537FC补normalDATA/Start带payload重传descriptor；原selector/userid/token的native logoutSession serializer/result已证实，新增rpc_logout/ARC私有reply/actor semantic wait+Join确认IO release，RuntimeCommands仅clone原命令引用。Controller保持originalbackend_owner跨callback退休/expiry/failure、先关logicalcallbacks再原IO注销/退役、失败/取消cleanup保留owner等待，不伪造imported-only unregister。最新341 source＋4待Actions，384Pythonstatic/mockPASS（旧guardclone字面误报已恢复并加强originalowner断言）；commandProperty/Login/Binding/Gateway Dropwipe，source review辅助Azure400无结论，不当signoff。仍真HostingBackend/provision/endpointbinding/Unregister ACK/persistAPI/SMS/callmedia/trunk/feesrenewal未接完整，quiet继续，不设备服务/IDB/target/本机Rust。
+- **当前代码 `8e9a570` 已验证**：Build40045409934/Beta40045409943、ARM64/AMD64成功；两套官方SHA测试ZIP各逐名355 Jegotrip＋4共享/原SIP、原86矩阵通过，387本机static/mock，Release skipped，60warnings/20Jegotrip excerpts保留。原STATUS3内层结果与外层ACK/SDK logout/IO release分层；独立deadline覆盖所有后续IO及晚到结果，完整aggregate/queue admission在cancel guard前，同响应fallible发送/事件交付完成后才发布成功。两个readonly source reviews完成，main修复三具体缺口；不把source inspection或offline CI当实网/完整backend。Controller原backend_owner、commands-only clone、Secret Dropwipe与失败cleanup保留均保持，无设备/服务/部署/IDB写/target执行或本机Rust。
 
-- 用户已手动开原SHA libmtc.so/只读IDA；native_router/channel边界草稿新增kind2/3/2048-bit bookkeeping/u16双向邻片、8/10hdr/LSB ACK/gap31/BE16/FE-FF records，source315＋4SIP待Actions，383static/mock首PASS待最新cleanup修后复跑。源审查job_mvledrqc_9两问题main已修（allinput半片expiry、ownedDrop/几何grow-before-wipe/预reserve精确join），非编译signoff。仅协议数据primitives未Roottrust/socket/provider/authready，fulltiming/NetStream/provision/connector/HostingBackend/独立account persistAPI/SMS/callmedia/trunk/费用并发仍按八步继续；不把旧ed6绿灯替新验证，不IDB写/target或设备服务/本机Rust。
+- `60c6c64`的341＋4/86已由Build40026210652/Beta40026210599及双架构/官方SHA核验；`65fad23`的315＋4/86由Build40017848477/Beta40017848512核验。Router/Channel kind2/3、2048-bit统计不drop duplicate、16-bit邻片、8/10header/LSB ACK/gap31/BE16/FE-FF为数据边界；缓存expiry/owned Dropwipe问题已修。尚未接完整liveNetStream/时序/路由/可信connector，不授provider/channel/outbound。先复用23日志中用户已开IDA后的139次只读调用与原SHA ELF，仅具体缺证据才请求同文件MCP，不能把旧gate或缺实网配置当停止理由。
 
 - 当前部署/config/reference/ownedbootstrap子阶段`ed6fb33`已由Build39983918744/Beta39983918718/ARM64+AMD64验证，官方SHA ZIP各281＋4old/sharedSIP及86矩阵逐项核验，381静态mock通过、Release skip；57warnings/17Jegotrip excerpts保留。salt8DES-CBC-PKCS5/1000MD5仅配置unwrap，explicitClient/Reference contextkey，无SDKdefault/auth；facet/id/adapter-locator/explicit -h/-p是候选数据，私有originalowner/scopebootstrap与actor配置event不改TLStrust/授ready。partialreview3issues main修、dropwipe/确定padding负例，非fullreview；仍fullRouterNetStream/provision/可信endpointconnector/providerpersistAPI/SMSmedia费用续期并发未接通。无本机Rust/设备服务部署，该已验证解码子阶段未使用IDA，unsupported/outboundfalse。
 
@@ -40,11 +40,11 @@
 
 ## P0：无忧行 backend 的实施顺序与原生证据关口
 
-用户要求持续规划并完成 backend，仅完成或确实需要手动 IDA 时汇报。当前源码仍为已验证 `ed6fb33`，不把部署解码和 caller-IO actor 当作完整客户端。实施顺序：
+用户要求持续规划并完成 backend，仅完成或确实需要手动 IDA 时汇报。当前已验证代码为 `8e9a570`；部署解码、caller-IO actor及原会话注销接线仍不等于完整客户端。实施顺序：
 
 | 顺序 | 必须交付的实际行为 | 不能用什么替代 |
 | --- | --- | --- |
-| 1 | Router/NetStream 控制、序号环绕/乱序、缓存清退、重传/MTU/路径与真实流生命周期 | 当前仅有序 part2/3、原样 header 或接上 TcpStream |
+| 1 | Router/NetStream 控制、序号环绕/乱序、缓存清退、重传/MTU/路径与真实流生命周期 | 已有数据codec/缓存、原样header或接上TcpStream |
 | 2 | 原导入/匹配 bootstrap 的 endpoint-authority-root 绑定、分连接 scope 与原 attempt 生命周期 | 从解密成功猜地址/根、复用旧 scope、替换活动 TLS IO |
 | 3 | 真正 HostingBackend 及 bounded event pump，SDK/hosting/channel ACK 分层、注销/取消/超时原归属 | submission receipt、模拟 callback 或仅安装 descriptor |
 | 4 | 独立 app-account line、私有凭据/配置持久化和脱敏管理 API、启动/停止/重建隔离 | 伪造 ICCID/五码/UICC、重启恢复 cached ready |
@@ -55,9 +55,9 @@
 
 已核对 `app_voice/registry` 仅 descriptor/availability、API 仅 metadata；`line_registry` 只注册真实 modem/reader/五码虚拟 SIM；SMS/voice/trunk 的 `AccessPathKind` 仅三种 3GPP/CS 路径。后端接线必须新增独立 app-account 归属，不把原 IMS/WLAN 免费规则套用应用收费。原 native PDU inbox 的 commit-before-ACK 模式可借鉴，不能伪造 SIM/PDU scope。
 
-**当前确需用户手动 IDA 的具体关口**：已对原 SHA ELF 做 FDE 有界静态复核，Router receiver `D68010` 调 `D66270`（2048-bit window/时间反馈/状态重置），`D6429C` 发送 kind3/part1，part2/3 在 16-bit 环绕下双向寻找邻片；重复位仅退出统计更新，调用者并未直接 drop payload。不能凭这些局部分支发明完整 ACK/重传/NetStream ready/lifecycle。现有无完整 NetStream 类型/控制流与 timer/callback 解编译，Rust 仍拒绝控制 kind2/3。随后还需核实 `Mtc_SgwDeliSipInvite` 与 Smgw receiver 注册/消息编码/媒体回调，不猜 direct SIP 或短信类型。
+**剩余原生关口**：Router数据controls/16-bit邻片/2048-bit统计与Channel header/SACK/record/retransmit descriptor已有证据及codec；原会话SDK logout和STATUS3 semantic ACK已验证。完整NetStream ready/时序/选路/重传生命周期、正常provision到endpoint-authority-root绑定、业务channel及call/media仍需闭环，不能用codec存在或ACK成功替代。原Smgw登记`Sip.Request`、SDK/app text/可选millis已确认；不能把所有generic消息或本地UUID自动当SMS类别/remote delivery ID，更不猜PDU/direct SIP/RTP/费用。
 
-只需用户打开现有 `.local/jegotrip/libmtc.so`（base0、原 SHA），等待分析并启用既有 IDA MCP；不需另开 APK/其他库、不运行设备/服务。仅只读 decompile/disassembly/xrefs/vtable，不编辑 IDB、不自行启动/加载。详尽源文件映射、验收与局限保存在 `.local/jegotrip/backend-implementation-plan.md`、`backend-native-function-frontier.json`。两只读 subagent 因 provider encrypted-content400失败无结论，主线程独立复核；该错误不是 IDA 必要性的理由。当前无新 Rust/backend 实现或 provider 启用，完整任务保持 open。
+此前用户已打开原SHA/base0的`.local/jegotrip/libmtc.so`。23日志保存139次只读MCP调用，包含NetStream构造/回调、Channel和SipGateway代理；先整理并复用已有结果/FDE，再针对真实missing函数/类型决定是否需用户恢复同文件MCP。当前MCP cached/notlistening本身不构成证据缺口，不自行启动/加载/改IDB，也不要求手机/服务或其他库。八步计划及精确FDE metadata在`.local/jegotrip/backend-implementation-plan.md`、`backend-native-function-frontier.json`；新注销报告为`verified-native-8e9a570.json`。早期两subagent encrypted-content400无结论不当review/IDA理由；本轮两readonly source reviews完成而非执行signoff。完整backend保持open、provider unsupported、outboundfalse。
 
 ## P0：第一批补全的交付核验
 
