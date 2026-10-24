@@ -78,6 +78,9 @@ impl DuplexConnector {
     pub(crate) fn captured_scope(&self) -> Option<RpcConnectionScope> {
         lock(&self.captured).as_ref().map(|(_, scope)| scope.clone())
     }
+    pub(crate) fn captured_scope_is_open(&self) -> bool {
+        lock(&self.captured).as_ref().is_some_and(|(_, scope)| scope.is_open())
+    }
     pub(crate) fn connection_calls(&self) -> usize { self.calls.load(Ordering::SeqCst) }
 }
 impl RuntimeConnector for DuplexConnector {

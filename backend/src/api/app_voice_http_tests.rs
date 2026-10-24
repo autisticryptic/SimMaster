@@ -1,4 +1,4 @@
-//! Included inside main's Actions-only real HTTP/router test module.
+// Included inside main's Actions-only real HTTP/router test module.
 mod app_voice_accounts {
     use super::*;
     use crate::connectivity::app_voice::providers::jegotrip::{account_store, account_test_support::config_json,
@@ -161,12 +161,12 @@ mod app_voice_accounts {
         assert_eq!(hosted["data"]["io_cleanup_required"], true);
         assert_eq!(hosted["data"]["incoming_call_ready"], false); assert_eq!(hosted["data"]["incoming_message_ready"], false);
         assert_eq!(hosted["data"]["outbound_authorized"], false); assert_eq!(hosted["data"]["provider_availability"], "unsupported");
-        let original = connector.captured_scope().unwrap(); assert!(original.is_open());
+        assert!(connector.captured_scope_is_open());
         let (status, headers, body) = account_request(&served, reqwest::Method::POST, &format!("{path}/stop"),
             Some(serde_json::json!({"expected_revision":1})), Some(&cookie)).await;
         assert_eq!(status, StatusCode::OK, "{body}"); no_store(&headers); no_secrets(&body);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["io_cleanup_required"], false);
-        assert!(!original.is_open()); assert!(dropped.load(Ordering::SeqCst)); assert_eq!(factory.build_count(), 1);
+        assert!(!connector.captured_scope_is_open()); assert!(dropped.load(Ordering::SeqCst)); assert_eq!(factory.build_count(), 1);
         serving.await.unwrap();
     }
 
