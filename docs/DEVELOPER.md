@@ -328,7 +328,7 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 
 ### 完整 backend 的下一实施关口（持续）
 
-按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)补完整Router/NetStream、trusted connector/HostingBackend/event pump，再接独立app-account line/private persistence/API、verified SMS分类/commit-before-ACK、calls/media/trunk与独立费用/续期/并发。现有provider registry/API仍为metadata-only，应用账号不伪装UICC/PDU或免费VoWiFi。先复用23日志中用户已开原SHA/base0 IDA后的139次只读调用和ELF/FDE；初始cached/notlistening后lazyconnect＋get_metadata已成功确认同原libmtc.so/base0/SHA，继续只读IDA，无需用户重复打开；仅新的具体missing函数/类型才请求手动操作，不自行加载或改IDB。
+按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)继续完整Router/NetStream、正常provision/locator与原可信映射。显式profile HostingBackend/event pump、独立app-account私有配置/API和generic durable inbox已在`d666f10`验证，不能继续把它们写成未实现，也不能升级为已分类SMS/call/media/trunk。global provider仍未安装，应用账号不伪装UICC/PDU或免费VoWiFi。先复用23日志139次只读调用和原SHA ELF/FDE；24轮同libmtc.so/base0已核对，本次存储/inbox无新IDA调用或手动打开需求。下一真正缺函数/类型时再实时核对MCP，不自行加载或改IDB。
 
 ### Router/Channel 原生边界（`65fad23`已验证）
 
@@ -360,9 +360,29 @@ Build40045409934/Beta40045409943/ARM64 AMD64 success、Release skipped。官方S
 
 Build40057801164/Beta40057801104/ARM64 AMD64成功、Release skipped，官方SHA测试ZIP各逐名394 Jegotrip＋4共享/原SIP、7既有DNS、86矩阵通过；Build artifact12546610143 SHA`9ee166d0c7e016cd9590b0285c524ab2295c60a72982ee97a0c4186a7f3501bb`，Beta12546077296 SHA`4cf5a2c2005e1348c30b497769ebc2b9991d3caa9033af40f06194409dd19f6d`。391static/mock，57warnings/17Jegotrip节选保留。首lookup_host static失败未豁免guard而改shared prepared DNS；首9809ae7 Beta E0618 callback shadow以fixture-onlyd593551修复，failedZIP/annotations保留。代码helper只写两文件+16source tests，main补2并修terminal/ENC/device/Join slot/poll死锁与logout race；不当review/实网signoff，readonly辅助timeout无findings。两新module filters已实际执行，证据`.local/jegotrip/verified-native-d593551.json`、`runtime-backend-implementation-evidence.md`。仍完整NetStream/路由/正常provision原endpoint绑定、accountline私有存储API、durableSMS/callmedia/trunk/独立费用续期并发缺口，transport_implemented=false/providerunsupported/outboundfalse。
 
-1. 继续确认 SDK 外线登录/网关帧、通知、注销、续期以及 Linux 兼容的实现路径。
-2. 实现完整 backend 后才接入凭据持久化、线路配置和 provider 注册。
-3. 对接来电、接收短信至现有 trunk/消息工作流；发送行为和资费独立，不继承 IMS 免费假设。
+### 独立应用账号与通用消息耐久入站（`d666f10`已验证）
+
+- `account_config.rs`保存原SDK/网关两层凭据和显式`direct_tls_carrier` profile；identity/DeviceId/ClientId/selector/authority/root/引用与binary属性分开，严格验证后才落库或start，无默认值。私有JSON version1、256KiB预分配zeroizing buffer，Secret/config无公开Serialize；SQLite页缓存/解析器临时内存不保证擦除。**data.db为机器本地明文私有存储，不是加密保险箱**；备份/目录权限须保护，API无凭据导出。
+- `account_store.rs`独立`app_voice_accounts`，随机本地`app-account-`＋32hex ID不冒充远程ID或ICCID；cap64、IMMEDIATE事务、严格revision CAS、失败/溢出不更新。原provider id始终`app_voice`；早期新schema误写`app-voice`已原子迁移，保留配置/版本/时间及失败回滚，不更改既有产品id或未知对象。
+- `account_runtime.rs`由AppState拥有，startup不连接/恢复cached ready。显式start构造真正NativeHostingBackend，await/连接前保留原run/controller/Join；取消同步retire旧scope，stop按原STATUS3→SDKlogout→Join，实际释放后才能replace/delete/restart。配置revision变化终止旧scope而不重绑定，原negative reason保留；global provider/Channels/外发仍false。
+- `account_inbox.rs`保存generic原body/sender/time及原receiver object/domain/kind；line/revision/run nonce与actual direct call-id或batch peer-incarnation/sequence定义本地dedup，NULL不等于empty，同key不同bytes/binding拒绝。旧schema新增binding列保持NULL unknown，不从当前profile填补历史。raw＋`app_voice.inbox_stored`脱敏event同事务commit，之后才提交原借用consumer ticket；这是持久接收generic bytes，不是SMS类别、内容编码或媒体证明。
+- 64KiB/字段、128行/账号、2048全局、16MiB原消息与receiver累计配额；不驱逐已持久化未知消息腾位置。native queue压力保留16项/1MiB原消息票据，重试不重复event；direct只记`direct_submitted`，batch只记`batch_queued`，不是peer ACK。回执标记SQL失败保留原data但不重发已消费ticket；close竞争下已接收观察可能历史提交，不授新scope，已发字节不宣称可召回。显式删除账号同CAS事务只清其私有inbox，脱敏历史event保留。
+
+| 管理接口（沿用既有认证，响应`Cache-Control: no-store`） | 行为 |
+| --- | --- |
+| `GET/POST /api/non-3gpp/accounts` | 列脱敏状态；单账号创建要求`provider_id: app_voice`与完整`config`，不start |
+| `GET/PUT /api/non-3gpp/accounts/{line_id}` | 只读metadata；全量替换要求`expected_revision`，活跃IO先停止 |
+| `DELETE /api/non-3gpp/accounts/{line_id}?expected_revision=N` | CAS删除；不借新配置清理旧owner |
+| `POST .../{line_id}/start`、`POST .../{line_id}/stop` | JSON `expected_revision`；202只代表原RPC提交，stop需原IO释放 |
+| `GET .../{line_id}/inbox?limit=1..128` | 仅本地row id、unclassified、回执层级和时间，无raw/body/sender/凭据导出 |
+
+Build40114399262/Beta40114399090/ARM64 AMD64成功、Release skipped；官方SHA测试ZIP逐名各**445 Jegotrip＋6真实production-router/auth HTTP＋4共享/原SIP＋7DNS、原86矩阵**核验。Build12568140922 SHA`b1f1aed6cf7ee83072a809334677c54b25bba74401c1976c506d4c775332a142`，Beta12567913303 SHA`3b907263daef37e544346c447c52be92067dd914b9606774130d24b78ac3f39e`；401本机static/mock，56warnings/16Jegotrip节选保留。REST quota403后从官方公开run页面取同artifact-id/digest、job页面核对双架构succeeded，结合先前已保存实际REST success；仍逐名/矩阵/源码fingerprint严格审计，非第三方自报hash或仅绿灯。证据`verified-native-d666f10.json`含每官方网页URL/文件SHA，`app-inbox-implementation-evidence.md`说明边界。
+
+前账号阶段3b7356d为423＋5HTTP/core76493e3为442＋6HTTP，各有独立两Actions/SHA证据。首d5e26a2 E0753/E0624仅修测试include注释/私有scope观察；第二b309c0f core421通过但3HTTP因错误provider id返回501，已纠正真实schema/fixture并加迁移回归，四份失败ZIP/annotations全部保留，未削断言。源码贡献辅助partial限流、只读review Azure资源400没有结论；main独立复核/Actions不冒充完整review或实网。无本机Rust/前端/peer/注册模拟，无设备/真实服务/部署/NV/IDA写；未改UI，仍需SMS可靠分类/业务promotion、默认native路径、媒体/Trunk、独立费用续期并发。
+
+1. 继续确认正常SDK provisioning/locator、完整NetStream/Router控制和可信原连接映射。
+2. 在已验证独立账号与generic inbox上补原消息分类/业务promotion，不能提前安装可用provider或Channels。
+3. 对接真实来电、接收短信至trunk/消息工作流；发送行为和资费独立，不继承IMS免费假设。
 4. 用户有可用参数后，另行授权验证过期、掉线、并发设备、真实收短信及双向通话。
 
 当前有静态证据、契约及offline codec/owned协议测试，但没有设备、服务端或资费验收。
