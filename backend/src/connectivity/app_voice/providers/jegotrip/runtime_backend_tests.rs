@@ -317,8 +317,8 @@ async fn original_controller_login_nested_hosted_ack_unregistration_sdk_logout_j
     let original = controller.start(100).await.unwrap(); assert_eq!(controller.phase(), Phase::SdkLoginPending);
     let event = callback(&mut events).await; assert_eq!(event.owner(), &original);
     let scope = event.connection_scope(); let captured = lock(&connector.captured); assert!(captured.as_ref().unwrap().1.matches(&scope)); drop(captured);
-    let BackendEventPayload::Callback(callback) = event.payload else { unreachable!() };
-    assert!(controller.on_callback(&callback.owner, callback.callback, 100).await.unwrap());
+    let BackendEventPayload::Callback(sdk_callback) = event.payload else { unreachable!() };
+    assert!(controller.on_callback(&sdk_callback.owner, sdk_callback.callback, 100).await.unwrap());
     let event = callback(&mut events).await;
     assert!(event.matches(&original, &scope));
     let BackendEventPayload::Callback(callback) = event.payload else { unreachable!() };
