@@ -6,6 +6,8 @@
 
 ## 当前基线与工作规则
 
+- **当前代码 `d593551` 已验证**（实现9809ae7，首E0618 callback fixture shadow修复）：Build40057801164/Beta40057801104、ARM64/AMD64成功，官方SHA测试ZIP各精确394 Jegotrip＋4共享/原SIP＋7原DNS/原86矩阵通过；391static/mock，57warnings/17Jegotrip excerpts保留，Release skipped。真实RuntimeConnector/PreparedRuntime/NativeHostingBackend原owner/physical scope接线、shared Hickory prepared DNS与逐poll gate、owned callback/poll/semantic unregister/SDKlogout/Join cleanup已实现，仅显式 supplied DirectTlsCarrier profile。不是默认SDK自动provision/locator、全Router/NetStream/媒体或已安装provider；Channels/外发仍false。状态及首失败见`.local/jegotrip/runtime-backend-implementation-evidence.md`。
+
 - **当前代码 `8e9a570` 已验证**：Build40045409934/Beta40045409943、ARM64/AMD64成功；两套官方SHA测试ZIP各逐名355 Jegotrip＋4共享/原SIP、原86矩阵通过，387本机static/mock，Release skipped，60warnings/20Jegotrip excerpts保留。原STATUS3内层结果与外层ACK/SDK logout/IO release分层；独立deadline覆盖所有后续IO及晚到结果，完整aggregate/queue admission在cancel guard前，同响应fallible发送/事件交付完成后才发布成功。两个readonly source reviews完成，main修复三具体缺口；不把source inspection或offline CI当实网/完整backend。Controller原backend_owner、commands-only clone、Secret Dropwipe与失败cleanup保留均保持，无设备/服务/部署/IDB写/target执行或本机Rust。
 
 - `60c6c64`的341＋4/86已由Build40026210652/Beta40026210599及双架构/官方SHA核验；`65fad23`的315＋4/86由Build40017848477/Beta40017848512核验。Router/Channel kind2/3、2048-bit统计不drop duplicate、16-bit邻片、8/10header/LSB ACK/gap31/BE16/FE-FF为数据边界；缓存expiry/owned Dropwipe问题已修。尚未接完整liveNetStream/时序/路由/可信connector，不授provider/channel/outbound。先复用23日志中用户已开IDA后的139次只读调用与原SHA ELF，仅具体缺证据才请求同文件MCP，不能把旧gate或缺实网配置当停止理由。
@@ -40,7 +42,7 @@
 
 ## P0：无忧行 backend 的实施顺序与原生证据关口
 
-用户要求持续规划并完成 backend，仅完成或确实需要手动 IDA 时汇报。当前已验证代码为 `8e9a570`；部署解码、caller-IO actor及原会话注销接线仍不等于完整客户端。实施顺序：
+用户要求持续规划并完成 backend，仅完成或确实需要手动 IDA 时汇报。当前已验证代码为 `d593551`；显式profile连接/HostingBackend驱动、部署解码和注销接线仍不等于完整默认SDK客户端。实施顺序：
 
 | 顺序 | 必须交付的实际行为 | 不能用什么替代 |
 | --- | --- | --- |

@@ -352,6 +352,14 @@ Build40045409934/Beta40045409943/ARM64 AMD64 success、Release skipped。官方S
 
 ### 5. 下一阶段与验收条件
 
+### 显式原会话连接与HostingBackend（`d593551`已验证）
+
+`runtime_connector.rs`只接显式direct tcp reference＋原authority/root/SNI；adapter/locator和其它scheme不当tcp默认值。ConnectedIo原owner/physical scope/request字段先捕获、consume精确匹配，Root/cert仍由原TLS引擎验证；PreparedRuntime在connect前拥有原ARC/TLS/scope，attach不mint scope或重开TLS期限，取消prepared立即retire。shared Hickory的hosts/配置准备在gate外，实际网络future每poll同旧scopegate，4秒DNS/10秒connect组及地址数量有界；没有系统hostname fallback或active IO替换。此轮不执行真实连接，只有Actions memory/loopback peers。
+
+`runtime_backend.rs`实现真正HostingBackend原connector/actor调用、bounded eventpump与poll、SDK成功原callback后scheduler配置、register submission/原status3 inner semantic/SDKlogout/owningJoin分层，closed ARC negative理由保留而不开放positive ACK/messages/channels。原owning handle在attach/spawn前拿slot，失败/取消cleanup保留原Join；poll admission只与logout起始串行，不能阻塞status3所需后续poll。记忆原result/已确认release不重放unregister/logout，不允许旧owner新start，borrowedconsumer票据无提前ACK。Profile值是显式原配置数据，不默认ClientId/DeviceId/selected-session；configured DeviceId不能丢弃，Common reference ENC只给显式key解码。此版本尚不自动bootstrap/locator/connection handoff、不装provider/Channels true/外发授权。
+
+Build40057801164/Beta40057801104/ARM64 AMD64成功、Release skipped，官方SHA测试ZIP各逐名394 Jegotrip＋4共享/原SIP、7既有DNS、86矩阵通过；Build artifact12546610143 SHA`9ee166d0c7e016cd9590b0285c524ab2295c60a72982ee97a0c4186a7f3501bb`，Beta12546077296 SHA`4cf5a2c2005e1348c30b497769ebc2b9991d3caa9033af40f06194409dd19f6d`。391static/mock，57warnings/17Jegotrip节选保留。首lookup_host static失败未豁免guard而改shared prepared DNS；首9809ae7 Beta E0618 callback shadow以fixture-onlyd593551修复，failedZIP/annotations保留。代码helper只写两文件+16source tests，main补2并修terminal/ENC/device/Join slot/poll死锁与logout race；不当review/实网signoff，readonly辅助timeout无findings。两新module filters已实际执行，证据`.local/jegotrip/verified-native-d593551.json`、`runtime-backend-implementation-evidence.md`。仍完整NetStream/路由/正常provision原endpoint绑定、accountline私有存储API、durableSMS/callmedia/trunk/独立费用续期并发缺口，transport_implemented=false/providerunsupported/outboundfalse。
+
 1. 继续确认 SDK 外线登录/网关帧、通知、注销、续期以及 Linux 兼容的实现路径。
 2. 实现完整 backend 后才接入凭据持久化、线路配置和 provider 注册。
 3. 对接来电、接收短信至现有 trunk/消息工作流；发送行为和资费独立，不继承 IMS 免费假设。

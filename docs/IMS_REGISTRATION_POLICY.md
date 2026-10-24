@@ -455,6 +455,8 @@ Build40045409934/Beta40045409943/ARM64 AMD64 success，Release skipped；官方S
 
 ## 10. 验证清单与验收标准
 
+显式profile原连接/HostingBackend驱动`d593551`已由Build40057801164/Beta40057801104/双架构/officialSHA测试ZIP各394＋4SIP＋7原DNS/86矩阵核验，391static/mock、57warnings/17Jegotrip节选保留，Release skipped。RuntimeConnector/PreparedRuntime先持原owner/scope，shared prepared Hickory DNS配置在gate外/网络每poll核验；真实owned callbacks/poll/原status3 semantic/SDKlogout/owningJoin、closed negative原因与retained取消cleanup，不提前consumer ACK。只承诺显式 supplied DirectTlsCarrier，不猜默认provision/locator/route/ClientId/session/root，不以成功连接/receipt授Channels/provider/费用。首系统lookup guard失败按原架构修、首E0618 fixture shadow保留官方failedZIP后修复；本机无Rust/前端编译或peer运行、未设备服务/部署/IDA写。完整accountline/privateAPI/durableSMS/调用媒体/独立费用等仍open，不能改称完整backend或仅剩实机。
+
 构建/Rust/注册模拟仅走 GitHub Actions，流程见 [开发指南](DEVELOPER.md)。
 手册不替代测试报告；当前已核验的 commit、运行记录与实机范围见 [HANDOFF](HANDOFF.md)。
 
