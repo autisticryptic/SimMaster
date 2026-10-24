@@ -57,7 +57,7 @@
 
 **剩余原生关口**：Router数据controls/16-bit邻片/2048-bit统计与Channel header/SACK/record/retransmit descriptor已有证据及codec；原会话SDK logout和STATUS3 semantic ACK已验证。完整NetStream ready/时序/选路/重传生命周期、正常provision到endpoint-authority-root绑定、业务channel及call/media仍需闭环，不能用codec存在或ACK成功替代。原Smgw登记`Sip.Request`、SDK/app text/可选millis已确认；不能把所有generic消息或本地UUID自动当SMS类别/remote delivery ID，更不猜PDU/direct SIP/RTP/费用。
 
-此前用户已打开原SHA/base0的`.local/jegotrip/libmtc.so`。23日志保存139次只读MCP调用，包含NetStream构造/回调、Channel和SipGateway代理；先整理并复用已有结果/FDE，再针对真实missing函数/类型决定是否需用户恢复同文件MCP。当前MCP cached/notlistening本身不构成证据缺口，不自行启动/加载/改IDB，也不要求手机/服务或其他库。八步计划及精确FDE metadata在`.local/jegotrip/backend-implementation-plan.md`、`backend-native-function-frontier.json`；新注销报告为`verified-native-8e9a570.json`。早期两subagent encrypted-content400无结论不当review/IDA理由；本轮两readonly source reviews完成而非执行signoff。完整backend保持open、provider unsupported、outboundfalse。
+此前用户已打开原SHA/base0的`.local/jegotrip/libmtc.so`。23日志保存139次只读MCP调用，包含NetStream构造/回调、Channel和SipGateway代理；先整理并复用已有结果/FDE，再针对真实missing函数/类型决定是否需用户恢复同文件MCP。初始cached/notlistening后lazyconnect＋get_metadata已成功确认同原libmtc.so/base0/SHA，继续只读分析，不需用户重开；仍不自行启动/加载/改IDB，也不要求手机/服务或其他库。八步计划及精确FDE metadata在`.local/jegotrip/backend-implementation-plan.md`、`backend-native-function-frontier.json`；新注销报告为`verified-native-8e9a570.json`。早期两subagent encrypted-content400无结论不当review/IDA理由；本轮两readonly source reviews完成而非执行signoff。完整backend保持open、provider unsupported、outboundfalse。
 
 ## P0：第一批补全的交付核验
 

@@ -328,7 +328,7 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 
 ### 完整 backend 的下一实施关口（持续）
 
-按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)补完整Router/NetStream、trusted connector/HostingBackend/event pump，再接独立app-account line/private persistence/API、verified SMS分类/commit-before-ACK、calls/media/trunk与独立费用/续期/并发。现有provider registry/API仍为metadata-only，应用账号不伪装UICC/PDU或免费VoWiFi。先复用23日志中用户已开原SHA/base0 IDA后的139次只读调用和ELF/FDE；当前MCP cached/notlistening不单独作为重开理由，只有具体missing函数/类型才请求同文件MCP，不自行加载或改IDB。
+按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)补完整Router/NetStream、trusted connector/HostingBackend/event pump，再接独立app-account line/private persistence/API、verified SMS分类/commit-before-ACK、calls/media/trunk与独立费用/续期/并发。现有provider registry/API仍为metadata-only，应用账号不伪装UICC/PDU或免费VoWiFi。先复用23日志中用户已开原SHA/base0 IDA后的139次只读调用和ELF/FDE；初始cached/notlistening后lazyconnect＋get_metadata已成功确认同原libmtc.so/base0/SHA，继续只读IDA，无需用户重复打开；仅新的具体missing函数/类型才请求手动操作，不自行加载或改IDB。
 
 ### Router/Channel 原生边界（`65fad23`已验证）
 
