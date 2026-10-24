@@ -1182,7 +1182,7 @@ async fn main() -> Result<()> {
         let accounts=app_state.app_accounts.clone();let mut shutdown=app_state.shutdown.clone();
         tokio::spawn(async move {
             shutdown.wait().await;
-            tokio::time::timeout(Duration::from_secs(20),accounts.shutdown_all()).await
+            tokio::time::timeout(std::time::Duration::from_secs(20),accounts.shutdown_all()).await
         })
     };
 
@@ -1447,7 +1447,7 @@ async fn main() -> Result<()> {
         Ok(Ok(failed))=>warn!(failed,"Application account shutdown had unconfirmed cleanup results"),
         _=>warn!("Application account shutdown deadline reached; original scopes retired without fabricating release proof"),
     }
-    if tokio::time::timeout(Duration::from_secs(3),app_notification_worker.join()).await.is_err(){
+    if tokio::time::timeout(std::time::Duration::from_secs(3),app_notification_worker.join()).await.is_err(){
         warn!("Application notification drain deadline reached; outstanding claims remain unconfirmed");
     }
     drop(app_notification_worker);
