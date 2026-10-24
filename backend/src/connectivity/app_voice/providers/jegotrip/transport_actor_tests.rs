@@ -112,7 +112,7 @@ async fn cancelling_original_command_during_send_terminates_and_releases_actor_i
     let (io, bytes, _, _, dropped) = poll_io(true);
     let (_commands, commands) = mpsc::channel(MAX_COMMANDS); let (events, _events) = mpsc::channel(MAX_EVENTS);
     let mut actor = Actor { io: Some(io), owner: original, scope: scope.clone(), backend, tls, commands, events,
-        policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new(), logout_pending: None };
+        policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new(), logout_pending: None, unhosting_pending: None };
     let (mut completion, receiver) = oneshot::channel();
     {
         let sending = actor.send_wire(&wire, Some(&mut completion)); tokio::pin!(sending);
@@ -280,6 +280,213 @@ async fn real_duplex_batch_ack_is_not_hosting_success_and_original_message_compl
     assert!(hosting); let ticket = ticket.unwrap(); runtime.complete_direct(&original, &scope, &ticket, true).await.unwrap();
     assert!(runtime.complete_direct(&original, &scope, &ticket, true).await.is_err());
     assert!(runtime.close().await.io_released()); received.await.unwrap();
+}
+
+async fn commands_logged_in(commands:&RuntimeCommands,original:&AttemptOwner,scope:&RpcConnectionScope,events:&mut mpsc::Receiver<RuntimeEvent>) {
+    tokio::time::timeout(Duration::from_secs(2),async {loop {match commands.login(original,scope,login(),&[]).await {
+        Ok(_)=>break,Err(RuntimeError::Tls(TlsError::NotReady))=>tokio::time::sleep(Duration::from_millis(5)).await,Err(e)=>panic!("login {e:?}"),
+    }}}).await.unwrap();let event=tokio::time::timeout(Duration::from_secs(2),events.recv()).await.unwrap().unwrap();
+    assert!(matches!(&event.events_for(original,scope).unwrap()[0],OfflineEvent::Callback(c) if c.callback==(Callback::SdkLogin{success:true})));
+    commands.configure(original,scope,7,None).await.unwrap();
+}
+fn unhosting_swap_result(sequence:Option<i32>,accepted:bool)->super::super::rpc_stream::RpcBytes {
+    let mut writer=Writer::new();writer.boolean(true).unwrap();for word in [9,1,1,7,1,1]{writer.u32(word).unwrap();}
+    writer.u32(0).unwrap();writer.u32(u32::from(sequence.is_some())).unwrap();
+    if let Some(sequence)=sequence {writer.i32(sequence).unwrap();writer.u32(0).unwrap();writer.bytes(&[0,u8::from(accepted),0,0,0,0]).unwrap();}
+    writer.properties(&[]).unwrap();writer.bytes(b"").unwrap();writer.finish()
+}
+
+#[tokio::test]
+async fn native_unregistration_waits_for_original_nested_bool_then_keeps_io_for_sdk_logout() {
+    for accepted in [true,false] {
+        let cert=Certificates::generate("DNS:fixture.invalid");let original=owner();let (client,server)=tokio::io::duplex(65_536);
+        let (mut runtime,mut events)=start(client,original.clone(),PacketRoute::DirectTlsCarrier,parameters(&cert.root),policy(),None).unwrap();let scope=runtime.connection_scope();
+        let mut peer=Peer{io:server,server:cert.server(&rustls::version::TLS13),network:PacketStreamDecoder::default(),plaintext:super::super::tls_plaintext::PlaintextPacketDecoder::default(),assembler:CallAssembler::default(),received:std::collections::VecDeque::new()};
+        let server=tokio::spawn(async move {
+            let message=peer.receive().await.unwrap();let request=decode_request(message.payload.expose_to_transport()).unwrap();peer.send_reply(request.call_id,&login_result()).await;
+            let message=peer.receive().await.unwrap();let request=decode_request(message.payload.expose_to_transport()).unwrap();assert_eq!(request.method,super::super::rpc_batch::SWAP_CALLS_METHOD.as_bytes());
+            let mut arguments=super::super::rpc_stream::Reader::versioned(request.arguments).unwrap();arguments.bytes().unwrap();arguments.bytes().unwrap();let payload=super::super::rpc_batch::read_payload(&mut arguments).unwrap();
+            assert_eq!(payload.requests.len(),1);let sequence=*payload.requests.keys().next().unwrap();let mut method=super::super::rpc_stream::Reader::versioned(payload.requests[&sequence].arguments).unwrap();
+            assert_eq!(method.bytes().unwrap(),b"fixture-uri");assert_eq!(method.properties().unwrap().iter().find(|p|p.key==b"SipFlag").unwrap().value,b"3");method.finish().unwrap();
+            let result=unhosting_swap_result(Some(sequence),accepted);peer.send_reply(request.call_id,result.expose_to_transport()).await;
+            if accepted {let message=peer.receive().await.unwrap();let request=decode_request(message.payload.expose_to_transport()).unwrap();assert_eq!(request.method,super::super::rpc_logout::LOGOUT_SESSION_METHOD.as_bytes());peer.send_reply(request.call_id,b"\0\x01\0\0\0\0").await;}
+            while peer.io.read(&mut[0;1024]).await.unwrap()!=0 {}
+        });
+        let commands=runtime.command_handle();commands_logged_in(&commands,&original,&scope,&mut events).await;
+        let result=tokio::time::timeout(Duration::from_secs(2),runtime.hosting(&original,&scope,"fixture-uri",super::super::session::STATUS_UNREGISTER,gateway(),&[],&[])).await.unwrap();
+        if accepted {assert!(result.unwrap().matches(&original,&scope));assert!(scope.is_open());assert!(runtime.logout(&original,&scope,&[]).await.unwrap().io_released());}
+        else {assert!(result.is_err());assert!(!scope.is_open());assert!(runtime.close().await.io_released());}
+        assert!(!scope.is_open());server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn outer_swap_ack_without_unregistration_result_is_not_native_success_and_cancel_retires_io() {
+    let cert=Certificates::generate("DNS:fixture.invalid");let original=owner();let (client,server)=tokio::io::duplex(65_536);
+    let (mut runtime,mut events)=start(client,original.clone(),PacketRoute::DirectTlsCarrier,parameters(&cert.root),policy(),None).unwrap();let scope=runtime.connection_scope();
+    let mut peer=Peer{io:server,server:cert.server(&rustls::version::TLS13),network:PacketStreamDecoder::default(),plaintext:super::super::tls_plaintext::PlaintextPacketDecoder::default(),assembler:CallAssembler::default(),received:std::collections::VecDeque::new()};
+    let (acked,ack_seen)=oneshot::channel();let server=tokio::spawn(async move {
+        let message=peer.receive().await.unwrap();let request=decode_request(message.payload.expose_to_transport()).unwrap();peer.send_reply(request.call_id,&login_result()).await;
+        let message=peer.receive().await.unwrap();let request=decode_request(message.payload.expose_to_transport()).unwrap();let result=unhosting_swap_result(None,true);peer.send_reply(request.call_id,result.expose_to_transport()).await;acked.send(()).unwrap();
+        while peer.io.read(&mut[0;1024]).await.unwrap()!=0 {}
+    });
+    let commands=runtime.command_handle();commands_logged_in(&commands,&original,&scope,&mut events).await;
+    {
+        let unhosting=commands.hosting(&original,&scope,"fixture-uri",super::super::session::STATUS_UNREGISTER,gateway(),&[],&[]);tokio::pin!(unhosting);
+        tokio::select!{result=unhosting.as_mut()=>panic!("outer ACK isn't gateway result {result:?}"),_ = ack_seen=>{}}
+        assert!(tokio::time::timeout(Duration::from_millis(10),unhosting.as_mut()).await.is_err());assert!(scope.is_open());
+    }
+    assert!(!scope.is_open());assert!(runtime.close().await.io_released());server.await.unwrap();
+}
+
+#[tokio::test]
+async fn unregistration_inner_deadline_survives_retirement_of_acknowledged_outer_rpc() {
+    let cert=Certificates::generate("DNS:fixture.invalid");let original=owner();let (client,server)=tokio::io::duplex(65_536);let mut p=policy();p.rpc_timeout=Duration::from_millis(80);
+    let (mut runtime,mut events)=start(client,original.clone(),PacketRoute::DirectTlsCarrier,parameters(&cert.root),p,None).unwrap();let scope=runtime.connection_scope();
+    let mut peer=Peer{io:server,server:cert.server(&rustls::version::TLS13),network:PacketStreamDecoder::default(),plaintext:super::super::tls_plaintext::PlaintextPacketDecoder::default(),assembler:CallAssembler::default(),received:std::collections::VecDeque::new()};
+    let server=tokio::spawn(async move {
+        let message=peer.receive().await.unwrap();let request=decode_request(message.payload.expose_to_transport()).unwrap();peer.send_reply(request.call_id,&login_result()).await;
+        let message=peer.receive().await.unwrap();let request=decode_request(message.payload.expose_to_transport()).unwrap();let result=unhosting_swap_result(None,true);peer.send_reply(request.call_id,result.expose_to_transport()).await;
+        while peer.io.read(&mut[0;1024]).await.unwrap()!=0 {}
+    });
+    let commands=runtime.command_handle();commands_logged_in(&commands,&original,&scope,&mut events).await;
+    assert!(tokio::time::timeout(Duration::from_secs(1),commands.hosting(&original,&scope,"fixture-uri",super::super::session::STATUS_UNREGISTER,gateway(),&[],&[])).await.unwrap().is_err());
+    let close=runtime.close().await;assert!(close.io_released());assert_eq!(close.reason,RuntimeError::Timeout);server.await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_unregistration_aggregate_has_no_queue_or_scope_side_effects() {
+    let original = owner(); let scope = RpcConnectionScope::fresh();
+    let (commands, mut receiver) = mpsc::channel(MAX_COMMANDS);
+    let runtime = RuntimeCommands { owner: original.clone(), scope: scope.clone(), commands };
+    let field = "x".repeat(16_384);
+    let registration = || GatewayRegistration { authname_prefix: &field, channel_id: &field,
+        delete_int_code: &field, sip_number: &field, sip_password: &field };
+    let routing_value = vec![b'y'; 60 * 1024];
+    let routing = [RpcProperty { key: b"fixture-route", value: &routing_value }];
+    // Each capture separately fits; only the combined operation is oversized.
+    assert!(Gateway::capture(&field, super::super::session::STATUS_UNREGISTER, registration(), &[]).is_ok());
+    assert!(Property::capture(&routing).is_ok());
+    assert_eq!(runtime.hosting(&original, &scope, &field, super::super::session::STATUS_UNREGISTER,
+        registration(), &[], &routing).await.err(), Some(RuntimeError::InvalidConfiguration));
+    assert!(scope.is_open()); assert_eq!(runtime.commands.capacity(), MAX_COMMANDS);
+    assert!(matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+}
+
+#[tokio::test]
+async fn unregistration_and_logout_queue_rejection_do_not_arm_cancellation_guards() {
+    let original = owner(); let scope = RpcConnectionScope::fresh();
+    let (commands, _receiver) = mpsc::channel(MAX_COMMANDS);
+    let runtime = RuntimeCommands { owner: original.clone(), scope: scope.clone(), commands };
+    let mut waiting = Vec::new();
+    for _ in 0..MAX_COMMANDS {
+        let (completion, result) = oneshot::channel(); waiting.push(result);
+        runtime.commands.try_send(Command { operation: Operation::Configure(1, None), completion })
+            .unwrap_or_else(|_| panic!("fixture queue capacity"));
+    }
+    assert_eq!(runtime.hosting(&original, &scope, "fixture-uri", super::super::session::STATUS_UNREGISTER,
+        gateway(), &[], &[]).await.err(), Some(RuntimeError::Backpressure));
+    assert!(scope.is_open());
+    assert_eq!(runtime.logout(&original, &scope, &[]).await.err(), Some(RuntimeError::Backpressure));
+    assert!(scope.is_open()); assert_eq!(runtime.commands.capacity(), 0);
+    drop(waiting);
+}
+
+fn unhosting_actor_fixture(root: &str, original: AttemptOwner, blocked: bool)
+    -> (Actor<PollIo>, Vec<OwnedWireFrames>, Arc<Mutex<Vec<u8>>>, mpsc::Receiver<RuntimeEvent>) {
+    let mut backend = OfflineBackend::new(original.clone()); let scope = backend.connection_scope(); let now = Instant::now();
+    let mut tls = backend.take_tls_engine(PacketRoute::DirectTlsCarrier, parameters(root), now).unwrap();
+    let wire = tls.take_wire_output(&original, &scope, None, now).unwrap();
+    let (io, bytes, _, _, _) = poll_io(blocked);
+    let (_commands, commands) = mpsc::channel(MAX_COMMANDS); let (events, receive_events) = mpsc::channel(MAX_EVENTS);
+    let actor = Actor { io: Some(io), owner: original, scope, backend, tls, commands, events,
+        policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new(),
+        logout_pending: None, unhosting_pending: None };
+    (actor, wire, bytes, receive_events)
+}
+
+fn original_unhosting_completion(actor: &Actor<PollIo>) -> (i32, super::super::rpc_pending::OwnedUnhostingReply) {
+    let mut tracker = super::super::rpc_pending::HostingRpcTracker::for_arc_session(actor.owner.clone(), actor.scope.clone());
+    let (sequence, _) = tracker.prepare_update_status(actor.owner.clone(), "fixture-uri", super::super::session::STATUS_UNREGISTER,
+        &gateway(), &[]).unwrap();
+    let envelope = encode_reply(sequence, 0, b"\0\x01\0\0\0\0").unwrap();
+    assert!(tracker.on_reply(&actor.scope, envelope.expose_to_transport()).unwrap().is_none());
+    (sequence, tracker.take_unhosting_replies().pop().unwrap())
+}
+
+#[tokio::test]
+async fn original_unregistration_deadline_bounds_all_writes_after_outer_rpc_ack() {
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    for blocked in [true, false] {
+        let (mut actor, wire, bytes, _events) = unhosting_actor_fixture(&cert.root, owner(), blocked);
+        let (completion, _result) = oneshot::channel(); let scope = actor.scope.clone();
+        let deadline = if blocked { Instant::now() + Duration::from_millis(40) }
+            else { Instant::now() - Duration::from_secs(1) };
+        // An outer ACK already retired all ARC ids; its inner result is still pending.
+        assert!(actor.pending.is_empty());
+        actor.unhosting_pending = Some(UnhostingPending { sequence: 1, outer_id: 2, deadline, completion });
+        assert_eq!(tokio::time::timeout(Duration::from_millis(500), actor.send_wire(&wire, None)).await.unwrap(),
+            Err(RuntimeError::Timeout));
+        assert!(bytes.lock().unwrap().is_empty()); assert!(!scope.is_open());
+        drop(actor);
+    }
+}
+
+#[tokio::test]
+async fn matched_but_expired_unregistration_result_cannot_win_between_timer_ticks() {
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    let (mut actor, _wire, bytes, mut events) = unhosting_actor_fixture(&cert.root, owner(), false);
+    let scope = actor.scope.clone(); let (sequence, reply) = original_unhosting_completion(&actor);
+    let (completion, result) = oneshot::channel();
+    actor.unhosting_pending = Some(UnhostingPending { sequence, outer_id: 2,
+        deadline: Instant::now() - Duration::from_secs(1), completion });
+    assert_eq!(actor.deliver(vec![OfflineEvent::Unhosting(reply)]).await, Err(RuntimeError::Timeout));
+    assert_eq!(result.await.unwrap().err(), Some(RuntimeError::Timeout));
+    assert!(bytes.lock().unwrap().is_empty());
+    assert!(matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    drop(actor); assert!(!scope.is_open());
+}
+
+#[tokio::test]
+async fn accepted_unregistration_with_same_delivery_event_backpressure_never_reports_success() {
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    let (mut actor, _wire, bytes, mut events) = unhosting_actor_fixture(&cert.root, owner(), false);
+    let scope = actor.scope.clone(); let (sequence, reply) = original_unhosting_completion(&actor);
+    let (completion, result) = oneshot::channel();
+    actor.unhosting_pending = Some(UnhostingPending { sequence, outer_id: 2,
+        deadline: Instant::now() + Duration::from_secs(1), completion });
+    for _ in 0..MAX_EVENTS {
+        actor.events.try_send(RuntimeEvent { owner: actor.owner.clone(), scope: scope.clone(), events: Vec::new() }).unwrap();
+    }
+    assert_eq!(actor.deliver(vec![OfflineEvent::Unhosting(reply), OfflineEvent::Control(CallKind::Ping)]).await,
+        Err(RuntimeError::Backpressure));
+    assert_eq!(result.await.unwrap().err(), Some(RuntimeError::Backpressure));
+    assert!(bytes.lock().unwrap().is_empty());
+    for _ in 0..MAX_EVENTS { assert!(events.try_recv().unwrap().events.is_empty()); }
+    assert!(matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    drop(actor); assert!(!scope.is_open());
+}
+
+#[tokio::test]
+async fn accepted_unregistration_followed_by_same_delivery_io_failure_never_reports_success() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let original = owner(); let now = Instant::now();
+    let mut backend = OfflineBackend::new(original.clone()); let scope = backend.connection_scope();
+    let mut tls = backend.take_tls_engine(PacketRoute::DirectTlsCarrier, parameters(&cert.root), now).unwrap();
+    let mut peer = cert.server(&rustls::version::TLS13);
+    super::super::tls_engine::tests::handshake(&mut tls, &original, &scope, &mut peer, now).unwrap();
+    assert_eq!(tls.phase(), TlsPhase::Verified);
+    let (mut io, bytes, _, _, _) = poll_io(false); io.limit = 0;
+    let (_commands, commands) = mpsc::channel(MAX_COMMANDS); let (events, _events) = mpsc::channel(MAX_EVENTS);
+    let mut actor = Actor { io: Some(io), owner: original, scope: scope.clone(), backend, tls, commands, events,
+        policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new(),
+        logout_pending: None, unhosting_pending: None };
+    let (sequence, reply) = original_unhosting_completion(&actor); let (completion, result) = oneshot::channel();
+    actor.unhosting_pending = Some(UnhostingPending { sequence, outer_id: 2,
+        deadline: Instant::now() + Duration::from_secs(1), completion });
+    let outgoing = actor.backend.prepare_bootstrap(b"fixture-bootstrap-key", &[]).unwrap();
+    assert_eq!(actor.deliver(vec![OfflineEvent::Unhosting(reply), OfflineEvent::Outgoing(outgoing)]).await, Err(RuntimeError::Io));
+    assert_eq!(result.await.unwrap().err(), Some(RuntimeError::Io));
+    assert!(!scope.is_open()); assert!(bytes.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

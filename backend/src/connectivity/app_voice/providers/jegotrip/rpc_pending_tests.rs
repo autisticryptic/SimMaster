@@ -25,6 +25,70 @@ fn reply(id: i32, code: u32, result: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn matched_unregistration_has_private_original_completion_but_never_a_hosting_callback() {
+    let original=owner();let mut tracker=HostingRpcTracker::new();let scope=tracker.connection_scope();
+    let (id,_)=tracker.prepare_update_status(original.clone(),"uri",STATUS_UNREGISTER,&registration(),&[]).unwrap();
+    assert!(tracker.on_reply(&scope,&reply(id,0,b"\0\x01\0\0\0\0")).unwrap().is_none());
+    let mut results=tracker.take_unhosting_replies();assert_eq!(results.len(),1);let result=results.pop().unwrap();
+    assert!(result.accepted());assert_eq!(result.sequence(),id);assert!(result.matches(&original,&scope));assert!(!result.matches(&owner(),&scope));
+    assert!(!result.matches(&original,&RpcConnectionScope::fresh()));assert!(!format!("{result:?}").contains("fixture"));
+    assert!(tracker.on_reply(&scope,&reply(id,0,b"\0\x01\0\0\0\0")).unwrap().is_none());assert!(tracker.take_unhosting_replies().is_empty());
+    scope.close();assert!(!result.matches(&original,&scope));
+}
+
+#[test]
+fn false_failed_or_malformed_unregistration_never_has_true_original_completion() {
+    for (code,bytes) in [(0,b"\0\0\0\0\0\0".as_slice()),(1,b"\0\x01\0\0\0\0"),(0,b"\0")] {
+        let original=owner();let mut tracker=HostingRpcTracker::new();let scope=tracker.connection_scope();
+        let (id,_)=tracker.prepare_update_status(original.clone(),"uri",STATUS_UNREGISTER,&registration(),&[]).unwrap();
+        assert!(tracker.on_reply(&scope,&reply(id,code,bytes)).unwrap().is_none());let receipt=tracker.take_unhosting_replies().pop().unwrap();
+        assert!(receipt.matches(&original,&scope));assert!(!receipt.accepted());
+    }
+}
+
+#[test]
+fn stale_unknown_or_retired_unregistration_reply_does_not_consume_other_original_operations() {
+    let original=owner();let mut tracker=HostingRpcTracker::new();let scope=tracker.connection_scope();
+    let (id,_)=tracker.prepare_update_status(original.clone(),"uri",STATUS_UNREGISTER,&registration(),&[]).unwrap();
+    assert!(tracker.on_reply(&RpcConnectionScope::fresh(),&reply(id,0,b"\0\x01\0\0\0\0")).unwrap().is_none());
+    assert!(tracker.on_reply(&scope,&reply(id+1,0,b"\0\x01\0\0\0\0")).unwrap().is_none());assert!(tracker.take_unhosting_replies().is_empty());
+    tracker.retire_request(id);assert!(tracker.on_reply(&scope,&reply(id,0,b"\0\x01\0\0\0\0")).unwrap().is_none());assert!(tracker.take_unhosting_replies().is_empty());
+}
+
+#[test]
+fn undelivered_unregistration_completion_is_cleared_by_original_retirement_or_scope_close() {
+    for retirement in 0..4 {
+        let original = owner(); let mut tracker = HostingRpcTracker::new(); let scope = tracker.connection_scope();
+        let (id, _) = tracker.prepare_update_status(original.clone(), "uri", STATUS_UNREGISTER, &registration(), &[]).unwrap();
+        assert!(tracker.on_reply(&scope, &reply(id, 0, b"\0\x01\0\0\0\0")).unwrap().is_none());
+        assert_eq!(tracker.unhosting.len(), 1);
+        match retirement {
+            0 => tracker.retire_request(id),
+            1 => tracker.retire_owner(&original),
+            2 => tracker.retire_all(),
+            _ => scope.close(),
+        }
+        assert!(tracker.take_unhosting_replies().is_empty()); assert!(tracker.pending.is_empty());
+    }
+}
+
+#[test]
+fn unregistration_completion_queue_is_bounded_and_overflow_retires_the_original_scope() {
+    let original = owner(); let mut tracker = HostingRpcTracker::new(); let scope = tracker.connection_scope();
+    for _ in 0..MAX_MAP_ENTRIES {
+        let (id, _) = tracker.prepare_update_status(original.clone(), "uri", STATUS_UNREGISTER, &registration(), &[]).unwrap();
+        assert!(tracker.on_reply(&scope, &reply(id, 0, b"\0\x01\0\0\0\0")).unwrap().is_none());
+        assert!(scope.is_open());
+    }
+    assert_eq!(tracker.unhosting.len(), MAX_MAP_ENTRIES);
+    let (id, _) = tracker.prepare_update_status(original, "uri", STATUS_UNREGISTER, &registration(), &[]).unwrap();
+    assert!(tracker.on_reply(&scope, &reply(id, 0, b"\0\x01\0\0\0\0")).unwrap().is_none());
+    assert!(!scope.is_open()); assert!(tracker.pending.is_empty()); assert!(tracker.unhosting.is_empty());
+    assert!(tracker.take_unhosting_replies().is_empty());
+    assert!(tracker.on_reply(&scope, &[0xff]).unwrap().is_none());
+}
+
+#[test]
 fn reply_is_bound_to_submitted_owner_and_is_delivered_only_once() {
     let owner = owner();
     let mut tracker = HostingRpcTracker::new();

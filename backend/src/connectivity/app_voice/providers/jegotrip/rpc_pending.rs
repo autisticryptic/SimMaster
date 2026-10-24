@@ -91,6 +91,18 @@ impl std::fmt::Debug for PreparedHostingCall {
     }
 }
 
+/// Privately matched unregister result from one original pending operation.
+/// It is never a Hosted/channel callback and cannot complete another register.
+pub struct OwnedUnhostingReply { owner: AttemptOwner, connection: RpcConnectionScope, sequence: i32, accepted: bool }
+impl OwnedUnhostingReply {
+    pub fn sequence(&self) -> i32 { self.sequence }
+    pub fn accepted(&self) -> bool { self.accepted }
+    pub(super) fn matches(&self, owner: &AttemptOwner, connection: &RpcConnectionScope) -> bool {
+        &self.owner == owner && self.connection.matches(connection) && self.connection.is_open()
+    }
+}
+impl std::fmt::Debug for OwnedUnhostingReply { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("OwnedUnhostingReply(<redacted>)") } }
+
 pub struct OwnedRpcCallback {
     pub owner: AttemptOwner,
     pub callback: Callback,
@@ -101,6 +113,7 @@ pub struct HostingRpcTracker {
     batch_owner: Option<AttemptOwner>,
     next_id: Option<i32>,
     pending: BTreeMap<i32, PendingRequest>,
+    unhosting: Vec<OwnedUnhostingReply>,
 }
 
 impl Default for HostingRpcTracker {
@@ -112,11 +125,11 @@ impl HostingRpcTracker {
     /// Native nested hosting requires the original ARC session's one-time tracker.
     pub fn new() -> Self {
         Self { connection: RpcConnectionScope::fresh(), batch_owner: None,
-            next_id: Some(1), pending: BTreeMap::new() }
+            next_id: Some(1), pending: BTreeMap::new(), unhosting: Vec::new() }
     }
 
     pub(super) fn for_arc_session(owner: AttemptOwner, connection: RpcConnectionScope) -> Self {
-        Self { connection, batch_owner: Some(owner), next_id: Some(1), pending: BTreeMap::new() }
+        Self { connection, batch_owner: Some(owner), next_id: Some(1), pending: BTreeMap::new(), unhosting: Vec::new() }
     }
 
     /// Capture this when the authenticated connection installs its receive task.
@@ -197,12 +210,7 @@ impl HostingRpcTracker {
         for (&sequence, result) in &reply.payload.results {
             if !self.pending.get(&sequence).is_some_and(|request| request.delivery == Delivery::Batch) { continue; }
             let Some(request) = self.pending.remove(&sequence) else { continue; };
-            if request.operation != NativeOperation::HostingRegister { continue; }
-            let callback = match decode_update_status_result(result.result_code, result.result_stream) {
-                Ok((success, _)) => Callback::HostingAck { success },
-                Err(_) => Callback::Failure(BackendFailure::HostingRejected),
-            };
-            callbacks.push(OwnedRpcCallback { owner: request.owner, callback });
+            if let Some(callback) = self.status_completed(request, sequence, result.result_code, result.result_stream) { callbacks.push(callback); }
         }
         Ok(callbacks)
     }
@@ -216,23 +224,39 @@ impl HostingRpcTracker {
         for (sequence, result) in delivery.results() {
             if !self.pending.get(&sequence).is_some_and(|p| p.delivery == Delivery::Batch) { continue; }
             let Some(request) = self.pending.remove(&sequence) else { continue; };
-            if request.operation != NativeOperation::HostingRegister { continue; }
-            let callback = match decode_update_status_result(result.result_code, result.result_stream) {
-                Ok((success, _)) => Callback::HostingAck { success },
-                Err(_) => Callback::Failure(BackendFailure::HostingRejected),
-            };
-            callbacks.push(OwnedRpcCallback { owner: request.owner, callback });
+            if let Some(callback) = self.status_completed(request, sequence, result.result_code, result.result_stream) { callbacks.push(callback); }
         }
         callbacks
     }
 
-    pub(super) fn retire_all(&mut self) { self.pending.clear(); }
+    fn status_completed(&mut self, request: PendingRequest, sequence: i32, code: u32, bytes: &[u8]) -> Option<OwnedRpcCallback> {
+        if request.operation == NativeOperation::HostingUnregister {
+            if self.unhosting.len() >= MAX_MAP_ENTRIES { self.connection.close(); self.pending.clear(); self.unhosting.clear(); return None; }
+            let accepted = decode_update_status_result(code, bytes).is_ok_and(|(accepted, _)| accepted);
+            self.unhosting.push(OwnedUnhostingReply { owner: request.owner, connection: self.connection.clone(), sequence, accepted });
+            None
+        } else if request.operation == NativeOperation::HostingRegister {
+            let callback = match decode_update_status_result(code, bytes) { Ok((success, _)) => Callback::HostingAck { success },
+                Err(_) => Callback::Failure(BackendFailure::HostingRejected) };
+            Some(OwnedRpcCallback { owner: request.owner, callback })
+        } else { None }
+    }
+    pub(super) fn take_unhosting_replies(&mut self) -> Vec<OwnedUnhostingReply> {
+        if !self.connection.is_open() { self.retire_all(); return Vec::new(); }
+        std::mem::take(&mut self.unhosting)
+    }
+    pub(super) fn retire_all(&mut self) { self.pending.clear(); self.unhosting.clear(); }
 
-    /// Submission errors/timeouts must retire the originally captured request.
-    pub fn retire_request(&mut self, id: i32) { self.pending.remove(&id); }
+    /// Retire pending work AND any completion not yet handed to its consumer.
+    /// Already borrowed/copied results remain scoped snapshots, not revocable.
+    pub fn retire_request(&mut self, id: i32) {
+        self.pending.remove(&id);
+        self.unhosting.retain(|reply| reply.sequence != id);
+    }
 
     pub fn retire_owner(&mut self, owner: &AttemptOwner) {
         self.pending.retain(|_, request| &request.owner != owner);
+        self.unhosting.retain(|reply| &reply.owner != owner);
     }
 
     /// A failed outer RPC or malformed nested result consumes its request and
@@ -247,12 +271,7 @@ impl HostingRpcTracker {
             return Ok(None);
         }
         let Some(request) = self.pending.remove(&reply.call_id) else { return Ok(None); };
-        if request.operation != NativeOperation::HostingRegister { return Ok(None); }
-        let callback = match decode_update_status_result(reply.result_code, reply.result_stream) {
-            Ok((success, _)) => Callback::HostingAck { success },
-            Err(_) => Callback::Failure(BackendFailure::HostingRejected),
-        };
-        Ok(Some(OwnedRpcCallback { owner: request.owner, callback }))
+        Ok(self.status_completed(request, reply.call_id, reply.result_code, reply.result_stream))
     }
 }
 

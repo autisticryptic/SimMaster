@@ -9,7 +9,7 @@ use super::{
     batch_scheduler::{BatchScheduler, ServerRequestTicket},
     native_events::IncomingMessage,
     rpc_incoming::{encode_online_message_result, IncomingBinding, IncomingDispatcher},
-    rpc_pending::{HostingRpcTracker, OwnedRpcCallback, RpcConnectionScope},
+    rpc_pending::{HostingRpcTracker, OwnedRpcCallback, OwnedUnhostingReply, RpcConnectionScope},
     packet_transport::{OwnedPacketTransport, PacketRoute},
     tls_engine::{TlsEngine, TlsError, TlsParameters, VerifiedPlaintextPackets},
     rpc_stream::{CodecError, RpcProperty},
@@ -32,6 +32,7 @@ impl fmt::Debug for ScheduledIncomingMessage {
 pub enum OfflineEvent {
     Bootstrap(OwnedBootstrapReply),
     Logout(OwnedLogoutReply),
+    Unhosting(OwnedUnhostingReply),
     Callback(OwnedRpcCallback),
     Message(ScheduledIncomingMessage),
     DirectMessage(IncomingProtocolMessage),
@@ -167,6 +168,7 @@ impl OfflineBackend {
                         Err(error) => { processing_error = Some(error.into()); return; }
                     };
                     for callback in tracker.on_scheduled_delivery(&delivery) { events.push(OfflineEvent::Callback(callback)); }
+                    for reply in tracker.take_unhosting_replies() { events.push(OfflineEvent::Unhosting(reply)); }
                     for incoming in delivery.requests {
                         if incoming.request().method != super::rpc_incoming::ONLINE_MESSAGE_METHOD.as_bytes()
                             || dispatcher.is_none() {

@@ -100,7 +100,9 @@ class JegotripContract(unittest.TestCase):
         pending = (MOD / 'rpc_pending.rs').read_text(encoding='utf-8')
         self.assertIn('Arc::ptr_eq(&self.connection.0, &connection.0)', pending)
         self.assertIn('self.pending.remove(&reply.call_id)', pending)
-        self.assertIn('request.operation != NativeOperation::HostingRegister', pending)
+        self.assertIn('request.operation == NativeOperation::HostingRegister', pending)
+        self.assertIn('request.operation == NativeOperation::HostingUnregister', pending)
+        self.assertIn('self.unhosting.push(OwnedUnhostingReply', pending)
         self.assertIn('id.checked_add(1)', pending)
         self.assertNotIn('session.current_owner()', pending)
         for module in ['rpc_stream', 'rpc_envelope', 'rpc_batch', 'rpc_login', 'rpc_pending']:
@@ -151,7 +153,9 @@ class JegotripContract(unittest.TestCase):
         tracker = (MOD / 'rpc_pending.rs').read_text(encoding='utf-8')
         self.assertIn('Delivery::Batch', tracker)
         self.assertIn('Delivery::Envelope', tracker)
-        self.assertIn('request.operation != NativeOperation::HostingRegister', tracker)
+        self.assertIn('request.operation == NativeOperation::HostingRegister', tracker)
+        self.assertIn('request.operation == NativeOperation::HostingUnregister', tracker)
+        self.assertIn('self.unhosting.push(OwnedUnhostingReply', tracker)
         self.assertIn('batch.matches(owner, &self.connection)', tracker)
         self.assertIn('self.batch_owner.as_ref() != Some(&owner)', tracker)
         self.assertIn('if !self.connection.is_open()', tracker)
@@ -492,6 +496,40 @@ class JegotripContract(unittest.TestCase):
         for name in ['beta-validation.yml', 'build-release.yml']:
             self.assertIn('connectivity::app_voice::providers::jegotrip::rpc_logout::tests',
                           (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_gateway_unregistration_is_a_distinct_original_nested_result_not_outer_ack(self):
+        pending = (MOD / 'rpc_pending.rs').read_text(encoding='utf-8')
+        self.assertIn('pub struct OwnedUnhostingReply', pending)
+        self.assertIn('request.operation == NativeOperation::HostingUnregister', pending)
+        self.assertIn('take_unhosting_replies', pending)
+        offline = (MOD / 'offline_backend.rs').read_text(encoding='utf-8')
+        self.assertIn('events.push(OfflineEvent::Unhosting(reply))', offline)
+        actor = (MOD / 'transport_actor.rs').read_text(encoding='utf-8')
+        self.assertIn('reply.sequence() == pending.sequence && reply.accepted()', actor)
+        self.assertIn('UnhostingRetirement', actor)
+        self.assertIn('if now >= pending.deadline', actor)
+        self.assertIn('unhosting_sequence = Some(sequence)', actor)
+
+    def test_unregister_admission_precedes_retirement_and_preserves_invalid_input_io(self):
+        actor = (MOD / 'transport_actor.rs').read_text(encoding='utf-8')
+        enqueue = actor.split('fn enqueue(', 1)[1].split('async fn submit(', 1)[0]
+        self.assertIn('operation.byte_length() > MAX_PARAMETER_BYTES', enqueue)
+        self.assertIn('self.commands.try_send', enqueue)
+        hosting = actor.split('pub async fn hosting(', 1)[1].split('pub async fn complete_batch(', 1)[0]
+        self.assertLess(hosting.index('self.enqueue('), hosting.index('Some(UnhostingRetirement'))
+        pending = (MOD / 'rpc_pending.rs').read_text(encoding='utf-8')
+        self.assertIn('self.unhosting.retain(|reply| reply.sequence != id)', pending)
+        self.assertIn('if !self.connection.is_open() { self.retire_all(); return Vec::new(); }', pending)
+
+    def test_unregister_deadline_and_same_delivery_failures_precede_semantic_success(self):
+        actor = (MOD / 'transport_actor.rs').read_text(encoding='utf-8')
+        self.assertIn('.chain(self.unhosting_pending.as_ref().map(|pending| pending.deadline))', actor)
+        self.assertIn('if now >= deadline { self.scope.close(); return Err(RuntimeError::Timeout); }', actor)
+        delivery = actor.split('async fn deliver(', 1)[1].split('async fn deliver_events(', 1)[0]
+        self.assertLess(delivery.index('self.deliver_events('), delivery.index('pending.completion.send(result)'))
+        self.assertIn('if Instant::now() >= pending.deadline', delivery)
+        self.assertIn('if !self.scope.is_open()', delivery)
+        self.assertIn('if unhosting_accepted || outcome.is_err()', delivery)
 
     def test_native_notifications_require_local_operation_and_stale_scope_checks(self):
         events = (MOD / 'native_events.rs').read_text(encoding='utf-8')

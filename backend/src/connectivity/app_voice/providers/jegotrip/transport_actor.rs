@@ -151,12 +151,17 @@ impl Operation {
 }
 struct Command { operation: Operation, completion: oneshot::Sender<Result<RuntimeReceipt, RuntimeError>> }
 struct LogoutPending { id: i32, completion: oneshot::Sender<Result<RuntimeReceipt, RuntimeError>> }
+struct UnhostingPending { sequence: i32, outer_id: i32, deadline: Instant, completion: oneshot::Sender<Result<RuntimeReceipt, RuntimeError>> }
+struct UnhostingRetirement { scope: RpcConnectionScope, completed: bool }
+impl Drop for UnhostingRetirement { fn drop(&mut self) { if !self.completed { self.scope.close(); } } }
 struct LogoutRetirement(RpcConnectionScope);
 impl Drop for LogoutRetirement { fn drop(&mut self) { self.0.close(); } }
 
 pub struct RuntimeReceipt { owner: AttemptOwner, scope: RpcConnectionScope, pub call_id: Option<i32> }
 impl RuntimeReceipt {
-    /// Successful transport submission is NOT an ARC login or hosting ACK.
+    /// Correlation is not channel readiness. Login/register/poll return only
+    /// transport submission; unregister/logout waits also require the original
+    /// semantic result. None of these receipts grants a new connection or IO.
     pub fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
         &self.owner == owner && self.scope.matches(scope) && self.scope.is_open()
     }
@@ -203,7 +208,8 @@ impl RuntimeCommands {
     fn accepts(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
         &self.owner == owner && self.scope.matches(scope) && self.scope.is_open()
     }
-    async fn submit(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, operation: Operation) -> Result<RuntimeReceipt, RuntimeError> {
+    fn enqueue(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, operation: Operation)
+        -> Result<oneshot::Receiver<Result<RuntimeReceipt, RuntimeError>>, RuntimeError> {
         if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
         if operation.byte_length() > MAX_PARAMETER_BYTES { return Err(RuntimeError::InvalidConfiguration); }
         let (completion, result) = oneshot::channel();
@@ -211,7 +217,10 @@ impl RuntimeCommands {
             mpsc::error::TrySendError::Full(_) => RuntimeError::Backpressure,
             mpsc::error::TrySendError::Closed(_) => RuntimeError::Closed,
         })?;
-        result.await.map_err(|_| RuntimeError::Closed)?
+        Ok(result)
+    }
+    async fn submit(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, operation: Operation) -> Result<RuntimeReceipt, RuntimeError> {
+        self.enqueue(owner, scope, operation)?.await.map_err(|_| RuntimeError::Closed)?
     }
     pub async fn login(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, inputs: ArcLoginInputs<'_>, routing: &[RpcProperty<'_>]) -> Result<RuntimeReceipt, RuntimeError> {
         if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
@@ -235,7 +244,16 @@ impl RuntimeCommands {
     pub async fn hosting(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, uri: &str, status: i32, registration: GatewayRegistration<'_>,
         metadata: &[RpcProperty<'_>], routing: &[RpcProperty<'_>]) -> Result<RuntimeReceipt, RuntimeError> {
         if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
-        self.submit(owner, scope, Operation::Swap(Property::capture(routing)?, Some(Gateway::capture(uri, status, registration, metadata)?))).await
+        if status == super::session::STATUS_UNREGISTER && routing.iter().any(|p| p.key == b"pwd" || p.key == b"token") { return Err(RuntimeError::InvalidConfiguration); }
+        let routing = Property::capture(routing)?; let gateway = Gateway::capture(uri, status, registration, metadata)?;
+        // No suspension occurs between successful admission and arming this
+        // guard. Invalid aggregate inputs or a full queue did not submit any
+        // unregister work and must not retire the original live connection.
+        let completion = self.enqueue(owner, scope, Operation::Swap(routing, Some(gateway)))?;
+        let mut retirement = if status == super::session::STATUS_UNREGISTER { Some(UnhostingRetirement { scope: self.scope.clone(), completed: false }) } else { None };
+        let result = completion.await.map_err(|_| RuntimeError::Closed)?;
+        if result.is_ok() { if let Some(guard) = &mut retirement { guard.completed = true; } }
+        result
     }
     pub async fn complete_batch(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, ticket: &ServerRequestTicket, accepted: bool) -> Result<RuntimeReceipt, RuntimeError> {
         if !self.accepts(owner, scope) || !ticket.matches(owner, scope) { return Err(RuntimeError::Scope); }
@@ -245,13 +263,15 @@ impl RuntimeCommands {
         if !self.accepts(owner, scope) || !ticket.matches(owner, scope) { return Err(RuntimeError::Scope); }
         self.submit(owner, scope, Operation::CompleteDirect(ticket.captured_copy(), accepted)).await
     }
-    /// Unlike login/hosting submission receipts, this wait completes ONLY on
-    /// the matched original logout RPC result. It does not own/join the IO task.
+    /// This method returns only the matched original logout RPC result, not an
+    /// IO release receipt. Hosting-register returns a submission receipt;
+    /// hosting-unregister separately waits for its matched nested result.
     pub async fn logout(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, routing: &[RpcProperty<'_>]) -> Result<(), RuntimeError> {
         if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
         let routing = logout_properties(routing)?;
+        let completion = self.enqueue(owner, scope, Operation::Logout(routing))?;
         let _retirement = LogoutRetirement(self.scope.clone());
-        self.submit(owner, scope, Operation::Logout(routing)).await.map(|_| ())
+        completion.await.map_err(|_| RuntimeError::Closed)?.map(|_| ())
     }
     pub fn request_close(&self) { self.scope.close(); }
 }
@@ -294,8 +314,7 @@ impl RuntimeHandle {
     }
     pub async fn hosting(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, uri: &str, status: i32,
         registration: GatewayRegistration<'_>, metadata: &[RpcProperty<'_>], routing: &[RpcProperty<'_>]) -> Result<RuntimeReceipt, RuntimeError> {
-        if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
-        self.submit(owner, scope, Operation::Swap(Property::capture(routing)?, Some(Gateway::capture(uri, status, registration, metadata)?))).await
+        self.command_handle().hosting(owner, scope, uri, status, registration, metadata, routing).await
     }
     pub async fn complete_batch(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, ticket: &ServerRequestTicket, accepted: bool)
         -> Result<RuntimeReceipt, RuntimeError> {
@@ -342,7 +361,7 @@ pub fn start<I>(io: I, owner: AttemptOwner, route: PacketRoute<'_>, tls_paramete
     let tls = backend.take_tls_engine(route, tls_parameters, start)?;
     let (commands_tx, commands_rx) = mpsc::channel(MAX_COMMANDS); let (events_tx, events_rx) = mpsc::channel(MAX_EVENTS);
     let actor = Actor { io: Some(io), owner: owner.clone(), scope: scope.clone(), backend, tls, commands: commands_rx,
-        events: events_tx, policy, timing, start, pending: std::collections::BTreeMap::new(), logout_pending: None };
+        events: events_tx, policy, timing, start, pending: std::collections::BTreeMap::new(), logout_pending: None, unhosting_pending: None };
     let task = tokio::spawn(actor.run());
     Ok((RuntimeHandle { owner, scope, commands: commands_tx, task: Some(task) }, events_rx))
 }
@@ -350,7 +369,7 @@ pub fn start<I>(io: I, owner: AttemptOwner, route: PacketRoute<'_>, tls_paramete
 struct Actor<I> {
     io: Option<I>, owner: AttemptOwner, scope: RpcConnectionScope, backend: OfflineBackend, tls: TlsEngine,
     commands: mpsc::Receiver<Command>, events: mpsc::Sender<RuntimeEvent>, policy: RuntimePolicy,
-    timing: Option<RouterTiming>, start: Instant, pending: std::collections::BTreeMap<i32, Instant>, logout_pending: Option<LogoutPending>,
+    timing: Option<RouterTiming>, start: Instant, pending: std::collections::BTreeMap<i32, Instant>, logout_pending: Option<LogoutPending>, unhosting_pending: Option<UnhostingPending>,
 }
 impl<I> Drop for Actor<I> {
     fn drop(&mut self) { self.scope.close(); self.backend.close(); self.tls.close(); self.io = None; self.commands.close(); }
@@ -381,6 +400,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                     if let Err(error) = self.tls.tick(&self.owner, &self.scope, now) { return error.into(); }
                     self.pending.retain(|id, _| self.backend.is_pending(*id));
                     if self.logout_pending.as_ref().is_some_and(|pending| pending.completion.is_closed()) { return RuntimeError::Cancelled; }
+                    if let Some(pending) = &self.unhosting_pending {
+                        if pending.completion.is_closed() { return RuntimeError::Cancelled; }
+                        if now >= pending.deadline { return RuntimeError::Timeout; }
+                    }
                     if self.pending.values().any(|deadline| now >= *deadline) { return RuntimeError::Timeout; }
                 }
                 received = self.io.as_mut().expect("owned IO").read(&mut read) => {
@@ -408,9 +431,40 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         }
     }
     async fn deliver(&mut self, events: Vec<OfflineEvent>) -> Result<(), RuntimeError> {
+        let mut unhosting_accepted = false;
+        let outcome = self.deliver_events(events, &mut unhosting_accepted).await;
+        // Keep the original wait (and its deadline) installed while every
+        // outgoing reply and visible event from this delivery can still fail.
+        // A semantic true followed by an IO/queue error is not an open-IO
+        // receipt on which the caller may proceed to SDK logout.
+        if unhosting_accepted || outcome.is_err() {
+            if let Some(pending) = self.unhosting_pending.take() {
+                let result = outcome.and_then(|()| {
+                    if Instant::now() >= pending.deadline { return Err(RuntimeError::Timeout); }
+                    if !self.scope.is_open() { return Err(RuntimeError::Closed); }
+                    Ok(RuntimeReceipt { owner: self.owner.clone(), scope: self.scope.clone(), call_id: Some(pending.outer_id) })
+                });
+                let error = result.as_ref().err().copied();
+                if pending.completion.send(result).is_err() { return Err(RuntimeError::Cancelled); }
+                if let Some(error) = error { return Err(error); }
+            }
+        }
+        outcome
+    }
+    async fn deliver_events(&mut self, events: Vec<OfflineEvent>, unhosting_accepted: &mut bool) -> Result<(), RuntimeError> {
         let mut visible = Vec::new();
         for event in events {
             match event {
+                OfflineEvent::Unhosting(reply) => {
+                    let pending = self.unhosting_pending.as_ref().ok_or(RuntimeError::Protocol)?;
+                    // A result may arrive between timer ticks. A repeated or
+                    // expired result cannot turn this original wait into Ok.
+                    if *unhosting_accepted { return Err(RuntimeError::Protocol); }
+                    if Instant::now() >= pending.deadline { return Err(RuntimeError::Timeout); }
+                    let accepted = reply.matches(&self.owner, &self.scope) && reply.sequence() == pending.sequence && reply.accepted();
+                    if !accepted { return Err(RuntimeError::Protocol); }
+                    *unhosting_accepted = true;
+                }
                 OfflineEvent::Logout(reply) => {
                     let pending = self.logout_pending.take().ok_or(RuntimeError::Protocol)?;
                     let accepted = reply.matches(&self.owner, &self.scope) && reply.call_id() == pending.id && reply.accepted();
@@ -435,7 +489,13 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     async fn command(&mut self, mut command: Command) -> Result<(), RuntimeError> {
         if !self.scope.is_open() { let _ = command.completion.send(Err(RuntimeError::Closed)); return Err(RuntimeError::Closed); }
         let now = Instant::now();
-        if self.logout_pending.is_some() { let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(()); }
+        if self.unhosting_pending.as_ref().is_some_and(|pending| now >= pending.deadline) {
+            let _ = command.completion.send(Err(RuntimeError::Timeout));
+            return Err(RuntimeError::Timeout);
+        }
+        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _)) {
+            let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
+        }
         if self.tls.phase() != TlsPhase::Verified {
             let _ = command.completion.send(Err(RuntimeError::Tls(TlsError::NotReady))); return Ok(());
         }
@@ -444,6 +504,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         }
         let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _));
         let is_logout = matches!(&command.operation, Operation::Logout(_));
+        let mut unhosting_sequence = None;
         let elapsed_ms = self.elapsed_ms(now);
         let prepared = match command.operation {
             Operation::Configure(epoch, incoming) => {
@@ -478,6 +539,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                     let sequence = match self.backend.queue_hosting(self.owner.clone(), &gateway.uri, gateway.status, &gateway.registration(), &metadata) {
                         Ok(sequence) => sequence, Err(_) => { let _ = command.completion.send(Err(RuntimeError::Protocol)); return Ok(()); }
                     };
+                    if gateway.status == super::session::STATUS_UNREGISTER { unhosting_sequence = Some(sequence); }
                     match self.backend.prepare_swap(elapsed_ms, &routing) {
                         Ok(packets) => Ok(packets), Err(error) => { self.backend.retire_hosting(sequence); Err(error) }
                     }
@@ -500,6 +562,11 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if !is_response {
             self.pending.insert(packets.call_id, Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?);
         }
+        if let Some(sequence) = unhosting_sequence {
+            self.unhosting_pending = Some(UnhostingPending { sequence, outer_id: packets.call_id,
+                deadline: Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?, completion: command.completion });
+            return Ok(());
+        }
         if is_logout { self.logout_pending = Some(LogoutPending { id: packets.call_id, completion: command.completion }); return Ok(()); }
         if command.completion.send(Ok(RuntimeReceipt { owner: self.owner.clone(), scope: self.scope.clone(), call_id: Some(packets.call_id) })).is_err() {
             return Err(RuntimeError::Cancelled);
@@ -516,10 +583,13 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 frames.push(bytes);
             }
         }
-        let step_deadline = self.pending.values().copied().chain(self.tls.next_deadline()).min();
+        let step_deadline = self.pending.values().copied().chain(self.tls.next_deadline())
+            .chain(self.unhosting_pending.as_ref().map(|pending| pending.deadline)).min();
         let deadline = Instant::now().checked_add(self.policy.io_timeout).ok_or(RuntimeError::Timeout)?;
         let deadline = step_deadline.map_or(deadline, |rpc| deadline.min(rpc));
-        let timeout = deadline.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        if now >= deadline { self.scope.close(); return Err(RuntimeError::Timeout); }
+        let timeout = deadline.saturating_duration_since(now);
         let scope = self.scope.clone();
         if self.tls.tick(&self.owner, &self.scope, Instant::now()).is_err() { return Err(RuntimeError::Timeout); }
         let io = self.io.as_mut().ok_or(RuntimeError::Closed)?;

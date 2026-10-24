@@ -91,7 +91,7 @@ fn receive_all(engine: &mut TlsEngine, original: &AttemptOwner, scope: &RpcConne
     }
     Ok((plain, output))
 }
-fn handshake(engine: &mut TlsEngine, original: &AttemptOwner, scope: &RpcConnectionScope, server: &mut rustls::ServerConnection, now: Instant)
+pub(crate) fn handshake(engine: &mut TlsEngine, original: &AttemptOwner, scope: &RpcConnectionScope, server: &mut rustls::ServerConnection, now: Instant)
     -> Result<(), TlsError> {
     let mut outgoing = engine.take_wire_output(original, scope, None, now)?;
     for _ in 0..20 {
