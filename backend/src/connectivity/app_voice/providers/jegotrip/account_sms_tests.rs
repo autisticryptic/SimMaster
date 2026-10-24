@@ -126,7 +126,7 @@ fn original_raw_scope_required_for_promotion_and_no_sms_from_an_unrelated_row() 
     let (db,line,_)=setup();let message=text();let text=super::super::smgw_text::classify(SMGW_RECEIVER,&message).unwrap();
     let result=db.with_conn(|conn| {
         let tx=rusqlite::Transaction::new_unchecked(conn,rusqlite::TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
-        promote_new(&tx,999,&line,1,&text,"2023-11-14T22:13:20Z").map(|_|())
+        promote_new(&tx,999,&line,1,&text,"2023-11-14T22:13:20Z",None).map(|_|())
     });
     assert_eq!(result,Err(SCOPE));assert_eq!(count(&db,"sms_messages"),0);assert_eq!(count(&db,"app_events"),0);
 }
@@ -150,11 +150,11 @@ fn a_different_timestamp_or_retired_config_cannot_project_an_existing_raw_observ
     let (db,line,context)=setup();let id=context.commit_fixture(&db,1,&text()).unwrap();
     let mut changed=text();changed.time=Some(b"1700000000124".to_vec());let classified=super::super::smgw_text::classify(SMGW_RECEIVER,&changed).unwrap();
     let result=db.with_conn(|conn|{let tx=rusqlite::Transaction::new_unchecked(conn,rusqlite::TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
-        promote_new(&tx,id,&line,1,&classified,"2023-11-14T22:13:20Z").map(|_|())});assert_eq!(result,Err(SCOPE));
+        promote_new(&tx,id,&line,1,&classified,"2023-11-14T22:13:20Z",None).map(|_|())});assert_eq!(result,Err(SCOPE));
     db.with_conn(|conn|conn.execute("UPDATE app_voice_accounts SET revision=2 WHERE line_id=?1",[&line]).map(|_|()).map_err(|_|STORAGE)).unwrap();
     let original=text();let classified=super::super::smgw_text::classify(SMGW_RECEIVER,&original).unwrap();
     let result=db.with_conn(|conn|{let tx=rusqlite::Transaction::new_unchecked(conn,rusqlite::TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
-        promote_new(&tx,id,&line,1,&classified,"2023-11-14T22:13:20Z").map(|_|())});assert_eq!(result,Err(SCOPE));
+        promote_new(&tx,id,&line,1,&classified,"2023-11-14T22:13:20Z",None).map(|_|())});assert_eq!(result,Err(SCOPE));
     assert_eq!(count(&db,"sms_messages"),1);assert_eq!(count(&db,"app_events"),2);
 }
 #[test]

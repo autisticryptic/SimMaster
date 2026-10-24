@@ -5,7 +5,7 @@
 //! are different layers. Local row ids/nonces are NOT remote message identities.
 //! Unknown data is never evicted to make room, promoted as SMS or marked ready.
 use super::{
-    account_runs, account_sms, account_store, arc_protocol::IncomingProtocolMessage,
+    account_notifications, account_runs, account_sms, account_store, arc_protocol::IncomingProtocolMessage,
     native_events::IncomingMessage, offline_backend::ScheduledIncomingMessage,
     rpc_pending::RpcConnectionScope, runtime_backend::NativeHostingBackend,
     session::AttemptOwner, smgw_text, transport_actor::RuntimeError,
@@ -86,6 +86,7 @@ fn require_account(conn: &Connection, line: &str, revision: u64) -> Result<(), &
 pub(super) struct InboxScope {
     line_id: String, revision: u64, nonce: String, owner: AttemptOwner, scope: RpcConnectionScope,
     receiver: Option<ReceiverContext>,
+    notifications: Result<Option<Box<dyn account_notifications::NoticeSnapshot>>, &'static str>,
 }
 struct ReceiverContext { object: Zeroizing<Vec<u8>>, domain: Zeroizing<Vec<u8>>, kind: Zeroizing<Vec<u8>> }
 impl ReceiverContext {
@@ -99,7 +100,10 @@ impl InboxScope {
         -> Result<Self, &'static str> {
         if !account_store::valid_line_id(line) || owner.line_id() != line || revision == 0 || revision > i64::MAX as u64
             || !valid_nonce(nonce) || !scope.is_open() { return Err(SCOPE); }
-        Ok(Self { line_id: line.to_owned(), revision, nonce: nonce.to_owned(), owner: owner.clone(), scope: scope.clone(), receiver: None })
+        Ok(Self { line_id: line.to_owned(), revision, nonce: nonce.to_owned(), owner: owner.clone(), scope: scope.clone(), receiver: None, notifications: Ok(None) })
+    }
+    pub(super) fn with_notifications(mut self,snapshot:Result<Option<Box<dyn account_notifications::NoticeSnapshot>>, &'static str>)->Self {
+        self.notifications=snapshot;self
     }
     pub(super) fn with_receiver(mut self, binding: super::rpc_incoming::IncomingBinding<'_>) -> Result<Self, &'static str> {
         for value in [binding.object_id, binding.domain, binding.receiver_kind] {
@@ -166,7 +170,8 @@ impl InboxScope {
                 .map_err(|_| STORAGE)?;
             let mut events = vec![event];
             if let Some(text) = &classified {
-                events.push(account_sms::promote_new(&tx, id, &self.line_id, self.revision, text, &stamp)?);
+                let notices=self.notifications.as_ref().map_err(|code|*code)?;
+                events.push(account_sms::promote_new(&tx, id, &self.line_id, self.revision, text, &stamp, notices.as_deref())?);
             }
             tx.commit().map_err(|_| STORAGE)?;
             Ok((id,events))
@@ -274,6 +279,7 @@ pub(super) fn delete_private_for_account(conn:&Connection,line:&str)->Result<(),
         conn.execute("DELETE FROM app_voice_sms_projection WHERE line_id=?1 AND deleted=1",[line]).map_err(|_|STORAGE)?;
         conn.execute("DELETE FROM app_voice_inbox WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;
     }
+    account_notifications::cancel_account(conn,line)?;
     account_runs::delete_account_state(conn,line)?;
     Ok(())
 }

@@ -39,6 +39,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/stop", post(stop_account))
         .route("/api/non-3gpp/accounts/{line_id}/inbox", get(get_inbox))
         .route("/api/non-3gpp/accounts/{line_id}/messages", get(get_messages))
+        .route("/api/non-3gpp/accounts/{line_id}/notifications", get(get_notifications))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
 }
 fn no_store(mut response: Response) -> Response {
@@ -51,10 +52,10 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_revision_conflict" | "app_account_stop_before_replace" => StatusCode::CONFLICT,
         "app_account_provider_unsupported" => StatusCode::NOT_IMPLEMENTED,
         "app_account_storage_failed" | "app_account_inbox_storage_failed" | "app_account_sms_storage_failed"
-            | "app_account_run_storage_failed" | "database_unavailable" => StatusCode::INTERNAL_SERVER_ERROR,
+            | "app_account_run_storage_failed" | "app_account_notification_storage_failed" | "database_unavailable" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_account_limit" | "app_account_run_limit" | "app_account_entropy_unavailable" | "app_account_backend_unavailable"
             | "app_account_authentication_rejected" | "app_account_disconnected" | "app_account_hosting_rejected"
-            | "app_account_operation_timeout" => StatusCode::SERVICE_UNAVAILABLE,
+            | "app_account_operation_timeout" | "app_account_shutting_down" | "app_account_cleanup_unconfirmed" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
     }
 }
@@ -106,6 +107,13 @@ pub async fn get_messages(State(manager): State<Arc<AccountManager>>, Path(line_
     // Only exact recovered Smgw text projections. Generic raw bytes, original
     // routing/credentials and guessed time/remote ids never enter this API.
     success(StatusCode::OK, manager.messages(&line_id, request.limit))
+}
+
+pub async fn get_notifications(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,
+    request:Result<Query<InboxQuery>,QueryRejection>)->Response{
+    let Ok(Query(request))=request else{return failure("app_account_request_invalid");};
+    if !(1..=128).contains(&request.limit){return failure("app_account_request_invalid");}
+    success(StatusCode::OK,manager.notification_status(&line_id,request.limit))
 }
 
 pub async fn start_account(State(manager): State<Arc<AccountManager>>, Path(line_id): Path<String>,

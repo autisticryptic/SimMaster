@@ -1176,6 +1176,15 @@ async fn main() -> Result<()> {
     // Kept out of the router's state so session teardown can still run after
     // `serve` returns and the state itself has been consumed.
     let shutdown_registry = Arc::clone(&app_state.line_registry);
+    let mut app_notification_worker=connectivity::app_voice::providers::jegotrip::account_notifications::NotificationWorker::spawn(
+        app_state.database.clone(),app_state.notification_sender.clone(),app_state.shutdown.clone());
+    let account_shutdown={
+        let accounts=app_state.app_accounts.clone();let mut shutdown=app_state.shutdown.clone();
+        tokio::spawn(async move {
+            shutdown.wait().await;
+            tokio::time::timeout(Duration::from_secs(20),accounts.shutdown_all()).await
+        })
+    };
 
     api::handlers::spawn_call_monitor(app_state.clone());
     spawn_runtime_event_bridge(app_state.clone());
@@ -1433,6 +1442,15 @@ async fn main() -> Result<()> {
         ))
         .await?;
     let _ = ims_cleanup_wait.await;
+    match account_shutdown.await {
+        Ok(Ok(0))=>{},
+        Ok(Ok(failed))=>warn!(failed,"Application account shutdown had unconfirmed cleanup results"),
+        _=>warn!("Application account shutdown deadline reached; original scopes retired without fabricating release proof"),
+    }
+    if tokio::time::timeout(Duration::from_secs(3),app_notification_worker.join()).await.is_err(){
+        warn!("Application notification drain deadline reached; outstanding claims remain unconfirmed");
+    }
+    drop(app_notification_worker);
 
     // Only reached once the drain completes, which is what the shutdown signal
     // above makes possible. Releasing the data sessions here is what keeps the

@@ -134,7 +134,7 @@ impl AppState {
             e911,
             shutdown,
         } = dependencies;
-        let app_accounts = Arc::new(crate::connectivity::app_voice::providers::jegotrip::account_runtime::AccountManager::new(database.clone()));
+        let app_accounts = Arc::new(crate::connectivity::app_voice::providers::jegotrip::account_runtime::AccountManager::with_notifications(database.clone(),notification_sender.clone()));
         Self {
             dbus_conn,
             modem_radio,

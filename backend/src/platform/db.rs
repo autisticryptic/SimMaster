@@ -3569,6 +3569,8 @@ impl Database {
             .map_err(|code| rusqlite::Error::InvalidParameterName(code.to_owned()))?;
         crate::connectivity::app_voice::providers::jegotrip::account_inbox::initialize_schema(&conn)
             .map_err(|code| rusqlite::Error::InvalidParameterName(code.to_owned()))?;
+        crate::connectivity::app_voice::providers::jegotrip::account_notifications::initialize_schema(&conn)
+            .map_err(|code| rusqlite::Error::InvalidParameterName(code.to_owned()))?;
         crate::connectivity::app_voice::providers::jegotrip::account_sms::initialize_schema(&conn)
             .map_err(|code| rusqlite::Error::InvalidParameterName(code.to_owned()))?;
         crate::connectivity::app_voice::providers::jegotrip::account_runs::initialize_schema(&conn)

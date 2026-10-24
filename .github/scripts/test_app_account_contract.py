@@ -69,7 +69,7 @@ class AppAccountContractTests(unittest.TestCase):
         database = source('backend/src/platform/db.rs')
         self.assertIn('account_store::initialize_schema(&conn)', database)
         state = source('backend/src/state.rs')
-        self.assertIn('AccountManager::new(database.clone())', state)
+        self.assertIn('AccountManager::with_notifications(database.clone(),notification_sender.clone())', state)
         self.assertNotIn('app_accounts.start(', state)
         self.assertNotIn('app_accounts.install(', state)
         self.assertNotIn('account_store::install_all', database)
@@ -187,11 +187,48 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('task: AsyncMutex<Option<tokio::task::JoinHandle<()>>>', runtime)
         self.assertIn('!run.finalized.load(Ordering::SeqCst)', runtime)
 
+    def test_notification_plans_are_durable_bounded_and_claim_fenced(self):
+        notices = (PROVIDER / 'account_notifications.rs').read_text(encoding='utf-8')
+        for item in ['MAX_TARGETS:usize=8', 'MAX_JOBS:i64=2048', 'MAX_BYTES:i64=16*1024*1024', 'WORKERS:usize=4', 'MAX_ATTEMPTS:i64=5']:
+            self.assertIn(item, notices)
+        self.assertIn('UNIQUE(sms_id,rule_id,channel_id)', notices)
+        self.assertIn("WHERE id=?5 AND claim=?6 AND state='sending'", notices)
+        self.assertIn("state='uncertain'", notices)
+        self.assertIn('shutdown.wait()', notices)
+        self.assertIn('while running.join_next().await.is_some()', notices)
+        self.assertNotIn('forward_sms(', notices)
+        self.assertNotIn('line_registry', notices)
+        sms = (PROVIDER / 'account_sms.rs').read_text(encoding='utf-8')
+        promote = sms.split('pub(super) fn promote_new', 1)[1].split('struct WipingSms', 1)[0]
+        self.assertIn('account_notifications::enqueue(tx,&snapshot.0,plan)', promote)
+        self.assertNotIn('.await', promote)
+        self.assertNotIn('tx.commit()', promote)
+        runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
+        self.assertIn('planner.capture()', runtime)
+        self.assertIn('with_notifications(notifications)', runtime)
+        self.assertIn('_=self.shutdown_requested()', runtime)
+
+    def test_notification_service_uses_original_captured_destination_without_modem_or_requeue(self):
+        adapter = source('backend/src/services/notify/app_voice_notifications.rs')
+        self.assertIn('pair_fingerprint(rule, channel)', adapter)
+        self.assertIn('fingerprint == work.fingerprint', adapter)
+        self.assertIn('send_text_to_channel', adapter)
+        self.assertIn('render_sms_template_bounded', adapter)
+        self.assertNotIn('discover_modem', adapter)
+        self.assertNotIn('forward_sms(', adapter)
+        self.assertNotIn('enqueue_notification(', adapter)
+        main = source('backend/src/main.rs')
+        self.assertIn('NotificationWorker::spawn(', main)
+        self.assertIn('accounts.shutdown_all()', main)
+        self.assertIn('app_notification_worker.join()', main)
+
     def test_both_actions_have_nonzero_account_and_real_auth_http_filters(self):
         for workflow in ['.github/workflows/build-release.yml', '.github/workflows/beta-validation.yml']:
             text = source(workflow)
-            for module in ['account_config', 'account_store', 'account_runtime', 'account_sms', 'smgw_text', 'account_runs']:
+            for module in ['account_config', 'account_store', 'account_runtime', 'account_sms', 'smgw_text', 'account_runs', 'account_notifications']:
                 self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests', text)
+            self.assertIn('services::notify::notification::tests', text)
+            self.assertIn('services::notify::notification::app_voice::tests', text)
             self.assertIn('for filter in http_router_tests::app_voice_accounts', text)
             self.assertIn('DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"', text)
             self.assertIn('grep -q ": test$"', text)

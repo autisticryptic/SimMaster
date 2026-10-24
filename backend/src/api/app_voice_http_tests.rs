@@ -46,6 +46,7 @@ mod app_voice_accounts {
             (reqwest::Method::POST, format!("/api/non-3gpp/accounts/{line}/stop")),
             (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}/inbox")),
             (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}/messages")),
+            (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}/notifications")),
         ];
         for (method, path) in cases {
             let (status, _, body) = account_request(&served, method, &path, Some(serde_json::json!({})), None).await;
@@ -263,6 +264,54 @@ mod app_voice_accounts {
             let (status,headers,body)=account_request(&served,reqwest::Method::GET,&format!("/api/non-3gpp/accounts/{line}/messages{query}"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);
         }
     }
+
+    async fn notification_http_case(change_destination:bool){
+        use crate::connectivity::app_voice::providers::jegotrip::{account_runtime::AccountManager,
+            account_notifications::NotificationWorker,account_test_support::{peer,QueuedFactory},
+            rpc_envelope::decode_request,runtime_backend::tests::next_non_poll,session::{STATUS_REGISTER,STATUS_UNREGISTER},transport_packets::CallKind};
+        let mut state=build_test_router().await.expect("Actions private D-Bus required; no skip");
+        let (notice_tx,mut notice_rx)=tokio::sync::mpsc::channel::<String>(4);
+        let webhook=serve(Router::new().route("/notice",post(move |body:String|{let tx=notice_tx.clone();async move{tx.send(body).await.unwrap();StatusCode::OK}}))).await;
+        let cert=Certificates::generate("DNS:fixture.invalid");let factory=Arc::new(QueuedFactory::default());let (mut peer,_,dropped)=peer(&cert,&factory);
+        state.app.app_accounts=Arc::new(AccountManager::with_factory_and_notifications(state.app.database.clone(),factory,state.app.notification_sender.clone()));
+        let cors=CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+        let served=serve(build_router(state.app.clone(),cors)).await;let cookie=authenticate(&served).await;
+        let mut config=config_json(&cert.root);config["profile"]["incoming"]["receiver_kind"]=serde_json::json!(b"Sip.Request");
+        let(status,_,body)=account_request(&served,reqwest::Method::POST,"/api/non-3gpp/accounts",Some(serde_json::json!({"provider_id":"app_voice","config":config})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::CREATED);let line=created_line(&body);let path=format!("/api/non-3gpp/accounts/{line}");
+        let mut notices=serde_json::json!({"version":2,"channels":[{"id":"notice-channel","name":"fixture channel","type":"webhook","enabled":true,"rate_limit":{"enabled":false},"config":{"url":format!("{}/notice",webhook.base),"secret":"","headers":{}}}],
+            "rules":[{"id":"notice-rule","name":"fixture rule","type":"sms","enabled":true,"channel_ids":["notice-channel"],"sim_channel_ids":[line.clone()],"template":"{{sim_channel_id}}|{{own_number}}|{{carrier}}|{{content}}"}]});
+        state.config_manager.set_notifications(serde_json::from_value(notices.clone()).unwrap()).unwrap();
+        let observed=state.app.database.clone();let origin=line.clone();let (received,receipt)=tokio::sync::oneshot::channel();
+        let serving=tokio::spawn(async move{
+            peer.authenticate().await;peer.swap(Some(STATUS_REGISTER),true).await;
+            peer.incoming_with_fields(91,b"Sip.Request",b"fixture-native-message",Some(b"fixture-sender"),None).await;
+            let reply=next_non_poll(&mut peer).await;assert_eq!(reply.kind,CallKind::Reply);
+            let jobs:i64=observed.with_conn(|conn|conn.query_row("SELECT COUNT(*) FROM app_voice_notification_jobs WHERE line_id=?1 AND state='pending'",[&origin],|r|r.get(0)).map_err(|_|"test_query_failed")).unwrap();assert_eq!(jobs,1);
+            received.send(()).unwrap();peer.swap(Some(STATUS_UNREGISTER),true).await;
+            let message=next_non_poll(&mut peer).await;let request=decode_request(message.payload.expose_to_transport()).unwrap();peer.reply(request.call_id,&[0,1,0,0,0,0]).await;assert!(peer.receive().await.is_none());
+        });
+        let(status,_,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/start"),Some(serde_json::json!({"expected_revision":1})),Some(&cookie)).await;assert_eq!(status,StatusCode::ACCEPTED,"{body}");
+        tokio::time::timeout(std::time::Duration::from_secs(5),receipt).await.unwrap().unwrap();assert!(notice_rx.try_recv().is_err());
+        let(status,headers,body)=account_request(&served,reqwest::Method::GET,&format!("{path}/notifications"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"][0]["state"],"pending");
+        if change_destination{notices["channels"][0]["config"]["url"]=serde_json::json!(format!("{}/replacement",webhook.base));state.config_manager.set_notifications(serde_json::from_value(notices).unwrap()).unwrap();}
+        let(control,signal)=platform::shutdown::channel();let mut worker=NotificationWorker::spawn(state.app.database.clone(),state.app.notification_sender.clone(),signal);
+        let expected=if change_destination{"cancelled"}else{"delivered"};
+        tokio::time::timeout(std::time::Duration::from_secs(6),async{loop{
+            let(status,headers,body)=account_request(&served,reqwest::Method::GET,&format!("{path}/notifications?limit=10"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
+            let json:serde_json::Value=serde_json::from_str(&body).unwrap();if json["data"][0]["state"]==expected{break;}
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }}).await.unwrap();
+        if change_destination{assert!(notice_rx.try_recv().is_err());}else{assert_eq!(notice_rx.recv().await.unwrap(),format!("{line}|||fixture-native-message"));}
+        control.trigger();worker.join().await;
+        let(status,_,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/stop"),Some(serde_json::json!({"expected_revision":1})),Some(&cookie)).await;assert_eq!(status,StatusCode::OK,"{body}");serving.await.unwrap();assert!(dropped.load(Ordering::SeqCst));
+        let(status,headers,body)=account_request(&served,reqwest::Method::GET,&format!("{path}/notifications?include_body=true"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);
+    }
+    #[tokio::test]
+    async fn native_sms_plan_commits_before_ack_then_real_webhook_uses_original_non_sim_context(){notification_http_case(false).await;}
+    #[tokio::test]
+    async fn changed_destination_under_same_channel_id_cancels_instead_of_rerouting_original_message(){notification_http_case(true).await;}
 
     #[tokio::test]
     async fn body_limit_blocks_oversized_private_import_and_keeps_storage_empty() {

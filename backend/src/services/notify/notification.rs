@@ -410,6 +410,9 @@ impl NotificationSender {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("unassigned")
             .to_string();
+        if message.transport=="app_voice" {
+            return SmsTemplateContext {sim_channel_id:channel_id,sim_channel_label:"无忧行 · 应用账号".to_owned(),..Default::default()};
+        }
         if let Some(slot_id) = channel_id.strip_prefix("reader:") {
             let label = self
                 .config_manager
@@ -478,6 +481,9 @@ impl NotificationSender {
 
     /// Forward an incoming SMS to all enabled channels.
     pub async fn forward_sms(&self, message: &SmsMessage) -> Result<(), String> {
+        if message.transport=="app_voice" && !message.line_id.as_deref().is_some_and(crate::connectivity::app_voice::providers::jegotrip::account_store::valid_line_id) {
+            return Err("app_account_notification_message_invalid".to_owned());
+        }
         let context = self.sms_template_context(message).await;
         let event = NotificationEvent::Sms {
             message,
@@ -3034,76 +3040,50 @@ fn response_result(label: &str, status: StatusCode, body: String) -> Result<Stri
 }
 
 fn render_sms_template(
-    template: &str,
-    message: &SmsMessage,
-    context: &SmsTemplateContext,
-    escape_json: bool,
+    template: &str, message: &SmsMessage, context: &SmsTemplateContext, escape_json: bool,
 ) -> String {
-    let content = if escape_json {
-        escape_json_string(&message.content)
-    } else {
-        message.content.clone()
-    };
-    let own_number = if escape_json {
-        escape_json_string(&context.own_number)
-    } else {
-        context.own_number.clone()
-    };
-    let carrier = if escape_json {
-        escape_json_string(&context.carrier)
-    } else {
-        context.carrier.clone()
-    };
-    let sim_channel_id = if escape_json {
-        escape_json_string(&context.sim_channel_id)
-    } else {
-        context.sim_channel_id.clone()
-    };
-    let sim_channel_label = if escape_json {
-        escape_json_string(&context.sim_channel_label)
-    } else {
-        context.sim_channel_label.clone()
-    };
-    let timestamp = render_time_value(&message.timestamp, escape_json);
-    let verification_code = extract_verification_code(&message.content).unwrap_or_default();
-    let transport = sms_transport_label(&message.transport);
+    render_sms_template_bounded(template,message,context,escape_json,usize::MAX).expect("representable SMS template")
+}
 
-    let rendered = template
-        .replace("{{id}}", &message.id.to_string())
-        .replace("{{phone_number}}", &message.phone_number)
-        .replace("{{发送方号码}}", &message.phone_number)
-        .replace("{{发送方}}", &message.phone_number)
-        .replace("{{发件人}}", &message.phone_number)
-        .replace("{{content}}", &content)
-        .replace("{{内容}}", &content)
-        .replace("{{短信内容}}", &content)
-        .replace("{{verification_code}}", &verification_code)
-        .replace("{{验证码}}", &verification_code)
-        .replace("{{direction}}", &message.direction)
-        .replace("{{短信方向}}", &message.direction)
-        .replace("{{方向}}", &message.direction)
-        .replace("{{timestamp}}", &timestamp)
-        .replace("{{时间}}", &timestamp)
-        .replace("{{status}}", &message.status)
-        .replace("{{短信状态}}", &message.status)
-        .replace("{{状态}}", &message.status)
-        .replace("{{transport}}", transport)
-        .replace("{{path}}", transport)
-        .replace("{{短信途径}}", transport)
-        .replace("{{短信路径}}", transport)
-        .replace("{{传输方式}}", transport)
-        .replace("{{sender}}", &message.phone_number)
-        .replace("{{message}}", &content)
-        .replace("{{time}}", &timestamp)
-        .replace("{{carrier}}", &carrier)
-        .replace("{{operator}}", &carrier)
-        .replace("{{运营商}}", &carrier);
-    let rendered = rendered
-        .replace("{{sim_channel_id}}", &sim_channel_id)
-        .replace("{{SIM通道ID}}", &sim_channel_id)
-        .replace("{{sim_channel}}", &sim_channel_label)
-        .replace("{{SIM通道}}", &sim_channel_label);
-    replace_own_number(rendered, &own_number)
+fn render_sms_template_bounded(
+    template:&str,message:&SmsMessage,context:&SmsTemplateContext,escape_json:bool,limit:usize,
+)->Result<String,&'static str>{
+    use zeroize::Zeroizing;
+    const TOO_LARGE:&str="app_account_notification_plan_too_large";
+    if [template,&message.content,&message.phone_number,&message.timestamp,&context.own_number,&context.carrier,
+        &context.sim_channel_id,&context.sim_channel_label].iter().any(|text|text.len()>limit){return Err(TOO_LARGE);}
+    let value=|input:&str|Zeroizing::new(if escape_json{escape_json_string(input)}else{input.to_owned()});
+    let content=value(&message.content);let own_number=value(&context.own_number);let carrier=value(&context.carrier);
+    let channel_id=value(&context.sim_channel_id);let channel_label=value(&context.sim_channel_label);
+    let timestamp=Zeroizing::new(render_time_value(&message.timestamp,escape_json));
+    let verification_code=Zeroizing::new(extract_verification_code(&message.content).unwrap_or_default());
+    let id=message.id.to_string();let transport=sms_transport_label(&message.transport);
+    let replacements=[
+        ("{{id}}",id.as_str()),("{{phone_number}}",message.phone_number.as_str()),("{{发送方号码}}",message.phone_number.as_str()),
+        ("{{发送方}}",message.phone_number.as_str()),("{{发件人}}",message.phone_number.as_str()),
+        ("{{content}}",content.as_str()),("{{内容}}",content.as_str()),("{{短信内容}}",content.as_str()),
+        ("{{verification_code}}",verification_code.as_str()),("{{验证码}}",verification_code.as_str()),
+        ("{{direction}}",message.direction.as_str()),("{{短信方向}}",message.direction.as_str()),("{{方向}}",message.direction.as_str()),
+        ("{{timestamp}}",timestamp.as_str()),("{{时间}}",timestamp.as_str()),
+        ("{{status}}",message.status.as_str()),("{{短信状态}}",message.status.as_str()),("{{状态}}",message.status.as_str()),
+        ("{{transport}}",transport),("{{path}}",transport),("{{短信途径}}",transport),("{{短信路径}}",transport),("{{传输方式}}",transport),
+        ("{{sender}}",message.phone_number.as_str()),("{{message}}",content.as_str()),("{{time}}",timestamp.as_str()),
+        ("{{carrier}}",carrier.as_str()),("{{operator}}",carrier.as_str()),("{{运营商}}",carrier.as_str()),
+        ("{{sim_channel_id}}",channel_id.as_str()),("{{SIM通道ID}}",channel_id.as_str()),("{{sim_channel}}",channel_label.as_str()),("{{SIM通道}}",channel_label.as_str()),
+        ("{{own_number}}",own_number.as_str()),("{{local_phone_number}}",own_number.as_str()),("{{self_phone_number}}",own_number.as_str()),("{{本机号码}}",own_number.as_str()),
+    ];
+    let mut rendered=Zeroizing::new(template.to_owned());
+    for (pattern,value) in replacements{
+        let count=rendered.matches(pattern).count();
+        let removed=count.checked_mul(pattern.len()).ok_or(TOO_LARGE)?;
+        let added=count.checked_mul(value.len()).ok_or(TOO_LARGE)?;
+        let next=rendered.len().checked_sub(removed).and_then(|bytes|bytes.checked_add(added)).ok_or(TOO_LARGE)?;
+        if next>limit{return Err(TOO_LARGE);}
+        // Preserve the existing ordered/cascading replacement semantics, but
+        // check exact expansion size BEFORE allocating the next string.
+        rendered=Zeroizing::new(rendered.replace(pattern,value));
+    }
+    Ok(std::mem::take(&mut *rendered))
 }
 
 fn sms_transport_label(transport: &str) -> &'static str {
@@ -3111,6 +3091,7 @@ fn sms_transport_label(transport: &str) -> &'static str {
         "vowifi_ims" => "VoWiFi",
         // `volte_ims` is how rows stored before the cellular IMS rename read.
         "cellular_ims" | "volte_ims" => "VoLTE",
+        "app_voice" => "应用消息",
         _ => "CS",
     }
 }
@@ -3274,6 +3255,9 @@ fn compute_legacy_signature(secret: &str, data: &str) -> String {
 
     format!("{:016x}", hash)
 }
+
+#[path = "app_voice_notifications.rs"]
+pub(crate) mod app_voice;
 
 #[cfg(test)]
 mod tests {

@@ -10,6 +10,7 @@ use super::{
     account_store::{self, AccountMetadata, StoredAccount},
     account_sms::{self, AccountSmsMessage},
     account_runs::{self, RunToken},
+    account_notifications::NoticePlanner,
     controller::{Callback, ControllerFailure, HostingController},
     runtime_backend::{BackendEvent, BackendEventPayload, NativeHostingBackend},
     runtime_connector::TcpRuntimeConnector,
@@ -112,6 +113,7 @@ struct ManagedRun {
     inbox_nonce: String,
     run_token: Arc<RunToken>,
     finalized: AtomicBool,
+    notifications: Option<Arc<dyn NoticePlanner>>,
     controller: AsyncMutex<HostingController>,
     backend: Arc<NativeHostingBackend>,
     accepting: AtomicBool,
@@ -154,6 +156,9 @@ struct AccountSlot {
 pub struct AccountManager {
     database: Arc<Database>,
     factory: Arc<dyn AccountBackendFactory>,
+    notifications: Option<Arc<dyn NoticePlanner>>,
+    shutting_down: AtomicBool,
+    shutdown_changed: tokio::sync::Notify,
     slots: Mutex<BTreeMap<String, Arc<AccountSlot>>>,
 }
 impl fmt::Debug for AccountManager {
@@ -161,8 +166,15 @@ impl fmt::Debug for AccountManager {
 }
 impl AccountManager {
     pub fn new(database: Arc<Database>) -> Self { Self::with_factory(database, Arc::new(ExplicitNativeFactory)) }
+    pub(crate) fn with_notifications(database:Arc<Database>,notifications:Arc<dyn NoticePlanner>)->Self {
+        let mut manager=Self::new(database);manager.notifications=Some(notifications);manager
+    }
+    #[cfg(test)]
+    pub(crate) fn with_factory_and_notifications(database:Arc<Database>,factory:Arc<dyn AccountBackendFactory>,notifications:Arc<dyn NoticePlanner>)->Self {
+        let mut manager=Self::with_factory(database,factory);manager.notifications=Some(notifications);manager
+    }
     pub(crate) fn with_factory(database: Arc<Database>, factory: Arc<dyn AccountBackendFactory>) -> Self {
-        Self { database, factory, slots: Mutex::new(BTreeMap::new()) }
+        Self { database, factory, notifications: None, shutting_down:AtomicBool::new(false), shutdown_changed:tokio::sync::Notify::new(), slots: Mutex::new(BTreeMap::new()) }
     }
     fn metadata(&self, line_id: &str) -> Result<AccountMetadata, &'static str> {
         if !account_store::valid_line_id(line_id) { return Err("app_account_line_invalid"); }
@@ -216,6 +228,10 @@ impl AccountManager {
         self.metadata(line_id)?;
         self.database.with_conn(|conn| account_sms::list(conn, line_id, limit))
     }
+    pub fn notification_status(&self,line_id:&str,limit:usize)->Result<Vec<super::account_notifications::NoticeStatus>,&'static str>{
+        self.metadata(line_id)?;
+        self.database.with_conn(|conn|super::account_notifications::metadata(conn,line_id,limit))
+    }
     pub async fn create(&self, config: AccountConfig, now: u64) -> Result<AccountView, &'static str> {
         config.validate(now)?;
         // Local random ID never embeds a phone number/token/ICCID or claims to
@@ -258,7 +274,9 @@ impl AccountManager {
         Ok(())
     }
     pub async fn start(&self, line_id: &str, expected_revision: u64, now: u64) -> Result<AccountView, &'static str> {
+        if self.shutting_down.load(Ordering::SeqCst){return Err("app_account_shutting_down");}
         let slot = self.slot(line_id)?; let _operation = slot.operation.lock().await;
+        if self.shutting_down.load(Ordering::SeqCst){return Err("app_account_shutting_down");}
         let metadata = self.check_revision(line_id, expected_revision)?;
         Self::require_released(&slot).await?;
         let StoredAccount { metadata: stored, config } = self.database.with_conn(|conn| account_store::load(conn, line_id))?
@@ -271,7 +289,7 @@ impl AccountManager {
         controller.import(config.credentials, now).map_err(controller_error)?;
         let run_token=Arc::new(self.database.with_conn(|conn|account_runs::register(conn,line_id,metadata.revision,&inbox_nonce))?);
         let run = Arc::new(ManagedRun { line_id: line_id.to_owned(), database: self.database.clone(), revision: metadata.revision,
-            inbox_nonce, run_token, finalized: AtomicBool::new(false), controller: AsyncMutex::new(controller), backend,
+            inbox_nonce, run_token, finalized: AtomicBool::new(false), notifications:self.notifications.clone(), controller: AsyncMutex::new(controller), backend,
             accepting: AtomicBool::new(true), stopping: AtomicBool::new(false), error: Mutex::new(None), task: AsyncMutex::new(None) });
         // Retain the owning backend BEFORE any await that can create IO. A
         // cancelled HTTP future leaves this same run available for stop/retry.
@@ -282,11 +300,16 @@ impl AccountManager {
         *task_slot = Some(tokio::spawn(consume_events(weak, events)));
         drop(task_slot);
         let mut controller = run.controller.lock().await;
-        match controller.start(now).await {
+        let started=tokio::select!{biased;
+            _=self.shutdown_requested()=>{*lock(&run.error)=Some("app_account_shutting_down");return Err("app_account_shutting_down");},
+            result=controller.start(now)=>result,
+        };
+        match started {
             Ok(_) => {
                 if let Err(code) = self.check_revision(line_id, expected_revision) {
                     *lock(&run.error) = Some(code); return Err(code);
                 }
+                if self.shutting_down.load(Ordering::SeqCst){return Err("app_account_shutting_down");}
                 retirement.disarm();
                 Ok(view(metadata, controller.phase(), !controller.resources_released(), None))
             }
@@ -299,9 +322,11 @@ impl AccountManager {
         let slot = self.slot(line_id)?; let _operation = slot.operation.lock().await;
         let metadata = self.check_revision(line_id, expected_revision)?;
         let Some(run) = lock(&slot.run).clone() else { return Ok(view(metadata, Phase::Unconfigured, false, None)); };
-        // A private DB edit detected by the event/timer gate must still allow
-        // cleanup of the retained OLD run. This command never imports the new
-        // revision or substitutes its owner/connection for the original IO.
+        let phase=self.cleanup_run(&run,now).await?;
+        Ok(view(metadata,phase,!run.finalized.load(Ordering::SeqCst),None))
+    }
+    async fn cleanup_run(&self,run:&Arc<ManagedRun>,now:u64)->Result<Phase,&'static str>{
+        // Original retained resource owner, not current database configuration.
         run.stopping.store(true, Ordering::SeqCst);
         run.accepting.store(false, Ordering::SeqCst);
         let mut retirement = Retirement::new(run.clone());
@@ -327,13 +352,43 @@ impl AccountManager {
         }
         match result {
             Ok(()) => {
+                if !released||!run.finalized.load(Ordering::SeqCst){return Err("app_account_cleanup_unconfirmed");}
                 *lock(&run.error) = None;
-                Ok(view(metadata, phase, !released || !run.finalized.load(Ordering::SeqCst), None))
+                Ok(phase)
             }
             Err(reason) => { let code = controller_error(reason); *lock(&run.error) = Some(code); Err(code) }
         }
     }
+    async fn shutdown_requested(&self){
+        loop {
+            let changed=self.shutdown_changed.notified();tokio::pin!(changed);changed.as_mut().enable();
+            if self.shutting_down.load(Ordering::SeqCst){return;}changed.await;
+        }
+    }
+    /// Explicit process lifecycle owner, not a cached state/PID cleanup guess.
+    /// Pending starts are cancelled, retained original actors/consumers joined.
+    pub(crate) async fn shutdown_all(&self)->usize{
+        use futures_util::{stream,StreamExt};
+        self.shutting_down.store(true,Ordering::SeqCst);self.shutdown_changed.notify_waiters();
+        let _retirement=ShutdownRetirement(self);
+        let slots=lock(&self.slots).values().cloned().collect::<Vec<_>>();
+        let results=stream::iter(slots).map(|slot|async move{
+            let _operation=slot.operation.lock().await;
+            let run=lock(&slot.run).clone();let Some(run)=run else{return false;};
+            if self.cleanup_run(&run,unix_now()).await.is_err(){
+                // A native negative result can coexist with released IO. A
+                // second wait confirms the same owner; never resends a command.
+                let _=self.cleanup_run(&run,unix_now()).await;return true;
+            }
+            false
+        }).buffer_unordered(4).collect::<Vec<_>>().await;
+        results.into_iter().filter(|failed|*failed).count()
+    }
 }
+struct ShutdownRetirement<'a>(&'a AccountManager);
+impl Drop for ShutdownRetirement<'_>{fn drop(&mut self){
+    for slot in lock(&self.0.slots).values(){if let Some(run)=lock(&slot.run).as_ref(){run.retire();}}
+}}
 impl Drop for AccountManager {
     fn drop(&mut self) {
         for slot in lock(&self.slots).values() { if let Some(run) = lock(&slot.run).as_ref() { run.retire(); } }
@@ -366,8 +421,9 @@ async fn handle_message(run: &ManagedRun, controller: &mut HostingController, de
     let binding = match run.backend.original_incoming_binding(&delivery.owner, &delivery.scope) {
         Some(binding) => binding, None => { *lock(&run.error) = Some("app_account_inbox_scope_invalid"); run.retire(); return; }
     };
+    let notifications=run.notifications.as_ref().map(|planner|planner.capture()).transpose();
     let context = match InboxScope::original(&run.line_id, run.revision, &run.inbox_nonce, &delivery.owner, &delivery.scope)
-        .and_then(|context| context.with_receiver(binding)) {
+        .and_then(|context| context.with_receiver(binding)).map(|context|context.with_notifications(notifications)) {
         Ok(context) => context, Err(code) => { *lock(&run.error) = Some(code); run.retire(); return; }
     };
     let result = match &delivery.message {

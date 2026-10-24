@@ -42,6 +42,30 @@ async fn failed_gc_after_native_release_keeps_cleanup_required_and_retries_no_rp
     assert_eq!(count(&temp.database,"app_voice_inbox"),0);assert_eq!(manager.messages(&line,128).unwrap().len(),1);
 }
 #[tokio::test]
+async fn process_shutdown_cancels_pending_start_and_joins_original_run_without_rebinding() {
+    let cert=Certificates::generate("DNS:fixture.invalid");let temp=TempDatabase::new();let factory=Arc::new(QueuedFactory::default());
+    let held=Arc::new(HeldConnector{entered:tokio::sync::Notify::new(),scope:Mutex::new(None)});factory.add(held.clone());
+    let manager=Arc::new(AccountManager::with_factory(temp.database.clone(),factory.clone()));let line=manager.create(config(&cert.root),100).await.unwrap().account.line_id;
+    let owner=manager.clone();let id=line.clone();let start=tokio::spawn(async move{owner.start(&id,1,100).await});
+    tokio::time::timeout(Duration::from_secs(3),held.entered.notified()).await.unwrap();
+    let original=lock(&held.scope).clone().unwrap();
+    assert_eq!(tokio::time::timeout(Duration::from_secs(3),manager.shutdown_all()).await.unwrap(),0);
+    assert_eq!(start.await.unwrap().err(),Some("app_account_shutting_down"));assert!(!original.is_open());
+    assert_eq!(manager.start(&line,1,100).await.err(),Some("app_account_shutting_down"));
+    assert_eq!(count(&temp.database,"app_voice_inbox_runs"),0);assert_eq!(factory.build_count(),1);
+}
+
+#[tokio::test]
+async fn process_shutdown_gracefully_releases_hosted_original_run_and_keeps_sms_history() {
+    let cert=Certificates::generate("DNS:fixture.invalid");let temp=TempDatabase::new();let factory=Arc::new(QueuedFactory::default());let(peer,_,dropped)=peer(&cert,&factory);
+    let manager=AccountManager::with_factory(temp.database.clone(),factory);let line=manager.create(smgw(&cert.root),100).await.unwrap().account.line_id;
+    let worker=tokio::spawn(serving(peer));manager.start(&line,1,100).await.unwrap();have_messages(&manager,&line,1).await;
+    assert_eq!(manager.shutdown_all().await,0);worker.await.unwrap();assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(count(&temp.database,"app_voice_inbox"),0);assert_eq!(count(&temp.database,"sms_messages"),1);
+    assert_eq!(manager.shutdown_all().await,0);
+}
+
+#[tokio::test]
 async fn cancelling_between_actor_release_and_consumer_join_keeps_original_fence_and_join() {
     let cert=Certificates::generate("DNS:fixture.invalid");let temp=TempDatabase::new();let factory=Arc::new(QueuedFactory::default());let (peer,_,dropped)=peer(&cert,&factory);
     let manager=Arc::new(AccountManager::with_factory(temp.database.clone(),factory));let line=manager.create(smgw(&cert.root),100).await.unwrap().account.line_id;

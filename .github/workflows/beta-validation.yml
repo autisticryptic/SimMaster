@@ -266,6 +266,7 @@ jobs:
             connectivity::app_voice::providers::jegotrip::smgw_text::tests \
             connectivity::app_voice::providers::jegotrip::account_sms::tests \
             connectivity::app_voice::providers::jegotrip::account_runs::tests \
+            connectivity::app_voice::providers::jegotrip::account_notifications::tests \
             connectivity::app_voice::providers::jegotrip::account_runtime::tests \
             connectivity::app_voice::providers::jegotrip::legacy_config::tests \
             connectivity::app_voice::providers::jegotrip::object_reference::tests \
@@ -277,6 +278,8 @@ jobs:
             connectivity::modems::ims::cellular_ims::live::refresh_tests \
             connectivity::modems::ims::cellular_ims::security_agreement::tests \
             connectivity::modems::ims::cellular_ims::errors::tests \
+            services::notify::notification::tests \
+            services::notify::notification::app_voice::tests \
             services::notify::telegram_endpoint::tests; do
             cargo test --locked "$filter" -- --list > beta-test-list.txt
             if ! grep -q ': test$' beta-test-list.txt; then
