@@ -330,7 +330,11 @@ async fn handle_message(run: &ManagedRun, controller: &mut HostingController, de
     if pending.len() >= MAX_PENDING_MESSAGES || bytes.saturating_add(delivery.message.byte_length()) > MAX_PENDING_MESSAGE_BYTES {
         *lock(&run.error) = Some("app_account_inbox_backpressure"); run.retire(); return;
     }
-    let context = match InboxScope::original(&run.line_id, run.revision, &run.inbox_nonce, &delivery.owner, &delivery.scope) {
+    let binding = match run.backend.original_incoming_binding(&delivery.owner, &delivery.scope) {
+        Some(binding) => binding, None => { *lock(&run.error) = Some("app_account_inbox_scope_invalid"); run.retire(); return; }
+    };
+    let context = match InboxScope::original(&run.line_id, run.revision, &run.inbox_nonce, &delivery.owner, &delivery.scope)
+        .and_then(|context| context.with_receiver(binding)) {
         Ok(context) => context, Err(code) => { *lock(&run.error) = Some(code); run.retire(); return; }
     };
     let result = match &delivery.message {

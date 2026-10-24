@@ -15,7 +15,6 @@ use ring::digest::{Context, SHA256};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::{fmt, sync::atomic::{AtomicBool, Ordering}};
-#[cfg(test)]
 use zeroize::Zeroizing;
 
 const STORAGE: &str = "app_account_inbox_storage_failed";
@@ -33,11 +32,25 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), &'static str> {
         run_nonce TEXT NOT NULL,source_kind TEXT NOT NULL CHECK(source_kind IN ('direct','batch')),
         peer_epoch INTEGER NOT NULL,sequence INTEGER NOT NULL,fingerprint TEXT NOT NULL,
         body BLOB NOT NULL,sender BLOB,opaque_time BLOB,
+        receiver_object BLOB,receiver_domain BLOB,receiver_kind BLOB,
         reply_state TEXT NOT NULL DEFAULT 'pending' CHECK(reply_state IN ('pending','direct_submitted','batch_queued')),
         created_at TEXT NOT NULL,
         UNIQUE(line_id,revision,run_nonce,source_kind,peer_epoch,sequence));
         CREATE INDEX IF NOT EXISTS idx_app_voice_inbox_line ON app_voice_inbox(line_id,id);")
-        .map_err(|_| STORAGE)
+        .map_err(|_| STORAGE)?;
+    // Existing unclassified rows remain readable as unknown-context history;
+    // the old provider binding cannot be reconstructed from a newer config.
+    // Never populate them from today's profile or pretend they were classified.
+    let mut query = conn.prepare("PRAGMA table_info(app_voice_inbox)").map_err(|_| STORAGE)?;
+    let columns = query.query_map([], |row| row.get::<_, String>(1)).map_err(|_| STORAGE)?
+        .collect::<Result<Vec<_>, _>>().map_err(|_| STORAGE)?;
+    drop(query);
+    for (column, statement) in [("receiver_object", "ALTER TABLE app_voice_inbox ADD COLUMN receiver_object BLOB"),
+        ("receiver_domain", "ALTER TABLE app_voice_inbox ADD COLUMN receiver_domain BLOB"),
+        ("receiver_kind", "ALTER TABLE app_voice_inbox ADD COLUMN receiver_kind BLOB")] {
+        if !columns.iter().any(|existing| existing == column) { conn.execute(statement, []).map_err(|_| STORAGE)?; }
+    }
+    Ok(())
 }
 fn valid_nonce(nonce: &str) -> bool {
     nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -71,6 +84,11 @@ fn require_account(conn: &Connection, line: &str, revision: u64) -> Result<(), &
 /// supplied or serialized by HTTP callers, and never creates/relabels a scope.
 pub(super) struct InboxScope {
     line_id: String, revision: u64, nonce: String, owner: AttemptOwner, scope: RpcConnectionScope,
+    receiver: Option<ReceiverContext>,
+}
+struct ReceiverContext { object: Zeroizing<Vec<u8>>, domain: Zeroizing<Vec<u8>>, kind: Zeroizing<Vec<u8>> }
+impl ReceiverContext {
+    fn bytes(&self) -> usize { self.object.len() + self.domain.len() + self.kind.len() }
 }
 impl fmt::Debug for InboxScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("InboxScope(<redacted>)") }
@@ -80,13 +98,25 @@ impl InboxScope {
         -> Result<Self, &'static str> {
         if !account_store::valid_line_id(line) || owner.line_id() != line || revision == 0 || revision > i64::MAX as u64
             || !valid_nonce(nonce) || !scope.is_open() { return Err(SCOPE); }
-        Ok(Self { line_id: line.to_owned(), revision, nonce: nonce.to_owned(), owner: owner.clone(), scope: scope.clone() })
+        Ok(Self { line_id: line.to_owned(), revision, nonce: nonce.to_owned(), owner: owner.clone(), scope: scope.clone(), receiver: None })
+    }
+    pub(super) fn with_receiver(mut self, binding: super::rpc_incoming::IncomingBinding<'_>) -> Result<Self, &'static str> {
+        for value in [binding.object_id, binding.domain, binding.receiver_kind] {
+            if value.is_empty() || value.len() > MAX_FIELD_BYTES { return Err(INVALID); }
+        }
+        self.receiver = Some(ReceiverContext { object: Zeroizing::new(binding.object_id.to_vec()),
+            domain: Zeroizing::new(binding.domain.to_vec()), kind: Zeroizing::new(binding.receiver_kind.to_vec()) });
+        Ok(self)
     }
     fn commit(&self, database: &Database, kind: &'static str, epoch: u32, sequence: i32, message: &IncomingMessage)
         -> Result<CommittedInbox, &'static str> {
         if !self.scope.is_open() || sequence <= 0 { return Err(SCOPE); }
         if !matches!(kind,"direct"|"batch") || kind=="direct" && epoch!=0 || kind=="batch" && epoch==0 { return Err(INVALID); }
-        let size = message_size(message)?; let fingerprint = fingerprint(message);
+        let size = message_size(message)? + self.receiver.as_ref().map_or(0, |receiver| receiver.bytes() as i64);
+        let fingerprint = fingerprint(message);
+        let object = self.receiver.as_ref().map(|receiver| receiver.object.as_slice());
+        let domain = self.receiver.as_ref().map(|receiver| receiver.domain.as_slice());
+        let receiver_kind = self.receiver.as_ref().map(|receiver| receiver.kind.as_slice());
         // Never hold the NONBLOCKING IO poll gate across SQLite/config IO. The
         // captured observation can be committed historically if physical close
         // races it; a closed/retired scope cannot admit the subsequent reply.
@@ -95,26 +125,28 @@ impl InboxScope {
             require_account(&tx, &self.line_id, self.revision)?;
             let existing: Option<(i64, bool)> = tx.query_row("SELECT id,
                 fingerprint=?7 AND body=?8 AND sender IS ?9 AND opaque_time IS ?10
+                    AND receiver_object IS ?11 AND receiver_domain IS ?12 AND receiver_kind IS ?13
                 FROM app_voice_inbox WHERE line_id=?1 AND revision=?2 AND run_nonce=?3
                 AND source_kind=?4 AND peer_epoch=?5 AND sequence=?6",
                 params![&self.line_id,self.revision as i64,&self.nonce,kind,epoch as i64,sequence,&fingerprint,
-                    message.body.as_slice(),message.from.as_deref(),message.time.as_deref()],
+                    message.body.as_slice(),message.from.as_deref(),message.time.as_deref(),object,domain,receiver_kind],
                 |row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(|_| STORAGE)?;
             if let Some((id, matches)) = existing {
                 if !matches { return Err("app_account_inbox_duplicate_conflict"); }
                 tx.commit().map_err(|_| STORAGE)?; return Ok((id,None));
             }
             let (local,total,stored): (i64,i64,i64) = tx.query_row("SELECT COALESCE(SUM(line_id=?1),0),COUNT(*),
-                COALESCE(SUM(length(body)+COALESCE(length(sender),0)+COALESCE(length(opaque_time),0)),0) FROM app_voice_inbox",
+                COALESCE(SUM(length(body)+COALESCE(length(sender),0)+COALESCE(length(opaque_time),0)
+                    +COALESCE(length(receiver_object),0)+COALESCE(length(receiver_domain),0)+COALESCE(length(receiver_kind),0)),0) FROM app_voice_inbox",
                 [&self.line_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|_| STORAGE)?;
             if local >= MAX_PER_ACCOUNT || total >= MAX_TOTAL || stored.checked_add(size).map_or(true,|bytes|bytes>MAX_TOTAL_BYTES) {
                 return Err(FULL);
             }
             let stamp = chrono::Utc::now().to_rfc3339();
-            tx.execute("INSERT INTO app_voice_inbox(line_id,revision,run_nonce,source_kind,peer_epoch,sequence,fingerprint,body,sender,opaque_time,created_at)
-                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            tx.execute("INSERT INTO app_voice_inbox(line_id,revision,run_nonce,source_kind,peer_epoch,sequence,fingerprint,body,sender,opaque_time,created_at,receiver_object,receiver_domain,receiver_kind)
+                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![&self.line_id,self.revision as i64,&self.nonce,kind,epoch as i64,sequence,&fingerprint,
-                    message.body.as_slice(),message.from.as_deref(),message.time.as_deref(),&stamp]).map_err(|_| STORAGE)?;
+                    message.body.as_slice(),message.from.as_deref(),message.time.as_deref(),&stamp,object,domain,receiver_kind]).map_err(|_| STORAGE)?;
             let id = tx.last_insert_rowid();
             let payload = serde_json::json!({"inbox_id":id,"classification":"unclassified"}).to_string();
             let event = insert_app_event_for_conn(&tx, "app_voice.inbox_stored", Some(&self.line_id), Some(super::PROVIDER_ID), &payload, &stamp)
@@ -128,10 +160,12 @@ impl InboxScope {
     }
     pub(super) fn commit_direct(&self, database: &Database, message: &IncomingProtocolMessage) -> Result<CommittedInbox, &'static str> {
         if message.owner()!=&self.owner || !message.reply_ticket().matches(&self.owner,&self.scope) { return Err(SCOPE); }
+        if self.receiver.is_none() { return Err(INVALID); }
         self.commit(database,"direct",0,message.reply_ticket().request_id(),message.message())
     }
     pub(super) fn commit_batch(&self, database: &Database, message: &ScheduledIncomingMessage) -> Result<CommittedInbox, &'static str> {
         if message.owner()!=&self.owner || !message.ticket().matches(&self.owner,&self.scope) { return Err(SCOPE); }
+        if self.receiver.is_none() { return Err(INVALID); }
         self.commit(database,"batch",message.ticket().peer_incarnation(),message.ticket().sequence(),message.message())
     }
     pub(super) async fn accept_direct(&self, database: &Database, backend: &NativeHostingBackend, message: &IncomingProtocolMessage,

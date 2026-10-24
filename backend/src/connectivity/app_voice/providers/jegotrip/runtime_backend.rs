@@ -293,6 +293,12 @@ impl NativeHostingBackend {
     pub(super) fn original_scope(&self, owner: &AttemptOwner) -> Option<RpcConnectionScope> {
         self.original(owner).ok().map(|attempt| attempt.scope.clone())
     }
+    pub(super) fn original_incoming_binding(&self, owner: &AttemptOwner, scope: &RpcConnectionScope)
+        -> Option<super::rpc_incoming::IncomingBinding<'_>> {
+        let attempt = self.original(owner).ok()?;
+        if !attempt.scope.matches(scope) || !scope.is_open() || !lock(&attempt.state).configured { return None; }
+        self.profile.incoming.as_ref().map(Binding::borrowed)
+    }
     fn original(&self, owner: &AttemptOwner) -> Result<Arc<Attempt>, BackendFailure> {
         lock(&self.state).slot.as_ref().filter(|a| &a.owner == owner).cloned().ok_or(BackendFailure::Disconnected)
     }

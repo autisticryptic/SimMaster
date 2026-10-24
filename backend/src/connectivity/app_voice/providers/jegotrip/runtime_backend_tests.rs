@@ -596,8 +596,11 @@ async fn durable_inbox_rejects_foreign_tickets_and_retired_admission_keeps_origi
     assert_eq!(wrong.commit_direct(&database, &message).err(), Some("app_account_inbox_scope_invalid"));
     let wrong = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &RpcConnectionScope::fresh()).unwrap();
     assert_eq!(wrong.commit_direct(&database, &message).err(), Some("app_account_inbox_scope_invalid"));
+    let unbound = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &scope).unwrap();
+    assert_eq!(unbound.commit_direct(&database, &message).err(), Some("app_account_inbox_message_invalid"));
     assert!(database.get_recent_app_events(Some(&line), 10).unwrap().is_empty());
-    let context = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &scope).unwrap();
+    let context = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &scope).unwrap()
+        .with_receiver(backend.original_incoming_binding(&original, &scope).unwrap()).unwrap();
     let admission = AtomicBool::new(false);
     assert_eq!(context.accept_direct(&database, &backend, &message, &admission).await.unwrap(), Completion::Retired);
     assert!(message.reply_ticket().is_open()); no_reply_yet.await.unwrap();
@@ -626,7 +629,8 @@ async fn durable_inbox_commit_is_idempotent_under_real_command_queue_pressure() 
     begin.send(()).unwrap(); let event = events.recv().await.unwrap();
     let BackendEventPayload::DirectMessage(message) = event.payload else { panic!("original direct message required") };
     blocked.store(true, Ordering::SeqCst);
-    let context = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &scope).unwrap();
+    let context = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &scope).unwrap()
+        .with_receiver(backend.original_incoming_binding(&original, &scope).unwrap()).unwrap();
     let admission = AtomicBool::new(true); let mut pending = FuturesUnordered::new();
     for _ in 0..64 { pending.push(context.accept_direct(&database, &backend, &message, &admission)); }
     assert_eq!(tokio::time::timeout(Duration::from_millis(250), pending.next()).await.unwrap().unwrap().unwrap(), Completion::Backpressure);

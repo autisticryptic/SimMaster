@@ -43,6 +43,54 @@ fn generic_bytes_and_redacted_event_commit_atomically_without_sms_or_readiness()
 }
 
 #[test]
+fn original_receiver_binding_is_preserved_when_newer_configuration_replaces_it() {
+    let (database,line,context)=setup();
+    let context=context.with_receiver(super::super::rpc_incoming::IncomingBinding {
+        object_id:b"#original-object",domain:b"original-domain",receiver_kind:b"original.kind"
+    }).unwrap();
+    let receipt=context.commit(&database,"direct",0,1,&message()).unwrap();
+    database.with_conn(|conn|conn.execute("UPDATE app_voice_accounts SET revision=2 WHERE line_id=?1",[&line]).map(|_|()).map_err(|_|STORAGE)).unwrap();
+    let values:(Vec<u8>,Vec<u8>,Vec<u8>)=database.with_conn(|conn|conn.query_row(
+        "SELECT receiver_object,receiver_domain,receiver_kind FROM app_voice_inbox WHERE id=?1 AND line_id=?2",
+        params![receipt.id,&line],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|_|STORAGE)).unwrap();
+    assert_eq!(values.0,b"#original-object");assert_eq!(values.1,b"original-domain");assert_eq!(values.2,b"original.kind");
+    assert!(context.commit(&database,"direct",0,2,&message()).is_err());
+    let json=serde_json::to_string(&database.with_conn(|conn|metadata(conn,&line,50)).unwrap()).unwrap();
+    assert!(!json.contains("original"));assert!(!json.contains("receiver"));assert!(json.contains("unclassified"));
+}
+
+#[test]
+fn changed_receiver_context_is_a_conflict_not_an_equivalent_duplicate() {
+    let (database,line,context)=setup();let nonce=context.nonce.clone();let owner=context.owner.clone();let scope=context.scope.clone();
+    let context=context.with_receiver(super::super::rpc_incoming::IncomingBinding {
+        object_id:b"#original-object",domain:b"original-domain",receiver_kind:b"original.kind"
+    }).unwrap();
+    context.commit(&database,"direct",0,1,&message()).unwrap();
+    let changed=InboxScope::original(&line,1,&nonce,&owner,&scope).unwrap().with_receiver(super::super::rpc_incoming::IncomingBinding {
+        object_id:b"#original-object",domain:b"original-domain",receiver_kind:b"different.kind"
+    }).unwrap();
+    assert_eq!(changed.commit(&database,"direct",0,1,&message()).err(),Some("app_account_inbox_duplicate_conflict"));
+    assert_eq!(count(&database,"app_voice_inbox"),1);assert_eq!(count(&database,"app_events"),1);
+}
+
+#[test]
+fn legacy_inbox_binding_columns_stay_unknown_instead_of_using_current_profile() {
+    let conn=Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE app_voice_inbox(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,line_id TEXT NOT NULL,revision INTEGER NOT NULL,
+        run_nonce TEXT NOT NULL,source_kind TEXT NOT NULL,peer_epoch INTEGER NOT NULL,
+        sequence INTEGER NOT NULL,fingerprint TEXT NOT NULL,body BLOB NOT NULL,sender BLOB,opaque_time BLOB,
+        reply_state TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,
+        UNIQUE(line_id,revision,run_nonce,source_kind,peer_epoch,sequence));
+        INSERT INTO app_voice_inbox(line_id,revision,run_nonce,source_kind,peer_epoch,sequence,fingerprint,body,created_at)
+        VALUES('old-local-line',1,'old-run','direct',0,1,'old-fingerprint',X'FF0003','old-time');").unwrap();
+    initialize_schema(&conn).unwrap();initialize_schema(&conn).unwrap();
+    let row:(Vec<u8>,bool)=conn.query_row("SELECT body,receiver_object IS NULL AND receiver_domain IS NULL AND receiver_kind IS NULL FROM app_voice_inbox WHERE id=1",
+        [],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!(row.0,[0xff,0,3]);assert!(row.1);
+}
+
+#[test]
 fn equal_original_delivery_is_idempotent_and_does_not_emit_an_extra_event() {
     let (database,_,context)=setup();let first=context.commit(&database,"direct",0,7,&message()).unwrap();
     let duplicate=context.commit(&database,"direct",0,7,&message()).unwrap();assert_eq!(first.id,duplicate.id);

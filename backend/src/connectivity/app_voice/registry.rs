@@ -1,12 +1,12 @@
 //! Reserved interface for non-3GPP, application-based voice/messaging.
 //!
-//! This module defines *contracts only*: no provider is implemented here and
-//! none is registered by default. A provider is added later as a separate
-//! module that plugs into this registry.
+//! This registry defines *contracts only*: no usable provider is registered by
+//! default. An explicit account/backend driver does not install a descriptor or
+//! prove that the provider's voice, messaging or media channels are ready.
 //!
 //! A provider must:
-//! - run on a no-modem WLAN line (see the virtual-SIM line work), never on a
-//!   modem line's UICC path;
+//! - own an independent no-modem app-account line over ordinary application
+//!   data, never a fake virtual SIM or a modem line's UICC/IMS path;
 //! - declare its capabilities instead of assuming IMS equivalence;
 //! - keep its credentials out of logs, diagnostics and the public API.
 use std::collections::BTreeMap;

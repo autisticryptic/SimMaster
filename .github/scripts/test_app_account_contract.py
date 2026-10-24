@@ -94,6 +94,10 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('sender IS ?9 AND opaque_time IS ?10', inbox)
         self.assertIn('app_voice.inbox_stored', inbox)
         self.assertIn('"classification":"unclassified"', inbox)
+        self.assertIn('receiver_object IS ?11 AND receiver_domain IS ?12 AND receiver_kind IS ?13', inbox)
+        self.assertIn('if self.receiver.is_none() { return Err(INVALID); }', inbox)
+        self.assertIn('old provider binding cannot be reconstructed', inbox)
+        self.assertIn('original_incoming_binding(&delivery.owner, &delivery.scope)', (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8'))
         for forbidden in ['sms.received', 'INSERT INTO sms_messages', 'from_utf8_lossy', 'with_io_gate', 'impl Serialize for InboxScope', 'impl Serialize for CommittedInbox']:
             self.assertNotIn(forbidden, inbox)
 
