@@ -145,6 +145,7 @@ pub struct ServerRequestTicket {
 
 impl ServerRequestTicket {
     pub fn sequence(&self) -> i32 { self.sequence }
+    pub(super) fn peer_incarnation(&self) -> u32 { self.peer_incarnation }
     pub fn owner(&self) -> &AttemptOwner { &self.owner }
     pub fn is_open(&self) -> bool { self.connection.is_open() }
     /// Private duplication for a queued original-runtime completion only. The

@@ -521,7 +521,7 @@ pub struct Database {
     app_event_tx: broadcast::Sender<AppEventEntry>,
 }
 
-fn insert_app_event_for_conn(
+pub(crate) fn insert_app_event_for_conn(
     conn: &Connection,
     event_type: &str,
     line_id: Option<&str>,
@@ -3567,6 +3567,8 @@ impl Database {
         crate::platform::config_store::initialize_schema(&conn)?;
         crate::connectivity::app_voice::providers::jegotrip::account_store::initialize_schema(&conn)
             .map_err(|code| rusqlite::Error::InvalidParameterName(code.to_owned()))?;
+        crate::connectivity::app_voice::providers::jegotrip::account_inbox::initialize_schema(&conn)
+            .map_err(|code| rusqlite::Error::InvalidParameterName(code.to_owned()))?;
 
         let (app_event_tx, _) = broadcast::channel(512);
         Ok(Self {
@@ -3865,6 +3867,13 @@ impl Database {
         tx.commit()?;
         let _ = self.app_event_tx.send(event);
         Ok(id)
+    }
+
+    /// Trusted domains call this ONLY with the event returned after committing
+    /// their private row and event in one transaction. Broadcast is a hint, not
+    /// the durable outbox; lagging consumers re-read app_events by id.
+    pub(crate) fn publish_committed_app_event(&self, event: AppEventEntry) {
+        let _ = self.app_event_tx.send(event);
     }
 
     pub fn subscribe_app_events(&self) -> broadcast::Receiver<AppEventEntry> {

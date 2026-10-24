@@ -6,6 +6,7 @@
 //! cancellation and cleanup retry; a revision change cannot rebind old work.
 use super::{
     account_config::AccountConfig,
+    account_inbox::{self, Completion, InboxMetadata, InboxScope},
     account_store::{self, AccountMetadata, StoredAccount},
     controller::{Callback, ControllerFailure, HostingController},
     runtime_backend::{BackendEvent, BackendEventPayload, NativeHostingBackend},
@@ -15,7 +16,7 @@ use super::{
 use crate::platform::db::Database;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
-use std::{collections::BTreeMap, fmt, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}, time::{Duration, Instant}};
+use std::{collections::{BTreeMap, VecDeque}, fmt, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}, time::{Duration, Instant}};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 pub trait AccountBackendFactory: Send + Sync {
@@ -99,6 +100,7 @@ struct ManagedRun {
     line_id: String,
     database: Arc<Database>,
     revision: u64,
+    inbox_nonce: String,
     controller: AsyncMutex<HostingController>,
     backend: Arc<NativeHostingBackend>,
     accepting: AtomicBool,
@@ -195,6 +197,10 @@ impl AccountManager {
         let metadata = self.metadata(line_id)?; let run = lock(&slot.run).clone();
         self.snapshot_run(metadata, run, now).await
     }
+    pub fn inbox(&self, line_id: &str, limit: usize) -> Result<Vec<InboxMetadata>, &'static str> {
+        self.metadata(line_id)?;
+        self.database.with_conn(|conn| account_inbox::metadata(conn, line_id, limit))
+    }
     pub async fn create(&self, config: AccountConfig, now: u64) -> Result<AccountView, &'static str> {
         config.validate(now)?;
         // Local random ID never embeds a phone number/token/ICCID or claims to
@@ -242,11 +248,12 @@ impl AccountManager {
             .ok_or("app_account_not_found")?;
         if stored.revision != metadata.revision { return Err("app_account_revision_conflict"); }
         config.validate(now)?;
+        let inbox_nonce = local_nonce()?;
         let (backend, events) = self.factory.build(&config)?;
         let mut controller = HostingController::new(line_id.to_owned(), Some(backend.clone()));
         controller.import(config.credentials, now).map_err(controller_error)?;
         let run = Arc::new(ManagedRun { line_id: line_id.to_owned(), database: self.database.clone(), revision: metadata.revision,
-            controller: AsyncMutex::new(controller), backend,
+            inbox_nonce, controller: AsyncMutex::new(controller), backend,
             accepting: AtomicBool::new(true), stopping: AtomicBool::new(false), error: Mutex::new(None), task: Mutex::new(None) });
         // Retain the owning backend BEFORE any await that can create IO. A
         // cancelled HTTP future leaves this same run available for stop/retry.
@@ -300,7 +307,52 @@ impl Drop for AccountManager {
     }
 }
 
+const MAX_PENDING_MESSAGES: usize = 16;
+const MAX_PENDING_MESSAGE_BYTES: usize = 1024 * 1024;
+enum PendingMessage {
+    Direct(super::arc_protocol::IncomingProtocolMessage),
+    Batch(super::offline_backend::ScheduledIncomingMessage),
+}
+impl PendingMessage {
+    fn byte_length(&self) -> usize {
+        let message = match self { Self::Direct(message) => message.message(), Self::Batch(message) => message.message() };
+        message.body.len() + message.from.as_ref().map_or(0, Vec::len) + message.time.as_ref().map_or(0, Vec::len)
+    }
+}
+struct PendingDelivery { owner: super::session::AttemptOwner, scope: super::rpc_pending::RpcConnectionScope, message: PendingMessage }
+async fn handle_message(run: &ManagedRun, controller: &mut HostingController, delivery: PendingDelivery,
+    pending: &mut VecDeque<PendingDelivery>) {
+    if !run.accepting.load(Ordering::SeqCst) { return; }
+    if controller.phase() != Phase::Hosted { *lock(&run.error) = Some("app_account_inbox_not_hosted"); run.retire(); return; }
+    if controller.resource_owner().as_ref() != Some(&delivery.owner)
+        || !run.backend.original_scope(&delivery.owner).is_some_and(|scope| scope.matches(&delivery.scope)) { return; }
+    let bytes = pending.iter().map(|message| message.message.byte_length()).sum::<usize>();
+    if pending.len() >= MAX_PENDING_MESSAGES || bytes.saturating_add(delivery.message.byte_length()) > MAX_PENDING_MESSAGE_BYTES {
+        *lock(&run.error) = Some("app_account_inbox_backpressure"); run.retire(); return;
+    }
+    let context = match InboxScope::original(&run.line_id, run.revision, &run.inbox_nonce, &delivery.owner, &delivery.scope) {
+        Ok(context) => context, Err(code) => { *lock(&run.error) = Some(code); run.retire(); return; }
+    };
+    let result = match &delivery.message {
+        PendingMessage::Direct(message) => context.accept_direct(&run.database, &run.backend, message, &run.accepting).await,
+        PendingMessage::Batch(message) => context.accept_batch(&run.database, &run.backend, message, &run.accepting).await,
+    };
+    match result {
+        Ok(Completion::Recorded | Completion::Retired) => {},
+        // ONLY command-admission pressure is retryable. The borrowed original
+        // message/ticket remains here and duplicate commit emits no new event.
+        Ok(Completion::Backpressure) => pending.push_back(delivery),
+        // Data already committed and the original response was accepted. A
+        // failed SQL status update cannot replay an already-consumed ticket.
+        Ok(Completion::StatusUnrecorded) => { *lock(&run.error) = Some("app_account_inbox_reply_status_unrecorded"); run.retire(); },
+        Err(code) => {
+            if run.accepting.load(Ordering::SeqCst) { *lock(&run.error) = Some(code); run.retire(); }
+        },
+    }
+}
+
 async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Receiver<BackendEvent>) {
+    let mut pending = VecDeque::new();
     let mut timer = tokio::time::interval(Duration::from_millis(250));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -344,18 +396,19 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                         if reason != BackendFailure::Disconnected || error.is_none() { *error = Some(failure_code(reason)); }
                         drop(error); run.retire();
                     }
-                    // Generic receiver bytes are NOT yet SMS/PDU/call media.
-                    // No automatic ACK is permitted until the durable consumer
-                    // is installed; fail the original attempt, never discard as
-                    // an acknowledged public SMS or silently grant readiness.
-                    BackendEventPayload::BatchMessage(_) | BackendEventPayload::DirectMessage(_) => {
-                        *lock(&run.error) = Some("app_account_inbox_unavailable"); run.retire();
+                    BackendEventPayload::BatchMessage(message) => {
+                        controller.tick(unix_now(), Instant::now());
+                        handle_message(&run, &mut controller, PendingDelivery { owner, scope, message: PendingMessage::Batch(message) }, &mut pending).await;
+                    }
+                    BackendEventPayload::DirectMessage(message) => {
+                        controller.tick(unix_now(), Instant::now());
+                        handle_message(&run, &mut controller, PendingDelivery { owner, scope, message: PendingMessage::Direct(message) }, &mut pending).await;
                     }
                 }
             }
             _ = timer.tick() => {
                 let Some(run) = run.upgrade() else { return; };
-                if !run.accepting.load(Ordering::SeqCst) { continue; }
+                if !run.accepting.load(Ordering::SeqCst) { pending.clear(); continue; }
                 let mut controller = run.controller.lock().await;
                 if run.accepting.load(Ordering::SeqCst) {
                     if let Err(code) = run.configuration_current() {
@@ -364,6 +417,9 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                         }
                         *lock(&run.error) = Some(code); run.retire();
                     } else { controller.tick(unix_now(), Instant::now()); }
+                    if run.accepting.load(Ordering::SeqCst) {
+                        if let Some(message) = pending.pop_front() { handle_message(&run, &mut controller, message, &mut pending).await; }
+                    } else { pending.clear(); }
                 }
             }
         }

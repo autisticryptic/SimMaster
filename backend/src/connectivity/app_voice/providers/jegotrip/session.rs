@@ -83,6 +83,9 @@ pub struct AttemptOwner {
     generation: u64,
     incarnation: Arc<()>,
 }
+impl AttemptOwner {
+    pub(super) fn line_id(&self) -> &str { &self.line_id }
+}
 
 impl PartialEq for AttemptOwner {
     fn eq(&self, other: &Self) -> bool {

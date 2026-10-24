@@ -46,6 +46,7 @@ pub struct DirectReplyTicket { owner: AttemptOwner, connection: RpcConnectionSco
 
 impl DirectReplyTicket {
     pub fn is_open(&self) -> bool { self.connection.is_open() }
+    pub(super) fn request_id(&self) -> i32 { self.call_id }
     pub(super) fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
         &self.owner == owner && self.connection.matches(scope) && self.connection.is_open()
     }

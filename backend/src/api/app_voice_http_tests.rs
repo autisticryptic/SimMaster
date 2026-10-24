@@ -44,6 +44,7 @@ mod app_voice_accounts {
             (reqwest::Method::DELETE, format!("/api/non-3gpp/accounts/{line}?expected_revision=1")),
             (reqwest::Method::POST, format!("/api/non-3gpp/accounts/{line}/start")),
             (reqwest::Method::POST, format!("/api/non-3gpp/accounts/{line}/stop")),
+            (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}/inbox")),
         ];
         for (method, path) in cases {
             let (status, _, body) = account_request(&served, method, &path, Some(serde_json::json!({})), None).await;
@@ -137,6 +138,10 @@ mod app_voice_accounts {
         let served = serve(build_router(state.app.clone(), cors)).await; let cookie = authenticate(&served).await;
         let serving = tokio::spawn(async move {
             peer.authenticate().await; peer.swap(Some(STATUS_REGISTER), true).await;
+            peer.incoming(91).await;
+            let reply = next_non_poll(&mut peer).await;
+            assert_eq!(reply.kind, crate::connectivity::app_voice::providers::jegotrip::transport_packets::CallKind::Reply);
+            assert_eq!(crate::connectivity::app_voice::providers::jegotrip::rpc_envelope::decode_reply(reply.payload.expose_to_transport()).unwrap().call_id, 91);
             peer.swap(Some(STATUS_UNREGISTER), true).await;
             let message = next_non_poll(&mut peer).await; let request = decode_request(message.payload.expose_to_transport()).unwrap();
             assert_eq!(request.method, crate::connectivity::app_voice::providers::jegotrip::rpc_logout::LOGOUT_SESSION_METHOD.as_bytes());
@@ -162,12 +167,40 @@ mod app_voice_accounts {
         assert_eq!(hosted["data"]["incoming_call_ready"], false); assert_eq!(hosted["data"]["incoming_message_ready"], false);
         assert_eq!(hosted["data"]["outbound_authorized"], false); assert_eq!(hosted["data"]["provider_availability"], "unsupported");
         assert!(connector.captured_scope_is_open());
+        let inbox = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                let (status, headers, body) = account_request(&served, reqwest::Method::GET, &format!("{path}/inbox?limit=10"), None, Some(&cookie)).await;
+                assert_eq!(status, StatusCode::OK); no_store(&headers); no_secrets(&body);
+                for private in ["body", "sender", "opaque_time", "nonce", "epoch", "sequence", "fingerprint"] { assert!(!body.contains(private)); }
+                let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+                if json["data"][0]["reply_state"] == "direct_submitted" { break json; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(inbox["data"][0]["classification"], "unclassified");
         let (status, headers, body) = account_request(&served, reqwest::Method::POST, &format!("{path}/stop"),
             Some(serde_json::json!({"expected_revision":1})), Some(&cookie)).await;
         assert_eq!(status, StatusCode::OK, "{body}"); no_store(&headers); no_secrets(&body);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["io_cleanup_required"], false);
         assert!(!connector.captured_scope_is_open()); assert!(dropped.load(Ordering::SeqCst)); assert_eq!(factory.build_count(), 1);
         serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbox_metadata_is_authenticated_bounded_and_has_no_raw_export_option() {
+        let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");
+        let served = serve(state.router.clone()).await; let cookie = authenticate(&served).await;
+        let cert = Certificates::generate("DNS:fixture.invalid");
+        let (status, _, body) = account_request(&served, reqwest::Method::POST, "/api/non-3gpp/accounts",
+            Some(serde_json::json!({"provider_id":"app_voice","config":config_json(&cert.root)})), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::CREATED); let line = created_line(&body); let path = format!("/api/non-3gpp/accounts/{line}/inbox");
+        for suffix in ["?limit=0", "?limit=129", "?limit=invalid", "?include_raw=true", "?body=fixture-must-not-echo"] {
+            let (status, headers, body) = account_request(&served, reqwest::Method::GET, &format!("{path}{suffix}"), None, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST); no_store(&headers); no_secrets(&body);
+        }
+        let (status, headers, body) = account_request(&served, reqwest::Method::GET, &path, None, Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK); no_store(&headers); no_secrets(&body);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"], serde_json::json!([]));
     }
 
     #[tokio::test]

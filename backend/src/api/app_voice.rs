@@ -25,6 +25,10 @@ pub struct ReplaceAccountRequest { expected_revision: u64, config: AccountConfig
 #[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevisionRequest { expected_revision: u64 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxQuery { #[serde(default = "default_inbox_limit")] limit: usize }
+fn default_inbox_limit() -> usize { 50 }
 
 /// Merged into main's protected routes BEFORE its existing auth middleware.
 pub fn routes() -> Router<AppState> {
@@ -33,6 +37,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}", get(get_account).put(replace_account).delete(delete_account))
         .route("/api/non-3gpp/accounts/{line_id}/start", post(start_account))
         .route("/api/non-3gpp/accounts/{line_id}/stop", post(stop_account))
+        .route("/api/non-3gpp/accounts/{line_id}/inbox", get(get_inbox))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
 }
 fn no_store(mut response: Response) -> Response {
@@ -44,7 +49,7 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_not_found" => StatusCode::NOT_FOUND,
         "app_account_revision_conflict" | "app_account_stop_before_replace" => StatusCode::CONFLICT,
         "app_account_provider_unsupported" => StatusCode::NOT_IMPLEMENTED,
-        "app_account_storage_failed" | "database_unavailable" => StatusCode::INTERNAL_SERVER_ERROR,
+        "app_account_storage_failed" | "app_account_inbox_storage_failed" | "database_unavailable" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_account_limit" | "app_account_entropy_unavailable" | "app_account_backend_unavailable"
             | "app_account_authentication_rejected" | "app_account_disconnected" | "app_account_hosting_rejected"
             | "app_account_operation_timeout" => StatusCode::SERVICE_UNAVAILABLE,
@@ -83,6 +88,15 @@ pub async fn delete_account(State(manager): State<Arc<AccountManager>>, Path(lin
     let Ok(Query(request)) = request else { return failure("app_account_request_invalid"); };
     success(StatusCode::OK, manager.delete(&line_id, request.expected_revision).await)
 }
+pub async fn get_inbox(State(manager): State<Arc<AccountManager>>, Path(line_id): Path<String>,
+    request: Result<Query<InboxQuery>, QueryRejection>) -> Response {
+    let Ok(Query(request)) = request else { return failure("app_account_request_invalid"); };
+    if !(1..=128).contains(&request.limit) { return failure("app_account_request_invalid"); }
+    // Local ids/unclassified status only. Raw body/sender/time and protocol
+    // sequences/nonces stay private; this is not a public SMS feed.
+    success(StatusCode::OK, manager.inbox(&line_id, request.limit))
+}
+
 pub async fn start_account(State(manager): State<Arc<AccountManager>>, Path(line_id): Path<String>,
     request: Result<Json<RevisionRequest>, JsonRejection>) -> Response {
     let Ok(Json(request)) = request else { return failure("app_account_request_invalid"); };

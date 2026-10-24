@@ -206,6 +206,7 @@ pub fn delete(conn: &Connection, id: &str, expected_revision: u64) -> Result<boo
     let changed = tx.execute("DELETE FROM app_voice_accounts WHERE line_id = ?1 AND revision = ?2",
         params![id, expected]).map_err(|_| STORAGE)?;
     if changed != 1 { return Err(CONFLICT); }
+    super::account_inbox::delete_private_for_account(&tx, id)?;
     tx.commit().map_err(|_| STORAGE)?;
     Ok(true)
 }

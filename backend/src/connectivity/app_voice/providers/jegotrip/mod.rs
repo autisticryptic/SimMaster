@@ -10,6 +10,7 @@ pub mod arc_protocol;
 pub mod arc_session;
 pub mod account_config;
 pub mod account_store;
+pub mod account_inbox;
 pub mod account_runtime;
 #[cfg(test)]
 pub(crate) mod account_test_support;

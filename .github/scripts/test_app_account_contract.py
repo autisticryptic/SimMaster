@@ -83,6 +83,49 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn("CASE WHEN provider_id='app-voice' THEN 'app_voice'", store)
         self.assertIn('known_hyphenated_schema_migrates_atomically', (PROVIDER / 'account_store_tests.rs').read_text(encoding='utf-8'))
 
+    def test_durable_generic_inbox_preserves_original_scope_without_claiming_sms(self):
+        inbox = (PROVIDER / 'account_inbox.rs').read_text(encoding='utf-8')
+        self.assertIn('UNIQUE(line_id,revision,run_nonce,source_kind,peer_epoch,sequence)', inbox)
+        self.assertIn('TransactionBehavior::Immediate', inbox)
+        self.assertIn('const MAX_PER_ACCOUNT: i64 = 128', inbox)
+        self.assertIn('const MAX_TOTAL: i64 = 2048', inbox)
+        self.assertIn('const MAX_TOTAL_BYTES: i64 = 16 * 1024 * 1024', inbox)
+        self.assertIn('message.ticket().peer_incarnation()', inbox)
+        self.assertIn('sender IS ?9 AND opaque_time IS ?10', inbox)
+        self.assertIn('app_voice.inbox_stored', inbox)
+        self.assertIn('"classification":"unclassified"', inbox)
+        for forbidden in ['sms.received', 'INSERT INTO sms_messages', 'from_utf8_lossy', 'with_io_gate', 'impl Serialize for InboxScope', 'impl Serialize for CommittedInbox']:
+            self.assertNotIn(forbidden, inbox)
+
+    def test_consumer_reply_admission_follows_commit_and_retains_pressure_tickets(self):
+        inbox = (PROVIDER / 'account_inbox.rs').read_text(encoding='utf-8')
+        for kind in ['direct', 'batch']:
+            begin = inbox.index(f'pub(super) async fn accept_{kind}')
+            end = inbox.index('\n    }', begin)
+            implementation = inbox[begin:end]
+            self.assertLess(implementation.index(f'let committed = self.commit_{kind}'), implementation.index(f'backend.complete_{kind}'))
+            self.assertIn('admission.load(Ordering::SeqCst)', implementation)
+            self.assertIn('RuntimeError::Backpressure', implementation)
+            self.assertIn('Completion::StatusUnrecorded', implementation)
+        self.assertLess(inbox.index('tx.commit().map_err(|_| STORAGE)?;\n            Ok((id,Some(event)))'), inbox.index('database.publish_committed_app_event'))
+        runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
+        self.assertIn('MAX_PENDING_MESSAGES: usize = 16', runtime)
+        self.assertIn('MAX_PENDING_MESSAGE_BYTES: usize = 1024 * 1024', runtime)
+        self.assertIn('Completion::Backpressure) => pending.push_back(delivery)', runtime)
+        self.assertIn('Completion::StatusUnrecorded', runtime)
+        self.assertIn('controller.phase() != Phase::Hosted', runtime)
+
+    def test_inbox_api_exports_only_redacted_history_and_deletion_is_transactional(self):
+        api = source('backend/src/api/app_voice.rs')
+        self.assertIn('/api/non-3gpp/accounts/{line_id}/inbox', api)
+        self.assertIn('!(1..=128).contains(&request.limit)', api)
+        self.assertNotIn('private_message', api)
+        store = (PROVIDER / 'account_store.rs').read_text(encoding='utf-8')
+        self.assertIn('delete_private_for_account(&tx, id)', store)
+        for workflow in ['.github/workflows/build-release.yml', '.github/workflows/beta-validation.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::account_inbox::tests', source(workflow))
+        self.assertIn('impl Drop for IncomingMessage', (PROVIDER / 'native_events.rs').read_text(encoding='utf-8'))
+
     def test_both_actions_have_nonzero_account_and_real_auth_http_filters(self):
         for workflow in ['.github/workflows/build-release.yml', '.github/workflows/beta-validation.yml']:
             text = source(workflow)

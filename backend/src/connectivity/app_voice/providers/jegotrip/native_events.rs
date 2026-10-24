@@ -35,6 +35,15 @@ pub struct IncomingMessage {
     pub time: Option<Vec<u8>>,
 }
 
+impl Drop for IncomingMessage {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.body.zeroize();
+        if let Some(from) = &mut self.from { from.zeroize(); }
+        if let Some(time) = &mut self.time { time.zeroize(); }
+    }
+}
+
 impl fmt::Debug for IncomingMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IncomingMessage").field("body_bytes", &self.body.len())

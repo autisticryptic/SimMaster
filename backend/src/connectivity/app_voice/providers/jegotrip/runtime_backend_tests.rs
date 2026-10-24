@@ -568,6 +568,77 @@ async fn original_direct_ticket_survives_command_queue_pressure_without_automati
 }
 
 #[tokio::test]
+async fn durable_inbox_rejects_foreign_tickets_and_retired_admission_keeps_original_retry() {
+    use super::super::{account_inbox::{Completion, InboxScope}, account_runtime::local_nonce, account_store, account_test_support::config};
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    let (backend, mut events, _connector, mut peer, dropped, _) = fixture(&cert, false);
+    let database = crate::platform::db::Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+    let line = format!("app-account-{}", local_nonce().unwrap()); let imported = config(&cert.root);
+    database.with_conn(|conn| account_store::create(conn, &line, &imported, 100)).unwrap();
+    let mut session = HostingSession::new(line.clone()); session.import(imported.credentials.clone(), 100).unwrap();
+    let original = session.begin_login(100).unwrap();
+    let (begin, begun) = oneshot::channel(); let (checked, no_reply_yet) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel();
+    let serving = tokio::spawn(async move {
+        peer.authenticate().await; begun.await.unwrap(); peer.incoming(17).await;
+        assert!(tokio::time::timeout(Duration::from_millis(40), next_non_poll(&mut peer)).await.is_err());
+        checked.send(()).unwrap(); resumed.await.unwrap();
+        let call = next_non_poll(&mut peer).await; assert_eq!(call.kind, CallKind::Reply);
+        assert_eq!(super::super::rpc_envelope::decode_reply(call.payload.expose_to_transport()).unwrap().call_id, 17);
+        peer.drain_until_eof().await;
+    });
+    let scope = logged_in(&backend, &mut events, &original, &cert.root).await;
+    begin.send(()).unwrap(); let event = events.recv().await.unwrap();
+    let BackendEventPayload::DirectMessage(message) = event.payload else { panic!("original direct message required") };
+    let mut other = HostingSession::new(line.clone()); other.import(imported.credentials, 100).unwrap();
+    let other_owner = other.begin_login(100).unwrap();
+    let wrong = InboxScope::original(&line, 1, &local_nonce().unwrap(), &other_owner, &scope).unwrap();
+    assert_eq!(wrong.commit_direct(&database, &message).err(), Some("app_account_inbox_scope_invalid"));
+    let wrong = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &RpcConnectionScope::fresh()).unwrap();
+    assert_eq!(wrong.commit_direct(&database, &message).err(), Some("app_account_inbox_scope_invalid"));
+    assert!(database.get_recent_app_events(Some(&line), 10).unwrap().is_empty());
+    let context = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &scope).unwrap();
+    let admission = AtomicBool::new(false);
+    assert_eq!(context.accept_direct(&database, &backend, &message, &admission).await.unwrap(), Completion::Retired);
+    assert!(message.reply_ticket().is_open()); no_reply_yet.await.unwrap();
+    assert_eq!(database.get_recent_app_events(Some(&line), 10).unwrap().len(), 1);
+    admission.store(true, Ordering::SeqCst); resume.send(()).unwrap();
+    assert_eq!(context.accept_direct(&database, &backend, &message, &admission).await.unwrap(), Completion::Recorded);
+    assert_eq!(database.get_recent_app_events(Some(&line), 10).unwrap().len(), 1);
+    backend.retire(&original); backend.logout(original).await.unwrap();
+    assert!(dropped.load(Ordering::SeqCst)); serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_inbox_commit_is_idempotent_under_real_command_queue_pressure() {
+    use futures_util::{stream::FuturesUnordered, StreamExt};
+    use super::super::{account_inbox::{Completion, InboxScope}, account_runtime::local_nonce, account_store, account_test_support::config};
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    let (backend, mut events, _connector, mut peer, dropped, blocked) = fixture(&cert, false);
+    let database = crate::platform::db::Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+    let line = format!("app-account-{}", local_nonce().unwrap()); let imported = config(&cert.root);
+    database.with_conn(|conn| account_store::create(conn, &line, &imported, 100)).unwrap();
+    let mut session = HostingSession::new(line.clone()); session.import(imported.credentials, 100).unwrap();
+    let original = session.begin_login(100).unwrap(); let (begin, begun) = oneshot::channel();
+    let serving = tokio::spawn(async move { peer.authenticate().await; begun.await.unwrap(); peer.incoming(1).await;
+        assert!(peer.receive().await.is_none()); });
+    let scope = logged_in(&backend, &mut events, &original, &cert.root).await;
+    begin.send(()).unwrap(); let event = events.recv().await.unwrap();
+    let BackendEventPayload::DirectMessage(message) = event.payload else { panic!("original direct message required") };
+    blocked.store(true, Ordering::SeqCst);
+    let context = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &scope).unwrap();
+    let admission = AtomicBool::new(true); let mut pending = FuturesUnordered::new();
+    for _ in 0..64 { pending.push(context.accept_direct(&database, &backend, &message, &admission)); }
+    assert_eq!(tokio::time::timeout(Duration::from_millis(250), pending.next()).await.unwrap().unwrap().unwrap(), Completion::Backpressure);
+    assert!(message.reply_ticket().is_open()); assert!(scope.is_open());
+    assert_eq!(database.get_recent_app_events(Some(&line), 10).unwrap().len(), 1);
+    let stored = database.with_conn(|conn| super::super::account_inbox::metadata(conn, &line, 10)).unwrap();
+    assert_eq!(stored.len(), 1); assert_eq!(stored[0].reply_state, "pending");
+    backend.retire(&original); drop(pending); backend.logout(original).await.unwrap();
+    assert!(dropped.load(Ordering::SeqCst)); serving.await.unwrap();
+}
+
+#[tokio::test]
 async fn actual_negative_sdk_reply_never_configures_scheduler_or_synthesizes_login_success() {
     let cert = Certificates::generate("DNS:fixture.invalid"); let (backend, mut events, _connector, mut peer, dropped, _) = fixture(&cert, false);
     let serving = tokio::spawn(async move {
