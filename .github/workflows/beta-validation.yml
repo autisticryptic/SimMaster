@@ -265,6 +265,7 @@ jobs:
             connectivity::app_voice::providers::jegotrip::account_inbox::tests \
             connectivity::app_voice::providers::jegotrip::smgw_text::tests \
             connectivity::app_voice::providers::jegotrip::account_sms::tests \
+            connectivity::app_voice::providers::jegotrip::account_runs::tests \
             connectivity::app_voice::providers::jegotrip::account_runtime::tests \
             connectivity::app_voice::providers::jegotrip::legacy_config::tests \
             connectivity::app_voice::providers::jegotrip::object_reference::tests \

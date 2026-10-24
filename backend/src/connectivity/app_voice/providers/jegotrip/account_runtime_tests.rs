@@ -13,6 +13,8 @@ use tokio::sync::oneshot;
 mod inbox_native;
 #[path = "account_smgw_native_tests.rs"]
 mod smgw_native;
+#[path = "account_maintenance_native_tests.rs"]
+mod maintenance_native;
 
 async fn phase(manager: &AccountManager, line: &str, wanted: &str) -> AccountView {
     tokio::time::timeout(Duration::from_secs(4), async {

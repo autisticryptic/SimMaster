@@ -58,6 +58,13 @@ pub(crate) fn peer(cert: &Certificates, factory: &QueuedFactory) -> (super::runt
     drop(unused); drop(events); factory.add(connector.clone()); (peer, connector, dropped)
 }
 
+pub(crate) fn registered_inbox_scope(database:&Database,line:&str,revision:u64,owner:&super::session::AttemptOwner,
+    scope:&super::rpc_pending::RpcConnectionScope)->super::account_inbox::InboxScope {
+    let nonce=super::account_runtime::local_nonce().unwrap();
+    database.with_conn(|conn|super::account_runs::register(conn,line,revision,&nonce)).unwrap();
+    super::account_inbox::InboxScope::original(line,revision,&nonce,owner,scope).unwrap()
+}
+
 static NEXT_DB: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct TempDatabase { pub database: Arc<Database>, pub path: PathBuf }
 impl TempDatabase {

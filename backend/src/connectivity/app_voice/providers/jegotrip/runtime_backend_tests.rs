@@ -605,7 +605,7 @@ async fn durable_inbox_rejects_foreign_tickets_and_retired_admission_keeps_origi
     let unbound = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &scope).unwrap();
     assert_eq!(unbound.commit_direct(&database, &message).err(), Some("app_account_inbox_message_invalid"));
     assert!(database.get_recent_app_events(Some(&line), 10).unwrap().is_empty());
-    let context = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &scope).unwrap()
+    let context = super::super::account_test_support::registered_inbox_scope(&database,&line,1,&original,&scope)
         .with_receiver(backend.original_incoming_binding(&original, &scope).unwrap()).unwrap();
     let admission = AtomicBool::new(false);
     assert_eq!(context.accept_direct(&database, &backend, &message, &admission).await.unwrap(), Completion::Retired);
@@ -635,7 +635,7 @@ async fn durable_inbox_commit_is_idempotent_under_real_command_queue_pressure() 
     begin.send(()).unwrap(); let event = events.recv().await.unwrap();
     let BackendEventPayload::DirectMessage(message) = event.payload else { panic!("original direct message required") };
     blocked.store(true, Ordering::SeqCst);
-    let context = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &scope).unwrap()
+    let context = super::super::account_test_support::registered_inbox_scope(&database,&line,1,&original,&scope)
         .with_receiver(backend.original_incoming_binding(&original, &scope).unwrap()).unwrap();
     let admission = AtomicBool::new(true); let mut pending = FuturesUnordered::new();
     for _ in 0..64 { pending.push(context.accept_direct(&database, &backend, &message, &admission)); }

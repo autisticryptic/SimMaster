@@ -157,7 +157,9 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('app_voice_sms_deleted AFTER DELETE ON sms_messages', sms)
         self.assertIn("SET body=X'',sender=NULL,opaque_time=NULL", sms)
         self.assertIn('deleted=1,sent_at_millis=NULL', sms)
-        self.assertNotIn('tx.commit()', sms)
+        promote = sms.split('pub(super) fn promote_new', 1)[1].split('/// Authorized read surface', 1)[0]
+        self.assertNotIn('tx.commit()', promote)
+        self.assertIn('TransactionBehavior::Immediate', sms)
         self.assertNotIn('insert_sms_with_transport', sms)
         self.assertNotIn('impl Serialize for SmgwText', sms)
         handlers = source('backend/src/api/handlers.rs')
@@ -166,10 +168,29 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertLess(guarded.index('account_store::valid_line_id'), guarded.index('VowifiScope::resolve'))
         self.assertIn('kind: "app_account"', handlers)
 
+    def test_run_compaction_requires_joined_consumer_and_durable_original_fence(self):
+        runs = (PROVIDER / 'account_runs.rs').read_text(encoding='utf-8')
+        self.assertIn('proof:&RunQuiescence', runs)
+        self.assertIn("SET state='released'", runs)
+        self.assertIn('envelope_retained=0', runs)
+        self.assertNotIn('DELETE FROM sms_messages', runs)
+        self.assertNotIn('std::process', runs)
+        self.assertNotIn('/proc/', runs)
+        inbox = (PROVIDER / 'account_inbox.rs').read_text(encoding='utf-8')
+        self.assertIn('account_runs::require_live(&tx,&self.line_id,self.revision,&self.nonce)', inbox)
+        self.assertIn('MAX_IDENTITIES_PER_ACCOUNT: i64 = 512', inbox)
+        runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
+        stop = runtime.split('pub async fn stop(', 1)[1].split('impl Drop for AccountManager', 1)[0]
+        self.assertLess(stop.index('drop(controller)'), stop.index('let _=task.await'))
+        self.assertLess(stop.index('let _=task.await'), stop.index('RunQuiescence {'))
+        self.assertLess(stop.index('release_and_compact'), stop.index('run.finalized.store(true'))
+        self.assertIn('task: AsyncMutex<Option<tokio::task::JoinHandle<()>>>', runtime)
+        self.assertIn('!run.finalized.load(Ordering::SeqCst)', runtime)
+
     def test_both_actions_have_nonzero_account_and_real_auth_http_filters(self):
         for workflow in ['.github/workflows/build-release.yml', '.github/workflows/beta-validation.yml']:
             text = source(workflow)
-            for module in ['account_config', 'account_store', 'account_runtime', 'account_sms', 'smgw_text']:
+            for module in ['account_config', 'account_store', 'account_runtime', 'account_sms', 'smgw_text', 'account_runs']:
                 self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests', text)
             self.assertIn('for filter in http_router_tests::app_voice_accounts', text)
             self.assertIn('DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"', text)

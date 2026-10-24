@@ -5,7 +5,7 @@
 //! are different layers. Local row ids/nonces are NOT remote message identities.
 //! Unknown data is never evicted to make room, promoted as SMS or marked ready.
 use super::{
-    account_sms, account_store, arc_protocol::IncomingProtocolMessage,
+    account_runs, account_sms, account_store, arc_protocol::IncomingProtocolMessage,
     native_events::IncomingMessage, offline_backend::ScheduledIncomingMessage,
     rpc_pending::RpcConnectionScope, runtime_backend::NativeHostingBackend,
     session::AttemptOwner, smgw_text, transport_actor::RuntimeError,
@@ -23,6 +23,7 @@ const FULL: &str = "app_account_inbox_full";
 const INVALID: &str = "app_account_inbox_message_invalid";
 const MAX_FIELD_BYTES: usize = 64 * 1024;
 const MAX_PER_ACCOUNT: i64 = 128;
+const MAX_IDENTITIES_PER_ACCOUNT: i64 = 512;
 const MAX_TOTAL: i64 = 2048;
 const MAX_TOTAL_BYTES: i64 = 16 * 1024 * 1024;
 
@@ -124,6 +125,7 @@ impl InboxScope {
         let (id, events) = database.with_conn(|conn| {
             let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|_| STORAGE)?;
             require_account(&tx, &self.line_id, self.revision)?;
+            account_runs::require_live(&tx,&self.line_id,self.revision,&self.nonce)?;
             let existing: Option<(i64, bool)> = tx.query_row("SELECT i.id,
                 fingerprint=?7 AND (body=?8 AND sender IS ?9 AND opaque_time IS ?10
                     OR EXISTS(SELECT 1 FROM app_voice_sms_projection p WHERE p.inbox_id=i.id AND p.line_id=i.line_id
@@ -140,11 +142,16 @@ impl InboxScope {
                 // receiver tombstone, not a request to recreate deleted text.
                 tx.commit().map_err(|_| STORAGE)?; return Ok((id,Vec::new()));
             }
-            let (local,total,stored): (i64,i64,i64) = tx.query_row("SELECT COALESCE(SUM(line_id=?1),0),COUNT(*),
+            let (local,completed,total,stored): (i64,i64,i64,i64) = tx.query_row("SELECT
+                COALESCE(SUM(line_id=?1 AND (reply_state='pending' OR NOT EXISTS(SELECT 1 FROM app_voice_sms_projection p
+                    WHERE p.inbox_id=i.id AND p.line_id=i.line_id AND p.revision=i.revision))),0),
+                COALESCE(SUM(line_id=?1 AND reply_state!='pending' AND EXISTS(SELECT 1 FROM app_voice_sms_projection p
+                    WHERE p.inbox_id=i.id AND p.line_id=i.line_id AND p.revision=i.revision)),0),COUNT(*),
                 COALESCE(SUM(length(body)+COALESCE(length(sender),0)+COALESCE(length(opaque_time),0)
-                    +COALESCE(length(receiver_object),0)+COALESCE(length(receiver_domain),0)+COALESCE(length(receiver_kind),0)),0) FROM app_voice_inbox",
-                [&self.line_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|_| STORAGE)?;
-            if local >= MAX_PER_ACCOUNT || total >= MAX_TOTAL || stored.checked_add(size).map_or(true,|bytes|bytes>MAX_TOTAL_BYTES) {
+                    +COALESCE(length(receiver_object),0)+COALESCE(length(receiver_domain),0)+COALESCE(length(receiver_kind),0)),0) FROM app_voice_inbox i",
+                [&self.line_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(|_| STORAGE)?;
+            if local >= MAX_PER_ACCOUNT || local + completed >= MAX_IDENTITIES_PER_ACCOUNT
+                || total >= MAX_TOTAL || stored.checked_add(size).map_or(true,|bytes|bytes>MAX_TOTAL_BYTES) {
                 return Err(FULL);
             }
             let stamp = chrono::Utc::now().to_rfc3339();
@@ -228,6 +235,7 @@ impl CommittedInbox {
         database.with_conn(|conn| {
             let tx=Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
             require_account(&tx,&self.line_id,self.revision)?;
+            account_runs::require_live(&tx,&self.line_id,self.revision,&self.nonce)?;
             let changed=tx.execute("UPDATE app_voice_inbox SET reply_state=?1 WHERE id=?2 AND line_id=?3 AND revision=?4
                 AND run_nonce=?5 AND source_kind=?6 AND peer_epoch=?7 AND sequence=?8 AND fingerprint=?9",
                 params![state,self.id,&self.line_id,self.revision as i64,&self.nonce,self.kind,self.epoch as i64,self.sequence,&self.fingerprint])
@@ -261,7 +269,12 @@ pub(super) fn metadata(conn:&Connection,line:&str,limit:usize)->Result<Vec<Inbox
 }
 pub(super) fn delete_private_for_account(conn:&Connection,line:&str)->Result<(), &'static str> {
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_voice_inbox')",[],|row|row.get(0)).map_err(|_|STORAGE)?;
-    if exists { conn.execute("DELETE FROM app_voice_inbox WHERE line_id=?1",[line]).map_err(|_|STORAGE)?; }
+    if exists {
+        conn.execute("UPDATE app_voice_sms_projection SET envelope_retained=0 WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;
+        conn.execute("DELETE FROM app_voice_sms_projection WHERE line_id=?1 AND deleted=1",[line]).map_err(|_|STORAGE)?;
+        conn.execute("DELETE FROM app_voice_inbox WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;
+    }
+    account_runs::delete_account_state(conn,line)?;
     Ok(())
 }
 

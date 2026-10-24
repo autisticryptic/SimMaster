@@ -12,7 +12,7 @@ fn setup() -> (Arc<Database>, String, InboxScope) {
     database.with_conn(|conn|account_store::create(conn,&line,&imported,100)).unwrap();
     let mut session=HostingSession::new(line.clone());session.import(imported.credentials,100).unwrap();
     let owner=session.begin_login(100).unwrap();let scope=RpcConnectionScope::fresh();
-    let context=InboxScope::original(&line,1,&local_nonce().unwrap(),&owner,&scope).unwrap();
+    let context=super::super::account_test_support::registered_inbox_scope(&database,&line,1,&owner,&scope);
     (database,line,context)
 }
 fn message()->IncomingMessage {
@@ -116,7 +116,7 @@ fn same_sequence_on_another_run_kind_or_actual_batch_peer_epoch_is_not_a_remote_
     let (database,line,context)=setup();let body=message();
     context.commit(&database,"direct",0,1,&body).unwrap();
     context.commit(&database,"batch",9,1,&body).unwrap();context.commit(&database,"batch",10,1,&body).unwrap();
-    let next=InboxScope::original(&line,1,&local_nonce().unwrap(),&context.owner,&context.scope).unwrap();
+    let next=super::super::account_test_support::registered_inbox_scope(&database,&line,1,&context.owner,&context.scope);
     next.commit(&database,"direct",0,1,&body).unwrap();assert_eq!(count(&database,"app_voice_inbox"),4);
     let mut session=HostingSession::new("line-wrong".into());let mut imported=config(&Certificates::generate("DNS:fixture.invalid").root);
     imported.credentials.sdk.expires_at_unix_seconds=None;session.import(imported.credentials,unix_now()).unwrap();let wrong=session.begin_login(unix_now()).unwrap();
@@ -160,12 +160,12 @@ fn shared_payload_byte_quota_keeps_previous_accounts_and_events_unchanged() {
     let cert=Certificates::generate("DNS:fixture.invalid");let imported=config(&cert.root);let other=format!("app-account-{}",local_nonce().unwrap());
     database.with_conn(|conn|account_store::create(conn,&other,&imported,100)).unwrap();
     let mut session=HostingSession::new(other.clone());session.import(imported.credentials,100).unwrap();let owner=session.begin_login(100).unwrap();
-    let other_scope=InboxScope::original(&other,1,&local_nonce().unwrap(),&owner,&RpcConnectionScope::fresh()).unwrap();
+    let other_scope=super::super::account_test_support::registered_inbox_scope(&database,&other,1,&owner,&RpcConnectionScope::fresh());
     for sequence in 1..=128 {other_scope.commit(&database,"direct",0,sequence,&large).unwrap();}
     let third=format!("app-account-{}",local_nonce().unwrap());let imported=config(&cert.root);
     database.with_conn(|conn|account_store::create(conn,&third,&imported,100)).unwrap();let mut session=HostingSession::new(third.clone());
     session.import(imported.credentials,100).unwrap();let owner=session.begin_login(100).unwrap();
-    let third_scope=InboxScope::original(&third,1,&local_nonce().unwrap(),&owner,&RpcConnectionScope::fresh()).unwrap();
+    let third_scope=super::super::account_test_support::registered_inbox_scope(&database,&third,1,&owner,&RpcConnectionScope::fresh());
     assert_eq!(third_scope.commit(&database,"direct",0,1,&message()).err(),Some(FULL));
     assert_eq!(count(&database,"app_voice_inbox"),256);assert_eq!(count(&database,"app_events"),256);
     assert_eq!(database.with_conn(|conn|metadata(conn,&line,128)).unwrap().len(),128);
@@ -179,12 +179,12 @@ fn total_row_quota_does_not_evict_another_accounts_unknown_deliveries() {
         let imported=config(&cert.root);let line=format!("app-account-{}",local_nonce().unwrap());
         database.with_conn(|conn|account_store::create(conn,&line,&imported,100)).unwrap();
         let mut session=HostingSession::new(line.clone());session.import(imported.credentials,100).unwrap();let owner=session.begin_login(100).unwrap();
-        let context=InboxScope::original(&line,1,&local_nonce().unwrap(),&owner,&RpcConnectionScope::fresh()).unwrap();
+        let context=super::super::account_test_support::registered_inbox_scope(&database,&line,1,&owner,&RpcConnectionScope::fresh());
         for sequence in 1..=128 {context.commit(&database,"direct",0,sequence,&bytes).unwrap();}
     }
     let imported=config(&cert.root);let line=format!("app-account-{}",local_nonce().unwrap());database.with_conn(|conn|account_store::create(conn,&line,&imported,100)).unwrap();
     let mut session=HostingSession::new(line.clone());session.import(imported.credentials,100).unwrap();let owner=session.begin_login(100).unwrap();
-    let extra=InboxScope::original(&line,1,&local_nonce().unwrap(),&owner,&RpcConnectionScope::fresh()).unwrap();
+    let extra=super::super::account_test_support::registered_inbox_scope(&database,&line,1,&owner,&RpcConnectionScope::fresh());
     assert_eq!(extra.commit(&database,"direct",0,1,&bytes).err(),Some(FULL));
     assert_eq!(count(&database,"app_voice_inbox"),MAX_TOTAL);assert_eq!(count(&database,"app_events"),MAX_TOTAL);
     assert!(first.commit(&database,"direct",0,1,&bytes).is_ok());
@@ -224,7 +224,7 @@ fn account_delete_purges_only_its_private_inbox_after_cas_and_reopen_preserves_b
     let cert=Certificates::generate("DNS:fixture.invalid");let temp=TempDatabase::new();let database=temp.database.clone();let imported=config(&cert.root);
     let line=format!("app-account-{}",local_nonce().unwrap());database.with_conn(|conn|account_store::create(conn,&line,&imported,100)).unwrap();
     let mut session=HostingSession::new(line.clone());session.import(imported.credentials,100).unwrap();let owner=session.begin_login(100).unwrap();
-    let context=InboxScope::original(&line,1,&local_nonce().unwrap(),&owner,&RpcConnectionScope::fresh()).unwrap();
+    let context=super::super::account_test_support::registered_inbox_scope(&database,&line,1,&owner,&RpcConnectionScope::fresh());
     let receipt=context.commit(&database,"direct",0,1,&message()).unwrap();
     let reopened=Database::new(temp.path.clone()).unwrap();let loaded=private_message(&reopened,&line,receipt.id).unwrap();assert_eq!(loaded.body.as_slice(),message().body.as_slice());
     assert_eq!(database.with_conn(|conn|account_store::delete(conn,&line,2)).err(),Some("app_account_revision_conflict"));

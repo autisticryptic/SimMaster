@@ -50,8 +50,9 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_not_found" => StatusCode::NOT_FOUND,
         "app_account_revision_conflict" | "app_account_stop_before_replace" => StatusCode::CONFLICT,
         "app_account_provider_unsupported" => StatusCode::NOT_IMPLEMENTED,
-        "app_account_storage_failed" | "app_account_inbox_storage_failed" | "app_account_sms_storage_failed" | "database_unavailable" => StatusCode::INTERNAL_SERVER_ERROR,
-        "app_account_limit" | "app_account_entropy_unavailable" | "app_account_backend_unavailable"
+        "app_account_storage_failed" | "app_account_inbox_storage_failed" | "app_account_sms_storage_failed"
+            | "app_account_run_storage_failed" | "database_unavailable" => StatusCode::INTERNAL_SERVER_ERROR,
+        "app_account_limit" | "app_account_run_limit" | "app_account_entropy_unavailable" | "app_account_backend_unavailable"
             | "app_account_authentication_rejected" | "app_account_disconnected" | "app_account_hosting_rejected"
             | "app_account_operation_timeout" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,

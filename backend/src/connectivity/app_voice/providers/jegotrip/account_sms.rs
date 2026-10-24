@@ -12,21 +12,39 @@ const STORAGE: &str = "app_account_sms_storage_failed";
 const SCOPE: &str = "app_account_sms_scope_invalid";
 
 pub fn initialize_schema(conn: &Connection) -> Result<(), &'static str> {
+    let tx=Transaction::new_unchecked(conn,rusqlite::TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
+    let conn=&*tx;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS app_voice_sms_projection(
         inbox_id INTEGER PRIMARY KEY,line_id TEXT NOT NULL,revision INTEGER NOT NULL,
         sms_id INTEGER NOT NULL UNIQUE,sent_at_millis INTEGER,
         timestamp_source TEXT NOT NULL CHECK(timestamp_source IN ('sender','received')),
-        deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)));
-        CREATE INDEX IF NOT EXISTS idx_app_voice_sms_line ON app_voice_sms_projection(line_id,sms_id);
-        CREATE TRIGGER IF NOT EXISTS app_voice_sms_deleted AFTER DELETE ON sms_messages
+        deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)),
+        envelope_retained INTEGER NOT NULL DEFAULT 1 CHECK(envelope_retained IN (0,1)));
+        CREATE INDEX IF NOT EXISTS idx_app_voice_sms_line ON app_voice_sms_projection(line_id,sms_id);")
+        .map_err(|_| STORAGE)?;
+    let mut query=conn.prepare("PRAGMA table_info(app_voice_sms_projection)").map_err(|_|STORAGE)?;
+    let columns=query.query_map([],|row|row.get::<_,String>(1)).map_err(|_|STORAGE)?
+        .collect::<Result<Vec<_>,_>>().map_err(|_|STORAGE)?;
+    drop(query);
+    if !columns.iter().any(|column|column=="envelope_retained") {
+        conn.execute("ALTER TABLE app_voice_sms_projection ADD COLUMN envelope_retained INTEGER NOT NULL DEFAULT 1 CHECK(envelope_retained IN (0,1))",[]).map_err(|_|STORAGE)?;
+    }
+    // Explicit old account deletion may have already detached a surviving SMS.
+    conn.execute("UPDATE app_voice_sms_projection SET envelope_retained=0 WHERE NOT EXISTS
+        (SELECT 1 FROM app_voice_inbox i WHERE i.id=app_voice_sms_projection.inbox_id AND i.line_id=app_voice_sms_projection.line_id)",[]).map_err(|_|STORAGE)?;
+    conn.execute_batch("DROP TRIGGER IF EXISTS app_voice_sms_deleted;
+        CREATE TRIGGER app_voice_sms_deleted AFTER DELETE ON sms_messages
         WHEN OLD.transport='app_voice' BEGIN
             UPDATE app_voice_inbox SET body=X'',sender=NULL,opaque_time=NULL
                 WHERE line_id=OLD.line_id AND id IN
                     (SELECT inbox_id FROM app_voice_sms_projection WHERE sms_id=OLD.id AND line_id=OLD.line_id);
             UPDATE app_voice_sms_projection SET deleted=1,sent_at_millis=NULL
                 WHERE sms_id=OLD.id AND line_id=OLD.line_id;
-        END;")
-        .map_err(|_| STORAGE)
+            DELETE FROM app_voice_sms_projection WHERE sms_id=OLD.id AND line_id=OLD.line_id AND envelope_retained=0;
+        END;
+        DELETE FROM app_voice_sms_projection WHERE envelope_retained=0 AND deleted=1;")
+        .map_err(|_| STORAGE)?;
+    tx.commit().map_err(|_|STORAGE)
 }
 
 /// Called only during the same transaction which inserted the matched raw

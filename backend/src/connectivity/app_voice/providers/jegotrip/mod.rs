@@ -14,6 +14,7 @@ pub mod account_inbox;
 pub mod account_sms;
 pub mod smgw_text;
 pub mod account_runtime;
+pub mod account_runs;
 #[cfg(test)]
 pub(crate) mod account_test_support;
 pub mod credentials;

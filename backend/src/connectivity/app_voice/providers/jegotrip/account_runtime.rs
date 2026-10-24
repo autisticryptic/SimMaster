@@ -9,6 +9,7 @@ use super::{
     account_inbox::{self, Completion, InboxMetadata, InboxScope},
     account_store::{self, AccountMetadata, StoredAccount},
     account_sms::{self, AccountSmsMessage},
+    account_runs::{self, RunToken},
     controller::{Callback, ControllerFailure, HostingController},
     runtime_backend::{BackendEvent, BackendEventPayload, NativeHostingBackend},
     runtime_connector::TcpRuntimeConnector,
@@ -97,17 +98,26 @@ pub(super) fn local_nonce() -> Result<String, &'static str> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+pub(super) struct RunQuiescence { token: Arc<RunToken> }
+impl RunQuiescence {
+    pub(super) fn token(&self) -> &RunToken { &self.token }
+}
+#[cfg(test)]
+pub(super) fn test_quiescence(token: RunToken) -> RunQuiescence { RunQuiescence { token: Arc::new(token) } }
+
 struct ManagedRun {
     line_id: String,
     database: Arc<Database>,
     revision: u64,
     inbox_nonce: String,
+    run_token: Arc<RunToken>,
+    finalized: AtomicBool,
     controller: AsyncMutex<HostingController>,
     backend: Arc<NativeHostingBackend>,
     accepting: AtomicBool,
     stopping: AtomicBool,
     error: Mutex<Option<&'static str>>,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl ManagedRun {
     fn configuration_current(&self) -> Result<(), &'static str> {
@@ -124,7 +134,7 @@ impl ManagedRun {
 impl Drop for ManagedRun {
     fn drop(&mut self) {
         self.retire();
-        if let Some(task) = lock(&self.task).take() { task.abort(); }
+        if let Some(task) = self.task.get_mut().take() { task.abort(); }
     }
 }
 struct Retirement { run: Arc<ManagedRun>, armed: bool }
@@ -180,7 +190,7 @@ impl AccountManager {
         controller.tick(now, Instant::now());
         let error = if controller.phase() == Phase::CredentialExpired { Some("app_account_credential_expired") }
             else { *lock(&run.error) };
-        Ok(view(metadata, controller.phase(), !controller.resources_released(), error))
+        Ok(view(metadata, controller.phase(), !controller.resources_released() || !run.finalized.load(Ordering::SeqCst), error))
     }
     pub async fn list(&self, now: u64) -> Result<Vec<AccountView>, &'static str> {
         let metadata = self.database.with_conn(account_store::list)?;
@@ -221,7 +231,9 @@ impl AccountManager {
     async fn require_released(slot: &AccountSlot) -> Result<(), &'static str> {
         let run = lock(&slot.run).clone();
         if let Some(run) = run {
-            if !run.controller.lock().await.resources_released() { return Err("app_account_stop_before_replace"); }
+            if !run.controller.lock().await.resources_released() || !run.finalized.load(Ordering::SeqCst) {
+                return Err("app_account_stop_before_replace");
+            }
         }
         Ok(())
     }
@@ -257,15 +269,18 @@ impl AccountManager {
         let (backend, events) = self.factory.build(&config)?;
         let mut controller = HostingController::new(line_id.to_owned(), Some(backend.clone()));
         controller.import(config.credentials, now).map_err(controller_error)?;
+        let run_token=Arc::new(self.database.with_conn(|conn|account_runs::register(conn,line_id,metadata.revision,&inbox_nonce))?);
         let run = Arc::new(ManagedRun { line_id: line_id.to_owned(), database: self.database.clone(), revision: metadata.revision,
-            inbox_nonce, controller: AsyncMutex::new(controller), backend,
-            accepting: AtomicBool::new(true), stopping: AtomicBool::new(false), error: Mutex::new(None), task: Mutex::new(None) });
+            inbox_nonce, run_token, finalized: AtomicBool::new(false), controller: AsyncMutex::new(controller), backend,
+            accepting: AtomicBool::new(true), stopping: AtomicBool::new(false), error: Mutex::new(None), task: AsyncMutex::new(None) });
         // Retain the owning backend BEFORE any await that can create IO. A
         // cancelled HTTP future leaves this same run available for stop/retry.
         *lock(&slot.run) = Some(run.clone());
         let mut retirement = Retirement::new(run.clone());
         let weak = Arc::downgrade(&run);
-        *lock(&run.task) = Some(tokio::spawn(consume_events(weak, events)));
+        let mut task_slot = run.task.lock().await;
+        *task_slot = Some(tokio::spawn(consume_events(weak, events)));
+        drop(task_slot);
         let mut controller = run.controller.lock().await;
         match controller.start(now).await {
             Ok(_) => {
@@ -293,14 +308,27 @@ impl AccountManager {
         let mut controller = run.controller.lock().await;
         controller.tick(now, Instant::now());
         let result = controller.stop().await;
-        if controller.resources_released() {
+        let phase=controller.phase();
+        let released=controller.resources_released();
+        // Never join a consumer while holding the controller it may be waiting
+        // for. Keep the actual JoinHandle in this run across caller cancellation.
+        drop(controller);
+        if released {
+            let mut task_slot=run.task.lock().await;
+            if let Some(task)=task_slot.as_mut() { task.abort(); let _=task.await; }
+            *task_slot=None;
+            drop(task_slot);
+            let proof=RunQuiescence { token:run.run_token.clone() };
+            if let Err(code)=self.database.with_conn(|conn|account_runs::release_and_compact(conn,&proof)) {
+                *lock(&run.error)=Some(code);return Err(code);
+            }
+            run.finalized.store(true,Ordering::SeqCst);
             retirement.disarm();
-            if let Some(task) = lock(&run.task).take() { task.abort(); }
         }
         match result {
             Ok(()) => {
                 *lock(&run.error) = None;
-                Ok(view(metadata, controller.phase(), !controller.resources_released(), None))
+                Ok(view(metadata, phase, !released || !run.finalized.load(Ordering::SeqCst), None))
             }
             Err(reason) => { let code = controller_error(reason); *lock(&run.error) = Some(code); Err(code) }
         }
