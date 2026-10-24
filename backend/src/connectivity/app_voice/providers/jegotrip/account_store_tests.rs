@@ -77,7 +77,7 @@ fn schema_is_idempotent_and_does_not_create_sim_trunk_or_readiness_tables() {
     let columns: Vec<String> = statement.query_map([], |row| row.get(1)).unwrap().map(Result::unwrap).collect();
     assert_eq!(columns, ["line_id", "provider_id", "revision", "private_config", "created_at", "updated_at"]);
     assert!(conn.execute("INSERT INTO app_voice_accounts VALUES (?1, 'other', 1, X'00', 't', 't')", [id(1)]).is_err());
-    assert!(conn.execute("INSERT INTO app_voice_accounts VALUES (?1, 'app-voice', 0, X'00', 't', 't')", [id(1)]).is_err());
+    assert!(conn.execute("INSERT INTO app_voice_accounts VALUES (?1, 'app_voice', 0, X'00', 't', 't')", [id(1)]).is_err());
 }
 
 #[test]
@@ -104,7 +104,8 @@ fn create_never_upserts_metadata_is_redacted_and_lines_are_independent() {
     let a = id(1); let b = id(2);
     let first = create(&conn, &a, &config, 100).unwrap();
     assert_eq!(first.revision, 1);
-    assert_eq!(first.provider_id, "app-voice");
+    assert_eq!(first.provider_id, super::super::PROVIDER_ID);
+    assert_eq!(first.provider_id, "app_voice");
     assert_eq!(first.created_at, "1970-01-01T00:01:40Z");
     assert_eq!(first.updated_at, first.created_at);
     assert_eq!(create(&conn, &a, &config, 101).err(), Some(CONFLICT));
@@ -255,12 +256,51 @@ fn invalid_configuration_and_unrepresentable_timestamp_do_not_persist_or_mutate(
 }
 
 #[test]
+fn known_hyphenated_schema_migrates_atomically_to_the_existing_product_provider_id() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let config = fixture(&cert.root);
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE app_voice_accounts(
+        line_id TEXT PRIMARY KEY NOT NULL, provider_id TEXT NOT NULL CHECK(provider_id='app-voice'),
+        revision INTEGER NOT NULL CHECK(revision>0), private_config BLOB NOT NULL,
+        created_at TEXT NOT NULL,updated_at TEXT NOT NULL);").unwrap();
+    let private = config.encode_private().unwrap();
+    conn.execute("INSERT INTO app_voice_accounts VALUES(?1,'app-voice',7,?2,'created','updated')", params![id(1),private.as_slice()]).unwrap();
+    initialize_schema(&conn).unwrap(); initialize_schema(&conn).unwrap();
+    let stored = load(&conn, &id(1)).unwrap().unwrap();
+    assert_eq!(stored.metadata.provider_id, super::super::PROVIDER_ID); assert_eq!(stored.metadata.revision, 7);
+    assert_eq!(stored.metadata.created_at, "created"); assert_eq!(stored.metadata.updated_at, "updated");
+    assert_eq!(stored.config.encode_private().unwrap().as_slice(), private.as_slice());
+    assert!(stored.config.validate(100).is_ok());
+    assert_eq!(create(&conn, &id(2), &config, 100).unwrap().provider_id, super::super::PROVIDER_ID);
+    let legacy_exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='app_voice_accounts_legacy_provider')", [], |row| row.get(0)).unwrap();
+    assert!(!legacy_exists);
+}
+
+#[test]
+fn provider_migration_failure_preserves_old_private_rows_and_unrelated_objects() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let config = fixture(&cert.root);
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE app_voice_accounts(
+        line_id TEXT PRIMARY KEY NOT NULL,provider_id TEXT NOT NULL CHECK(provider_id='app-voice'),
+        revision INTEGER NOT NULL CHECK(revision>0),private_config BLOB NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+        CREATE TABLE app_voice_accounts_legacy_provider(unrelated TEXT);
+        INSERT INTO app_voice_accounts_legacy_provider VALUES('must-not-clean');").unwrap();
+    let private = config.encode_private().unwrap();
+    conn.execute("INSERT INTO app_voice_accounts VALUES(?1,'app-voice',3,?2,'t','t')", params![id(1),private.as_slice()]).unwrap();
+    assert_eq!(initialize_schema(&conn), Err(STORAGE));
+    let original: (String,i64,Vec<u8>) = conn.query_row("SELECT provider_id,revision,private_config FROM app_voice_accounts WHERE line_id=?1", [id(1)], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!(original.0, "app-voice"); assert_eq!(original.1, 3); assert_eq!(original.2, private.as_slice());
+    let unrelated: String = conn.query_row("SELECT unrelated FROM app_voice_accounts_legacy_provider", [], |row| row.get(0)).unwrap();
+    assert_eq!(unrelated, "must-not-clean");
+}
+
+#[test]
 fn overcap_corruption_and_missing_schema_return_only_stable_errors() {
     let cert = Certificates::generate("DNS:fixture.invalid");
     let config = fixture(&cert.root); let conn = memory();
     let private = config.encode_private().unwrap();
     for n in 0..65 {
-        conn.execute("INSERT INTO app_voice_accounts VALUES (?1, 'app-voice', 1, ?2, 't', 't')",
+        conn.execute("INSERT INTO app_voice_accounts VALUES (?1, 'app_voice', 1, ?2, 't', 't')",
             params![id(n), private.as_slice()]).unwrap();
     }
     assert_eq!(list(&conn).err(), Some("app_account_limit"));

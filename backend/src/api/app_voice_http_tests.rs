@@ -57,7 +57,7 @@ mod app_voice_accounts {
         let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");
         let served = serve(state.router.clone()).await; let cookie = authenticate(&served).await;
         let cert = Certificates::generate("DNS:fixture.invalid"); let config = config_json(&cert.root);
-        let create = serde_json::json!({"provider_id":"app-voice","config":config});
+        let create = serde_json::json!({"provider_id":"app_voice","config":config});
         let (status, headers, body) = account_request(&served, reqwest::Method::POST, "/api/non-3gpp/accounts", Some(create), Some(&cookie)).await;
         assert_eq!(status, StatusCode::CREATED, "{body}"); no_store(&headers); no_secrets(&body);
         let line = created_line(&body); let path = format!("/api/non-3gpp/accounts/{line}");
@@ -106,7 +106,7 @@ mod app_voice_accounts {
         let mut root = config_json(&cert.root); root["credentials"]["sdk"]["root_der_base64"] = serde_json::json!("fixture-not-a-root");
         for config in [blank, unknown, wrong_type, root] {
             let (status, headers, body) = account_request(&served, reqwest::Method::POST, "/api/non-3gpp/accounts",
-                Some(serde_json::json!({"provider_id":"app-voice","config":config})), Some(&cookie)).await;
+                Some(serde_json::json!({"provider_id":"app_voice","config":config})), Some(&cookie)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST); no_store(&headers); no_secrets(&body);
             assert!(!body.contains("synthetic-secret-field"));
         }
@@ -143,7 +143,7 @@ mod app_voice_accounts {
             peer.reply(request.call_id, &[0, 1, 0, 0, 0, 0]).await; assert!(peer.receive().await.is_none());
         });
         let (status, _, body) = account_request(&served, reqwest::Method::POST, "/api/non-3gpp/accounts",
-            Some(serde_json::json!({"provider_id":"app-voice","config":config_json(&cert.root)})), Some(&cookie)).await;
+            Some(serde_json::json!({"provider_id":"app_voice","config":config_json(&cert.root)})), Some(&cookie)).await;
         assert_eq!(status, StatusCode::CREATED); let line = created_line(&body);
         let path = format!("/api/non-3gpp/accounts/{line}");
         let (status, headers, body) = account_request(&served, reqwest::Method::POST, &format!("{path}/start"),
@@ -174,7 +174,7 @@ mod app_voice_accounts {
     async fn body_limit_blocks_oversized_private_import_and_keeps_storage_empty() {
         let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");
         let served = serve(state.router.clone()).await; let cookie = authenticate(&served).await;
-        let body = serde_json::json!({"provider_id":"app-voice", "config":"fixture-private-".repeat(32 * 1024)});
+        let body = serde_json::json!({"provider_id":"app_voice", "config":"fixture-private-".repeat(32 * 1024)});
         let (status, headers, body) = account_request(&served, reqwest::Method::POST, "/api/non-3gpp/accounts", Some(body), Some(&cookie)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST); no_store(&headers); no_secrets(&body);
         assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());

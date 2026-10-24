@@ -8,7 +8,7 @@ use std::fmt;
 use zeroize::Zeroizing;
 
 pub const MAX_ACCOUNTS: i64 = 64;
-const PROVIDER: &str = "app-voice";
+const PROVIDER: &str = super::PROVIDER_ID;
 const STORAGE: &str = "app_account_storage_failed";
 const CONFIGURATION: &str = "app_account_configuration_invalid";
 const CONFLICT: &str = "app_account_revision_conflict";
@@ -16,17 +16,35 @@ const NOT_FOUND: &str = "app_account_not_found";
 const MAX_PRIVATE_BYTES: i64 = 256 * 1024;
 const METADATA_COLUMNS: &str = "line_id, provider_id, revision, created_at, updated_at";
 
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS app_voice_accounts (
+    line_id TEXT PRIMARY KEY NOT NULL,
+    provider_id TEXT NOT NULL CHECK (provider_id = 'app_voice'),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    private_config BLOB NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);";
+
 pub fn initialize_schema(conn: &Connection) -> Result<(), &'static str> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS app_voice_accounts (
-            line_id TEXT PRIMARY KEY NOT NULL,
-            provider_id TEXT NOT NULL CHECK (provider_id = 'app-voice'),
-            revision INTEGER NOT NULL CHECK (revision > 0),
-            private_config BLOB NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );"
-    ).map_err(|_| STORAGE)
+    conn.execute_batch(SCHEMA).map_err(|_| STORAGE)?;
+    let definition: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='app_voice_accounts'",
+        [], |row| row.get(0)).map_err(|_| STORAGE)?;
+    if definition.contains("'app-voice'") {
+        // Preserve only this stage's known erroneous hyphenated schema. The
+        // product/API provider id has ALWAYS been app_voice; migrate private
+        // rows atomically without reimporting or granting any runtime state.
+        let tx = immediate(conn)?;
+        tx.execute_batch("ALTER TABLE app_voice_accounts RENAME TO app_voice_accounts_legacy_provider;")
+            .map_err(|_| STORAGE)?;
+        tx.execute_batch(SCHEMA).map_err(|_| STORAGE)?;
+        tx.execute("INSERT INTO app_voice_accounts(line_id,provider_id,revision,private_config,created_at,updated_at)
+            SELECT line_id,CASE WHEN provider_id='app-voice' THEN 'app_voice' ELSE provider_id END,
+                revision,private_config,created_at,updated_at FROM app_voice_accounts_legacy_provider", [])
+            .map_err(|_| STORAGE)?;
+        tx.execute_batch("DROP TABLE app_voice_accounts_legacy_provider;").map_err(|_| STORAGE)?;
+        tx.commit().map_err(|_| STORAGE)?;
+    }
+    Ok(())
 }
 
 pub fn valid_line_id(id: &str) -> bool {
@@ -150,7 +168,7 @@ pub fn create(conn: &Connection, id: &str, config: &AccountConfig, now: u64)
     if count >= MAX_ACCOUNTS { return Err("app_account_limit"); }
     tx.execute(
         "INSERT INTO app_voice_accounts (line_id, provider_id, revision, private_config, created_at, updated_at)
-            VALUES (?1, 'app-voice', 1, ?2, ?3, ?3)",
+            VALUES (?1, 'app_voice', 1, ?2, ?3, ?3)",
         params![id, private.as_slice(), &time],
     ).map_err(|_| STORAGE)?;
     let metadata = AccountMetadata { line_id: id.to_owned(), provider_id: PROVIDER.to_owned(), revision: 1,

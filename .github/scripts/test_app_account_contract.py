@@ -74,6 +74,15 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertNotIn('app_accounts.install(', state)
         self.assertNotIn('account_store::install_all', database)
 
+    def test_canonical_provider_id_is_shared_with_the_existing_product_contract(self):
+        module = (PROVIDER / 'mod.rs').read_text(encoding='utf-8')
+        store = (PROVIDER / 'account_store.rs').read_text(encoding='utf-8')
+        self.assertIn('pub const PROVIDER_ID: &str = "app_voice"', module)
+        self.assertIn('const PROVIDER: &str = super::PROVIDER_ID', store)
+        self.assertIn("CHECK (provider_id = 'app_voice')", store)
+        self.assertIn("CASE WHEN provider_id='app-voice' THEN 'app_voice'", store)
+        self.assertIn('known_hyphenated_schema_migrates_atomically', (PROVIDER / 'account_store_tests.rs').read_text(encoding='utf-8'))
+
     def test_both_actions_have_nonzero_account_and_real_auth_http_filters(self):
         for workflow in ['.github/workflows/build-release.yml', '.github/workflows/beta-validation.yml']:
             text = source(workflow)
