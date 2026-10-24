@@ -3565,6 +3565,8 @@ impl Database {
         // `platform::config_store` for why.
         migrate_cellular_ims_persisted_names(&conn)?;
         crate::platform::config_store::initialize_schema(&conn)?;
+        crate::connectivity::app_voice::providers::jegotrip::account_store::initialize_schema(&conn)
+            .map_err(|code| rusqlite::Error::InvalidParameterName(code.to_owned()))?;
 
         let (app_event_tx, _) = broadcast::channel(512);
         Ok(Self {

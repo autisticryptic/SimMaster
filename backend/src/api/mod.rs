@@ -5,6 +5,7 @@
 //!   - `models`: request/response DTOs shared across handlers
 //!   - `auth`: password/session authentication + the auth middleware
 
+pub mod app_voice;
 pub mod auth;
 pub mod events;
 pub mod handlers;

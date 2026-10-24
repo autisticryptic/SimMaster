@@ -284,6 +284,15 @@ impl NativeHostingBackend {
         (Arc::new(Self { profile: Arc::new(profile), connector, events,
             state: Mutex::new(BackendState { slot: None, owners: Vec::new(), incarnations: Vec::new() }) }), receiver)
     }
+    /// The trusted account wrapper owns this backend exclusively. Cancellation
+    /// may happen before login returned its owner; retire that already-captured
+    /// slot synchronously, without transferring or claiming release of its IO.
+    pub(super) fn retire_current(&self) {
+        if let Some(attempt) = &lock(&self.state).slot { attempt.retire(); }
+    }
+    pub(super) fn original_scope(&self, owner: &AttemptOwner) -> Option<RpcConnectionScope> {
+        self.original(owner).ok().map(|attempt| attempt.scope.clone())
+    }
     fn original(&self, owner: &AttemptOwner) -> Result<Arc<Attempt>, BackendFailure> {
         lock(&self.state).slot.as_ref().filter(|a| &a.owner == owner).cloned().ok_or(BackendFailure::Disconnected)
     }
@@ -549,4 +558,4 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
 
 #[cfg(test)]
 #[path = "runtime_backend_tests.rs"]
-mod tests;
+pub(crate) mod tests;

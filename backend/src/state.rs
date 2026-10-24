@@ -52,7 +52,9 @@ pub struct AppState {
     pub modem_radio: Arc<dyn ModemRadioControl>,
     /// 数据库连接（用于存储 SMS 和通话记录）
     pub database: Arc<Database>,
-    /// 配置管理器（用于管理通知等配置）
+    /// Independent non-SIM application accounts. Construction never starts a
+    /// connection or installs an available voice/messaging provider.
+    pub app_accounts: Arc<crate::connectivity::app_voice::providers::jegotrip::account_runtime::AccountManager>,
     pub config_manager: Arc<ConfigManager>,
     /// 通知发送器（用于转发 SMS、通话和 DDNS 通知）
     pub notification_sender: Arc<NotificationSender>,
@@ -132,10 +134,12 @@ impl AppState {
             e911,
             shutdown,
         } = dependencies;
+        let app_accounts = Arc::new(crate::connectivity::app_voice::providers::jegotrip::account_runtime::AccountManager::new(database.clone()));
         Self {
             dbus_conn,
             modem_radio,
             database,
+            app_accounts,
             config_manager,
             notification_sender,
             system_event_emitter,
@@ -165,6 +169,10 @@ impl FromRef<AppState> for Arc<Connection> {
     fn from_ref(state: &AppState) -> Self {
         state.dbus_conn.clone()
     }
+}
+
+impl FromRef<AppState> for Arc<crate::connectivity::app_voice::providers::jegotrip::account_runtime::AccountManager> {
+    fn from_ref(state: &AppState) -> Self { state.app_accounts.clone() }
 }
 
 impl FromRef<AppState> for Arc<Database> {

@@ -70,9 +70,15 @@ impl AsyncWrite for TrackedIo {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> { Pin::new(&mut self.io).poll_flush(cx) }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> { Pin::new(&mut self.io).poll_shutdown(cx) }
 }
-struct DuplexConnector {
+pub(crate) struct DuplexConnector {
     io: Mutex<Option<TrackedIo>>, calls: AtomicUsize, captured: Mutex<Option<(AttemptOwner, RpcConnectionScope)>>,
     substitute_scope: bool,
+}
+impl DuplexConnector {
+    pub(crate) fn captured_scope(&self) -> Option<RpcConnectionScope> {
+        lock(&self.captured).as_ref().map(|(_, scope)| scope.clone())
+    }
+    pub(crate) fn connection_calls(&self) -> usize { self.calls.load(Ordering::SeqCst) }
 }
 impl RuntimeConnector for DuplexConnector {
     fn connect<'a>(&'a self, owner: &'a AttemptOwner, scope: &'a RpcConnectionScope, input: ConnectionInput<'a>) -> ConnectFuture<'a> {
@@ -85,12 +91,15 @@ impl RuntimeConnector for DuplexConnector {
         })
     }
 }
-struct Peer {
+pub(crate) struct Peer {
     io: DuplexStream, server: rustls::ServerConnection, network: PacketStreamDecoder,
     plaintext: PlaintextPacketDecoder, assembler: CallAssembler, received: VecDeque<CallMessage>,
 }
 impl Peer {
-    async fn receive(&mut self) -> Option<CallMessage> {
+    pub(crate) async fn drain_until_eof(&mut self) {
+        while self.io.read(&mut [0u8; 8192]).await.unwrap() != 0 {}
+    }
+    pub(crate) async fn receive(&mut self) -> Option<CallMessage> {
         let mut bytes = [0; 8192];
         loop {
             if let Some(message) = self.received.pop_front() { return Some(message); }
@@ -122,17 +131,17 @@ impl Peer {
             self.io.write_all(frame.expose_to_transport()).await.unwrap();
         }
     }
-    async fn send_call(&mut self, kind: CallKind, envelope: &[u8]) {
+    pub(crate) async fn send_call(&mut self, kind: CallKind, envelope: &[u8]) {
         for packet in encode_call_packets(kind, envelope, TLS_FRAGMENT_THRESHOLD).unwrap() {
             std::io::Write::write_all(&mut self.server.writer(), packet.expose_to_transport()).unwrap();
         }
         let mut output = Vec::new(); while self.server.wants_write() { self.server.write_tls(&mut output).unwrap(); }
         self.send_cipher(&output).await;
     }
-    async fn reply(&mut self, id: i32, stream: &[u8]) {
+    pub(crate) async fn reply(&mut self, id: i32, stream: &[u8]) {
         let envelope = encode_reply(id, 0, stream).unwrap(); self.send_call(CallKind::Reply, envelope.expose_to_transport()).await;
     }
-    async fn authenticate(&mut self) {
+    pub(crate) async fn authenticate(&mut self) {
         let message = self.receive().await.unwrap(); let request = decode_request(message.payload.expose_to_transport()).unwrap();
         assert_eq!(request.method, super::super::rpc_login::LOGIN_SESSION_METHOD.as_bytes());
         assert_eq!(request.metadata.iter().find(|p| p.key == b"pwd").unwrap().value, b"fixture-original-pwd");
@@ -149,7 +158,7 @@ impl Peer {
         let mut w = Writer::new(); w.boolean(true).unwrap(); w.bytes(b"fixture-user").unwrap(); w.bytes(b"fixture-auth").unwrap();
         w.properties(&[]).unwrap(); w.bytes(b"").unwrap(); self.reply(request.call_id, w.finish().expose_to_transport()).await;
     }
-    async fn swap(&mut self, status: Option<i32>, nested: bool) {
+    pub(crate) async fn swap(&mut self, status: Option<i32>, nested: bool) {
         loop {
             let message = self.receive().await.unwrap(); let request = decode_request(message.payload.expose_to_transport()).unwrap();
             assert_eq!(request.method, super::super::rpc_batch::SWAP_CALLS_METHOD.as_bytes());
@@ -171,7 +180,7 @@ impl Peer {
             self.reply(request.call_id, &result).await; return;
         }
     }
-    async fn incoming(&mut self, id: i32) {
+    pub(crate) async fn incoming(&mut self, id: i32) {
         let mut args = Writer::versioned().unwrap(); args.bytes(b"fixture.kind").unwrap(); args.properties(&[]).unwrap(); args.bytes(&[0xff, 0, 3]).unwrap();
         let request = super::super::rpc_envelope::encode_request(id, &[
             RpcProperty { key: b"id", value: b"#fixture-client" }, RpcProperty { key: b"domain", value: b"fixture-domain" },
@@ -180,14 +189,14 @@ impl Peer {
         self.send_call(CallKind::Request, request.expose_to_transport()).await;
     }
 }
-fn swap_result(sequence: Option<i32>, accepted: bool, original_words: [u32; 6]) -> Vec<u8> {
+pub(crate) fn swap_result(sequence: Option<i32>, accepted: bool, original_words: [u32; 6]) -> Vec<u8> {
     let mut w = Writer::new(); w.boolean(true).unwrap();
     for word in [9, 1, 1, original_words[0], original_words[1], original_words[2]] { w.u32(word).unwrap(); }
     w.u32(0).unwrap(); w.u32(u32::from(sequence.is_some())).unwrap();
     if let Some(sequence) = sequence { w.i32(sequence).unwrap(); w.u32(0).unwrap(); w.bytes(&[0, u8::from(accepted), 0, 0, 0, 0]).unwrap(); }
     w.properties(&[]).unwrap(); w.bytes(b"").unwrap(); w.finish().expose_to_transport().to_vec()
 }
-fn fixture(cert: &Certificates, substitute_scope: bool) -> (Arc<NativeHostingBackend>, mpsc::Receiver<BackendEvent>, Arc<DuplexConnector>, Peer, Arc<AtomicBool>, Arc<AtomicBool>) {
+pub(crate) fn fixture(cert: &Certificates, substitute_scope: bool) -> (Arc<NativeHostingBackend>, mpsc::Receiver<BackendEvent>, Arc<DuplexConnector>, Peer, Arc<AtomicBool>, Arc<AtomicBool>) {
     let (client, server) = tokio::io::duplex(65_536); let dropped = Arc::new(AtomicBool::new(false)); let blocked = Arc::new(AtomicBool::new(false));
     let connector = Arc::new(DuplexConnector { io: Mutex::new(Some(TrackedIo { io: client, dropped: dropped.clone(), block_writes: blocked.clone() })),
         calls: AtomicUsize::new(0), captured: Mutex::new(None), substitute_scope });
@@ -208,7 +217,7 @@ async fn logged_in(backend: &NativeHostingBackend, events: &mut mpsc::Receiver<B
     scope
 }
 
-async fn next_non_poll(peer: &mut Peer) -> CallMessage {
+pub(crate) async fn next_non_poll(peer: &mut Peer) -> CallMessage {
     loop {
         let message = peer.receive().await.unwrap();
         if message.kind == CallKind::Request {

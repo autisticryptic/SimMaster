@@ -206,6 +206,12 @@ impl HostingController {
         failure.map_or(Ok(()), Err)
     }
 
+    /// Resource ownership is distinct from hosted/channel readiness. Trusted
+    /// account lifecycle code uses this only to retain cleanup and reject stale
+    /// event delivery; it cannot mint a new owner or clear a retained Join.
+    pub(super) fn resource_owner(&self) -> Option<AttemptOwner> { self.backend_owner.clone() }
+    pub(super) fn resources_released(&self) -> bool { self.backend_owner.is_none() }
+
     pub fn phase(&self) -> Phase { self.session.phase() }
     pub fn incoming_call_ready(&self) -> bool { self.session.incoming_call_ready() }
     pub fn incoming_message_ready(&self) -> bool { self.session.incoming_message_ready() }

@@ -8,6 +8,11 @@
 pub mod batch_scheduler;
 pub mod arc_protocol;
 pub mod arc_session;
+pub mod account_config;
+pub mod account_store;
+pub mod account_runtime;
+#[cfg(test)]
+pub(crate) mod account_test_support;
 pub mod credentials;
 pub mod controller;
 pub mod offline_backend;

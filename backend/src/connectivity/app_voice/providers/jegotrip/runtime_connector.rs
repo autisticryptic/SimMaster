@@ -143,6 +143,12 @@ fn targets(input: ConnectionInput<'_>) -> Result<Vec<Target>, ConnectError> {
     Ok(targets)
 }
 
+/// Validate the complete explicit reference/root/authority binding without
+/// DNS, sockets, a scope capability or any readiness side effect.
+pub(super) fn validate_explicit_profile(input: ConnectionInput<'_>) -> Result<(), ConnectError> {
+    targets(input).map(|_| ())
+}
+
 /// Serialize every NONBLOCKING future poll with original retirement, including
 /// the first poll that may schedule DNS or issue a TCP connect. Resolver system
 /// configuration is prepared outside the gate; only nonblocking network work

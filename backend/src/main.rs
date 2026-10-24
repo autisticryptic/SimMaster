@@ -1726,6 +1726,7 @@ async fn wait_for_shutdown_signal(
 /// it returns exactly the router the binary serves.
 fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
     let protected_routes = Router::new()
+        .merge(api::app_voice::routes())
         .route(
             "/api/events",
             get(api::events::stream_app_events).options(options_handler),
@@ -2571,6 +2572,8 @@ mod http_router_tests {
     };
     use hardware::devices::transport::TransportFuture;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    include!("api/app_voice_http_tests.rs");
 
     /// Radio-only fixture. No modem, worker process, netns, call or packet is
     /// created by a command; failures/ordering can be exercised deterministically.
