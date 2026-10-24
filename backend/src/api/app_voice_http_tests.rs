@@ -45,6 +45,7 @@ mod app_voice_accounts {
             (reqwest::Method::POST, format!("/api/non-3gpp/accounts/{line}/start")),
             (reqwest::Method::POST, format!("/api/non-3gpp/accounts/{line}/stop")),
             (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}/inbox")),
+            (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}/messages")),
         ];
         for (method, path) in cases {
             let (status, _, body) = account_request(&served, method, &path, Some(serde_json::json!({})), None).await;
@@ -201,6 +202,66 @@ mod app_voice_accounts {
         let (status, headers, body) = account_request(&served, reqwest::Method::GET, &path, None, Some(&cookie)).await;
         assert_eq!(status, StatusCode::OK); no_store(&headers); no_secrets(&body);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn original_smgw_text_is_readable_in_scoped_sms_history_without_raw_or_credentials() {
+        use crate::connectivity::app_voice::providers::jegotrip::{account_runtime::AccountManager,
+            account_test_support::{peer,QueuedFactory},rpc_envelope::{decode_reply,decode_request},runtime_backend::tests::next_non_poll,
+            session::{STATUS_REGISTER,STATUS_UNREGISTER},transport_packets::CallKind};
+        let mut state=build_test_router().await.expect("Actions private D-Bus required; do not skip");
+        let cert=Certificates::generate("DNS:fixture.invalid");let factory=Arc::new(QueuedFactory::default());let (mut peer,_,dropped)=peer(&cert,&factory);
+        state.app.app_accounts=Arc::new(AccountManager::with_factory(state.app.database.clone(),factory));
+        let cors=CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+        let served=serve(build_router(state.app.clone(),cors)).await;let cookie=authenticate(&served).await;
+        let serving=tokio::spawn(async move {
+            peer.authenticate().await;peer.swap(Some(STATUS_REGISTER),true).await;
+            peer.incoming_with_fields(91,b"Sip.Request","fixture SMS 你好 🥘".as_bytes(),Some(b"fixture-sender"),Some(b"1700000000123")).await;
+            let reply=next_non_poll(&mut peer).await;assert_eq!(reply.kind,CallKind::Reply);assert_eq!(decode_reply(reply.payload.expose_to_transport()).unwrap().call_id,91);
+            peer.swap(Some(STATUS_UNREGISTER),true).await;let message=next_non_poll(&mut peer).await;let request=decode_request(message.payload.expose_to_transport()).unwrap();peer.reply(request.call_id,&[0,1,0,0,0,0]).await;assert!(peer.receive().await.is_none());
+        });
+        let mut configuration=config_json(&cert.root);configuration["profile"]["incoming"]["receiver_kind"]=serde_json::json!(b"Sip.Request");
+        let (status,_,body)=account_request(&served,reqwest::Method::POST,"/api/non-3gpp/accounts",Some(serde_json::json!({"provider_id":"app_voice","config":configuration})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::CREATED);let line=created_line(&body);let path=format!("/api/non-3gpp/accounts/{line}");
+        let (status,_,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/start"),Some(serde_json::json!({"expected_revision":1})),Some(&cookie)).await;assert_eq!(status,StatusCode::ACCEPTED,"{body}");
+        let projected=tokio::time::timeout(std::time::Duration::from_secs(4),async {
+            loop {
+                let (status,headers,body)=account_request(&served,reqwest::Method::GET,&format!("{path}/messages?limit=10"),None,Some(&cookie)).await;
+                assert_eq!(status,StatusCode::OK);no_store(&headers);
+                for private in ["phone_login_token","application_key","root_der","receiver_object","receiver_kind","run_nonce","__magic","private_config"]{assert!(!body.contains(private));}
+                let json:serde_json::Value=serde_json::from_str(&body).unwrap();if json["data"].as_array().unwrap().len()==1{break json;}
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        let message=&projected["data"][0];assert_eq!(message["content"],"fixture SMS 你好 🥘");assert_eq!(message["phone_number"],"fixture-sender");assert_eq!(message["transport"],"app_voice");assert!(message["pdu"].is_null());
+        assert_eq!(message["classification"],"smgw_text");assert_eq!(message["sent_at_unix_millis"],1_700_000_000_123i64);assert_eq!(message["timestamp_source"],"sender");
+        let sms_id=message["id"].as_i64().unwrap();
+        let (status,_,body)=account_request(&served,reqwest::Method::GET,&format!("/api/sms/list?channel_id={line}"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["messages"][0]["id"],sms_id);
+        let (status,_,body)=account_request(&served,reqwest::Method::GET,"/api/sms/list?channel_id=another-line",None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["messages"],serde_json::json!([]));
+        let (status,_,body)=account_request(&served,reqwest::Method::DELETE,&format!("/api/sms/message/{sms_id}?channel_id={line}"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["deleted"],1);
+        let (status,headers,body)=account_request(&served,reqwest::Method::GET,&format!("{path}/messages"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);no_store(&headers);assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"],serde_json::json!([]));
+        let wiped:bool=state.app.database.with_conn(|conn|conn.query_row("SELECT length(body)=0 AND sender IS NULL AND opaque_time IS NULL FROM app_voice_inbox WHERE line_id=?1",[&line],|row|row.get(0)).map_err(|_|"test_query_failed")).unwrap();assert!(wiped);
+        let (status,_,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/stop"),Some(serde_json::json!({"expected_revision":1})),Some(&cookie)).await;assert_eq!(status,StatusCode::OK,"{body}");serving.await.unwrap();assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn application_sms_channels_never_authorize_local_automation_or_trunk_sends() {
+        let state=build_test_router().await.expect("Actions private D-Bus required; do not skip");let served=serve(state.router.clone()).await;let cookie=authenticate(&served).await;
+        let cert=Certificates::generate("DNS:fixture.invalid");let (status,_,body)=account_request(&served,reqwest::Method::POST,"/api/non-3gpp/accounts",
+            Some(serde_json::json!({"provider_id":"app_voice","config":config_json(&cert.root)})),Some(&cookie)).await;assert_eq!(status,StatusCode::CREATED);let line=created_line(&body);
+        let (status,_,body)=account_request(&served,reqwest::Method::GET,"/api/sms/channels",None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);no_secrets(&body);
+        let json:serde_json::Value=serde_json::from_str(&body).unwrap();let channel=json["data"].as_array().unwrap().iter().find(|c|c["id"]==line).unwrap();
+        assert_eq!(channel["kind"],"app_account");assert_eq!(channel["available"],false);assert!(channel.get("iccid").is_none());assert!(channel.get("operator_id").is_none());
+        let (status,_,body)=account_request(&served,reqwest::Method::POST,&format!("/api/modem/lines/{line}/sms/send"),
+            Some(serde_json::json!({"phone_number":"fixture-recipient","content":"must-not-send"})),Some(&cookie)).await;assert_eq!(status,StatusCode::NOT_IMPLEMENTED);no_secrets(&body);assert!(body.contains("app_account_outbound_unsupported"));
+        assert_eq!(api::handlers::send_sms_on_line(&state.app,&line,"fixture-recipient","must-not-send").await.err().as_deref(),Some("app_account_outbound_unsupported"));
+        assert_eq!(api::handlers::send_sms_on_line_from_trunk(&state.app,&line,"fixture-recipient","must-not-send").await.err().as_deref(),Some("app_account_outbound_unsupported"));
+        assert!(state.app.database.get_sms_messages_for_channel(50,0,None,Some(&line)).unwrap().is_empty());
+        for query in ["?limit=0","?limit=129","?include_raw=true"] {
+            let (status,headers,body)=account_request(&served,reqwest::Method::GET,&format!("/api/non-3gpp/accounts/{line}/messages{query}"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);
+        }
     }
 
     #[tokio::test]

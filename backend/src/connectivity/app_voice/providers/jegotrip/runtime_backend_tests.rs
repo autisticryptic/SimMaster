@@ -184,7 +184,13 @@ impl Peer {
         }
     }
     pub(crate) async fn incoming(&mut self, id: i32) {
-        let mut args = Writer::versioned().unwrap(); args.bytes(b"fixture.kind").unwrap(); args.properties(&[]).unwrap(); args.bytes(&[0xff, 0, 3]).unwrap();
+        self.incoming_with_fields(id,b"fixture.kind",&[0xff,0,3],None,None).await;
+    }
+    pub(crate) async fn incoming_with_fields(&mut self, id:i32, kind:&[u8], body:&[u8], from:Option<&[u8]>, time:Option<&[u8]>) {
+        let mut properties=Vec::new();
+        if let Some(value)=from { properties.push(RpcProperty{key:b"Sip.Message.From",value}); }
+        if let Some(value)=time { properties.push(RpcProperty{key:b"Sip.Message.Time",value}); }
+        let mut args=Writer::versioned().unwrap();args.bytes(kind).unwrap();args.properties(&properties).unwrap();args.bytes(body).unwrap();
         let request = super::super::rpc_envelope::encode_request(id, &[
             RpcProperty { key: b"id", value: b"#fixture-client" }, RpcProperty { key: b"domain", value: b"fixture-domain" },
             RpcProperty { key: b"__magic", value: &[0, 0xff] }], super::super::rpc_incoming::ONLINE_MESSAGE_METHOD.as_bytes(),

@@ -5,10 +5,10 @@
 //! are different layers. Local row ids/nonces are NOT remote message identities.
 //! Unknown data is never evicted to make room, promoted as SMS or marked ready.
 use super::{
-    account_store, arc_protocol::IncomingProtocolMessage,
+    account_sms, account_store, arc_protocol::IncomingProtocolMessage,
     native_events::IncomingMessage, offline_backend::ScheduledIncomingMessage,
     rpc_pending::RpcConnectionScope, runtime_backend::NativeHostingBackend,
-    session::AttemptOwner, transport_actor::RuntimeError,
+    session::AttemptOwner, smgw_text, transport_actor::RuntimeError,
 };
 use crate::platform::db::{insert_app_event_for_conn, Database};
 use ring::digest::{Context, SHA256};
@@ -120,20 +120,25 @@ impl InboxScope {
         // Never hold the NONBLOCKING IO poll gate across SQLite/config IO. The
         // captured observation can be committed historically if physical close
         // races it; a closed/retired scope cannot admit the subsequent reply.
-        let (id, event) = database.with_conn(|conn| {
+        let classified = self.receiver.as_ref().and_then(|receiver| smgw_text::classify(&receiver.kind, message));
+        let (id, events) = database.with_conn(|conn| {
             let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|_| STORAGE)?;
             require_account(&tx, &self.line_id, self.revision)?;
-            let existing: Option<(i64, bool)> = tx.query_row("SELECT id,
-                fingerprint=?7 AND body=?8 AND sender IS ?9 AND opaque_time IS ?10
+            let existing: Option<(i64, bool)> = tx.query_row("SELECT i.id,
+                fingerprint=?7 AND (body=?8 AND sender IS ?9 AND opaque_time IS ?10
+                    OR EXISTS(SELECT 1 FROM app_voice_sms_projection p WHERE p.inbox_id=i.id AND p.line_id=i.line_id
+                        AND p.revision=i.revision AND p.deleted=1))
                     AND receiver_object IS ?11 AND receiver_domain IS ?12 AND receiver_kind IS ?13
-                FROM app_voice_inbox WHERE line_id=?1 AND revision=?2 AND run_nonce=?3
+                FROM app_voice_inbox i WHERE i.line_id=?1 AND i.revision=?2 AND run_nonce=?3
                 AND source_kind=?4 AND peer_epoch=?5 AND sequence=?6",
                 params![&self.line_id,self.revision as i64,&self.nonce,kind,epoch as i64,sequence,&fingerprint,
                     message.body.as_slice(),message.from.as_deref(),message.time.as_deref(),object,domain,receiver_kind],
                 |row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(|_| STORAGE)?;
             if let Some((id, matches)) = existing {
                 if !matches { return Err("app_account_inbox_duplicate_conflict"); }
-                tx.commit().map_err(|_| STORAGE)?; return Ok((id,None));
+                // A deliberate user SMS deletion leaves an original digest/
+                // receiver tombstone, not a request to recreate deleted text.
+                tx.commit().map_err(|_| STORAGE)?; return Ok((id,Vec::new()));
             }
             let (local,total,stored): (i64,i64,i64) = tx.query_row("SELECT COALESCE(SUM(line_id=?1),0),COUNT(*),
                 COALESCE(SUM(length(body)+COALESCE(length(sender),0)+COALESCE(length(opaque_time),0)
@@ -148,15 +153,25 @@ impl InboxScope {
                 params![&self.line_id,self.revision as i64,&self.nonce,kind,epoch as i64,sequence,&fingerprint,
                     message.body.as_slice(),message.from.as_deref(),message.time.as_deref(),&stamp,object,domain,receiver_kind]).map_err(|_| STORAGE)?;
             let id = tx.last_insert_rowid();
-            let payload = serde_json::json!({"inbox_id":id,"classification":"unclassified"}).to_string();
+            let classification = if classified.is_some() { "smgw_text" } else { "unclassified" };
+            let payload = serde_json::json!({"inbox_id":id,"classification":classification}).to_string();
             let event = insert_app_event_for_conn(&tx, "app_voice.inbox_stored", Some(&self.line_id), Some(super::PROVIDER_ID), &payload, &stamp)
                 .map_err(|_| STORAGE)?;
+            let mut events = vec![event];
+            if let Some(text) = &classified {
+                events.push(account_sms::promote_new(&tx, id, &self.line_id, self.revision, text, &stamp)?);
+            }
             tx.commit().map_err(|_| STORAGE)?;
-            Ok((id,Some(event)))
+            Ok((id,events))
         })?;
-        if let Some(event) = event { database.publish_committed_app_event(event); }
+        for event in events { database.publish_committed_app_event(event); }
         Ok(CommittedInbox { id, line_id: self.line_id.clone(), revision: self.revision, nonce: self.nonce.clone(),
             kind, epoch, sequence, fingerprint })
+    }
+    #[cfg(test)]
+    pub(super) fn commit_fixture(&self, database: &Database, sequence: i32, message: &IncomingMessage)
+        -> Result<i64, &'static str> {
+        self.commit(database, "direct", 0, sequence, message).map(|committed| committed.id)
     }
     pub(super) fn commit_direct(&self, database: &Database, message: &IncomingProtocolMessage) -> Result<CommittedInbox, &'static str> {
         if message.owner()!=&self.owner || !message.reply_ticket().matches(&self.owner,&self.scope) { return Err(SCOPE); }
@@ -229,15 +244,18 @@ pub struct InboxMetadata {
 }
 pub(super) fn metadata(conn:&Connection,line:&str,limit:usize)->Result<Vec<InboxMetadata>, &'static str> {
     if !account_store::valid_line_id(line) { return Err(SCOPE); }
-    let mut statement=conn.prepare("SELECT id,reply_state,created_at FROM app_voice_inbox WHERE line_id=?1 ORDER BY id DESC LIMIT ?2")
+    let mut statement=conn.prepare("SELECT i.id,i.reply_state,i.created_at,p.deleted FROM app_voice_inbox i
+        LEFT JOIN app_voice_sms_projection p ON p.inbox_id=i.id AND p.line_id=i.line_id AND p.revision=i.revision
+        WHERE i.line_id=?1 ORDER BY i.id DESC LIMIT ?2")
         .map_err(|_|STORAGE)?;
-    let raw=statement.query_map(params![line,limit.clamp(1,128) as i64],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))
+    let raw=statement.query_map(params![line,limit.clamp(1,128) as i64],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<i64>>(3)?)))
         .map_err(|_|STORAGE)?;
     let mut output=Vec::new();
     for row in raw {
-        let (id,state,stamp)=row.map_err(|_|STORAGE)?;
+        let (id,state,stamp,projection)=row.map_err(|_|STORAGE)?;
         let state=match state.as_str(){"pending"=>"pending","direct_submitted"=>"direct_submitted","batch_queued"=>"batch_queued",_=>return Err(STORAGE)};
-        output.push(InboxMetadata{inbox_id:id,classification:"unclassified",reply_state:state,created_at:stamp});
+        let classification=match projection{None=>"unclassified",Some(0)=>"smgw_text",Some(1)=>"smgw_text_deleted",_=>return Err(STORAGE)};
+        output.push(InboxMetadata{inbox_id:id,classification,reply_state:state,created_at:stamp});
     }
     Ok(output)
 }

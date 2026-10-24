@@ -93,7 +93,9 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('message.ticket().peer_incarnation()', inbox)
         self.assertIn('sender IS ?9 AND opaque_time IS ?10', inbox)
         self.assertIn('app_voice.inbox_stored', inbox)
-        self.assertIn('"classification":"unclassified"', inbox)
+        self.assertIn('"classification":classification', inbox)
+        self.assertIn('smgw_text::classify(&receiver.kind, message)', inbox)
+        self.assertIn('if classified.is_some() { "smgw_text" } else { "unclassified" }', inbox)
         self.assertIn('receiver_object IS ?11 AND receiver_domain IS ?12 AND receiver_kind IS ?13', inbox)
         self.assertIn('if self.receiver.is_none() { return Err(INVALID); }', inbox)
         self.assertIn('old provider binding cannot be reconstructed', inbox)
@@ -111,7 +113,8 @@ class AppAccountContractTests(unittest.TestCase):
             self.assertIn('admission.load(Ordering::SeqCst)', implementation)
             self.assertIn('RuntimeError::Backpressure', implementation)
             self.assertIn('Completion::StatusUnrecorded', implementation)
-        self.assertLess(inbox.index('tx.commit().map_err(|_| STORAGE)?;\n            Ok((id,Some(event)))'), inbox.index('database.publish_committed_app_event'))
+        self.assertLess(inbox.index('tx.commit().map_err(|_| STORAGE)?;\n            Ok((id,events))'), inbox.index('database.publish_committed_app_event'))
+        self.assertLess(inbox.index('account_sms::promote_new(&tx'), inbox.index('tx.commit().map_err(|_| STORAGE)?;\n            Ok((id,events))'))
         runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
         self.assertIn('MAX_PENDING_MESSAGES: usize = 16', runtime)
         self.assertIn('MAX_PENDING_MESSAGE_BYTES: usize = 1024 * 1024', runtime)
@@ -130,10 +133,43 @@ class AppAccountContractTests(unittest.TestCase):
             self.assertIn('connectivity::app_voice::providers::jegotrip::account_inbox::tests', source(workflow))
         self.assertIn('impl Drop for IncomingMessage', (PROVIDER / 'native_events.rs').read_text(encoding='utf-8'))
 
+    def test_recovered_smgw_text_is_strict_and_does_not_turn_other_kinds_into_sms(self):
+        text = (PROVIDER / 'smgw_text.rs').read_text(encoding='utf-8')
+        self.assertIn('SMGW_RECEIVER: &[u8] = b"Sip.Request"', text)
+        self.assertIn('receiver != SMGW_RECEIVER', text)
+        self.assertIn('std::str::from_utf8(&message.body)', text)
+        self.assertIn('message.from.as_deref()?', text)
+        self.assertIn('!value.iter().all(u8::is_ascii_digit)', text)
+        self.assertIn('DateTime::<Utc>::from_timestamp_millis', text)
+        self.assertNotIn('from_utf8_lossy', text)
+        self.assertNotIn('Utc::now()', text)
+        self.assertNotIn('base64::', text)
+        self.assertNotIn('pub text:', text)
+        self.assertIn('SmgwText(<redacted>)', text)
+
+    def test_sms_projection_is_atomic_explicit_application_transport_and_deletion_safe(self):
+        sms = (PROVIDER / 'account_sms.rs').read_text(encoding='utf-8')
+        self.assertIn('tx: &Transaction', sms)
+        self.assertIn('AND receiver_kind=?4 AND body=?5 AND sender=?6 AND opaque_time IS ?7', sms)
+        self.assertIn("'received',NULL,'app_voice'", sms)
+        self.assertIn('"sms.received",Some(line),Some(super::PROVIDER_ID)', sms)
+        self.assertIn('timestamp_source', sms)
+        self.assertIn('app_voice_sms_deleted AFTER DELETE ON sms_messages', sms)
+        self.assertIn("SET body=X'',sender=NULL,opaque_time=NULL", sms)
+        self.assertIn('deleted=1,sent_at_millis=NULL', sms)
+        self.assertNotIn('tx.commit()', sms)
+        self.assertNotIn('insert_sms_with_transport', sms)
+        self.assertNotIn('impl Serialize for SmgwText', sms)
+        handlers = source('backend/src/api/handlers.rs')
+        self.assertIn('"app_account_outbound_unsupported"', handlers)
+        guarded = handlers.split('async fn send_sms_on_line_with_origin', 1)[1].split('let policy =', 1)[0]
+        self.assertLess(guarded.index('account_store::valid_line_id'), guarded.index('VowifiScope::resolve'))
+        self.assertIn('kind: "app_account"', handlers)
+
     def test_both_actions_have_nonzero_account_and_real_auth_http_filters(self):
         for workflow in ['.github/workflows/build-release.yml', '.github/workflows/beta-validation.yml']:
             text = source(workflow)
-            for module in ['account_config', 'account_store', 'account_runtime']:
+            for module in ['account_config', 'account_store', 'account_runtime', 'account_sms', 'smgw_text']:
                 self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests', text)
             self.assertIn('for filter in http_router_tests::app_voice_accounts', text)
             self.assertIn('DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"', text)

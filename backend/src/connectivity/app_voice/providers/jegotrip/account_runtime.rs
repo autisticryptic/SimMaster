@@ -8,6 +8,7 @@ use super::{
     account_config::AccountConfig,
     account_inbox::{self, Completion, InboxMetadata, InboxScope},
     account_store::{self, AccountMetadata, StoredAccount},
+    account_sms::{self, AccountSmsMessage},
     controller::{Callback, ControllerFailure, HostingController},
     runtime_backend::{BackendEvent, BackendEventPayload, NativeHostingBackend},
     runtime_connector::TcpRuntimeConnector,
@@ -200,6 +201,10 @@ impl AccountManager {
     pub fn inbox(&self, line_id: &str, limit: usize) -> Result<Vec<InboxMetadata>, &'static str> {
         self.metadata(line_id)?;
         self.database.with_conn(|conn| account_inbox::metadata(conn, line_id, limit))
+    }
+    pub fn messages(&self, line_id: &str, limit: usize) -> Result<Vec<AccountSmsMessage>, &'static str> {
+        self.metadata(line_id)?;
+        self.database.with_conn(|conn| account_sms::list(conn, line_id, limit))
     }
     pub async fn create(&self, config: AccountConfig, now: u64) -> Result<AccountView, &'static str> {
         config.validate(now)?;

@@ -4710,6 +4710,9 @@ pub async fn send_sms_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<SendSmsRequest>,
 ) -> impl IntoResponse {
+    if crate::connectivity::app_voice::providers::jegotrip::account_store::valid_line_id(&line_id) {
+        return (StatusCode::NOT_IMPLEMENTED, Json(ApiResponse::<serde_json::Value>::error("app_account_outbound_unsupported")));
+    }
     let line_id = match resolve_sms_line_id(&app, &line_id).await {
         Ok(line_id) => line_id,
         Err(reason) => {
@@ -4792,6 +4795,11 @@ async fn send_sms_on_line_with_origin(
     content: &str,
     origin: crate::services::orchestrator::sms_router::SmsSendOrigin,
 ) -> Result<serde_json::Value, String> {
+    // App-account reception does not authorize 3GPP/CS fallback or paid sends,
+    // including automation and trunk callers which do not use the HTTP handler.
+    if crate::connectivity::app_voice::providers::jegotrip::account_store::valid_line_id(line_id) {
+        return Err("app_account_outbound_unsupported".to_owned());
+    }
     let payload = SendSmsRequest {
         phone_number: phone_number.to_string(),
         content: content.to_string(),
@@ -5308,6 +5316,17 @@ pub async fn get_sms_channels_handler(
             slot_id: None,
             iccid: (!modem.sim_iccid.trim().is_empty()).then_some(modem.sim_iccid),
             operator_id: (!modem.operator_id.trim().is_empty()).then_some(modem.operator_id),
+        });
+    }
+    let accounts = match app.database.with_conn(crate::connectivity::app_voice::providers::jegotrip::account_store::list) {
+        Ok(accounts) => accounts,
+        Err(code) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(code))),
+    };
+    for account in accounts {
+        channels.push(SmsChannelResponse {
+            id: account.line_id.clone(), kind: "app_account".to_owned(),
+            label: "无忧行 · 应用账号".to_owned(), available: false,
+            line_id: Some(account.line_id), ..Default::default()
         });
     }
     if app.database.has_unassigned_sms().unwrap_or(false) {
