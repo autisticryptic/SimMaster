@@ -56,7 +56,7 @@ async fn remote_release_between_submit_and_true_result_revokes_original_call_and
     let answer=invoke(&backend,&original,&scope,ticket,CallOperation::Accept);tokio::pin!(answer);
     let released=tokio::select!{result=answer.as_mut()=>panic!("must observe original cancel first: {result:?}"),call=received(&mut events)=>call};
     assert_eq!(released.notice().kind(),CallNoticeKind::Released);assert!(!ticket.is_live());backend.complete_call(&original,&scope,released.ticket(),true,&[]).await.unwrap();
-    assert_eq!(answer.await.err(),Some(RuntimeError::CallRejected));assert!(scope.is_open());backend.retire(&original);backend.logout(original).await.unwrap();assert!(dropped.load(Ordering::SeqCst));serving.await.unwrap();
+    assert_eq!(answer.await.err(),Some(RuntimeError::CallRejected));assert!(scope.is_open());backend.retire(&original);backend.logout(original.clone()).await.unwrap();assert!(dropped.load(Ordering::SeqCst));serving.await.unwrap();
 }
 #[tokio::test]
 async fn cancelled_original_accept_wait_retires_only_original_scope_and_retains_join_cleanup(){
