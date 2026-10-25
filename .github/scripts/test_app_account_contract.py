@@ -238,6 +238,50 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('StatusCode::UNAUTHORIZED', http)
         self.assertIn('StatusCode::CONFLICT', http)
 
+    def test_runtime_exclusion_is_local_durable_and_not_a_pid_age_or_remote_lease(self):
+        runs = (PROVIDER / 'account_runs.rs').read_text(encoding='utf-8')
+        self.assertIn('CREATE TABLE IF NOT EXISTS app_voice_runtime_leases', runs)
+        self.assertIn('line_id TEXT PRIMARY KEY NOT NULL', runs)
+        self.assertIn('exclusive_runtime: bool', runs)
+        self.assertIn('register_inner(conn,line,revision,nonce,true)', runs)
+        self.assertIn('ownership_pending(&tx,line)?', runs)
+        self.assertIn('revision=?2 AND run_nonce=?3', runs)
+        self.assertNotIn('lease_until', runs)
+        self.assertNotIn('std::process::id()', runs)
+        self.assertNotIn('principal_key', runs)
+        delete = runs.split('pub(super) fn delete_account_state', 1)[1]
+        self.assertNotIn('DELETE FROM app_voice_runtime_leases', delete)
+
+    def test_unowned_manager_cannot_start_stop_or_clear_original_runtime_state(self):
+        runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
+        self.assertIn('app_account_runtime_owner_unconfirmed', runtime)
+        self.assertIn('account_runs::runtime_matches(conn,&self.run_token)', runtime)
+        self.assertIn('account_runs::register_runtime(conn,line_id,metadata.revision,&inbox_nonce)', runtime)
+        start = runtime.split('pub async fn start(', 1)[1].split('pub async fn stop(', 1)[0]
+        self.assertLess(start.index('self.require_released(line_id,&slot)'), start.index('self.factory.build(&config)'))
+        self.assertLess(start.index('account_runs::register_runtime('), start.index('controller.start(now)'))
+        tests = (PROVIDER / 'account_runtime_tests.rs').read_text(encoding='utf-8')
+        self.assertIn('second_manager_cannot_start_stop_or_mutate_original_account', tests)
+        self.assertIn('foreign_manager_stop_never_closes_hosted_original_actor', tests)
+        self.assertIn('reopened_manager_keeps_legacy_live_run_unconfirmed', tests)
+
+    def test_store_and_original_join_gc_preserve_exclusion_until_atomic_release(self):
+        store = (PROVIDER / 'account_store.rs').read_text(encoding='utf-8')
+        for name, end in [('replace', 'pub fn delete'), ('delete', '#[cfg(test)]')]:
+            operation = store.split(f'pub fn {name}(', 1)[1].split(end, 1)[0]
+            self.assertIn('super::account_runs::runtime_held(&tx,id)?', operation)
+            self.assertIn('app_account_stop_before_replace', operation)
+        runs = (PROVIDER / 'account_runs.rs').read_text(encoding='utf-8')
+        release = runs.split('pub(super) fn release_and_compact', 1)[1].split('pub(super) fn delete_account_state', 1)[0]
+        self.assertIn('held.as_ref().is_some_and', release)
+        self.assertIn('token.exclusive_runtime', release)
+        self.assertIn('if removed!=1{return Err(SCOPE);}', release)
+        self.assertLess(release.index('DELETE FROM app_voice_runtime_leases'), release.rindex('tx.commit()'))
+        tests = (PROVIDER / 'account_runs_tests.rs').read_text(encoding='utf-8')
+        self.assertIn('failed_runtime_release_rolls_back_original_fence', tests)
+        self.assertIn('stale_joined_proof_cannot_release_a_new_run', tests)
+        self.assertIn('independent_sqlite_connections_atomically_admit_only_one', tests)
+
 
 if __name__ == '__main__':
     unittest.main()

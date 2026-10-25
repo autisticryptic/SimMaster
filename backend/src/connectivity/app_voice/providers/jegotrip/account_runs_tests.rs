@@ -114,3 +114,69 @@ fn completed_local_replies_leave_pending_budget_but_all_live_identity_bounds_rem
     assert_eq!(inbox.commit_fixture(&db,513,&message()).err(),Some("app_account_inbox_full"));assert_eq!(count(&db,"app_voice_inbox"),512);
     assert!(inbox.commit_fixture(&db,1,&message()).is_ok());
 }
+#[test]
+fn runtime_registration_is_exclusive_but_an_unrelated_account_is_not_blocked(){
+    let(db,line,_,_)=setup();let nonce=local_nonce().unwrap();let token=db.with_conn(|conn|register_runtime(conn,&line,1,&nonce)).unwrap();
+    assert!(db.with_conn(|conn|runtime_held(conn,&line)).unwrap());assert!(db.with_conn(|conn|runtime_matches(conn,&token)).unwrap());
+    assert_eq!(db.with_conn(|conn|register_runtime(conn,&line,1,&local_nonce().unwrap())).err(),Some("app_account_stop_before_replace"));
+    assert_eq!(count(&db,"app_voice_runtime_leases"),1);assert_eq!(count(&db,"app_voice_inbox_runs"),1);
+    let cert=Certificates::generate("DNS:fixture.invalid");let other=format!("app-account-{}",local_nonce().unwrap());
+    db.with_conn(|conn|account_store::create(conn,&other,&config(&cert.root),100)).unwrap();
+    let other_token=db.with_conn(|conn|register_runtime(conn,&other,1,&local_nonce().unwrap())).unwrap();
+    assert_eq!(count(&db,"app_voice_runtime_leases"),2);
+    db.with_conn(|conn|release_and_compact(conn,&test_quiescence(token))).unwrap();
+    assert!(!db.with_conn(|conn|runtime_held(conn,&line)).unwrap());assert!(db.with_conn(|conn|runtime_held(conn,&other)).unwrap());
+    db.with_conn(|conn|release_and_compact(conn,&test_quiescence(other_token))).unwrap();
+}
+#[test]
+fn legacy_live_run_without_local_release_proof_blocks_new_runtime_without_pid_or_age_takeover(){
+    let(db,line,_,_)=setup();let nonce=local_nonce().unwrap();db.with_conn(|conn|register(conn,&line,1,&nonce)).unwrap();
+    assert!(!db.with_conn(|conn|runtime_held(conn,&line)).unwrap());assert!(db.with_conn(|conn|ownership_pending(conn,&line)).unwrap());
+    assert_eq!(db.with_conn(|conn|register_runtime(conn,&line,1,&local_nonce().unwrap())).err(),Some("app_account_stop_before_replace"));
+    assert_eq!(count(&db,"app_voice_runtime_leases"),0);assert!(db.with_conn(|conn|require_live(conn,&line,1,&nonce)).is_ok());
+}
+#[test]
+fn failed_exclusive_admission_rolls_back_run_fence_and_does_not_leave_an_empty_lease(){
+    let(db,line,_,_)=setup();let nonce=local_nonce().unwrap();
+    db.with_conn(|conn|conn.execute_batch("CREATE TRIGGER fail_runtime_claim BEFORE INSERT ON app_voice_runtime_leases BEGIN SELECT RAISE(ABORT,'fixture-private');END;").map_err(|_|STORAGE)).unwrap();
+    assert_eq!(db.with_conn(|conn|register_runtime(conn,&line,1,&nonce)).err(),Some(STORAGE));
+    assert_eq!(count(&db,"app_voice_runtime_leases"),0);assert_eq!(count(&db,"app_voice_inbox_runs"),0);
+    db.with_conn(|conn|conn.execute_batch("DROP TRIGGER fail_runtime_claim").map_err(|_|STORAGE)).unwrap();
+    let token=db.with_conn(|conn|register_runtime(conn,&line,1,&nonce)).unwrap();db.with_conn(|conn|release_and_compact(conn,&test_quiescence(token))).unwrap();
+}
+#[test]
+fn failed_runtime_release_rolls_back_original_fence_and_retains_exclusion_until_retry(){
+    let(db,line,_,_)=setup();let nonce=local_nonce().unwrap();let token=db.with_conn(|conn|register_runtime(conn,&line,1,&nonce)).unwrap();
+    db.with_conn(|conn|conn.execute_batch("CREATE TRIGGER fail_runtime_release BEFORE DELETE ON app_voice_runtime_leases BEGIN SELECT RAISE(ABORT,'fixture-private');END;").map_err(|_|STORAGE)).unwrap();
+    let proof=test_quiescence(token);assert_eq!(db.with_conn(|conn|release_and_compact(conn,&proof)).err(),Some(STORAGE));
+    assert!(db.with_conn(|conn|runtime_held(conn,&line)).unwrap());assert!(db.with_conn(|conn|require_live(conn,&line,1,&nonce)).is_ok());
+    assert_eq!(db.with_conn(|conn|register_runtime(conn,&line,1,&local_nonce().unwrap())).err(),Some("app_account_stop_before_replace"));
+    db.with_conn(|conn|conn.execute_batch("DROP TRIGGER fail_runtime_release").map_err(|_|STORAGE)).unwrap();
+    db.with_conn(|conn|release_and_compact(conn,&proof)).unwrap();assert!(!db.with_conn(|conn|runtime_held(conn,&line)).unwrap());
+}
+#[test]
+fn stale_joined_proof_cannot_release_a_new_run_with_the_same_line_and_revision(){
+    let(db,line,_,_)=setup();let old=db.with_conn(|conn|register_runtime(conn,&line,1,&local_nonce().unwrap())).unwrap();
+    let proof=test_quiescence(old);db.with_conn(|conn|release_and_compact(conn,&proof)).unwrap();
+    let next=db.with_conn(|conn|register_runtime(conn,&line,1,&local_nonce().unwrap())).unwrap();
+    assert_eq!(db.with_conn(|conn|release_and_compact(conn,&proof)).err(),Some(SCOPE));
+    assert!(db.with_conn(|conn|runtime_matches(conn,&next)).unwrap());assert!(db.with_conn(|conn|require_live(conn,&line,1,next.nonce())).is_ok());
+    db.with_conn(|conn|release_and_compact(conn,&test_quiescence(next))).unwrap();
+}
+#[test]
+fn independent_sqlite_connections_atomically_admit_only_one_original_runtime(){
+    use super::super::account_test_support::TempDatabase;
+    let cert=Certificates::generate("DNS:fixture.invalid");let temp=TempDatabase::new();let line=format!("app-account-{}",local_nonce().unwrap());
+    temp.database.with_conn(|conn|account_store::create(conn,&line,&config(&cert.root),100)).unwrap();
+    let barrier=std::sync::Arc::new(std::sync::Barrier::new(2));
+    let results=std::thread::scope(|scope|{
+        let jobs=(0..2).map(|_|{let barrier=barrier.clone();let path=temp.path.clone();let line=line.clone();scope.spawn(move||{
+            let conn=Connection::open(path).unwrap();conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let nonce=local_nonce().unwrap();barrier.wait();register_runtime(&conn,&line,1,&nonce)
+        })}).collect::<Vec<_>>();jobs.into_iter().map(|job|job.join().unwrap()).collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|result|result.is_ok()).count(),1);
+    assert_eq!(results.iter().filter(|result|result.as_ref().err()==Some(&"app_account_stop_before_replace")).count(),1);
+    let token=results.into_iter().find_map(Result::ok).unwrap();
+    temp.database.with_conn(|conn|release_and_compact(conn,&test_quiescence(token))).unwrap();
+}

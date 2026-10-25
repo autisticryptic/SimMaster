@@ -685,6 +685,33 @@ class JegotripContract(unittest.TestCase):
             self.assertIn('connectivity::app_voice::providers::jegotrip::runtime_provision::tests',
                           (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
 
+    def test_call_codec_keeps_full_native_be64_distinct_from_arc_correlation(self):
+        stream = (MOD / 'rpc_stream.rs').read_text(encoding='utf-8')
+        self.assertIn('pub fn u64(&mut self, value: u64)', stream)
+        self.assertIn('u64::from_be_bytes(self.take(8)?', stream)
+        calls = (MOD / 'rpc_calls.rs').read_text(encoding='utf-8')
+        self.assertIn('accept.CallServerEx.CallEx', calls)
+        for method in ['onInvited.CallClientEx.CallEx', 'onReleased.CallClientEx.CallEx', 'onAccepted.CallClientEx.CallEx']:
+            self.assertIn(method, calls)
+        self.assertIn('NativeCallId(reader.u64()?)', calls)
+        self.assertIn('writer.u64(call_id.0)?', calls)
+        self.assertIn('let footer = read_footer(&mut reader)?', calls)
+        self.assertIn('if !accepted || !footer.reason.is_empty()', calls)
+        self.assertIn('else { return Ok(None); }', calls)
+
+    def test_call_codec_is_opaque_data_not_receiver_permission_or_media_readiness(self):
+        calls = (MOD / 'rpc_calls.rs').read_text(encoding='utf-8')
+        for forbidden in ['Callback::', 'TcpStream', 'impl HostingBackend', 'derive(Serialize)', 'from_utf8_lossy', 'media_ready: true']:
+            self.assertNotIn(forbidden, calls)
+        tests = (MOD / 'rpc_calls_tests.rs').read_text(encoding='utf-8')
+        self.assertIn('accept_fixture_has_complete_be64_native_id_separate_from_i32_rpc_correlation', tests)
+        self.assertIn('invited_independent_fixture_preserves_original_binary_peer', tests)
+        self.assertIn('accept_result_missing_footer_trailing_or_duplicate_properties', tests)
+        self.assertIn('unknown_call_method_is_refused_before_parsing', tests)
+        for name in ['beta-validation.yml', 'build-release.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::rpc_calls::tests',
+                          (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
 
 if __name__ == '__main__':
     unittest.main()

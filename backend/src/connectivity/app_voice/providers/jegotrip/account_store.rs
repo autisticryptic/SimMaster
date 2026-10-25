@@ -183,6 +183,7 @@ pub fn replace(conn: &Connection, id: &str, expected_revision: u64, config: &Acc
     let expected = check_revision(expected_revision)?;
     let tx = immediate(conn)?;
     matched_revision(&tx, id, expected)?;
+    if super::account_runs::runtime_held(&tx,id)? {return Err("app_account_stop_before_replace");}
     let revision = expected.checked_add(1).ok_or(CONFLICT)?;
     config.validate(now).map_err(|_| CONFIGURATION)?;
     let private = config.encode_private().map_err(|_| CONFIGURATION)?;
@@ -203,6 +204,7 @@ pub fn delete(conn: &Connection, id: &str, expected_revision: u64) -> Result<boo
     let expected = check_revision(expected_revision)?;
     let tx = immediate(conn)?;
     matched_revision(&tx, id, expected)?;
+    if super::account_runs::runtime_held(&tx,id)? {return Err("app_account_stop_before_replace");}
     let changed = tx.execute("DELETE FROM app_voice_accounts WHERE line_id = ?1 AND revision = ?2",
         params![id, expected]).map_err(|_| STORAGE)?;
     if changed != 1 { return Err(CONFLICT); }

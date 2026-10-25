@@ -382,6 +382,44 @@ mod app_voice_accounts {
     }
 
     #[tokio::test]
+    async fn other_runtime_owner_is_reported_without_callbacks_or_a_takeover_start_stop_or_delete() {
+        use crate::connectivity::app_voice::providers::jegotrip::{account_runtime::AccountManager,
+            account_test_support::QueuedFactory,rpc_pending::RpcConnectionScope,session::AttemptOwner,
+            runtime_connector::{ConnectFuture,ConnectionInput,ConnectedIo,RuntimeConnector}};
+        struct Held{entered:tokio::sync::Notify}
+        impl RuntimeConnector for Held {
+            fn connect<'a>(&'a self,_owner:&'a AttemptOwner,_scope:&'a RpcConnectionScope,_input:ConnectionInput<'a>)->ConnectFuture<'a>{
+                Box::pin(async move{self.entered.notify_one();std::future::pending::<Result<ConnectedIo,crate::connectivity::app_voice::providers::jegotrip::runtime_connector::ConnectError>>().await})
+            }
+        }
+        let mut state=build_test_router().await.expect("Actions private D-Bus required; do not skip");
+        let first_factory=Arc::new(QueuedFactory::default());let held=Arc::new(Held{entered:tokio::sync::Notify::new()});first_factory.add(held.clone());
+        let original=Arc::new(AccountManager::with_factory(state.app.database.clone(),first_factory));
+        let second_factory=Arc::new(QueuedFactory::default());
+        state.app.app_accounts=Arc::new(AccountManager::with_factory(state.app.database.clone(),second_factory.clone()));
+        let cors=CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+        let served=serve(build_router(state.app.clone(),cors)).await;let cookie=authenticate(&served).await;
+        let cert=Certificates::generate("DNS:fixture.invalid");
+        let(status,_,body)=account_request(&served,reqwest::Method::POST,"/api/non-3gpp/accounts",Some(serde_json::json!({"provider_id":"app_voice","config":config_json(&cert.root)})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::CREATED);let line=created_line(&body);let path=format!("/api/non-3gpp/accounts/{line}");
+        let active=original.clone();let id=line.clone();let starting=tokio::spawn(async move{active.start(&id,1,100).await});
+        tokio::time::timeout(std::time::Duration::from_secs(2),held.entered.notified()).await.unwrap();
+        let(status,headers,body)=account_request(&served,reqwest::Method::GET,&path,None,Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);assert!(!body.contains("run_nonce"));
+        let view:serde_json::Value=serde_json::from_str(&body).unwrap();assert_eq!(view["data"]["io_cleanup_required"],true);
+        assert_eq!(view["data"]["last_error"],"app_account_runtime_owner_unconfirmed");assert_eq!(view["data"]["outbound_authorized"],false);
+        let(status,headers,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/start"),Some(serde_json::json!({"expected_revision":1})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::CONFLICT);no_store(&headers);no_secrets(&body);
+        let(status,headers,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/stop"),Some(serde_json::json!({"expected_revision":1})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::SERVICE_UNAVAILABLE);no_store(&headers);no_secrets(&body);
+        let(status,headers,body)=account_request(&served,reqwest::Method::DELETE,&format!("{path}?expected_revision=1"),None,Some(&cookie)).await;
+        assert_eq!(status,StatusCode::CONFLICT);no_store(&headers);no_secrets(&body);assert_eq!(second_factory.build_count(),0);
+        starting.abort();assert!(starting.await.unwrap_err().is_cancelled());original.stop(&line,1,100).await.unwrap();
+        let(status,headers,body)=account_request(&served,reqwest::Method::GET,&path,None,Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["io_cleanup_required"],false);
+    }
+
+    #[tokio::test]
     async fn body_limit_blocks_oversized_private_import_and_keeps_storage_empty() {
         let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");
         let served = serve(state.router.clone()).await; let cookie = authenticate(&served).await;

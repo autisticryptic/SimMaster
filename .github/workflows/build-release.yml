@@ -375,6 +375,7 @@ jobs:
             connectivity::app_voice::providers::jegotrip::tests \
             connectivity::app_voice::providers::jegotrip::controller::tests \
             connectivity::app_voice::providers::jegotrip::rpc_arguments::tests \
+            connectivity::app_voice::providers::jegotrip::rpc_calls::tests \
             connectivity::app_voice::providers::jegotrip::native_events::tests \
             connectivity::app_voice::providers::jegotrip::rpc_stream::tests \
             connectivity::app_voice::providers::jegotrip::rpc_envelope::tests \

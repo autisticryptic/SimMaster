@@ -95,6 +95,9 @@ impl Writer {
     pub fn boolean(&mut self, value: bool) -> Result<(), CodecError> { self.append(&[u8::from(value)]) }
     pub fn u16(&mut self, value: u16) -> Result<(), CodecError> { self.append(&value.to_be_bytes()) }
     pub fn u32(&mut self, value: u32) -> Result<(), CodecError> { self.append(&value.to_be_bytes()) }
+    /// Native call identifiers use a distinct full-width BE64 field. They are
+    /// not ARC/direct/batch i32 request correlation identifiers.
+    pub fn u64(&mut self, value: u64) -> Result<(), CodecError> { self.append(&value.to_be_bytes()) }
     pub fn i32(&mut self, value: i32) -> Result<(), CodecError> { self.append(&value.to_be_bytes()) }
 
     pub fn bytes(&mut self, value: &[u8]) -> Result<(), CodecError> {
@@ -153,6 +156,10 @@ impl<'a> Reader<'a> {
 
     pub fn u32(&mut self) -> Result<u32, CodecError> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| CodecError::Truncated)?))
+    }
+
+    pub fn u64(&mut self) -> Result<u64, CodecError> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().map_err(|_| CodecError::Truncated)?))
     }
 
     pub fn i32(&mut self) -> Result<i32, CodecError> {

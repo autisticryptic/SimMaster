@@ -126,6 +126,9 @@ impl ManagedRun {
         let metadata = self.database.with_conn(|conn| account_store::metadata(conn, &self.line_id))?
             .ok_or("app_account_not_found")?;
         if metadata.revision != self.revision { return Err("app_account_revision_conflict"); }
+        if !self.database.with_conn(|conn|account_runs::runtime_matches(conn,&self.run_token))? {
+            return Err("app_account_runtime_owner_unconfirmed");
+        }
         Ok(())
     }
     fn retire(&self) {
@@ -196,8 +199,16 @@ impl AccountManager {
     }
     async fn snapshot_run(&self, metadata: AccountMetadata, run: Option<Arc<ManagedRun>>, now: u64)
         -> Result<AccountView, &'static str> {
-        let Some(run) = run else { return Ok(view(metadata, Phase::Unconfigured, false, None)); };
+        let Some(run) = run else {
+            if self.database.with_conn(|conn|account_runs::ownership_pending(conn,&metadata.line_id))? {
+                return Ok(view(metadata,Phase::Disconnected,true,Some("app_account_runtime_owner_unconfirmed")));
+            }
+            return Ok(view(metadata, Phase::Unconfigured, false, None));
+        };
         if run.revision != metadata.revision { return Err("app_account_revision_conflict"); }
+        if run.finalized.load(Ordering::SeqCst) && self.database.with_conn(|conn|account_runs::ownership_pending(conn,&metadata.line_id))? {
+            return Ok(view(metadata,Phase::Disconnected,true,Some("app_account_runtime_owner_unconfirmed")));
+        }
         let mut controller = run.controller.lock().await;
         controller.tick(now, Instant::now());
         let error = if controller.phase() == Phase::CredentialExpired { Some("app_account_credential_expired") }
@@ -244,12 +255,15 @@ impl AccountManager {
         }
         Err("app_account_entropy_unavailable")
     }
-    async fn require_released(slot: &AccountSlot) -> Result<(), &'static str> {
+    async fn require_released(&self,line_id:&str,slot: &AccountSlot) -> Result<(), &'static str> {
         let run = lock(&slot.run).clone();
         if let Some(run) = run {
             if !run.controller.lock().await.resources_released() || !run.finalized.load(Ordering::SeqCst) {
                 return Err("app_account_stop_before_replace");
             }
+        }
+        if self.database.with_conn(|conn|account_runs::ownership_pending(conn,line_id))? {
+            return Err("app_account_stop_before_replace");
         }
         Ok(())
     }
@@ -257,14 +271,14 @@ impl AccountManager {
         -> Result<AccountView, &'static str> {
         config.validate(now)?;
         let slot = self.slot(line_id)?; let _operation = slot.operation.lock().await;
-        self.check_revision(line_id, expected_revision)?; Self::require_released(&slot).await?;
+        self.check_revision(line_id, expected_revision)?; self.require_released(line_id,&slot).await?;
         let metadata = self.database.with_conn(|conn| account_store::replace(conn, line_id, expected_revision, &config, now))?;
         if let Some(run) = lock(&slot.run).take() { run.retire(); }
         Ok(view(metadata, Phase::Unconfigured, false, None))
     }
     pub async fn delete(&self, line_id: &str, expected_revision: u64) -> Result<(), &'static str> {
         let slot = self.slot(line_id)?; let _operation = slot.operation.lock().await;
-        self.check_revision(line_id, expected_revision)?; Self::require_released(&slot).await?;
+        self.check_revision(line_id, expected_revision)?; self.require_released(line_id,&slot).await?;
         if !self.database.with_conn(|conn| account_store::delete(conn, line_id, expected_revision))? {
             return Err("app_account_not_found");
         }
@@ -278,7 +292,7 @@ impl AccountManager {
         let slot = self.slot(line_id)?; let _operation = slot.operation.lock().await;
         if self.shutting_down.load(Ordering::SeqCst){return Err("app_account_shutting_down");}
         let metadata = self.check_revision(line_id, expected_revision)?;
-        Self::require_released(&slot).await?;
+        self.require_released(line_id,&slot).await?;
         let StoredAccount { metadata: stored, config } = self.database.with_conn(|conn| account_store::load(conn, line_id))?
             .ok_or("app_account_not_found")?;
         if stored.revision != metadata.revision { return Err("app_account_revision_conflict"); }
@@ -287,7 +301,7 @@ impl AccountManager {
         let (backend, events) = self.factory.build(&config)?;
         let mut controller = HostingController::new(line_id.to_owned(), Some(backend.clone()));
         controller.import(config.credentials, now).map_err(controller_error)?;
-        let run_token=Arc::new(self.database.with_conn(|conn|account_runs::register(conn,line_id,metadata.revision,&inbox_nonce))?);
+        let run_token=Arc::new(self.database.with_conn(|conn|account_runs::register_runtime(conn,line_id,metadata.revision,&inbox_nonce))?);
         let run = Arc::new(ManagedRun { line_id: line_id.to_owned(), database: self.database.clone(), revision: metadata.revision,
             inbox_nonce, run_token, finalized: AtomicBool::new(false), notifications:self.notifications.clone(), controller: AsyncMutex::new(controller), backend,
             accepting: AtomicBool::new(true), stopping: AtomicBool::new(false), error: Mutex::new(None), task: AsyncMutex::new(None) });
@@ -321,7 +335,10 @@ impl AccountManager {
     pub async fn stop(&self, line_id: &str, expected_revision: u64, now: u64) -> Result<AccountView, &'static str> {
         let slot = self.slot(line_id)?; let _operation = slot.operation.lock().await;
         let metadata = self.check_revision(line_id, expected_revision)?;
-        let Some(run) = lock(&slot.run).clone() else { return Ok(view(metadata, Phase::Unconfigured, false, None)); };
+        let Some(run) = lock(&slot.run).clone() else {
+            if self.database.with_conn(|conn|account_runs::ownership_pending(conn,line_id))? {return Err("app_account_cleanup_unconfirmed");}
+            return Ok(view(metadata, Phase::Unconfigured, false, None));
+        };
         let phase=self.cleanup_run(&run,now).await?;
         Ok(view(metadata,phase,!run.finalized.load(Ordering::SeqCst),None))
     }

@@ -91,3 +91,11 @@ fn terminal_footer_is_consumed_and_never_exposed_in_debug() {
     assert!(!format!("{:?}", footer.properties[0]).contains("fixture"));
     reader.finish().unwrap();
 }
+
+#[test]
+fn native_be64_preserves_high_bits_and_never_consumes_adjacent_i32_correlation_bytes() {
+    let mut writer=Writer::new();writer.u64(0x0123_4567_89ab_cdef).unwrap();writer.i32(37).unwrap();
+    let bytes=writer.finish();assert_eq!(bytes.expose_to_transport(),&[0,1,0x23,0x45,0x67,0x89,0xab,0xcd,0xef,0,0,0,37]);
+    let mut reader=Reader::new(bytes.expose_to_transport()).unwrap();assert_eq!(reader.u64().unwrap(),0x0123_4567_89ab_cdef);assert_eq!(reader.i32().unwrap(),37);reader.finish().unwrap();
+    for length in 1..9{assert_eq!(Reader::new(&bytes.expose_to_transport()[..length]).unwrap().u64().err(),Some(CodecError::Truncated));}
+}

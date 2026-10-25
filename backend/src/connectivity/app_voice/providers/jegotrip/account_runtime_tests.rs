@@ -231,7 +231,12 @@ async fn changed_private_revision_retires_old_io_but_keeps_its_cleanup_owner() {
     });
     manager.start(&line, 1, 100).await.unwrap(); phase(&manager, &line, "hosted").await;
     let original = connector.captured_scope().unwrap(); assert!(original.is_open());
-    temp.database.with_conn(|conn| account_store::replace(conn, &line, 1, &config(&cert.root), 101)).unwrap();
+    assert_eq!(temp.database.with_conn(|conn| account_store::replace(conn, &line, 1, &config(&cert.root), 101)).err(),Some("app_account_stop_before_replace"));
+    // An external database mutation is not an authorized store/API update.
+    // Keep this original revision-race regression by injecting it explicitly,
+    // while also proving the new production store guard refuses that write.
+    temp.database.with_conn(|conn| conn.execute("UPDATE app_voice_accounts SET revision=2 WHERE line_id=?1 AND revision=1",[&line])
+        .map(|changed|assert_eq!(changed,1)).map_err(|_|"test_mutation_failed")).unwrap();
     tokio::time::timeout(Duration::from_secs(3), original.closed()).await.unwrap();
     assert_eq!(manager.get(&line, 100).await.err(), Some("app_account_revision_conflict"));
     assert_eq!(manager.start(&line, 2, 100).await.err(), Some("app_account_stop_before_replace"));
@@ -255,4 +260,63 @@ async fn failed_storage_does_not_drop_original_configuration_or_mint_runtime_wor
     assert_eq!(manager.replace(&line, 1, config(&cert.root), 101).await.err(), Some("app_account_storage_failed"));
     assert_eq!(manager.get(&line, 100).await.unwrap().account.revision, 1); assert_eq!(factory.build_count(), 0);
     assert_eq!(manager.start(&line, 2, 100).await.err(), Some("app_account_revision_conflict"));
+}
+
+#[tokio::test]
+async fn second_manager_cannot_start_stop_or_mutate_original_account_before_owning_cleanup() {
+    let cert=Certificates::generate("DNS:fixture.invalid");let temp=TempDatabase::new();
+    let first_factory=Arc::new(QueuedFactory::default());
+    let held=Arc::new(HeldConnector{entered:tokio::sync::Notify::new(),scope:Mutex::new(None)});first_factory.add(held.clone());
+    let first=Arc::new(AccountManager::with_factory(temp.database.clone(),first_factory.clone()));
+    let line=first.create(config(&cert.root),100).await.unwrap().account.line_id;
+    let second_factory=Arc::new(QueuedFactory::default());
+    let second=AccountManager::with_factory(Arc::new(Database::new(temp.path.clone()).unwrap()),second_factory.clone());
+    let active=first.clone();let id=line.clone();let starting=tokio::spawn(async move{active.start(&id,1,100).await});
+    tokio::time::timeout(Duration::from_secs(2),held.entered.notified()).await.unwrap();
+    let original=lock(&held.scope).clone().unwrap();assert!(original.is_open());
+    let view=second.get(&line,100).await.unwrap();assert!(view.io_cleanup_required);
+    assert_eq!(view.last_error,Some("app_account_runtime_owner_unconfirmed"));assert_eq!(view.phase,"disconnected");
+    assert_eq!(second.start(&line,1,100).await.err(),Some("app_account_stop_before_replace"));
+    assert_eq!(second.replace(&line,1,config(&cert.root),101).await.err(),Some("app_account_stop_before_replace"));
+    assert_eq!(second.delete(&line,1).await.err(),Some("app_account_stop_before_replace"));
+    assert_eq!(second.stop(&line,1,100).await.err(),Some("app_account_cleanup_unconfirmed"));
+    assert!(original.is_open());assert_eq!(second_factory.build_count(),0);
+    starting.abort();assert!(starting.await.unwrap_err().is_cancelled());assert!(!original.is_open());
+    assert!(temp.database.with_conn(|conn|account_runs::runtime_held(conn,&line)).unwrap());
+    assert_eq!(second.start(&line,1,100).await.err(),Some("app_account_stop_before_replace"));
+    first.stop(&line,1,100).await.unwrap();assert!(!temp.database.with_conn(|conn|account_runs::runtime_held(conn,&line)).unwrap());
+    assert!(!second.get(&line,100).await.unwrap().io_cleanup_required);
+    assert_eq!(second.replace(&line,1,config(&cert.root),101).await.unwrap().account.revision,2);
+    second.delete(&line,2).await.unwrap();assert_eq!(first_factory.build_count(),1);
+}
+
+#[tokio::test]
+async fn foreign_manager_stop_never_closes_hosted_original_actor_or_claims_its_join() {
+    let cert=Certificates::generate("DNS:fixture.invalid");let temp=TempDatabase::new();let factory=Arc::new(QueuedFactory::default());
+    let(peer,connector,dropped)=peer(&cert,&factory);let first=AccountManager::with_factory(temp.database.clone(),factory);
+    let line=first.create(config(&cert.root),100).await.unwrap().account.line_id;
+    let serving=tokio::spawn(normal_peer(peer));first.start(&line,1,100).await.unwrap();phase(&first,&line,"hosted").await;
+    let original=connector.captured_scope().unwrap();
+    let second=AccountManager::with_factory(Arc::new(Database::new(temp.path.clone()).unwrap()),Arc::new(QueuedFactory::default()));
+    assert_eq!(second.stop(&line,1,100).await.err(),Some("app_account_cleanup_unconfirmed"));
+    assert!(original.is_open());assert!(!dropped.load(Ordering::SeqCst));
+    assert_eq!(second.start(&line,1,100).await.err(),Some("app_account_stop_before_replace"));
+    first.stop(&line,1,100).await.unwrap();assert!(!original.is_open());assert!(dropped.load(Ordering::SeqCst));
+    assert!(!second.get(&line,100).await.unwrap().io_cleanup_required);serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn reopened_manager_keeps_legacy_live_run_unconfirmed_instead_of_guessing_process_exit() {
+    let cert=Certificates::generate("DNS:fixture.invalid");let temp=TempDatabase::new();let factory=Arc::new(QueuedFactory::default());
+    let first=AccountManager::with_factory(temp.database.clone(),factory.clone());
+    let line=first.create(config(&cert.root),100).await.unwrap().account.line_id;let nonce=local_nonce().unwrap();
+    temp.database.with_conn(|conn|account_runs::register(conn,&line,1,&nonce)).unwrap();
+    let second=AccountManager::with_factory(Arc::new(Database::new(temp.path.clone()).unwrap()),factory.clone());
+    let view=second.get(&line,100).await.unwrap();assert!(view.io_cleanup_required);
+    assert!(!view.incoming_call_ready&&!view.incoming_message_ready&&!view.outbound_authorized);
+    assert_eq!(view.last_error,Some("app_account_runtime_owner_unconfirmed"));
+    assert_eq!(second.start(&line,1,100).await.err(),Some("app_account_stop_before_replace"));
+    assert_eq!(second.stop(&line,1,100).await.err(),Some("app_account_cleanup_unconfirmed"));
+    assert_eq!(second.delete(&line,1).await.err(),Some("app_account_stop_before_replace"));
+    assert!(temp.database.with_conn(|conn|account_runs::require_live(conn,&line,1,&nonce)).is_ok());assert_eq!(factory.build_count(),0);
 }

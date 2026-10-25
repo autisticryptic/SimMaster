@@ -13,7 +13,7 @@ const SCOPE: &str = "app_account_run_scope_invalid";
 const MAX_RUNS_PER_ACCOUNT: i64 = 256;
 const MAX_RUNS_TOTAL: i64 = 4096;
 
-pub(super) struct RunToken { line: String, revision: u64, nonce: String }
+pub(super) struct RunToken { line: String, revision: u64, nonce: String, exclusive_runtime: bool }
 impl fmt::Debug for RunToken {
     fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {f.write_str("RunToken(<redacted>)")}
 }
@@ -26,16 +26,44 @@ pub fn initialize_schema(conn:&Connection)->Result<(), &'static str> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS app_voice_inbox_runs(
         line_id TEXT NOT NULL,revision INTEGER NOT NULL,run_nonce TEXT NOT NULL,
         state TEXT NOT NULL CHECK(state IN ('live','released')),
-        PRIMARY KEY(line_id,revision,run_nonce));").map_err(|_|STORAGE)
+        PRIMARY KEY(line_id,revision,run_nonce));
+        CREATE TABLE IF NOT EXISTS app_voice_runtime_leases(
+        line_id TEXT PRIMARY KEY NOT NULL,revision INTEGER NOT NULL CHECK(revision>0),
+        run_nonce TEXT NOT NULL CHECK(length(run_nonce)=32));").map_err(|_|STORAGE)
 }
 fn valid_nonce(value:&str)->bool {
     value.len()==32 && value.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))
 }
+/// A durable local account exclusion, not remote principal/device ownership.
+/// No age/PID/phase is used to release or take over an unowned original run.
+pub(super) fn runtime_held(conn:&Connection,line:&str)->Result<bool,&'static str> {
+    let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_voice_runtime_leases')",[],|row|row.get(0)).map_err(|_|STORAGE)?;
+    if !exists{return Ok(false);}
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_runtime_leases WHERE line_id=?1)",[line],|row|row.get(0)).map_err(|_|STORAGE)
+}
+pub(super) fn ownership_pending(conn:&Connection,line:&str)->Result<bool,&'static str> {
+    if runtime_held(conn,line)?{return Ok(true);}
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_inbox_runs WHERE line_id=?1 AND state='live')",[line],|row|row.get(0)).map_err(|_|STORAGE)
+}
+pub(super) fn runtime_matches(conn:&Connection,token:&RunToken)->Result<bool,&'static str>{
+    if !token.exclusive_runtime{return Ok(false);}
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_runtime_leases WHERE line_id=?1 AND revision=?2 AND run_nonce=?3)",
+        params![token.line,token.revision as i64,token.nonce],|row|row.get(0)).map_err(|_|STORAGE)
+}
+/// Fence-only fixture registration does not grant production runtime ownership.
+#[cfg(test)]
 pub(super) fn register(conn:&Connection,line:&str,revision:u64,nonce:&str)->Result<RunToken,&'static str> {
+    register_inner(conn,line,revision,nonce,false)
+}
+pub(super) fn register_runtime(conn:&Connection,line:&str,revision:u64,nonce:&str)->Result<RunToken,&'static str> {
+    register_inner(conn,line,revision,nonce,true)
+}
+fn register_inner(conn:&Connection,line:&str,revision:u64,nonce:&str,exclusive_runtime:bool)->Result<RunToken,&'static str> {
     if !account_store::valid_line_id(line)||revision==0||revision>i64::MAX as u64||!valid_nonce(nonce){return Err(SCOPE);}
     let tx=Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
     let original=account_store::metadata(&tx,line)?.ok_or(SCOPE)?;
     if original.revision!=revision {return Err(SCOPE);}
+    if exclusive_runtime && ownership_pending(&tx,line)? {return Err("app_account_stop_before_replace");}
     let (local,total):(i64,i64)=tx.query_row("SELECT COALESCE(SUM(line_id=?1),0),COUNT(*) FROM app_voice_inbox_runs",[line],|row|Ok((row.get(0)?,row.get(1)?))).map_err(|_|STORAGE)?;
     if local>=MAX_RUNS_PER_ACCOUNT||total>=MAX_RUNS_TOTAL{return Err("app_account_run_limit");}
     // Never upsert/reactivate a released fence or attach to somebody else's
@@ -43,8 +71,11 @@ pub(super) fn register(conn:&Connection,line:&str,revision:u64,nonce:&str)->Resu
     let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_inbox_runs WHERE line_id=?1 AND revision=?2 AND run_nonce=?3)",params![line,revision as i64,nonce],|row|row.get(0)).map_err(|_|STORAGE)?;
     if exists{return Err(SCOPE);}
     tx.execute("INSERT INTO app_voice_inbox_runs(line_id,revision,run_nonce,state) VALUES(?1,?2,?3,'live')",params![line,revision as i64,nonce]).map_err(|_|STORAGE)?;
+    if exclusive_runtime {
+        tx.execute("INSERT INTO app_voice_runtime_leases(line_id,revision,run_nonce) VALUES(?1,?2,?3)",params![line,revision as i64,nonce]).map_err(|_|STORAGE)?;
+    }
     tx.commit().map_err(|_|STORAGE)?;
-    Ok(RunToken{line:line.to_owned(),revision,nonce:nonce.to_owned()})
+    Ok(RunToken{line:line.to_owned(),revision,nonce:nonce.to_owned(),exclusive_runtime})
 }
 pub(super) fn require_live(conn:&Connection,line:&str,revision:u64,nonce:&str)->Result<(), &'static str> {
     let state:Option<String>=conn.query_row("SELECT state FROM app_voice_inbox_runs WHERE line_id=?1 AND revision=?2 AND run_nonce=?3",
@@ -61,6 +92,13 @@ pub(super) fn release_and_compact(conn:&Connection,proof:&RunQuiescence)->Result
     let tx=Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
     let state:Option<String>=tx.query_row("SELECT state FROM app_voice_inbox_runs WHERE line_id=?1 AND revision=?2 AND run_nonce=?3",
         params![token.line,token.revision as i64,token.nonce],|row|row.get(0)).optional().map_err(|_|STORAGE)?;
+    let leased=if token.exclusive_runtime {
+        let held:Option<(i64,String)>=tx.query_row("SELECT revision,run_nonce FROM app_voice_runtime_leases WHERE line_id=?1",[&token.line],
+            |row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(|_|STORAGE)?;
+        if held.as_ref().is_some_and(|(revision,nonce)|*revision!=token.revision as i64||nonce!=&token.nonce){return Err(SCOPE);}
+        if held.is_some() && state.is_none() || held.is_none() && state.as_deref()==Some("live"){return Err(SCOPE);}
+        held.is_some()
+    }else{false};
     // A prior successful empty-run compaction may already have removed its
     // fence. The still-owned proof permits an idempotent repeat, never rebind.
     if state.is_none() {tx.commit().map_err(|_|STORAGE)?;return Ok(0);}
@@ -82,6 +120,11 @@ pub(super) fn release_and_compact(conn:&Connection,proof:&RunQuiescence)->Result
     tx.execute("DELETE FROM app_voice_inbox_runs WHERE line_id=?1 AND revision=?2 AND run_nonce=?3 AND state='released'
         AND NOT EXISTS(SELECT 1 FROM app_voice_inbox WHERE line_id=?1 AND revision=?2 AND run_nonce=?3)",
         params![token.line,token.revision as i64,token.nonce]).map_err(|_|STORAGE)?;
+    if leased {
+        let removed=tx.execute("DELETE FROM app_voice_runtime_leases WHERE line_id=?1 AND revision=?2 AND run_nonce=?3",
+            params![token.line,token.revision as i64,token.nonce]).map_err(|_|STORAGE)?;
+        if removed!=1{return Err(SCOPE);}
+    }
     tx.commit().map_err(|_|STORAGE)?;Ok(count)
 }
 
