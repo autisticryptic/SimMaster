@@ -6,7 +6,8 @@ use super::{
     legacy_config::ConfigDecodeKey,
     packet_transport::PacketRoute,
     rpc_stream::{RpcProperty, MAX_FIELD_BYTES, MAX_MAP_ENTRIES},
-    runtime_backend::{RuntimeProfile, RuntimeProfileInputs},
+    runtime_backend::{RuntimeBootstrapInputs, RuntimeProfile, RuntimeProfileInputs},
+    runtime_provision::{AccountTrust, AccountTrustInputs},
     runtime_connector::{validate_explicit_profile, ConnectionInput},
 };
 use serde::{ser::SerializeSeq, Deserialize, Serialize, Serializer};
@@ -21,6 +22,7 @@ const MAX_PRIVATE_BYTES: usize = 256 * 1024;
 pub struct AccountConfig {
     pub credentials: ImportedCredentials,
     pub profile: ProfileConfig,
+    pub bootstrap: Option<BootstrapConfig>,
 }
 impl fmt::Debug for AccountConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("AccountConfig(<redacted>)") }
@@ -60,15 +62,28 @@ impl fmt::Debug for IncomingBinding {
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct BootstrapConfig {
+    pub account_authority: Secret,
+    pub account_root_der_base64: Secret,
+    pub account_enable_sni: bool,
+    pub routing: Vec<ProfileProperty>,
+    pub handoff_timeout_ms: u64,
+}
+impl fmt::Debug for BootstrapConfig {
+    fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("BootstrapConfig(<redacted>)")}
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
     pub route: ProfileRoute,
     pub authority: Secret,
     pub enable_sni: bool,
     pub identity_type: Secret,
-    pub domain_name: Secret,
-    pub domain_id: Secret,
-    pub application_id: Secret,
-    pub device_info_cc: Secret,
+    pub domain_name: Option<Secret>,
+    pub domain_id: Option<Secret>,
+    pub application_id: Option<Secret>,
+    pub device_info_cc: Option<Secret>,
     pub client_properties: Vec<ProfileProperty>,
     pub include_device_id: bool,
     pub login_routing: Vec<ProfileProperty>,
@@ -87,6 +102,10 @@ impl fmt::Debug for ProfileConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("ProfileConfig(<redacted>)") }
 }
 
+fn required_secret(value:&Option<Secret>)->Result<&str,&'static str>{
+    let value=value.as_ref().ok_or(INVALID)?.expose_to_backend();
+    if value.trim().is_empty(){return Err(INVALID);}Ok(value)
+}
 fn borrowed(properties: &[ProfileProperty]) -> Result<Vec<RpcProperty<'_>>, &'static str> {
     if properties.len() > MAX_MAP_ENTRIES { return Err(INVALID); }
     Ok(properties.iter().map(|p| RpcProperty { key: &p.key, value: &p.value }).collect())
@@ -114,21 +133,25 @@ impl AccountConfig {
     pub fn runtime_profile(&self) -> Result<RuntimeProfile, &'static str> {
         let p = &self.profile;
         p.validate_timeouts()?;
-        for required in [&p.authority, &p.identity_type, &p.domain_name, &p.domain_id,
-            &p.application_id, &p.gateway_uri] {
+        for required in [&p.authority, &p.identity_type, &p.gateway_uri] {
             if required.expose_to_backend().trim().is_empty() { return Err(INVALID); }
         }
+        let (domain_name,domain_id,application_id,cc)=if self.bootstrap.is_some(){
+            if [&p.domain_name,&p.domain_id,&p.application_id,&p.device_info_cc].iter().any(|value|value.is_some()){return Err(INVALID);}
+            ("","","","")
+        }else{(required_secret(&p.domain_name)?,required_secret(&p.domain_id)?,required_secret(&p.application_id)?,
+            p.device_info_cc.as_ref().map(Secret::expose_to_backend).unwrap_or(""))};
         let client = borrowed(&p.client_properties)?;
         let login = borrowed(&p.login_routing)?;
         let gateway = borrowed(&p.gateway_metadata)?;
         let poll = borrowed(&p.poll_routing)?;
         let logout = borrowed(&p.logout_routing)?;
-        RuntimeProfile::supplied(RuntimeProfileInputs {
+        let inputs=RuntimeProfileInputs {
             route: match p.route { ProfileRoute::DirectTlsCarrier => PacketRoute::DirectTlsCarrier },
             authority: p.authority.expose_to_backend(), enable_sni: p.enable_sni,
-            identity_type: p.identity_type.expose_to_backend(), domain_name: p.domain_name.expose_to_backend(),
-            domain_id: p.domain_id.expose_to_backend(), application_id: p.application_id.expose_to_backend(),
-            device_info_cc: p.device_info_cc.expose_to_backend(), client_properties: &client,
+            identity_type: p.identity_type.expose_to_backend(), domain_name,
+            domain_id, application_id,
+            device_info_cc: cc, client_properties: &client,
             include_device_id: p.include_device_id, login_routing: &login,
             gateway_uri: p.gateway_uri.expose_to_backend(), gateway_metadata: &gateway,
             poll_routing: &poll, logout_routing: &logout,
@@ -140,7 +163,17 @@ impl AccountConfig {
             partial_timeout: Duration::from_millis(p.partial_timeout_ms),
             io_timeout: Duration::from_millis(p.io_timeout_ms),
             rpc_timeout: Duration::from_millis(p.rpc_timeout_ms),
-        }).map_err(|_| INVALID)
+        };
+        if let Some(bootstrap)=&self.bootstrap{
+            if bootstrap.handoff_timeout_ms==0||bootstrap.handoff_timeout_ms>30_000
+                ||bootstrap.account_root_der_base64.expose_to_backend().len()>16_384{return Err(INVALID);}
+            let routing=borrowed(&bootstrap.routing)?;
+            let account_trust=AccountTrust::supplied(AccountTrustInputs{authority:bootstrap.account_authority.expose_to_backend(),
+                root_der_base64:bootstrap.account_root_der_base64.expose_to_backend(),enable_sni:bootstrap.account_enable_sni}).map_err(|_|INVALID)?;
+            let client_key=self.credentials.sdk.client_config_decode_key.as_ref().map(|key|ConfigDecodeKey::supplied(key.expose_to_backend().as_bytes()).map_err(|_|INVALID)).transpose()?;
+            RuntimeProfile::supplied_bootstrap(inputs,RuntimeBootstrapInputs{account_trust,routing:&routing,client_config_decode_key:client_key,
+                handoff_timeout:Duration::from_millis(bootstrap.handoff_timeout_ms)}).map_err(|_|INVALID)
+        }else{RuntimeProfile::supplied(inputs).map_err(|_|INVALID)}
     }
 
     /// Pure admission only: no DNS, network, SDK execution or readiness state.
@@ -223,7 +256,10 @@ struct PrivateEnvelope { format_version: u32, config: AccountConfig }
 #[derive(Serialize)]
 struct PrivateEnvelopeRef<'a> { format_version: u32, config: PrivateConfigRef<'a> }
 #[derive(Serialize)]
-struct PrivateConfigRef<'a> { credentials: PrivateCredentialsRef<'a>, profile: PrivateProfileRef<'a> }
+struct PrivateConfigRef<'a> { credentials: PrivateCredentialsRef<'a>, profile: PrivateProfileRef<'a>, bootstrap:Option<PrivateBootstrapRef<'a>> }
+#[derive(Serialize)]
+struct PrivateBootstrapRef<'a>{account_authority:&'a str,account_root_der_base64:&'a str,account_enable_sni:bool,
+    routing:PrivateProperties<'a>,handoff_timeout_ms:u64}
 #[derive(Serialize)]
 struct PrivateCredentialsRef<'a> { sdk: PrivateSdkRef<'a>, hosting: PrivateHostingRef<'a> }
 #[derive(Serialize)]
@@ -255,7 +291,7 @@ struct PrivateIncomingRef<'a> { object_id: &'a [u8], domain: &'a [u8], receiver_
 #[derive(Serialize)]
 struct PrivateProfileRef<'a> {
     route: &'static str, authority: &'a str, enable_sni: bool, identity_type: &'a str,
-    domain_name: &'a str, domain_id: &'a str, application_id: &'a str, device_info_cc: &'a str,
+    domain_name: Option<&'a str>, domain_id: Option<&'a str>, application_id: Option<&'a str>, device_info_cc: Option<&'a str>,
     client_properties: PrivateProperties<'a>, include_device_id: bool,
     login_routing: PrivateProperties<'a>, gateway_uri: &'a str,
     gateway_metadata: PrivateProperties<'a>, poll_routing: PrivateProperties<'a>,
@@ -291,9 +327,9 @@ impl<'a> PrivateConfigRef<'a> {
             profile: PrivateProfileRef {
                 route: match p.route { ProfileRoute::DirectTlsCarrier => "direct_tls_carrier" },
                 authority: p.authority.expose_to_backend(), enable_sni: p.enable_sni,
-                identity_type: p.identity_type.expose_to_backend(), domain_name: p.domain_name.expose_to_backend(),
-                domain_id: p.domain_id.expose_to_backend(), application_id: p.application_id.expose_to_backend(),
-                device_info_cc: p.device_info_cc.expose_to_backend(), client_properties: private_properties(&p.client_properties),
+                identity_type: p.identity_type.expose_to_backend(), domain_name: exposed(&p.domain_name),
+                domain_id: exposed(&p.domain_id), application_id: exposed(&p.application_id),
+                device_info_cc: exposed(&p.device_info_cc), client_properties: private_properties(&p.client_properties),
                 include_device_id: p.include_device_id, login_routing: private_properties(&p.login_routing),
                 gateway_uri: p.gateway_uri.expose_to_backend(), gateway_metadata: private_properties(&p.gateway_metadata),
                 poll_routing: private_properties(&p.poll_routing), logout_routing: private_properties(&p.logout_routing),
@@ -301,6 +337,9 @@ impl<'a> PrivateConfigRef<'a> {
                 connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
                 partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
             },
+            bootstrap:config.bootstrap.as_ref().map(|b|PrivateBootstrapRef{account_authority:b.account_authority.expose_to_backend(),
+                account_root_der_base64:b.account_root_der_base64.expose_to_backend(),account_enable_sni:b.account_enable_sni,
+                routing:private_properties(&b.routing),handoff_timeout_ms:b.handoff_timeout_ms}),
         }
     }
 }

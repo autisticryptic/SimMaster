@@ -16,6 +16,8 @@ use crate::connectivity::app_voice::providers::jegotrip::{
 use std::{collections::VecDeque, io, pin::Pin, sync::atomic::{AtomicBool, AtomicUsize, Ordering}, task::{Context, Poll}};
 use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf}, sync::oneshot};
 use tokio_rustls::rustls;
+#[path="runtime_bootstrap_backend_tests.rs"]
+mod bootstrap;
 
 fn credentials(root: &str) -> ImportedCredentials {
     serde_json::from_value(serde_json::json!({
@@ -673,7 +675,7 @@ fn bounded_backend_queue_reserves_terminal_slot_and_pressure_retires_original_at
     let original = owner("fixture-public-root"); let scope = RpcConnectionScope::fresh();
     let attempt = Attempt { owner: original.clone(), scope: scope.clone(), incarnation: 1,
         state: Mutex::new(AttemptState::default()), commands: Mutex::new(None), handle: AsyncMutex::new(None),
-        work: AsyncMutex::new(()), poll_work: AsyncMutex::new(()) };
+        work: AsyncMutex::new(()), poll_work: AsyncMutex::new(()),bootstrap_scope:None,bootstrap_handle:AsyncMutex::new(None) };
     let (sender, mut receiver) = mpsc::channel(EVENT_CAPACITY);
     for _ in 0..EVENT_CAPACITY - 1 {
         assert!(emit(&sender, &attempt, BackendEventPayload::Callback(OwnedRpcCallback { owner: original.clone(), callback: Callback::Failure(BackendFailure::Disconnected) })));

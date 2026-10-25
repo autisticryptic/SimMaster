@@ -313,6 +313,74 @@ mod app_voice_accounts {
     #[tokio::test]
     async fn changed_destination_under_same_channel_id_cancels_instead_of_rerouting_original_message(){notification_http_case(true).await;}
 
+    fn bootstrap_config_json(source_root: &str, account_root: &str) -> serde_json::Value {
+        let mut config = config_json(source_root);
+        for field in ["domain_name", "domain_id", "application_id", "device_info_cc"] {
+            config["profile"].as_object_mut().unwrap().remove(field);
+        }
+        config["bootstrap"] = serde_json::json!({
+            "account_authority": "account.fixture.invalid", "account_root_der_base64": account_root,
+            "account_enable_sni": false, "routing": [{"key": b"ServerGroup", "value": b"original-server-group"}],
+            "handoff_timeout_ms": 3000
+        });
+        config
+    }
+
+    #[tokio::test]
+    async fn bootstrap_import_stores_separate_original_trust_without_starting_or_exposing_configuration() {
+        let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");
+        let served = serve(state.router.clone()).await; let cookie = authenticate(&served).await;
+        let source = Certificates::generate("DNS:fixture.invalid");
+        let account = Certificates::generate("DNS:account.fixture.invalid");
+        let config = bootstrap_config_json(&source.root, &account.root);
+        let (status, headers, body) = account_request(&served, reqwest::Method::POST, "/api/non-3gpp/accounts",
+            Some(serde_json::json!({"provider_id":"app_voice", "config":config})), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}"); no_store(&headers); no_secrets(&body);
+        assert!(!body.contains("bootstrap") && !body.contains("account_authority"));
+        let line = created_line(&body); let path = format!("/api/non-3gpp/accounts/{line}");
+        let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(view["data"]["phase"], "stopped"); assert_eq!(view["data"]["io_cleanup_required"], false);
+        assert_eq!(view["data"]["incoming_call_ready"], false); assert_eq!(view["data"]["outbound_authorized"], false);
+        let stored = state.app.database.with_conn(|conn| account_store::load(conn, &line)).unwrap().unwrap();
+        assert!(stored.config.profile.domain_name.is_none() && stored.config.profile.application_id.is_none());
+        let bootstrap = stored.config.bootstrap.as_ref().unwrap();
+        assert_eq!(bootstrap.account_root_der_base64.expose_to_backend(), account.root);
+        assert_eq!(stored.config.credentials.sdk.root_der_base64.expose_to_backend(), source.root);
+        assert_eq!(stored.config.credentials.sdk.phone_login_token.expose_to_backend(), "fixture-original-pwd");
+        assert_eq!(stored.config.credentials.hosting.sip_password.expose_to_backend(), "fixture-SipPwd");
+        let (status, headers, body) = account_request(&served, reqwest::Method::PUT, &path,
+            Some(serde_json::json!({"expected_revision":1, "config":config_json(&source.root)})), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK, "{body}"); no_store(&headers); no_secrets(&body);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["revision"], 2);
+        let replaced = state.app.database.with_conn(|conn| account_store::load(conn, &line)).unwrap().unwrap();
+        assert!(replaced.config.bootstrap.is_none()); assert!(replaced.config.profile.domain_name.is_some());
+        let (status, headers, body) = account_request(&served, reqwest::Method::DELETE, &format!("{path}?expected_revision=2"), None, Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK); no_store(&headers); no_secrets(&body);
+        assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+        assert!(crate::connectivity::app_voice::registry::registry().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_or_incomplete_bootstrap_imports_are_rejected_without_secret_reflection_or_session_start() {
+        let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");
+        let served = serve(state.router.clone()).await; let cookie = authenticate(&served).await;
+        let cert = Certificates::generate("DNS:fixture.invalid"); let baseline = bootstrap_config_json(&cert.root, &cert.root);
+        let mut manual = baseline.clone(); manual["profile"]["domain_name"] = serde_json::json!("manual-placeholder");
+        let mut root = baseline.clone(); root["bootstrap"]["account_root_der_base64"] = serde_json::json!("fixture-not-a-root");
+        let mut missing = baseline.clone(); missing["bootstrap"].as_object_mut().unwrap().remove("account_root_der_base64");
+        let mut authority = baseline.clone(); authority["bootstrap"]["account_authority"] = serde_json::json!("*.fixture.invalid");
+        let mut budget = baseline.clone(); budget["bootstrap"]["handoff_timeout_ms"] = serde_json::json!(0);
+        let mut routing = baseline.clone(); routing["bootstrap"]["routing"] = serde_json::json!([{"key":b"token", "value":b"not-a-bootstrap-key"}]);
+        let mut unknown = baseline; unknown["bootstrap"]["fixture-secret-field"] = serde_json::json!("fixture-must-not-echo");
+        for config in [manual, root, missing, authority, budget, routing, unknown] {
+            let (status, headers, body) = account_request(&served, reqwest::Method::POST, "/api/non-3gpp/accounts",
+                Some(serde_json::json!({"provider_id":"app_voice", "config":config})), Some(&cookie)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}"); no_store(&headers); no_secrets(&body);
+            assert!(!body.contains("fixture-secret-field"));
+        }
+        assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn body_limit_blocks_oversized_private_import_and_keeps_storage_empty() {
         let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");

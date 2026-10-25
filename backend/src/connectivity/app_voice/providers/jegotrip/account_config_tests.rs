@@ -13,11 +13,11 @@ fn fixture(root: &str) -> AccountConfig {
     credentials.sdk.selected_session_id = Some(secret("\"fixture-original-selector\""));
     credentials.sdk.client_config_decode_key = Some(secret("\"fixture-client-context\""));
     credentials.sdk.reference_decode_key = Some(secret("\"fixture-reference-context\""));
-    AccountConfig { credentials, profile: ProfileConfig {
+    AccountConfig { credentials, bootstrap:None, profile: ProfileConfig {
         route: ProfileRoute::DirectTlsCarrier, authority: secret("\"fixture.invalid\""), enable_sni: true,
-        identity_type: secret("\"username\""), domain_name: secret("\"fixture.invalid\""),
-        domain_id: secret("\"fixture-domain\""), application_id: secret("\"fixture-app\""),
-        device_info_cc: secret("\"fixture-cc\""), include_device_id: true,
+        identity_type: secret("\"username\""), domain_name: Some(secret("\"fixture.invalid\"")),
+        domain_id: Some(secret("\"fixture-domain\"")), application_id: Some(secret("\"fixture-app\"")),
+        device_info_cc: Some(secret("\"fixture-cc\"")), include_device_id: true,
         client_properties: vec![ProfileProperty { key: b"ClientId".to_vec(), value: b"fixture-exact-client-id".to_vec() },
             ProfileProperty { key: vec![0, 0xff, 1], value: vec![0xff, 0, 2] }],
         login_routing: vec![ProfileProperty { key: vec![0xfe], value: vec![0, 0xff] }],
@@ -236,7 +236,7 @@ fn profile_map_field_and_private_writer_bounds_fail_without_partial_success() {
     }).collect();
     assert_eq!(config.runtime_profile().err(), Some(INVALID));
     let mut config = fixture(&cert.root);
-    config.profile.domain_name = secret("\"   \"");
+    config.profile.domain_name = Some(secret("\"   \""));
     assert_eq!(config.validate(100), Err(INVALID));
     let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_PRIVATE_BYTES));
     let mut writer = PrivateWriter(&mut bytes);
@@ -254,4 +254,115 @@ fn debugging_is_fully_redacted_without_secret_values_lengths_or_policy() {
     assert_eq!(format!("{:?}", config.profile.client_properties[0]), "ProfileProperty(<redacted>)");
     assert_eq!(format!("{:?}", config.profile.incoming.as_ref().unwrap()), "IncomingBinding(<redacted>)");
     assert_eq!(format!("{:?}", config.runtime_profile().unwrap()), "RuntimeProfile(<redacted>)");
+}
+
+fn bootstrap_fixture(source_root: &str, account_root: &str) -> AccountConfig {
+    let mut config = fixture(source_root);
+    config.profile.domain_name = None; config.profile.domain_id = None;
+    config.profile.application_id = None; config.profile.device_info_cc = None;
+    config.bootstrap = Some(BootstrapConfig {
+        account_authority: secret("\"account.fixture.invalid\""),
+        account_root_der_base64: Secret::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(account_root)).unwrap(),
+        account_enable_sni: false,
+        routing: vec![ProfileProperty { key: b"ServerGroup".to_vec(), value: b"original-server-group".to_vec() }],
+        handoff_timeout_ms: 3000,
+    });
+    config
+}
+
+#[test]
+fn bootstrap_private_roundtrip_preserves_separate_trust_routing_and_missing_login_properties() {
+    let source_cert = Certificates::generate("DNS:fixture.invalid");
+    let account_cert = Certificates::generate("DNS:account.fixture.invalid");
+    let config = bootstrap_fixture(&source_cert.root, &account_cert.root);
+    assert_eq!(config.validate(100), Ok(()));
+    let encoded = config.encode_private().unwrap(); let loaded = AccountConfig::decode_private(&encoded).unwrap();
+    assert_eq!(loaded.validate(100), Ok(()));
+    assert_eq!(encoded.as_slice(), loaded.encode_private().unwrap().as_slice());
+    assert!(loaded.profile.domain_name.is_none() && loaded.profile.domain_id.is_none());
+    assert!(loaded.profile.application_id.is_none() && loaded.profile.device_info_cc.is_none());
+    let bootstrap = loaded.bootstrap.as_ref().unwrap();
+    assert_eq!(bootstrap.account_authority.expose_to_backend(), "account.fixture.invalid");
+    assert_eq!(bootstrap.account_root_der_base64.expose_to_backend(), account_cert.root);
+    assert_eq!(loaded.credentials.sdk.root_der_base64.expose_to_backend(), source_cert.root);
+    assert!(!bootstrap.account_enable_sni); assert!(loaded.profile.enable_sni);
+    assert_eq!(bootstrap.routing[0].value, b"original-server-group");
+    assert_eq!(bootstrap.handoff_timeout_ms, 3000);
+    assert_eq!(format!("{bootstrap:?}"), "BootstrapConfig(<redacted>)");
+    assert_eq!(format!("{:?}", loaded.runtime_profile().unwrap()), "RuntimeProfile(<redacted>)");
+}
+
+#[test]
+fn legacy_private_version_one_without_bootstrap_stays_explicit_and_does_not_discover_defaults() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let config = fixture(&cert.root);
+    let bytes = config.encode_private().unwrap(); let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains(",\"bootstrap\":null"));
+    let legacy = Zeroizing::new(text.replace(",\"bootstrap\":null", ""));
+    let mut loaded = AccountConfig::decode_private(legacy.as_bytes()).unwrap();
+    assert!(loaded.bootstrap.is_none()); assert_eq!(loaded.validate(100), Ok(()));
+    assert_eq!(exposed(&loaded.profile.domain_name), Some("fixture.invalid"));
+    assert_eq!(exposed(&loaded.profile.application_id), Some("fixture-app"));
+    loaded.profile.device_info_cc = None; assert_eq!(loaded.validate(100), Ok(()));
+    loaded.profile.domain_name = None; assert_eq!(loaded.validate(100), Err(INVALID));
+}
+
+#[test]
+fn bootstrap_mode_refuses_every_manual_login_property_and_explicit_mode_requires_original_fields() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let baseline = bootstrap_fixture(&cert.root, &cert.root);
+    for index in 0..4 {
+        let mut config = baseline.clone(); let p = &mut config.profile;
+        let fields = [&mut p.domain_name, &mut p.domain_id, &mut p.application_id, &mut p.device_info_cc];
+        *fields.into_iter().nth(index).unwrap() = Some(secret("\"manual-placeholder\""));
+        assert_eq!(config.runtime_profile().err(), Some(INVALID)); assert_eq!(config.validate(100), Err(INVALID));
+    }
+    for index in 0..3 {
+        let mut config = fixture(&cert.root); let p = &mut config.profile;
+        let fields = [&mut p.domain_name, &mut p.domain_id, &mut p.application_id];
+        *fields.into_iter().nth(index).unwrap() = None; assert_eq!(config.validate(100), Err(INVALID));
+    }
+    for domain in ["\"a@b\"", "\"[domain]\"", "\"   \""] {
+        let mut config = fixture(&cert.root); config.profile.domain_name = Some(secret(domain));
+        assert_eq!(config.validate(100), Err(INVALID));
+    }
+}
+
+#[test]
+fn bootstrap_trust_budget_and_auth_routing_fail_pure_admission_without_guessing_missing_inputs() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let baseline = bootstrap_fixture(&cert.root, &cert.root);
+    for timeout in [0, 1, 30_000, 30_001, u64::MAX] {
+        let mut config = baseline.clone(); config.bootstrap.as_mut().unwrap().handoff_timeout_ms = timeout;
+        assert_eq!(config.validate(100).is_ok(), (1..=30_000).contains(&timeout));
+    }
+    for key in [b"pwd".as_slice(), b"token"] {
+        let mut config = baseline.clone(); config.bootstrap.as_mut().unwrap().routing.push(ProfileProperty { key: key.to_vec(), value: b"substitute".to_vec() });
+        assert_eq!(config.validate(100), Err(INVALID));
+    }
+    for root in ["\"\"", "\"not-base64\"", "\"AA==\""] {
+        let mut config = baseline.clone(); config.bootstrap.as_mut().unwrap().account_root_der_base64 = secret(root);
+        assert_eq!(config.validate(100), Err(INVALID));
+    }
+    let mut config = baseline.clone(); config.bootstrap.as_mut().unwrap().account_authority = secret("\"*.fixture.invalid\"");
+    assert_eq!(config.validate(100), Err(INVALID));
+    let json = public_json(&baseline);
+    for (from, to) in [("\"account_enable_sni\":false,", ""), ("\"handoff_timeout_ms\":3000", "\"unknown\":true"),
+        ("\"account_authority\":", "\"unrecognized\":true,\"account_authority\":")] {
+        assert!(serde_json::from_str::<AccountConfig>(&replaced(&json, from, to)).is_err());
+    }
+}
+
+#[test]
+fn bootstrap_import_does_not_alias_client_key_to_common_or_replace_original_credential_layers() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let mut config = bootstrap_fixture(&cert.root, &cert.root);
+    let original = config.credentials.sdk.phone_login_token.expose_to_backend().to_owned();
+    let selector = exposed(&config.credentials.sdk.selected_session_id).unwrap().to_owned();
+    let gateway = config.credentials.hosting.sip_password.expose_to_backend().to_owned();
+    let envelope = Zeroizing::new(super::super::legacy_config::tests::fixture_envelope(
+        b"#fixture-account:tcp -h fixture.invalid -p 443;", b"fixture-reference-context", [8, 7, 6, 5, 4, 3, 2, 1]));
+    config.credentials.sdk.server_address = Secret::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(std::str::from_utf8(&envelope).unwrap())).unwrap();
+    assert_eq!(config.validate(100), Ok(()));
+    assert_eq!(config.credentials.sdk.phone_login_token.expose_to_backend(), original);
+    assert_eq!(exposed(&config.credentials.sdk.selected_session_id), Some(selector.as_str()));
+    assert_eq!(config.credentials.hosting.sip_password.expose_to_backend(), gateway);
+    config.credentials.sdk.reference_decode_key = None;
+    assert!(config.credentials.sdk.client_config_decode_key.is_some()); assert_eq!(config.validate(100), Err(INVALID));
 }

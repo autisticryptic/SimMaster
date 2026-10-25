@@ -99,18 +99,21 @@ pub trait RuntimeConnector: Send + Sync {
         input: ConnectionInput<'a>) -> ConnectFuture<'a>;
 }
 
-fn validate_input(input: ConnectionInput<'_>) -> Result<(), ConnectError> {
-    if !valid_authority(input.authority) || input.server_reference.is_empty()
-        || input.server_reference.len() > MAX_TARGET_BYTES || input.server_reference.chars().any(char::is_control)
-        || input.root_der_base64.is_empty() || input.root_der_base64.len() > (MAX_ROOT_BYTES + 2) / 3 * 4 {
+pub(super) fn validate_tls_anchor(authority: &str, root_der_base64: &str) -> Result<(), ConnectError> {
+    if !valid_authority(authority) || root_der_base64.is_empty() || root_der_base64.len() > (MAX_ROOT_BYTES + 2) / 3 * 4 {
         return Err(ConnectError::InvalidConfiguration);
     }
-    let root = STANDARD.decode(input.root_der_base64).map_err(|_| ConnectError::InvalidConfiguration)?;
+    let root = STANDARD.decode(root_der_base64).map_err(|_| ConnectError::InvalidConfiguration)?;
     if root.is_empty() || root.len() > MAX_ROOT_BYTES { return Err(ConnectError::InvalidConfiguration); }
     let mut store = tokio_rustls::rustls::RootCertStore::empty();
     store.add(tokio_rustls::rustls::pki_types::CertificateDer::from(root))
         .map_err(|_| ConnectError::InvalidConfiguration)?;
     Ok(())
+}
+fn validate_input(input: ConnectionInput<'_>) -> Result<(), ConnectError> {
+    if input.server_reference.is_empty() || input.server_reference.len() > MAX_TARGET_BYTES
+        || input.server_reference.chars().any(char::is_control) { return Err(ConnectError::InvalidConfiguration); }
+    validate_tls_anchor(input.authority,input.root_der_base64)
 }
 
 pub(super) fn same_authority(host: &str, authority: &str) -> bool {

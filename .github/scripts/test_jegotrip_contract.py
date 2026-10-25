@@ -619,6 +619,72 @@ class JegotripContract(unittest.TestCase):
             self.assertIn('connectivity::app_voice::providers::jegotrip::tests',
                           (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
 
+    def test_bootstrap_profile_keeps_explicit_trust_and_legacy_private_import_separate(self):
+        config = (MOD / 'account_config.rs').read_text(encoding='utf-8')
+        self.assertIn('pub bootstrap: Option<BootstrapConfig>', config)
+        self.assertIn('pub account_root_der_base64: Secret', config)
+        self.assertIn('pub account_enable_sni: bool', config)
+        self.assertIn('value.is_some()', config)
+        self.assertIn('required_secret(&p.domain_name)?', config)
+        self.assertIn('AccountTrust::supplied(AccountTrustInputs', config)
+        self.assertIn('RuntimeProfile::supplied_bootstrap(inputs,RuntimeBootstrapInputs', config)
+        self.assertIn('format_version: 1', config)
+        tests = (MOD / 'account_config_tests.rs').read_text(encoding='utf-8')
+        self.assertIn('legacy_private_version_one_without_bootstrap', tests)
+        self.assertIn('bootstrap_mode_refuses_every_manual_login_property', tests)
+        self.assertNotIn('impl Serialize for AccountConfig', config)
+        self.assertNotIn('impl Default for BootstrapConfig', config)
+
+    def test_bootstrap_source_join_precedes_destination_connect_and_cleanup_owns_both_handles(self):
+        backend = (MOD / 'runtime_backend.rs').read_text(encoding='utf-8')
+        login = backend.split('async fn login_original(', 1)[1].split('async fn bootstrap_original(', 1)[0]
+        self.assertLess(login.index('self.bootstrap_original(&attempt'), login.index('self.connector.connect(&attempt.owner, &attempt.scope, input)'))
+        bootstrap = backend.split('async fn bootstrap_original(', 1)[1].split('async fn status_original(', 1)[0]
+        self.assertIn('value.call_id()==call_id', bootstrap)
+        self.assertIn('plan.original_source_scope().matches(scope)', bootstrap)
+        self.assertLess(bootstrap.index('close().await'), bootstrap.index('if !release.io_released()'))
+        self.assertLess(bootstrap.index('if !release.io_released()'), bootstrap.index('Ok(plan)'))
+        cleanup = backend.split('async fn logout_original(', 1)[1].split('impl HostingBackend', 1)[0]
+        self.assertLess(cleanup.index('attempt.bootstrap_handle.lock().await'), cleanup.index('attempt.handle.lock().await'))
+        self.assertNotIn('bootstrap_handle.take()', cleanup)
+        self.assertNotIn('handle.take()', cleanup)
+        retire = backend.split('fn retire(&self)', 1)[1].split('fn commands(', 1)[0]
+        self.assertIn('self.scope.close()', retire)
+        self.assertIn('self.bootstrap_scope', retire)
+        self.assertIn('scope.close()', retire)
+
+    def test_provisioned_login_copies_original_raw_domain_and_decodes_only_client_properties(self):
+        provision = (MOD / 'runtime_provision.rs').read_text(encoding='utf-8')
+        self.assertIn('reply.material_for(owner,source)', provision)
+        self.assertIn('source.matches(destination)', provision)
+        self.assertIn('p.key==b"DomainName"', provision)
+        self.assertIn('decoded(b"DomainId")?', provision)
+        self.assertIn('decoded(b"AppId")?', provision)
+        self.assertIn('decoded(b"CC")?', provision)
+        self.assertIn('Arc::ptr_eq(&self.trust,&trust.identity)', provision)
+        self.assertIn('destination.is_open()', provision)
+        self.assertIn('reference_decode_key:None', provision)
+        for shortcut in ['Callback::', 'TcpStream', 'default_root', 'from_utf8_lossy', 'derive(Serialize)']:
+            self.assertNotIn(shortcut, provision)
+
+    def test_bootstrap_deadline_and_real_two_connection_regressions_are_selected(self):
+        backend = (MOD / 'runtime_backend.rs').read_text(encoding='utf-8')
+        self.assertIn('let began=Instant::now()', backend)
+        self.assertIn('began.checked_add(bootstrap.handoff_timeout)', backend)
+        self.assertIn('tokio::time::timeout_at', backend)
+        tests = (MOD / 'runtime_bootstrap_backend_tests.rs').read_text(encoding='utf-8')
+        for regression in ['two_original_tls_scopes_join_bootstrap_before_account_login',
+                           'cancellation_during_bootstrap_join_retains_source_handle',
+                           'original_handoff_deadline_spans_bootstrap_release',
+                           'foreign_destination_scope_drops_connected_io',
+                           'unmatched_bootstrap_call_id_never_hands_off']:
+            self.assertIn(regression, tests)
+        self.assertIn('source_dropped.load(Ordering::SeqCst)', tests)
+        self.assertIn('runtime_bootstrap_backend_tests.rs', (MOD / 'runtime_backend_tests.rs').read_text(encoding='utf-8'))
+        for name in ['beta-validation.yml', 'build-release.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::runtime_provision::tests',
+                          (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
 
 if __name__ == '__main__':
     unittest.main()

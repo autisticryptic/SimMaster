@@ -16,11 +16,11 @@ fn fixture(root: &str) -> AccountConfig {
     credentials.sdk.root_der_base64 = Secret::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(root)).unwrap();
     credentials.sdk.server_address = secret("\"#fixture-account:tcp -h fixture.invalid -p 443;\"");
     credentials.sdk.selected_session_id = Some(secret("\"fixture-original-selector\""));
-    AccountConfig { credentials, profile: ProfileConfig {
+    AccountConfig { credentials, bootstrap:None, profile: ProfileConfig {
         route: ProfileRoute::DirectTlsCarrier, authority: secret("\"fixture.invalid\""), enable_sni: true,
-        identity_type: secret("\"username\""), domain_name: secret("\"fixture.invalid\""),
-        domain_id: secret("\"fixture-domain\""), application_id: secret("\"fixture-app\""),
-        device_info_cc: secret("\"fixture-cc\""), include_device_id: true,
+        identity_type: secret("\"username\""), domain_name: Some(secret("\"fixture.invalid\"")),
+        domain_id: Some(secret("\"fixture-domain\"")), application_id: Some(secret("\"fixture-app\"")),
+        device_info_cc: Some(secret("\"fixture-cc\"")), include_device_id: true,
         client_properties: vec![ProfileProperty { key: b"ClientId".to_vec(), value: b"fixture-exact-client-id".to_vec() },
             ProfileProperty { key: vec![0, 0xff], value: vec![0xff, 0] }],
         login_routing: vec![], gateway_uri: secret("\"fixture-exact-gateway-uri\""),

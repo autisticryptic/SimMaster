@@ -40,6 +40,7 @@ pub mod tls_engine;
 pub mod tls_plaintext;
 pub mod transport_actor;
 pub mod runtime_connector;
+pub mod runtime_provision;
 pub mod runtime_backend;
 pub mod legacy_config;
 pub mod object_reference;

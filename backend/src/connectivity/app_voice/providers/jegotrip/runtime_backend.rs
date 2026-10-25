@@ -4,8 +4,9 @@
 //! actor-produced reason even when ARC has already retired the physical scope.
 //! Malformed data remains a protocol failure, never a fabricated native reject.
 //! A supplied profile is deployment data, never account/channel readiness. Only
-//! DirectTlsCarrier is supported. There is no default target/root/identity,
-//! bootstrap discovery, paid outbound, automatic consumer ACK or Channels event.
+//! DirectTlsCarrier is supported, either explicitly or through a matched
+//! bootstrap-to-account handoff with separately imported TLS trust. No default
+//! target/root/identity, paid outbound, automatic consumer ACK or Channels event.
 use super::{
     arc_protocol::{DirectReplyTicket, IncomingProtocolMessage},
     arc_session::ArcLoginInputs,
@@ -17,13 +18,14 @@ use super::{
     rpc_pending::{OwnedRpcCallback, RpcConnectionScope},
     rpc_stream::{RpcProperty, MAX_FIELD_BYTES, MAX_MAP_ENTRIES},
     runtime_connector::{ConnectionInput, RuntimeConnector},
+    runtime_provision::{AccountTrust, ProvisionedLogin},
     session::{AttemptOwner, BackendFailure, BackendFuture, GatewayRegistration, HostingBackend,
         SdkLoginRequest, STATUS_REGISTER, STATUS_UNREGISTER},
     tls_engine::{valid_authority, TlsError, TlsParameters},
     transport_actor::{self, RuntimeCommands, RuntimeError, RuntimeEvent, RuntimeHandle, RuntimePolicy, RuntimeReceipt},
 };
 use ring::rand::{SecureRandom, SystemRandom};
-use std::{fmt, sync::{Arc, Mutex, MutexGuard}, time::Duration};
+use std::{fmt, sync::{Arc, Mutex, MutexGuard}, time::{Duration, Instant}};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -87,7 +89,7 @@ fn add_bytes(total: &mut usize, bytes: usize) -> Result<(), ProfileError> {
     Ok(())
 }
 fn text(value: &str, empty: bool, total: &mut usize) -> Result<Zeroizing<String>, ProfileError> {
-    if (!empty && value.is_empty()) || value.len() > MAX_FIELD_BYTES
+    if (!empty && value.trim().is_empty()) || value.len() > MAX_FIELD_BYTES
         || value.chars().any(char::is_control) || value.contains("ENC(") {
         return Err(ProfileError::InvalidConfiguration);
     }
@@ -112,6 +114,19 @@ impl Binding {
     }
 }
 
+pub struct RuntimeBootstrapInputs<'a> {
+    pub account_trust: AccountTrust,
+    pub routing: &'a [RpcProperty<'a>],
+    pub client_config_decode_key: Option<ConfigDecodeKey>,
+    pub handoff_timeout: Duration,
+}
+impl fmt::Debug for RuntimeBootstrapInputs<'_> {
+    fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RuntimeBootstrapInputs(<redacted>)")}
+}
+struct BootstrapProfile {
+    account_trust: AccountTrust, routing:Vec<Property>, client_key:Option<ConfigDecodeKey>, handoff_timeout:Duration,
+}
+
 /// Bounded, owned, redacted, zeroizing deployment data. No Serialize/Default.
 pub struct RuntimeProfile {
     authority: Zeroizing<String>, enable_sni: bool, identity_type: Zeroizing<String>,
@@ -120,13 +135,22 @@ pub struct RuntimeProfile {
     login_routing: Vec<Property>, gateway_uri: Zeroizing<String>, gateway_metadata: Vec<Property>,
     poll_routing: Vec<Property>, logout_routing: Vec<Property>, incoming: Option<Binding>,
     reference_decode_key: Option<ConfigDecodeKey>, handshake_timeout: Duration, partial_timeout: Duration,
-    io_timeout: Duration, rpc_timeout: Duration,
+    io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>,
 }
 impl fmt::Debug for RuntimeProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RuntimeProfile(<redacted>)") }
 }
 impl RuntimeProfile {
-    pub fn supplied(input: RuntimeProfileInputs<'_>) -> Result<Self, ProfileError> {
+    pub fn supplied(input: RuntimeProfileInputs<'_>) -> Result<Self, ProfileError> { Self::capture(input,None) }
+    /// Exact imported bootstrap TLS anchor plus separately imported account
+    /// trust. Login domain/app/CC must come from the matched bootstrap, never
+    /// placeholder/manual values silently substituted for returned properties.
+    pub fn supplied_bootstrap(input:RuntimeProfileInputs<'_>,bootstrap:RuntimeBootstrapInputs<'_>)->Result<Self,ProfileError>{
+        if [input.domain_name,input.domain_id,input.application_id,input.device_info_cc].iter().any(|value|!value.is_empty())
+            ||bootstrap.handoff_timeout.is_zero()||bootstrap.handoff_timeout>Duration::from_secs(30){return Err(ProfileError::InvalidConfiguration);}
+        Self::capture(input,Some(bootstrap))
+    }
+    fn capture(input:RuntimeProfileInputs<'_>,bootstrap:Option<RuntimeBootstrapInputs<'_>>)->Result<Self,ProfileError>{
         if !matches!(input.route, PacketRoute::DirectTlsCarrier) { return Err(ProfileError::UnsupportedTransport); }
         if !valid_authority(input.authority) || input.identity_type.is_empty()
             || input.identity_type.len() > 64
@@ -145,6 +169,16 @@ impl RuntimeProfile {
             return Err(ProfileError::InvalidConfiguration);
         }
         let mut total = 0;
+        let from_bootstrap=bootstrap.is_some();
+        if !from_bootstrap && input.domain_name.bytes().any(|b| matches!(b, b'@' | b'[' | b']')) {
+            return Err(ProfileError::InvalidConfiguration);
+        }
+        let bootstrap=bootstrap.map(|bootstrap| -> Result<BootstrapProfile, ProfileError> {
+            add_bytes(&mut total,bootstrap.account_trust.authority().len())?;
+            add_bytes(&mut total,bootstrap.account_trust.root_der_base64().len())?;
+            let captured=routing(bootstrap.routing,&mut total)?;
+            Ok(BootstrapProfile{account_trust:bootstrap.account_trust,routing:captured,client_key:bootstrap.client_config_decode_key,handoff_timeout:bootstrap.handoff_timeout})
+        }).transpose()?;
         let incoming = input.incoming.map(|b| {
             for value in [b.object_id, b.domain, b.receiver_kind] {
                 if value.is_empty() || value.len() > MAX_FIELD_BYTES || value.iter().any(u8::is_ascii_control)
@@ -158,14 +192,14 @@ impl RuntimeProfile {
         Ok(Self {
             authority: text(input.authority, false, &mut total)?, enable_sni: input.enable_sni,
             identity_type: text(input.identity_type, false, &mut total)?,
-            domain_name: text(input.domain_name, false, &mut total)?, domain_id: text(input.domain_id, false, &mut total)?,
-            application_id: text(input.application_id, false, &mut total)?, device_info_cc: text(input.device_info_cc, true, &mut total)?,
+            domain_name: text(input.domain_name, from_bootstrap, &mut total)?, domain_id: text(input.domain_id, from_bootstrap, &mut total)?,
+            application_id: text(input.application_id, from_bootstrap, &mut total)?, device_info_cc: text(input.device_info_cc, true, &mut total)?,
             client_properties: properties(input.client_properties, &mut total)?, include_device_id: input.include_device_id,
             login_routing: routing(input.login_routing, &mut total)?, gateway_uri: text(input.gateway_uri, false, &mut total)?,
             gateway_metadata: routing(input.gateway_metadata, &mut total)?, poll_routing: routing(input.poll_routing, &mut total)?,
             logout_routing: routing(input.logout_routing, &mut total)?, incoming, reference_decode_key: input.reference_decode_key,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
-            io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout,
+            io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap,
         })
     }
 }
@@ -243,6 +277,8 @@ struct Attempt {
     // Commands do not own IO. The owning handle is NEVER moved into a cleanup
     // future: cancellation of close retains its original Join in this slot.
     handle: AsyncMutex<Option<RuntimeHandle>>,
+    bootstrap_scope: Option<RpcConnectionScope>,
+    bootstrap_handle: AsyncMutex<Option<RuntimeHandle>>,
     // Serializes login/attach and controller commands with resource cleanup.
     // The independent event pump polls/configures without a controller lock.
     work: AsyncMutex<()>,
@@ -252,7 +288,10 @@ struct Attempt {
 }
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> { mutex.lock().unwrap_or_else(|p| p.into_inner()) }
 impl Attempt {
-    fn retire(&self) { lock(&self.state).retired = true; self.scope.close(); }
+    fn retire(&self) {
+        lock(&self.state).retired = true; self.scope.close();
+        if let Some(scope)=&self.bootstrap_scope{scope.close();}
+    }
     fn commands(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Result<RuntimeCommands, RuntimeError> {
         if &self.owner != owner || !self.scope.matches(scope) || !self.scope.is_open() || lock(&self.state).retired {
             return Err(RuntimeError::Scope);
@@ -318,6 +357,8 @@ impl NativeHostingBackend {
         let captured = LoginCapture::capture(request, &self.profile)?;
         let attempt;
         let prepared;
+        let bootstrap_prepared;
+        let began=Instant::now();
         {
             let mut state = lock(&self.state);
             if state.slot.as_ref().is_some_and(|a| !lock(&a.state).released)
@@ -333,21 +374,36 @@ impl NativeHostingBackend {
                 if value != 0 && !state.incarnations.contains(&value) { incarnation = Some(value); break; }
             }
             let incarnation = incarnation.ok_or(BackendFailure::Unavailable)?;
+            let (authority,root,sni)=match &self.profile.bootstrap {
+                Some(bootstrap)=>(bootstrap.account_trust.authority(),bootstrap.account_trust.root_der_base64(),bootstrap.account_trust.enable_sni()),
+                None=>(self.profile.authority.as_str(),captured.root.as_str(),self.profile.enable_sni),
+            };
             prepared = transport_actor::prepare(owner.clone(), PacketRoute::DirectTlsCarrier,
-                TlsParameters { authority: &self.profile.authority, root_der_base64: &captured.root, tls_only: true,
-                    enable_sni: self.profile.enable_sni, handshake_timeout: self.profile.handshake_timeout,
-                    partial_timeout: self.profile.partial_timeout },
-                RuntimePolicy { io_timeout: self.profile.io_timeout, rpc_timeout: self.profile.rpc_timeout }, None)
-                .map_err(|_| BackendFailure::Unavailable)?;
+                TlsParameters { authority, root_der_base64:root, tls_only:true, enable_sni:sni,
+                    handshake_timeout:self.profile.handshake_timeout,partial_timeout:self.profile.partial_timeout },
+                RuntimePolicy { io_timeout:self.profile.io_timeout,rpc_timeout:self.profile.rpc_timeout },None)
+                .map_err(|_|BackendFailure::Unavailable)?;
+            bootstrap_prepared=if self.profile.bootstrap.is_some(){Some(transport_actor::prepare(owner.clone(),PacketRoute::DirectTlsCarrier,
+                TlsParameters{authority:&self.profile.authority,root_der_base64:&captured.root,tls_only:true,enable_sni:self.profile.enable_sni,
+                    handshake_timeout:self.profile.handshake_timeout,partial_timeout:self.profile.partial_timeout},
+                RuntimePolicy{io_timeout:self.profile.io_timeout,rpc_timeout:self.profile.rpc_timeout},None).map_err(|_|BackendFailure::Unavailable)?)}else{None};
             attempt = Arc::new(Attempt { owner: owner.clone(), scope: prepared.connection_scope(), incarnation,
                 state: Mutex::new(AttemptState::default()), commands: Mutex::new(None), handle: AsyncMutex::new(None),
+                bootstrap_scope:bootstrap_prepared.as_ref().map(|prepared|prepared.connection_scope()),bootstrap_handle:AsyncMutex::new(None),
                 work: AsyncMutex::new(()), poll_work: AsyncMutex::new(()) });
             state.owners.push(owner); state.incarnations.push(incarnation); state.slot = Some(attempt.clone());
         }
         let mut retirement = Retirement::new(attempt.clone());
         let _work = attempt.work.lock().await;
+        let operation=async {
         if !attempt.scope.is_open() || lock(&attempt.state).retired { return Err(BackendFailure::Disconnected); }
-        let input = captured.connection(&self.profile);
+        let provisioned=match bootstrap_prepared {
+            Some(bootstrap)=>Some(self.bootstrap_original(&attempt,&captured,bootstrap).await?),None=>None,
+        };
+        let input=match (&provisioned,&self.profile.bootstrap){
+            (Some(plan),Some(bootstrap))=>plan.connection_for(&attempt.owner,&attempt.scope,&bootstrap.account_trust).map_err(|_|BackendFailure::Unavailable)?,
+            (None,None)=>captured.connection(&self.profile),_=>return Err(BackendFailure::Unavailable),
+        };
         let connected = tokio::select! {
             biased;
             _ = attempt.scope.closed() => return Err(BackendFailure::Disconnected),
@@ -372,16 +428,82 @@ impl NativeHostingBackend {
         let routing = borrowed(&self.profile.login_routing);
         // Only NotReady is retryable: actor has submitted NO login at that
         // point. Once any receipt/error other than NotReady arrives, no replay.
+        let derived=provisioned.as_ref().map(|plan|plan.fields_for(&attempt.owner,&attempt.scope)).transpose().map_err(|_|BackendFailure::Unavailable)?;
+        let login=||match &derived {
+            Some(fields)=>ArcLoginInputs{typed_identity:captured.identity.as_bytes(),domain_name:fields.domain_name,
+                selected_session_id:captured.selector.as_bytes(),phone_login_token:captured.password.as_bytes(),application_key:captured.appkey.as_bytes(),
+                domain_id:fields.domain_id,application_id:fields.application_id,device_info_cc:fields.device_info_cc,client_properties:&client},
+            None=>captured.login(&self.profile,&client),
+        };
         let submitted = tokio::time::timeout(self.profile.handshake_timeout, async {
             loop {
-                match commands.login(&attempt.owner, &attempt.scope, captured.login(&self.profile, &client), &routing).await {
+                match commands.login(&attempt.owner, &attempt.scope, login(), &routing).await {
                     Err(RuntimeError::Tls(TlsError::NotReady)) => tokio::time::sleep(TLS_RETRY_CADENCE).await,
                     result => return result,
                 }
             }
         }).await.map_err(|_| BackendFailure::Disconnected)?.map_err(|_| BackendFailure::Disconnected)?;
         if !submitted.submitted_on(&attempt.owner, &attempt.scope) { return Err(BackendFailure::Disconnected); }
+        Ok(())
+        };
+        if let Some(bootstrap)=&self.profile.bootstrap {
+            let deadline=began.checked_add(bootstrap.handoff_timeout).ok_or(BackendFailure::Unavailable)?;
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline),operation).await.map_err(|_|BackendFailure::Disconnected)??;
+        }else{operation.await?;}
         retirement.disarm(); Ok(())
+    }
+    async fn bootstrap_original(&self,attempt:&Arc<Attempt>,captured:&LoginCapture,prepared:transport_actor::PreparedRuntime)->Result<ProvisionedLogin,BackendFailure>{
+        let bootstrap=self.profile.bootstrap.as_ref().ok_or(BackendFailure::Unavailable)?;
+        let scope=attempt.bootstrap_scope.as_ref().ok_or(BackendFailure::Unavailable)?;
+        if prepared.connection_scope().matches(&attempt.scope)||!prepared.connection_scope().matches(scope){return Err(BackendFailure::Unavailable);}
+        let input=captured.connection(&self.profile);
+        let connected=tokio::select!{biased;
+            _=scope.closed()=>return Err(BackendFailure::Disconnected),
+            _=self.events.closed()=>return Err(BackendFailure::Disconnected),
+            result=self.connector.connect(&attempt.owner,scope,input)=>result.map_err(|_|BackendFailure::Disconnected)?,
+        };
+        let io=connected.into_original_io(&attempt.owner,scope,input).map_err(|_|BackendFailure::Disconnected)?;
+        let mut owning=attempt.bootstrap_handle.lock().await;
+        let(handle,mut events)=prepared.attach(io).map_err(|_|BackendFailure::Disconnected)?;
+        let commands=handle.command_handle();*owning=Some(handle);drop(owning);
+        let routing=borrowed(&bootstrap.routing);
+        let submitted=loop{
+            match commands.bootstrap(&attempt.owner,scope,captured.appkey.as_bytes(),&routing).await {
+                Err(RuntimeError::Tls(TlsError::NotReady))=>tokio::time::sleep(TLS_RETRY_CADENCE).await,
+                Ok(receipt) if receipt.submitted_on(&attempt.owner,scope)=>break receipt,
+                _=>return Err(BackendFailure::Unavailable),
+            }
+        };
+        let call_id=submitted.call_id.ok_or(BackendFailure::Unavailable)?;
+        let plan=loop{
+            let event=tokio::select!{biased;
+                _=self.events.closed()=>return Err(BackendFailure::Disconnected),
+                event=events.recv()=>event.ok_or(BackendFailure::Unavailable)?,
+            };
+            if event.terminal_failure(&attempt.owner,scope).is_some(){return Err(BackendFailure::Unavailable);}
+            let visible=event.into_events(&attempt.owner,scope).ok_or(BackendFailure::Disconnected)?;
+            let mut reply=None;
+            for event in visible {
+                match event {
+                    OfflineEvent::Bootstrap(value) if value.call_id()==call_id && reply.is_none()=>reply=Some(value),
+                    OfflineEvent::Control(_)=>{},_=>return Err(BackendFailure::Unavailable),
+                }
+            }
+            if let Some(reply)=reply{
+                break ProvisionedLogin::from_reply(&reply,&attempt.owner,scope,&attempt.scope,&bootstrap.account_trust,
+                    self.profile.reference_decode_key.as_ref(),bootstrap.client_key.as_ref()).map_err(|_|BackendFailure::Unavailable)?;
+            }
+        };
+        if !plan.original_source_scope().matches(scope){return Err(BackendFailure::Unavailable);}
+        // Immutable data is captured while source is still open. Now release
+        // that owning actor before ANY destination connect. A cancelled Join
+        // stays in this exact slot for logout cleanup; no active IO is replaced.
+        let mut owning=attempt.bootstrap_handle.lock().await;
+        let release=owning.as_mut().ok_or(BackendFailure::Disconnected)?.close().await;
+        if !release.io_released(){return Err(BackendFailure::Disconnected);}
+        *owning=None;
+        if !attempt.scope.is_open()||lock(&attempt.state).retired{return Err(BackendFailure::Disconnected);}
+        Ok(plan)
     }
     async fn status_original(&self, owner: AttemptOwner, status: i32, registration: GatewayRegistration<'_>) -> Result<(), BackendFailure> {
         if !matches!(status, STATUS_REGISTER | STATUS_UNREGISTER) { return Err(BackendFailure::Unavailable); }
@@ -414,6 +536,12 @@ impl NativeHostingBackend {
         let _work = attempt.work.lock().await;
         if lock(&attempt.state).released { return Ok(()); }
         let mut retirement = Retirement::new(attempt.clone());
+        let mut bootstrap=attempt.bootstrap_handle.lock().await;
+        if let Some(handle)=bootstrap.as_mut(){
+            let released=handle.close().await;
+            if !released.io_released(){return Err(BackendFailure::Disconnected);}
+        }
+        *bootstrap=None;drop(bootstrap);
         let mut owning = attempt.handle.lock().await;
         let Some(handle) = owning.as_mut() else {
             // work barrier guarantees the cancelled connector/attach future is
