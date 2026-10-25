@@ -116,8 +116,15 @@ impl Peer {
         self.send_call(CallKind::Reply, reply.expose_to_transport()).await
     }
     async fn eof(&mut self) {
-        assert!(self.receive().await.unwrap().is_none(), "no replay, retry or extra RPC on retirement");
-        assert!(self.received.is_empty());
+        match self.receive().await {
+            Ok(None) => {},
+            // Native retirement drops the original socket, not a promise of a
+            // TLS close_notify/FIN. Linux may RST when control bytes are unread.
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {},
+            Ok(Some(_)) => panic!("replay, retry or extra RPC on retirement"),
+            Err(error) => panic!("unexpected retirement IO error {error:?}"),
+        }
+        assert!(self.received.is_empty(), "retirement must not queue another native RPC");
     }
 }
 
@@ -461,10 +468,13 @@ async fn partial_initial_request_and_pong_writes_cannot_outlive_original_absolut
         }, Instant::now()).unwrap();
         // Directly exercise the production write helper with bound frames. The
         // payload distinction cannot create a new IO/RPC deadline or scope.
+        // Retain the original transport owner until the write future finishes.
+        // A temporary owner would close this same scope on leaving the branch,
+        // incorrectly testing Closed instead of an outstanding IO deadline.
+        let mut transport = super::super::packet_transport::OwnedPacketTransport::for_arc_session(owner.clone(), scope.clone(), PacketRoute::DirectTlsCarrier).unwrap();
         let groups = if let Some(kind) = kind {
             let payload = if kind == CallKind::Request { plan.request().unwrap() } else { b"" };
             let packets = encode_call_packets(kind, payload, TLS_FRAGMENT_THRESHOLD).unwrap();
-            let mut transport = super::super::packet_transport::OwnedPacketTransport::for_arc_session(owner.clone(), scope.clone(), PacketRoute::DirectTlsCarrier).unwrap();
             vec![transport.encode_tls_bytes(&owner, &scope, packets[0].expose_to_transport(), None).unwrap().unwrap()]
         } else { tls.take_wire_output(&owner, &scope, None, Instant::now()).unwrap() };
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
