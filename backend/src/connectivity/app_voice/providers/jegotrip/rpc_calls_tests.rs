@@ -91,3 +91,33 @@ fn unknown_call_method_is_refused_before_parsing_or_guessing_an_invitation(){
         assert!(decode_notice(method,&[0xff]).unwrap().is_none());
     }
 }
+#[test]
+fn inform_and_release_arguments_share_original_be64_map_but_results_do_not_require_accept_map(){
+    for operation in [CallOperation::Inform,CallOperation::Accept,CallOperation::Release]{
+        assert_eq!(encode_operation(operation,NativeCallId::from_bits(ID),&[]).unwrap().expose_to_transport(),ACCEPT_EMPTY);
+        assert!(!operation.method().is_empty());
+    }
+    for operation in [CallOperation::Inform,CallOperation::Release]{
+        let result=decode_operation_result(operation,0,&[0,1,0,0,0,0]).unwrap();assert!(result.accepted&&result.properties.is_empty());
+        assert!(!decode_operation_result(operation,0,&[0,0,0,0,0,0]).unwrap().accepted);
+        assert!(decode_operation_result(operation,1,&[0,1,0,0,0,0]).is_err());
+    }
+}
+#[test]
+fn notice_replies_preserve_the_native_invited_released_and_accepted_format_distinction(){
+    for kind in [CallNoticeKind::Invited,CallNoticeKind::Released]{
+        assert_eq!(encode_notice_result(kind,true,&[]).unwrap().expose_to_transport(),&[0,1,0,0,0,0]);
+        assert_eq!(encode_notice_result(kind,false,&[]).unwrap().expose_to_transport(),&[0,0,0,0,0,0]);
+        assert_eq!(encode_notice_result(kind,true,&[RpcProperty{key:b"p",value:b"v"}]).err(),Some(CodecError::InvalidField));
+    }
+    assert_eq!(encode_notice_result(CallNoticeKind::Accepted,true,&[]).unwrap().expose_to_transport(),&[0,1,0,0,0,0,0,0,0,0]);
+    assert!(encode_notice_result(CallNoticeKind::Accepted,true,&[RpcProperty{key:b"p",value:b"v"}]).is_ok());
+}
+#[test]
+fn call_operation_rejections_and_malformed_results_never_become_sdk_success_or_media_state(){
+    let values=[RpcProperty{key:b"endpoint",value:b"opaque"}];
+    let bytes=result(false,&values,b"");let rejected=decode_operation_result(CallOperation::Accept,0,&bytes).unwrap();assert!(!rejected.accepted);assert!(rejected.properties.contains(&values[0]));
+    let bytes=result(true,&values,b"rejected");assert!(!decode_operation_result(CallOperation::Accept,0,&bytes).unwrap().accepted);
+    assert!(decode_operation_result(CallOperation::Accept,0,&[0,1,0,0,0,0]).is_err());
+    assert_eq!(format!("{:?}",decode_operation_result(CallOperation::Inform,0,&[0,1,0,0,0,0]).unwrap()),"OperationResult(<redacted>)");
+}

@@ -7,6 +7,8 @@
 //! not replay or rebind. Bytes already accepted by IO/kernel cannot be recalled.
 use super::{
     arc_session::{ArcLoginInputs, ArcPhase},
+    call_binding::CallIncomingBinding,
+    call_delivery::CallReplyTicket,
     offline_backend::{OfflineBackend, OfflineEvent},
     packet_transport::{OwnedWireFrames, PacketRoute, RouterTiming},
     rpc_incoming::IncomingBinding,
@@ -108,6 +110,15 @@ impl Binding {
     }
     fn borrowed(&self) -> IncomingBinding<'_> { IncomingBinding { object_id: &self.object, domain: &self.domain, receiver_kind: &self.receiver } }
 }
+struct CallBinding{object:Zeroizing<Vec<u8>>,domain:Zeroizing<Vec<u8>>}
+impl CallBinding{
+    fn capture(binding:CallIncomingBinding<'_>)->Result<Self,RuntimeError>{
+        let values=[binding.object_id,binding.domain];let total=values.iter().map(|v|v.len()).sum::<usize>();
+        if total>MAX_PARAMETER_BYTES||values.iter().any(|v|v.is_empty()||v.len()>super::rpc_stream::MAX_FIELD_BYTES||v.contains(&b'*')||v.iter().any(u8::is_ascii_control)||v.windows(4).any(|w|w==b"ENC(")){return Err(RuntimeError::InvalidConfiguration);}
+        Ok(Self{object:Zeroizing::new(binding.object_id.to_vec()),domain:Zeroizing::new(binding.domain.to_vec())})
+    }
+    fn borrowed(&self)->CallIncomingBinding<'_>{CallIncomingBinding{object_id:&self.object,domain:&self.domain}}
+}
 struct Gateway { uri: String, status: i32, prefix: String, channel: String, int_code: String, number: String, password: String, metadata: Vec<Property> }
 impl Drop for Gateway {
     fn drop(&mut self) { self.uri.zeroize(); self.prefix.zeroize(); self.channel.zeroize(); self.int_code.zeroize(); self.number.zeroize(); self.password.zeroize(); }
@@ -130,8 +141,8 @@ impl Gateway {
 }
 
 enum Operation {
-    Login(Login, Vec<Property>), Bootstrap(Zeroizing<Vec<u8>>, Vec<Property>), Configure(u32, Option<Binding>), Logout(Vec<Property>),
-    Swap(Vec<Property>, Option<Gateway>), CompleteBatch(ServerRequestTicket, bool), CompleteDirect(DirectReplyTicket, bool),
+    Login(Login, Vec<Property>), Bootstrap(Zeroizing<Vec<u8>>, Vec<Property>), Configure(u32, Option<Binding>), ConfigureCalls(CallBinding), Logout(Vec<Property>),
+    Swap(Vec<Property>, Option<Gateway>), CompleteBatch(ServerRequestTicket, bool), CompleteDirect(DirectReplyTicket, bool), CompleteCall(CallReplyTicket,bool,Vec<Property>),
 }
 impl Operation {
     fn byte_length(&self) -> usize {
@@ -146,6 +157,8 @@ impl Operation {
                 + gateway.as_ref().map_or(0, |g| g.uri.len() + g.prefix.len() + g.channel.len() + g.int_code.len() + g.number.len() + g.password.len()
                     + g.metadata.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()),
             Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) => 0,
+            Self::ConfigureCalls(binding)=>binding.object.len()+binding.domain.len(),
+            Self::CompleteCall(_,_,properties)=>properties.iter().map(|p|p.key.len()+p.value.len()).sum(),
         }
     }
 }
@@ -293,6 +306,14 @@ impl RuntimeCommands {
         if !self.accepts(owner, scope) || !ticket.matches(owner, scope) { return Err(RuntimeError::Scope); }
         self.submit(owner, scope, Operation::CompleteDirect(ticket.captured_copy(), accepted)).await
     }
+    pub async fn configure_calls(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,binding:CallIncomingBinding<'_>)->Result<RuntimeReceipt,RuntimeError>{
+        if !self.accepts(owner,scope){return Err(RuntimeError::Scope);}
+        self.submit(owner,scope,Operation::ConfigureCalls(CallBinding::capture(binding)?)).await
+    }
+    pub async fn complete_call(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,ticket:&CallReplyTicket,accepted:bool,properties:&[RpcProperty<'_>])->Result<RuntimeReceipt,RuntimeError>{
+        if !self.accepts(owner,scope)||!ticket.matches(owner,scope){return Err(RuntimeError::Scope);}
+        self.submit(owner,scope,Operation::CompleteCall(ticket.captured_copy(),accepted,Property::capture(properties)?)).await
+    }
     /// This method returns only the matched original logout RPC result, not an
     /// IO release receipt. Hosting-register returns a submission receipt;
     /// hosting-unregister separately waits for its matched nested result.
@@ -355,6 +376,12 @@ impl RuntimeHandle {
         -> Result<RuntimeReceipt, RuntimeError> {
         if !self.accepts(owner, scope) || !ticket.matches(owner, scope) { return Err(RuntimeError::Scope); }
         self.submit(owner, scope, Operation::CompleteDirect(ticket.captured_copy(), accepted)).await
+    }
+    pub async fn configure_calls(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,binding:CallIncomingBinding<'_>)->Result<RuntimeReceipt,RuntimeError>{
+        self.command_handle().configure_calls(owner,scope,binding).await
+    }
+    pub async fn complete_call(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,ticket:&CallReplyTicket,accepted:bool,properties:&[RpcProperty<'_>])->Result<RuntimeReceipt,RuntimeError>{
+        self.command_handle().complete_call(owner,scope,ticket,accepted,properties).await
     }
     /// Confirm native logout separately from actual original IO/task release.
     /// Wrong-owner requests have no close side effect. Failed/cancelled logout
@@ -560,7 +587,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             let _ = command.completion.send(Err(RuntimeError::Timeout));
             return Err(RuntimeError::Timeout);
         }
-        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _)) {
+        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_)) {
             let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
         }
         if self.tls.phase() != TlsPhase::Verified {
@@ -569,7 +596,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
-        let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _));
+        let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_));
         let is_logout = matches!(&command.operation, Operation::Logout(_));
         let mut unhosting_sequence = None;
         let elapsed_ms = self.elapsed_ms(now);
@@ -579,6 +606,21 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 let receipt = result.map(|()| RuntimeReceipt { owner: self.owner.clone(), scope: self.scope.clone(), call_id: None });
                 if command.completion.send(receipt).is_err() { return Err(RuntimeError::Cancelled); }
                 return Ok(());
+            }
+            Operation::ConfigureCalls(binding)=>{
+                let result=self.backend.configure_calls(binding.borrowed()).map_err(|_|RuntimeError::Protocol);
+                if command.completion.send(result.map(|()|RuntimeReceipt{owner:self.owner.clone(),scope:self.scope.clone(),call_id:None})).is_err(){return Err(RuntimeError::Cancelled);}
+                return Ok(());
+            }
+            Operation::CompleteCall(ticket,accepted,properties)=>{
+                match self.backend.complete_call(&ticket,accepted,&borrowed(&properties)){
+                    Ok(Some(super::offline_backend::CallCompletion::Direct(packets)))=>Ok(packets),
+                    Ok(Some(super::offline_backend::CallCompletion::BatchQueued))=>{
+                        if command.completion.send(Ok(RuntimeReceipt{owner:self.owner.clone(),scope:self.scope.clone(),call_id:None})).is_err(){return Err(RuntimeError::Cancelled);}
+                        return Ok(());
+                    }
+                    _=>{let _=command.completion.send(Err(RuntimeError::Protocol));return Ok(());}
+                }
             }
             Operation::CompleteBatch(ticket, accepted) => {
                 let result = self.backend.complete_message(&ticket, accepted).and_then(|completed| {

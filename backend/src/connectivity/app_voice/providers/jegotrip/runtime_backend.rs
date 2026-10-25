@@ -12,6 +12,8 @@ use super::{
     arc_session::ArcLoginInputs,
     batch_scheduler::ServerRequestTicket,
     controller::Callback,
+    call_binding::CallIncomingBinding,
+    call_delivery::{CallReplyTicket,IncomingCallDelivery},
     legacy_config::ConfigDecodeKey,
     offline_backend::{OfflineEvent, ScheduledIncomingMessage},
     packet_transport::PacketRoute,
@@ -114,6 +116,9 @@ impl Binding {
     }
 }
 
+struct CallBinding { object:Zeroizing<Vec<u8>>, domain:Zeroizing<Vec<u8>> }
+impl CallBinding { fn borrowed(&self)->CallIncomingBinding<'_>{CallIncomingBinding{object_id:&self.object,domain:&self.domain}} }
+
 pub struct RuntimeBootstrapInputs<'a> {
     pub account_trust: AccountTrust,
     pub routing: &'a [RpcProperty<'a>],
@@ -135,12 +140,23 @@ pub struct RuntimeProfile {
     login_routing: Vec<Property>, gateway_uri: Zeroizing<String>, gateway_metadata: Vec<Property>,
     poll_routing: Vec<Property>, logout_routing: Vec<Property>, incoming: Option<Binding>,
     reference_decode_key: Option<ConfigDecodeKey>, handshake_timeout: Duration, partial_timeout: Duration,
-    io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>,
+    io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, call_incoming:Option<CallBinding>, byte_length:usize,
 }
 impl fmt::Debug for RuntimeProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RuntimeProfile(<redacted>)") }
 }
 impl RuntimeProfile {
+    pub fn with_call_receiver(mut self,binding:Option<CallIncomingBinding<'_>>)->Result<Self,ProfileError>{
+        if self.call_incoming.is_some(){return Err(ProfileError::InvalidConfiguration);}
+        if let Some(binding)=binding{
+            for value in [binding.object_id,binding.domain]{
+                if value.is_empty()||value.len()>MAX_FIELD_BYTES||value.contains(&b'*')||value.iter().any(u8::is_ascii_control)||value.windows(4).any(|w|w==b"ENC("){return Err(ProfileError::InvalidConfiguration);}
+                add_bytes(&mut self.byte_length,value.len())?;
+            }
+            self.call_incoming=Some(CallBinding{object:Zeroizing::new(binding.object_id.to_vec()),domain:Zeroizing::new(binding.domain.to_vec())});
+        }
+        Ok(self)
+    }
     pub fn supplied(input: RuntimeProfileInputs<'_>) -> Result<Self, ProfileError> { Self::capture(input,None) }
     /// Exact imported bootstrap TLS anchor plus separately imported account
     /// trust. Login domain/app/CC must come from the matched bootstrap, never
@@ -199,7 +215,7 @@ impl RuntimeProfile {
             gateway_metadata: routing(input.gateway_metadata, &mut total)?, poll_routing: routing(input.poll_routing, &mut total)?,
             logout_routing: routing(input.logout_routing, &mut total)?, incoming, reference_decode_key: input.reference_decode_key,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
-            io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap,
+            io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, call_incoming:None,byte_length:total,
         })
     }
 }
@@ -250,6 +266,7 @@ pub enum BackendEventPayload {
     Callback(OwnedRpcCallback),
     BatchMessage(ScheduledIncomingMessage),
     DirectMessage(IncomingProtocolMessage),
+    Call(IncomingCallDelivery),
     Terminal(BackendFailure),
 }
 impl BackendEvent {
@@ -352,6 +369,10 @@ impl NativeHostingBackend {
         ticket: &DirectReplyTicket, accepted: bool) -> Result<RuntimeReceipt, RuntimeError> {
         let attempt = self.original(owner).map_err(|_| RuntimeError::Scope)?;
         attempt.commands(owner, scope)?.complete_direct(owner, scope, ticket, accepted).await
+    }
+    pub async fn complete_call(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,ticket:&CallReplyTicket,accepted:bool,properties:&[RpcProperty<'_>])->Result<RuntimeReceipt,RuntimeError>{
+        let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;
+        attempt.commands(owner,scope)?.complete_call(owner,scope,ticket,accepted,properties).await
     }
     async fn login_original(&self, owner: AttemptOwner, request: SdkLoginRequest<'_>) -> Result<(), BackendFailure> {
         let captured = LoginCapture::capture(request, &self.profile)?;
@@ -640,7 +661,15 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                                 };
                                 let mut retirement = Retirement::new(attempt.clone());
                                 match commands.configure(&attempt.owner, &attempt.scope, attempt.incarnation, profile.incoming.as_ref().map(Binding::borrowed)).await {
-                                    Ok(receipt) if receipt.matches(&attempt.owner, &attempt.scope) => { lock(&attempt.state).configured = true; retirement.disarm(); }
+                                    Ok(receipt) if receipt.matches(&attempt.owner, &attempt.scope) => {
+                                        if let Some(binding)=&profile.call_incoming{
+                                            match commands.configure_calls(&attempt.owner,&attempt.scope,binding.borrowed()).await{
+                                                Ok(receipt)if receipt.matches(&attempt.owner,&attempt.scope)=>{},
+                                                _=>{terminal(&sender,&attempt,BackendFailure::Disconnected);return;}
+                                            }
+                                        }
+                                        lock(&attempt.state).configured = true; retirement.disarm();
+                                    }
                                     _ => { terminal(&sender, &attempt, BackendFailure::Disconnected); return; }
                                 }
                             }
@@ -660,6 +689,10 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                                 terminal(&sender, &attempt, BackendFailure::Disconnected); return;
                             }
                             BackendEventPayload::DirectMessage(message)
+                        }
+                        OfflineEvent::Call(call)=>{
+                            if call.owner()!=&attempt.owner||!call.ticket().matches(&attempt.owner,&attempt.scope){terminal(&sender,&attempt,BackendFailure::Disconnected);return;}
+                            BackendEventPayload::Call(call)
                         }
                         // No fake interpretation of control/bootstrap/outer ACK.
                         OfflineEvent::Control(_) => continue,

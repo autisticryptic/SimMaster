@@ -18,6 +18,8 @@ use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStrea
 use tokio_rustls::rustls;
 #[path="runtime_bootstrap_backend_tests.rs"]
 mod bootstrap;
+#[path="runtime_call_tests.rs"]
+mod calls;
 
 fn credentials(root: &str) -> ImportedCredentials {
     serde_json::from_value(serde_json::json!({

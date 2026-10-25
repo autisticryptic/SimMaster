@@ -62,6 +62,12 @@ impl fmt::Debug for IncomingBinding {
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CallIncomingConfig{pub object_id:Vec<u8>,pub domain:Vec<u8>}
+impl Drop for CallIncomingConfig{fn drop(&mut self){self.object_id.zeroize();self.domain.zeroize();}}
+impl fmt::Debug for CallIncomingConfig{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("CallIncomingConfig(<redacted>)")}}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BootstrapConfig {
     pub account_authority: Secret,
     pub account_root_der_base64: Secret,
@@ -92,6 +98,7 @@ pub struct ProfileConfig {
     pub poll_routing: Vec<ProfileProperty>,
     pub logout_routing: Vec<ProfileProperty>,
     pub incoming: Option<IncomingBinding>,
+    pub call_incoming:Option<CallIncomingConfig>,
     pub connect_timeout_ms: u64,
     pub handshake_timeout_ms: u64,
     pub partial_timeout_ms: u64,
@@ -164,7 +171,7 @@ impl AccountConfig {
             io_timeout: Duration::from_millis(p.io_timeout_ms),
             rpc_timeout: Duration::from_millis(p.rpc_timeout_ms),
         };
-        if let Some(bootstrap)=&self.bootstrap{
+        let profile=if let Some(bootstrap)=&self.bootstrap{
             if bootstrap.handoff_timeout_ms==0||bootstrap.handoff_timeout_ms>30_000
                 ||bootstrap.account_root_der_base64.expose_to_backend().len()>16_384{return Err(INVALID);}
             let routing=borrowed(&bootstrap.routing)?;
@@ -172,8 +179,9 @@ impl AccountConfig {
                 root_der_base64:bootstrap.account_root_der_base64.expose_to_backend(),enable_sni:bootstrap.account_enable_sni}).map_err(|_|INVALID)?;
             let client_key=self.credentials.sdk.client_config_decode_key.as_ref().map(|key|ConfigDecodeKey::supplied(key.expose_to_backend().as_bytes()).map_err(|_|INVALID)).transpose()?;
             RuntimeProfile::supplied_bootstrap(inputs,RuntimeBootstrapInputs{account_trust,routing:&routing,client_config_decode_key:client_key,
-                handoff_timeout:Duration::from_millis(bootstrap.handoff_timeout_ms)}).map_err(|_|INVALID)
-        }else{RuntimeProfile::supplied(inputs).map_err(|_|INVALID)}
+                handoff_timeout:Duration::from_millis(bootstrap.handoff_timeout_ms)}).map_err(|_|INVALID)?
+        }else{RuntimeProfile::supplied(inputs).map_err(|_|INVALID)?};
+        profile.with_call_receiver(p.call_incoming.as_ref().map(|binding|super::call_binding::CallIncomingBinding{object_id:&binding.object_id,domain:&binding.domain})).map_err(|_|INVALID)
     }
 
     /// Pure admission only: no DNS, network, SDK execution or readiness state.
@@ -289,13 +297,15 @@ impl Serialize for PrivateProperties<'_> {
 #[derive(Serialize)]
 struct PrivateIncomingRef<'a> { object_id: &'a [u8], domain: &'a [u8], receiver_kind: &'a [u8] }
 #[derive(Serialize)]
+struct PrivateCallIncomingRef<'a>{object_id:&'a [u8],domain:&'a [u8]}
+#[derive(Serialize)]
 struct PrivateProfileRef<'a> {
     route: &'static str, authority: &'a str, enable_sni: bool, identity_type: &'a str,
     domain_name: Option<&'a str>, domain_id: Option<&'a str>, application_id: Option<&'a str>, device_info_cc: Option<&'a str>,
     client_properties: PrivateProperties<'a>, include_device_id: bool,
     login_routing: PrivateProperties<'a>, gateway_uri: &'a str,
     gateway_metadata: PrivateProperties<'a>, poll_routing: PrivateProperties<'a>,
-    logout_routing: PrivateProperties<'a>, incoming: Option<PrivateIncomingRef<'a>>,
+    logout_routing: PrivateProperties<'a>, incoming: Option<PrivateIncomingRef<'a>>,call_incoming:Option<PrivateCallIncomingRef<'a>>,
     connect_timeout_ms: u64, handshake_timeout_ms: u64, partial_timeout_ms: u64,
     io_timeout_ms: u64, rpc_timeout_ms: u64,
 }
@@ -334,6 +344,7 @@ impl<'a> PrivateConfigRef<'a> {
                 gateway_uri: p.gateway_uri.expose_to_backend(), gateway_metadata: private_properties(&p.gateway_metadata),
                 poll_routing: private_properties(&p.poll_routing), logout_routing: private_properties(&p.logout_routing),
                 incoming: p.incoming.as_ref().map(|b| PrivateIncomingRef { object_id: &b.object_id, domain: &b.domain, receiver_kind: &b.receiver_kind }),
+                call_incoming:p.call_incoming.as_ref().map(|binding|PrivateCallIncomingRef{object_id:&binding.object_id,domain:&binding.domain}),
                 connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
                 partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
             },

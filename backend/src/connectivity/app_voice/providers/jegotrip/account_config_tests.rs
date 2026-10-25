@@ -28,6 +28,7 @@ fn fixture(root: &str) -> AccountConfig {
         logout_routing: vec![ProfileProperty { key: vec![0xfc], value: vec![0, 0xff] }],
         incoming: Some(IncomingBinding { object_id: b"#fixture-client".to_vec(), domain: b"fixture-domain".to_vec(),
             receiver_kind: b"fixture.kind".to_vec() }),
+        call_incoming:None,
         connect_timeout_ms: 1000, handshake_timeout_ms: 3000, partial_timeout_ms: 300,
         io_timeout_ms: 2000, rpc_timeout_ms: 2000,
     } }
@@ -365,4 +366,23 @@ fn bootstrap_import_does_not_alias_client_key_to_common_or_replace_original_cred
     assert_eq!(config.credentials.hosting.sip_password.expose_to_backend(), gateway);
     config.credentials.sdk.reference_decode_key = None;
     assert!(config.credentials.sdk.client_config_decode_key.is_some()); assert_eq!(config.validate(100), Err(INVALID));
+}
+#[test]
+fn private_call_receiver_roundtrip_keeps_original_binding_without_default_install_or_scope_grant(){
+    let cert=Certificates::generate("DNS:fixture.invalid");let mut config=fixture(&cert.root);
+    config.profile.call_incoming=Some(CallIncomingConfig{object_id:b"#fixture-call-client".to_vec(),domain:b"fixture-call-domain".to_vec()});
+    assert_eq!(config.validate(100),Ok(()));let bytes=config.encode_private().unwrap();let restored=AccountConfig::decode_private(&bytes).unwrap();
+    let binding=restored.profile.call_incoming.as_ref().unwrap();assert_eq!(binding.object_id,b"#fixture-call-client");assert_eq!(binding.domain,b"fixture-call-domain");
+    assert_eq!(format!("{binding:?}"),"CallIncomingConfig(<redacted>)");assert_eq!(bytes.as_slice(),restored.encode_private().unwrap().as_slice());
+    config.profile.call_incoming=None;let old=config.encode_private().unwrap();let text=std::str::from_utf8(&old).unwrap();assert!(text.contains("\"call_incoming\":null,"));
+    let legacy=Zeroizing::new(text.replace("\"call_incoming\":null,",""));
+    assert!(AccountConfig::decode_private(legacy.as_bytes()).unwrap().profile.call_incoming.is_none());
+}
+#[test]
+fn invalid_call_receiver_binding_fails_pure_configuration_before_native_io(){
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    for value in [b"".as_slice(),b"*",b"ENC(unresolved)",b"has\0control"]{
+        let mut config=fixture(&cert.root);config.profile.call_incoming=Some(CallIncomingConfig{object_id:value.to_vec(),domain:b"fixture-domain".to_vec()});assert_eq!(config.validate(100),Err(INVALID));
+        let mut config=fixture(&cert.root);config.profile.call_incoming=Some(CallIncomingConfig{object_id:b"#fixture-call-client".to_vec(),domain:value.to_vec()});assert_eq!(config.validate(100),Err(INVALID));
+    }
 }

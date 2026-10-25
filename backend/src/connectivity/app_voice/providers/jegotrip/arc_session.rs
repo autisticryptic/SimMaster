@@ -222,6 +222,12 @@ impl ArcRpcSession {
         super::rpc_incoming::IncomingDispatcher::for_arc_session(self.owner.clone(), self.connection.clone(), binding)
     }
 
+    pub fn incoming_call_dispatcher(&self,binding:super::call_binding::CallIncomingBinding<'_>)
+        ->Result<super::call_binding::CallDispatcher,CodecError>{
+        if self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField);}
+        super::call_binding::CallDispatcher::for_arc_session(self.owner.clone(),self.connection.clone(),binding)
+    }
+
     /// Enable exactly one owned scheduler before any raw swap submission. The
     /// nonzero incarnation is generated/imported locally, never a credential or
     /// endpoint default. Configuring this engine performs no network operation.

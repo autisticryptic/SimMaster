@@ -29,6 +29,7 @@ fn fixture(root: &str) -> AccountConfig {
         poll_routing: vec![], logout_routing: vec![],
         incoming: Some(IncomingBinding { object_id: b"#fixture-client".to_vec(), domain: b"fixture-domain".to_vec(),
             receiver_kind: b"fixture.kind".to_vec() }),
+        call_incoming:None,
         connect_timeout_ms: 1000, handshake_timeout_ms: 3000, partial_timeout_ms: 300,
         io_timeout_ms: 2000, rpc_timeout_ms: 2000,
     } }

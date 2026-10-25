@@ -697,7 +697,7 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('writer.u64(call_id.0)?', calls)
         self.assertIn('let footer = read_footer(&mut reader)?', calls)
         self.assertIn('if !accepted || !footer.reason.is_empty()', calls)
-        self.assertIn('else { return Ok(None); }', calls)
+        self.assertIn('let Some(kind)=notice_kind(method)else{return Ok(None);}', calls)
 
     def test_call_codec_is_opaque_data_not_receiver_permission_or_media_readiness(self):
         calls = (MOD / 'rpc_calls.rs').read_text(encoding='utf-8')
@@ -710,6 +710,40 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('unknown_call_method_is_refused_before_parsing', tests)
         for name in ['beta-validation.yml', 'build-release.yml']:
             self.assertIn('connectivity::app_voice::providers::jegotrip::rpc_calls::tests',
+                          (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_original_call_receivers_and_branded_reply_shapes_are_separate_from_sms(self):
+        binding = (MOD / 'call_binding.rs').read_text(encoding='utf-8')
+        self.assertIn('property(b"id") != Some(self.object_id.as_slice())', binding)
+        self.assertIn('property(b"domain") != Some(self.domain.as_slice())', binding)
+        self.assertIn('incoming.ticket().matches(&self.owner, &self.scope)', binding)
+        self.assertNotIn('from_utf8_lossy', binding)
+        delivery = (MOD / 'call_delivery.rs').read_text(encoding='utf-8')
+        self.assertIn('pub struct CallReplyTicket', delivery)
+        self.assertIn('kind:CallNoticeKind,native_id:NativeCallId', delivery)
+        self.assertNotIn('derive(Serialize)', delivery)
+        protocol = (MOD / 'arc_protocol.rs').read_text(encoding='utf-8')
+        self.assertIn('DirectResponse::Call{kind,native_id}', protocol)
+        self.assertIn('IncomingCallDelivery::from_direct', protocol)
+        self.assertIn('encode_notice_result(ticket.kind(),accepted,properties)', protocol)
+        self.assertIn('CompleteCall', (MOD / 'transport_actor.rs').read_text(encoding='utf-8'))
+
+    def test_runtime_call_binding_is_installed_only_after_real_original_sdk_login(self):
+        backend = (MOD / 'runtime_backend.rs').read_text(encoding='utf-8')
+        pump = backend.split('async fn event_pump(', 1)[1]
+        self.assertIn('commands.configure_calls(&attempt.owner,&attempt.scope,binding.borrowed())', pump)
+        self.assertIn('BackendEventPayload::Call(call)', pump)
+        self.assertNotIn('Callback::Channels { calls: true', pump)
+        offline = (MOD / 'offline_backend.rs').read_text(encoding='utf-8')
+        self.assertIn('self.scheduler.is_none()||self.phase()!=ArcPhase::Authenticated', offline)
+        self.assertIn('CallCompletion::BatchQueued', offline)
+        self.assertIn('call_pending.get(&key)!=Some(&(ticket.kind(),ticket.native_id()))', offline)
+        tests = (MOD / 'runtime_call_tests.rs').read_text(encoding='utf-8')
+        for name in ['direct_invited_accepted_released_keep_original_ticket', 'batch_call_completion_is_original_queued_result',
+                     'uninstalled_call_receiver_never_fabricates', 'wrong_call_receiver_domain_fails', 'retired_call_reply_capability']:
+            self.assertIn(name, tests)
+        for name in ['beta-validation.yml', 'build-release.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::call_binding::tests',
                           (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
 
 

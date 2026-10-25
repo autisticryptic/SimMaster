@@ -500,6 +500,14 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                             *lock(&run.error) = Some(controller_error(reason)); run.retire();
                         }
                     }
+                    BackendEventPayload::Call(call)=>{
+                        // The original receiver/receipt path is distinct from
+                        // answering. Until the owned call/media runtime is
+                        // attached, refuse this exact original notification;
+                        // do not grant Channels or reinterpret it as SMS.
+                        *lock(&run.error)=Some("app_account_call_runtime_unavailable");
+                        if run.backend.complete_call(&owner,&scope,call.ticket(),false,&[]).await.is_err(){run.retire();}
+                    }
                     BackendEventPayload::Terminal(reason) => {
                         let _ = controller.on_callback(&owner, Callback::Failure(reason), unix_now()).await;
                         let mut error = lock(&run.error);

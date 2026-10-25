@@ -7,6 +7,9 @@ use super::{
     arc_protocol::{ArcProtocol, IncomingProtocolMessage, OwnedCallPackets, ProtocolError, ProtocolEvent},
     arc_session::{ArcLoginInputs, ArcPhase, ArcReply, OwnedBootstrapReply, OwnedLogoutReply},
     batch_scheduler::{BatchScheduler, ServerRequestTicket},
+    call_binding::{CallIncomingBinding,CallDispatcher},
+    call_delivery::{IncomingCallDelivery,CallReplyTicket,CallReplySource},
+    rpc_calls::{CallNoticeKind,NativeCallId,notice_kind,encode_notice_result},
     native_events::IncomingMessage,
     rpc_incoming::{encode_online_message_result, IncomingBinding, IncomingDispatcher},
     rpc_pending::{HostingRpcTracker, OwnedRpcCallback, OwnedUnhostingReply, RpcConnectionScope},
@@ -36,6 +39,7 @@ pub enum OfflineEvent {
     Callback(OwnedRpcCallback),
     Message(ScheduledIncomingMessage),
     DirectMessage(IncomingProtocolMessage),
+    Call(IncomingCallDelivery),
     Outgoing(OwnedCallPackets),
     Control(super::transport_packets::CallKind),
 }
@@ -44,11 +48,15 @@ impl fmt::Debug for OfflineEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("OfflineEvent(<redacted>)") }
 }
 
+pub(super) enum CallCompletion{Direct(OwnedCallPackets),BatchQueued}
+
 pub struct OfflineBackend {
     protocol: ArcProtocol,
     tracker: HostingRpcTracker,
     scheduler: Option<BatchScheduler>,
     dispatcher: Option<IncomingDispatcher>,
+    call_dispatcher:Option<CallDispatcher>,
+    call_pending:BTreeMap<(u32,i32),(CallNoticeKind,NativeCallId)>,
     swaps: BTreeMap<i32, u64>,
 }
 
@@ -63,7 +71,7 @@ impl OfflineBackend {
     pub fn new(owner: AttemptOwner) -> Self {
         let mut protocol = ArcProtocol::new(owner);
         let tracker = protocol.take_hosting_tracker().expect("fresh ARC tracker");
-        Self { protocol, tracker, scheduler: None, dispatcher: None, swaps: BTreeMap::new() }
+        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,call_pending:BTreeMap::new(),swaps: BTreeMap::new() }
     }
     pub fn phase(&self) -> ArcPhase { self.protocol.phase() }
     pub(super) fn is_pending(&self, id: i32) -> bool { self.protocol.is_pending(id) }
@@ -87,11 +95,13 @@ impl OfflineBackend {
     pub fn close(&mut self) {
         self.protocol.close(); if let Some(s) = &mut self.scheduler { s.close(); }
         self.tracker.retire_all();
-        self.swaps.clear(); self.dispatcher = None;
+        self.swaps.clear(); self.dispatcher = None;self.call_dispatcher=None;self.call_pending.clear();
     }
     pub fn prepare_login(&mut self, inputs: ArcLoginInputs<'_>, routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_login(inputs, routing) }
-    pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_logout(routing) }
+    pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
+        let packets=self.protocol.prepare_logout(routing)?;self.call_dispatcher=None;self.call_pending.clear();Ok(packets)
+    }
     pub fn prepare_bootstrap(&mut self, key: &[u8], routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_bootstrap(key, routing) }
 
@@ -109,6 +119,12 @@ impl OfflineBackend {
         }
         self.scheduler = Some(self.protocol.take_batch_scheduler(incarnation)?);
         Ok(())
+    }
+
+    pub fn configure_calls(&mut self,binding:CallIncomingBinding<'_>)->Result<(),ProtocolError>{
+        if self.call_dispatcher.is_some()||self.scheduler.is_none()||self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField.into());}
+        let copy=CallIncomingBinding{object_id:binding.object_id,domain:binding.domain};self.protocol.install_calls(copy)?;
+        self.call_dispatcher=Some(CallDispatcher::for_arc_session(self.tracker.batch_owner()?,self.protocol.connection_scope(),binding)?);Ok(())
     }
 
     pub fn queue_hosting(&mut self, owner: AttemptOwner, uri: &str, status: i32,
@@ -155,7 +171,7 @@ impl OfflineBackend {
         packet: &[u8], now_ms: u64) -> Result<Vec<OfflineEvent>, ProtocolError> {
         let mut events = Vec::new(); let mut processing_error = None;
         let scheduler = &mut self.scheduler; let tracker = &mut self.tracker;
-        let dispatcher = &self.dispatcher; let swaps = &mut self.swaps;
+        let dispatcher = &self.dispatcher;let call_dispatcher=&self.call_dispatcher;let call_pending=&mut self.call_pending;let swaps = &mut self.swaps;
         let result = self.protocol.on_plaintext_packet(owner, scope, packet, |event| {
             match event {
                 ProtocolEvent::Reply(ArcReply::Login(callback)) | ProtocolEvent::Reply(ArcReply::Failure(callback)) =>
@@ -170,6 +186,22 @@ impl OfflineBackend {
                     for callback in tracker.on_scheduled_delivery(&delivery) { events.push(OfflineEvent::Callback(callback)); }
                     for reply in tracker.take_unhosting_replies() { events.push(OfflineEvent::Unhosting(reply)); }
                     for incoming in delivery.requests {
+                        if let Some(kind)=notice_kind(incoming.request().method){
+                            let Some(dispatcher)=call_dispatcher.as_ref()else{processing_error=Some(super::transport_packets::TransportError::UnsupportedKind.into());return;};
+                            let decoded=match dispatcher.on_batch_request(&incoming){Ok(value)=>value,Err(error)=>{processing_error=Some(error.into());return;}};
+                            if let Some(notice)=decoded{
+                                let key=(incoming.ticket().peer_incarnation(),incoming.ticket().sequence());
+                                if call_pending.len()>=super::rpc_stream::MAX_MAP_ENTRIES||call_pending.contains_key(&key){processing_error=Some(CodecError::TooLarge.into());return;}
+                                call_pending.insert(key,(kind,notice.native_id()));
+                                match IncomingCallDelivery::from_batch(notice,incoming.into_ticket()){
+                                    Ok(call)=>events.push(OfflineEvent::Call(call)),Err(error)=>{processing_error=Some(error.into());return;}
+                                }
+                            }else{
+                                let result=match encode_notice_result(kind,false,&[]){Ok(bytes)=>bytes,Err(error)=>{processing_error=Some(error.into());return;}};
+                                if let Err(error)=scheduler.complete_server_request(incoming.ticket(),0,result.expose_to_transport()){processing_error=Some(error.into());return;}
+                            }
+                            continue;
+                        }
                         if incoming.request().method != super::rpc_incoming::ONLINE_MESSAGE_METHOD.as_bytes()
                             || dispatcher.is_none() {
                             processing_error = Some(super::transport_packets::TransportError::UnsupportedKind.into());
@@ -194,6 +226,7 @@ impl OfflineBackend {
                 ProtocolEvent::Reply(ArcReply::Bootstrap(configuration)) => events.push(OfflineEvent::Bootstrap(configuration)),
                 ProtocolEvent::Control(kind) => events.push(OfflineEvent::Control(kind)),
                 ProtocolEvent::Incoming(message) => events.push(OfflineEvent::DirectMessage(message)),
+                ProtocolEvent::IncomingCall(call)=>events.push(OfflineEvent::Call(call)),
                 ProtocolEvent::OutgoingReply(reply) => events.push(OfflineEvent::Outgoing(reply)),
             }
         });
@@ -204,6 +237,7 @@ impl OfflineBackend {
     }
 
     pub fn complete_message(&mut self, ticket: &ServerRequestTicket, accepted: bool) -> Result<bool, ProtocolError> {
+        if self.call_pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())){return Err(CodecError::InvalidField.into());}
         let bytes = encode_online_message_result(accepted)?;
         let result = self.scheduler.as_mut().ok_or(CodecError::InvalidField)?
             .complete_server_request(ticket, 0, bytes.expose_to_transport());
@@ -215,6 +249,20 @@ impl OfflineBackend {
 
     pub fn complete_direct_message(&mut self, ticket: &super::arc_protocol::DirectReplyTicket, accepted: bool)
         -> Result<Option<OwnedCallPackets>, ProtocolError> { self.protocol.complete_incoming(ticket, accepted) }
+    pub(super) fn complete_call(&mut self,ticket:&CallReplyTicket,accepted:bool,properties:&[RpcProperty<'_>])->Result<Option<CallCompletion>,ProtocolError>{
+        if !ticket.matches(&self.tracker.batch_owner()?,&self.protocol.connection_scope()){return Ok(None);}
+        match ticket.source(){
+            CallReplySource::Direct(_)=>self.protocol.complete_call(ticket,accepted,properties).map(|value|value.map(CallCompletion::Direct)),
+            CallReplySource::Batch(inner)=>{
+                let key=(inner.peer_incarnation(),inner.sequence());
+                if self.call_pending.get(&key)!=Some(&(ticket.kind(),ticket.native_id())){return Ok(None);}
+                let result=encode_notice_result(ticket.kind(),accepted,properties)?;
+                if self.scheduler.as_mut().ok_or(CodecError::InvalidField)?.complete_server_request(inner,0,result.expose_to_transport())?{
+                    self.call_pending.remove(&key);Ok(Some(CallCompletion::BatchQueued))
+                }else{Ok(None)}
+            }
+        }
+    }
 }
 
 #[cfg(test)]
