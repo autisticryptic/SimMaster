@@ -28,7 +28,7 @@ fn fixture(root: &str) -> AccountConfig {
         logout_routing: vec![ProfileProperty { key: vec![0xfc], value: vec![0, 0xff] }],
         incoming: Some(IncomingBinding { object_id: b"#fixture-client".to_vec(), domain: b"fixture-domain".to_vec(),
             receiver_kind: b"fixture.kind".to_vec() }),
-        call_incoming:None,
+        call_incoming:None,call_control:None,
         connect_timeout_ms: 1000, handshake_timeout_ms: 3000, partial_timeout_ms: 300,
         io_timeout_ms: 2000, rpc_timeout_ms: 2000,
     } }
@@ -384,5 +384,22 @@ fn invalid_call_receiver_binding_fails_pure_configuration_before_native_io(){
     for value in [b"".as_slice(),b"*",b"ENC(unresolved)",b"has\0control"]{
         let mut config=fixture(&cert.root);config.profile.call_incoming=Some(CallIncomingConfig{object_id:value.to_vec(),domain:b"fixture-domain".to_vec()});assert_eq!(config.validate(100),Err(INVALID));
         let mut config=fixture(&cert.root);config.profile.call_incoming=Some(CallIncomingConfig{object_id:b"#fixture-call-client".to_vec(),domain:value.to_vec()});assert_eq!(config.validate(100),Err(INVALID));
+    }
+}
+#[test]
+fn call_control_routing_private_roundtrip_preserves_original_target_and_never_implies_paid_authorization(){
+    let cert=Certificates::generate("DNS:fixture.invalid");let mut config=fixture(&cert.root);
+    config.profile.call_incoming=Some(CallIncomingConfig{object_id:b"#fixture-call-client".to_vec(),domain:b"fixture-domain".to_vec()});
+    config.profile.call_control=Some(vec![ProfileProperty{key:b"id".to_vec(),value:b"#fixture-server".to_vec()},ProfileProperty{key:b"domain".to_vec(),value:b"fixture-domain".to_vec()}]);
+    assert_eq!(config.validate(100),Ok(()));let bytes=config.encode_private().unwrap();let restored=AccountConfig::decode_private(&bytes).unwrap();
+    assert_eq!(restored.profile.call_control.as_ref().unwrap()[0].value,b"#fixture-server");assert_eq!(bytes.as_slice(),restored.encode_private().unwrap().as_slice());
+    config.profile.call_incoming=None;assert_eq!(config.validate(100),Err(INVALID));
+}
+#[test]
+fn call_control_auth_keys_or_unparsed_endpoint_substitutes_fail_before_any_original_socket(){
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    for key in [b"pwd".as_slice(),b"token"]{
+        let mut config=fixture(&cert.root);config.profile.call_incoming=Some(CallIncomingConfig{object_id:b"#fixture-call-client".to_vec(),domain:b"fixture-domain".to_vec()});
+        config.profile.call_control=Some(vec![ProfileProperty{key:b"id".to_vec(),value:b"#fixture-server".to_vec()},ProfileProperty{key:b"domain".to_vec(),value:b"fixture-domain".to_vec()},ProfileProperty{key:key.to_vec(),value:b"not-sdk-secret".to_vec()}]);assert_eq!(config.validate(100),Err(INVALID));
     }
 }

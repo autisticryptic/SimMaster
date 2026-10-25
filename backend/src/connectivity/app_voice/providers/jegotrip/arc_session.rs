@@ -9,6 +9,9 @@ use super::{
     packet_transport::{OwnedPacketTransport, PacketRoute},
     tls_engine::{TlsEngine, TlsError, TlsParameters},
     controller::Callback,
+    call_control::{CallBook,CallControlTicket,OwnedCallOperationReply},
+    call_binding::OwnedCallNotice,
+    rpc_calls::{CallOperation,encode_operation,decode_operation_result},
     rpc_batch::{decode_swap_calls_reply, encode_swap_calls, BatchPayload, BatchReply, SWAP_CALLS_METHOD},
     rpc_bootstrap::{decode_get_app_configs_result, encode_get_app_configs, AppConfigsResult, GET_APP_CONFIGS_METHOD},
     rpc_envelope::{decode_reply, encode_request},
@@ -50,10 +53,11 @@ impl Drop for ArcAuthentication {
 }
 
 #[derive(Clone, Copy)]
-enum PendingKind { Bootstrap, Login, Swap, Logout }
+enum PendingKind { Bootstrap, Login, Swap, Logout, Call }
+struct PendingCall{ticket:CallControlTicket,operation:CallOperation}
 
 struct PendingRpc {
-    kind: PendingKind, selected_session_id: Option<Vec<u8>>, scheduler: Option<Arc<()>>,
+    kind: PendingKind, selected_session_id: Option<Vec<u8>>, scheduler: Option<Arc<()>>,call:Option<PendingCall>,
 }
 impl Drop for PendingRpc {
     fn drop(&mut self) { if let Some(selector) = &mut self.selected_session_id { selector.zeroize(); } }
@@ -71,6 +75,7 @@ pub struct ArcRpcSession {
     hosting_tracker_taken: bool,
     batch_scheduler_taken: bool,
     packet_transport_taken: bool,
+    call_book:CallBook,
 }
 
 impl fmt::Debug for ArcRpcSession {
@@ -165,6 +170,7 @@ pub enum ArcReply<'a> {
     Login(OwnedRpcCallback),
     Swap(OwnedBatchReply<'a>),
     Failure(OwnedRpcCallback),
+    Call(OwnedCallOperationReply),
 }
 
 impl fmt::Debug for ArcReply<'_> {
@@ -173,9 +179,10 @@ impl fmt::Debug for ArcReply<'_> {
 
 impl ArcRpcSession {
     pub fn new(owner: AttemptOwner) -> Self {
-        Self { owner, connection: RpcConnectionScope::fresh(), phase: ArcPhase::Initial,
+        let connection=RpcConnectionScope::fresh();let call_book=CallBook::new(owner.clone(),connection.clone());
+        Self { owner, connection, phase: ArcPhase::Initial,
             next_id: Some(1), pending: BTreeMap::new(), authentication: None, hosting_tracker_taken: false,
-            batch_scheduler_taken: false, packet_transport_taken: false }
+            batch_scheduler_taken: false, packet_transport_taken: false,call_book }
     }
 
     pub fn connection_scope(&self) -> RpcConnectionScope { self.connection.clone() }
@@ -228,6 +235,30 @@ impl ArcRpcSession {
         super::call_binding::CallDispatcher::for_arc_session(self.owner.clone(),self.connection.clone(),binding)
     }
 
+    pub(super) fn configure_call_control(&mut self,routing:&[RpcProperty<'_>])->Result<(),CodecError>{
+        if self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField);}
+        self.call_book.configure(routing)
+    }
+    pub(super) fn register_call_notice(&mut self,notice:&OwnedCallNotice)->Result<Option<CallControlTicket>,CodecError>{
+        if self.phase()!=ArcPhase::Authenticated||!notice.matches(&self.owner,&self.connection){return Err(CodecError::InvalidField);}
+        if self.call_book.is_configured(){self.call_book.register(notice)}else{Ok(None)}
+    }
+    pub(super) fn call_acknowledged(&mut self,ticket:&CallControlTicket,accepted:bool)->Result<(),CodecError>{self.call_book.acknowledged(ticket,accepted)}
+    pub(super) fn call_acknowledgement_ready(&self,ticket:&CallControlTicket)->bool{self.call_book.acknowledgement_ready(ticket)}
+    pub(super) fn prepare_call(&mut self,ticket:&CallControlTicket,operation:CallOperation,properties:&[RpcProperty<'_>])->Result<(i32,RpcBytes),CodecError>{
+        if self.phase()!=ArcPhase::Authenticated||!ticket.matches(&self.owner,&self.connection){return Err(CodecError::InvalidField);}
+        if self.pending.len()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
+        let id=self.next_id.ok_or(CodecError::InvalidCallId)?;let arguments=encode_operation(operation,ticket.native_id(),properties)?;
+        let bytes={
+            let mut metadata=self.call_book.prepare(ticket,operation)?;let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
+            metadata.push(RpcProperty{key:b"token",value:&auth.token});encode_request(id,&metadata,operation.method().as_bytes(),arguments.expose_to_transport())?
+        };
+        self.next_id=id.checked_add(1);
+        self.pending.insert(id,PendingRpc{kind:PendingKind::Call,selected_session_id:None,scheduler:None,call:Some(PendingCall{ticket:ticket.captured_copy(),operation})});
+        if let Err(error)=self.call_book.submitted(ticket,operation){self.pending.remove(&id);return Err(error);}
+        Ok((id,bytes))
+    }
+
     /// Enable exactly one owned scheduler before any raw swap submission. The
     /// nonzero incarnation is generated/imported locally, never a credential or
     /// endpoint default. Configuring this engine performs no network operation.
@@ -258,7 +289,7 @@ impl ArcRpcSession {
         reject_auth_keys(routing)?;
         let arguments = encode_get_app_configs(application_key)?;
         self.allocate(routing, GET_APP_CONFIGS_METHOD.as_bytes(), arguments.expose_to_transport(),
-            PendingRpc { kind: PendingKind::Bootstrap, selected_session_id: None, scheduler: None })
+            PendingRpc { kind: PendingKind::Bootstrap, selected_session_id: None, scheduler: None,call:None })
     }
 
     /// The imported phone token is per-call metadata `pwd`, not a method string
@@ -298,7 +329,7 @@ impl ArcRpcSession {
         metadata.push(RpcProperty { key: b"pwd", value: inputs.phone_login_token });
         let selected_session_id = inputs.selected_session_id.to_vec();
         let prepared = self.allocate(&metadata, LOGIN_SESSION_METHOD.as_bytes(), arguments.expose_to_transport(),
-            PendingRpc { kind: PendingKind::Login, selected_session_id: Some(selected_session_id), scheduler: None })?;
+            PendingRpc { kind: PendingKind::Login, selected_session_id: Some(selected_session_id), scheduler: None,call:None })?;
         self.phase = ArcPhase::LoginPending;
         Ok(prepared)
     }
@@ -314,8 +345,8 @@ impl ArcRpcSession {
         let mut metadata = routing.to_vec(); metadata.push(RpcProperty { key: b"token", value: &auth.token });
         let bytes = encode_request(self.next_id.ok_or(CodecError::InvalidCallId)?, &metadata, LOGOUT_SESSION_METHOD.as_bytes(), arguments.expose_to_transport())?;
         let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
-        self.next_id = id.checked_add(1); self.pending.clear();
-        self.pending.insert(id, PendingRpc { kind: PendingKind::Logout, selected_session_id: None, scheduler: None });
+        self.next_id = id.checked_add(1); self.pending.clear();self.call_book.close();
+        self.pending.insert(id, PendingRpc { kind: PendingKind::Logout, selected_session_id: None, scheduler: None,call:None });
         self.phase = ArcPhase::LogoutPending; Ok((id, bytes))
     }
 
@@ -348,7 +379,7 @@ impl ArcRpcSession {
         if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
         let bytes = encode_request(id, &metadata, SWAP_CALLS_METHOD.as_bytes(), arguments.expose_to_transport())?;
         self.next_id = id.checked_add(1);
-        self.pending.insert(id, PendingRpc { kind: PendingKind::Swap, selected_session_id: None, scheduler });
+        self.pending.insert(id, PendingRpc { kind: PendingKind::Swap, selected_session_id: None, scheduler,call:None });
         Ok((id, bytes))
     }
 
@@ -364,7 +395,7 @@ impl ArcRpcSession {
         self.phase = ArcPhase::Closed;
         self.connection.close();
         self.authentication = None;
-        self.pending.clear();
+        self.pending.clear();self.call_book.close();
     }
 
     pub fn accepts_scope(&self, owner: &AttemptOwner, connection: &RpcConnectionScope) -> bool {
@@ -390,6 +421,16 @@ impl ArcRpcSession {
         };
         let Some(mut pending) = self.pending.remove(&reply.call_id) else { return Ok(None); };
         let result = match pending.kind {
+            PendingKind::Call=>{
+                let Some(call)=pending.call.take()else{self.close();return Err(CodecError::InvalidField);};
+                let material=match decode_operation_result(call.operation,reply.result_code,reply.result_stream){
+                    Ok(value)=>Some(value),Err(CodecError::RemoteFailure)=>None,Err(error)=>{self.close();return Err(error);}
+                };
+                let accepted=material.as_ref().is_some_and(|value|value.accepted);
+                let valid=self.call_book.result(&call.ticket,call.operation,accepted);
+                let properties=material.as_ref().map_or(&[][..],|value|value.properties.as_slice());
+                ArcReply::Call(OwnedCallOperationReply::original(self.owner.clone(),self.connection.clone(),reply.call_id,call.ticket,call.operation,accepted,valid,properties)?)
+            }
             PendingKind::Bootstrap => match decode_get_app_configs_result(reply.result_code, reply.result_stream) {
                 Ok(result) => ArcReply::Bootstrap(OwnedBootstrapReply { owner: self.owner.clone(), connection: self.connection.clone(),
                     call_id: reply.call_id, properties: result.properties.iter().map(|p| (p.key.to_vec(), p.value.to_vec())).collect(),

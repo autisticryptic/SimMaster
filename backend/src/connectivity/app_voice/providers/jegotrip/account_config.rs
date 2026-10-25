@@ -99,6 +99,7 @@ pub struct ProfileConfig {
     pub logout_routing: Vec<ProfileProperty>,
     pub incoming: Option<IncomingBinding>,
     pub call_incoming:Option<CallIncomingConfig>,
+    pub call_control:Option<Vec<ProfileProperty>>,
     pub connect_timeout_ms: u64,
     pub handshake_timeout_ms: u64,
     pub partial_timeout_ms: u64,
@@ -181,7 +182,8 @@ impl AccountConfig {
             RuntimeProfile::supplied_bootstrap(inputs,RuntimeBootstrapInputs{account_trust,routing:&routing,client_config_decode_key:client_key,
                 handoff_timeout:Duration::from_millis(bootstrap.handoff_timeout_ms)}).map_err(|_|INVALID)?
         }else{RuntimeProfile::supplied(inputs).map_err(|_|INVALID)?};
-        profile.with_call_receiver(p.call_incoming.as_ref().map(|binding|super::call_binding::CallIncomingBinding{object_id:&binding.object_id,domain:&binding.domain})).map_err(|_|INVALID)
+        let profile=profile.with_call_receiver(p.call_incoming.as_ref().map(|binding|super::call_binding::CallIncomingBinding{object_id:&binding.object_id,domain:&binding.domain})).map_err(|_|INVALID)?;
+        if let Some(properties)=&p.call_control{profile.with_call_control(&borrowed(properties)?).map_err(|_|INVALID)}else{Ok(profile)}
     }
 
     /// Pure admission only: no DNS, network, SDK execution or readiness state.
@@ -305,7 +307,7 @@ struct PrivateProfileRef<'a> {
     client_properties: PrivateProperties<'a>, include_device_id: bool,
     login_routing: PrivateProperties<'a>, gateway_uri: &'a str,
     gateway_metadata: PrivateProperties<'a>, poll_routing: PrivateProperties<'a>,
-    logout_routing: PrivateProperties<'a>, incoming: Option<PrivateIncomingRef<'a>>,call_incoming:Option<PrivateCallIncomingRef<'a>>,
+    logout_routing: PrivateProperties<'a>, incoming: Option<PrivateIncomingRef<'a>>,call_incoming:Option<PrivateCallIncomingRef<'a>>,call_control:Option<PrivateProperties<'a>>,
     connect_timeout_ms: u64, handshake_timeout_ms: u64, partial_timeout_ms: u64,
     io_timeout_ms: u64, rpc_timeout_ms: u64,
 }
@@ -345,6 +347,7 @@ impl<'a> PrivateConfigRef<'a> {
                 poll_routing: private_properties(&p.poll_routing), logout_routing: private_properties(&p.logout_routing),
                 incoming: p.incoming.as_ref().map(|b| PrivateIncomingRef { object_id: &b.object_id, domain: &b.domain, receiver_kind: &b.receiver_kind }),
                 call_incoming:p.call_incoming.as_ref().map(|binding|PrivateCallIncomingRef{object_id:&binding.object_id,domain:&binding.domain}),
+                call_control:p.call_control.as_ref().map(|properties|PrivateProperties(properties)),
                 connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
                 partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
             },

@@ -9,6 +9,8 @@ use super::{
     arc_session::{ArcLoginInputs, ArcPhase},
     call_binding::CallIncomingBinding,
     call_delivery::CallReplyTicket,
+    call_control::{CallControlTicket,OwnedCallOperationReply},
+    rpc_calls::CallOperation,
     offline_backend::{OfflineBackend, OfflineEvent},
     packet_transport::{OwnedWireFrames, PacketRoute, RouterTiming},
     rpc_incoming::IncomingBinding,
@@ -29,7 +31,7 @@ const MAX_PARAMETER_BYTES: usize = 128 * 1024;
 const MAX_PENDING_RPC: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuntimeError { Scope, InvalidConfiguration, Backpressure, Closed, Cancelled, Timeout, Io, Protocol, UnregistrationRejected, LoggedOut, Tls(TlsError) }
+pub enum RuntimeError { Scope, InvalidConfiguration, Backpressure, Closed, Cancelled, Timeout, Io, Protocol, CallNotReady,CallRejected,UnregistrationRejected, LoggedOut, Tls(TlsError) }
 impl From<TlsError> for RuntimeError { fn from(error: TlsError) -> Self { Self::Tls(error) } }
 
 pub struct RuntimePolicy { pub io_timeout: Duration, pub rpc_timeout: Duration }
@@ -143,6 +145,7 @@ impl Gateway {
 enum Operation {
     Login(Login, Vec<Property>), Bootstrap(Zeroizing<Vec<u8>>, Vec<Property>), Configure(u32, Option<Binding>), ConfigureCalls(CallBinding), Logout(Vec<Property>),
     Swap(Vec<Property>, Option<Gateway>), CompleteBatch(ServerRequestTicket, bool), CompleteDirect(DirectReplyTicket, bool), CompleteCall(CallReplyTicket,bool,Vec<Property>),
+    ConfigureCallControl(Vec<Property>),Call(CallControlTicket,CallOperation,Vec<Property>,oneshot::Sender<Result<OwnedCallOperationReply,RuntimeError>>),
 }
 impl Operation {
     fn byte_length(&self) -> usize {
@@ -158,11 +161,14 @@ impl Operation {
                     + g.metadata.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()),
             Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) => 0,
             Self::ConfigureCalls(binding)=>binding.object.len()+binding.domain.len(),
-            Self::CompleteCall(_,_,properties)=>properties.iter().map(|p|p.key.len()+p.value.len()).sum(),
+            Self::CompleteCall(_,_,properties)|Self::ConfigureCallControl(properties)|Self::Call(_,_,properties,_)=>properties.iter().map(|p|p.key.len()+p.value.len()).sum(),
         }
     }
 }
 struct Command { operation: Operation, completion: oneshot::Sender<Result<RuntimeReceipt, RuntimeError>> }
+struct CallPending{ticket:CallControlTicket,operation:CallOperation,deadline:Instant,completion:oneshot::Sender<Result<OwnedCallOperationReply,RuntimeError>>}
+struct CallRetirement{scope:RpcConnectionScope,ticket:CallControlTicket,done:bool}
+impl Drop for CallRetirement{fn drop(&mut self){if !self.done{self.ticket.revoke();self.scope.close();}}}
 struct LogoutPending { id: i32, completion: oneshot::Sender<Result<RuntimeReceipt, RuntimeError>> }
 struct UnhostingPending { sequence: i32, outer_id: i32, deadline: Instant, completion: oneshot::Sender<Result<RuntimeReceipt, RuntimeError>> }
 struct UnhostingRetirement { scope: RpcConnectionScope, completed: bool }
@@ -314,6 +320,21 @@ impl RuntimeCommands {
         if !self.accepts(owner,scope)||!ticket.matches(owner,scope){return Err(RuntimeError::Scope);}
         self.submit(owner,scope,Operation::CompleteCall(ticket.captured_copy(),accepted,Property::capture(properties)?)).await
     }
+    pub async fn configure_call_control(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,routing:&[RpcProperty<'_>])->Result<RuntimeReceipt,RuntimeError>{
+        if !self.accepts(owner,scope){return Err(RuntimeError::Scope);}
+        self.submit(owner,scope,Operation::ConfigureCallControl(logout_properties(routing)?)).await
+    }
+    pub async fn call(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,ticket:&CallControlTicket,operation:CallOperation,properties:&[RpcProperty<'_>])->Result<OwnedCallOperationReply,RuntimeError>{
+        if !self.accepts(owner,scope)||!ticket.matches(owner,scope)||operation!=CallOperation::Release&&!ticket.is_live(){return Err(RuntimeError::Scope);}
+        let properties=Property::capture(properties)?;let(reply,result)=oneshot::channel();
+        let completion=self.enqueue(owner,scope,Operation::Call(ticket.captured_copy(),operation,properties,reply))?;
+        let mut guard=CallRetirement{scope:scope.clone(),ticket:ticket.captured_copy(),done:false};
+        let submitted=completion.await.map_err(|_|RuntimeError::Closed)?;
+        if let Err(error)=submitted{if matches!(error,RuntimeError::CallNotReady|RuntimeError::InvalidConfiguration){guard.done=true;}return Err(error);}
+        let reply=result.await.map_err(|_|RuntimeError::Closed)?;
+        if reply.is_ok()||matches!(&reply,Err(RuntimeError::CallRejected)){guard.done=true;}
+        reply
+    }
     /// This method returns only the matched original logout RPC result, not an
     /// IO release receipt. Hosting-register returns a submission receipt;
     /// hosting-unregister separately waits for its matched nested result.
@@ -383,6 +404,8 @@ impl RuntimeHandle {
     pub async fn complete_call(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,ticket:&CallReplyTicket,accepted:bool,properties:&[RpcProperty<'_>])->Result<RuntimeReceipt,RuntimeError>{
         self.command_handle().complete_call(owner,scope,ticket,accepted,properties).await
     }
+    pub async fn configure_call_control(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,routing:&[RpcProperty<'_>])->Result<RuntimeReceipt,RuntimeError>{self.command_handle().configure_call_control(owner,scope,routing).await}
+    pub async fn call(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,ticket:&CallControlTicket,operation:CallOperation,properties:&[RpcProperty<'_>])->Result<OwnedCallOperationReply,RuntimeError>{self.command_handle().call(owner,scope,ticket,operation,properties).await}
     /// Confirm native logout separately from actual original IO/task release.
     /// Wrong-owner requests have no close side effect. Failed/cancelled logout
     /// still closes original IO; a cancelled join can be waited again via close.
@@ -436,7 +459,7 @@ impl PreparedRuntime {
         let owner = self.owner.clone(); let scope = self.scope.clone();
         let actor = Actor { io: Some(io), owner: owner.clone(), scope: scope.clone(), backend, tls, commands: commands_rx,
             events: events_tx, policy, timing: self.timing, start: self.start, pending: std::collections::BTreeMap::new(),
-            logout_pending: None, unhosting_pending: None };
+            logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new() };
         self.attached = true;
         let task = tokio::spawn(actor.run());
         Ok((RuntimeHandle { owner, scope, commands: commands_tx, task: Some(task) }, events_rx))
@@ -463,6 +486,7 @@ struct Actor<I> {
     io: Option<I>, owner: AttemptOwner, scope: RpcConnectionScope, backend: OfflineBackend, tls: TlsEngine,
     commands: mpsc::Receiver<Command>, events: mpsc::Sender<RuntimeEvent>, policy: RuntimePolicy,
     timing: Option<RouterTiming>, start: Instant, pending: std::collections::BTreeMap<i32, Instant>, logout_pending: Option<LogoutPending>, unhosting_pending: Option<UnhostingPending>,
+    call_pending:std::collections::BTreeMap<i32,CallPending>,
 }
 impl<I> Drop for Actor<I> {
     fn drop(&mut self) { self.scope.close(); self.backend.close(); self.tls.close(); self.io = None; self.commands.close(); }
@@ -497,6 +521,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                         if pending.completion.is_closed() { return RuntimeError::Cancelled; }
                         if now >= pending.deadline { return RuntimeError::Timeout; }
                     }
+                    if self.call_pending.values().any(|pending|pending.completion.is_closed()||now>=pending.deadline){return RuntimeError::Timeout;}
                     if self.pending.values().any(|deadline| now >= *deadline) { return RuntimeError::Timeout; }
                 }
                 received = self.io.as_mut().expect("owned IO").read(&mut read) => {
@@ -524,8 +549,15 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         }
     }
     async fn deliver(&mut self, events: Vec<OfflineEvent>) -> Result<(), RuntimeError> {
-        let mut unhosting_accepted = false;
-        let outcome = self.deliver_events(events, &mut unhosting_accepted).await;
+        let mut unhosting_accepted = false;let mut call_replies=Vec::new();
+        let outcome = self.deliver_events(events, &mut unhosting_accepted,&mut call_replies).await;
+        for reply in call_replies{
+            let pending=self.call_pending.remove(&reply.request_id()).ok_or(RuntimeError::Protocol)?;
+            if !reply.matches(&self.owner,&self.scope)||reply.native_id()!=pending.ticket.native_id()||reply.operation()!=pending.operation{return Err(RuntimeError::Protocol);}
+            if Instant::now()>=pending.deadline||!self.scope.is_open(){let _=pending.completion.send(Err(RuntimeError::Timeout));return Err(RuntimeError::Timeout);}
+            let result=outcome.and_then(|()|if reply.accepted(){Ok(reply)}else{Err(RuntimeError::CallRejected)});
+            if pending.completion.send(result).is_err(){return Err(RuntimeError::Cancelled);}
+        }
         // Keep the original wait (and its deadline) installed while every
         // outgoing reply and visible event from this delivery can still fail.
         // A semantic true followed by an IO/queue error is not an open-IO
@@ -544,10 +576,14 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         }
         outcome
     }
-    async fn deliver_events(&mut self, events: Vec<OfflineEvent>, unhosting_accepted: &mut bool) -> Result<(), RuntimeError> {
+    async fn deliver_events(&mut self, events: Vec<OfflineEvent>, unhosting_accepted: &mut bool,call_replies:&mut Vec<OwnedCallOperationReply>) -> Result<(), RuntimeError> {
         let mut visible = Vec::new();
         for event in events {
             match event {
+                OfflineEvent::CallOperation(reply)=>{
+                    if !self.call_pending.contains_key(&reply.request_id()){return Err(RuntimeError::Protocol);}
+                    call_replies.push(reply);
+                }
                 OfflineEvent::Unhosting(reply) => {
                     let pending = self.unhosting_pending.as_ref().ok_or(RuntimeError::Protocol)?;
                     // A result may arrive between timer ticks. A repeated or
@@ -593,12 +629,12 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if self.tls.phase() != TlsPhase::Verified {
             let _ = command.completion.send(Err(RuntimeError::Tls(TlsError::NotReady))); return Ok(());
         }
-        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _)) {
+        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
         let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_));
         let is_logout = matches!(&command.operation, Operation::Logout(_));
-        let mut unhosting_sequence = None;
+        let mut unhosting_sequence = None;let mut call_wait=None;
         let elapsed_ms = self.elapsed_ms(now);
         let prepared = match command.operation {
             Operation::Configure(epoch, incoming) => {
@@ -606,6 +642,20 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 let receipt = result.map(|()| RuntimeReceipt { owner: self.owner.clone(), scope: self.scope.clone(), call_id: None });
                 if command.completion.send(receipt).is_err() { return Err(RuntimeError::Cancelled); }
                 return Ok(());
+            }
+            Operation::ConfigureCallControl(routing)=>{
+                let result=self.backend.configure_call_control(&borrowed(&routing)).map_err(|_|RuntimeError::InvalidConfiguration);
+                if command.completion.send(result.map(|()|RuntimeReceipt{owner:self.owner.clone(),scope:self.scope.clone(),call_id:None})).is_err(){return Err(RuntimeError::Cancelled);}
+                return Ok(());
+            }
+            Operation::Call(ticket,operation,properties,reply)=>{
+                if operation==CallOperation::Inform&&!self.backend.call_acknowledgement_ready(&ticket){
+                    let _=reply.send(Err(RuntimeError::CallNotReady));let _=command.completion.send(Err(RuntimeError::CallNotReady));return Ok(());
+                }
+                match self.backend.prepare_call(&ticket,operation,&borrowed(&properties)){
+                    Ok(packets)=>{call_wait=Some((ticket,operation,reply));Ok(packets)}
+                    Err(_)=>{let _=reply.send(Err(RuntimeError::InvalidConfiguration));let _=command.completion.send(Err(RuntimeError::InvalidConfiguration));return Ok(());}
+                }
             }
             Operation::ConfigureCalls(binding)=>{
                 let result=self.backend.configure_calls(binding.borrowed()).map_err(|_|RuntimeError::Protocol);
@@ -671,6 +721,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if !is_response {
             self.pending.insert(packets.call_id, Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?);
         }
+        if let Some((ticket,operation,completion))=call_wait{
+            let deadline=Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?;
+            self.call_pending.insert(packets.call_id,CallPending{ticket,operation,deadline,completion});
+        }
         if let Some(sequence) = unhosting_sequence {
             self.unhosting_pending = Some(UnhostingPending { sequence, outer_id: packets.call_id,
                 deadline: Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?, completion: command.completion });
@@ -693,7 +747,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             }
         }
         let step_deadline = self.pending.values().copied().chain(self.tls.next_deadline())
-            .chain(self.unhosting_pending.as_ref().map(|pending| pending.deadline)).min();
+            .chain(self.unhosting_pending.as_ref().map(|pending| pending.deadline)).chain(self.call_pending.values().map(|pending|pending.deadline)).min();
         let deadline = Instant::now().checked_add(self.policy.io_timeout).ok_or(RuntimeError::Timeout)?;
         let deadline = step_deadline.map_or(deadline, |rpc| deadline.min(rpc));
         let now = Instant::now();

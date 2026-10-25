@@ -14,6 +14,8 @@ use super::{
     controller::Callback,
     call_binding::CallIncomingBinding,
     call_delivery::{CallReplyTicket,IncomingCallDelivery},
+    call_control::{CallControlTicket,OwnedCallOperationReply},
+    rpc_calls::CallOperation,
     legacy_config::ConfigDecodeKey,
     offline_backend::{OfflineEvent, ScheduledIncomingMessage},
     packet_transport::PacketRoute,
@@ -140,7 +142,7 @@ pub struct RuntimeProfile {
     login_routing: Vec<Property>, gateway_uri: Zeroizing<String>, gateway_metadata: Vec<Property>,
     poll_routing: Vec<Property>, logout_routing: Vec<Property>, incoming: Option<Binding>,
     reference_decode_key: Option<ConfigDecodeKey>, handshake_timeout: Duration, partial_timeout: Duration,
-    io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, call_incoming:Option<CallBinding>, byte_length:usize,
+    io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>, byte_length:usize,
 }
 impl fmt::Debug for RuntimeProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RuntimeProfile(<redacted>)") }
@@ -156,6 +158,11 @@ impl RuntimeProfile {
             self.call_incoming=Some(CallBinding{object:Zeroizing::new(binding.object_id.to_vec()),domain:Zeroizing::new(binding.domain.to_vec())});
         }
         Ok(self)
+    }
+    pub fn with_call_control(mut self,routing:&[RpcProperty<'_>])->Result<Self,ProfileError>{
+        if self.call_incoming.is_none()||self.call_control.is_some(){return Err(ProfileError::InvalidConfiguration);}
+        super::call_control::validate_routing(routing).map_err(|_|ProfileError::InvalidConfiguration)?;
+        self.call_control=Some(properties(routing,&mut self.byte_length)?);Ok(self)
     }
     pub fn supplied(input: RuntimeProfileInputs<'_>) -> Result<Self, ProfileError> { Self::capture(input,None) }
     /// Exact imported bootstrap TLS anchor plus separately imported account
@@ -215,7 +222,7 @@ impl RuntimeProfile {
             gateway_metadata: routing(input.gateway_metadata, &mut total)?, poll_routing: routing(input.poll_routing, &mut total)?,
             logout_routing: routing(input.logout_routing, &mut total)?, incoming, reference_decode_key: input.reference_decode_key,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
-            io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, call_incoming:None,byte_length:total,
+            io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, call_incoming:None,call_control:None,byte_length:total,
         })
     }
 }
@@ -373,6 +380,10 @@ impl NativeHostingBackend {
     pub async fn complete_call(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,ticket:&CallReplyTicket,accepted:bool,properties:&[RpcProperty<'_>])->Result<RuntimeReceipt,RuntimeError>{
         let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;
         attempt.commands(owner,scope)?.complete_call(owner,scope,ticket,accepted,properties).await
+    }
+    pub async fn call(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,ticket:&CallControlTicket,operation:CallOperation,properties:&[RpcProperty<'_>])->Result<OwnedCallOperationReply,RuntimeError>{
+        let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;
+        attempt.commands(owner,scope)?.call(owner,scope,ticket,operation,properties).await
     }
     async fn login_original(&self, owner: AttemptOwner, request: SdkLoginRequest<'_>) -> Result<(), BackendFailure> {
         let captured = LoginCapture::capture(request, &self.profile)?;
@@ -664,6 +675,12 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                                     Ok(receipt) if receipt.matches(&attempt.owner, &attempt.scope) => {
                                         if let Some(binding)=&profile.call_incoming{
                                             match commands.configure_calls(&attempt.owner,&attempt.scope,binding.borrowed()).await{
+                                                Ok(receipt)if receipt.matches(&attempt.owner,&attempt.scope)=>{},
+                                                _=>{terminal(&sender,&attempt,BackendFailure::Disconnected);return;}
+                                            }
+                                        }
+                                        if let Some(routing)=&profile.call_control{
+                                            match commands.configure_call_control(&attempt.owner,&attempt.scope,&borrowed(routing)).await{
                                                 Ok(receipt)if receipt.matches(&attempt.owner,&attempt.scope)=>{},
                                                 _=>{terminal(&sender,&attempt,BackendFailure::Disconnected);return;}
                                             }

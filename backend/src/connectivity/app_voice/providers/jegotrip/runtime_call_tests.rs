@@ -5,6 +5,8 @@ use crate::connectivity::app_voice::providers::jegotrip as native;
 use native::{call_binding::CallIncomingBinding,rpc_calls::{CallNoticeKind,NativeCallId,encode_notice_result}};
 
 const CALL_ID:u64=0x0123_4567_89ab_cdef;
+#[path="runtime_call_control_tests.rs"]
+mod control;
 fn call_fixture(cert:&Certificates,enabled:bool)->(Arc<NativeHostingBackend>,mpsc::Receiver<BackendEvent>,Peer,Arc<AtomicBool>){
     let(unused,old_events,connector,peer,dropped,_)=fixture(cert,false);drop(unused);drop(old_events);
     let profile=if enabled{profile().with_call_receiver(Some(CallIncomingBinding{object_id:b"#fixture-call-client",domain:b"fixture-domain"})).unwrap()}else{profile()};

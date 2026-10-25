@@ -29,6 +29,7 @@ pub mod rpc_arguments;
 pub mod rpc_calls;
 pub mod call_binding;
 pub mod call_delivery;
+pub mod call_control;
 pub mod rpc_batch;
 pub mod rpc_bootstrap;
 pub mod rpc_envelope;

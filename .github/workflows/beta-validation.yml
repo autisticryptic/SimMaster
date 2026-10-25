@@ -240,6 +240,7 @@ jobs:
             connectivity::app_voice::providers::jegotrip::rpc_arguments::tests \
             connectivity::app_voice::providers::jegotrip::rpc_calls::tests \
             connectivity::app_voice::providers::jegotrip::call_binding::tests \
+            connectivity::app_voice::providers::jegotrip::call_control::tests \
             connectivity::app_voice::providers::jegotrip::native_events::tests \
             connectivity::app_voice::providers::jegotrip::rpc_stream::tests \
             connectivity::app_voice::providers::jegotrip::rpc_envelope::tests \

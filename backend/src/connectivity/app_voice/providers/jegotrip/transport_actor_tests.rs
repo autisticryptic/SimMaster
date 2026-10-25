@@ -194,7 +194,7 @@ async fn cancelling_original_command_during_send_terminates_and_releases_actor_i
     let (io, bytes, _, _, dropped) = poll_io(true);
     let (_commands, commands) = mpsc::channel(MAX_COMMANDS); let (events, _events) = mpsc::channel(MAX_EVENTS);
     let mut actor = Actor { io: Some(io), owner: original, scope: scope.clone(), backend, tls, commands, events,
-        policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new(), logout_pending: None, unhosting_pending: None };
+        policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new(), logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new() };
     let (mut completion, receiver) = oneshot::channel();
     {
         let sending = actor.send_wire(&wire, Some(&mut completion)); tokio::pin!(sending);
@@ -483,7 +483,7 @@ fn unhosting_actor_fixture(root: &str, original: AttemptOwner, blocked: bool)
     let (_commands, commands) = mpsc::channel(MAX_COMMANDS); let (events, receive_events) = mpsc::channel(MAX_EVENTS);
     let actor = Actor { io: Some(io), owner: original, scope, backend, tls, commands, events,
         policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new(),
-        logout_pending: None, unhosting_pending: None };
+        logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new() };
     (actor, wire, bytes, receive_events)
 }
 
@@ -561,7 +561,7 @@ async fn accepted_unregistration_followed_by_same_delivery_io_failure_never_repo
     let (_commands, commands) = mpsc::channel(MAX_COMMANDS); let (events, _events) = mpsc::channel(MAX_EVENTS);
     let mut actor = Actor { io: Some(io), owner: original, scope: scope.clone(), backend, tls, commands, events,
         policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new(),
-        logout_pending: None, unhosting_pending: None };
+        logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new() };
     let (sequence, reply) = original_unhosting_completion(&actor); let (completion, result) = oneshot::channel();
     actor.unhosting_pending = Some(UnhostingPending { sequence, outer_id: 2,
         deadline: Instant::now() + Duration::from_secs(1), completion });

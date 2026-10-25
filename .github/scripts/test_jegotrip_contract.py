@@ -746,6 +746,42 @@ class JegotripContract(unittest.TestCase):
             self.assertIn('connectivity::app_voice::providers::jegotrip::call_binding::tests',
                           (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
 
+    def test_call_control_uses_original_shared_arc_allocator_and_separate_owned_result(self):
+        session = (MOD / 'arc_session.rs').read_text(encoding='utf-8')
+        self.assertIn('struct PendingCall{ticket:CallControlTicket,operation:CallOperation}', session)
+        prepare = session.split('pub(super) fn prepare_call(', 1)[1].split('/// Enable exactly one owned scheduler', 1)[0]
+        self.assertIn('let id=self.next_id.ok_or(CodecError::InvalidCallId)?', prepare)
+        self.assertIn('metadata.push(RpcProperty{key:b"token",value:&auth.token})', prepare)
+        self.assertIn('self.pending.insert(id,PendingRpc{kind:PendingKind::Call', prepare)
+        self.assertIn('OwnedCallOperationReply::original(self.owner.clone(),self.connection.clone(),reply.call_id', session)
+        self.assertNotIn('next_call_id:', (MOD / 'call_control.rs').read_text(encoding='utf-8'))
+
+    def test_original_call_cancel_or_wrong_owner_cannot_turn_late_reply_into_media_ready(self):
+        book = (MOD / 'call_control.rs').read_text(encoding='utf-8')
+        self.assertIn('Arc::ptr_eq(&slot.ticket.identity,&ticket.identity)', book)
+        self.assertIn('operation!=CallOperation::Release && !ticket.is_live()', book)
+        self.assertIn('slot.ticket.revoke();slot.phase=Phase::Ended', book)
+        self.assertNotIn('media_ready: true', book)
+        actor = (MOD / 'transport_actor.rs').read_text(encoding='utf-8')
+        delivery = actor.split('async fn deliver(', 1)[1].split('async fn deliver_events(', 1)[0]
+        self.assertLess(delivery.index('self.deliver_events('), delivery.index('pending.completion.send(result)'))
+        self.assertIn('Instant::now()>=pending.deadline', delivery)
+        self.assertIn('CallRetirement', actor)
+        self.assertIn('RuntimeError::CallNotReady', actor)
+
+    def test_batch_call_receipt_cannot_be_overtaken_by_inform_or_unmatched_control(self):
+        offline = (MOD / 'offline_backend.rs').read_text(encoding='utf-8')
+        self.assertIn('call_acks:BTreeMap<(u32,i32),(CallControlTicket,bool)>', offline)
+        self.assertIn('let result_sequences=batch.payload().results.keys()', offline)
+        self.assertIn('self.protocol.call_acknowledged(&ticket,accepted)?', offline)
+        tests = (MOD / 'runtime_call_control_tests.rs').read_text(encoding='utf-8')
+        for name in ['original_inform_accept_release_wait_for_matched_semantics', 'remote_release_between_submit_and_true_result',
+                     'cancelled_original_accept_wait_retires_only_original_scope', 'batch_original_invitation_result_is_transmitted_before_inform']:
+            self.assertIn(name, tests)
+        for name in ['beta-validation.yml', 'build-release.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::call_control::tests',
+                          (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
 
 if __name__ == '__main__':
     unittest.main()

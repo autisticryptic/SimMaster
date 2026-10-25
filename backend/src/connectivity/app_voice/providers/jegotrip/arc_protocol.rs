@@ -8,7 +8,8 @@ use super::{
     batch_scheduler::{BatchError, BatchScheduler, ScheduledBatch},
     call_binding::{CallIncomingBinding,CallDispatcher},
     call_delivery::{IncomingCallDelivery,CallReplyTicket,CallReplySource},
-    rpc_calls::{CallNoticeKind,NativeCallId,encode_notice_result},
+    call_control::CallControlTicket,
+    rpc_calls::{CallNoticeKind,NativeCallId,CallOperation,encode_notice_result},
     arc_session::{ArcLoginInputs, ArcPhase, ArcReply, ArcRpcSession},
     rpc_batch::BatchPayload,
     rpc_envelope::{decode_request, encode_reply},
@@ -136,6 +137,14 @@ impl ArcProtocol {
         self.call_incoming=Some(self.rpc.incoming_call_dispatcher(binding)?);Ok(())
     }
 
+    pub(super) fn configure_call_control(&mut self,routing:&[RpcProperty<'_>])->Result<(),ProtocolError>{Ok(self.rpc.configure_call_control(routing)?)}
+    pub(super) fn register_call_notice(&mut self,notice:&super::call_binding::OwnedCallNotice)->Result<Option<CallControlTicket>,ProtocolError>{Ok(self.rpc.register_call_notice(notice)?)}
+    pub(super) fn call_acknowledged(&mut self,ticket:&CallControlTicket,accepted:bool)->Result<(),ProtocolError>{Ok(self.rpc.call_acknowledged(ticket,accepted)?)}
+    pub(super) fn call_acknowledgement_ready(&self,ticket:&CallControlTicket)->bool{self.rpc.call_acknowledgement_ready(ticket)}
+    pub(super) fn prepare_call(&mut self,ticket:&CallControlTicket,operation:CallOperation,properties:&[RpcProperty<'_>])->Result<OwnedCallPackets,ProtocolError>{
+        let(id,bytes)=self.rpc.prepare_call(ticket,operation,properties)?;self.packets(id,bytes.expose_to_transport())
+    }
+
     pub fn prepare_scheduled_swap(&mut self, batch: &ScheduledBatch, routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> {
         let (id, bytes) = self.rpc.prepare_scheduled_swap(batch, routing)?;
@@ -249,9 +258,10 @@ impl ArcProtocol {
             let decoded=match dispatcher.on_direct_request(owner,scope,&request){Ok(value)=>value,Err(error)=>{self.close();return Err(error.into());}};
             self.direct_last_id=request.call_id;
             if let Some(notice)=decoded{
+                let control=self.rpc.register_call_notice(&notice)?;
                 self.direct_pending.insert(request.call_id,PendingDirect{magic:magic.to_vec(),response:DirectResponse::Call{kind,native_id:notice.native_id()}});
                 let original=self.rpc.owner().clone();let ticket=DirectReplyTicket{owner:original,connection:self.rpc.connection_scope(),call_id:request.call_id};
-                deliver(ProtocolEvent::IncomingCall(IncomingCallDelivery::from_direct(notice,ticket)?));
+                deliver(ProtocolEvent::IncomingCall(IncomingCallDelivery::from_direct(notice,ticket)?.with_control(control)?));
             }else{
                 let result=encode_notice_result(kind,false,&[])?;let reply=encode_reply(request.call_id,0,result.expose_to_transport())?;
                 let packets=encode_call_packets(CallKind::Reply,reply.expose_to_transport(),TLS_FRAGMENT_THRESHOLD)?;
@@ -309,6 +319,7 @@ impl ArcProtocol {
         // pending capability; malformed local properties retain its retry.
         let result=encode_notice_result(ticket.kind(),accepted,properties)?;let reply=encode_reply(inner.call_id,0,result.expose_to_transport())?;
         let packets=encode_call_packets(CallKind::Reply,reply.expose_to_transport(),TLS_FRAGMENT_THRESHOLD)?;
+        if ticket.kind()==CallNoticeKind::Invited{if let Some(control)=ticket.control_ticket(){self.rpc.call_acknowledged(control,accepted)?;}}
         let pending=self.direct_pending.remove(&inner.call_id).ok_or(CodecError::InvalidField)?;
         self.record_direct(inner.call_id,pending.magic);Ok(Some(OwnedCallPackets{call_id:inner.call_id,packets}))
     }
