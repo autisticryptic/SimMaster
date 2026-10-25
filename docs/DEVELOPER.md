@@ -223,9 +223,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 `GET /api/non-3gpp/providers/app_voice/credential-contract` 只返回字段说明和实现边界，
 不初始化 SDK、不读取账号、不发送网络请求；明确 `transport_implemented=false`。
 
-**未实现** Linux SDK backend、凭据落库/API 导入、真实托管注册、收短信/接打电话、计费 UI。
-模块不是已可用 provider，不自动注册，不改变下拉框可用状态。Google Voice/Telegram 槽位保留。
-不能 dlopen APK 中 Android/AArch64 库冒充通用 Linux/AMD64 后端。
+**当前已实现支持子集** Linux显式TLS/native actor与原matched bootstrap handoff、独立账号私有存储/API、Smgw文本与耐久通知；`7cc8b8f`已验证，不等于完整SDK默认locator/NetStream、真实call/media/Trunk或独立资费续期/设备并发。模块仍不是全局可用provider，不自动注册、不改变下拉框可用状态或授paid outbound。不能dlopen APK中的Android/AArch64库冒充通用Linux/AMD64后端。
 
 ## 应用通话 provider 目录与下一阶段
 
@@ -328,7 +326,16 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 
 ### 完整 backend 的下一实施关口（持续）
 
-按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)继续完整Router/NetStream、正常provision/locator与原可信映射。独立账号、Smgw文本/持久通知和原run释放回收已由`c55f773`验证，不重复称缺少，但不等于默认native或call/media/trunk可用。global provider/Channels/paidoutbound仍false，应用账号不伪装UICC/PDU/免费VoWiFi。本轮已实际核对原IDA同SHA/base0并只读追踪bootstrap/accept/locator注册边界，见`native-provision-call-frontier.md`；不自行加载或改IDB，当前无需用户重开。
+按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)继续完整Router/NetStream和default locator/原可信映射。原matched bootstrap到单独TLS account scope/IO handoff已由`7cc8b8f`验证，独立账号、Smgw文本/持久通知和原run回收保留；这些不是默认native或call/media/trunk可用。global provider/Channels/paidoutbound仍false，不冒充UICC/PDU/免费VoWiFi。本轮原IDA同SHA/base0再次只读核对，58C98C/58F6F8/580BA4复核原字段/独立pwd语义；不自行加载或改IDB，当前无需重开。
+
+### 原bootstrap到单独账号TLS handoff（`7cc8b8f`已验证）
+
+- `runtime_provision.rs`只能从原owner/source/call-id成功`OwnedBootstrapReply`构造bounded plan：DomainName原map，DomainId/AppId/可选CC按显式Client key，AccountEntry按Common key；缺CC清空。原destination physical scope和imported AccountTrust身份固定，source关闭后copied data不是新source IO lease，也不能授权另一root/scope。完整reference仅接受已支持direct TCP，authority/root/SNI独立导入，locator/alternate transport不当默认端点。
+- `runtime_backend.rs`预先捕获两个ARC/TLS scope，原source连接只做getAppConfigs；保存plan后等待原source owning actor真实Join，再connect/attach新的account scope，不修改活动IO。总handoff deadline涵盖全流程，原TLS clock不重开；原pwd/appKey/selected session/DeviceId/ClientId与supplied routing保持，bootstrap不发SDK/hosting/Channels callback。取消/失败保留两owning handles，logout原cleanup barrier完成后才released。
+- 私有`AccountConfig.bootstrap`要求单独trust/routing/预算，manual domain/app/CC不能与bootstrap混用；旧version1 JSON遗漏bootstrap仍explicit直连，manual缺required字段失败。私有存储/CAS与认证/no-store HTTP保持，Derived字段不覆写原配置，不自动start，不导出root/密码。data.db仍本机明文，不声称加密或SQLite/WAL物理擦除。
+- Build40202373634/Beta40202373625/ARM64 AMD64 success，Release skipped；官方SHA ZIP各精确**525 Jegotrip＋31通知service/模板＋12真实HTTP/auth＋4原/sharedSIP＋7DNS/原86矩阵**，410本机static/mock，58compile warnings/17Jegotrip节选保留，首轮通过。新增10provision/11真实双TLS与AccountManager/5config＋2HTTP；不同root/SNI/scope、未真实login不callback、source Join取消重等/总deadline、错scope/未知reply及旧JSON兼容实际执行。
+- Build artifact12602133480 SHA`22fe5810c469061073d9b0002443f0d89c2e9ef027978c38002e3b56fedbec1d`；Beta12602128285 SHA`bdcd088e6108bf276e253bfa599dbaf9ea3c0bd804ec646c5df141afe0b9770f`。证据`verified-native-7cc8b8f.json`、`bootstrap-handoff-implementation-evidence.md`。初WSL GitHubErrno113用opt-in Windows系统curl的有界HTTPS证据读取恢复，不改digest/commit/清单规则；warning初extract未strip ANSI的零计数已按官方test-compile.log纠正，不冒称无warning。辅助review API400无findings，research partial不当signoff；无本机Rust/设备服务/部署/NV/target/IDB写、UI和未知数据未动。
+- 仍需完整default locator/NetStream/Router/Channel生命周期、call ingress/accept/terminate/media/Trunk、独立action/cost/principal并发与renewal、有证明的跨进程恢复及共享历史政策；不把上述支持子集降为仅剩实机。
 
 ### Router/Channel 原生边界（`65fad23`已验证）
 
