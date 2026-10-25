@@ -413,6 +413,7 @@ jobs:
             connectivity::app_voice::providers::jegotrip::account_runs::tests \
             connectivity::app_voice::providers::jegotrip::account_notifications::tests \
             connectivity::app_voice::providers::jegotrip::account_runtime::tests \
+            connectivity::app_voice::providers::jegotrip::message_provider::tests \
             connectivity::app_voice::providers::jegotrip::legacy_config::tests \
             connectivity::app_voice::providers::jegotrip::object_reference::tests \
             connectivity::app_voice::providers::jegotrip::deployment::tests \

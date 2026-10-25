@@ -14,7 +14,7 @@ use super::super::{
     transport_packets::{decode_tls_carrier, encode_tls_carrier, CallMessage},
 };
 use std::{collections::VecDeque, io, sync::{Mutex as StdMutex, atomic::{AtomicBool, Ordering}}};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream, UdpSocket}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 use tokio_rustls::rustls;
 
 async fn bounded<F: Future>(future: F) -> F::Output {
@@ -28,20 +28,19 @@ struct Fixture {
     rpc: ArcRpcSession, owner: AttemptOwner, account: RpcConnectionScope,
     ticket: CallControlTicket, supplied: Arc<MediaEndpointProfile>,
     handle: MediaEndpointHandle, result: MediaEndpointReady,
-    // Only reserves the ORIGINAL supplied port. No UDP read/write or success
-    // assertion: a real bound port is still DATA, not a recovered UDP carrier.
-    _original_bound_port: UdpSocket, port: u16,
+    // A synthetic ORIGINAL logical Router port, never an OS UDP endpoint or
+    // raw-carrier readiness proof. Only actual TCP/TLS signaling is exercised.
+    port: u16,
 }
 async fn start(supplied: Arc<MediaEndpointProfile>) -> (Fixture, TcpListener) {
     let listener = bounded(TcpListener::bind(("127.0.0.1", 0))).await.unwrap();
     let endpoint = format!("#fixture-endpoint:tcp -h 127.0.0.1 -p {};", listener.local_addr().unwrap().port());
-    let original_bound_port = bounded(UdpSocket::bind(("127.0.0.1", 0))).await.unwrap();
-    let port = original_bound_port.local_addr().unwrap().port();
+    let port = 49151; // original logical ARC port fixture, not a UDP bind
     let (rpc, owner, account, ticket, accepted) = accepted_context(endpoint.as_bytes(), CONTENT);
     let plan = MediaEndpointPlan::from_accept(&accepted, &ticket, RpcConnectionScope::fresh(), supplied.clone(), port).unwrap();
     let connector = Arc::new(TcpRuntimeConnector::new(Duration::from_secs(2)).unwrap());
     let (handle, result) = spawn(plan, connector);
-    (Fixture { rpc, owner, account, ticket, supplied, handle, result, _original_bound_port: original_bound_port, port }, listener)
+    (Fixture { rpc, owner, account, ticket, supplied, handle, result, port }, listener)
 }
 fn account_live(fixture: &Fixture) {
     assert!(fixture.account.is_open()); assert!(fixture.ticket.is_live());
@@ -204,13 +203,13 @@ async fn dropping_original_result_receiver_cancels_pending_actor_and_join_does_n
         pending.send(()).unwrap(); peer.eof().await;
     });
     bounded(pending_rx).await.unwrap(); account_live(&fixture);
-    let Fixture { rpc, owner, account, ticket, supplied: _, handle, result, _original_bound_port, port: _ } = fixture;
+    let Fixture { rpc, owner, account, ticket, supplied: _, handle, result, port: _ } = fixture;
     let media_scope = handle.scope(); drop(result);
     bounded(media_scope.closed()).await;
     let closed = bounded(handle.close()).await; assert!(closed.io_released());
     assert!(!handle.scope().is_open()); assert!(account.is_open()); assert!(ticket.is_live());
     assert_eq!(rpc.phase(), ArcPhase::Authenticated); assert_eq!(ticket.owner(), &owner);
-    bounded(peer).await.unwrap(); drop(_original_bound_port);
+    bounded(peer).await.unwrap();
 }
 
 #[tokio::test]

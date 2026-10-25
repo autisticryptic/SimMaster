@@ -281,6 +281,35 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('failed_runtime_release_rolls_back_original_fence', tests)
         self.assertIn('stale_joined_proof_cannot_release_a_new_run', tests)
         self.assertIn('independent_sqlite_connections_atomically_admit_only_one', tests)
+    def test_inbound_text_provider_uses_live_original_consumer_not_imported_or_cached_ready(self):
+        runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
+        self.assertIn('struct MessagingReadiness { owner: AttemptOwner, scope: RpcConnectionScope }', runtime)
+        self.assertIn('Callback::HostingAck { success: true }', runtime)
+        self.assertIn('run.install_message_readiness(&owner, &scope)', runtime)
+        self.assertIn('original.scope.is_open()', runtime)
+        self.assertIn('binding.receiver_kind == super::smgw_text::SMGW_RECEIVER', runtime)
+        self.assertIn('credential_expiry.is_some_and(|at| at <= now)', runtime)
+        self.assertIn('!task.is_finished()', runtime)
+        provider = (PROVIDER / 'message_provider.rs').read_text(encoding='utf-8')
+        self.assertIn('Weak<AccountManager>', provider)
+        self.assertIn('capabilities: vec![VoiceCapability::Messaging]', provider)
+        self.assertNotIn('VoiceCapability::Voice', provider)
+        self.assertNotIn('expose_to_backend', provider)
+        self.assertIn('MessagingProvider::for_accounts(&app_state.app_accounts)', source('backend/src/main.rs'))
+        for workflow in ['.github/workflows/build-release.yml', '.github/workflows/beta-validation.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::message_provider::tests', source(workflow))
+
+    def test_current_sms_receive_availability_is_independent_from_unsupported_paid_sends(self):
+        handlers = source('backend/src/api/handlers.rs')
+        self.assertIn('app.app_accounts.messaging_availability(&account.line_id)', handlers)
+        self.assertIn('incoming_ready: Some(receiving), outbound_authorized: Some(false)', handlers)
+        models = source('backend/src/api/models.rs')
+        self.assertIn('pub incoming_ready: Option<bool>', models)
+        self.assertIn('pub outbound_authorized: Option<bool>', models)
+        tests = source('backend/src/api/app_voice_http_tests.rs')
+        self.assertIn('channel["incoming_ready"],true', tests)
+        self.assertIn('readiness["data"]["incoming_call_ready"],false', tests)
+        self.assertIn('get_sms_messages_for_channel(10,0,Some("outgoing"),Some(&line)).unwrap().is_empty()', tests)
 
 
 if __name__ == '__main__':

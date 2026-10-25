@@ -26,7 +26,7 @@ async fn original_direct_smgw_text_sms_and_both_events_commit_before_native_repl
     });
     manager.start(&line,1,100).await.unwrap();tokio::time::timeout(Duration::from_secs(4),observed_reply).await.unwrap().unwrap();
     let rows=manager.messages(&line,50).unwrap();assert_eq!(rows.len(),1);assert_eq!(rows[0].sent_at_unix_millis,Some(1_700_000_000_123));assert_eq!(rows[0].timestamp_source,"sender");
-    let view=manager.get(&line,100).await.unwrap();assert!(!view.incoming_message_ready&&!view.incoming_call_ready&&!view.outbound_authorized);
+    let view=manager.get(&line,100).await.unwrap();assert!(view.incoming_message_ready);assert!(!view.incoming_call_ready&&!view.outbound_authorized);assert_eq!(view.provider_availability,"available");
     assert_eq!(manager.inbox(&line,50).unwrap()[0].classification,"smgw_text");
     manager.stop(&line,1,100).await.unwrap();serving.await.unwrap();assert!(dropped.load(Ordering::SeqCst));
 }
@@ -42,6 +42,8 @@ async fn original_smgw_sms_event_failure_rolls_back_and_never_acks_raw_only_succ
         while let Some(message)=peer.receive().await {assert_ne!(message.kind,CallKind::Reply);}
     });
     manager.start(&line,1,100).await.unwrap();let state=phase(&manager,&line,"disconnected").await;assert_eq!(state.last_error,Some("app_account_sms_storage_failed"));
+    assert!(!state.incoming_message_ready&&!state.incoming_call_ready&&!state.outbound_authorized);
+    assert_ne!(manager.messaging_availability(&line),crate::connectivity::app_voice::registry::ProviderAvailability::Available);
     assert!(manager.messages(&line,50).unwrap().is_empty());assert!(manager.inbox(&line,50).unwrap().is_empty());assert!(temp.database.get_recent_app_events(Some(&line),10).unwrap().is_empty());
     manager.stop(&line,1,100).await.unwrap();serving.await.unwrap();assert!(dropped.load(Ordering::SeqCst));
 }

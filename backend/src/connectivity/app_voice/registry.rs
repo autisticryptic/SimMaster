@@ -103,6 +103,11 @@ impl ProviderRegistry {
         Ok(())
     }
 
+    pub fn availability(&self, provider_id: &str, line_id: &str) -> ProviderAvailability {
+        let Ok(providers) = self.providers.read() else { return ProviderAvailability::Unknown; };
+        providers.get(provider_id).map_or(ProviderAvailability::Unsupported, |provider| provider.availability(line_id))
+    }
+
     pub fn descriptors(&self) -> Vec<ProviderDescriptor> {
         self.providers.read().map(|map| map.values().map(|p| p.descriptor().clone()).collect())
             .unwrap_or_default()

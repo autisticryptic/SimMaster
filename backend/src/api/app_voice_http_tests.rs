@@ -237,6 +237,23 @@ mod app_voice_accounts {
         let message=&projected["data"][0];assert_eq!(message["content"],"fixture SMS 你好 🥘");assert_eq!(message["phone_number"],"fixture-sender");assert_eq!(message["transport"],"app_voice");assert!(message["pdu"].is_null());
         assert_eq!(message["classification"],"smgw_text");assert_eq!(message["sent_at_unix_millis"],1_700_000_000_123i64);assert_eq!(message["timestamp_source"],"sender");
         let sms_id=message["id"].as_i64().unwrap();
+        let (status,headers,body)=account_request(&served,reqwest::Method::GET,&path,None,Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
+        let readiness:serde_json::Value=serde_json::from_str(&body).unwrap();
+        assert_eq!(readiness["data"]["incoming_message_ready"],true);assert_eq!(readiness["data"]["provider_availability"],"available");
+        assert_eq!(readiness["data"]["incoming_call_ready"],false);assert_eq!(readiness["data"]["outbound_authorized"],false);
+        let (status,_,body)=account_request(&served,reqwest::Method::GET,"/api/sms/channels",None,Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_secrets(&body);
+        let channels:serde_json::Value=serde_json::from_str(&body).unwrap();
+        let channel=channels["data"].as_array().unwrap().iter().find(|channel|channel["id"]==line).unwrap();
+        assert_eq!(channel["available"],true);assert_eq!(channel["incoming_ready"],true);assert_eq!(channel["outbound_authorized"],false);
+        assert!(channel.get("iccid").is_none());assert!(channel.get("operator_id").is_none());
+        // An actually ready receive channel still cannot send through the
+        // modem/IMS billing path or manufacture an outgoing history record.
+        let (status,_,body)=account_request(&served,reqwest::Method::POST,&format!("/api/modem/lines/{line}/sms/send"),
+            Some(serde_json::json!({"phone_number":"fixture-recipient","content":"must-not-send"})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::NOT_IMPLEMENTED);assert!(body.contains("app_account_outbound_unsupported"));no_secrets(&body);
+        assert!(state.app.database.get_sms_messages_for_channel(10,0,Some("outgoing"),Some(&line)).unwrap().is_empty());
         let (status,_,body)=account_request(&served,reqwest::Method::GET,&format!("/api/sms/list?channel_id={line}"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["messages"][0]["id"],sms_id);
         let (status,_,body)=account_request(&served,reqwest::Method::GET,"/api/sms/list?channel_id=another-line",None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);
@@ -254,7 +271,7 @@ mod app_voice_accounts {
             Some(serde_json::json!({"provider_id":"app_voice","config":config_json(&cert.root)})),Some(&cookie)).await;assert_eq!(status,StatusCode::CREATED);let line=created_line(&body);
         let (status,_,body)=account_request(&served,reqwest::Method::GET,"/api/sms/channels",None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);no_secrets(&body);
         let json:serde_json::Value=serde_json::from_str(&body).unwrap();let channel=json["data"].as_array().unwrap().iter().find(|c|c["id"]==line).unwrap();
-        assert_eq!(channel["kind"],"app_account");assert_eq!(channel["available"],false);assert!(channel.get("iccid").is_none());assert!(channel.get("operator_id").is_none());
+        assert_eq!(channel["kind"],"app_account");assert_eq!(channel["available"],false);assert_eq!(channel["incoming_ready"],false);assert_eq!(channel["outbound_authorized"],false);assert!(channel.get("iccid").is_none());assert!(channel.get("operator_id").is_none());
         let (status,_,body)=account_request(&served,reqwest::Method::POST,&format!("/api/modem/lines/{line}/sms/send"),
             Some(serde_json::json!({"phone_number":"fixture-recipient","content":"must-not-send"})),Some(&cookie)).await;assert_eq!(status,StatusCode::NOT_IMPLEMENTED);no_secrets(&body);assert!(body.contains("app_account_outbound_unsupported"));
         assert_eq!(api::handlers::send_sms_on_line(&state.app,&line,"fixture-recipient","must-not-send").await.err().as_deref(),Some("app_account_outbound_unsupported"));

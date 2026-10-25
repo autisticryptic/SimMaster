@@ -14,7 +14,8 @@ use super::{
     controller::{Callback, ControllerFailure, HostingController},
     runtime_backend::{BackendEvent, BackendEventPayload, NativeHostingBackend},
     runtime_connector::TcpRuntimeConnector,
-    session::{BackendFailure, Phase},
+    session::{AttemptOwner, BackendFailure, Phase},
+    rpc_pending::RpcConnectionScope,
 };
 use crate::platform::db::Database;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -106,6 +107,10 @@ impl RunQuiescence {
 #[cfg(test)]
 pub(super) fn test_quiescence(token: RunToken) -> RunQuiescence { RunQuiescence { token: Arc::new(token) } }
 
+/// Runtime-only evidence that the exact native Smgw receiver and durable
+/// consumer belong to the current hosted owner. Never restored from storage.
+struct MessagingReadiness { owner: AttemptOwner, scope: RpcConnectionScope }
+
 struct ManagedRun {
     line_id: String,
     database: Arc<Database>,
@@ -114,6 +119,9 @@ struct ManagedRun {
     run_token: Arc<RunToken>,
     finalized: AtomicBool,
     notifications: Option<Arc<dyn NoticePlanner>>,
+    sms_supported: bool,
+    credential_expiry: Option<u64>,
+    messaging_readiness: Mutex<Option<MessagingReadiness>>,
     controller: AsyncMutex<HostingController>,
     backend: Arc<NativeHostingBackend>,
     accepting: AtomicBool,
@@ -131,8 +139,27 @@ impl ManagedRun {
         }
         Ok(())
     }
+    fn install_message_readiness(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) {
+        let verified_receiver = self.backend.original_incoming_binding(owner, scope)
+            .is_some_and(|binding| binding.receiver_kind == super::smgw_text::SMGW_RECEIVER);
+        if self.sms_supported && self.accepting.load(Ordering::SeqCst) && verified_receiver {
+            *lock(&self.messaging_readiness) = Some(MessagingReadiness { owner: owner.clone(), scope: scope.clone() });
+        }
+    }
+    fn message_ready(&self, now: u64) -> bool {
+        if !self.sms_supported || !self.accepting.load(Ordering::SeqCst) || self.stopping.load(Ordering::SeqCst)
+            || self.finalized.load(Ordering::SeqCst) || self.credential_expiry.is_some_and(|at| at <= now)
+            || self.configuration_current().is_err() { return false; }
+        let consumer_live = self.task.try_lock().is_ok_and(|task| task.as_ref().is_some_and(|task| !task.is_finished()));
+        if !consumer_live { return false; }
+        let readiness = lock(&self.messaging_readiness);
+        readiness.as_ref().is_some_and(|original| original.scope.is_open()
+            && self.backend.original_incoming_binding(&original.owner, &original.scope)
+                .is_some_and(|binding| binding.receiver_kind == super::smgw_text::SMGW_RECEIVER))
+    }
     fn retire(&self) {
         self.accepting.store(false, Ordering::SeqCst);
+        *lock(&self.messaging_readiness) = None;
         self.backend.retire_current();
     }
 }
@@ -213,7 +240,30 @@ impl AccountManager {
         controller.tick(now, Instant::now());
         let error = if controller.phase() == Phase::CredentialExpired { Some("app_account_credential_expired") }
             else { *lock(&run.error) };
-        Ok(view(metadata, controller.phase(), !controller.resources_released() || !run.finalized.load(Ordering::SeqCst), error))
+        let mut snapshot = view(metadata, controller.phase(), !controller.resources_released() || !run.finalized.load(Ordering::SeqCst), error);
+        // SDK hosting success alone is not enough: only the exact supported
+        // receiver + live original durable consumer publishes SMS readiness.
+        if controller.phase() == Phase::Hosted && run.message_ready(now) {
+            snapshot.incoming_message_ready = true;
+            snapshot.provider_availability = "available";
+        }
+        Ok(snapshot)
+    }
+    /// Synchronous provider observation, not an IO/action grant. Configuration
+    /// revision, local run lease, expiry and original physical scope are checked
+    /// on every query; old successes and prior-process rows cannot restore it.
+    pub(crate) fn messaging_availability(&self, line_id: &str) -> crate::connectivity::app_voice::registry::ProviderAvailability {
+        use crate::connectivity::app_voice::registry::ProviderAvailability as Availability;
+        if !account_store::valid_line_id(line_id) { return Availability::Unsupported; }
+        let metadata = match self.metadata(line_id) {
+            Ok(metadata) => metadata, Err("app_account_not_found") => return Availability::NotConfigured,
+            Err(_) => return Availability::Unknown,
+        };
+        let run = lock(&self.slots).get(line_id).and_then(|slot| lock(&slot.run).clone());
+        let Some(run) = run else { return Availability::NotConfigured; };
+        if metadata.revision != run.revision || run.configuration_current().is_err() { return Availability::Unknown; }
+        if !run.sms_supported { return Availability::Unsupported; }
+        if run.message_ready(unix_now()) { Availability::Available } else { Availability::NotConfigured }
     }
     pub async fn list(&self, now: u64) -> Result<Vec<AccountView>, &'static str> {
         let metadata = self.database.with_conn(account_store::list)?;
@@ -298,12 +348,15 @@ impl AccountManager {
         if stored.revision != metadata.revision { return Err("app_account_revision_conflict"); }
         config.validate(now)?;
         let inbox_nonce = local_nonce()?;
+        let sms_supported = config.profile.incoming.as_ref().is_some_and(|binding| binding.receiver_kind == super::smgw_text::SMGW_RECEIVER);
+        let credential_expiry = config.credentials.sdk.expires_at_unix_seconds;
         let (backend, events) = self.factory.build(&config)?;
         let mut controller = HostingController::new(line_id.to_owned(), Some(backend.clone()));
         controller.import(config.credentials, now).map_err(controller_error)?;
         let run_token=Arc::new(self.database.with_conn(|conn|account_runs::register_runtime(conn,line_id,metadata.revision,&inbox_nonce))?);
         let run = Arc::new(ManagedRun { line_id: line_id.to_owned(), database: self.database.clone(), revision: metadata.revision,
-            inbox_nonce, run_token, finalized: AtomicBool::new(false), notifications:self.notifications.clone(), controller: AsyncMutex::new(controller), backend,
+            inbox_nonce, run_token, finalized: AtomicBool::new(false), notifications:self.notifications.clone(),
+            sms_supported, credential_expiry, messaging_readiness: Mutex::new(None), controller: AsyncMutex::new(controller), backend,
             accepting: AtomicBool::new(true), stopping: AtomicBool::new(false), error: Mutex::new(None), task: AsyncMutex::new(None) });
         // Retain the owning backend BEFORE any await that can create IO. A
         // cancelled HTTP future leaves this same run available for stop/retry.
@@ -496,8 +549,11 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                         if matches!(callback.callback, Callback::Channels { .. }) {
                             *lock(&run.error) = Some("app_account_channels_unverified"); run.retire(); continue;
                         }
-                        if let Err(reason) = controller.on_callback(&owner, callback.callback, unix_now()).await {
-                            *lock(&run.error) = Some(controller_error(reason)); run.retire();
+                        let hosted = matches!(callback.callback, Callback::HostingAck { success: true });
+                        match controller.on_callback(&owner, callback.callback, unix_now()).await {
+                            Ok(true) if hosted && controller.phase() == Phase::Hosted => run.install_message_readiness(&owner, &scope),
+                            Ok(_) => {},
+                            Err(reason) => { *lock(&run.error) = Some(controller_error(reason)); run.retire(); }
                         }
                     }
                     BackendEventPayload::Call(call)=>{

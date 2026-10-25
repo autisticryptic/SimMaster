@@ -16,6 +16,7 @@ pub mod smgw_text;
 pub mod account_runtime;
 pub mod account_runs;
 pub mod account_notifications;
+pub(crate) mod message_provider;
 #[cfg(test)]
 pub(crate) mod account_test_support;
 pub mod credentials;

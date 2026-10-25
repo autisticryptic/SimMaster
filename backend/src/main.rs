@@ -1173,6 +1173,13 @@ async fn main() -> Result<()> {
         e911,
     });
 
+    // Explicitly install only the currently implemented inbound-text provider.
+    // Its descriptor never promises outgoing SMS, SIM billing or voice/media;
+    // availability is tied to this manager's actual original hosted run.
+    connectivity::app_voice::registry::registry().install(Box::new(
+        connectivity::app_voice::providers::jegotrip::message_provider::MessagingProvider::for_accounts(&app_state.app_accounts),
+    )).map_err(anyhow::Error::msg)?;
+
     // Kept out of the router's state so session teardown can still run after
     // `serve` returns and the state itself has been consumed.
     let shutdown_registry = Arc::clone(&app_state.line_registry);

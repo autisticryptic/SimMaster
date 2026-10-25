@@ -5311,6 +5311,8 @@ pub async fn get_sms_channels_handler(
             kind: "modem_line".to_string(),
             label: format!("{} · 卡槽 {}", modem.slot_label, modem.uim_slot),
             available: modem.present,
+            incoming_ready: None,
+            outbound_authorized: None,
             uim_slot: modem.uim_slot,
             line_id: Some(modem.line_id),
             slot_id: None,
@@ -5323,9 +5325,12 @@ pub async fn get_sms_channels_handler(
         Err(code) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(code))),
     };
     for account in accounts {
+        let receiving = app.app_accounts.messaging_availability(&account.line_id)
+            == crate::connectivity::app_voice::registry::ProviderAvailability::Available;
         channels.push(SmsChannelResponse {
             id: account.line_id.clone(), kind: "app_account".to_owned(),
-            label: "无忧行 · 应用账号".to_owned(), available: false,
+            label: "无忧行 · 应用账号".to_owned(), available: receiving,
+            incoming_ready: Some(receiving), outbound_authorized: Some(false),
             line_id: Some(account.line_id), ..Default::default()
         });
     }

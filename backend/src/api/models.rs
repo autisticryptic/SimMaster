@@ -1063,6 +1063,12 @@ pub struct SmsChannelResponse {
     pub kind: String,
     pub label: String,
     pub available: bool,
+    /// Application-account receive readiness is independent from paid send
+    /// permission. None preserves the existing modem/historical DTO shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incoming_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outbound_authorized: Option<bool>,
     pub uim_slot: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_id: Option<String>,

@@ -76,20 +76,20 @@ impl MediaEndpointPlan{
     /// Production creates the physical destination internally. It cannot reuse
     /// an account/another call's scope or collide with that scope's sequence 1.
     pub(super) fn prepare(reply:&OwnedCallOperationReply,ticket:&CallControlTicket,
-        profile:Arc<MediaEndpointProfile>,original_udp_port:u16)->Result<Self,MediaError>{
-        Self::capture(reply,ticket,RpcConnectionScope::fresh(),profile,original_udp_port)
+        profile:Arc<MediaEndpointProfile>,original_arc_port:u16)->Result<Self,MediaError>{
+        Self::capture(reply,ticket,RpcConnectionScope::fresh(),profile,original_arc_port)
     }
     /// Only source fixtures can inject scopes to test original-scope rejection.
     #[cfg(test)]
     pub(super) fn from_accept(reply:&OwnedCallOperationReply,ticket:&CallControlTicket,scope:RpcConnectionScope,
-        profile:Arc<MediaEndpointProfile>,original_udp_port:u16)->Result<Self,MediaError>{
-        Self::capture(reply,ticket,scope,profile,original_udp_port)
+        profile:Arc<MediaEndpointProfile>,original_arc_port:u16)->Result<Self,MediaError>{
+        Self::capture(reply,ticket,scope,profile,original_arc_port)
     }
     fn capture(reply:&OwnedCallOperationReply,ticket:&CallControlTicket,scope:RpcConnectionScope,
-        profile:Arc<MediaEndpointProfile>,original_udp_port:u16)->Result<Self,MediaError>{
+        profile:Arc<MediaEndpointProfile>,original_arc_port:u16)->Result<Self,MediaError>{
         let owner=ticket.owner();let account=ticket.connection_scope();
         if !ticket.is_live()||!scope.is_open()||scope.matches(&account)||!reply.original_call(ticket)
-            ||reply.operation()!=CallOperation::Accept||!reply.accepted()||reply.native_id()!=ticket.native_id()||original_udp_port==0{return Err(MediaError::Scope);}
+            ||reply.operation()!=CallOperation::Accept||!reply.accepted()||reply.native_id()!=ticket.native_id()||original_arc_port==0{return Err(MediaError::Scope);}
         let data=reply.properties_for(owner,&account).ok_or(MediaError::Scope)?;
         let get=|name:&[u8]|data.iter().find(|p|p.key==name).map(|p|p.value).ok_or(MediaError::MissingProperty);
         let endpoint=get(b"endpoint")?;let content=get(b"content")?;
@@ -103,7 +103,9 @@ impl MediaEndpointPlan{
         let text=std::str::from_utf8(canonical.expose_to_backend()).map_err(|_|MediaError::UnsupportedReference)?;
         validate_explicit_profile(ConnectionInput{server_reference:text,authority:profile.trust.authority(),root_der_base64:profile.trust.root_der_base64(),
             enable_sni:profile.trust.enable_sni(),reference_decode_key:None}).map_err(|_|MediaError::UnsupportedReference)?;
-        let port=Zeroizing::new(original_udp_port.to_string());let mut parameters=borrowed(&profile.properties);
+        // Native Client.ArcPort is a logical Router listener port. It is DATA
+        // here, not an OS UDP binding or a permission to dial an RTP endpoint.
+        let port=Zeroizing::new(original_arc_port.to_string());let mut parameters=borrowed(&profile.properties);
         parameters.push(RpcProperty{key:b"Client.ArcPort",value:port.as_bytes()});
         let features:Vec<&[u8]>=profile.features.iter().map(|v|v.as_slice()).collect();
         let args=encode_endpoint_connect(EndpointConnectInputs{content,features:&features,properties:&parameters}).map_err(|_|MediaError::Configuration)?;
@@ -140,7 +142,8 @@ impl MediaEndpointPlan{
 }
 
 /// Constructed only by the original pending Endpoint receive path. Raw audio
-/// activation still needs the original bound UDP socket and supported SDP.
+/// still needs an original native logical listener/route or supported Mpath
+/// transport and SDP. Client.Host/ArcPort are not an IP/OS UDP socket grant.
 pub(super) struct OwnedMediaEndpointReply{
     owner:AttemptOwner,ticket:CallControlTicket,scope:RpcConnectionScope,profile:Arc<MediaEndpointProfile>,
     features:Vec<Zeroizing<Vec<u8>>>,properties:Vec<Property>,
