@@ -6,7 +6,9 @@
 
 ## 当前基线与工作规则
 
-- **当前代码 `7cc8b8f` 已验证**：Build40202373634/Beta40202373625/ARM64 AMD64 success，官方SHA测试ZIP各525 Jegotrip＋31通知service/模板＋12真实HTTP/auth＋4SIP＋7DNS/原86矩阵，410static/mock、58warnings/17节选、Release skipped，首轮全过。原matched getAppConfigs字段/引用→单独导入account trust和destination scope→原source actor Join后新connection/TLS/login已接真实AccountManager；raw DomainName与Client Domain/App/CC、原pwd/selector/device、双root/SNI/Scope/总deadline/取消和旧version1配置兼容均实际验证，不启provider/Channels/paidoutbound。完整locator/default选路/NetStream、call ingress/media/trunk及独立policy/principal并发/renewal、orphan与共享历史仍open，不能把此支持子集改称全backend或只剩实机。
+- **当前代码 `aa87c18` 已验证**：Build40207983533/Beta40207983422/双架构success，officialSHA ZIP各544 Jegotrip＋31service/模板＋13HTTP/auth＋4SIP＋7DNS/原86矩阵，415static/mock、58warnings/17节选、Release skipped，首轮全过。新增本地per-account SQL排他/原nonce proof CAS，与run fence同事务admit、原actor+consumer Join/GC同事务release；跨manager/SQLite/legacy unknown不能start/CRUD/stop接管，不是remote principal/device lease或crash恢复。CallEx BE64/三通知/accept参数结果仅data codecs，原receiver/agent/pending/results及SDP/media/Trunk仍未接，不能当call-ready；后续保持完整native、独立action/cost/principal/renewal、真实process恢复/history open。
+
+- **前bootstrap代码 `7cc8b8f` 已验证**：Build40202373634/Beta40202373625/ARM64 AMD64 success，官方SHA测试ZIP各525 Jegotrip＋31通知service/模板＋12真实HTTP/auth＋4SIP＋7DNS/原86矩阵，410static/mock、58warnings/17节选、Release skipped，首轮全过。原matched getAppConfigs字段/引用→单独导入account trust和destination scope→原source actor Join后新connection/TLS/login已接真实AccountManager；raw DomainName与Client Domain/App/CC、原pwd/selector/device、双root/SNI/Scope/总deadline/取消和旧version1配置兼容均实际验证，不启provider/Channels/paidoutbound。完整locator/default选路/NetStream、call ingress/media/trunk及独立policy/principal并发/renewal、orphan与共享历史仍open，不能把此支持子集改称全backend或只剩实机。
 
 - **前原run/通知代码 `c55f773` 已验证**：Build40135247656/Beta40135247579/ARM64 AMD64 success，官方SHA测试ZIP各499 Jegotrip＋31通知service/旧模板＋10真实HTTP/auth＋4SIP＋7DNS/86矩阵，406static/mock、58warnings/19节选，Release skipped。原run持久fence、actor及consumer双Join后已投影envelope回收、保留SMS/unknown raw；正常run结束后不再终身占用128配额，但原direct协议128活跃history不改。已渲染通知计划与SMS同事务入队，目标指纹/CAS claims/有界工作池/到期和不确定结果、原上下文HTTP实测、main关机与pending start取消已接通；首main Duration编译缺口已修，失败ZIP保留。未启UI/globalprovider/Channels/paidoutbound。完整native和进程/业务后续仍open，详见本页P0及`app-notification-implementation-evidence.md`。
 
@@ -50,7 +52,7 @@
 
 ## P0：无忧行 backend 的实施顺序与原生证据关口
 
-用户要求持续规划并完成 backend，仅完成或确实需要手动 IDA 时汇报。当前已验证代码为 `7cc8b8f`；原matched bootstrap到单独TLS账号scope的handoff、独立账号/显式profile runtime/Smgw文本/持久通知和原run释放回收已实现，但不是完整默认SDK客户端、所有SMS编码或通话媒体。后续不重复已验证组件，实施顺序与边界：
+用户要求持续规划并完成 backend，仅完成或确实需要手动 IDA 时汇报。当前已验证代码为 `aa87c18`；本地account runtime exclusion、原matched bootstrap到单独TLS账号scope的handoff、独立账号/显式profile runtime/Smgw文本/持久通知和原run释放回收已实现，但不是完整默认SDK客户端、所有SMS编码或通话媒体。后续不重复已验证组件，实施顺序与边界：
 
 | 顺序 | 必须交付的实际行为 | 不能用什么替代 |
 | --- | --- | --- |
@@ -63,11 +65,13 @@
 | 7 | 独立费用/授权、已核实生命周期/续期与设备并发、普通失败恢复 | 将 app 通话/短信当 IMS 免费，force takeover、猜 TTL/renewal endpoint |
 | 8 | 两套 Actions/双架构、官方 SHA ZIP 精确清单/原86矩阵/旧SIP、固定手册与私有证据 | 静态、子agent 或 CI 绿灯充当实网完成 |
 
-**步骤2的matched bootstrap/direct-TLS handoff、步骤3的显式profile、步骤4、步骤5的Smgw文本/通知及正常run回收已验证。** 7cc8b8f按原source/call-id捕获raw DomainName和Client DomainId/AppId/CC及Common reference，单独account authority/root/SNI与destination scope不可从回复猜出；原source owning Join结束才接新IO，取消保留两句柄，总期限及原TLS时钟不reset。旧JSON无bootstrap仍explicit、混合手工字段拒绝，真实双连接与AccountManager/HTTP已执行；原cfg不被derived字段覆写。其余locator/default选路与全部NetStream不是此子集承诺。原actor和consumer都join后，通过持久写fence回收已投影私有envelope且保留共享SMS；未知raw/无证明legacy-orphan不回收。128unknown/pending预算与512所有live identity预算分开，原direct协议自身128去重历史仍约束单连接，不承诺无限常驻或自动重连。通知配置在SQL外捕获、纯计划在SMS原事务入队、目标指纹冻结目的地；bounded worker、CAS/每channel单claim、删除/过期/未知结果不伪造成功，原字段不借SIM/modem。**仍未闭环**：有证据的跨进程/crash owner恢复、共享SMS历史保留策略与必要其他编码，无remote id的跨新run去重；完整默认provision/locator/NetStream/Router/Channel，真实call/media/trunk，独立费用/续期/设备并发。通知远端不可承诺exactly-once，已admitted发送不能召回；global provider/Channels/paidoutbound仍false，不能称全部backend或只剩实机。
+**本地account runtime排他、步骤2的matched bootstrap/direct-TLS handoff、步骤3的显式profile、步骤4、步骤5的Smgw文本/通知及正常run回收已验证。** aa87c18增加数据库连接共享的line/revision/nonce排他，原run fence和claim同事务、原actor+consumer proof CAS/GC/release同事务；未持有原run的manager不能stop/CRUD接管，旧live孤儿不凭PID/age视作释放。此不等于remote principal/device lease、跨账号同principal检测或真实crash-owner恢复。CallEx只新增精确BE64与通知/accept数据codec，完整ownership/result/media尚未接。
+
+7cc8b8f按原source/call-id捕获raw DomainName和Client DomainId/AppId/CC及Common reference，单独account authority/root/SNI与destination scope不可从回复猜出；原source owning Join结束才接新IO，取消保留两句柄，总期限及原TLS时钟不reset。旧JSON无bootstrap仍explicit、混合手工字段拒绝，真实双连接与AccountManager/HTTP已执行；原cfg不被derived字段覆写。其余locator/default选路与全部NetStream不是此子集承诺。原actor和consumer都join后，通过持久写fence回收已投影私有envelope且保留共享SMS；未知raw/无证明legacy-orphan不回收。128unknown/pending预算与512所有live identity预算分开，原direct协议自身128去重历史仍约束单连接，不承诺无限常驻或自动重连。通知配置在SQL外捕获、纯计划在SMS原事务入队、目标指纹冻结目的地；bounded worker、CAS/每channel单claim、删除/过期/未知结果不伪造成功，原字段不借SIM/modem。**仍未闭环**：有证据的跨进程/crash owner恢复、共享SMS历史保留策略与必要其他编码，无remote id的跨新run去重；完整默认provision/locator/NetStream/Router/Channel，真实call/media/trunk，独立费用/续期/设备并发。通知远端不可承诺exactly-once，已admitted发送不能召回；global provider/Channels/paidoutbound仍false，不能称全部backend或只剩实机。
 
 **剩余原生关口**：Router数据controls/16-bit邻片/2048-bit统计与Channel header/SACK/record/retransmit descriptor已有证据及codec；原会话SDK logout和STATUS3 semantic ACK已验证。完整NetStream ready/时序/选路/重传生命周期、正常provision到endpoint-authority-root绑定、业务channel及call/media仍需闭环，不能用codec存在或ACK成功替代。原Smgw登记`Sip.Request`、SDK/app text/可选millis已确认；不能把所有generic消息或本地UUID自动当SMS类别/remote delivery ID，更不猜PDU/direct SIP/RTP/费用。
 
-此前用户已打开原SHA/base0的`.local/jegotrip/libmtc.so`，本轮又实际metadata匹配后只读分析。新增证实：Client580BA4对DomainId/AppId的原map值做Client解码，DomainName仍原map；60CAAC应答经4773C0/473AEC/477074为`accept.CallServerEx.CallEx`，保留原64-bit call id和RseEx.SDP等，477464版本类重试不等于媒体成功。Locator方法字符串仅注册元数据，不能拿常量3猜wire版本/locator结果。完整默认connector/媒体仍需证据与实现，定位见`.local/jegotrip/native-provision-call-frontier.md`。不因helper失败或未知字段要求重开IDA，不自行加载/改IDB；未执行SDK目标或真实服务。最新bootstrap验证`verified-native-7cc8b8f.json`及`bootstrap-handoff-implementation-evidence.md`；前原run/通知验证`verified-native-c55f773.json`、Smgw证据继续有效，完整backend保持open。
+此前用户已打开原SHA/base0的`.local/jegotrip/libmtc.so`，本轮又实际metadata匹配后只读分析。新增证实：Client580BA4对DomainId/AppId的原map值做Client解码，DomainName仍原map；60CAAC应答经4773C0/473AEC/477074为`accept.CallServerEx.CallEx`，保留原64-bit call id和RseEx.SDP等，477464版本类重试不等于媒体成功。Locator方法字符串仅注册元数据，不能拿常量3猜wire版本/locator结果。完整默认connector/媒体仍需证据与实现，定位见`.local/jegotrip/native-provision-call-frontier.md`。不因helper失败或未知字段要求重开IDA，不自行加载/改IDB；未执行SDK目标或真实服务。最新排他/CallEx data验证`verified-native-aa87c18.json`及`runtime-exclusion-call-evidence.md`；原bootstrap `verified-native-7cc8b8f.json`和前原run/通知/Smgw证据继续有效，完整backend保持open。
 
 ## P0：第一批补全的交付核验
 

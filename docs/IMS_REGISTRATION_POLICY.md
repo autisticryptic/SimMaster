@@ -9,7 +9,7 @@
 
 - 应用接入位于 `connectivity/app_voice`，与 `modems/ims` 并列。无忧行/Google Voice/Telegram/iMessage分别实现，不能共享AKA/CS兜底/资费；旧import仅兼容。无忧行controller调度SDK（31d3739已由两套Actions各8项调度回归验证）不等于实现wire transport，iMessage不是语音运营商。
 
-- 无忧行托管与IMS/AKA分离：SDK phone token与托管SipPwd是两层凭据，App登录UI可暂缓但不省服务开通/到期。`7cc8b8f`已验证原matched bootstrap到单独TLS account scope/IO handoff，原显式runtime、独立账号/Smgw文本/通知/正常run回收保留；这不是完整default locator/NetStream、真实call/media/Trunk或全局可用provider，不授Channels/paidoutbound、不套IMS资费。[支持子集和参数](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行托管与IMS/AKA分离：SDK phone token与托管SipPwd是两层凭据，App登录UI可暂缓但不省服务开通/到期。`aa87c18`已验证本地per-account runtime exclusion，原matched bootstrap到单独TLS account scope/IO handoff保留，原显式runtime、独立账号/Smgw文本/通知/正常run回收保留；这不是完整default locator/NetStream、真实call/media/Trunk或全局可用provider，不授Channels/paidoutbound、不套IMS资费。[支持子集和参数](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - 蜂窝 IMS 是语音、短信、补充业务共享的接入；VoLTE/VoNR 是语音能力，不是注册开关。
 - 已实现接入协调、协商门禁、受保护续期和按来源解析 profile；不承诺所有网络互通。
@@ -455,7 +455,9 @@ Build40045409934/Beta40045409943/ARM64 AMD64 success，Release skipped；官方S
 
 ## 10. 验证清单与验收标准
 
-最新`7cc8b8f`：Build40202373634/Beta40202373625/双架构success，officialSHA ZIP各525 Jegotrip＋31通知service/模板＋12HTTP/auth＋4SIP＋7DNS/原86矩阵，410static/mock、58warnings/17节选，Release skipped，首轮全过。原getAppConfigs成功/call-id/source快照、DomainName raw与独立Client/Common context、缺CC清空、不同root/SNI/scope、source Join后实际handoff及取消/总期限/旧JSON/CAS/no-store HTTP已执行。Scope flags/源reply不是release或SDK/hosting/media ACK，Derived不替代原凭据/trust/配置，不授paid outbound。证据`verified-native-7cc8b8f.json`/`bootstrap-handoff-implementation-evidence.md`；WSL GitHub路由失败已用有界WindowsHTTPS读取恢复，未放宽SHA，不本机Rust/真实服务设备/部署/NV/IDB写。
+最新`aa87c18`：Build40207983533/Beta40207983422/双架构success，officialSHA ZIP各544 Jegotrip＋31service/模板＋13HTTP/auth＋4SIP＋7DNS/原86，415static/mock、58warnings/17节选、Release skipped，首轮全过。持久per-account line/revision/nonce lease与run fence原子admit，原actor+consumer Join proof/CAS/GC/release原子，foreign/reopened manager无owner不可start/CRUD/stop接管，legacy live不猜已退出。不是remote principal/device全局lease或自动crash恢复。CallEx精确BE64/三通知/accept data不授receiver/pending/results/媒体或独立付费权限；原SDP变换/CONNECTING分支仍待真实owner/media接线。全backend保持open，无本机Rust/设备服务/部署/NV/IDB写/unknown清理；证据`verified-native-aa87c18.json`及`runtime-exclusion-call-evidence.md`。
+
+前bootstrap`7cc8b8f`：Build40202373634/Beta40202373625/双架构success，officialSHA ZIP各525 Jegotrip＋31通知service/模板＋12HTTP/auth＋4SIP＋7DNS/原86矩阵，410static/mock、58warnings/17节选，Release skipped，首轮全过。原getAppConfigs成功/call-id/source快照、DomainName raw与独立Client/Common context、缺CC清空、不同root/SNI/scope、source Join后实际handoff及取消/总期限/旧JSON/CAS/no-store HTTP已执行。Scope flags/源reply不是release或SDK/hosting/media ACK，Derived不替代原凭据/trust/配置，不授paid outbound。证据`verified-native-7cc8b8f.json`/`bootstrap-handoff-implementation-evidence.md`；WSL GitHub路由失败已用有界WindowsHTTPS读取恢复，未放宽SHA，不本机Rust/真实服务设备/部署/NV/IDB写。
 
 前原run/通知`c55f773`：Build40135247656/Beta40135247579/双架构success，官方SHA测试ZIP各499 Jego＋31通知service/旧模板＋10真实HTTP/auth＋4SIP＋7DNS/86核验，406static/mock，Release skipped，58warnings/19节选保留。只有原actor/controller＋consumer都Join才提交原run released fence并回收已投影envelope，SMS保留/unknown不丢，失败阻止replace/restart；原native direct128上限不删。通知计划SQL外配置snapshot、原SMS事务内入队，原目的地指纹/有界claim与CAS/期限/不确定态、元数据API和main关机接通，不访问modem或授paid SMS/voice。首main Duration类型缺口已修，失败两ZIP/annotations保留；不把已提交、回收或重试当remoteACK/媒体ready/全backend完成。无本机Rust/真实设备服务/部署/NV/IDB写；证据`verified-native-c55f773.json`及`app-notification-implementation-evidence.md`。
 

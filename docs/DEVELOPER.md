@@ -326,7 +326,16 @@ DEX已证明JNI参数但不含登录/托管网络封包。用户已手动打开�
 
 ### 完整 backend 的下一实施关口（持续）
 
-按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)继续完整Router/NetStream和default locator/原可信映射。原matched bootstrap到单独TLS account scope/IO handoff已由`7cc8b8f`验证，独立账号、Smgw文本/持久通知和原run回收保留；这些不是默认native或call/media/trunk可用。global provider/Channels/paidoutbound仍false，不冒充UICC/PDU/免费VoWiFi。本轮原IDA同SHA/base0再次只读核对，58C98C/58F6F8/580BA4复核原字段/独立pwd语义；不自行加载或改IDB，当前无需重开。
+按[开发计划](DEVELOPMENT_PLAN.md#p0无忧行-backend-的实施顺序与原生证据关口)继续完整Router/NetStream和default locator/原可信映射。`aa87c18`已验证本地per-account runtime排他和CallEx数据、原matched bootstrap到单独TLS account scope/IO handoff保留；独立账号、Smgw文本/持久通知和原run回收保留；这些不是默认native或call/media/trunk可用。global provider/Channels/paidoutbound仍false，不冒充UICC/PDU/免费VoWiFi。本轮原IDA同SHA/base0再次只读核对，58C98C/58F6F8/580BA4复核原字段/独立pwd语义；不自行加载或改IDB，当前无需重开。
+
+### 原运行排他与CallEx数据（`aa87c18`已验证）
+
+- `account_runs`新增持久per-account runtime exclusion，line/revision/run nonce与原fence同IMMEDIATE事务admit；`AccountManager`与Store CAS保护原lease，跨manager/SQLite不重复start/替换/删除或无owner stop。Reopen显示cleanup-required/owner-unconfirmed，legacy live不以PID/age自动清退。原actor/controller与consumer都Join的私有proof才可按原nonce/revision CAS，并与GC同事务release；失败/stale proof不清新owner，原bootstrap两句柄/通知/历史fence保留。
+- 本地per-account排他不识别别名/重复导入的remote principal，不承诺device全局并发/服务端独占或crash-owner恢复。未知持有者保持blocked，尚无force-clear/猜TTL/renewal。
+- 只读IDA `484788`确认为CallClientEx dispatcher：479DE8 onInvited为原BE64 id/peer string/map，479C2C/47963C为Released/Accepted BE64/map；477074 accept为版本表[0]/BE64/map，4757E4为zero/bool/map/Common footer。E70B6C逐字节证实64bit高位，不从旧EH合并的E70C88 decompile猜入口。新`rpc_calls`保留opaque数据、拒绝未知method/version/重复/截断/trailing及Debug redaction，native id不截为ARC/direct/batch i32。
+- 这是data codec：没有call receiver/agent安装、original-call capability、shared pending/result归属、answer/release runtime、自动ACK、SDP/crypto/endpoint推断或媒体/Trunk就绪。5FA47C有输出变换分支，5FCA0C的CONNECTING和60851C hooks不是完整media证明。仍须原call owner/反取消/资源joins、独立action/cost/principal/device/renewal与媒体支持，不能用bool/codec或本地lease代替。
+- Build40207983533/Beta40207983422/ARM64 AMD64 success、Release skipped；官方SHA ZIP各精确**544 Jegotrip＋31service/模板＋13真实HTTP/auth＋4SIP＋7DNS/原86矩阵**，415static/mock、58warnings/17节选，首轮两Actions通过。新增6SQL/3原manager+actor/1HTTP和9CallEx/1BE64；旧external-revision fixture加Store拒绝后显式SQL注入，原断言不削。首90s本机static外层timeout原日志保留，240s budget重跑完整PASS，无本机Rust/peers。
+- Build artifact12604921666 SHA`9da01b2a5a2c7bd79af8146d4bce7701725cb681713224546c2d0475ea54b65e`；Beta12604792393 SHA`e096bd713cdc2898c70c635545ad7db2cdceabdad5cc1a83b5805ba914e6418f`。证据`verified-native-aa87c18.json`/`runtime-exclusion-call-evidence.md`。未设备/服务/部署/NV/IDB写，UI/unknown资料不动，globalprovider/Channels/paidoutboundfalse。
 
 ### 原bootstrap到单独账号TLS handoff（`7cc8b8f`已验证）
 
