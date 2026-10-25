@@ -30,6 +30,12 @@ pub mod rpc_calls;
 pub mod call_binding;
 pub mod call_delivery;
 pub mod call_control;
+pub mod rpc_endpoint;
+pub mod raw_arc_audio;
+pub mod media_endpoint;
+pub(crate) mod media_endpoint_runtime;
+#[cfg(test)]
+pub(crate) mod media_test_support;
 pub mod rpc_batch;
 pub mod rpc_bootstrap;
 pub mod rpc_envelope;

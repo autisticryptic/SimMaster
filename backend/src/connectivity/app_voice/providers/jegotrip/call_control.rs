@@ -3,7 +3,7 @@
 //! call IDs and original identities survive all async command/receipt paths.
 use super::{call_binding::OwnedCallNotice,rpc_calls::{CallNoticeKind,CallOperation,NativeCallId},
     rpc_pending::RpcConnectionScope,rpc_stream::{CodecError,RpcProperty,MAX_FIELD_BYTES,MAX_MAP_ENTRIES,MAX_STREAM_BYTES},session::AttemptOwner};
-use std::{collections::BTreeMap,fmt,sync::{Arc,atomic::{AtomicBool,Ordering}}};
+use std::{collections::{BTreeMap,VecDeque},fmt,sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}};
 use zeroize::Zeroizing;
 
 const MAX_CALL_HISTORY:usize=128;
@@ -29,7 +29,7 @@ pub(super) fn validate_routing(routing:&[RpcProperty<'_>])->Result<(),CodecError
     if !get(b"id").is_some_and(valid_identifier)||!get(b"domain").is_some_and(valid_identifier){return Err(CodecError::InvalidField);}
     capture(routing).map(|_|())
 }
-struct CallIdentity{live:AtomicBool}
+struct CallIdentity{live:AtomicBool,media_started:AtomicBool,gate:Mutex<()>,changed:tokio::sync::Notify}
 pub struct CallControlTicket{owner:AttemptOwner,scope:RpcConnectionScope,native_id:NativeCallId,identity:Arc<CallIdentity>}
 impl fmt::Debug for CallControlTicket{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("CallControlTicket(<redacted>)")}}
 impl CallControlTicket{
@@ -37,16 +37,42 @@ impl CallControlTicket{
     pub fn connection_scope(&self)->RpcConnectionScope{self.scope.clone()}
     pub fn native_id(&self)->NativeCallId{self.native_id}
     pub fn is_live(&self)->bool{self.scope.is_open()&&self.identity.live.load(Ordering::Acquire)}
+    pub(super) fn same_call(&self,other:&Self)->bool{
+        self.owner==other.owner&&self.scope.matches(&other.scope)&&self.native_id==other.native_id&&Arc::ptr_eq(&self.identity,&other.identity)
+    }
+    /// Lock order: call identity -> original account scope -> destination media
+    /// scope (in the media caller). Nonblocking IO polls only; no close or await
+    /// in the closure. Revocation serializes with each poll, not a copied ticket.
     pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{&self.owner==owner&&self.scope.matches(scope)&&scope.is_open()}
     pub(super) fn captured_copy(&self)->Self{Self{owner:self.owner.clone(),scope:self.scope.clone(),native_id:self.native_id,identity:self.identity.clone()}}
-    pub(super) fn revoke(&self){self.identity.live.store(false,Ordering::Release);}
+    pub(super) fn with_media_gate<T>(&self,work:impl FnOnce()->T)->Option<T>{
+        let _gate=match self.identity.gate.lock(){Ok(gate)=>gate,Err(poison)=>{
+            let _gate=poison.into_inner();self.identity.live.store(false,Ordering::Release);self.identity.changed.notify_waiters();return None;
+        }};
+        if !self.is_live(){return None;}
+        self.scope.with_io_gate(||if self.identity.live.load(Ordering::Acquire){Some(work())}else{None}).flatten()
+    }
+    /// One original native call gets at most one media connection attempt.
+    /// Failure/Drop cannot grant an automatic second use of its Accept result.
+    pub(super) fn begin_media(&self)->bool{
+        self.with_media_gate(||!self.identity.media_started.swap(true,Ordering::AcqRel)).unwrap_or(false)
+    }
+    pub(super) async fn revoked(&self){loop{
+        let wake=self.identity.changed.notified();tokio::pin!(wake);wake.as_mut().enable();
+        if !self.is_live(){return;}
+        tokio::select!{biased;_=self.scope.closed()=>return,_=wake=>{}}
+    }}
+    pub(super) fn revoke(&self){
+        let _gate=self.identity.gate.lock().unwrap_or_else(|poison|poison.into_inner());
+        self.identity.live.store(false,Ordering::Release);self.identity.changed.notify_waiters();
+    }
 }
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum Phase{Received,Admitted,Checking,Checked,Accepting,Accepted,Releasing,Ended,Failed}
 struct Slot{ticket:CallControlTicket,phase:Phase,override_id:Option<Zeroizing<Vec<u8>>>}
-pub(super) struct CallBook{owner:AttemptOwner,scope:RpcConnectionScope,routing:Option<Vec<Property>>,calls:BTreeMap<u64,Slot>}
+pub(super) struct CallBook{owner:AttemptOwner,scope:RpcConnectionScope,routing:Option<Vec<Property>>,calls:BTreeMap<u64,Slot>,retired:VecDeque<u64>}
 impl CallBook{
-    pub(super) fn new(owner:AttemptOwner,scope:RpcConnectionScope)->Self{Self{owner,scope,routing:None,calls:BTreeMap::new()}}
+    pub(super) fn new(owner:AttemptOwner,scope:RpcConnectionScope)->Self{Self{owner,scope,routing:None,calls:BTreeMap::new(),retired:VecDeque::new()}}
     pub(super) fn is_configured(&self)->bool{self.routing.is_some()}
     pub(super) fn acknowledgement_ready(&self,ticket:&CallControlTicket)->bool{
         self.slot(ticket).is_ok_and(|slot|slot.phase!=Phase::Received)
@@ -61,6 +87,7 @@ impl CallBook{
     pub(super) fn register(&mut self,notice:&OwnedCallNotice)->Result<Option<CallControlTicket>,CodecError>{
         if !notice.matches(&self.owner,&self.scope)||self.routing.is_none(){return Err(CodecError::InvalidField);}
         let id=notice.native_id().expose_to_backend();
+        if self.retired.contains(&id){return Ok(None);}
         if let Some(slot)=self.calls.get_mut(&id){
             if notice.kind()==CallNoticeKind::Released{slot.ticket.revoke();slot.phase=Phase::Ended;}
             if notice.kind()==CallNoticeKind::Invited{return Ok(None);}
@@ -69,11 +96,22 @@ impl CallBook{
         if notice.kind()!=CallNoticeKind::Invited{return Ok(None);}
         // -1 is native's unallocated sentinel. Zero remains a full-width DATA
         // value, but is not admitted as a new control context by this policy.
-        if id==0||id==u64::MAX||self.calls.len()>=MAX_CALL_HISTORY{return Err(CodecError::InvalidCallId);}
+        if id==0||id==u64::MAX{return Err(CodecError::InvalidCallId);}
+        // Ended calls are replay history, not lifetime active-call capacity.
+        // Keep a bounded tombstone window; never evict a live/releasing/failed
+        // call whose cleanup is unconfirmed. Old tickets retain their revoked
+        // Arc identity even after a completed slot is no longer in the table.
+        if self.calls.len()>=MAX_CALL_HISTORY{
+            if let Some(completed)=self.calls.iter().find(|(_,slot)|slot.phase==Phase::Ended).map(|(id,_)|*id){
+                self.calls.remove(&completed);self.retired.push_back(completed);
+                if self.retired.len()>MAX_CALL_HISTORY{self.retired.pop_front();}
+            }
+        }
+        if self.calls.len()>=MAX_CALL_HISTORY{return Err(CodecError::InvalidCallId);}
         let data=notice.data_for(&self.owner,&self.scope).ok_or(CodecError::InvalidField)?;
         let override_id=data.properties.iter().find(|p|p.key==b"callServerEx.oid").map(|p|p.value);
         if override_id.is_some_and(|value|!valid_identifier(value)){return Err(CodecError::InvalidField);}
-        let ticket=CallControlTicket{owner:self.owner.clone(),scope:self.scope.clone(),native_id:notice.native_id(),identity:Arc::new(CallIdentity{live:AtomicBool::new(true)})};
+        let ticket=CallControlTicket{owner:self.owner.clone(),scope:self.scope.clone(),native_id:notice.native_id(),identity:Arc::new(CallIdentity{live:AtomicBool::new(true),media_started:AtomicBool::new(false),gate:Mutex::new(()),changed:tokio::sync::Notify::new()})};
         self.calls.insert(id,Slot{ticket:ticket.captured_copy(),phase:Phase::Received,override_id:override_id.map(|v|Zeroizing::new(v.to_vec()))});Ok(Some(ticket))
     }
     fn slot(&self,ticket:&CallControlTicket)->Result<&Slot,CodecError>{
@@ -115,7 +153,7 @@ impl CallBook{
         if !accepted{slot.ticket.revoke();slot.phase=Phase::Failed;return true;}
         slot.phase=match operation{CallOperation::Inform=>Phase::Checked,CallOperation::Accept=>Phase::Accepted,CallOperation::Release=>Phase::Ended};true
     }
-    pub(super) fn close(&mut self){for slot in self.calls.values(){slot.ticket.revoke();}self.calls.clear();self.routing=None;}
+    pub(super) fn close(&mut self){for slot in self.calls.values(){slot.ticket.revoke();}self.calls.clear();self.retired.clear();self.routing=None;}
 }
 impl Drop for CallBook{fn drop(&mut self){self.close();}}
 
@@ -127,6 +165,7 @@ impl OwnedCallOperationReply{
     pub(super) fn original(owner:AttemptOwner,scope:RpcConnectionScope,request_id:i32,ticket:CallControlTicket,operation:CallOperation,accepted:bool,valid_call:bool,properties:&[RpcProperty<'_>])->Result<Self,CodecError>{
         Ok(Self{owner,scope,request_id,ticket,operation,accepted,valid_call,properties:capture(properties)?})
     }
+    pub(super) fn original_call(&self,ticket:&CallControlTicket)->bool{self.ticket.same_call(ticket)&&self.matches(ticket.owner(),&ticket.connection_scope())}
     pub fn request_id(&self)->i32{self.request_id}
     pub fn native_id(&self)->NativeCallId{self.ticket.native_id()}
     pub fn operation(&self)->CallOperation{self.operation}

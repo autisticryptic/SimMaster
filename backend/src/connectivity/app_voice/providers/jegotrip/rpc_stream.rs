@@ -5,6 +5,7 @@
 //! Strings are length-prefixed bytes: binary metadata must not be UTF-8-lossy
 //! decoded or rejected merely because it contains NUL.
 use std::{cmp::Ordering, fmt};
+use zeroize::Zeroize;
 
 pub const MAX_STREAM_BYTES: usize = 128 * 1024;
 pub const MAX_FIELD_BYTES: usize = 64 * 1024;
@@ -42,6 +43,7 @@ impl CodecError {
 
 /// Contains tokens, credentials or message contents; never a public DTO.
 pub struct RpcBytes(Vec<u8>);
+impl Drop for RpcBytes{fn drop(&mut self){self.0.zeroize();}}
 
 impl RpcBytes {
     pub fn expose_to_transport(&self) -> &[u8] { &self.0 }
@@ -71,9 +73,12 @@ pub(super) fn compare_keys(left: &[u8], right: &[u8]) -> Ordering {
 }
 
 pub(super) struct Writer(Vec<u8>);
+impl Drop for Writer{fn drop(&mut self){self.0.zeroize();}}
 
 impl Writer {
-    pub fn new() -> Self { Self(vec![STREAM_DATA]) }
+    /// Reserve the full local bound once: growing secret-bearing request
+    /// buffers must not free unwiped old allocations on ordinary append.
+    pub fn new() -> Self { let mut bytes=Vec::with_capacity(MAX_STREAM_BYTES);bytes.push(STREAM_DATA);Self(bytes) }
 
     /// Produces the supported native method-version list: BE16 count=1 followed
     /// by one BE16 method version=0. These words are not a major/minor pair;
@@ -122,7 +127,7 @@ impl Writer {
         Ok(())
     }
 
-    pub fn finish(self) -> RpcBytes { RpcBytes(self.0) }
+    pub fn finish(mut self) -> RpcBytes { RpcBytes(std::mem::take(&mut self.0)) }
 }
 
 pub(super) struct Reader<'a> { remaining: &'a [u8] }

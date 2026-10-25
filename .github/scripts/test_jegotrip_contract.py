@@ -82,7 +82,12 @@ class JegotripContract(unittest.TestCase):
 
     def test_rpc_stream_envelopes_and_batches_keep_type_marker_and_bound_parsers(self):
         stream = (MOD / 'rpc_stream.rs').read_text(encoding='utf-8')
-        self.assertIn('Self(vec![STREAM_DATA])', stream)
+        self.assertIn('Vec::with_capacity(MAX_STREAM_BYTES)', stream)
+        self.assertIn('bytes.push(STREAM_DATA)', stream)
+        self.assertIn('impl Drop for RpcBytes', stream)
+        self.assertIn('impl Drop for Writer', stream)
+        self.assertIn('self.0.zeroize()', stream)
+        self.assertIn('RpcBytes(std::mem::take(&mut self.0))', stream)
         self.assertIn('MAX_FIELD_BYTES', stream)
         self.assertIn('MAX_MAP_ENTRIES', stream)
         self.assertIn('CodecError::DuplicateKey', stream)
@@ -781,6 +786,47 @@ class JegotripContract(unittest.TestCase):
         for name in ['beta-validation.yml', 'build-release.yml']:
             self.assertIn('connectivity::app_voice::providers::jegotrip::call_control::tests',
                           (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+    def test_media_endpoint_uses_original_accept_content_and_internally_minted_scope(self):
+        endpoint = (MOD / 'media_endpoint.rs').read_text(encoding='utf-8')
+        self.assertIn('reply.original_call(ticket)', endpoint)
+        self.assertIn('get(b"endpoint")?', endpoint)
+        self.assertIn('get(b"content")?', endpoint)
+        self.assertIn('Self::capture(reply,ticket,RpcConnectionScope::fresh()', endpoint)
+        self.assertIn('ticket.begin_media()', endpoint)
+        self.assertIn('self.request=None', endpoint)
+        self.assertNotIn('from_utf8_lossy', endpoint)
+        codec = (MOD / 'rpc_endpoint.rs').read_text(encoding='utf-8')
+        self.assertIn('features.sort_by', codec)
+        self.assertIn('reader.count(4)?', codec)
+        self.assertIn('read_footer(&mut reader)?', codec)
+        for module in ['rpc_endpoint', 'raw_arc_audio', 'media_endpoint', 'media_endpoint_runtime']:
+            for name in ['beta-validation.yml', 'build-release.yml']:
+                self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests',
+                              (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_media_actor_keeps_original_deadline_through_io_and_final_reply_publication(self):
+        runtime = (MOD / 'media_endpoint_runtime.rs').read_text(encoding='utf-8')
+        self.assertIn('connect_original(&plan, connector.as_ref(), tls.next_deadline())', runtime)
+        self.assertIn('let limit = io_deadline(plan, absolute)?', runtime)
+        self.assertIn('_ = deadline(limit)', runtime)
+        self.assertIn('check_deadline(absolute)?', runtime)
+        self.assertIn('publish_original(&plan, completion, reply, earlier(tls.next_deadline(), rpc_deadline))', runtime)
+        self.assertIn('let result = original.await;', runtime)
+        self.assertLess(runtime.index('let result = original.await;'), runtime.index('join.take();'))
+        self.assertIn('if !self.delivered { self.scope.close(); }', runtime)
+        self.assertNotIn('Callback::Channels', runtime)
+        self.assertNotIn('UdpSocket', runtime)
+
+    def test_raw_audio_callback_is_not_a_guessed_udp_carrier_or_malformed_rtcp_acceptance(self):
+        raw = (MOD / 'raw_arc_audio.rs').read_text(encoding='utf-8')
+        self.assertIn('not the complete UDP carrier', raw)
+        self.assertIn('200 => packet.len() == 28 + count * 24', raw)
+        self.assertIn('201 => packet.len() == 8 + count * 24', raw)
+        self.assertIn('validate_sdes(packet, count)', raw)
+        self.assertIn('padding == 0', raw)
+        self.assertIn('(64..=95)', raw)
+        self.assertNotIn('UdpSocket', raw)
+        self.assertNotIn('media_ready', raw)
 
 
 if __name__ == '__main__':

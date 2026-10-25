@@ -77,8 +77,80 @@ fn call_scope_drop_and_malformed_reply_never_expose_positive_data_or_original_ti
     let(id,_)=rpc.prepare_call(&ticket,CallOperation::Inform,&[]).unwrap();let bad=encode_reply(id,0,&[0,1]).unwrap();assert!(rpc.on_reply(&original,&scope,bad.expose_to_transport()).is_err());assert!(!ticket.is_live());assert!(!scope.is_open());
 }
 #[test]
+fn original_call_identity_not_native_id_alone_is_the_media_provenance_key(){
+    let(mut rpc,original,scope,d)=context();let incoming=notice(&d,&original,&scope,CallNoticeKind::Invited,ID);let ticket=rpc.register_call_notice(&incoming).unwrap().unwrap();
+    assert!(ticket.same_call(&ticket.captured_copy()));
+    let(mut other,other_owner,other_scope,other_d)=context();let incoming=notice(&other_d,&other_owner,&other_scope,CallNoticeKind::Invited,ID);
+    let other_ticket=other.register_call_notice(&incoming).unwrap().unwrap();assert_eq!(ticket.native_id(),other_ticket.native_id());assert!(!ticket.same_call(&other_ticket));
+    rpc.call_acknowledged(&ticket,true).unwrap();let(id,_)=rpc.prepare_call(&ticket,CallOperation::Inform,&[]).unwrap();let reply=finish(&mut rpc,&original,&scope,id,CallOperation::Inform,true);
+    assert!(reply.original_call(&ticket));assert!(!reply.original_call(&other_ticket));
+}
+#[test]
+fn original_media_poll_gate_is_revoked_before_any_later_nonblocking_poll(){
+    let(mut rpc,original,scope,d)=context();let invited=notice(&d,&original,&scope,CallNoticeKind::Invited,ID);let ticket=rpc.register_call_notice(&invited).unwrap().unwrap();
+    let polls=std::sync::atomic::AtomicUsize::new(0);
+    assert_eq!(ticket.with_media_gate(||polls.fetch_add(1,Ordering::SeqCst)),Some(0));
+    let released=notice(&d,&original,&scope,CallNoticeKind::Released,ID);rpc.register_call_notice(&released).unwrap();
+    assert_eq!(ticket.with_media_gate(||polls.fetch_add(1,Ordering::SeqCst)),None);assert_eq!(polls.load(Ordering::SeqCst),1);assert!(scope.is_open());
+}
+#[tokio::test]
+async fn original_call_revocation_notification_never_loses_pre_wait_or_post_wait_release(){
+    let(mut rpc,original,scope,d)=context();let invited=notice(&d,&original,&scope,CallNoticeKind::Invited,ID);let ticket=rpc.register_call_notice(&invited).unwrap().unwrap();
+    let copied=ticket.captured_copy();let waiting=tokio::spawn(async move{copied.revoked().await;});
+    ticket.revoke();tokio::time::timeout(std::time::Duration::from_secs(1),waiting).await.unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1),ticket.revoked()).await.unwrap();assert!(scope.is_open());
+}
+#[tokio::test]
+async fn account_scope_close_also_wakes_original_call_media_poll_waiters(){
+    let(mut rpc,original,scope,d)=context();let invited=notice(&d,&original,&scope,CallNoticeKind::Invited,ID);let ticket=rpc.register_call_notice(&invited).unwrap().unwrap();
+    scope.close();tokio::time::timeout(std::time::Duration::from_secs(1),ticket.revoked()).await.unwrap();assert!(!ticket.is_live());assert_eq!(ticket.with_media_gate(||1),None);
+}
+#[tokio::test]
+async fn poisoned_original_call_media_gate_revokes_only_that_call_and_wakes_waiters(){
+    let(mut rpc,original,scope,d)=context();let invited=notice(&d,&original,&scope,CallNoticeKind::Invited,ID);let ticket=rpc.register_call_notice(&invited).unwrap().unwrap();
+    let copied=ticket.captured_copy();assert!(std::thread::spawn(move||copied.with_media_gate(||panic!("synthetic media poll panic"))).join().is_err());
+    assert_eq!(ticket.with_media_gate(||1),None);assert!(!ticket.is_live());assert!(scope.is_open());
+    tokio::time::timeout(std::time::Duration::from_secs(1),ticket.revoked()).await.unwrap();
+}
+#[test]
 fn debug_wrappers_and_checked_reply_borrows_do_not_publish_peer_call_ids_or_keys(){
     let(mut rpc,original,scope,d)=context();let incoming=notice(&d,&original,&scope,CallNoticeKind::Invited,ID);let ticket=rpc.register_call_notice(&incoming).unwrap().unwrap();rpc.call_acknowledged(&ticket,true).unwrap();
     let(id,_)=rpc.prepare_call(&ticket,CallOperation::Inform,&[]).unwrap();let reply=finish(&mut rpc,&original,&scope,id,CallOperation::Inform,true);
     assert_eq!(format!("{ticket:?}"),"CallControlTicket(<redacted>)");assert_eq!(format!("{reply:?}"),"OwnedCallOperationReply(<redacted>)");assert!(reply.properties_for(&owner(),&scope).is_none());scope.close();assert!(reply.properties_for(&original,&scope).is_none());
+}
+#[test]
+fn completed_call_history_does_not_exhaust_call_book_after_more_than_128_original_calls(){
+    let(mut rpc,original,scope,d)=context();let mut first=None;
+    for id in 1..=(MAX_CALL_HISTORY as u64*3+1){
+        let incoming=notice(&d,&original,&scope,CallNoticeKind::Invited,id);
+        let ticket=rpc.register_call_notice(&incoming).unwrap().unwrap();
+        if first.is_none(){first=Some(ticket.captured_copy());}
+        let(sequence,_)=rpc.prepare_call(&ticket,CallOperation::Release,&[]).unwrap();
+        assert!(finish(&mut rpc,&original,&scope,sequence,CallOperation::Release,true).accepted());
+        assert!(!ticket.is_live());assert!(scope.is_open());
+    }
+    let first=first.unwrap();assert!(!first.is_live());assert!(rpc.prepare_call(&first,CallOperation::Release,&[]).is_err());
+    let recent=notice(&d,&original,&scope,CallNoticeKind::Invited,MAX_CALL_HISTORY as u64*3+1);
+    assert!(rpc.register_call_notice(&recent).unwrap().is_none());
+    assert_eq!(rpc.phase(),super::super::arc_session::ArcPhase::Authenticated);
+    // This exercises CallBook history, not an unlimited native direct-RPC
+    // replay window. Protocol sequence/dedup budgets retain separate bounds.
+}
+#[test]
+fn active_call_capacity_and_completed_tombstones_remain_bounded_and_old_tickets_stay_revoked(){
+    let(_rpc,original,scope,d)=context();let mut book=CallBook::new(original.clone(),scope.clone());
+    book.configure(&[RpcProperty{key:b"id",value:b"#fixture-server"},RpcProperty{key:b"domain",value:b"fixture-domain"}]).unwrap();
+    let mut first=None;
+    for id in 1..=MAX_CALL_HISTORY as u64{
+        let incoming=notice(&d,&original,&scope,CallNoticeKind::Invited,id);
+        let ticket=book.register(&incoming).unwrap().unwrap();if first.is_none(){first=Some(ticket);}
+    }
+    let overflow=notice(&d,&original,&scope,CallNoticeKind::Invited,MAX_CALL_HISTORY as u64+1);
+    assert_eq!(book.register(&overflow).err(),Some(CodecError::InvalidCallId));
+    let first=first.unwrap();assert!(first.is_live());
+    let released=notice(&d,&original,&scope,CallNoticeKind::Released,1);book.register(&released).unwrap();assert!(!first.is_live());
+    assert!(book.register(&overflow).unwrap().is_some());assert_eq!(book.calls.len(),MAX_CALL_HISTORY);assert_eq!(book.retired.len(),1);
+    let replay=notice(&d,&original,&scope,CallNoticeKind::Invited,1);assert!(book.register(&replay).unwrap().is_none());
+    assert!(book.prepare(&first,CallOperation::Release).is_err());assert!(scope.is_open());
+    book.close();assert!(book.calls.is_empty());assert!(book.retired.is_empty());
 }
