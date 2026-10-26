@@ -68,7 +68,7 @@ impl MediaEndpointProfile{
 /// with the account ARC connection's existing shared pending allocator.
 pub(super) struct MediaEndpointPlan{
     owner:AttemptOwner,ticket:CallControlTicket,scope:RpcConnectionScope,profile:Arc<MediaEndpointProfile>,
-    reference:Zeroizing<String>,request:Option<RpcBytes>,id:i32,pending:bool,
+    reference:Zeroizing<String>,request:Option<RpcBytes>,id:i32,pending:bool,mpath:bool,
 }
 impl fmt::Debug for MediaEndpointPlan{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("MediaEndpointPlan(<redacted>)")}}
 impl Drop for MediaEndpointPlan{fn drop(&mut self){self.scope.close();}}
@@ -77,19 +77,26 @@ impl MediaEndpointPlan{
     /// an account/another call's scope or collide with that scope's sequence 1.
     pub(super) fn prepare(reply:&OwnedCallOperationReply,ticket:&CallControlTicket,
         profile:Arc<MediaEndpointProfile>,original_arc_port:u16)->Result<Self,MediaError>{
-        Self::capture(reply,ticket,RpcConnectionScope::fresh(),profile,original_arc_port)
+        Self::capture(reply,ticket,RpcConnectionScope::fresh(),profile,Some(original_arc_port))
+    }
+    /// Native fallback when no raw-ARC SocketFactory/listener is installed.
+    /// It omits Client.ArcPort and retains the same original Endpoint TCP
+    /// connection for Mpath DATA. No logical address becomes an OS UDP grant.
+    pub(super) fn prepare_mpath(reply:&OwnedCallOperationReply,ticket:&CallControlTicket,
+        profile:Arc<MediaEndpointProfile>)->Result<Self,MediaError>{
+        Self::capture(reply,ticket,RpcConnectionScope::fresh(),profile,None)
     }
     /// Only source fixtures can inject scopes to test original-scope rejection.
     #[cfg(test)]
     pub(super) fn from_accept(reply:&OwnedCallOperationReply,ticket:&CallControlTicket,scope:RpcConnectionScope,
         profile:Arc<MediaEndpointProfile>,original_arc_port:u16)->Result<Self,MediaError>{
-        Self::capture(reply,ticket,scope,profile,original_arc_port)
+        Self::capture(reply,ticket,scope,profile,Some(original_arc_port))
     }
     fn capture(reply:&OwnedCallOperationReply,ticket:&CallControlTicket,scope:RpcConnectionScope,
-        profile:Arc<MediaEndpointProfile>,original_arc_port:u16)->Result<Self,MediaError>{
+        profile:Arc<MediaEndpointProfile>,original_arc_port:Option<u16>)->Result<Self,MediaError>{
         let owner=ticket.owner();let account=ticket.connection_scope();
         if !ticket.is_live()||!scope.is_open()||scope.matches(&account)||!reply.original_call(ticket)
-            ||reply.operation()!=CallOperation::Accept||!reply.accepted()||reply.native_id()!=ticket.native_id()||original_arc_port==0{return Err(MediaError::Scope);}
+            ||reply.operation()!=CallOperation::Accept||!reply.accepted()||reply.native_id()!=ticket.native_id()||original_arc_port==Some(0){return Err(MediaError::Scope);}
         let data=reply.properties_for(owner,&account).ok_or(MediaError::Scope)?;
         let get=|name:&[u8]|data.iter().find(|p|p.key==name).map(|p|p.value).ok_or(MediaError::MissingProperty);
         let endpoint=get(b"endpoint")?;let content=get(b"content")?;
@@ -105,16 +112,17 @@ impl MediaEndpointPlan{
             enable_sni:profile.trust.enable_sni(),reference_decode_key:None}).map_err(|_|MediaError::UnsupportedReference)?;
         // Native Client.ArcPort is a logical Router listener port. It is DATA
         // here, not an OS UDP binding or a permission to dial an RTP endpoint.
-        let port=Zeroizing::new(original_arc_port.to_string());let mut parameters=borrowed(&profile.properties);
-        parameters.push(RpcProperty{key:b"Client.ArcPort",value:port.as_bytes()});
+        let port=original_arc_port.map(|port|Zeroizing::new(port.to_string()));let mut parameters=borrowed(&profile.properties);
+        if let Some(port)=&port{parameters.push(RpcProperty{key:b"Client.ArcPort",value:port.as_bytes()});}
         let features:Vec<&[u8]>=profile.features.iter().map(|v|v.as_slice()).collect();
         let args=encode_endpoint_connect(EndpointConnectInputs{content,features:&features,properties:&parameters}).map_err(|_|MediaError::Configuration)?;
         let id=1;let request=encode_request(id,&borrowed(&profile.routing),CONNECT_ENDPOINT_METHOD.as_bytes(),args.expose_to_transport()).map_err(|_|MediaError::Configuration)?;
         // Consume one original-call admission only after all configuration and
         // request bounds pass. A prior/failed/dropped plan never reopens it.
         if !ticket.begin_media(){return Err(MediaError::AlreadyStarted);}
-        Ok(Self{owner:owner.clone(),ticket:ticket.captured_copy(),scope,profile,reference:Zeroizing::new(text.to_owned()),request:Some(request),id,pending:true})
+        Ok(Self{owner:owner.clone(),ticket:ticket.captured_copy(),scope,profile,reference:Zeroizing::new(text.to_owned()),request:Some(request),id,pending:true,mpath:original_arc_port.is_none()})
     }
+    pub(super) fn is_mpath(&self)->bool{self.mpath}
     pub(super) fn owner(&self)->&AttemptOwner{&self.owner}
     pub(super) fn scope(&self)->RpcConnectionScope{self.scope.clone()}
     pub(super) fn ticket(&self)->CallControlTicket{self.ticket.captured_copy()}

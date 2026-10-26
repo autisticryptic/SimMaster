@@ -33,6 +33,9 @@ pub mod call_delivery;
 pub mod call_control;
 pub mod rpc_endpoint;
 pub mod raw_arc_audio;
+pub mod tcp_mpath;
+pub(crate) mod native_audio_sdp;
+pub(crate) mod tcp_mpath_audio;
 pub mod media_endpoint;
 pub(crate) mod media_endpoint_runtime;
 #[cfg(test)]

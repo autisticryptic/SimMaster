@@ -382,6 +382,9 @@ jobs:
             connectivity::app_voice::providers::jegotrip::raw_arc_audio::tests \
             connectivity::app_voice::providers::jegotrip::media_endpoint::tests \
             connectivity::app_voice::providers::jegotrip::media_endpoint_runtime::tests \
+            connectivity::app_voice::providers::jegotrip::tcp_mpath::tests \
+            connectivity::app_voice::providers::jegotrip::native_audio_sdp::tests \
+            connectivity::app_voice::providers::jegotrip::tcp_mpath_audio::tests \
             connectivity::app_voice::providers::jegotrip::native_events::tests \
             connectivity::app_voice::providers::jegotrip::rpc_stream::tests \
             connectivity::app_voice::providers::jegotrip::rpc_envelope::tests \

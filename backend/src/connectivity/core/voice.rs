@@ -334,6 +334,9 @@ pub enum AudioCodec {
     Pcmu,
     /// G.711 a-law (PCMA), static payload type 8.
     Pcma,
+    /// Already encoded Opus RTP passthrough (RFC7587). This does not provide
+    /// an Opus encoder/decoder or authorize a media/transcoding backend.
+    Opus,
 }
 
 impl AudioCodec {
@@ -344,6 +347,7 @@ impl AudioCodec {
             Self::AmrWb => "amr_wb",
             Self::Pcmu => "pcmu",
             Self::Pcma => "pcma",
+            Self::Opus => "opus",
         }
     }
 
@@ -355,6 +359,7 @@ impl AudioCodec {
             Self::AmrWb => "AMR-WB",
             Self::Pcmu => "PCMU",
             Self::Pcma => "PCMA",
+            Self::Opus => "opus",
         }
     }
 
@@ -363,6 +368,7 @@ impl AudioCodec {
         match self {
             Self::Amr | Self::Pcmu | Self::Pcma => 8000,
             Self::Evs | Self::AmrWb => 16000,
+            Self::Opus => 48000,
         }
     }
 
@@ -371,7 +377,7 @@ impl AudioCodec {
         match self {
             Self::Pcmu => Some(0),
             Self::Pcma => Some(8),
-            Self::Evs | Self::Amr | Self::AmrWb => None,
+            Self::Evs | Self::Amr | Self::AmrWb | Self::Opus => None,
         }
     }
 
@@ -388,6 +394,7 @@ impl AudioCodec {
             "amr-wb" | "amr_wb" | "amrwb" => Some(Self::AmrWb),
             "pcmu" => Some(Self::Pcmu),
             "pcma" => Some(Self::Pcma),
+            "opus" => Some(Self::Opus),
             _ => None,
         }
     }

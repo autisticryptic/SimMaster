@@ -827,6 +827,39 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('(64..=95)', raw)
         self.assertNotIn('UdpSocket', raw)
         self.assertNotIn('media_ready', raw)
+    def test_native_mpath_data_is_distinct_from_common_rpc_tls_and_logical_arc_ports(self):
+        codec = (MOD / 'tcp_mpath.rs').read_text(encoding='utf-8')
+        self.assertIn('MAX_MPATH_PAYLOAD: usize = 2918', codec)
+        self.assertIn('MPATH_SINGLE_THRESHOLD: usize = 1459', codec)
+        self.assertIn('((header.path as u32) << 28)', codec)
+        self.assertIn('((header.sequence as u32) << 14)', codec)
+        self.assertIn('if duplicate { return Ok(None); }', codec)
+        self.assertIn('receiver', (MOD / 'tcp_mpath_tests.rs').read_text(encoding='utf-8'))
+        profile = (MOD / 'media_endpoint.rs').read_text(encoding='utf-8')
+        self.assertIn('Self::capture(reply,ticket,RpcConnectionScope::fresh(),profile,None)', profile)
+        for module in ['tcp_mpath', 'native_audio_sdp', 'tcp_mpath_audio']:
+            for name in ['beta-validation.yml', 'build-release.yml']:
+                self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests',
+                              (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
+    def test_original_mpath_audio_has_actual_scoped_bidirectional_io_and_strict_plain_sdp(self):
+        audio = (MOD / 'tcp_mpath_audio.rs').read_text(encoding='utf-8')
+        self.assertIn('socket.poll_recv_from(cx, &mut buffer)', audio)
+        self.assertIn('socket.poll_send_to(cx, bytes, relay.peer)', audio)
+        self.assertIn('peer != relay.peer', audio)
+        self.assertIn('tls.phase() != TlsPhase::Verified', audio)
+        self.assertIn('plan.with_io_gate(', audio)
+        self.assertIn('original.await; join.take();', audio)
+        sdp = (MOD / 'native_audio_sdp.rs').read_text(encoding='utf-8')
+        self.assertIn('property.key == b"RseEx.SDP"', sdp)
+        self.assertIn('words[2] != "RTP/AVP"', sdp)
+        self.assertIn('lower.starts_with("a=crypto:")', sdp)
+        self.assertIn('original.fmtp != codec.fmtp', sdp)
+        self.assertNotIn('from_utf8_lossy', sdp + audio)
+        tests = (MOD / 'tcp_mpath_audio_tests.rs').read_text(encoding='utf-8')
+        self.assertIn('both_rtp_directions_byte_exact', tests)
+        self.assertIn('another_udp_source_cannot_inject_audio', tests)
+        self.assertIn('closing', (MOD / 'message_provider_tests.rs').read_text(encoding='utf-8'))
 
 
 if __name__ == '__main__':

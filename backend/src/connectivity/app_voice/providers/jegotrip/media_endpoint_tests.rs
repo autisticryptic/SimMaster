@@ -266,3 +266,18 @@ fn production_plan_mints_distinct_physical_scopes_for_original_calls_with_same_n
     let second_scope = second.scope(); drop(first); assert!(second_scope.is_open());
     assert!(first_account.is_open()); assert!(second_account.is_open());
 }
+#[test]
+fn original_mpath_fallback_omits_logical_arc_port_without_substituting_content_or_adding_a_second_owner() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let supplied = profile(&cert.root, "fixture.invalid");
+    let (_rpc, _, account, ticket, accepted) = accepted_context(ENDPOINT, CONTENT);
+    let plan = MediaEndpointPlan::prepare_mpath(&accepted, &ticket, supplied.clone()).unwrap();
+    assert!(plan.is_mpath()); assert!(!plan.scope().matches(&account));
+    let request = decode_request(plan.request().unwrap()).unwrap(); assert_eq!(request.call_id, 1);
+    assert_eq!(request.method, b"connect.Endpoint.Endpoint");
+    let mut reader = Reader::versioned(request.arguments).unwrap(); assert_eq!(reader.bytes().unwrap(), CONTENT);
+    let count = reader.u32().unwrap(); for _ in 0..count { reader.bytes().unwrap(); }
+    let properties = reader.properties().unwrap(); reader.finish().unwrap();
+    assert!(!properties.iter().any(|property| property.key == b"Client.ArcPort"));
+    assert_eq!(MediaEndpointPlan::prepare(&accepted, &ticket, supplied, 49151).err(), Some(MediaError::AlreadyStarted));
+    assert!(account.is_open()); assert!(ticket.is_live());
+}

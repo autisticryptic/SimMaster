@@ -100,25 +100,25 @@ pub(super) fn spawn(plan: MediaEndpointPlan, connector: Arc<dyn RuntimeConnector
         MediaEndpointReady { scope, ticket, result, delivered: false })
 }
 
-fn earlier(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
+pub(super) fn earlier(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
     match (left, right) {
         (Some(a), Some(b)) => Some(a.min(b)), (Some(a), None) | (None, Some(a)) => Some(a), (None, None) => None,
     }
 }
-fn check_deadline(value: Option<Instant>) -> Result<(), MediaError> {
+pub(super) fn check_deadline(value: Option<Instant>) -> Result<(), MediaError> {
     if value.is_some_and(|deadline| Instant::now() >= deadline) { Err(MediaError::Timeout) } else { Ok(()) }
 }
-fn io_deadline(plan: &MediaEndpointPlan, absolute: Option<Instant>) -> Result<Option<Instant>, MediaError> {
+pub(super) fn io_deadline(plan: &MediaEndpointPlan, absolute: Option<Instant>) -> Result<Option<Instant>, MediaError> {
     let local = Instant::now().checked_add(plan.profile().io_timeout).ok_or(MediaError::Configuration)?;
     Ok(earlier(absolute, Some(local)))
 }
-fn tls_error(error: TlsError) -> MediaError {
+pub(super) fn tls_error(error: TlsError) -> MediaError {
     match error { TlsError::Timeout => MediaError::Timeout, TlsError::Closed => MediaError::Closed, _ => MediaError::Protocol }
 }
 fn connect_error(error: ConnectError) -> MediaError {
     match error { ConnectError::Timeout => MediaError::Timeout, ConnectError::Scope => MediaError::Scope, _ => MediaError::Io }
 }
-async fn deadline(value: Option<Instant>) {
+pub(super) async fn deadline(value: Option<Instant>) {
     if let Some(value) = value { tokio::time::sleep_until(value.into()).await; } else { std::future::pending::<()>().await; }
 }
 
@@ -126,7 +126,7 @@ async fn deadline(value: Option<Instant>) {
 /// call/account gate surrounds the future; recursively taking the media scope
 /// gate would deadlock the production connector. TLS's original absolute clock
 /// also covers DNS/connect, not a second handshake budget after connect ends.
-async fn connect_original(plan: &MediaEndpointPlan, connector: &dyn RuntimeConnector, absolute: Option<Instant>) -> Result<BoxRuntimeIo, MediaError> {
+pub(super) async fn connect_original(plan: &MediaEndpointPlan, connector: &dyn RuntimeConnector, absolute: Option<Instant>) -> Result<BoxRuntimeIo, MediaError> {
     let owner = plan.owner();
     let scope = plan.scope();
     let ticket = plan.ticket();
@@ -154,7 +154,7 @@ async fn connect_original(plan: &MediaEndpointPlan, connector: &dyn RuntimeConne
 /// One partial-write/flush group uses a fixed local deadline intersected with
 /// the ORIGINAL TLS/RPC deadline. Every poll rechecks it, even an immediately
 /// ready write. Neither partial writes nor a queued pong reopen native time.
-async fn write_frames(plan: &MediaEndpointPlan, io: &mut BoxRuntimeIo, groups: Vec<OwnedWireFrames>, absolute: Option<Instant>) -> Result<(), MediaError> {
+pub(super) async fn write_frames(plan: &MediaEndpointPlan, io: &mut BoxRuntimeIo, groups: Vec<OwnedWireFrames>, absolute: Option<Instant>) -> Result<(), MediaError> {
     check_deadline(absolute)?;
     if groups.is_empty() { return Ok(()); }
     let owner = plan.owner();
@@ -195,13 +195,13 @@ async fn write_frames(plan: &MediaEndpointPlan, io: &mut BoxRuntimeIo, groups: V
         result = write => result,
     }
 }
-async fn send_packets(plan: &MediaEndpointPlan, io: &mut BoxRuntimeIo, tls: &mut TlsEngine, packets: &[TransportBytes], rpc_deadline: Option<Instant>) -> Result<(), MediaError> {
+pub(super) async fn send_packets(plan: &MediaEndpointPlan, io: &mut BoxRuntimeIo, tls: &mut TlsEngine, packets: &[TransportBytes], rpc_deadline: Option<Instant>) -> Result<(), MediaError> {
     let absolute = earlier(tls.next_deadline(), rpc_deadline);
     check_deadline(absolute)?;
     let wire = tls.encrypt_packets(plan.owner(), &plan.scope(), packets, None, Instant::now()).map_err(tls_error)?.ok_or(MediaError::Scope)?;
     write_frames(plan, io, wire, absolute).await
 }
-async fn read_original(plan: &MediaEndpointPlan, io: &mut BoxRuntimeIo, bytes: &mut [u8]) -> Result<usize, MediaError> {
+pub(super) async fn read_original(plan: &MediaEndpointPlan, io: &mut BoxRuntimeIo, bytes: &mut [u8]) -> Result<usize, MediaError> {
     poll_fn(|cx| {
         let mut buffer = ReadBuf::new(bytes);
         match plan.with_io_gate(|| Pin::new(&mut *io).poll_read(cx, &mut buffer)) {
