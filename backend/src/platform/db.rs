@@ -3575,6 +3575,8 @@ impl Database {
             .map_err(|code| rusqlite::Error::InvalidParameterName(code.to_owned()))?;
         crate::connectivity::app_voice::providers::jegotrip::account_runs::initialize_schema(&conn)
             .map_err(|code| rusqlite::Error::InvalidParameterName(code.to_owned()))?;
+        crate::connectivity::app_voice::providers::jegotrip::account_call_history::initialize_schema(&conn)
+            .map_err(|code| rusqlite::Error::InvalidParameterName(code.to_owned()))?;
 
         let (app_event_tx, _) = broadcast::channel(512);
         Ok(Self {

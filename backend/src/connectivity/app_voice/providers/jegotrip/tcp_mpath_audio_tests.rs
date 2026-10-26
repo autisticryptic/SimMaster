@@ -14,10 +14,10 @@ use tokio_rustls::rustls;
 async fn bounded<F: Future>(future: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(5), future).await.expect("bounded original audio fixture")
 }
-struct Peer { io: TcpStream, tls: rustls::ServerConnection, network: PacketStreamDecoder,
+pub(crate) struct Peer { io: TcpStream, tls: rustls::ServerConnection, network: PacketStreamDecoder,
     plaintext: PlaintextPacketDecoder, calls: CallAssembler, rpc: VecDeque<CallMessage>, raw: VecDeque<Vec<u8>> }
 impl Peer {
-    async fn accept(listener: TcpListener, tls: rustls::ServerConnection) -> Self {
+    pub(crate) async fn accept(listener: TcpListener, tls: rustls::ServerConnection) -> Self {
         let (io, peer) = listener.accept().await.unwrap(); assert!(peer.ip().is_loopback());
         Self { io, tls, network: PacketStreamDecoder::default(), plaintext: PlaintextPacketDecoder::default(),
             calls: CallAssembler::default(), rpc: VecDeque::new(), raw: VecDeque::new() }
@@ -53,21 +53,21 @@ impl Peer {
         }
         self.io.flush().await
     }
-    async fn next_rpc(&mut self) -> io::Result<Option<CallMessage>> {
+    pub(crate) async fn next_rpc(&mut self) -> io::Result<Option<CallMessage>> {
         loop { if let Some(call) = self.rpc.pop_front() { return Ok(Some(call)); } if !self.pump().await? { return Ok(None); } }
     }
-    async fn next_raw(&mut self) -> io::Result<Option<Vec<u8>>> {
+    pub(crate) async fn next_raw(&mut self) -> io::Result<Option<Vec<u8>>> {
         loop { if let Some(raw) = self.raw.pop_front() { return Ok(Some(raw)); } if !self.pump().await? { return Ok(None); } }
     }
-    async fn reply(&mut self, accepted: bool) {
+    pub(crate) async fn reply(&mut self, accepted: bool) {
         let result = endpoint_result(accepted, b""); let envelope = encode_reply(1, 0, result.expose_to_transport()).unwrap();
         for packet in encode_call_packets(CallKind::Reply, envelope.expose_to_transport(), TLS_FRAGMENT_THRESHOLD).unwrap() {
             std::io::Write::write_all(&mut self.tls.writer(), packet.expose_to_transport()).unwrap();
         }
         let cipher = self.cipher(); self.send_cipher(&cipher).await.unwrap();
     }
-    async fn send_raw(&mut self, packet: &[u8]) { let frame = encode_packet_stream_frame(packet).unwrap(); self.io.write_all(frame.expose_to_transport()).await.unwrap(); self.io.flush().await.unwrap(); }
-    async fn eof(&mut self) {
+    pub(crate) async fn send_raw(&mut self, packet: &[u8]) { let frame = encode_packet_stream_frame(packet).unwrap(); self.io.write_all(frame.expose_to_transport()).await.unwrap(); self.io.flush().await.unwrap(); }
+    pub(crate) async fn eof(&mut self) {
         loop { match self.pump().await {
             Ok(false) => break, Ok(true) => { assert!(self.rpc.is_empty()); assert!(self.raw.is_empty()); },
             Err(error) if error.kind() == io::ErrorKind::ConnectionReset => break, Err(error) => panic!("unexpected retirement {error:?}"),

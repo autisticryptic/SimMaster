@@ -1,7 +1,7 @@
-//! Explicit installation of the implemented inbound Smgw-text capability.
-//! Available is per current original application-account run, not a SIM/IMS
-//! grant or permission to send a paid message. Incoming voice is not advertised
-//! until its media/runtime integration is implemented and independently verified.
+//! Explicit installation of implemented basic inbound voice/text capability.
+//! Availability is per current original application-account run, never a SIM/IMS
+//! grant or permission to send a paid message/place an outbound call. Voice
+//! requires its explicitly configured original media/call supervisor.
 use super::{account_runtime::AccountManager, LABEL, PROVIDER_ID};
 use crate::connectivity::app_voice::registry::{Non3gppVoiceProvider, ProviderAvailability, ProviderDescriptor, VoiceCapability};
 use std::{fmt, sync::{Arc, Weak}};
@@ -18,13 +18,13 @@ impl MessagingProvider {
     /// Main explicitly installs this only after constructing the owning manager.
     pub(crate) fn for_accounts(accounts: &Arc<AccountManager>) -> Self {
         Self { descriptor: ProviderDescriptor { id: PROVIDER_ID, label: LABEL,
-            capabilities: vec![VoiceCapability::Messaging] }, accounts: Arc::downgrade(accounts) }
+            capabilities: vec![VoiceCapability::Voice, VoiceCapability::Messaging] }, accounts: Arc::downgrade(accounts) }
     }
 }
 impl Non3gppVoiceProvider for MessagingProvider {
     fn descriptor(&self) -> &ProviderDescriptor { &self.descriptor }
     fn availability(&self, line_id: &str) -> ProviderAvailability {
-        self.accounts.upgrade().map_or(ProviderAvailability::NotConfigured, |accounts| accounts.messaging_availability(line_id))
+        self.accounts.upgrade().map_or(ProviderAvailability::NotConfigured, |accounts| accounts.inbound_availability(line_id))
     }
 }
 #[cfg(test)]

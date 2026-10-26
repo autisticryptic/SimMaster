@@ -348,6 +348,8 @@ jobs:
             connectivity::core::ims_registration_coordinator::tests \
             services::trunk::access_router::tests \
             services::trunk::operator::tests \
+            services::trunk::runtime::tests \
+            services::trunk::driver::tests \
             services::trunk::bridge::tests \
             services::orchestrator::voice_router::tests \
             services::orchestrator::sms_router \
@@ -416,6 +418,8 @@ jobs:
             connectivity::app_voice::providers::jegotrip::account_runs::tests \
             connectivity::app_voice::providers::jegotrip::account_notifications::tests \
             connectivity::app_voice::providers::jegotrip::account_runtime::tests \
+            connectivity::app_voice::providers::jegotrip::account_calls::tests \
+            connectivity::app_voice::providers::jegotrip::account_call_history::tests \
             connectivity::app_voice::providers::jegotrip::message_provider::tests \
             connectivity::app_voice::providers::jegotrip::legacy_config::tests \
             connectivity::app_voice::providers::jegotrip::object_reference::tests \

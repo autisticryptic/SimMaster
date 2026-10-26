@@ -16,7 +16,7 @@ fn fixture(root: &str) -> AccountConfig {
     credentials.sdk.root_der_base64 = Secret::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(root)).unwrap();
     credentials.sdk.server_address = secret("\"#fixture-account:tcp -h fixture.invalid -p 443;\"");
     credentials.sdk.selected_session_id = Some(secret("\"fixture-original-selector\""));
-    AccountConfig { credentials, bootstrap:None, profile: ProfileConfig {
+    AccountConfig { credentials, bootstrap:None, call_media:None, profile: ProfileConfig {
         route: ProfileRoute::DirectTlsCarrier, authority: secret("\"fixture.invalid\""), enable_sni: true,
         identity_type: secret("\"username\""), domain_name: Some(secret("\"fixture.invalid\"")),
         domain_id: Some(secret("\"fixture-domain\"")), application_id: Some(secret("\"fixture-app\"")),

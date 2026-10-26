@@ -275,4 +275,4 @@ async fn run(mut plan: MediaEndpointPlan, connector: Arc<dyn RuntimeConnector>, 
 }
 #[cfg(test)]
 #[path = "tcp_mpath_audio_tests.rs"]
-mod tests;
+pub(crate) mod tests;

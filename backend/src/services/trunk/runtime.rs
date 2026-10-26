@@ -350,17 +350,22 @@ impl TrunkRuntime {
     /// grace period to send Expires: 0 before it is force-aborted.
     pub async fn activate_profile(&self, profile: &TrunkProfileConfig) -> TrunkSnapshot {
         let _guard = self.operation_guard().await;
-        if let Some(driver) = self.driver_task.lock().await.take() {
+        // Keep the original driver and its JoinHandle in the owning slot
+        // across await. Cancelling profile/teardown cannot detach it or make
+        // an unconfirmed old endpoint appear available for a replacement.
+        let mut driver_slot = self.driver_task.lock().await;
+        if let Some(driver) = driver_slot.as_mut() {
             let _ = driver.shutdown.send(true);
-            let mut task = driver.task;
-            if tokio::time::timeout(std::time::Duration::from_secs(6), &mut task)
+            if tokio::time::timeout(std::time::Duration::from_secs(6), &mut driver.task)
                 .await
                 .is_err()
             {
-                task.abort();
-                let _ = task.await;
+                driver.task.abort();
+                let _ = (&mut driver.task).await;
             }
         }
+        driver_slot.take();
+        drop(driver_slot);
         let snapshot = self.apply_profile(profile).await;
         if profile.enabled {
             let generation = self.generation();
@@ -444,5 +449,29 @@ mod tests {
         runtime.apply_profile(&TrunkProfileConfig::default()).await;
         assert_eq!(runtime.generation(), generation + 1);
         assert_eq!(runtime.status().await.phase, "disabled");
+    }
+
+    #[tokio::test]
+    async fn cancelling_driver_teardown_retains_original_join_slot_until_cleanup_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Released(Arc<AtomicBool>);
+        impl Drop for Released { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+        let runtime = TrunkRuntime::new(); let released = Arc::new(AtomicBool::new(false));
+        let (shutdown, mut observed) = watch::channel(false); let (entered, saw_shutdown) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel(); let marker = released.clone();
+        let task = tokio::spawn(async move {
+            let _release = Released(marker); observed.changed().await.unwrap(); assert!(*observed.borrow());
+            entered.send(()).unwrap(); resumed.await.unwrap();
+        });
+        *runtime.driver_task.lock().await = Some(TrunkDriverTask { shutdown, task });
+        let pending = {
+            let profile = TrunkProfileConfig::default();
+            let future = runtime.activate_profile(&profile); tokio::pin!(future);
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(future.as_mut(), cx).is_pending())).await
+        };
+        assert!(pending); tokio::time::timeout(std::time::Duration::from_secs(2), saw_shutdown).await.unwrap().unwrap();
+        assert!(runtime.driver_task.lock().await.is_some()); assert!(!released.load(Ordering::SeqCst));
+        resume.send(()).unwrap(); runtime.activate_profile(&TrunkProfileConfig::default()).await;
+        assert!(runtime.driver_task.lock().await.is_none()); assert!(released.load(Ordering::SeqCst));
     }
 }

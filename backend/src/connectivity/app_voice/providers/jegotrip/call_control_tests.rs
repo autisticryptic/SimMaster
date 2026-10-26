@@ -48,7 +48,7 @@ fn wrong_original_owner_scope_and_rpc_sequence_never_complete_call_pending_or_re
 fn remote_release_revokes_before_late_true_accept_and_never_revives_original_call(){
     let(mut rpc,original,scope,d)=context();let incoming=notice(&d,&original,&scope,CallNoticeKind::Invited,ID);let ticket=rpc.register_call_notice(&incoming).unwrap().unwrap();rpc.call_acknowledged(&ticket,true).unwrap();
     let(id,_)=rpc.prepare_call(&ticket,CallOperation::Inform,&[]).unwrap();finish(&mut rpc,&original,&scope,id,CallOperation::Inform,true);
-    let(id,_)=rpc.prepare_call(&ticket,CallOperation::Accept,&[]).unwrap();let released=notice(&d,&original,&scope,CallNoticeKind::Released,ID);rpc.register_call_notice(&released).unwrap();assert!(!ticket.is_live());
+    let(id,_)=rpc.prepare_call(&ticket,CallOperation::Accept,&[]).unwrap();let released=notice(&d,&original,&scope,CallNoticeKind::Released,ID);rpc.register_call_notice(&released).unwrap();assert!(!ticket.is_live());assert!(ticket.remote_released());
     let late=finish(&mut rpc,&original,&scope,id,CallOperation::Accept,true);assert!(!late.accepted());assert_eq!(rpc.phase(),super::super::arc_session::ArcPhase::Authenticated);assert!(rpc.prepare_call(&ticket,CallOperation::Accept,&[]).is_err());
 }
 #[test]

@@ -82,6 +82,13 @@ impl PlainAudioOffer {
         if trunk && !lines.contains(&"a=rtcp-mux") { return Err(MediaError::Configuration); }
         Ok(Self { description, events })
     }
+    pub(super) fn restrict(mut self, allow: &[String]) -> Result<Self, MediaError> {
+        if !allow.is_empty() {
+            self.description.codecs.retain(|codec| allow.iter().any(|name| name.eq_ignore_ascii_case(codec.codec.as_str()) || name.eq_ignore_ascii_case(codec.codec.rtpmap_encoding())));
+            if self.description.codecs.is_empty() { return Err(MediaError::Configuration); }
+        }
+        Ok(self)
+    }
     pub(super) fn endpoint(&self) -> Result<SocketAddr, MediaError> {
         let address: IpAddr = self.description.connection_addr.parse().map_err(|_| MediaError::Configuration)?;
         if address.is_unspecified() || address.is_multicast() || self.description.media_port == 0 { return Err(MediaError::Configuration); }

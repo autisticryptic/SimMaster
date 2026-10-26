@@ -11,6 +11,7 @@ use super::{
     account_sms::{self, AccountSmsMessage},
     account_runs::{self, RunToken},
     account_notifications::NoticePlanner,
+    account_calls::{CallService, CallView},
     controller::{Callback, ControllerFailure, HostingController},
     runtime_backend::{BackendEvent, BackendEventPayload, NativeHostingBackend},
     runtime_connector::TcpRuntimeConnector,
@@ -122,6 +123,7 @@ struct ManagedRun {
     sms_supported: bool,
     credential_expiry: Option<u64>,
     messaging_readiness: Mutex<Option<MessagingReadiness>>,
+    calls: Option<Arc<CallService>>,
     controller: AsyncMutex<HostingController>,
     backend: Arc<NativeHostingBackend>,
     accepting: AtomicBool,
@@ -157,9 +159,17 @@ impl ManagedRun {
             && self.backend.original_incoming_binding(&original.owner, &original.scope)
                 .is_some_and(|binding| binding.receiver_kind == super::smgw_text::SMGW_RECEIVER))
     }
+    fn call_ready(&self, now: u64) -> bool {
+        if !self.accepting.load(Ordering::SeqCst) || self.stopping.load(Ordering::SeqCst)
+            || self.finalized.load(Ordering::SeqCst) || self.credential_expiry.is_some_and(|at| at<=now)
+            || self.configuration_current().is_err() { return false; }
+        self.task.try_lock().is_ok_and(|task| task.as_ref().is_some_and(|task| !task.is_finished()))
+            && self.calls.as_ref().is_some_and(|calls| calls.ready())
+    }
     fn retire(&self) {
         self.accepting.store(false, Ordering::SeqCst);
         *lock(&self.messaging_readiness) = None;
+        if let Some(calls) = &self.calls { calls.retire(); }
         self.backend.retire_current();
     }
 }
@@ -247,6 +257,10 @@ impl AccountManager {
             snapshot.incoming_message_ready = true;
             snapshot.provider_availability = "available";
         }
+        if controller.phase() == Phase::Hosted && run.call_ready(now) {
+            snapshot.incoming_call_ready = true;
+            snapshot.provider_availability = "available";
+        }
         Ok(snapshot)
     }
     /// Synchronous provider observation, not an IO/action grant. Configuration
@@ -264,6 +278,56 @@ impl AccountManager {
         if metadata.revision != run.revision || run.configuration_current().is_err() { return Availability::Unknown; }
         if !run.sms_supported { return Availability::Unsupported; }
         if run.message_ready(unix_now()) { Availability::Available } else { Availability::NotConfigured }
+    }
+    pub(crate) fn inbound_availability(&self, line_id: &str) -> crate::connectivity::app_voice::registry::ProviderAvailability {
+        use crate::connectivity::app_voice::registry::ProviderAvailability as Availability;
+        let messaging = self.messaging_availability(line_id);
+        if messaging == Availability::Available { return messaging; }
+        if !account_store::valid_line_id(line_id) { return Availability::Unsupported; }
+        let run = lock(&self.slots).get(line_id).and_then(|slot| lock(&slot.run).clone());
+        let Some(run) = run else { return messaging; };
+        if !run.accepting.load(Ordering::SeqCst) || run.configuration_current().is_err() { return messaging; }
+        if run.call_ready(unix_now()) { Availability::Available } else { messaging }
+    }
+    pub fn reserve_outbound(&self, line_id: &str, revision: u64) -> Result<(), &'static str> {
+        self.check_revision(line_id, revision)?;
+        // Retained interface only. Neither receive readiness nor imported
+        // credentials can authorize app-account billing or IMS/CS fallback.
+        Err("app_account_outbound_unsupported")
+    }
+    pub async fn calls(&self, line_id: &str) -> Result<Vec<CallView>, &'static str> {
+        let slot = self.slot(line_id)?; let run = lock(&slot.run).clone();
+        let Some(run) = run else { return Ok(Vec::new()); }; run.configuration_current()?;
+        run.calls.as_ref().map_or(Ok(Vec::new()), |calls| calls.list())
+    }
+    pub async fn call(&self, line_id: &str, call_id: &str) -> Result<CallView, &'static str> {
+        let slot = self.slot(line_id)?; let run = lock(&slot.run).clone().ok_or("app_account_call_not_found")?;
+        run.configuration_current()?; run.calls.as_ref().ok_or("app_account_call_runtime_unavailable")?.get(call_id)
+    }
+    async fn active_calls(&self, line_id: &str, revision: u64, now: u64) -> Result<Arc<CallService>, &'static str> {
+        let slot = self.slot(line_id)?; let _operation = slot.operation.lock().await;
+        self.check_revision(line_id, revision)?;
+        let run = lock(&slot.run).clone().ok_or("app_account_call_runtime_unavailable")?;
+        run.configuration_current()?; let mut controller = run.controller.lock().await; controller.tick(now, Instant::now());
+        if !run.accepting.load(Ordering::SeqCst) || controller.phase() != Phase::Hosted { return Err("app_account_call_runtime_unavailable"); }
+        run.calls.as_ref().cloned().ok_or("app_account_call_runtime_unavailable")
+    }
+    pub async fn answer_call(&self, line_id: &str, revision: u64, call_id: &str, sdp: Vec<u8>, now: u64) -> Result<CallView, &'static str> {
+        let calls = self.active_calls(line_id, revision, now).await?;
+        calls.accept(call_id, sdp).await?.await
+    }
+    pub async fn hangup_call(&self, line_id: &str, revision: u64, call_id: &str, now: u64) -> Result<CallView, &'static str> {
+        let calls = self.active_calls(line_id, revision, now).await?;
+        calls.hangup(call_id).await?.await
+    }
+    pub async fn call_trunk_status(&self, line_id: &str) -> Result<crate::services::trunk::runtime::TrunkRuntimeStatus, &'static str> {
+        let slot = self.slot(line_id)?; let run = lock(&slot.run).clone().ok_or("app_account_call_runtime_unavailable")?;
+        run.configuration_current()?; let calls = run.calls.as_ref().ok_or("app_account_call_runtime_unavailable")?;
+        Ok(calls.trunk_status().await)
+    }
+    pub(crate) async fn call_operator(&self, line_id: &str) -> Result<crate::services::trunk::operator::OperatorLink, &'static str> {
+        let slot = self.slot(line_id)?; let run = lock(&slot.run).clone().ok_or("app_account_call_runtime_unavailable")?;
+        run.configuration_current()?; Ok(run.calls.as_ref().ok_or("app_account_call_runtime_unavailable")?.operator())
     }
     pub async fn list(&self, now: u64) -> Result<Vec<AccountView>, &'static str> {
         let metadata = self.database.with_conn(account_store::list)?;
@@ -350,13 +414,15 @@ impl AccountManager {
         let inbox_nonce = local_nonce()?;
         let sms_supported = config.profile.incoming.as_ref().is_some_and(|binding| binding.receiver_kind == super::smgw_text::SMGW_RECEIVER);
         let credential_expiry = config.credentials.sdk.expires_at_unix_seconds;
+        let call_settings = config.runtime_calls()?;
         let (backend, events) = self.factory.build(&config)?;
         let mut controller = HostingController::new(line_id.to_owned(), Some(backend.clone()));
         controller.import(config.credentials, now).map_err(controller_error)?;
         let run_token=Arc::new(self.database.with_conn(|conn|account_runs::register_runtime(conn,line_id,metadata.revision,&inbox_nonce))?);
+        let calls = call_settings.map(|settings| CallService::new(self.database.clone(),run_token.clone(),backend.clone(),settings,credential_expiry));
         let run = Arc::new(ManagedRun { line_id: line_id.to_owned(), database: self.database.clone(), revision: metadata.revision,
             inbox_nonce, run_token, finalized: AtomicBool::new(false), notifications:self.notifications.clone(),
-            sms_supported, credential_expiry, messaging_readiness: Mutex::new(None), controller: AsyncMutex::new(controller), backend,
+            sms_supported, credential_expiry, messaging_readiness: Mutex::new(None), calls, controller: AsyncMutex::new(controller), backend,
             accepting: AtomicBool::new(true), stopping: AtomicBool::new(false), error: Mutex::new(None), task: AsyncMutex::new(None) });
         // Retain the owning backend BEFORE any await that can create IO. A
         // cancelled HTTP future leaves this same run available for stop/retry.
@@ -400,11 +466,13 @@ impl AccountManager {
         run.stopping.store(true, Ordering::SeqCst);
         run.accepting.store(false, Ordering::SeqCst);
         let mut retirement = Retirement::new(run.clone());
+        let calls_error = if let Some(calls) = &run.calls { calls.close().await.err() } else { None };
+        let calls_released = run.calls.as_ref().is_none_or(|calls| calls.resources_released());
         let mut controller = run.controller.lock().await;
         controller.tick(now, Instant::now());
         let result = controller.stop().await;
         let phase=controller.phase();
-        let released=controller.resources_released();
+        let released=controller.resources_released() && calls_released;
         // Never join a consumer while holding the controller it may be waiting
         // for. Keep the actual JoinHandle in this run across caller cancellation.
         drop(controller);
@@ -423,7 +491,8 @@ impl AccountManager {
         match result {
             Ok(()) => {
                 if !released||!run.finalized.load(Ordering::SeqCst){return Err("app_account_cleanup_unconfirmed");}
-                *lock(&run.error) = None;
+                *lock(&run.error) = calls_error;
+                if let Some(code) = calls_error { return Err(code); }
                 Ok(phase)
             }
             Err(reason) => { let code = controller_error(reason); *lock(&run.error) = Some(code); Err(code) }
@@ -551,16 +620,26 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                         }
                         let hosted = matches!(callback.callback, Callback::HostingAck { success: true });
                         match controller.on_callback(&owner, callback.callback, unix_now()).await {
-                            Ok(true) if hosted && controller.phase() == Phase::Hosted => run.install_message_readiness(&owner, &scope),
+                            Ok(true) if hosted && controller.phase() == Phase::Hosted => {
+                                run.install_message_readiness(&owner, &scope);
+                                if let Some(calls) = &run.calls { if let Err(code) = calls.start(&owner,&scope).await { *lock(&run.error)=Some(code);run.retire(); } }
+                            },
                             Ok(_) => {},
                             Err(reason) => { *lock(&run.error) = Some(controller_error(reason)); run.retire(); }
                         }
                     }
                     BackendEventPayload::Call(call)=>{
-                        // The original receiver/receipt path is distinct from
-                        // answering. Until the owned call/media runtime is
-                        // attached, refuse this exact original notification;
-                        // do not grant Channels or reinterpret it as SMS.
+                        controller.tick(unix_now(), Instant::now());
+                        if controller.phase() == Phase::Hosted && run.accepting.load(Ordering::SeqCst) {
+                            if let Some(calls) = &run.calls {
+                                if let Err(code) = calls.delivery(&call).await {
+                                    *lock(&run.error)=Some(code);
+                                    if call.ticket().is_open() { let _=run.backend.complete_call(&owner,&scope,call.ticket(),false,&[]).await; }
+                                    run.retire();
+                                }
+                                continue;
+                            }
+                        }
                         *lock(&run.error)=Some("app_account_call_runtime_unavailable");
                         if run.backend.complete_call(&owner,&scope,call.ticket(),false,&[]).await.is_err(){run.retire();}
                     }

@@ -11,7 +11,7 @@ use super::{
     runtime_connector::{validate_explicit_profile, ConnectionInput},
 };
 use serde::{ser::SerializeSeq, Deserialize, Serialize, Serializer};
-use std::{fmt, io, time::Duration};
+use std::{fmt, io, net::IpAddr, time::Duration};
 use zeroize::{Zeroize, Zeroizing};
 
 const INVALID: &str = "app_account_configuration_invalid";
@@ -23,6 +23,7 @@ pub struct AccountConfig {
     pub credentials: ImportedCredentials,
     pub profile: ProfileConfig,
     pub bootstrap: Option<BootstrapConfig>,
+    pub call_media: Option<CallMediaConfig>,
 }
 impl fmt::Debug for AccountConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("AccountConfig(<redacted>)") }
@@ -110,6 +111,23 @@ impl fmt::Debug for ProfileConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("ProfileConfig(<redacted>)") }
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileBytes { pub value: Vec<u8> }
+impl Drop for ProfileBytes { fn drop(&mut self) { self.value.zeroize(); } }
+impl fmt::Debug for ProfileBytes { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("ProfileBytes(<redacted>)") } }
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallMediaConfig {
+    pub authority: Secret, pub root_der_base64: Secret, pub enable_sni: bool,
+    pub routing: Vec<ProfileProperty>, pub features: Vec<ProfileBytes>, pub properties: Vec<ProfileProperty>,
+    pub reference_decode_key: Option<Secret>, pub audio_bind_ip: IpAddr, pub allow_plain_media: bool,
+    pub trunk: Option<crate::platform::config::TrunkProfileConfig>,
+}
+impl fmt::Debug for CallMediaConfig { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("CallMediaConfig(<redacted>)") } }
+impl Drop for CallMediaConfig { fn drop(&mut self) { if let Some(trunk) = &mut self.trunk { trunk.secret.zeroize(); } } }
+
 fn required_secret(value:&Option<Secret>)->Result<&str,&'static str>{
     let value=value.as_ref().ok_or(INVALID)?.expose_to_backend();
     if value.trim().is_empty(){return Err(INVALID);}Ok(value)
@@ -186,6 +204,22 @@ impl AccountConfig {
         if let Some(properties)=&p.call_control{profile.with_call_control(&borrowed(properties)?).map_err(|_|INVALID)}else{Ok(profile)}
     }
 
+    pub(super) fn runtime_calls(&self) -> Result<Option<super::call_settings::CallSettings>, &'static str> {
+        let Some(media) = &self.call_media else { return Ok(None); };
+        if self.profile.call_incoming.is_none() || self.profile.call_control.is_none() { return Err(INVALID); }
+        let routing = borrowed(&media.routing)?; let properties = borrowed(&media.properties)?;
+        let features = media.features.iter().map(|feature| feature.value.as_slice()).collect::<Vec<_>>();
+        let key = media.reference_decode_key.as_ref().map(|key| ConfigDecodeKey::supplied(key.expose_to_backend().as_bytes()).map_err(|_| INVALID)).transpose()?;
+        super::call_settings::CallSettings::supplied(super::call_settings::Inputs {
+            authority: media.authority.expose_to_backend(), root: media.root_der_base64.expose_to_backend(), enable_sni: media.enable_sni,
+            routing: &routing, features: &features, properties: &properties, key,
+            connect_timeout: Duration::from_millis(self.profile.connect_timeout_ms), handshake_timeout: Duration::from_millis(self.profile.handshake_timeout_ms),
+            partial_timeout: Duration::from_millis(self.profile.partial_timeout_ms), io_timeout: Duration::from_millis(self.profile.io_timeout_ms),
+            rpc_timeout: Duration::from_millis(self.profile.rpc_timeout_ms), bind_ip: media.audio_bind_ip, allow_plain_media: media.allow_plain_media,
+            trunk: media.trunk.as_ref(),
+        }).map(Some)
+    }
+
     /// Pure admission only: no DNS, network, SDK execution or readiness state.
     pub fn validate(&self, now: u64) -> Result<(), &'static str> {
         self.credentials.validate(now).map_err(|_| INVALID)?;
@@ -216,6 +250,7 @@ impl AccountConfig {
         // Constructing the profile is bounded and validates all property maps,
         // incoming binding, required text, supported route and explicit deadlines.
         let _profile = self.runtime_profile()?;
+        let _calls = self.runtime_calls()?;
         let key = self.reference_key()?;
         validate_explicit_profile(ConnectionInput {
             server_reference: sdk.server_address.expose_to_backend(),
@@ -266,7 +301,21 @@ struct PrivateEnvelope { format_version: u32, config: AccountConfig }
 #[derive(Serialize)]
 struct PrivateEnvelopeRef<'a> { format_version: u32, config: PrivateConfigRef<'a> }
 #[derive(Serialize)]
-struct PrivateConfigRef<'a> { credentials: PrivateCredentialsRef<'a>, profile: PrivateProfileRef<'a>, bootstrap:Option<PrivateBootstrapRef<'a>> }
+struct PrivateConfigRef<'a> { credentials: PrivateCredentialsRef<'a>, profile: PrivateProfileRef<'a>, bootstrap:Option<PrivateBootstrapRef<'a>>,
+    call_media: Option<PrivateCallMediaRef<'a>> }
+#[derive(Serialize)]
+struct PrivateCallMediaRef<'a> { authority: &'a str, root_der_base64: &'a str, enable_sni: bool,
+    routing: PrivateProperties<'a>, features: PrivateFeatures<'a>, properties: PrivateProperties<'a>, reference_decode_key: Option<&'a str>,
+    audio_bind_ip: IpAddr, allow_plain_media: bool, trunk: Option<&'a crate::platform::config::TrunkProfileConfig> }
+#[derive(Serialize)]
+struct PrivateFeatureRef<'a> { value: &'a [u8] }
+struct PrivateFeatures<'a>(&'a [ProfileBytes]);
+impl Serialize for PrivateFeatures<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut values = serializer.serialize_seq(Some(self.0.len()))?;
+        for feature in self.0 { values.serialize_element(&PrivateFeatureRef { value: &feature.value })?; } values.end()
+    }
+}
 #[derive(Serialize)]
 struct PrivateBootstrapRef<'a>{account_authority:&'a str,account_root_der_base64:&'a str,account_enable_sni:bool,
     routing:PrivateProperties<'a>,handoff_timeout_ms:u64}
@@ -351,6 +400,11 @@ impl<'a> PrivateConfigRef<'a> {
                 connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
                 partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
             },
+            call_media: config.call_media.as_ref().map(|media| PrivateCallMediaRef { authority: media.authority.expose_to_backend(),
+                root_der_base64: media.root_der_base64.expose_to_backend(), enable_sni: media.enable_sni,
+                routing: PrivateProperties(&media.routing), features: PrivateFeatures(&media.features), properties: PrivateProperties(&media.properties),
+                reference_decode_key: exposed(&media.reference_decode_key), audio_bind_ip: media.audio_bind_ip, allow_plain_media: media.allow_plain_media,
+                trunk: media.trunk.as_ref() }),
             bootstrap:config.bootstrap.as_ref().map(|b|PrivateBootstrapRef{account_authority:b.account_authority.expose_to_backend(),
                 account_root_der_base64:b.account_root_der_base64.expose_to_backend(),account_enable_sni:b.account_enable_sni,
                 routing:private_properties(&b.routing),handoff_timeout_ms:b.handoff_timeout_ms}),

@@ -47,6 +47,14 @@ mod app_voice_accounts {
             (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}/inbox")),
             (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}/messages")),
             (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}/notifications")),
+            (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}/calls")),
+            (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}/calls/0123456789abcdef0123456789abcdef")),
+            (reqwest::Method::POST, format!("/api/non-3gpp/accounts/{line}/calls/0123456789abcdef0123456789abcdef/answer")),
+            (reqwest::Method::POST, format!("/api/non-3gpp/accounts/{line}/calls/0123456789abcdef0123456789abcdef/hangup")),
+            (reqwest::Method::POST, format!("/api/non-3gpp/accounts/{line}/calls/0123456789abcdef0123456789abcdef/reject")),
+            (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}/trunk")),
+            (reqwest::Method::POST, format!("/api/non-3gpp/accounts/{line}/outbound/calls")),
+            (reqwest::Method::POST, format!("/api/non-3gpp/accounts/{line}/outbound/messages")),
         ];
         for (method, path) in cases {
             let (status, _, body) = account_request(&served, method, &path, Some(serde_json::json!({})), None).await;
@@ -123,6 +131,34 @@ mod app_voice_accounts {
             assert_eq!(status, StatusCode::BAD_REQUEST); no_store(&headers); no_secrets(&body);
         }
         assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_and_reserved_outbound_http_are_bounded_revision_guarded_and_never_fallback_to_sim() {
+        let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");
+        let served = serve(state.router.clone()).await; let cookie = authenticate(&served).await;
+        let cert = Certificates::generate("DNS:fixture.invalid");
+        let (status, _, body) = account_request(&served, reqwest::Method::POST, "/api/non-3gpp/accounts",
+            Some(serde_json::json!({"provider_id":"app_voice","config":config_json(&cert.root)})), Some(&cookie)).await;
+        assert_eq!(status,StatusCode::CREATED);let line=created_line(&body);let path=format!("/api/non-3gpp/accounts/{line}");
+        let call="0123456789abcdef0123456789abcdef";
+        let (status,headers,body)=account_request(&served,reqwest::Method::GET,&format!("{path}/calls"),None,Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"],serde_json::json!([]));
+        for action in ["answer","hangup","reject"] {
+            let request=if action=="answer"{serde_json::json!({"expected_revision":2,"sdp":"fixture-private"})}else{serde_json::json!({"expected_revision":2})};
+            let (status,headers,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/calls/{call}/{action}"),Some(request),Some(&cookie)).await;
+            assert_eq!(status,StatusCode::CONFLICT);no_store(&headers);no_secrets(&body);
+            let (status,headers,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/calls/{call}/{action}"),Some(serde_json::json!({"expected_revision":1,"private":"fixture-must-not-echo"})),Some(&cookie)).await;
+            assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);
+        }
+        for target in ["calls","messages"] {
+            let mut request=serde_json::json!({"expected_revision":1,"target":"fixture-private-target"});if target=="messages"{request["body"]=serde_json::json!("fixture-private-body");}
+            let (status,headers,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/outbound/{target}"),Some(request),Some(&cookie)).await;
+            assert_eq!(status,StatusCode::NOT_IMPLEMENTED);no_store(&headers);no_secrets(&body);assert!(body.contains("app_account_outbound_unsupported"));
+        }
+        assert!(state.app.database.get_call_history_for_line(&line,20,0).unwrap().is_empty());
+        assert!(state.app.database.get_sms_messages_for_channel(20,0,None,Some(&line)).unwrap().is_empty());
+        assert_eq!(state.app.app_accounts.get(&line,100).await.unwrap().phase,"stopped");
     }
 
     #[tokio::test]

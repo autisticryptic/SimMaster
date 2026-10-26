@@ -29,7 +29,7 @@ pub(super) fn validate_routing(routing:&[RpcProperty<'_>])->Result<(),CodecError
     if !get(b"id").is_some_and(valid_identifier)||!get(b"domain").is_some_and(valid_identifier){return Err(CodecError::InvalidField);}
     capture(routing).map(|_|())
 }
-struct CallIdentity{live:AtomicBool,media_started:AtomicBool,gate:Mutex<()>,changed:tokio::sync::Notify}
+struct CallIdentity{live:AtomicBool,media_started:AtomicBool,remote_released:AtomicBool,gate:Mutex<()>,changed:tokio::sync::Notify}
 pub struct CallControlTicket{owner:AttemptOwner,scope:RpcConnectionScope,native_id:NativeCallId,identity:Arc<CallIdentity>}
 impl fmt::Debug for CallControlTicket{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("CallControlTicket(<redacted>)")}}
 impl CallControlTicket{
@@ -37,12 +37,14 @@ impl CallControlTicket{
     pub fn connection_scope(&self)->RpcConnectionScope{self.scope.clone()}
     pub fn native_id(&self)->NativeCallId{self.native_id}
     pub fn is_live(&self)->bool{self.scope.is_open()&&self.identity.live.load(Ordering::Acquire)}
+    pub(super) fn remote_released(&self)->bool{self.identity.remote_released.load(Ordering::Acquire)}
     pub(super) fn same_call(&self,other:&Self)->bool{
         self.owner==other.owner&&self.scope.matches(&other.scope)&&self.native_id==other.native_id&&Arc::ptr_eq(&self.identity,&other.identity)
     }
     /// Lock order: call identity -> original account scope -> destination media
-    /// scope (in the media caller). Nonblocking IO polls only; no close or await
-    /// in the closure. Revocation serializes with each poll, not a copied ticket.
+    /// scope (in the media caller). Nonblocking IO polls or bounded in-memory
+    /// publication only; no blocking locks, close or await in the closure.
+    /// Revocation serializes with each poll, not a copied ticket.
     pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{&self.owner==owner&&self.scope.matches(scope)&&scope.is_open()}
     pub(super) fn captured_copy(&self)->Self{Self{owner:self.owner.clone(),scope:self.scope.clone(),native_id:self.native_id,identity:self.identity.clone()}}
     pub(super) fn with_media_gate<T>(&self,work:impl FnOnce()->T)->Option<T>{
@@ -89,7 +91,7 @@ impl CallBook{
         let id=notice.native_id().expose_to_backend();
         if self.retired.contains(&id){return Ok(None);}
         if let Some(slot)=self.calls.get_mut(&id){
-            if notice.kind()==CallNoticeKind::Released{slot.ticket.revoke();slot.phase=Phase::Ended;}
+            if notice.kind()==CallNoticeKind::Released{slot.ticket.identity.remote_released.store(true,Ordering::Release);slot.ticket.revoke();slot.phase=Phase::Ended;}
             if notice.kind()==CallNoticeKind::Invited{return Ok(None);}
             return Ok(Some(slot.ticket.captured_copy()));
         }
@@ -111,7 +113,7 @@ impl CallBook{
         let data=notice.data_for(&self.owner,&self.scope).ok_or(CodecError::InvalidField)?;
         let override_id=data.properties.iter().find(|p|p.key==b"callServerEx.oid").map(|p|p.value);
         if override_id.is_some_and(|value|!valid_identifier(value)){return Err(CodecError::InvalidField);}
-        let ticket=CallControlTicket{owner:self.owner.clone(),scope:self.scope.clone(),native_id:notice.native_id(),identity:Arc::new(CallIdentity{live:AtomicBool::new(true),media_started:AtomicBool::new(false),gate:Mutex::new(()),changed:tokio::sync::Notify::new()})};
+        let ticket=CallControlTicket{owner:self.owner.clone(),scope:self.scope.clone(),native_id:notice.native_id(),identity:Arc::new(CallIdentity{live:AtomicBool::new(true),media_started:AtomicBool::new(false),remote_released:AtomicBool::new(false),gate:Mutex::new(()),changed:tokio::sync::Notify::new()})};
         self.calls.insert(id,Slot{ticket:ticket.captured_copy(),phase:Phase::Received,override_id:override_id.map(|v|Zeroizing::new(v.to_vec()))});Ok(Some(ticket))
     }
     fn slot(&self,ticket:&CallControlTicket)->Result<&Slot,CodecError>{

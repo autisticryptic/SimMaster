@@ -120,3 +120,12 @@ fn telephone_event_mapping_is_separate_from_voice_and_survives_original_answer_p
     assert!(rendered.contains("a=rtpmap:101 telephone-event/8000")); assert!(rendered.contains("a=fmtp:101 0-16"));
     let event_only = body.replace("RTP/AVP 0 8 101", "RTP/AVP 101"); assert!(PlainAudioOffer::trunk(event_only.as_bytes(), true).is_err());
 }
+#[test]
+fn explicit_trunk_codec_allow_filters_native_offer_without_relabeling_payload_or_transcoding() {
+    let offer = PlainAudioOffer::trunk(SDP, true).unwrap().restrict(&["pcmu".to_owned()]).unwrap();
+    assert_eq!(offer.matching_payloads(&offer).unwrap(),vec![0]);
+    let (_rpc, _, _, ticket, _) = accepted_context(ENDPOINT, CONTENT);
+    let rendered=offer.with_local_endpoint(&ticket,"127.0.0.1:49152".parse().unwrap()).unwrap();
+    let rendered=std::str::from_utf8(&rendered).unwrap();assert!(rendered.contains("RTP/AVP 0\r\n"));assert!(!rendered.contains("rtpmap:8"));
+    assert!(PlainAudioOffer::trunk(SDP,true).unwrap().restrict(&["not-implemented".to_owned()]).is_err());
+}

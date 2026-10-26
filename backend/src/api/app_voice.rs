@@ -27,6 +27,15 @@ pub struct ReplaceAccountRequest { expected_revision: u64, config: AccountConfig
 pub struct RevisionRequest { expected_revision: u64 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AnswerCallRequest { expected_revision: u64, sdp: String }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundCallRequest { expected_revision: u64, target: String }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundMessageRequest { expected_revision: u64, target: String, body: String }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InboxQuery { #[serde(default = "default_inbox_limit")] limit: usize }
 fn default_inbox_limit() -> usize { 50 }
 
@@ -40,6 +49,14 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/inbox", get(get_inbox))
         .route("/api/non-3gpp/accounts/{line_id}/messages", get(get_messages))
         .route("/api/non-3gpp/accounts/{line_id}/notifications", get(get_notifications))
+        .route("/api/non-3gpp/accounts/{line_id}/calls", get(get_calls))
+        .route("/api/non-3gpp/accounts/{line_id}/calls/{call_id}", get(get_call))
+        .route("/api/non-3gpp/accounts/{line_id}/calls/{call_id}/answer", post(answer_call))
+        .route("/api/non-3gpp/accounts/{line_id}/calls/{call_id}/hangup", post(hangup_call))
+        .route("/api/non-3gpp/accounts/{line_id}/calls/{call_id}/reject", post(hangup_call))
+        .route("/api/non-3gpp/accounts/{line_id}/trunk", get(get_call_trunk_status))
+        .route("/api/non-3gpp/accounts/{line_id}/outbound/calls", post(reserved_outbound_call))
+        .route("/api/non-3gpp/accounts/{line_id}/outbound/messages", post(reserved_outbound_message))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
 }
 fn no_store(mut response: Response) -> Response {
@@ -48,14 +65,15 @@ fn no_store(mut response: Response) -> Response {
 }
 fn error_status(code: &str) -> StatusCode {
     match code {
-        "app_account_not_found" => StatusCode::NOT_FOUND,
-        "app_account_revision_conflict" | "app_account_stop_before_replace" => StatusCode::CONFLICT,
-        "app_account_provider_unsupported" => StatusCode::NOT_IMPLEMENTED,
+        "app_account_not_found" | "app_account_call_not_found" => StatusCode::NOT_FOUND,
+        "app_account_revision_conflict" | "app_account_stop_before_replace" | "app_account_call_operation_pending" => StatusCode::CONFLICT,
+        "app_account_provider_unsupported" | "app_account_outbound_unsupported" => StatusCode::NOT_IMPLEMENTED,
         "app_account_storage_failed" | "app_account_inbox_storage_failed" | "app_account_sms_storage_failed"
-            | "app_account_run_storage_failed" | "app_account_notification_storage_failed" | "database_unavailable" => StatusCode::INTERNAL_SERVER_ERROR,
+            | "app_account_run_storage_failed" | "app_account_notification_storage_failed" | "app_account_call_storage_failed" | "database_unavailable" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_account_limit" | "app_account_run_limit" | "app_account_entropy_unavailable" | "app_account_backend_unavailable"
             | "app_account_authentication_rejected" | "app_account_disconnected" | "app_account_hosting_rejected"
-            | "app_account_operation_timeout" | "app_account_shutting_down" | "app_account_cleanup_unconfirmed" => StatusCode::SERVICE_UNAVAILABLE,
+            | "app_account_operation_timeout" | "app_account_shutting_down" | "app_account_cleanup_unconfirmed"
+            | "app_account_call_runtime_unavailable" | "app_account_call_cleanup_unconfirmed" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
     }
 }
@@ -114,6 +132,42 @@ pub async fn get_notifications(State(manager):State<Arc<AccountManager>>,Path(li
     let Ok(Query(request))=request else{return failure("app_account_request_invalid");};
     if !(1..=128).contains(&request.limit){return failure("app_account_request_invalid");}
     success(StatusCode::OK,manager.notification_status(&line_id,request.limit))
+}
+
+fn call_id_valid(value: &str) -> bool { value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) }
+pub async fn get_calls(State(manager): State<Arc<AccountManager>>, Path(line_id): Path<String>) -> Response {
+    success(StatusCode::OK, manager.calls(&line_id).await)
+}
+pub async fn get_call(State(manager): State<Arc<AccountManager>>, Path((line_id, call_id)): Path<(String,String)>) -> Response {
+    if !call_id_valid(&call_id) { return failure("app_account_request_invalid"); }
+    success(StatusCode::OK, manager.call(&line_id,&call_id).await)
+}
+pub async fn answer_call(State(manager): State<Arc<AccountManager>>, Path((line_id, call_id)): Path<(String,String)>,
+    request: Result<Json<AnswerCallRequest>, JsonRejection>) -> Response {
+    let Ok(Json(request)) = request else { return failure("app_account_request_invalid"); };
+    if !call_id_valid(&call_id) || request.sdp.is_empty() || request.sdp.len()>16_384 { return failure("app_account_request_invalid"); }
+    success(StatusCode::OK, manager.answer_call(&line_id,request.expected_revision,&call_id,request.sdp.into_bytes(),now()).await)
+}
+pub async fn hangup_call(State(manager): State<Arc<AccountManager>>, Path((line_id, call_id)): Path<(String,String)>,
+    request: Result<Json<RevisionRequest>, JsonRejection>) -> Response {
+    let Ok(Json(request)) = request else { return failure("app_account_request_invalid"); };
+    if !call_id_valid(&call_id) { return failure("app_account_request_invalid"); }
+    success(StatusCode::OK, manager.hangup_call(&line_id,request.expected_revision,&call_id,now()).await)
+}
+pub async fn get_call_trunk_status(State(manager): State<Arc<AccountManager>>, Path(line_id): Path<String>) -> Response {
+    success(StatusCode::OK, manager.call_trunk_status(&line_id).await)
+}
+pub async fn reserved_outbound_call(State(manager): State<Arc<AccountManager>>, Path(line_id): Path<String>,
+    request: Result<Json<OutboundCallRequest>, JsonRejection>) -> Response {
+    let Ok(Json(request)) = request else { return failure("app_account_request_invalid"); };
+    if request.target.trim().is_empty() || request.target.len()>128 { return failure("app_account_request_invalid"); }
+    success(StatusCode::OK, manager.reserve_outbound(&line_id,request.expected_revision))
+}
+pub async fn reserved_outbound_message(State(manager): State<Arc<AccountManager>>, Path(line_id): Path<String>,
+    request: Result<Json<OutboundMessageRequest>, JsonRejection>) -> Response {
+    let Ok(Json(request)) = request else { return failure("app_account_request_invalid"); };
+    if request.target.trim().is_empty() || request.target.len()>128 || request.body.is_empty() || request.body.len()>16_384 { return failure("app_account_request_invalid"); }
+    success(StatusCode::OK, manager.reserve_outbound(&line_id,request.expected_revision))
 }
 
 pub async fn start_account(State(manager): State<Arc<AccountManager>>, Path(line_id): Path<String>,

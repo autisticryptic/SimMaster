@@ -766,7 +766,7 @@ async fn sync_bridge_diagnostics(state: &TrunkStateWriter, bridge: &TrunkBridge)
         .await;
 }
 
-fn validate_profile(profile: &TrunkProfileConfig) -> Result<(), String> {
+pub(crate) fn validate_profile(profile: &TrunkProfileConfig) -> Result<(), String> {
     if profile.asterisk_host.trim().is_empty() {
         return Err("trunk_asterisk_host_required".to_string());
     }

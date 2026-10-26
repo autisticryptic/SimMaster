@@ -362,6 +362,11 @@ impl NativeHostingBackend {
         if !attempt.scope.matches(scope) || !scope.is_open() || !lock(&attempt.state).configured { return None; }
         self.profile.incoming.as_ref().map(Binding::borrowed)
     }
+    pub(super) fn original_call_receiver_ready(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
+        let Ok(attempt) = self.original(owner) else { return false; };
+        attempt.scope.matches(scope) && scope.is_open() && lock(&attempt.state).configured
+            && self.profile.call_incoming.is_some() && self.profile.call_control.is_some()
+    }
     fn original(&self, owner: &AttemptOwner) -> Result<Arc<Attempt>, BackendFailure> {
         lock(&self.state).slot.as_ref().filter(|a| &a.owner == owner).cloned().ok_or(BackendFailure::Disconnected)
     }

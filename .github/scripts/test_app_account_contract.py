@@ -292,8 +292,10 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('!task.is_finished()', runtime)
         provider = (PROVIDER / 'message_provider.rs').read_text(encoding='utf-8')
         self.assertIn('Weak<AccountManager>', provider)
-        self.assertIn('capabilities: vec![VoiceCapability::Messaging]', provider)
-        self.assertNotIn('VoiceCapability::Voice', provider)
+        self.assertIn('capabilities: vec![VoiceCapability::Voice, VoiceCapability::Messaging]', provider)
+        self.assertIn('accounts.inbound_availability(line_id)', provider)
+        self.assertIn('self.calls.as_ref().is_some_and(|calls| calls.ready())', runtime)
+        self.assertIn('run.call_ready(unix_now())', runtime)
         self.assertNotIn('expose_to_backend', provider)
         self.assertIn('MessagingProvider::for_accounts(&app_state.app_accounts)', source('backend/src/main.rs'))
         for workflow in ['.github/workflows/build-release.yml', '.github/workflows/beta-validation.yml']:
@@ -310,6 +312,65 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('channel["incoming_ready"],true', tests)
         self.assertIn('readiness["data"]["incoming_call_ready"],false', tests)
         self.assertIn('get_sms_messages_for_channel(10,0,Some("outgoing"),Some(&line)).unwrap().is_empty()', tests)
+    def test_basic_call_settings_are_explicit_pure_and_original_receiver_bound(self):
+        config = (PROVIDER / 'account_config.rs').read_text(encoding='utf-8')
+        settings = (PROVIDER / 'call_settings.rs').read_text(encoding='utf-8')
+        self.assertIn('pub call_media: Option<CallMediaConfig>', config)
+        self.assertIn('self.profile.call_incoming.is_none() || self.profile.call_control.is_none()', config)
+        self.assertIn('let _calls = self.runtime_calls()?', config)
+        self.assertIn('!input.allow_plain_media', settings)
+        self.assertIn('input.bind_ip.is_unspecified()', settings)
+        self.assertIn('TrunkIncomingMode::BoundImmediate', settings)
+        self.assertIn('trunk.vowifi_only || trunk.allow_home_cellular_calls', settings)
+        self.assertNotIn('.connect(', settings)
+        self.assertNotIn('.bind(', settings)
+        self.assertNotIn('tokio::spawn', settings)
+        for secret in ['CallMediaConfig', 'ProfileBytes']:
+            self.assertNotIn(f'impl Serialize for {secret}', config)
+
+    def test_basic_call_supervisor_waits_for_actual_original_media_and_keeps_join_ownership(self):
+        calls = (PROVIDER / 'account_calls.rs').read_text(encoding='utf-8')
+        operation = calls.split('async fn accept_original',1)[1].split('pub(super) async fn hangup',1)[0]
+        self.assertLess(operation.index('CallOperation::Accept'),operation.index('MediaEndpointPlan::prepare_mpath'))
+        self.assertLess(operation.index('ready=ready.await'),operation.index('Phase::Connected'))
+        self.assertLess(operation.index('ready.original(&call.ticket'),operation.index('history::connected'))
+        self.assertIn('socket.for_peer(&call.ticket,&call.offer,&answer',operation)
+        self.assertIn('call.ticket.same_call(ticket)',calls)
+        self.assertIn('self.expiry.is_some_and',calls)
+        self.assertIn('account_runs::runtime_matches(conn,&self.run)',calls)
+        self.assertIn('impl Drop for OperationWaiter',calls)
+        self.assertIn('call.ticket.revoke()',calls)
+        self.assertNotIn('CallOperation::Start',calls)
+        self.assertIn('OperatorCommand::StartCall{call_id,..}=>current.operator.send_event(OperatorEvent::Unavailable',calls)
+        runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
+        cleanup = runtime.split('async fn cleanup_run',1)[1].split('async fn shutdown_requested',1)[0]
+        self.assertLess(cleanup.index('calls.close().await'),cleanup.index('controller.stop().await'))
+        self.assertIn('controller.resources_released() && calls_released',cleanup)
+        for workflow in ['.github/workflows/build-release.yml','.github/workflows/beta-validation.yml']:
+            for module in ['account_calls','account_call_history']:
+                self.assertIn(f'connectivity::app_voice::providers::jegotrip::{module}::tests',source(workflow))
+            self.assertIn('services::trunk::runtime::tests',source(workflow))
+            self.assertIn('services::trunk::driver::tests',source(workflow))
+
+    def test_call_history_cas_and_outbound_interfaces_never_inherit_original_grants(self):
+        history = (PROVIDER / 'account_call_history.rs').read_text(encoding='utf-8')
+        self.assertIn('app_call_token=?3 AND end_time IS NULL',history)
+        self.assertIn('account_runs::require_live(&tx',history)
+        self.assertIn('account_runs::runtime_matches(&tx',history)
+        self.assertIn('TransactionBehavior::Immediate',history)
+        self.assertIn('db.publish_committed_app_event',history)
+        self.assertNotIn('impl Serialize for HistoryTicket',history)
+        runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
+        reserve = runtime.split('pub fn reserve_outbound',1)[1].split('pub async fn calls',1)[0]
+        self.assertIn('self.check_revision(line_id, revision)?',reserve)
+        self.assertIn('Err("app_account_outbound_unsupported")',reserve)
+        self.assertNotIn('.call(',reserve)
+        self.assertNotIn('.send(',reserve)
+        api=source('backend/src/api/app_voice.rs')
+        self.assertIn('request.sdp.len()>16_384',api)
+        self.assertIn('manager.reserve_outbound(&line_id,request.expected_revision)',api)
+        for path in ['calls/{call_id}/answer','calls/{call_id}/hangup','calls/{call_id}/reject','outbound/calls','outbound/messages']:
+            self.assertIn(path,api)
 
 
 if __name__ == '__main__':

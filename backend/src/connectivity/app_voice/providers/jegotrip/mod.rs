@@ -16,9 +16,14 @@ pub mod smgw_text;
 pub mod account_runtime;
 pub mod account_runs;
 pub mod account_notifications;
+pub(crate) mod call_settings;
+pub(crate) mod account_calls;
+pub mod account_call_history;
 pub(crate) mod message_provider;
 #[cfg(test)]
 pub(crate) mod account_test_support;
+#[cfg(test)]
+pub(crate) mod account_call_test_support;
 pub mod credentials;
 pub mod controller;
 pub mod offline_backend;

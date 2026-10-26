@@ -13,7 +13,7 @@ fn fixture(root: &str) -> AccountConfig {
     credentials.sdk.selected_session_id = Some(secret("\"fixture-original-selector\""));
     credentials.sdk.client_config_decode_key = Some(secret("\"fixture-client-context\""));
     credentials.sdk.reference_decode_key = Some(secret("\"fixture-reference-context\""));
-    AccountConfig { credentials, bootstrap:None, profile: ProfileConfig {
+    AccountConfig { credentials, bootstrap:None, call_media:None, profile: ProfileConfig {
         route: ProfileRoute::DirectTlsCarrier, authority: secret("\"fixture.invalid\""), enable_sni: true,
         identity_type: secret("\"username\""), domain_name: Some(secret("\"fixture.invalid\"")),
         domain_id: Some(secret("\"fixture-domain\"")), application_id: Some(secret("\"fixture-app\"")),

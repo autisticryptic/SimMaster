@@ -1173,9 +1173,9 @@ async fn main() -> Result<()> {
         e911,
     });
 
-    // Explicitly install only the currently implemented inbound-text provider.
-    // Its descriptor never promises outgoing SMS, SIM billing or voice/media;
-    // availability is tied to this manager's actual original hosted run.
+    // Explicitly install only the implemented basic inbound voice/text provider.
+    // Its descriptor never grants outgoing SDK operations or SIM billing;
+    // availability is tied to this manager's actual original hosted pipelines.
     connectivity::app_voice::registry::registry().install(Box::new(
         connectivity::app_voice::providers::jegotrip::message_provider::MessagingProvider::for_accounts(&app_state.app_accounts),
     )).map_err(anyhow::Error::msg)?;

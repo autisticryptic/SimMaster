@@ -111,11 +111,11 @@ impl Running {
 }
 
 #[test]
-fn construction_and_descriptor_only_advertise_inbound_implemented_text_not_voice_or_paid_actions() {
+fn construction_and_descriptor_only_advertise_implemented_basic_receive_capabilities_not_paid_actions() {
     let temp = TempDatabase::new(); let accounts = Arc::new(AccountManager::new(temp.database.clone()));
     let provider = MessagingProvider::for_accounts(&accounts);
     assert_eq!(provider.descriptor().id, PROVIDER_ID);
-    assert_eq!(provider.descriptor().capabilities, vec![VoiceCapability::Messaging]);
+    assert_eq!(provider.descriptor().capabilities, vec![VoiceCapability::Voice, VoiceCapability::Messaging]);
     assert_eq!(provider.availability("modem-fixture"), ProviderAvailability::Unsupported);
     assert_eq!(provider.availability("wlan-fixture"), ProviderAvailability::Unsupported);
     assert_eq!(format!("{provider:?}"), "MessagingProvider(<redacted>)");
