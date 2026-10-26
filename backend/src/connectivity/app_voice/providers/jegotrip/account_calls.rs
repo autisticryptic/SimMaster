@@ -31,10 +31,15 @@ struct Call { id: String, ticket: CallControlTicket, offer: PlainAudioOffer, cal
 impl Call {
     fn retire(&self) { self.cancelled.store(true,Ordering::SeqCst); self.ticket.revoke(); let mut state=lock(&self.state);
         state.socket.take(); if let Some(media)=&state.media { media.retire(); } }
-    fn view(&self) -> CallView { let state=lock(&self.state); CallView { id:self.id.clone(),history_id:self.history.id(),phase:state.phase.name(),
-        received_at_unix_seconds:self.received, peer:self.caller.clone(),peer_source:"native_invitation_peer",
-        media_active:state.phase==Phase::Connected&&self.ticket.is_live()&&state.media.as_ref().is_some_and(|media|media.scope().is_open()),
-        sdp:state.local.and_then(|local|self.offer.with_local_endpoint(&self.ticket,local).ok()).and_then(|body|std::str::from_utf8(&body).ok().map(str::to_owned)),last_error:state.error } }
+    fn view(&self) -> CallView {
+        let(phase,media_active,local,error)={let state=lock(&self.state);(state.phase,
+            state.phase==Phase::Connected&&self.ticket.is_live()&&state.media.as_ref().is_some_and(|media|media.scope().is_open()),state.local,state.error)};
+        // SDP rendering does not retain the call-state lock or affect action
+        // admission. Read-only polling cannot reject a legitimate answer.
+        let sdp=local.and_then(|local|self.offer.with_local_endpoint(&self.ticket,local).ok()).and_then(|body|std::str::from_utf8(&body).ok().map(str::to_owned));
+        CallView{id:self.id.clone(),history_id:self.history.id(),phase:phase.name(),received_at_unix_seconds:self.received,peer:self.caller.clone(),peer_source:"native_invitation_peer",
+            media_active:media_active&&self.ticket.is_live(),sdp,last_error:error}
+    }
 }
 #[derive(Clone, Serialize)]
 pub struct CallView { pub id:String,pub history_id:i64,pub phase:&'static str,pub received_at_unix_seconds:u64,pub peer:String,
@@ -144,6 +149,20 @@ impl CallService {
         if !self.accepting.load(Ordering::SeqCst)||tasks.len()>=512{return false;}
         tasks.push(tokio::spawn(future));true
     }
+    async fn publish_state<T>(&self,call:&Call,work:impl FnOnce(&mut State)->T)->Result<T,&'static str>{
+        let deadline=Instant::now()+std::time::Duration::from_millis(250);let mut work=Some(work);
+        loop{
+            if !self.active(call){return Err(SCOPE);}
+            let published=call.ticket.with_media_gate(||{
+                let Ok(mut state)=call.state.try_lock()else{return None;};
+                if call.cancelled.load(Ordering::SeqCst){return None;}
+                Some(work.take().expect("one original publication")(&mut state))
+            }).ok_or(SCOPE)?;
+            if let Some(value)=published{return Ok(value);}
+            if Instant::now()>=deadline{return Err("app_account_call_timeout");}
+            tokio::task::yield_now().await;
+        }
+    }
     async fn ring(&self,call:&Arc<Call>)->Result<(),&'static str>{
         if !self.active(call){return Err(SCOPE);}
         let scope=call.ticket.connection_scope();let result=self.backend.call(call.ticket.owner(),&scope,&call.ticket,CallOperation::Inform,&[]).await.map_err(call_error)?;
@@ -152,11 +171,7 @@ impl CallService {
         let address=socket.address(&call.ticket).ok_or(SCOPE)?;let body=call.offer.with_local_endpoint(&call.ticket,address).map_err(|error|error.code())?;
         if !self.active(call){return Err(SCOPE);}
         let mut socket=Some(socket);
-        call.ticket.with_media_gate(||{
-            let Ok(mut state)=call.state.try_lock()else{return false;};
-            if call.cancelled.load(Ordering::SeqCst){return false;}
-            state.socket=socket.take();state.local=Some(address);state.phase=Phase::Ringing;true
-        }).filter(|committed|*committed).ok_or(SCOPE)?;
+        self.publish_state(call,|state|{state.socket=socket.take();state.local=Some(address);state.phase=Phase::Ringing;}).await?;
         call.ticket.with_media_gate(||self.operator.send_event(OperatorEvent::Incoming{call_id:call.id.clone(),caller:if call.caller.is_empty(){"unknown".into()}else{call.caller.clone()},body:body.to_vec()})).ok_or(SCOPE)?;Ok(())
     }
     pub(super) async fn accept(self:&Arc<Self>,id:&str,body:Vec<u8>)->Result<OperationWaiter,&'static str>{
@@ -184,11 +199,7 @@ impl CallService {
         lock(&call.state).media=Some(handle.clone());
         let ready=ready.await.map_err(|error|error.code())?;
         if !self.active(call)||!ready.original(&call.ticket,&handle.scope()){return Err(SCOPE);}
-        call.ticket.with_media_gate(||{
-            let Ok(mut state)=call.state.try_lock()else{return false;};
-            if call.cancelled.load(Ordering::SeqCst){return false;}
-            state.phase=Phase::Connected;state.connected=Some(Instant::now());true
-        }).filter(|committed|*committed).ok_or(SCOPE)?;
+        self.publish_state(call,|state|{state.phase=Phase::Connected;state.connected=Some(Instant::now());}).await?;
         history::connected(&self.database,&call.history)?;
         call.ticket.with_media_gate(||self.operator.send_event(OperatorEvent::Connected{call_id:call.id.clone()})).ok_or(SCOPE)?;
         let weak=Arc::downgrade(self);let original=call.clone();let mut watch=call.watch.lock().await;

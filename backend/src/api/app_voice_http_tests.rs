@@ -162,6 +162,56 @@ mod app_voice_accounts {
     }
 
     #[tokio::test]
+    async fn actual_authenticated_call_answer_audio_sms_during_call_and_hangup_keep_original_account_and_ack() {
+        use crate::connectivity::app_voice::providers::jegotrip as native;
+        use native::{account_runtime::AccountManager,account_test_support::{peer,QueuedFactory},
+            account_call_test_support::{call_config_json,sdp,notice,operation,reply_operation,finish_sdk},
+            rpc_calls::{CallNoticeKind,CallOperation,encode_notice_result},rpc_envelope::{decode_reply,decode_request},rpc_stream::Reader,
+            runtime_backend::tests::next_non_poll,tcp_mpath::{self,Input},tcp_mpath_audio::tests::Peer as MediaPeer,smgw_text::SMGW_RECEIVER};
+        use tokio::{net::{TcpListener,UdpSocket},sync::oneshot};
+        fn redacted_call(body:&str){for secret in ["fixture-original","fixture-domain","#fixture","phone_login_token","application_key","root_der","selected_session","private_config","__magic","SipPwd"]{assert!(!body.contains(secret));}}
+        fn rtp(sequence:u16)->Vec<u8>{let mut packet=vec![0x80,0,0,0,0,0,0,160,0x12,0x34,0x56,0x78];packet[2..4].copy_from_slice(&sequence.to_be_bytes());packet.resize(173,sequence as u8);packet}
+        let mut state=build_test_router().await.expect("Actions private D-Bus required; do not skip");let sdk=Certificates::generate("DNS:fixture.invalid");let media=Certificates::generate("IP:127.0.0.1");
+        let factory=Arc::new(QueuedFactory::default());let(mut sdk_peer,_,dropped)=peer(&sdk,&factory);state.app.app_accounts=Arc::new(AccountManager::with_factory(state.app.database.clone(),factory));
+        let listener=TcpListener::bind(("127.0.0.1",0)).await.unwrap();let endpoint=format!("#fixture-endpoint:tcp -h 127.0.0.1 -p {};",listener.local_addr().unwrap().port());let audio_peer=UdpSocket::bind(("127.0.0.1",0)).await.unwrap();
+        let cors=CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);let served=serve(build_router(state.app.clone(),cors)).await;let cookie=authenticate(&served).await;
+        let mut config=call_config_json(&sdk.root,&media.root);config["profile"]["incoming"]["receiver_kind"]=serde_json::json!(SMGW_RECEIVER);
+        let(status,headers,body)=account_request(&served,reqwest::Method::POST,"/api/non-3gpp/accounts",Some(serde_json::json!({"provider_id":"app_voice","config":config})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::CREATED);no_store(&headers);no_secrets(&body);let line=created_line(&body);let path=format!("/api/non-3gpp/accounts/{line}");
+        let(go,invite)=oneshot::channel();let(done,stop)=oneshot::channel();let(sms,sms_seen)=oneshot::channel();let observed=state.app.database.clone();let original_line=line.clone();
+        let sdk_task=tokio::spawn(async move{tokio::time::timeout(std::time::Duration::from_secs(20),async move{
+            sdk_peer.authenticate().await;sdk_peer.swap(Some(4),true).await;invite.await.unwrap();notice(&mut sdk_peer,CallNoticeKind::Invited,101,&sdp("127.0.0.1:5006".parse().unwrap()),b"fixture-domain").await;
+            let packet=next_non_poll(&mut sdk_peer).await;let reply=decode_reply(packet.payload.expose_to_transport()).unwrap();assert_eq!(reply.call_id,101);assert_eq!(reply.result_stream,encode_notice_result(CallNoticeKind::Invited,true,&[]).unwrap().expose_to_transport());
+            let(id,_)=operation(&mut sdk_peer,CallOperation::Inform).await;reply_operation(&mut sdk_peer,id,CallOperation::Inform,true,None).await;
+            let(id,_)=operation(&mut sdk_peer,CallOperation::Accept).await;reply_operation(&mut sdk_peer,id,CallOperation::Accept,true,Some(endpoint.as_bytes())).await;
+            sdk_peer.incoming_with_fields(201,SMGW_RECEIVER,b"fixture simultaneous SMS",Some(b"fixture-sender"),Some(b"1700000000123")).await;
+            let packet=next_non_poll(&mut sdk_peer).await;assert_eq!(decode_reply(packet.payload.expose_to_transport()).unwrap().call_id,201);
+            let rows=observed.get_sms_messages_for_channel(20,0,None,Some(&original_line)).unwrap();assert_eq!(rows.len(),1);assert_eq!(rows[0].transport,"app_voice");assert_eq!(rows[0].content,"fixture simultaneous SMS");sms.send(()).unwrap();
+            let(id,_)=operation(&mut sdk_peer,CallOperation::Release).await;reply_operation(&mut sdk_peer,id,CallOperation::Release,true,None).await;stop.await.unwrap();finish_sdk(sdk_peer).await;
+        }).await.unwrap()});
+        let down=rtp(33);let up=rtp(34);let native_down=down.clone();let native_up=up.clone();let server=media.server(&tokio_rustls::rustls::version::TLS13);let(passed,saw_audio)=oneshot::channel();
+        let media_task=tokio::spawn(async move{tokio::time::timeout(std::time::Duration::from_secs(20),async move{
+            let mut peer=MediaPeer::accept(listener,server).await;let packet=peer.next_rpc().await.unwrap().unwrap();let request=decode_request(packet.payload.expose_to_transport()).unwrap();assert_eq!(request.method,b"connect.Endpoint.Endpoint");
+            let mut reader=Reader::versioned(request.arguments).unwrap();assert_eq!(reader.bytes().unwrap(),b"fixture-original-content");let count=reader.u32().unwrap();for _ in 0..count{reader.bytes().unwrap();}assert!(!reader.properties().unwrap().iter().any(|property|property.key==b"Client.ArcPort"));reader.finish().unwrap();peer.reply(true).await;
+            let(packets,_)=tcp_mpath::encode_payload(0,32,1200,0,&native_down).unwrap();peer.send_raw(packets[0].expose_to_transport()).await;let raw=peer.next_raw().await.unwrap().unwrap();let mut decoder=tcp_mpath::Receiver::default();
+            let Some(Input::Payload{channel:0,payload,..})=decoder.on_packet(&raw,std::time::Instant::now()).unwrap()else{panic!("actual HTTP call uplink")};assert_eq!(payload.expose_to_transport(),native_up);passed.send(()).unwrap();peer.eof().await;
+        }).await.unwrap()});
+        let(status,headers,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/start"),Some(serde_json::json!({"expected_revision":1})),Some(&cookie)).await;assert_eq!(status,StatusCode::ACCEPTED);no_store(&headers);no_secrets(&body);
+        tokio::time::timeout(std::time::Duration::from_secs(4),async{loop{let(status,headers,body)=account_request(&served,reqwest::Method::GET,&path,None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);let json:serde_json::Value=serde_json::from_str(&body).unwrap();if json["data"]["incoming_call_ready"]==true&&json["data"]["incoming_message_ready"]==true{assert_eq!(json["data"]["outbound_authorized"],false);break;}tokio::task::yield_now().await;}}).await.unwrap();
+        go.send(()).unwrap();let call=tokio::time::timeout(std::time::Duration::from_secs(4),async{loop{let(status,headers,body)=account_request(&served,reqwest::Method::GET,&format!("{path}/calls"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);no_store(&headers);redacted_call(&body);let json:serde_json::Value=serde_json::from_str(&body).unwrap();if json["data"][0]["phase"]=="ringing"{return json["data"][0].clone();}tokio::task::yield_now().await;}}).await.unwrap();
+        let id=call["id"].as_str().unwrap();let history_id=call["history_id"].as_i64().unwrap();assert_eq!(call["media_active"],false);let offered=crate::connectivity::core::voice::parse_audio_sdp(call["sdp"].as_str().unwrap().as_bytes()).unwrap();let local:std::net::SocketAddr=format!("{}:{}",offered.connection_addr,offered.media_port).parse().unwrap();
+        let(status,headers,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/calls/{id}/answer"),Some(serde_json::json!({"expected_revision":1,"sdp":std::str::from_utf8(&sdp(audio_peer.local_addr().unwrap())).unwrap()})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK,"{body}");no_store(&headers);redacted_call(&body);let json:serde_json::Value=serde_json::from_str(&body).unwrap();assert_eq!(json["data"]["phase"],"connected");assert_eq!(json["data"]["media_active"],true);
+        let mut bytes=[0;4096];let(count,source)=tokio::time::timeout(std::time::Duration::from_secs(4),audio_peer.recv_from(&mut bytes)).await.unwrap().unwrap();assert_eq!(source,local);assert_eq!(&bytes[..count],down);audio_peer.send_to(&up,local).await.unwrap();tokio::time::timeout(std::time::Duration::from_secs(4),saw_audio).await.unwrap().unwrap();tokio::time::timeout(std::time::Duration::from_secs(4),sms_seen).await.unwrap().unwrap();
+        let(status,headers,body)=account_request(&served,reqwest::Method::GET,&format!("{path}/messages"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);no_store(&headers);let json:serde_json::Value=serde_json::from_str(&body).unwrap();assert_eq!(json["data"][0]["content"],"fixture simultaneous SMS");redacted_call(&body);
+        let(status,headers,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/outbound/calls"),Some(serde_json::json!({"expected_revision":1,"target":"fixture-paid-target"})),Some(&cookie)).await;assert_eq!(status,StatusCode::NOT_IMPLEMENTED);no_store(&headers);no_secrets(&body);
+        let(status,headers,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/calls/{id}/hangup"),Some(serde_json::json!({"expected_revision":1})),Some(&cookie)).await;assert_eq!(status,StatusCode::OK,"{body}");no_store(&headers);redacted_call(&body);assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["media_active"],false);
+        media_task.await.unwrap();let reused=UdpSocket::bind(local).await.unwrap();assert_eq!(reused.local_addr().unwrap(),local);let row=state.app.database.get_call_by_id(history_id).unwrap().unwrap();assert!(row.answered);assert!(row.end_time.is_some());assert_eq!(row.line_id.as_deref(),Some(line.as_str()));
+        done.send(()).unwrap();let(status,headers,body)=account_request(&served,reqwest::Method::POST,&format!("{path}/stop"),Some(serde_json::json!({"expected_revision":1})),Some(&cookie)).await;assert_eq!(status,StatusCode::OK,"{body}");no_store(&headers);no_secrets(&body);sdk_task.await.unwrap();assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(state.app.database.get_sms_messages_for_channel(20,0,None,Some(&line)).unwrap().len(),1);assert!(state.app.database.get_sms_messages_for_channel(20,0,Some("outgoing"),Some(&line)).unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn authenticated_start_and_stop_use_real_native_callbacks_and_original_join() {
         use crate::connectivity::app_voice::providers::jegotrip::{
             account_runtime::AccountManager, account_test_support::{peer, QueuedFactory},

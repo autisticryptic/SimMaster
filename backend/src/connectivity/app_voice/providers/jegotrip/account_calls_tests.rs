@@ -105,3 +105,7 @@ fn call_media_import_is_explicit_pure_secret_preserving_and_rejects_cellular_cos
     config.call_media.as_mut().unwrap().trunk.as_mut().unwrap().vowifi_only=false;config.call_media.as_mut().unwrap().trunk.as_mut().unwrap().allow_home_cellular_calls=true;assert!(config.validate(100).is_err());
     config.call_media.as_mut().unwrap().trunk=None;config.profile.call_control=None;assert!(config.validate(100).is_err());
 }
+#[path="account_calls_trunk_tests.rs"]
+mod trunk;
+#[path="account_calls_lifecycle_tests.rs"]
+mod lifecycle;

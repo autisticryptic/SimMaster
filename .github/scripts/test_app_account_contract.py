@@ -336,6 +336,13 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertLess(operation.index('ready.original(&call.ticket'),operation.index('history::connected'))
         self.assertIn('socket.for_peer(&call.ticket,&call.offer,&answer',operation)
         self.assertIn('call.ticket.same_call(ticket)',calls)
+        publication=calls.split('async fn publish_state',1)[1].split('async fn ring',1)[0]
+        self.assertIn('call.state.try_lock()',publication)
+        self.assertIn('from_millis(250)',publication)
+        self.assertIn('tokio::task::yield_now().await',publication)
+        self.assertNotIn('.revoke()',publication)
+        self.assertNotIn('.close()',publication)
+        self.assertIn('!call.ticket.remote_released()',calls)
         self.assertIn('self.expiry.is_some_and',calls)
         self.assertIn('account_runs::runtime_matches(conn,&self.run)',calls)
         self.assertIn('impl Drop for OperationWaiter',calls)

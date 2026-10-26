@@ -325,6 +325,11 @@ impl AccountManager {
         run.configuration_current()?; let calls = run.calls.as_ref().ok_or("app_account_call_runtime_unavailable")?;
         Ok(calls.trunk_status().await)
     }
+    #[cfg(test)]
+    pub(super) fn original_call_service(&self,line_id:&str)->Result<Arc<CallService>,&'static str>{
+        let slot=self.slot(line_id)?;let run=lock(&slot.run).clone().ok_or("app_account_call_runtime_unavailable")?;
+        run.configuration_current()?;run.calls.as_ref().cloned().ok_or("app_account_call_runtime_unavailable")
+    }
     pub(crate) async fn call_operator(&self, line_id: &str) -> Result<crate::services::trunk::operator::OperatorLink, &'static str> {
         let slot = self.slot(line_id)?; let run = lock(&slot.run).clone().ok_or("app_account_call_runtime_unavailable")?;
         run.configuration_current()?; Ok(run.calls.as_ref().ok_or("app_account_call_runtime_unavailable")?.operator())
