@@ -16918,16 +16918,20 @@ pub struct Non3gppProviderView {
     pub id: String,
     pub label: String,
     pub capabilities: Vec<String>,
+    pub implemented_operations: Vec<String>,
     pub availability: String,
 }
 
 pub async fn get_jegotrip_credential_contract_handler() -> (
     StatusCode,
+    [(axum::http::HeaderName, axum::http::HeaderValue); 1],
     Json<ApiResponse<crate::connectivity::app_voice::providers::jegotrip::credentials::CredentialContract>>,
 ) {
-    // Static metadata only. No SDK initialization, account credentials or network I/O.
+    // Static implementation metadata, not account readiness or authorization.
+    // No SDK initialization, account credentials or network I/O.
     (
         StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"))],
         Json(ApiResponse::success_with_message(
             "ok",
             crate::connectivity::app_voice::providers::jegotrip::credentials::contract(),
@@ -16936,9 +16940,10 @@ pub async fn get_jegotrip_credential_contract_handler() -> (
 }
 
 pub async fn get_non_3gpp_providers_handler(
-) -> (StatusCode, Json<ApiResponse<Vec<Non3gppProviderView>>>) {
+) -> (StatusCode, [(axum::http::HeaderName, axum::http::HeaderValue); 1], Json<ApiResponse<Vec<Non3gppProviderView>>>) {
     use crate::connectivity::app_voice::registry as non_3gpp_voice;
-    let installed = non_3gpp_voice::registry().descriptors();
+    let registry = non_3gpp_voice::registry();
+    let installed = registry.descriptors();
     let reserved = non_3gpp_voice::PLANNED_PROVIDERS
         .iter()
         .filter(|&&(id, _)| !installed.iter().any(|descriptor| descriptor.id == id))
@@ -16947,11 +16952,11 @@ pub async fn get_non_3gpp_providers_handler(
             label: label.to_string(),
             capabilities: crate::connectivity::app_voice::providers::reserved_capabilities(id)
                 .iter().map(|capability| format!("{capability:?}").to_lowercase()).collect(),
+            implemented_operations: Vec::new(),
             availability: "unsupported".to_string(),
         })
         .collect::<Vec<_>>();
-    let providers = non_3gpp_voice::registry()
-        .descriptors()
+    let providers = installed
         .into_iter()
         .map(|descriptor| Non3gppProviderView {
             id: descriptor.id.to_string(),
@@ -16961,9 +16966,14 @@ pub async fn get_non_3gpp_providers_handler(
                 .iter()
                 .map(|capability| format!("{capability:?}").to_lowercase())
                 .collect(),
+            implemented_operations: registry.implemented_operations(descriptor.id)
+                .iter().map(|operation| operation.as_str().to_owned()).collect(),
+            // No line was requested. Installation is not live readiness of
+            // every account/capability, and never permission for paid sends.
             availability: "unknown".to_string(),
         })
         .chain(reserved)
         .collect();
-    (StatusCode::OK, Json(ApiResponse::success_with_message("ok", providers)))
+    (StatusCode::OK, [(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"))],
+        Json(ApiResponse::success_with_message("ok", providers)))
 }

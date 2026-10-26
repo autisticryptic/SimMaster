@@ -32,11 +32,47 @@ mod app_voice_accounts {
     }
 
     #[tokio::test]
+    async fn credential_metadata_exposes_only_explicit_inbound_implementation_without_start_or_ready_grants() {
+        let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");
+        let served = serve(state.router.clone()).await; let cookie = authenticate(&served).await;
+        let (status, headers, body) = account_request(&served, reqwest::Method::GET,
+            "/api/non-3gpp/providers/app_voice/credential-contract", None, Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK); no_store(&headers);
+        assert!(!body.contains("fixture-") && !body.contains("private_config") && !body.contains("__magic"));
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap(); let contract = &json["data"];
+        assert_eq!(contract["transport_implemented"], true);
+        assert_eq!(contract["account_login_ui_required"], false); assert_eq!(contract["service_credentials_required"], true);
+        let basic = &contract["basic_hosting"];
+        assert_eq!(basic["account_line_kind"], "app_account"); assert_eq!(basic["access"], "application_data");
+        assert_eq!(basic["billing_account"], "jegotrip_account"); assert_eq!(basic["manual_start_required"], true);
+        assert_eq!(basic["explicit_profile_required"], true); assert_eq!(basic["plain_media_opt_in_required"], true);
+        assert_eq!(basic["default_sdk_client_implemented"], false);
+        assert_eq!(basic["outbound_call_implemented"], false); assert_eq!(basic["outbound_message_implemented"], false);
+        assert_eq!(basic["media_transport"], "endpoint_tcp_mpath");
+        assert_eq!(basic["media_profile"], "raw_rse_sdp_rtp_avp_rtcp_mux_passthrough");
+        assert_eq!(basic["implemented_operations"], serde_json::json!(["incoming_call", "answer_call", "hangup_call", "bidirectional_audio",
+            "incoming_message", "message_history", "message_notification", "incoming_trunk"]));
+        assert_eq!(contract["direct_sip_interoperability"], "unverified");
+        assert_eq!(contract["renewal"], "manual_reimport_until_renewal_verified");
+        let (status, headers, body) = account_request(&served, reqwest::Method::GET, "/api/non-3gpp/providers", None, Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK); no_store(&headers); no_secrets(&body);
+        let providers: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let rows = providers["data"].as_array().unwrap(); assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|row| row["availability"] == "unsupported" && row["implemented_operations"] == serde_json::json!([])));
+        // The HTTP fixture did not run main's explicit installation or create
+        // an account. Static implemented metadata cannot mint runtime proof.
+        assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+        assert!(crate::connectivity::app_voice::registry::registry().is_empty());
+    }
+
+    #[tokio::test]
     async fn all_management_and_start_stop_routes_are_behind_real_auth() {
         let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");
         let served = serve(state.router.clone()).await;
         let line = "app-account-0123456789abcdef0123456789abcdef";
         let cases = [
+            (reqwest::Method::GET, "/api/non-3gpp/providers".to_owned()),
+            (reqwest::Method::GET, "/api/non-3gpp/providers/app_voice/credential-contract".to_owned()),
             (reqwest::Method::GET, "/api/non-3gpp/accounts".to_owned()),
             (reqwest::Method::POST, "/api/non-3gpp/accounts".to_owned()),
             (reqwest::Method::GET, format!("/api/non-3gpp/accounts/{line}")),

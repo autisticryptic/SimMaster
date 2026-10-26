@@ -71,5 +71,18 @@ pub mod native_channel;
 pub const PROVIDER_ID: &str = "app_voice";
 pub const LABEL: &str = "无忧行 / 应用语音";
 
+/// Implemented operations, not current account readiness or a billing grant.
+/// Outbound interfaces deliberately do not appear in this list.
+pub(crate) const BASIC_INBOUND_OPERATIONS: &[crate::connectivity::app_voice::registry::ProviderOperation] = &[
+    crate::connectivity::app_voice::registry::ProviderOperation::IncomingCall,
+    crate::connectivity::app_voice::registry::ProviderOperation::AnswerCall,
+    crate::connectivity::app_voice::registry::ProviderOperation::HangupCall,
+    crate::connectivity::app_voice::registry::ProviderOperation::BidirectionalAudio,
+    crate::connectivity::app_voice::registry::ProviderOperation::IncomingMessage,
+    crate::connectivity::app_voice::registry::ProviderOperation::MessageHistory,
+    crate::connectivity::app_voice::registry::ProviderOperation::MessageNotification,
+    crate::connectivity::app_voice::registry::ProviderOperation::IncomingTrunk,
+];
+
 #[cfg(test)]
 mod tests;

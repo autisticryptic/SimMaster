@@ -6,6 +6,7 @@ use super::super::{account_runtime::AccountManager,account_test_support::{TempDa
     runtime_backend::tests::next_non_poll,tcp_mpath_audio::tests::Peer as MediaPeer,
     rpc_calls::encode_notice_result,rpc_envelope::{decode_reply,decode_request},rpc_stream::Reader,
     tcp_mpath::{self,Input as MpathInput},tls_engine::tests::Certificates,transport_packets::CallKind};
+use crate::connectivity::app_voice::registry::{ProviderAvailability, ProviderRegistry, VoiceCapability};
 use std::time::Duration;
 use tokio::{net::{TcpListener,UdpSocket},sync::oneshot};
 use tokio_rustls::rustls;
@@ -23,7 +24,7 @@ async fn positive(operator_commands:bool){
     let temp=TempDatabase::new();let factory=Arc::new(QueuedFactory::default());let sdk=Certificates::generate("DNS:fixture.invalid");let media=Certificates::generate("IP:127.0.0.1");
     let(listener,endpoint)={let listener=TcpListener::bind(("127.0.0.1",0)).await.unwrap();let endpoint=format!("#fixture-endpoint:tcp -h 127.0.0.1 -p {};",listener.local_addr().unwrap().port());(listener,endpoint)};
     let asterisk=UdpSocket::bind(("127.0.0.1",0)).await.unwrap();let answer=sdp(asterisk.local_addr().unwrap());let native=sdp("127.0.0.1:5006".parse().unwrap());
-    let(mut peer,_,dropped)=sdk_peer(&sdk,&factory);let manager=AccountManager::with_factory(temp.database.clone(),factory.clone());
+    let(mut peer,_,dropped)=sdk_peer(&sdk,&factory);let manager=Arc::new(AccountManager::with_factory(temp.database.clone(),factory.clone()));
     let account=manager.create(call_config(&sdk.root,&media.root),100).await.unwrap().account;let line=account.line_id;let revision=account.revision;
     let(go,invite)=oneshot::channel();let(done,stop)=oneshot::channel();let(answered,seen_answer)=oneshot::channel();
     let sdk_task=tokio::spawn(async move{bounded(async move{
@@ -41,7 +42,13 @@ async fn positive(operator_commands:bool){
         let raw=peer.next_raw().await.unwrap().unwrap();let mut receiver=tcp_mpath::Receiver::default();let Some(MpathInput::Payload{channel:0,payload,..})=receiver.on_packet(&raw,Instant::now()).unwrap()else{panic!("original native audio")};
         assert_eq!(payload.expose_to_transport(),up_peer);sent.send(()).unwrap();peer.eof().await;
     }).await});
-    bounded(manager.start(&line,revision,100)).await.unwrap();ready(&manager,&line).await;let link=manager.call_operator(&line).await.unwrap();let mut events=link.subscribe_events();
+    bounded(manager.start(&line,revision,100)).await.unwrap();ready(&manager,&line).await;
+    let registry=ProviderRegistry::new();registry.install(Box::new(super::super::message_provider::MessagingProvider::for_accounts(&manager))).unwrap();
+    assert_eq!(registry.capability_availability(super::super::PROVIDER_ID,&line,VoiceCapability::Voice),ProviderAvailability::Available);
+    assert_eq!(registry.capability_availability(super::super::PROVIDER_ID,&line,VoiceCapability::Messaging),ProviderAvailability::Unsupported);
+    assert_eq!(registry.capability_availability(super::super::PROVIDER_ID,&line,VoiceCapability::Conference),ProviderAvailability::Unsupported);
+    assert_eq!(registry.implemented_operations(super::super::PROVIDER_ID).as_slice(),super::super::BASIC_INBOUND_OPERATIONS);
+    let link=manager.call_operator(&line).await.unwrap();let mut events=link.subscribe_events();
     assert!(!manager.get(&line,100).await.unwrap().outbound_authorized);go.send(()).unwrap();let call=first_call(&manager,&line).await;
     assert_eq!(call.peer,"fixture-caller");assert!(!call.media_active);assert!(!temp.database.get_call_by_id(call.history_id).unwrap().unwrap().answered);
     let offered=PlainAudioOffer::trunk(call.sdp.as_ref().unwrap().as_bytes(),true).unwrap().endpoint().unwrap();

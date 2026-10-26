@@ -185,7 +185,7 @@ impl CallService {
             let _=sender.send(result.map(|_|original.view()));
         }).await;
         if !admitted{return Err(SCOPE);}
-        Ok(OperationWaiter{call,receiver,delivered:false})
+        Ok(OperationWaiter{call,service:Arc::downgrade(self),receiver,delivered:false})
     }
     async fn accept_original(self:&Arc<Self>,call:&Arc<Call>,answer:PlainAudioOffer)->Result<(),&'static str>{
         if !self.active(call){return Err(SCOPE);}let socket={let mut state=lock(&call.state);
@@ -213,7 +213,7 @@ impl CallService {
         call.retire();
         let(sender,receiver)=oneshot::channel();let service=self.clone();let original=call.clone();let admitted=self.spawn_task(async move{
             let _guard=original.operation.lock().await;let result=service.finish(&original,true).await.map(|_|original.view());let _=sender.send(result);
-        }).await;if !admitted{return Err(SCOPE);}Ok(OperationWaiter{call,receiver,delivered:false})
+        }).await;if !admitted{return Err(SCOPE);}Ok(OperationWaiter{call,service:Arc::downgrade(self),receiver,delivered:false})
     }
     async fn finish(&self,call:&Call,release:bool)->Result<(),&'static str>{
         let(media,answered,duration)={let mut state=lock(&call.state);if state.phase==Phase::Ended{return Ok(());}
@@ -250,12 +250,37 @@ impl CallService {
     pub(super) fn resources_released(&self)->bool{self.quiescent.load(Ordering::SeqCst)}
 }
 impl Drop for CallService{fn drop(&mut self){self.retire();}}
-pub(super) struct OperationWaiter{call:Arc<Call>,receiver:oneshot::Receiver<Result<CallView,&'static str>>,delivered:bool}
-impl Future for OperationWaiter{type Output=Result<CallView,&'static str>;fn poll(self:Pin<&mut Self>,cx:&mut std::task::Context<'_>)->Poll<Self::Output>{
-    let this=self.get_mut();match Pin::new(&mut this.receiver).poll(cx){Poll::Pending=>Poll::Pending,Poll::Ready(result)=>{
-        this.delivered=true;let result=result.unwrap_or(Err(SCOPE));if result.is_err(){this.call.retire();}
-        if result.as_ref().is_ok_and(|view|view.phase=="connected")&&!this.call.ticket.is_live(){Poll::Ready(Err(SCOPE))}else{Poll::Ready(result)}}}
-}}
+/// A queued connected result is not a transferable or cached readiness grant.
+/// Recheck its original service and physical media when the caller consumes it;
+/// a confirmed Ended receipt remains deliverable after resource retirement.
+pub(super) struct OperationWaiter {
+    call: Arc<Call>, service: Weak<CallService>,
+    receiver: oneshot::Receiver<Result<CallView, &'static str>>, delivered: bool,
+}
+impl Future for OperationWaiter {
+    type Output = Result<CallView, &'static str>;
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let result = match Pin::new(&mut this.receiver).poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(result) => result.unwrap_or(Err(SCOPE)),
+        };
+        this.delivered = true;
+        if result.is_err() { this.call.retire(); }
+        if result.as_ref().is_ok_and(|view| view.phase == "connected") {
+            let current = this.service.upgrade().is_some_and(|service| service.active(&this.call));
+            let media_open = {
+                let state = lock(&this.call.state);
+                state.phase == Phase::Connected && state.media.as_ref().is_some_and(|media| media.scope().is_open())
+            };
+            if !current || !media_open {
+                this.call.retire();
+                return Poll::Ready(Err(SCOPE));
+            }
+        }
+        Poll::Ready(result)
+    }
+}
 impl Drop for OperationWaiter{fn drop(&mut self){if !self.delivered{self.call.retire();}}}
 async fn command_loop(service:Weak<CallService>,mut commands:broadcast::Receiver<OperatorCommand>){loop{
     let Some(current)=service.upgrade()else{return;};

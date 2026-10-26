@@ -116,6 +116,10 @@ fn construction_and_descriptor_only_advertise_implemented_basic_receive_capabili
     let provider = MessagingProvider::for_accounts(&accounts);
     assert_eq!(provider.descriptor().id, PROVIDER_ID);
     assert_eq!(provider.descriptor().capabilities, vec![VoiceCapability::Voice, VoiceCapability::Messaging]);
+    assert_eq!(provider.implemented_operations(), super::super::BASIC_INBOUND_OPERATIONS);
+    assert_eq!(provider.capability_availability("modem-fixture", VoiceCapability::Voice), ProviderAvailability::Unsupported);
+    assert_eq!(provider.capability_availability("modem-fixture", VoiceCapability::Messaging), ProviderAvailability::Unsupported);
+    assert_eq!(provider.capability_availability("app-account-0123456789abcdef0123456789abcdef", VoiceCapability::Video), ProviderAvailability::Unsupported);
     assert_eq!(provider.availability("modem-fixture"), ProviderAvailability::Unsupported);
     assert_eq!(provider.availability("wlan-fixture"), ProviderAvailability::Unsupported);
     assert_eq!(format!("{provider:?}"), "MessagingProvider(<redacted>)");
@@ -133,6 +137,10 @@ async fn exact_native_smgw_hosting_and_live_durable_consumer_publish_only_sms_re
     assert_eq!(running.provider.availability(&running.line), ProviderAvailability::Available);
     let registry = ProviderRegistry::new(); registry.install(Box::new(MessagingProvider::for_accounts(&running.accounts))).unwrap();
     assert_eq!(registry.availability(PROVIDER_ID, &running.line), ProviderAvailability::Available);
+    assert_eq!(registry.capability_availability(PROVIDER_ID, &running.line, VoiceCapability::Messaging), ProviderAvailability::Available);
+    assert_eq!(registry.capability_availability(PROVIDER_ID, &running.line, VoiceCapability::Voice), ProviderAvailability::Unsupported);
+    assert_eq!(registry.capability_availability(PROVIDER_ID, &running.line, VoiceCapability::Video), ProviderAvailability::Unsupported);
+    assert_eq!(registry.implemented_operations(PROVIDER_ID), super::super::BASIC_INBOUND_OPERATIONS);
     assert_eq!(registry.availability("google_voice", &running.line), ProviderAvailability::Unsupported);
     assert_eq!(registry.availability(PROVIDER_ID, "modem-fixture"), ProviderAvailability::Unsupported);
     running.stop(Stop::Normal).await;
@@ -154,6 +162,8 @@ async fn another_manager_cannot_restore_readiness_from_same_database_live_run_or
     let other_provider = MessagingProvider::for_accounts(&other);
     assert_eq!(running.provider.availability(&running.line), ProviderAvailability::Available);
     assert_eq!(other_provider.availability(&running.line), ProviderAvailability::NotConfigured);
+    assert_eq!(other_provider.capability_availability(&running.line, VoiceCapability::Messaging), ProviderAvailability::NotConfigured);
+    assert_eq!(other_provider.capability_availability(&running.line, VoiceCapability::Voice), ProviderAvailability::NotConfigured);
     let other_view = other.get(&running.line, 100).await.unwrap();
     assert!(!other_view.incoming_message_ready); assert_eq!(other_view.last_error, Some("app_account_runtime_owner_unconfirmed"));
     assert_eq!(other.start(&running.line, 1, 100).await.err(), Some("app_account_stop_before_replace"));

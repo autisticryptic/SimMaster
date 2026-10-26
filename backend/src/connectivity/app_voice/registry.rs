@@ -1,8 +1,9 @@
-//! Reserved interface for non-3GPP, application-based voice/messaging.
+//! Contracts and explicit installation for application-based voice/messaging.
 //!
-//! This registry defines *contracts only*: no usable provider is registered by
-//! default. An explicit account/backend driver does not install a descriptor or
-//! prove that the provider's voice, messaging or media channels are ready.
+//! The registry itself starts empty; main explicitly installs implemented
+//! integrations. Descriptors/operations describe software, not a live account
+//! grant. Aggregate availability does not imply readiness of every capability.
+//! Query the requested capability separately before interpreting its readiness.
 //!
 //! A provider must:
 //! - own an independent no-modem app-account line over ordinary application
@@ -24,6 +25,30 @@ pub enum VoiceCapability {
     Conference,
 }
 
+/// Implemented operation metadata. Listing an operation is never permission
+/// to execute it or evidence that any particular account is currently ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderOperation {
+    IncomingCall,
+    AnswerCall,
+    HangupCall,
+    BidirectionalAudio,
+    IncomingMessage,
+    MessageHistory,
+    MessageNotification,
+    IncomingTrunk,
+}
+impl ProviderOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IncomingCall => "incoming_call", Self::AnswerCall => "answer_call",
+            Self::HangupCall => "hangup_call", Self::BidirectionalAudio => "bidirectional_audio",
+            Self::IncomingMessage => "incoming_message", Self::MessageHistory => "message_history",
+            Self::MessageNotification => "message_notification", Self::IncomingTrunk => "incoming_trunk",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderDescriptor {
     /// Stable identifier, e.g. `"app-voice"`.
@@ -38,9 +63,20 @@ pub struct ProviderDescriptor {
 pub trait Non3gppVoiceProvider: Send + Sync {
     fn descriptor(&self) -> &ProviderDescriptor;
 
-    /// Whether this provider can currently be used on the given line. A
-    /// provider must not report availability based on a cached "last success".
+    /// Aggregate observation: at least one implemented capability is ready.
+    /// This does not authorize an action or imply that Voice and Messaging are
+    /// interchangeable. Cached last-success observations are never sufficient.
     fn availability(&self, line_id: &str) -> ProviderAvailability;
+
+    /// Only an implementation's current original-owner proof may return
+    /// Available for a particular capability. Legacy implementations without
+    /// that proof remain Unknown, even if aggregate availability is Available.
+    fn capability_availability(&self, _line_id: &str, capability: VoiceCapability) -> ProviderAvailability {
+        if self.descriptor().capabilities.contains(&capability) { ProviderAvailability::Unknown }
+        else { ProviderAvailability::Unsupported }
+    }
+
+    fn implemented_operations(&self) -> &'static [ProviderOperation] { &[] }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +142,19 @@ impl ProviderRegistry {
     pub fn availability(&self, provider_id: &str, line_id: &str) -> ProviderAvailability {
         let Ok(providers) = self.providers.read() else { return ProviderAvailability::Unknown; };
         providers.get(provider_id).map_or(ProviderAvailability::Unsupported, |provider| provider.availability(line_id))
+    }
+
+    pub fn capability_availability(&self, provider_id: &str, line_id: &str, capability: VoiceCapability) -> ProviderAvailability {
+        let Ok(providers) = self.providers.read() else { return ProviderAvailability::Unknown; };
+        providers.get(provider_id).map_or(ProviderAvailability::Unsupported, |provider| {
+            if provider.descriptor().capabilities.contains(&capability) { provider.capability_availability(line_id, capability) }
+            else { ProviderAvailability::Unsupported }
+        })
+    }
+
+    pub fn implemented_operations(&self, provider_id: &str) -> Vec<ProviderOperation> {
+        self.providers.read().ok().and_then(|providers| providers.get(provider_id)
+            .map(|provider| provider.implemented_operations().to_vec())).unwrap_or_default()
     }
 
     pub fn descriptors(&self) -> Vec<ProviderDescriptor> {
@@ -177,6 +226,25 @@ mod tests {
     #[test]
     fn unknown_provider_has_no_invented_capabilities() {
         assert!(super::super::providers::reserved_capabilities("not-installed").is_empty());
+    }
+
+    #[test]
+    fn aggregate_availability_cannot_invent_capability_proof_or_implemented_operations() {
+        struct AggregateOnly(ProviderDescriptor);
+        impl Non3gppVoiceProvider for AggregateOnly {
+            fn descriptor(&self) -> &ProviderDescriptor { &self.0 }
+            fn availability(&self, _: &str) -> ProviderAvailability { ProviderAvailability::Available }
+        }
+        let registry = ProviderRegistry::new();
+        registry.install(Box::new(AggregateOnly(descriptor()))).unwrap();
+        assert_eq!(registry.availability("app-voice", "app-account-fixture"), ProviderAvailability::Available);
+        for capability in [VoiceCapability::Voice, VoiceCapability::Messaging] {
+            assert_eq!(registry.capability_availability("app-voice", "app-account-fixture", capability), ProviderAvailability::Unknown);
+        }
+        assert_eq!(registry.capability_availability("app-voice", "app-account-fixture", VoiceCapability::Video), ProviderAvailability::Unsupported);
+        assert_eq!(registry.capability_availability("not-installed", "app-account-fixture", VoiceCapability::Voice), ProviderAvailability::Unsupported);
+        assert!(registry.implemented_operations("app-voice").is_empty());
+        assert!(registry.implemented_operations("not-installed").is_empty());
     }
 
     #[test]

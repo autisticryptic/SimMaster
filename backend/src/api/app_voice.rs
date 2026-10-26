@@ -1,6 +1,7 @@
 //! Authenticated, redacted application-account management, separate from SIM APIs.
-//! No credential export, caller-supplied callbacks, SMS/media commands or cached
-//! readiness restoration. Native start is explicit and revision-bound.
+//! No credential export, caller-supplied callbacks or cached readiness restore.
+//! Incoming-call SDP/actions are bounded and original-owned; reserved outbound
+//! endpoints cannot authorize SDK/SIM/IMS/CS sends. Native start is explicit.
 use axum::{
     extract::{rejection::{JsonRejection, QueryRejection}, DefaultBodyLimit, Path, Query, State},
     http::{header, StatusCode},

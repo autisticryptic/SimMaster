@@ -380,5 +380,43 @@ class AppAccountContractTests(unittest.TestCase):
             self.assertIn(path,api)
 
 
+    def test_specific_capability_availability_cannot_be_inherited_from_aggregate_sms_or_voice(self):
+        registry = source('backend/src/connectivity/app_voice/registry.rs')
+        self.assertIn('fn capability_availability', registry)
+        self.assertIn('ProviderAvailability::Unknown', registry)
+        self.assertIn('fn implemented_operations', registry)
+        provider = (PROVIDER / 'message_provider.rs').read_text(encoding='utf-8')
+        self.assertIn('VoiceCapability::Voice => accounts.call_availability(line_id)', provider)
+        self.assertIn('VoiceCapability::Messaging => accounts.messaging_availability(line_id)', provider)
+        self.assertIn('super::BASIC_INBOUND_OPERATIONS', provider)
+        runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
+        call = runtime.split('fn call_availability', 1)[1].split('fn inbound_availability', 1)[0]
+        self.assertIn('metadata.revision != run.revision || run.configuration_current().is_err()', call)
+        self.assertIn('run.call_ready(unix_now())', call)
+        handlers = source('backend/src/api/handlers.rs')
+        metadata = handlers.split('pub async fn get_jegotrip_credential_contract_handler()', 1)[1]
+        self.assertIn('HeaderValue::from_static("no-store")', metadata)
+        self.assertIn('implemented_operations: Vec::new()', metadata)
+        self.assertIn('availability: "unknown".to_string()', metadata)
+
+    def test_connected_waiter_rechecks_original_service_and_physical_media_at_actual_delivery(self):
+        calls = (PROVIDER / 'account_calls.rs').read_text(encoding='utf-8')
+        waiter = calls.split('impl Future for OperationWaiter', 1)[1].split('impl Drop for OperationWaiter', 1)[0]
+        self.assertIn('this.service.upgrade()', waiter)
+        self.assertIn('service.active(&this.call)', waiter)
+        self.assertIn('state.phase == Phase::Connected', waiter)
+        self.assertIn('media.scope().is_open()', waiter)
+        self.assertIn('if !current || !media_open', waiter)
+        self.assertIn('this.call.retire()', waiter)
+        lifecycle = (PROVIDER / 'account_calls_lifecycle_tests.rs').read_text(encoding='utf-8')
+        for regression in ['queued_connected_result_rechecks_permission_before_delivery',
+                           'queued_connected_result_rechecks_original_revision_without_rebinding',
+                           'queued_connected_result_rejects_closed_physical_media']:
+            self.assertIn(regression, lifecycle)
+        self.assertIn('let operation_guard = bounded(call.operation.lock()).await', lifecycle)
+        self.assertIn('peer.reply(true).await; peer.eof().await', lifecycle)
+        self.assertIn('account_runs::ownership_pending', lifecycle)
+
+
 if __name__ == '__main__':
     unittest.main()

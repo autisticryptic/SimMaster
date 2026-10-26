@@ -69,3 +69,97 @@ async fn original_call_api_rejects_other_manager_and_revision_then_expiry_retire
     let result=bounded(manager.stop(&account.line_id,account.revision,expiry)).await;assert!(matches!(result,Ok(_)|Err("app_account_lifecycle_invalid")|Err("app_account_disconnected")));bounded(sdk_task).await.unwrap();assert!(dropped.load(Ordering::SeqCst));
     assert!(!temp.database.get_call_by_id(call.history_id).unwrap().unwrap().answered);assert!(!temp.database.with_conn(|conn|account_runs::ownership_pending(conn,&account.line_id)).unwrap());let reused=UdpSocket::bind(address).await.unwrap();assert_eq!(reused.local_addr().unwrap(),address);
 }
+
+#[derive(Clone, Copy)]
+enum FinalDeliveryChange { Permission, Revision, PhysicalMedia }
+
+/// The real original SDK/Endpoint exchange has already queued Connected, but
+/// its caller has not consumed that result. Keep the operation lock so the
+/// watch cannot revoke the ticket first and accidentally hide the delivery gap.
+async fn queued_connected_delivery(change: FinalDeliveryChange) {
+    let revision_changed = matches!(change, FinalDeliveryChange::Revision);
+    let temp = TempDatabase::new(); let factory = Arc::new(QueuedFactory::default());
+    let sdk = Certificates::generate("DNS:fixture.invalid"); let media = Certificates::generate("IP:127.0.0.1");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let endpoint = format!("#fixture-endpoint:tcp -h 127.0.0.1 -p {};", listener.local_addr().unwrap().port());
+    let (mut peer, _, dropped) = sdk_peer(&sdk, &factory);
+    let manager = AccountManager::with_factory(temp.database.clone(), factory.clone());
+    let account = manager.create(call_config(&sdk.root, &media.root), 100).await.unwrap().account;
+    let (go, invited) = oneshot::channel(); let (done, stopped) = oneshot::channel();
+    let sdk_task = tokio::spawn(async move { bounded(async move {
+        peer.authenticate().await; peer.swap(Some(4), true).await; invited.await.unwrap();
+        notice(&mut peer, CallNoticeKind::Invited, 101, &sdp("127.0.0.1:5006".parse().unwrap()), b"fixture-domain").await;
+        receipt(&mut peer, 101, true).await;
+        let (id, _) = operation(&mut peer, CallOperation::Inform).await;
+        reply_operation(&mut peer, id, CallOperation::Inform, true, None).await;
+        let (id, _) = operation(&mut peer, CallOperation::Accept).await;
+        reply_operation(&mut peer, id, CallOperation::Accept, true, Some(endpoint.as_bytes())).await;
+        if revision_changed {
+            // A concurrent database revision change retires the original SDK
+            // scope. Its already-admitted bytes can precede EOF; do not invent
+            // a positive remote release or force another session to clean it.
+            peer.drain_until_eof().await;
+        } else {
+            let (id, _) = operation(&mut peer, CallOperation::Release).await;
+            reply_operation(&mut peer, id, CallOperation::Release, true, None).await;
+            stopped.await.unwrap(); finish_sdk(peer).await;
+        }
+    }).await });
+    let server = media.server(&rustls::version::TLS13);
+    let media_task = tokio::spawn(async move { bounded(async move {
+        let mut peer = MediaPeer::accept(listener, server).await;
+        original_endpoint(peer.next_rpc().await.unwrap().unwrap().payload.expose_to_transport());
+        peer.reply(true).await; peer.eof().await;
+    }).await });
+    bounded(manager.start(&account.line_id, account.revision, 100)).await.unwrap();
+    ready(&manager, &account.line_id).await; go.send(()).unwrap();
+    let view = first_call(&manager, &account.line_id).await;
+    let service = manager.original_call_service(&account.line_id).unwrap(); let call = service.find(&view.id).unwrap();
+    let offered = PlainAudioOffer::trunk(view.sdp.as_ref().unwrap().as_bytes(), true).unwrap().endpoint().unwrap();
+    let asterisk = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+    let waiter = service.accept(&view.id, sdp(asterisk.local_addr().unwrap())).await.unwrap();
+    assert!(phase(&manager, &account.line_id, &view.id, "connected").await.media_active);
+    let operation_guard = bounded(call.operation.lock()).await;
+    // The guarded accept task sends its result before releasing this lock.
+    // Thus no timeout/sleep or synthetic connected result is used here.
+    assert!(call.ticket.is_live()); assert!(call.ticket.connection_scope().is_open());
+    match change {
+        FinalDeliveryChange::Permission => service.operator().set_incoming_call_allowed(false),
+        FinalDeliveryChange::Revision => {
+            temp.database.with_conn(|conn| conn.execute("UPDATE app_voice_accounts SET revision=2 WHERE line_id=?1", [&account.line_id])
+                .map_err(|_| "test_revision_injection_failed")).unwrap();
+        }
+        FinalDeliveryChange::PhysicalMedia => lock(&call.state).media.as_ref().unwrap().retire(),
+    }
+    assert!(call.ticket.is_live(), "the stale ticket alone still permits the old positive result");
+    assert_eq!(bounded(waiter).await.err(), Some(SCOPE));
+    assert!(!call.ticket.is_live()); drop(operation_guard);
+    bounded(async { loop {
+        if lock(&call.state).phase == Phase::Ended { break; }
+        tokio::task::yield_now().await;
+    }}).await;
+    bounded(media_task).await.unwrap(); let rebound = UdpSocket::bind(offered).await.unwrap();
+    assert_eq!(rebound.local_addr().unwrap(), offered);
+    let row = temp.database.get_call_by_id(view.history_id).unwrap().unwrap();
+    assert!(row.answered && row.end_time.is_some()); assert_eq!(row.line_id.as_deref(), Some(account.line_id.as_str()));
+    if !revision_changed { done.send(()).unwrap(); }
+    let revision = if revision_changed { 2 } else { account.revision };
+    let result = bounded(manager.stop(&account.line_id, revision, 100)).await;
+    assert!(matches!(result, Ok(_) | Err("app_account_disconnected")), "original stop verdict: {result:?}");
+    bounded(sdk_task).await.unwrap(); assert!(dropped.load(Ordering::SeqCst));
+    assert!(service.resources_released()); assert_eq!(factory.build_count(), 1);
+    assert!(!temp.database.with_conn(|conn| account_runs::ownership_pending(conn, &account.line_id)).unwrap());
+}
+
+#[tokio::test]
+async fn queued_connected_result_rechecks_permission_before_delivery_and_joins_original_media() {
+    queued_connected_delivery(FinalDeliveryChange::Permission).await;
+}
+#[tokio::test]
+async fn queued_connected_result_rechecks_original_revision_without_rebinding_or_cached_success() {
+    queued_connected_delivery(FinalDeliveryChange::Revision).await;
+}
+#[tokio::test]
+async fn queued_connected_result_rejects_closed_physical_media_even_while_original_ticket_is_live() {
+    queued_connected_delivery(FinalDeliveryChange::PhysicalMedia).await;
+}

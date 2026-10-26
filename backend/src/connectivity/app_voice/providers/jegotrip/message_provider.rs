@@ -3,7 +3,7 @@
 //! grant or permission to send a paid message/place an outbound call. Voice
 //! requires its explicitly configured original media/call supervisor.
 use super::{account_runtime::AccountManager, LABEL, PROVIDER_ID};
-use crate::connectivity::app_voice::registry::{Non3gppVoiceProvider, ProviderAvailability, ProviderDescriptor, VoiceCapability};
+use crate::connectivity::app_voice::registry::{Non3gppVoiceProvider, ProviderAvailability, ProviderDescriptor, ProviderOperation, VoiceCapability};
 use std::{fmt, sync::{Arc, Weak}};
 
 pub(crate) struct MessagingProvider {
@@ -26,6 +26,15 @@ impl Non3gppVoiceProvider for MessagingProvider {
     fn availability(&self, line_id: &str) -> ProviderAvailability {
         self.accounts.upgrade().map_or(ProviderAvailability::NotConfigured, |accounts| accounts.inbound_availability(line_id))
     }
+    fn capability_availability(&self, line_id: &str, capability: VoiceCapability) -> ProviderAvailability {
+        if !matches!(capability, VoiceCapability::Voice | VoiceCapability::Messaging) { return ProviderAvailability::Unsupported; }
+        self.accounts.upgrade().map_or(ProviderAvailability::NotConfigured, |accounts| match capability {
+            VoiceCapability::Voice => accounts.call_availability(line_id),
+            VoiceCapability::Messaging => accounts.messaging_availability(line_id),
+            _ => ProviderAvailability::Unsupported,
+        })
+    }
+    fn implemented_operations(&self) -> &'static [ProviderOperation] { super::BASIC_INBOUND_OPERATIONS }
 }
 #[cfg(test)]
 #[path = "message_provider_tests.rs"]

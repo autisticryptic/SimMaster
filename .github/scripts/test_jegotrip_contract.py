@@ -1,4 +1,4 @@
-"""Offline credential contract only; no fictitious service transport."""
+"""Static original-owner and explicit inbound contract; never a live-service probe."""
 from pathlib import Path
 import unittest
 
@@ -17,11 +17,17 @@ class JegotripContract(unittest.TestCase):
         for key in ['AuthnamePrefix', 'ChannelId', 'DeleteIntCode', 'SipNumber', 'SipPwd']:
             self.assertIn(f'serde(rename = "{key}")', source)
 
-    def test_contract_is_not_a_login_or_transport_implementation(self):
+    def test_contract_describes_explicit_inbound_implementation_not_login_ready_or_paid_grants(self):
         source = (MOD / 'credentials.rs').read_text(encoding='utf-8')
         self.assertIn('account_login_ui_required: false', source)
         self.assertIn('service_credentials_required: true', source)
-        self.assertIn('transport_implemented: false', source)
+        self.assertIn('transport_implemented: true', source)
+        self.assertIn('explicit_profile_required: true', source)
+        self.assertIn('manual_start_required: true', source)
+        self.assertIn('default_sdk_client_implemented: false', source)
+        self.assertIn('outbound_call_implemented: false, outbound_message_implemented: false', source)
+        self.assertIn('billing_account: "jegotrip_account"', source)
+        self.assertIn('media_profile: "raw_rse_sdp_rtp_avp_rtcp_mux_passthrough"', source)
         self.assertIn('direct_sip_interoperability: "unverified"', source)
         self.assertNotIn('derive(Clone, Debug, Serialize)', source)
         self.assertIn('f.write_str("<redacted>")', source)

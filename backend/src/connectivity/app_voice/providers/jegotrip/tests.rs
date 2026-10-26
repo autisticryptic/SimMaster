@@ -189,9 +189,28 @@ fn debug_and_contract_never_expose_imported_credentials() {
     }
     let public = serde_json::to_string(&contract()).unwrap();
     assert!(!public.contains("fixture-"));
-    assert!(public.contains("\"transport_implemented\":false"));
+    assert!(public.contains("\"transport_implemented\":true"));
     assert!(public.contains("\"account_login_ui_required\":false"));
     assert!(public.contains("\"service_credentials_required\":true"));
+}
+
+#[test]
+fn public_contract_limits_implementation_to_explicit_original_inbound_hosting() {
+    let contract = contract(); let basic = &contract.basic_hosting;
+    assert!(contract.transport_implemented);
+    assert_eq!(contract.direct_sip_interoperability, "unverified");
+    assert_eq!(contract.renewal, "manual_reimport_until_renewal_verified");
+    assert_eq!(basic.account_line_kind, "app_account");
+    assert_eq!(basic.access, "application_data");
+    assert_eq!(basic.billing_account, "jegotrip_account");
+    assert!(basic.explicit_profile_required && basic.manual_start_required && basic.plain_media_opt_in_required);
+    assert!(!basic.default_sdk_client_implemented && !basic.outbound_call_implemented && !basic.outbound_message_implemented);
+    assert_eq!(basic.media_transport, "endpoint_tcp_mpath");
+    assert_eq!(basic.media_profile, "raw_rse_sdp_rtp_avp_rtcp_mux_passthrough");
+    assert_eq!(basic.implemented_operations, vec!["incoming_call", "answer_call", "hangup_call", "bidirectional_audio",
+        "incoming_message", "message_history", "message_notification", "incoming_trunk"]);
+    assert!(contract.required_parameters.iter().any(|parameter| parameter.field == "config.profile"));
+    assert!(contract.required_parameters.iter().any(|parameter| parameter.field == "config.call_media (optional)"));
 }
 
 #[test]

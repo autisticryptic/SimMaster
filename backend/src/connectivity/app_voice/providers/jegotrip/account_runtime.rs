@@ -279,15 +279,28 @@ impl AccountManager {
         if !run.sms_supported { return Availability::Unsupported; }
         if run.message_ready(unix_now()) { Availability::Available } else { Availability::NotConfigured }
     }
+    pub(crate) fn call_availability(&self, line_id: &str) -> crate::connectivity::app_voice::registry::ProviderAvailability {
+        use crate::connectivity::app_voice::registry::ProviderAvailability as Availability;
+        if !account_store::valid_line_id(line_id) { return Availability::Unsupported; }
+        let metadata = match self.metadata(line_id) {
+            Ok(metadata) => metadata, Err("app_account_not_found") => return Availability::NotConfigured,
+            Err(_) => return Availability::Unknown,
+        };
+        let run = lock(&self.slots).get(line_id).and_then(|slot| lock(&slot.run).clone());
+        let Some(run) = run else { return Availability::NotConfigured; };
+        if metadata.revision != run.revision || run.configuration_current().is_err() { return Availability::Unknown; }
+        if run.calls.is_none() { return Availability::Unsupported; }
+        if run.call_ready(unix_now()) { Availability::Available } else { Availability::NotConfigured }
+    }
+    /// Aggregate observation only; callers needing Voice or Messaging must use
+    /// the corresponding capability's current original-owner proof separately.
     pub(crate) fn inbound_availability(&self, line_id: &str) -> crate::connectivity::app_voice::registry::ProviderAvailability {
         use crate::connectivity::app_voice::registry::ProviderAvailability as Availability;
-        let messaging = self.messaging_availability(line_id);
-        if messaging == Availability::Available { return messaging; }
-        if !account_store::valid_line_id(line_id) { return Availability::Unsupported; }
-        let run = lock(&self.slots).get(line_id).and_then(|slot| lock(&slot.run).clone());
-        let Some(run) = run else { return messaging; };
-        if !run.accepting.load(Ordering::SeqCst) || run.configuration_current().is_err() { return messaging; }
-        if run.call_ready(unix_now()) { Availability::Available } else { messaging }
+        let capabilities = [self.messaging_availability(line_id), self.call_availability(line_id)];
+        if capabilities.contains(&Availability::Available) { Availability::Available }
+        else if capabilities.contains(&Availability::Unknown) { Availability::Unknown }
+        else if capabilities.contains(&Availability::NotConfigured) { Availability::NotConfigured }
+        else { Availability::Unsupported }
     }
     pub fn reserve_outbound(&self, line_id: &str, revision: u64) -> Result<(), &'static str> {
         self.check_revision(line_id, revision)?;

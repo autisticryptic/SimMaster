@@ -28,8 +28,9 @@ pub struct SdkCredentials {
     pub server_address: Secret,
     /// Preserve the configured device identity; do not invent a new one.
     pub device_id: Option<Secret>,
-    /// Originally selected Mtc_CliApplySessId input, not an auth token. Absent
-    /// values remain absent; only a future native/wire backend needs this stage.
+    /// Originally selected Mtc_CliApplySessId input, not an auth token. The
+    /// credential import stays backward-compatible; explicit native runtime
+    /// validation requires this selector and never invents a default.
     pub selected_session_id: Option<Secret>,
     pub root_der_base64: Secret,
     /// Legacy configuration unwrap only. Client-property and reference keys
@@ -101,17 +102,35 @@ impl ImportedCredentials {
     }
 }
 
-/// Static contract, not a claim that the transport can connect yet.
+/// Static implementation contract, never current account readiness or consent.
 #[derive(Debug, Serialize)]
 pub struct CredentialContract {
     pub provider_id: &'static str,
     pub account_login_ui_required: bool,
     pub service_credentials_required: bool,
     pub transport_implemented: bool,
+    pub basic_hosting: BasicHostingContract,
     pub direct_sip_interoperability: &'static str,
     pub renewal: &'static str,
     pub verified_sdk_call_path: &'static str,
     pub required_parameters: Vec<ParameterContract>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BasicHostingContract {
+    pub account_line_kind: &'static str,
+    pub access: &'static str,
+    pub billing_account: &'static str,
+    pub explicit_profile_required: bool,
+    pub manual_start_required: bool,
+    pub implemented_operations: Vec<&'static str>,
+    pub media_transport: &'static str,
+    pub media_profile: &'static str,
+    pub plain_media_opt_in_required: bool,
+    pub outbound_call_implemented: bool,
+    pub outbound_message_implemented: bool,
+    pub default_sdk_client_implemented: bool,
+    pub readiness_source: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -127,7 +146,18 @@ pub fn contract() -> CredentialContract {
         provider_id: super::PROVIDER_ID,
         account_login_ui_required: false,
         service_credentials_required: true,
-        transport_implemented: false,
+        transport_implemented: true,
+        basic_hosting: BasicHostingContract {
+            account_line_kind: "app_account", access: "application_data", billing_account: "jegotrip_account",
+            explicit_profile_required: true, manual_start_required: true,
+            implemented_operations: super::BASIC_INBOUND_OPERATIONS.iter().map(|operation| operation.as_str()).collect(),
+            media_transport: "endpoint_tcp_mpath",
+            media_profile: "raw_rse_sdp_rtp_avp_rtcp_mux_passthrough",
+            plain_media_opt_in_required: true,
+            outbound_call_implemented: false, outbound_message_implemented: false,
+            default_sdk_client_implemented: false,
+            readiness_source: "current_original_run_and_per_capability_proof",
+        },
         direct_sip_interoperability: "unverified",
         renewal: "manual_reimport_until_renewal_verified",
         verified_sdk_call_path: "JCClient.login -> JCAccount.updateStatus(4)",
@@ -149,6 +179,8 @@ pub fn contract() -> CredentialContract {
             ParameterContract { field: "hosting.channel_id", source: "ChannelId", purpose: "Gateway deployment channel", secret: true },
             ParameterContract { field: "hosting.delete_int_code", source: "DeleteIntCode", purpose: "Preserve supplied string policy", secret: false },
             ParameterContract { field: "hosting.enrollment_confirmed", source: "Existing account hosting enrollment", purpose: "Import does not enable server entitlement", secret: false },
+            ParameterContract { field: "config.profile", source: "Original explicit native connection, routing and receiver bindings", purpose: "Required by the native account runtime; no guessed endpoint, authority, receiver or current readiness", secret: true },
+            ParameterContract { field: "config.call_media (optional)", source: "Original Endpoint authority/root/routing and explicit local audio/Trunk settings", purpose: "Required for incoming voice; plain-media opt-in, current original call binding and supported SDP, never a SIM cost grant", secret: true },
         ],
     }
 }
