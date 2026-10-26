@@ -165,9 +165,9 @@ mod app_voice_accounts {
     async fn actual_authenticated_call_answer_audio_sms_during_call_and_hangup_keep_original_account_and_ack() {
         use crate::connectivity::app_voice::providers::jegotrip as native;
         use native::{account_runtime::AccountManager,account_test_support::{peer,QueuedFactory},
-            account_call_test_support::{call_config_json,sdp,notice,operation,reply_operation,finish_sdk},
-            rpc_calls::{CallNoticeKind,CallOperation,encode_notice_result},rpc_envelope::{decode_reply,decode_request},rpc_stream::Reader,
-            runtime_backend::tests::next_non_poll,tcp_mpath::{self,Input},tcp_mpath_audio::tests::Peer as MediaPeer,smgw_text::SMGW_RECEIVER};
+            account_call_test_support::{call_config_json,sdp,notice,operation,reply_operation,finish_sdk,assert_mpath_request,SMS_KIND},
+            rpc_calls::{CallNoticeKind,CallOperation,encode_notice_result},rpc_envelope::decode_reply,
+            runtime_backend::tests::next_non_poll,tcp_mpath::{self,Input},tcp_mpath_audio::tests::Peer as MediaPeer};
         use tokio::{net::{TcpListener,UdpSocket},sync::oneshot};
         fn redacted_call(body:&str){for secret in ["fixture-original","fixture-domain","#fixture","phone_login_token","application_key","root_der","selected_session","private_config","__magic","SipPwd"]{assert!(!body.contains(secret));}}
         fn rtp(sequence:u16)->Vec<u8>{let mut packet=vec![0x80,0,0,0,0,0,0,160,0x12,0x34,0x56,0x78];packet[2..4].copy_from_slice(&sequence.to_be_bytes());packet.resize(173,sequence as u8);packet}
@@ -175,7 +175,7 @@ mod app_voice_accounts {
         let factory=Arc::new(QueuedFactory::default());let(mut sdk_peer,_,dropped)=peer(&sdk,&factory);state.app.app_accounts=Arc::new(AccountManager::with_factory(state.app.database.clone(),factory));
         let listener=TcpListener::bind(("127.0.0.1",0)).await.unwrap();let endpoint=format!("#fixture-endpoint:tcp -h 127.0.0.1 -p {};",listener.local_addr().unwrap().port());let audio_peer=UdpSocket::bind(("127.0.0.1",0)).await.unwrap();
         let cors=CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);let served=serve(build_router(state.app.clone(),cors)).await;let cookie=authenticate(&served).await;
-        let mut config=call_config_json(&sdk.root,&media.root);config["profile"]["incoming"]["receiver_kind"]=serde_json::json!(SMGW_RECEIVER);
+        let mut config=call_config_json(&sdk.root,&media.root);config["profile"]["incoming"]["receiver_kind"]=serde_json::json!(SMS_KIND);
         let(status,headers,body)=account_request(&served,reqwest::Method::POST,"/api/non-3gpp/accounts",Some(serde_json::json!({"provider_id":"app_voice","config":config})),Some(&cookie)).await;
         assert_eq!(status,StatusCode::CREATED);no_store(&headers);no_secrets(&body);let line=created_line(&body);let path=format!("/api/non-3gpp/accounts/{line}");
         let(go,invite)=oneshot::channel();let(done,stop)=oneshot::channel();let(sms,sms_seen)=oneshot::channel();let observed=state.app.database.clone();let original_line=line.clone();
@@ -184,15 +184,14 @@ mod app_voice_accounts {
             let packet=next_non_poll(&mut sdk_peer).await;let reply=decode_reply(packet.payload.expose_to_transport()).unwrap();assert_eq!(reply.call_id,101);assert_eq!(reply.result_stream,encode_notice_result(CallNoticeKind::Invited,true,&[]).unwrap().expose_to_transport());
             let(id,_)=operation(&mut sdk_peer,CallOperation::Inform).await;reply_operation(&mut sdk_peer,id,CallOperation::Inform,true,None).await;
             let(id,_)=operation(&mut sdk_peer,CallOperation::Accept).await;reply_operation(&mut sdk_peer,id,CallOperation::Accept,true,Some(endpoint.as_bytes())).await;
-            sdk_peer.incoming_with_fields(201,SMGW_RECEIVER,b"fixture simultaneous SMS",Some(b"fixture-sender"),Some(b"1700000000123")).await;
+            sdk_peer.incoming_with_fields(201,SMS_KIND,b"fixture simultaneous SMS",Some(b"fixture-sender"),Some(b"1700000000123")).await;
             let packet=next_non_poll(&mut sdk_peer).await;assert_eq!(decode_reply(packet.payload.expose_to_transport()).unwrap().call_id,201);
             let rows=observed.get_sms_messages_for_channel(20,0,None,Some(&original_line)).unwrap();assert_eq!(rows.len(),1);assert_eq!(rows[0].transport,"app_voice");assert_eq!(rows[0].content,"fixture simultaneous SMS");sms.send(()).unwrap();
             let(id,_)=operation(&mut sdk_peer,CallOperation::Release).await;reply_operation(&mut sdk_peer,id,CallOperation::Release,true,None).await;stop.await.unwrap();finish_sdk(sdk_peer).await;
         }).await.unwrap()});
         let down=rtp(33);let up=rtp(34);let native_down=down.clone();let native_up=up.clone();let server=media.server(&tokio_rustls::rustls::version::TLS13);let(passed,saw_audio)=oneshot::channel();
         let media_task=tokio::spawn(async move{tokio::time::timeout(std::time::Duration::from_secs(20),async move{
-            let mut peer=MediaPeer::accept(listener,server).await;let packet=peer.next_rpc().await.unwrap().unwrap();let request=decode_request(packet.payload.expose_to_transport()).unwrap();assert_eq!(request.method,b"connect.Endpoint.Endpoint");
-            let mut reader=Reader::versioned(request.arguments).unwrap();assert_eq!(reader.bytes().unwrap(),b"fixture-original-content");let count=reader.u32().unwrap();for _ in 0..count{reader.bytes().unwrap();}assert!(!reader.properties().unwrap().iter().any(|property|property.key==b"Client.ArcPort"));reader.finish().unwrap();peer.reply(true).await;
+            let mut peer=MediaPeer::accept(listener,server).await;let packet=peer.next_rpc().await.unwrap().unwrap();assert_mpath_request(packet.payload.expose_to_transport());peer.reply(true).await;
             let(packets,_)=tcp_mpath::encode_payload(0,32,1200,0,&native_down).unwrap();peer.send_raw(packets[0].expose_to_transport()).await;let raw=peer.next_raw().await.unwrap().unwrap();let mut decoder=tcp_mpath::Receiver::default();
             let Some(Input::Payload{channel:0,payload,..})=decoder.on_packet(&raw,std::time::Instant::now()).unwrap()else{panic!("actual HTTP call uplink")};assert_eq!(payload.expose_to_transport(),native_up);passed.send(()).unwrap();peer.eof().await;
         }).await.unwrap()});

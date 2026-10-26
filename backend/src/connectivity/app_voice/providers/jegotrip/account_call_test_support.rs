@@ -5,6 +5,13 @@ use super::{account_config::AccountConfig,account_test_support::config_json,rpc_
     session::STATUS_UNREGISTER};
 use std::net::SocketAddr;
 pub(crate) const NATIVE_ID:u64=0x0123_4567_89ab_cdef;
+pub(crate) const SMS_KIND:&[u8]=super::smgw_text::SMGW_RECEIVER;
+pub(crate) fn assert_mpath_request(wire:&[u8]){
+    let request=decode_request(wire).unwrap();assert_eq!(request.method,b"connect.Endpoint.Endpoint");
+    let mut reader=Reader::versioned(request.arguments).unwrap();assert_eq!(reader.bytes().unwrap(),b"fixture-original-content");
+    let count=reader.u32().unwrap();for _ in 0..count{reader.bytes().unwrap();}
+    assert!(!reader.properties().unwrap().iter().any(|property|property.key==b"Client.ArcPort"));reader.finish().unwrap();
+}
 pub(crate) fn call_config(sdk_root:&str,media_root:&str)->AccountConfig{
     serde_json::from_value(call_config_json(sdk_root,media_root)).unwrap()
 }
