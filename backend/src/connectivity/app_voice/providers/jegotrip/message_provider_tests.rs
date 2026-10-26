@@ -79,8 +79,31 @@ impl Running {
         Self { temp, accounts, provider, factory, line, revision: 1, stop: Some(stop), serving, dropped }
     }
     async fn stop(mut self, stop: Stop) {
+        let retired = matches!(stop, Stop::Retired);
         self.stop.take().unwrap().send(stop).ok().unwrap();
-        let stopped = bounded(self.accounts.stop(&self.line, self.revision, 100)).await.unwrap();
+        let stopped = match bounded(self.accounts.stop(&self.line, self.revision, 100)).await {
+            Ok(stopped) => stopped,
+            // Retiring IO before the controller sees its terminal callback can
+            // make unregister report Disconnected. Do not erase that verdict:
+            // first prove this original owner really joined/compacted, then
+            // repeat ONLY its cleanup wait, not a new SDK operation/session.
+            Err("app_account_disconnected") if retired => {
+                let released = self.temp.database.with_conn(|conn| super::super::account_runs::ownership_pending(conn, &self.line)).unwrap();
+                assert!(!released, "only original actor+consumer Join proof can retire the database fence");
+                assert!(self.dropped.load(Ordering::SeqCst), "original connector IO must actually be released");
+                match bounded(self.accounts.get(&self.line, 100)).await {
+                    Ok(first) => {
+                        assert!(!first.io_cleanup_required);
+                        assert!(!first.incoming_message_ready && !first.incoming_call_ready && !first.outbound_authorized);
+                    }
+                    Err("app_account_revision_conflict") if self.revision == 2 => {},
+                    Err(error) => panic!("unexpected post-Join snapshot {error}"),
+                }
+                bounded(self.accounts.stop(&self.line, self.revision, 100)).await.unwrap()
+            }
+            Err(error) => panic!("unexpected original cleanup verdict {error}"),
+        };
+        assert!(!stopped.io_cleanup_required);
         assert!(!stopped.incoming_message_ready && !stopped.incoming_call_ready && !stopped.outbound_authorized);
         assert_ne!(self.provider.availability(&self.line), ProviderAvailability::Available);
         bounded(self.serving).await.unwrap(); assert!(self.dropped.load(Ordering::SeqCst));
