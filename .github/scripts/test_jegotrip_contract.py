@@ -27,7 +27,7 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('default_sdk_client_implemented: false', source)
         self.assertIn('outbound_call_implemented: false, outbound_message_implemented: false', source)
         self.assertIn('billing_account: "jegotrip_account"', source)
-        self.assertIn('media_profile: "raw_rse_sdp_rtp_avp_rtcp_mux_passthrough"', source)
+        self.assertIn('media_profile: "raw_or_zlib_base64_rse_sdp_rtp_avp_rtcp_mux_passthrough"', source)
         self.assertIn('direct_sip_interoperability: "unverified"', source)
         self.assertNotIn('derive(Clone, Debug, Serialize)', source)
         self.assertIn('f.write_str("<redacted>")', source)

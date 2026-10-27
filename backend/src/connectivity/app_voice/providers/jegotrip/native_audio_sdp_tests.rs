@@ -59,9 +59,9 @@ fn malformed_mixed_trailing_and_expanding_compressed_sdp_fail_closed_before_call
     }
     let oversized_plain = vec![b'x'; MAX_SDP + 1]; let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&oversized_plain).unwrap(); let bomb = STANDARD.encode(encoder.finish().unwrap());
-    let notice = notice(&rpc, &ticket, bomb.as_bytes()); assert_eq!(PlainAudioOffer::native(&notice, &ticket, true).err(), Some(MediaError::Protocol));
+    let bomb_notice = notice(&rpc, &ticket, bomb.as_bytes()); assert_eq!(PlainAudioOffer::native(&bomb_notice, &ticket, true).err(), Some(MediaError::Protocol));
     let too_large = vec![b'A'; MAX_NATIVE_SDP_WIRE + (4 - MAX_NATIVE_SDP_WIRE % 4)];
-    let notice = notice(&rpc, &ticket, &too_large); assert_eq!(PlainAudioOffer::native(&notice, &ticket, true).err(), Some(MediaError::Configuration));
+    let large_notice = notice(&rpc, &ticket, &too_large); assert_eq!(PlainAudioOffer::native(&large_notice, &ticket, true).err(), Some(MediaError::Configuration));
 }
 #[test]
 fn security_attributes_remain_rejected_after_native_decompression() {
