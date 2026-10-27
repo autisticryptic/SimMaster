@@ -6,7 +6,8 @@
 
 ## 当前基线与工作规则
 
-- **当前持续托管增量 `b13223a` 已核验**：Build40458126579/Beta40458126681、ARM64/AMD64成功，officialdigest ZIP/CRC/逐名各711 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，438static/mock。全call watcher补振铃断线/过期/版本变化；可选cleanup_on_disconnect defaultfalse只清本manager退休原run、20秒有界/同owner最多重等一次，不自动start/reconnect/renew/清unknownorphan。原Trunk FIFO先处理/发Ended/CANCEL/BYE再停，history SQL失败保lease，terminal原因和cleanup_error分开。首fixture在release后查询当前call的错误已修、原失败ZIP保留；详见DEVELOPER。
+- **当前长期收件增量 `c6f0ba1` 已核验**：Build40499505183/Beta40499505215、ARM64/AMD64成功，officialdigest ZIP/CRC/逐名各744 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，444static/mock、67warnings。DIRECT原双180秒窗口及实际响应write后frontier；batch原result-bearing epoch精确ACK→FIFO私有retirement/sparse身份与before-base水位，不过pending/unACKed result。各保最近128完成envelope与全部SMS、未知/pending不清，稀疏2048/account+8192global仅按proof退休；GC失败不重发原ACK/result。新14项含同run600batch、2300ring滚动、partialACK/低gap/删除不复活和129postACK GC失败；DIRECT600及前回归保持，详见DEVELOPER。
+- **前断线托管增量 `b13223a` 已核验**：Build40458126579/Beta40458126681、ARM64/AMD64成功，officialdigest ZIP/CRC/逐名各711 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，438static/mock。全call watcher补振铃断线/过期/版本变化；可选cleanup_on_disconnect defaultfalse只清本manager退休原run、20秒有界/同owner最多重等一次，不自动start/reconnect/renew/清unknownorphan。原Trunk FIFO先处理/发Ended/CANCEL/BYE再停，history SQL失败保lease，terminal原因和cleanup_error分开。首fixture在release后查询当前call的错误已修、原失败ZIP保留；详见DEVELOPER。
 - **前无忧行基础范围：接电话/接短信，外呼/发短信只留接口。** `d0a2b67` 已推送并核验：Build40445960947/Beta40445960949、ARM64/AMD64成功，官方digest ZIP各699 Jegotrip＋7registry＋16HTTP＋42Trunk＋31通知＋4SIP＋7DNS/86矩阵逐名/source-run匹配，435static/mock通过，Release skipped。多任务Join取消重试、batch回执queued与Inform准入、应答/挂机入队前取消三项缺口已由新6项及双Join回归验证；不以旧4375a53成绩替代。
 - 基础入站已接原 receiver/control、实际 Endpoint TCP-Mpath↔UDP 音频、账号/API/Trunk、durable SMS与通知。当前不是登录 UI、默认完整 SDK 或付费外发项目；真实服务部署与资费仍未验收。实施/配置说明见[开发指南](DEVELOPER.md#当前基础托管配置与操作)。
 
@@ -73,15 +74,15 @@
 | 外发接口与费用隔离 | 有效reserved请求501，Asterisk/interactive/automation SMS或call均不能借入站ready走SIM/IMS/CS或免费WLAN规则 |
 | 证据与手册 | 新SHA两Actions实际逐名执行、官方digest ZIP/CRC/源码-run/86矩阵及双架构；原固定五手册、私有交接同步；不把静态/helper/绿灯当实网 |
 
-**当前断线回收已验证**：b13223a两Actions/双架构及officialdigest711/17HTTP/46Trunk等清单核验通过。全生命周期watch、opt-in原run清理、原FIFO/actual CANCEL、SQL/Join失败保留和未知进程拒绝均有新执行证据；固定手册记清defaultfalse与不自动重连。以下长接收容量工作仍是真实软件剩余，不因本次清理成功改称已完成：
+**当前长期接收已分别验证**：c6f0ba1两Actions/双架构及officialdigest744/17HTTP/46Trunk等清单通过；cb33653的DIRECT730项也有独立证据。直接窗口、真实response write后frontier、batch精确result-epoch ACK与durable sparse/before-base证明解决及时完成的已分类收件终身128/512限制；不驱逐unknown/pending，不靠新nonce/重连掩盖容量，低gap/burst/未ACK与磁盘仍有限。原watch/cleanup/FIFO能力保留。后续工作保持：
 
-1. 原direct128去重身份保留与private inbox512历史需要联合还原native时间窗口/重复请求边界、durable tombstone与已投影envelope清退证明。不能仅驱逐缓存、换nonce或自动重连掩盖容量耗尽/旧投递重放；未知raw或未确认ACK不得丢弃。
-2. 受控的自动重连/凭据更新与任何原生扩展需单独设计，保留原owner释放、同账号/设备策略、bounded失败退避及实际服务语义；本次仅自动清理，不宣称renew/remote lease或crash owner接管。
-3. 真实账号参数/服务/Trunk/通知/账单验收需新明确授权；未知媒体模式依然据证补实现，不放松TLS或归属。源码改变继续新SHA Actions/official artifact验证，docs-only收尾编译输入同b13223a。
+1. 受控自动重连/凭据更新需独立还原原服务刷新、跨run重投语义与账号/设备约束；保留旧owner实际释放、失败退避和不借cached ready。当前没有renew/remote lease或crash owner接管，也不因长收件回收而授这些能力。
+2. 默认locator/全部native或其他SDP/媒体模式仍须根据原目标及实际参数证据补实现，不放松TLS/归属或复制报告常量。已实现basic入站与这些扩展分别验收。
+3. 真实账号参数/服务/Trunk/通知/账单验收需新明确授权；当前没有设备/服务/部署执行。源码改变继续新SHA Actions/official artifact验证，docs-only收尾编译输入同c6f0ba1。
 
 **前基础软件交付已验证**：`d0a2b67`的Build40445960947/Beta40445960949、ARM64/AMD64及官方digest ZIP核验通过，新增6项admission/batch和双Join取消场景均实际执行；各699 Jegotrip与原HTTP/Trunk/通知/SIP/DNS/86矩阵精确匹配，435本机static/mock通过。固定五手册记录当前配置/API及支持界限；文档收尾不改变编译输入。后续源码改变仍须新SHA验证，不能复用当前绿灯；详细清单见 `verified-native-d0a2b67.json`。以下是明确的扩展与实网验收工作，不再把已接通的基础来电/媒体/SMS写成未实现。
 
-**明确但不伪装已完成的扩展**：当前原生/媒体支持显式raw `RseEx.SDP`、RTP/AVP sendrecv、RTCP-mux和编码passthrough。默认全部locator/Router/NetStream、压缩SDP/SRTP/ICE/BUNDLE/P2P、转码、自动token续期、remote principal/device全局lease、未知prior-process owner恢复、额外SMS编码及无限单连接历史不是本次已支持能力；付费外发尤其不是本轮必做项。原direct 128去重身份满则关闭scope；正常run原actor/consumer/媒体Join后回收已投影私有envelope且保留SMS，不承诺自动重连或跨新run exactly-once。
+**明确但不伪装已完成的扩展**：当前原生/媒体支持显式raw `RseEx.SDP`、RTP/AVP sendrecv、RTCP-mux和编码passthrough。默认全部locator/Router/NetStream、压缩SDP/SRTP/ICE/BUNDLE/P2P、转码、自动token续期、remote principal/device全局lease、未知prior-process owner恢复、额外SMS编码及无限单连接历史不是本次已支持能力；付费外发尤其不是本轮必做项。DIRECT/batch已按原回执和durable证明回收完成副本，但pending/unknown/burst/未ACK及磁盘保持有界；正常run原actor/consumer/媒体Join后继续回收已投影私有envelope且保留SMS，不承诺自动重连或跨新run exactly-once。
 
 **实网边界**：目前未使用真实服务、设备或账单。静态导入字段、isolated peer和native raw分支不能证明实际服务部署参数；以后经明确授权获得自有有效参数时，验证接收、双向音频、Trunk/通知、有效期/掉线/设备绑定与独立计费。若真实配置依赖当前未支持的模式，必须继续据证补实现，不能用改状态或放松TLS/owner门禁冒称兼容。
 

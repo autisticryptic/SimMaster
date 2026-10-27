@@ -155,7 +155,7 @@ python3 -B offline-registration-sim/run.py --fallback --report offline-registrat
 
 当前目标是**基础接电话、应答、挂机、双向音频与 Trunk，以及接短信、查询/删除、通知和原生回执**；外呼、发短信只保留接口。登录/号码绑定 UI 暂缓，由用户从自己的 root 手机取得现有参数。账号使用独立 `app_account` / `application_data` 线路，不借 SIM、五码、UICC、IMS/CS 或免费 WLAN 资费。
 
-当前源码 `b13223a` 已由两套 Actions、官方摘要产物和双架构核验，在已接通基础入站整链上补齐全生命周期来电收尾、可选断线清理和原 Trunk 结束事件排空。之前 `d0a2b67` 的批次回执等待及取消/Join 修复仍有独立证据。原邀请→应答→Endpoint TCP-Mpath↔UDP RTP→挂机、认证 HTTP、Asterisk 侧 SIP 与通话期间 SMS 均有隔离执行证据，**不是已连接无忧行、设备部署或资费验收**。用户所述入站免费不替代实际账单证据。
+当前源码 `c6f0ba1` 已由两套 Actions、官方摘要产物和双架构核验；在基础入站整链、全生命周期来电收尾、可选断线清理和原 Trunk 排空之上，补齐DIRECT与batch长期接收的独立回收证明。原邀请→应答→Endpoint TCP-Mpath↔UDP RTP→挂机、认证 HTTP、Asterisk 侧 SIP 与通话期间 SMS 均有隔离执行证据，**不是已连接无忧行、设备部署或资费验收**。用户所述入站免费不替代实际账单证据。
 
 ### 1. 纠正旧勘察结论
 
@@ -287,9 +287,16 @@ Main 在创建原账号 manager 后显式安装 Voice/Messaging provider。Regis
 
 `GET A` 在该 manager 持有 run 时可观察 `cleanup_on_disconnect`；自动清理后保留原 disconnected/expired 等原因和独立 `cleanup_error`。`io_cleanup_required` 表示本地原资源/fence 义务，`cleanup_error` 可能含局部已释放后的不确定远端/Trunk结果，两者不能互代。人工 stop 可重等/清除该原运行状态；最终租约释放后 `A/calls` 是运行期接口，不能再当作活跃旧call查询（`app_account_runtime_owner_unconfirmed`），已结束通话/短信历史仍在既有数据库/历史 API，下一次显式 start 才创建新 owner。
 
-单账号配置/消息/任务均有界；direct receipt 的 128 个原身份历史满时关闭原 scope，不静默驱逐去重信息，**不承诺单连接无限常驻或自动重连**。未知 prior-process run 仍保持 `app_account_runtime_owner_unconfirmed`，不从 PID/年龄猜已退出、不提供 force-clear。默认 locator/所有原生模式、自动 token 续期、remote principal/device 全局租约及其他媒体模式是后续扩展，不伪装已支持，也不扩大为本轮付费外发必做项。
+#### 长期收件与原回执回收
 
-最新源码 **`b13223ab8f8515a9e27b84a64c12f0a68809e90a` 已验证**：Build40458126579 / Beta40458126681、ARM64/AMD64成功，官方digest ZIP/CRC/逐名/source-run各 **711 Jegotrip＋7 registry＋17 HTTP＋46 Trunk＋31通知＋4 SIP＋7 DNS/86矩阵**，438 static/mock通过，65条compile warning保留；Release skipped。新增12 Jegotrip、4原Trunk FIFO和1认证HTTP实际执行，原双向音频/接短信/通知/归属回归保持。Build artifact12713424118摘要`d2bcd976c01d43d6a1a8bcdef33332cdf163926074c5a18788765b7b56e3eabc`，Beta12713408030摘要`07212f43c97a1ed7e9e5598d202b0a8e4acf72e7239b18fe788cf0e6555611a1`；清单见私有`verified-native-b13223a.json`。首e78a7b1两Actions编译成功但一新fixture在最终lease释放后错误unwrap当前call query，已仅修fixture为原对象/SQL历史与旧query应拒绝的断言，失败ZIP/全文保留，不弱化生产owner/TLS/Join/FIFO。
+- DIRECT原去重是两个180秒接收窗口，严格超过窗口才单次轮转、重复magic刷新；RPC ID保持正序且不复用。pending原票据不按时间驱逐，128 pending、4096同时历史/burst及原128KiB身份字节预算仍有限。只有原actor实际响应write/flush后的私有frontier，在当前line/revision/run lease下同事务记录状态、推进不越过较低pending的水位并回收旧已分类副本。
+- batch的`batch_queued`仍不证明已发送/ACK。必须取得原受认证swap回包，ACK精确`ack_next_batch-1-bit`所指、实际承载原result的epoch，才由同原consumer FIFO持久化稀疏已ACK身份。before-base前缀只在原2048-bit ring已不能重新投递、且不越过pending request或working/unACKed result时推进；未见乱序gap不被高序号误拒。
+- 稀疏身份最多2048/account、8192全局，只有证明覆盖的前缀可以退休，不随ring移动任意清除；长期低pending可触发有界失败。DIRECT/batch分别保最近128项可回收短信envelope元数据与完整共享SMS；既有通知状态聚合/终态审计保留策略不变。unknown/pending/另一种协议或另一run不容量回收；已有raw/删除tombstone先于水位检查，已清退原票据不能复活短信。GC失败回滚并退休原scope，不重发已经提交的DIRECT ACK或已ACK batch result。原Join清理仅清本run的两类回收状态。
+- 单账号配置/消息/任务仍有界；原32batch epoch/45秒未ACK、128 unknown/pending、无回收证明的512身份与全局16MiB envelope等安全预算保持。及时完成/ACK的已分类收件不再受终身128/512累计上限，**不是无限流量、无限磁盘、自动重连、token续期或跨新run exactly-once**。未知prior-process run仍为`app_account_runtime_owner_unconfirmed`，不按PID/年龄force-clear；默认全SDK/locator、remote principal/device租约和其他媒体仍单独据证补齐，不扩大成付费外发必做项。
+
+最新源码 **`c6f0ba13bf2277910cc33834bcc1ea6fcd63f6b6` 已验证**：Build40499505183 / Beta40499505215、ARM64/AMD64成功，官方digest ZIP/CRC/逐名/source-run各 **744 Jegotrip＋7 registry＋17 HTTP＋46 Trunk＋31通知＋4 SIP＋7 DNS/86矩阵**，444 static/mock与10项SQL语法mock通过，67条compile warning保留，Release skipped。14新batch回归含同一个原manager/ARC/nonce600短信、2300ring滚动、partial ACK/低pending/乱序gap、删除/未知与GC rollback、129条后ACK/GC失败不重放；DIRECT600/原音频Trunk等回归保持。Build artifact12733490387 SHA`18d49e76cd6a6a6798041529e28992c63c6b437d65e2cdbd2892073cc35bfa7b`，Beta12732930975 SHA`de9e9b66e51b5c532b270a4851ac7ae6b009087a87b93daddfd7bb04484665c0`；见`verified-native-c6f0ba1.json`。DIRECT前源码cb33653两Actions各730项独立通过；首9d0原TLS夹具只有inbox fence缺runtime lease，生产frontier拒绝正确，仅夹具按真实runtime注册并增强SQL/原ACK断言，加缺lease负例，失败官方ZIP保留，不弱化归属。公共docs-only收尾构建输入同c6f0ba1，不假称另一个已验二进制。
+
+前源码 **`b13223ab8f8515a9e27b84a64c12f0a68809e90a` 已验证**：Build40458126579 / Beta40458126681、ARM64/AMD64成功，官方digest ZIP/CRC/逐名/source-run各 **711 Jegotrip＋7 registry＋17 HTTP＋46 Trunk＋31通知＋4 SIP＋7 DNS/86矩阵**，438 static/mock通过，65条compile warning保留；Release skipped。新增12 Jegotrip、4原Trunk FIFO和1认证HTTP实际执行，原双向音频/接短信/通知/归属回归保持。Build artifact12713424118摘要`d2bcd976c01d43d6a1a8bcdef33332cdf163926074c5a18788765b7b56e3eabc`，Beta12713408030摘要`07212f43c97a1ed7e9e5598d202b0a8e4acf72e7239b18fe788cf0e6555611a1`；清单见私有`verified-native-b13223a.json`。首e78a7b1两Actions编译成功但一新fixture在最终lease释放后错误unwrap当前call query，已仅修fixture为原对象/SQL历史与旧query应拒绝的断言，失败ZIP/全文保留，不弱化生产owner/TLS/Join/FIFO。
 
 前源码 **`d0a2b675329489c72542bb3b3d382e02b6eda15a` 已验证**：Build40445960947 / Beta40445960949、ARM64/AMD64成功；官方 digest ZIP 各逐名匹配 **699 Jegotrip＋7 registry＋16 HTTP＋42 Trunk＋31通知＋4 SIP＋7 DNS/86矩阵**，435 本机 static/mock 通过。六项新 admission/batch 与强化的双 Join 取消回归均实际执行；首轮通过，保留65条编译warning，不声称零warning。官方测试 artifact：Build12708308718 / Beta12708966079；详细官方摘要、CRC、源码/run/矩阵指纹见私有 `verified-native-d0a2b67.json`。Publish Release skipped；这不是程序包部署或服务验收。文档收尾须保持与该已验源码相同的构建输入，不假称新二进制。
 
