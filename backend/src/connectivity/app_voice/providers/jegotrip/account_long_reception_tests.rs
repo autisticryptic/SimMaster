@@ -13,6 +13,16 @@ async fn finish(mut peer:super::super::super::runtime_backend::tests::Peer) {
     peer.swap(Some(STATUS_UNREGISTER),true).await;let message=next_non_poll(&mut peer).await;let request=decode_request(message.payload.expose_to_transport()).unwrap();
     assert_eq!(request.method,super::super::super::rpc_logout::LOGOUT_SESSION_METHOD.as_bytes());peer.reply(request.call_id,&[0,1,0,0,0,0]).await;assert!(peer.receive().await.is_none());
 }
+/// The original IO already closed after the failed post-ACK GC, so native
+/// logout may truthfully report Disconnected. Like process shutdown, only the
+/// SAME owner's cleanup is waited once more; release must then be confirmed.
+async fn stop_after_disconnect(manager:&AccountManager,line:&str)->AccountView {
+    match bounded(manager.stop(line,1,100)).await {
+        Ok(view)=>view,
+        Err(code)=>{assert_eq!(code,"app_account_disconnected");bounded(manager.stop(line,1,100)).await.unwrap()}
+    }
+}
+
 #[tokio::test]
 async fn six_hundred_direct_sms_on_one_original_run_preserve_history_and_bound_private_envelopes() {
     let cert=Certificates::generate("DNS:fixture.invalid");let temp=TempDatabase::new();let factory=Arc::new(QueuedFactory::default());let(mut peer,connector,dropped)=peer(&cert,&factory);
@@ -65,6 +75,6 @@ async fn submitted_direct_reply_gc_failure_retires_original_run_without_replayin
     bounded(serving).await.unwrap();assert!(dropped.load(Ordering::SeqCst));assert_eq!(count(&temp.database,"sms_messages"),129);assert_eq!(count(&temp.database,"app_voice_inbox"),129);
     assert!(temp.database.with_conn(|conn|account_runs::ownership_pending(conn,&line)).unwrap());
     temp.database.with_conn(|conn|conn.execute_batch("DROP TRIGGER fail_live_direct_gc").map_err(|_|"test_trigger_failed")).unwrap();
-    assert!(!bounded(manager.stop(&line,1,100)).await.unwrap().io_cleanup_required);assert_eq!(count(&temp.database,"app_voice_inbox"),0);assert_eq!(count(&temp.database,"sms_messages"),129);
+    assert!(!stop_after_disconnect(&manager,&line).await.io_cleanup_required);assert_eq!(count(&temp.database,"app_voice_inbox"),0);assert_eq!(count(&temp.database,"sms_messages"),129);
     assert_eq!(connector.connection_calls(),1);assert_eq!(factory.build_count(),1);assert_eq!(count(&temp.database,"app_voice_direct_replay_fences"),0);
 }

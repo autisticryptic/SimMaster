@@ -54,6 +54,16 @@ async fn finish(mut peer:Peer,peer_next:u32) {
     let packet=next_non_poll(&mut peer).await;let request=decode_request(packet.payload.expose_to_transport()).unwrap();assert_eq!(request.method,super::super::super::rpc_logout::LOGOUT_SESSION_METHOD.as_bytes());
     peer.reply(request.call_id,&[0,1,0,0,0,0]).await;assert!(peer.receive().await.is_none());
 }
+/// The original IO already closed after the failed post-ACK GC, so native
+/// logout may truthfully report Disconnected. Like process shutdown, only the
+/// SAME owner's cleanup is waited once more; release must then be confirmed.
+async fn stop_after_disconnect(manager:&AccountManager,line:&str)->AccountView {
+    match bounded(manager.stop(line,1,100)).await {
+        Ok(view)=>view,
+        Err(code)=>{assert_eq!(code,"app_account_disconnected");bounded(manager.stop(line,1,100)).await.unwrap()}
+    }
+}
+
 #[tokio::test]
 async fn six_hundred_batch_sms_on_one_original_run_use_exact_ack_and_durable_sparse_retirement() {
     let cert=Certificates::generate("DNS:fixture.invalid");let temp=TempDatabase::new();let factory=Arc::new(QueuedFactory::default());let(mut peer,connector,dropped)=peer(&cert,&factory);
@@ -95,6 +105,6 @@ async fn post_ack_batch_gc_failure_retires_original_scope_without_requeuing_ackn
     assert!(state.io_cleanup_required);assert!(!state.incoming_message_ready&&!state.outbound_authorized);bounded(serving).await.unwrap();assert!(dropped.load(Ordering::SeqCst));
     assert_eq!(count(&temp.database,"sms_messages"),129);assert_eq!(count(&temp.database,"app_voice_inbox"),129);assert_eq!(count(&temp.database,"app_voice_batch_replay_ids"),128);
     temp.database.with_conn(|conn|conn.execute_batch("DROP TRIGGER fail_live_batch_gc").map_err(|_|"test_trigger_failed")).unwrap();
-    assert!(!bounded(manager.stop(&line,1,100)).await.unwrap().io_cleanup_required);assert_eq!(count(&temp.database,"sms_messages"),129);assert_eq!(count(&temp.database,"app_voice_inbox"),0);assert_eq!(count(&temp.database,"app_voice_batch_replay_ids"),0);
+    assert!(!stop_after_disconnect(&manager,&line).await.io_cleanup_required);assert_eq!(count(&temp.database,"sms_messages"),129);assert_eq!(count(&temp.database,"app_voice_inbox"),0);assert_eq!(count(&temp.database,"app_voice_batch_replay_ids"),0);
     assert_eq!(connector.connection_calls(),1);assert_eq!(factory.build_count(),1);
 }
