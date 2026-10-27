@@ -191,7 +191,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 | 参数 | 静态来源 | 用途 |
 |---|---|---|
 | `sdk.account_identity` | `getAreaCodeMobileNum` | SDK 会话身份，保留原区号格式 |
-| `sdk.phone_login_token` | SharedPreferences `wyx_phone_login_token` / `wyx_phone_login_token_key`；另一路 `CallUserInfo.cstToken` | SDK 登录凭据，不是 App 密码或 `SipPwd` |
+| `sdk.phone_login_token` | 认证的 `service/voip/v1/csb/token` 请求（`accountId`）成功响应 `body.token`，写入 SharedPreferences `wyx_phone_login_token` / `wyx_phone_login_token_key`；另一路 `CallUserInfo.cstToken` | SDK 登录凭据，不是 App 密码或 `SipPwd`；静态链无TTL |
 | `sdk.application_key` | `JCClient.create` 参数 | 匹配 SDK 应用配置 |
 | `sdk.server_address` | `config_key_server_address` | SDK 服务端配置，不要猜作 SIP SBC |
 | `sdk.root_der_base64` / `sdk.tls_only` | `config_key_root_der` / `config_key_use_tls_only` | 匹配部署信任与 TLS 策略 |
@@ -221,6 +221,14 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 
 Main 在创建原账号 manager 后显式安装 Voice/Messaging provider。Registry 的汇总 availability 不能互授能力，调用方分别检查 `incoming_call_ready` / `incoming_message_ready`；SMS-only 不授 Voice，反之亦然。只读描述不会加载配置或自动启动会话。Android/AArch64 库不经 `dlopen` 冒充 Linux/AMD64 后端。
 
+### 最新APK/IDA静态结论与压缩SDP（`2986a3d`已验证）
+
+本地APK（SHA与第三方报告样本不同）的7个嵌套DEX已用现有Androguard 4.1.4只读重扫。活跃phone-token链为`DeepLinkUtil.getPhoneLoginToken → CallLogic.getLoginToken(accountId) → service/voip/v1/csb/token → code=0/body.token → setPhoneToken → 下一次JCClient.login`；初始化、登录后、部分前台/空token恢复路径会请求，但成功回调只存值，不重启或原子替换已托管会话，也不解析TTL。另有`service/voip/v1/refreshToken`和`requestDelayTokenValid`，但应用DEX全部8567类只出现URL初始化与helper本身，无直接调用、专用callback、响应字段或写token路径。两接口都依赖独立App API会话token/签名配置；故`renewal=manual_reimport_until_renewal_verified`保持，不从静态常量构造真实请求。
+
+原libmtc只读链闭合：邀请`RseEx.SDP`若符合完整标准/URL-safe Base64语法，则Base64解码后zlib inflate；raw否则直读；回复按邀请标记，zlib deflate后始终标准有padding Base64。实现设置独立wire上限、inflate输出≤16KiB并拒绝尾随/混合字母表；解码后仍走相同严格SDP门禁，Trunk/API只交换raw SDP，native Accept才镜像wire。Build40585189198/Beta40585189753双架构/官方digest ZIP/CRC/逐名各757 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings，Release skipped；5项新回归实际通过。首7350f5f为测试变量遮蔽/旧静态契约，第二9a0e1ca漏HTTP旧字符串，均只修夹具，失败制品保留。
+
+该APK成功登录后无条件`closeAudioSrtp()`（crypto type 0、auth false），`MtcEngine.login`无条件`DirectConnect=false`且显式设置server address；`SRTP_ENABLE` getter无call-path引用。native `RseEx.CryptoKey`只是可选callback hook，不足以定义SRTP。NetStream无Java或已证CallEx引用；Locator仍只有方法注册名、没有wire/缓存生命周期。因此继续拒绝SRTP、ICE/BUNDLE/P2P、default Locator/NetStream和转码；这不是把未来SDK版本也证明为永远不用。
+
 ### 当前基础托管配置与操作
 
 #### 私有导入形状
@@ -244,7 +252,7 @@ Main 在创建原账号 manager 后显式安装 Voice/Messaging provider。Regis
 
 属性数组的每项是 `{"key":[字节...],"value":[字节...]}`；receiver 的二进制字段同样用 JSON 字节数组，**不是字符串或 Base64**。`call_media.features` 每项是 `{"value":[字节...]}`。解码 key 只用于对应原 ENC 上下文；不合并 SDK、Client、reference 或 media 的信任/密钥。
 
-`audio_bind_ip` 是 SimAdmin 实际可绑定且媒体对端可达的本地地址，不可为未指定/组播地址。它不是 native `Client.Host` / `Client.ArcPort`：后两者可能是逻辑 Router 地址/端口，不能当 OS RTP 目的地。支持的媒体为 raw `RseEx.SDP`、单音频 `RTP/AVP` / `sendrecv` / `rtcp-mux`，匹配 payload 的编码 RTP 原样转发（含已支持的 Opus passthrough，不是转码器）。压缩 SDP、SRTP、ICE/BUNDLE/P2P 或不支持协商明确拒绝；TLS 信令不因此降为明文。
+`audio_bind_ip` 是 SimAdmin 实际可绑定且媒体对端可达的本地地址，不可为未指定/组播地址。它不是 native `Client.Host` / `Client.ArcPort`：后两者可能是逻辑 Router 地址/端口，不能当 OS RTP 目的地。native支持raw或zlib＋Base64 `RseEx.SDP`并按邀请格式回复；解码后只允许单音频 `RTP/AVP` / `sendrecv` / `rtcp-mux`，匹配 payload 的编码 RTP 原样转发（含已支持的 Opus passthrough，不是转码器）。Trunk/API始终使用raw SDP。SRTP、ICE/BUNDLE/P2P、转码或其他不支持协商明确拒绝；TLS 信令不因此降为明文。
 
 #### 账号与业务 API
 
@@ -307,7 +315,7 @@ Build40517095074/Beta40517094859、ARM64/AMD64成功，官方digest ZIP/CRC/逐�
 - 稀疏身份最多2048/account、8192全局，只有证明覆盖的前缀可以退休，不随ring移动任意清除；长期低pending可触发有界失败。DIRECT/batch分别保最近128项可回收短信envelope元数据与完整共享SMS；既有通知状态聚合/终态审计保留策略不变。unknown/pending/另一种协议或另一run不容量回收；已有raw/删除tombstone先于水位检查，已清退原票据不能复活短信。GC失败回滚并退休原scope，不重发已经提交的DIRECT ACK或已ACK batch result。原Join清理仅清本run的两类回收状态。
 - 单账号配置/消息/任务仍有界；原32batch epoch/45秒未ACK、128 unknown/pending、无回收证明的512身份与全局16MiB envelope等安全预算保持。及时完成/ACK的已分类收件不再受终身128/512累计上限，**不是无限流量、无限磁盘、token续期或跨新run exactly-once**（重连见上节可选策略）。未知prior-process run仍为`app_account_runtime_owner_unconfirmed`，不按PID/年龄force-clear；默认全SDK/locator、remote principal/device租约和其他媒体仍单独据证补齐，不扩大成付费外发必做项。
 
-最新源码 **`c6f0ba13bf2277910cc33834bcc1ea6fcd63f6b6` 已验证**：Build40499505183 / Beta40499505215、ARM64/AMD64成功，官方digest ZIP/CRC/逐名/source-run各 **744 Jegotrip＋7 registry＋17 HTTP＋46 Trunk＋31通知＋4 SIP＋7 DNS/86矩阵**，444 static/mock与10项SQL语法mock通过，67条compile warning保留，Release skipped。14新batch回归含同一个原manager/ARC/nonce600短信、2300ring滚动、partial ACK/低pending/乱序gap、删除/未知与GC rollback、129条后ACK/GC失败不重放；DIRECT600/原音频Trunk等回归保持。Build artifact12733490387 SHA`18d49e76cd6a6a6798041529e28992c63c6b437d65e2cdbd2892073cc35bfa7b`，Beta12732930975 SHA`de9e9b66e51b5c532b270a4851ac7ae6b009087a87b93daddfd7bb04484665c0`；见`verified-native-c6f0ba1.json`。DIRECT前源码cb33653两Actions各730项独立通过；首9d0原TLS夹具只有inbox fence缺runtime lease，生产frontier拒绝正确，仅夹具按真实runtime注册并增强SQL/原ACK断言，加缺lease负例，失败官方ZIP保留，不弱化归属。公共docs-only收尾构建输入同c6f0ba1，不假称另一个已验二进制。
+长期收件检查点源码 **`c6f0ba13bf2277910cc33834bcc1ea6fcd63f6b6` 已验证**：Build40499505183 / Beta40499505215、ARM64/AMD64成功，官方digest ZIP/CRC/逐名/source-run各 **744 Jegotrip＋7 registry＋17 HTTP＋46 Trunk＋31通知＋4 SIP＋7 DNS/86矩阵**，444 static/mock与10项SQL语法mock通过，67条compile warning保留，Release skipped。14新batch回归含同一个原manager/ARC/nonce600短信、2300ring滚动、partial ACK/低pending/乱序gap、删除/未知与GC rollback、129条后ACK/GC失败不重放；DIRECT600/原音频Trunk等回归保持。Build artifact12733490387 SHA`18d49e76cd6a6a6798041529e28992c63c6b437d65e2cdbd2892073cc35bfa7b`，Beta12732930975 SHA`de9e9b66e51b5c532b270a4851ac7ae6b009087a87b93daddfd7bb04484665c0`；见`verified-native-c6f0ba1.json`。DIRECT前源码cb33653两Actions各730项独立通过；首9d0原TLS夹具只有inbox fence缺runtime lease，生产frontier拒绝正确，仅夹具按真实runtime注册并增强SQL/原ACK断言，加缺lease负例，失败官方ZIP保留，不弱化归属。公共docs-only收尾构建输入同c6f0ba1，不假称另一个已验二进制。
 
 前源码 **`b13223ab8f8515a9e27b84a64c12f0a68809e90a` 已验证**：Build40458126579 / Beta40458126681、ARM64/AMD64成功，官方digest ZIP/CRC/逐名/source-run各 **711 Jegotrip＋7 registry＋17 HTTP＋46 Trunk＋31通知＋4 SIP＋7 DNS/86矩阵**，438 static/mock通过，65条compile warning保留；Release skipped。新增12 Jegotrip、4原Trunk FIFO和1认证HTTP实际执行，原双向音频/接短信/通知/归属回归保持。Build artifact12713424118摘要`d2bcd976c01d43d6a1a8bcdef33332cdf163926074c5a18788765b7b56e3eabc`，Beta12713408030摘要`07212f43c97a1ed7e9e5598d202b0a8e4acf72e7239b18fe788cf0e6555611a1`；清单见私有`verified-native-b13223a.json`。首e78a7b1两Actions编译成功但一新fixture在最终lease释放后错误unwrap当前call query，已仅修fixture为原对象/SQL历史与旧query应拒绝的断言，失败ZIP/全文保留，不弱化生产owner/TLS/Join/FIFO。
 
