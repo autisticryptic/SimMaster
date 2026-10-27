@@ -217,7 +217,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 - 来电：`JCCall`；接收消息：同一 `JCClient` 上的 `JCMessageChannel`，
   App 接收回调进入 Realm/未读/通知。短信发送和服务端计费流程尚未确认。
 
-`GET /api/non-3gpp/providers/app_voice/credential-contract` 返回静态实现/参数说明，不初始化 SDK、不读账号或发请求；当前 `transport_implemented=true` **仅指显式入站实现**。`basic_hosting` 明列 profile、手动启动、plain-media opt-in、独立计费主体、实现的入站操作及 `default_sdk_client_implemented=false`；`automatic_cleanup_supported=true` 仅指下面的可选原运行清理，`automatic_reconnect_implemented=false`，外呼/发送均 false。它不是当前 readiness、服务可用性或收费授权。
+`GET /api/non-3gpp/providers/app_voice/credential-contract` 返回静态实现/参数说明，不初始化 SDK、不读账号或发请求；当前 `transport_implemented=true` **仅指显式入站实现**。`basic_hosting` 明列 profile、手动启动、plain-media opt-in、独立计费主体、实现的入站操作及 `default_sdk_client_implemented=false`；`automatic_cleanup_supported=true` 仅指下面的可选原运行清理，`automatic_reconnect_implemented=true` 仅指下文opt-in有界全新start（不是token续期，`renewal`仍为手工重新导入），外呼/发送均 false。它不是当前 readiness、服务可用性或收费授权。
 
 Main 在创建原账号 manager 后显式安装 Voice/Messaging provider。Registry 的汇总 availability 不能互授能力，调用方分别检查 `incoming_call_ready` / `incoming_message_ready`；SMS-only 不授 Voice，反之亦然。只读描述不会加载配置或自动启动会话。Android/AArch64 库不经 `dlopen` 冒充 Linux/AMD64 后端。
 
@@ -239,7 +239,8 @@ Main 在创建原账号 manager 后显式安装 Voice/Messaging provider。Regis
 | 五个 `profile.*_timeout_ms` | `connect` 为 1..10000，`handshake` / `partial` / `io` 各 1..30000，`rpc` 为 1..60000 毫秒；都是显式有界预算，不推断 token 租期 |
 | `config.bootstrap`（可选） | 独立 `account_authority` / `account_root_der_base64` / `account_enable_sni`、`routing` 与 1..30000 的 `handoff_timeout_ms`；不能同时手填 profile 的 domain/app/CC 字段 |
 | `config.call_media`（接电话） | 独立 `authority` / `root_der_base64` / `enable_sni`、原 `routing` / `features` / `properties`，可选 `reference_decode_key`，显式 `audio_bind_ip`、`allow_plain_media=true` 和可选 `trunk` |
-| `config.cleanup_on_disconnect`（可选） | JSON boolean，缺省 false；仅清理本 manager 已退休的原 run，不自动 start/reconnect/renew 或清除未知前进程 owner |
+| `config.cleanup_on_disconnect`（可选） | JSON boolean，缺省 false；仅清理本 manager 已退休的原 run，本身不 start/renew 或清除未知前进程 owner |
+| `config.reconnect`（可选） | `{max_attempts:1..16, initial_delay_ms:1000..600000, max_delay_ms:≤3600000}`；须 cleanup_on_disconnect=true，清理完成后同 revision 全新 start，仅断线/不可用/超时重试 |
 
 属性数组的每项是 `{"key":[字节...],"value":[字节...]}`；receiver 的二进制字段同样用 JSON 字节数组，**不是字符串或 Base64**。`call_media.features` 每项是 `{"value":[字节...]}`。解码 key 只用于对应原 ENC 上下文；不合并 SDK、Client、reference 或 media 的信任/密钥。
 
@@ -281,18 +282,24 @@ Main 在创建原账号 manager 后显式安装 Voice/Messaging provider。Regis
 
 来电现在从 Checking/Ringing 起就保留唯一原 watcher，不等到媒体连接后才监听。原 ticket/account scope 断开、过期或媒体 scope 关闭时，经原 operation 锁结束历史与 Ended，不覆盖/丢弃 watcher、不重复 Release。即使 SDK 断线发生在振铃，也不会只丢端口却留下未结束通话。
 
-设置 `cleanup_on_disconnect=true` 后，本 manager 的原 run 退休会触发最多20秒的自动清理（最多一次同 owner 清理重等），与人工 stop/关机在原 run 上串行；媒体、call任务、原 SIP driver、actor/controller 与 consumer 的实际 Join 后才提交 nonce fence/回收 envelope。它不会发送新的登录、自动重连或续期，不会按 PID/年龄清除未知前进程。缺省 false 保持人工 stop 行为；配置仅存在数据库而没有本 manager 原运行时，不能自动清理或授 readiness。
+设置 `cleanup_on_disconnect=true` 后，本 manager 的原 run 退休会触发最多20秒的自动清理（最多一次同 owner 清理重等），与人工 stop/关机在原 run 上串行；媒体、call任务、原 SIP driver、actor/controller 与 consumer 的实际 Join 后才提交 nonce fence/回收 envelope。它本身不发送新的登录或续期，不会按 PID/年龄清除未知前进程；只有另配 `reconnect` 时才在清理完成后由下节supervisor全新start。缺省 false 保持人工 stop 行为；配置仅存在数据库而没有本 manager 原运行时，不能自动清理或授 readiness。
 
 原 Trunk 驱动通过私有 FIFO fence 确认先前 Ended 的本地处理/发送后再停止；普通事件观察者、替换/丢弃/落后 driver 不能假确认。失败显示 `app_account_call_trunk_delivery_unconfirmed`（HTTP503），不宣称远端已收到 CANCEL/BYE。SQL/历史结束失败保留原运行 lease，修复后只能重等该 owner，不重放已尝试的 Release。局部 socket 关闭不等于历史提交或原资源全释放。
 
 `GET A` 在该 manager 持有 run 时可观察 `cleanup_on_disconnect`；自动清理后保留原 disconnected/expired 等原因和独立 `cleanup_error`。`io_cleanup_required` 表示本地原资源/fence 义务，`cleanup_error` 可能含局部已释放后的不确定远端/Trunk结果，两者不能互代。人工 stop 可重等/清除该原运行状态；最终租约释放后 `A/calls` 是运行期接口，不能再当作活跃旧call查询（`app_account_runtime_owner_unconfirmed`），已结束通话/短信历史仍在既有数据库/历史 API，下一次显式 start 才创建新 owner。
+
+#### 可选有界自动重连（`e5ef46dab3254016ab1ec2ba2aba316f4d407b1e`已验证）
+
+可选`config.reconnect`（须同时`cleanup_on_disconnect=true`；`max_attempts`1..16、`initial_delay_ms`1000..600000、`max_delay_ms`≤3600000，指数退避）：只有本manager原run完成实际Join与fence释放后，才对同一已存revision做一次全新start（新nonce/owner/登录/托管），不是token续期或会话恢复。仅disconnected/backend_unavailable/operation_timeout可重试；鉴权/托管拒绝、过期、revision/owner/存储错误不重试。自身HostingAck后重置计数；人工stop/start、replace/delete、关机取消或取代待执行重启；未启用supervisor时报`unsupervised`。`GET A`在策略存在时给出`reconnect_attempt`/`reconnect_state`/`reconnect_error`。跨新run的重投与原生一样是至少一次，不承诺exactly-once。
+
+Build40517095074/Beta40517094859、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各749 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，445static/mock，67warnings保留，Release skipped。
 
 #### 长期收件与原回执回收
 
 - DIRECT原去重是两个180秒接收窗口，严格超过窗口才单次轮转、重复magic刷新；RPC ID保持正序且不复用。pending原票据不按时间驱逐，128 pending、4096同时历史/burst及原128KiB身份字节预算仍有限。只有原actor实际响应write/flush后的私有frontier，在当前line/revision/run lease下同事务记录状态、推进不越过较低pending的水位并回收旧已分类副本。
 - batch的`batch_queued`仍不证明已发送/ACK。必须取得原受认证swap回包，ACK精确`ack_next_batch-1-bit`所指、实际承载原result的epoch，才由同原consumer FIFO持久化稀疏已ACK身份。before-base前缀只在原2048-bit ring已不能重新投递、且不越过pending request或working/unACKed result时推进；未见乱序gap不被高序号误拒。
 - 稀疏身份最多2048/account、8192全局，只有证明覆盖的前缀可以退休，不随ring移动任意清除；长期低pending可触发有界失败。DIRECT/batch分别保最近128项可回收短信envelope元数据与完整共享SMS；既有通知状态聚合/终态审计保留策略不变。unknown/pending/另一种协议或另一run不容量回收；已有raw/删除tombstone先于水位检查，已清退原票据不能复活短信。GC失败回滚并退休原scope，不重发已经提交的DIRECT ACK或已ACK batch result。原Join清理仅清本run的两类回收状态。
-- 单账号配置/消息/任务仍有界；原32batch epoch/45秒未ACK、128 unknown/pending、无回收证明的512身份与全局16MiB envelope等安全预算保持。及时完成/ACK的已分类收件不再受终身128/512累计上限，**不是无限流量、无限磁盘、自动重连、token续期或跨新run exactly-once**。未知prior-process run仍为`app_account_runtime_owner_unconfirmed`，不按PID/年龄force-clear；默认全SDK/locator、remote principal/device租约和其他媒体仍单独据证补齐，不扩大成付费外发必做项。
+- 单账号配置/消息/任务仍有界；原32batch epoch/45秒未ACK、128 unknown/pending、无回收证明的512身份与全局16MiB envelope等安全预算保持。及时完成/ACK的已分类收件不再受终身128/512累计上限，**不是无限流量、无限磁盘、token续期或跨新run exactly-once**（重连见上节可选策略）。未知prior-process run仍为`app_account_runtime_owner_unconfirmed`，不按PID/年龄force-clear；默认全SDK/locator、remote principal/device租约和其他媒体仍单独据证补齐，不扩大成付费外发必做项。
 
 最新源码 **`c6f0ba13bf2277910cc33834bcc1ea6fcd63f6b6` 已验证**：Build40499505183 / Beta40499505215、ARM64/AMD64成功，官方digest ZIP/CRC/逐名/source-run各 **744 Jegotrip＋7 registry＋17 HTTP＋46 Trunk＋31通知＋4 SIP＋7 DNS/86矩阵**，444 static/mock与10项SQL语法mock通过，67条compile warning保留，Release skipped。14新batch回归含同一个原manager/ARC/nonce600短信、2300ring滚动、partial ACK/低pending/乱序gap、删除/未知与GC rollback、129条后ACK/GC失败不重放；DIRECT600/原音频Trunk等回归保持。Build artifact12733490387 SHA`18d49e76cd6a6a6798041529e28992c63c6b437d65e2cdbd2892073cc35bfa7b`，Beta12732930975 SHA`de9e9b66e51b5c532b270a4851ac7ae6b009087a87b93daddfd7bb04484665c0`；见`verified-native-c6f0ba1.json`。DIRECT前源码cb33653两Actions各730项独立通过；首9d0原TLS夹具只有inbox fence缺runtime lease，生产frontier拒绝正确，仅夹具按真实runtime注册并增强SQL/原ACK断言，加缺lease负例，失败官方ZIP保留，不弱化归属。公共docs-only收尾构建输入同c6f0ba1，不假称另一个已验二进制。
 

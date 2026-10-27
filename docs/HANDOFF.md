@@ -10,7 +10,12 @@
 4. IDA 仅只读使用用户已打开的原 `libmtc.so`，调用前核对 metadata；不自行启动/加载、修改或保存 IDB。新 JADX/其他工具须先说明版本/用途，由用户手动安装。
 5. 保持原 UI 布局；本轮是后端，不做登录/绑定 UI。公共文档只更新原五手册。报告、APK/固件、JSONL、`.local`、私有交接和凭据不提交。
 
-## 当前：DIRECT 与 batch 长期接收已验证
+## 当前：可选有界自动重连已验证
+
+- **最新源码 `e5ef46dab3254016ab1ec2ba2aba316f4d407b1e` 已推送并核验**：可选`config.reconnect`（须同时`cleanup_on_disconnect=true`；`max_attempts`1..16、`initial_delay_ms`1000..600000、`max_delay_ms`≤3600000，指数退避）：只有本manager原run完成实际Join与fence释放后，才对同一已存revision做一次全新start（新nonce/owner/登录/托管），不是token续期或会话恢复。仅disconnected/backend_unavailable/operation_timeout可重试；鉴权/托管拒绝、过期、revision/owner/存储错误不重试。自身HostingAck后重置计数；人工stop/start、replace/delete、关机取消或取代待执行重启；未启用supervisor时报`unsupervised`。`GET A`在策略存在时给出`reconnect_attempt`/`reconnect_state`/`reconnect_error`。跨新run的重投与原生一样是至少一次，不承诺exactly-once。
+- Build40517095074/Beta40517094859、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各749 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，445static/mock，67warnings保留，Release skipped；新增4项真实native（断线后单次全新run、鉴权拒绝不重试、失败次数耗尽、延迟期间stop取消/无supervisor）与1项配置回归实际通过。凭据续期仍为手工重新导入。
+
+## 前检查点：DIRECT 与 batch 长期接收已验证
 
 - **最新源码 `c6f0ba13bf2277910cc33834bcc1ea6fcd63f6b6` 已推送并核验**：DIRECT 使用原双180秒 magic 窗口、正序不复用RPC ID与独立pending/burst/字节限额；原响应实际write后mint replay frontier，当前line/revision/run lease下同事务清退已完成短信副本。batch仅在原受认证回包ACK承载结果的精确epoch后生成私有FIFO retirement，不凭`batch_queued`或外层成功回收。
 - batch保留稀疏已ACK身份与before-base前缀；前缀不越过pending request或working/unACKed result，乱序未见gap仍可交付。稀疏身份最多2048/account、8192全局，只按证明退休，不任意evict；DIRECT/batch各保最近128项已完成短信envelope，完整SMS及原通知处理策略保留，unknown/pending不容量清除。失败回收退休原scope，不重发已提交DIRECT ACK或已ACK batch result；最终原Join仅清对应nonce。
@@ -39,7 +44,7 @@
 | 独立账号 | `app_account` / `application_data`；私有参数导入、随机本地 line_id、revision CAS、显式 start/stop；不伪造 ICCID/UICC，不恢复 cached ready |
 | 原来电 | 原 receiver、64-bit native ID、owner/scope/run 关联的邀请、Inform/Accept/Release；SDK/hosting 接受不等于媒体就绪 |
 | 音频与 Trunk | 原 Endpoint TCP/TLS＋独立 Mpath media、实际本地 UDP、原 payload/peer 校验；全call watcher、应答/挂机/history/event和Join；先原driver处理结束事件再停Trunk |
-| 原运行清理 | `cleanup_on_disconnect`可选、defaultfalse；只清本manager退休run并保留原因/cleanup_error，不自动重连/renew，不猜未知进程退出 |
+| 原运行清理/重连 | `cleanup_on_disconnect`可选、defaultfalse；只清本manager退休run并保留原因/cleanup_error。另可选`reconnect`在清理完成后同revision全新start（有界、仅断线类错误）；不renew token，不猜未知进程退出 |
 | 接短信 | 精确 `Sip.Request` 严格文本分类；raw/SMS/事件/通知计划同事务 commit 后才回原 ticket；未知 kind/编码不猜 SMS/PDU |
 | 查询与通知 | 既有 SMS 历史、删除/逻辑 raw 清除、通知目标指纹与有界重试；删除或改同名目的地不重放/改投旧短信 |
 | 能力隔离 | Voice/Messaging 各自实时原 proof；汇总 available 不互授；排队 Connected 消费时重核原权限、版本/有效期和物理媒体 |
@@ -55,7 +60,7 @@
 - 媒体限原 raw `RseEx.SDP`、RTP/AVP sendrecv、RTCP-mux、匹配编码 RTP passthrough。须 `allow_plain_media=true` 和明确本地 bind IP；信令 TLS 不降级。压缩 SDP、SRTP、ICE/BUNDLE/P2P、转码及所有原生选路模式不假装支持。
 - `Client.Host/ArcPort` 可能是逻辑 Router 地址/端口，不是 OS UDP/RTP 目的地。原 raw SDP 分支存在，**不证明服务当前选择了这个分支**。
 - 可选断线清理20秒有界，与人工stop/关机同原run串行。history失败保lease、consumer/actor/媒体/Trunk原Join后才finalize；自动清理后GET账号保留终端原因与cleanup_error。运行期calls接口不从已release租约重获owner，已结束数据库历史保留。Trunk FIFO只确认本地driver处理/发送，不是远端ACK；发送不确定不能冒称成功。
-- 单连接/账号/队列仍有显式限额。DIRECT双180秒窗口/4096 burst与128 pending及原字节预算，batch32epoch/45秒未ACK与2048/account稀疏身份均有界；及时完成/ACK的已分类收件不再因终身累计128/512停止。低未完成gap、未知raw或过量burst仍可失败关闭；正常原run Join后回收已投影副本，保留SMS，不承诺无限磁盘、自动重连/续期或跨run exactly-once。未知prior-process owner不凭PID/年龄清除。
+- 单连接/账号/队列仍有显式限额。DIRECT双180秒窗口/4096 burst与128 pending及原字节预算，batch32epoch/45秒未ACK与2048/account稀疏身份均有界；及时完成/ACK的已分类收件不再因终身累计128/512停止。低未完成gap、未知raw或过量burst仍可失败关闭；正常原run Join后回收已投影副本，保留SMS，不承诺无限磁盘、token续期或跨run exactly-once；自动重连只按可选策略全新start。未知prior-process owner不凭PID/年龄清除。
 - 默认 locator/全部 Router-NetStream、自动续期、remote principal/device 全局租约及其他媒体组合是后续扩展；用户本轮没有要求实现付费外发。通知不能承诺远端 exactly-once，已发字节不可召回，删除不是 SQLite/WAL/备份物理擦除。
 - 真实账号/服务/媒体部署、网络条件、双向音频、通知目的地、有效期/并发和账单仍无验收证据；以后须明确授权及自有有效参数。当前不要求用户贴出秘密或安装新工具。
 
@@ -66,8 +71,8 @@
 ## 本轮软件交付与后续验收
 
 1. 基础接电话/应答/挂机/双向音频/Trunk、durable短信/查询删除/通知原ACK，以及新取消/批次缺口已有新SHA两Actions整链证据；不是仅codec或单个信令阶段。
-2. 公共收尾只更新原五手册，构建输入保持与已验 `c6f0ba1` 相同；文档不代表另一个二进制。后续改源码仍须新SHA执行/产物核验，原失败证据不能删去。
-3. DIRECT/batch长期接收已分别取得原protocol与durable回收证明，不能互用ACK或清除pending/unknown。自动重连、凭据更新、其他native/media模式与真实部署/账户/账单仍需独立设计/证据和授权；不把本次长收件增量称为这些扩展或整个实网目标已经完成，不复用失效Goal工具ID或旧设备授权。
+2. 公共收尾只更新原五手册，构建输入保持与已验 `e5ef46d` 相同；文档不代表另一个二进制。后续改源码仍须新SHA执行/产物核验，原失败证据不能删去。
+3. DIRECT/batch长期接收已分别取得原protocol与durable回收证明，不能互用ACK或清除pending/unknown。可选重连已由e5ef46d实现；凭据/token续期、其他native/media模式与真实部署/账户/账单仍需独立证据和授权；不把这些增量称为续期或整个实网目标已经完成，不复用失效Goal工具ID或旧设备授权。
 
 ## IMS 注册主线：历史软件基线保持
 
