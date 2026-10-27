@@ -252,7 +252,7 @@ impl CallService {
     async fn accept_original(self:&Arc<Self>,call:&Arc<Call>,answer:PlainAudioOffer)->Result<(),&'static str>{
         if !self.active(call){return Err(SCOPE);}let socket={let mut state=lock(&call.state);
             if state.phase!=Phase::Ringing{return Err(SCOPE);}state.phase=Phase::Accepting;state.socket.take().ok_or(SCOPE)?};
-        let address=socket.address(&call.ticket).ok_or(SCOPE)?;let body=answer.with_local_endpoint(&call.ticket,address).map_err(|error|error.code())?;
+        let address=socket.address(&call.ticket).ok_or(SCOPE)?;let body=call.offer.native_answer(&answer,&call.ticket,address).map_err(|error|error.code())?;
         let scope=call.ticket.connection_scope();let result=self.backend.call(call.ticket.owner(),&scope,&call.ticket,CallOperation::Accept,&[RpcProperty{key:b"RseEx.SDP",value:&body}]).await.map_err(call_error)?;
         if !result.accepted()||!self.active(call){return Err("app_account_call_rejected");}
         let plan=MediaEndpointPlan::prepare_mpath(&result,&call.ticket,self.settings.profile.clone()).map_err(|error|error.code())?;

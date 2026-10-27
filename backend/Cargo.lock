@@ -1918,6 +1918,7 @@ dependencies = [
  "chrono",
  "clap",
  "des",
+ "flate2",
  "futures-util",
  "hickory-resolver",
  "lazy_static",

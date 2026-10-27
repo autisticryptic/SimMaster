@@ -25,6 +25,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 hickory-resolver = { version = "0.25.2", default-features = false, features = ["tokio", "system-config"] }
 md5 = "0.7"
 base64 = "0.22.1"
+flate2 = "1.1.9"
 percent-encoding = "2.3.2"
 url = "2.5"
 ring = "0.17.14"

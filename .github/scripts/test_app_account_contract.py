@@ -698,5 +698,27 @@ class AppAccountContractTests(unittest.TestCase):
         for name in ['exited_lock_holder_run_is_released', 'live_lock_owner_blocks_second_claim', 'claim_after_a_local_start_is_refused']:
             self.assertIn(name, tests)
 
+    def test_native_sdp_zlib_base64_mirrors_original_invitation_without_relaxing_media_policy(self):
+        cargo = source('backend/Cargo.toml')
+        self.assertIn('flate2 = "1.1.9"', cargo)
+        sdp = (PROVIDER / 'native_audio_sdp.rs').read_text(encoding='utf-8')
+        for proof in ['enum NativeSdpWire { Raw, ZlibBase64 }', 'ZlibDecoder::new', 'ZlibEncoder::new',
+                      'STANDARD.decode(body)', 'URL_SAFE.decode(body)', 'inflater.total_in()',
+                      'MAX_NATIVE_SDP_WIRE', 'encode_native_sdp(raw, self.wire)']:
+            self.assertIn(proof, sdp)
+        self.assertLess(sdp.index('take((MAX_SDP + 1) as u64)'), sdp.index('plain.len() > MAX_SDP'))
+        for rejected in ['a=crypto:', 'a=fingerprint:', 'a=ice-', 'a=candidate:', 'a=group:']:
+            self.assertIn(rejected, sdp)
+        calls = (PROVIDER / 'account_calls.rs').read_text(encoding='utf-8')
+        self.assertIn('call.offer.native_answer(&answer,&call.ticket,address)', calls)
+        tests = (PROVIDER / 'native_audio_sdp_tests.rs').read_text(encoding='utf-8')
+        for name in ['native_zlib_base64_invitation_is_bounded_inflated',
+                     'native_url_safe_base64_is_accepted',
+                     'malformed_mixed_trailing_and_expanding_compressed_sdp_fail_closed',
+                     'security_attributes_remain_rejected_after_native_decompression']:
+            self.assertIn(name, tests)
+        actual = (PROVIDER / 'account_calls_tests.rs').read_text(encoding='utf-8')
+        self.assertIn('original_compressed_invitation_is_plain_for_operator_and_zlib_base64_again_for_native_accept', actual)
+
 if __name__ == '__main__':
     unittest.main()

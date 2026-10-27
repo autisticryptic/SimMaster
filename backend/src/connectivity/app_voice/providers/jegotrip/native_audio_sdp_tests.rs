@@ -1,8 +1,15 @@
-//! Actions-only strict native/trunk raw-SDP oracles. No sockets or readiness.
+//! Actions-only strict native/trunk raw and zlib+Base64 SDP oracles. No sockets
+//! or service readiness; fixed wire fixture is standard zlib level 6 output.
 use super::*;
 use super::super::{media_test_support::{accepted_context, CONTENT, ENDPOINT}, rpc_calls::{INVITED_METHOD, NativeCallId},
     rpc_envelope::RpcRequest, rpc_stream::{RpcProperty, Writer}, call_binding::CallIncomingBinding};
 const SDP: &[u8] = b"v=0\r\no=fixture 10 11 IN IP4 127.0.0.1\r\ns=fixture\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=sendrecv\r\na=rtcp-mux\r\n";
+const COMPRESSED_SDP: &[u8] = b"eJwrszXg5cq3TcusKCktSlUwNFAwNFTw9FPwDDBRMDQy1zMAQkNermKYCl6uZFtM6RJbAwWgObm2iaUpmfkKJgZAoBAUEqDvGBagYKBgwcuVaFtUUpCbWGBloBDg7BuqbwFUgSRqARJ1hIsWp+alFKUml0FUJBfo5pZW8HIBAMNyLRg=";
+const URL_SAFE_COMPRESSED_SDP: &[u8] = b"eJwrszXg5cq3TcusKCktSlUwNFAwNFTw9FPwDDBRMDQy1zMAQkNermKYCl6uZFtM6RJbAwWgObm2iaUpmfkKJgZAoBAUEqDvGBagYKBgwcuVaFtUUpCbWGBloBDg7BuqbwFUgSRqARJ1hIsWp-alFKUml0FUJBfo5pZW8HIBAMNyLRg=";
+fn inflate_wire(body: &[u8]) -> Vec<u8> {
+    let compressed = STANDARD.decode(body).unwrap(); let mut decoder = ZlibDecoder::new(compressed.as_slice()); let mut plain = Vec::new();
+    decoder.read_to_end(&mut plain).unwrap(); assert_eq!(decoder.total_in() as usize, compressed.len()); plain
+}
 fn notice(rpc: &super::super::arc_session::ArcRpcSession, ticket: &CallControlTicket, sdp: &[u8]) -> OwnedCallNotice {
     let dispatcher = rpc.incoming_call_dispatcher(CallIncomingBinding { object_id: b"#fixture-call-client", domain: b"fixture-domain" }).unwrap();
     let mut data = Writer::versioned().unwrap(); data.u64(ticket.native_id().expose_to_backend()).unwrap(); data.bytes(b"fixture-peer").unwrap();
@@ -18,7 +25,49 @@ fn original_native_rse_sdp_only_is_accepted_without_using_its_network_address_as
     assert_eq!(offer.endpoint().unwrap(), "127.0.0.1:40000".parse().unwrap());
     assert_eq!(offer.description.codecs.len(), 2);
     assert_eq!(offer.description.codecs[0].payload_type, 0); assert_eq!(offer.description.codecs[1].payload_type, 8);
+    let answer = PlainAudioOffer::trunk(SDP, true).unwrap(); let raw = offer.native_answer(&answer, &ticket, "127.0.0.1:49151".parse().unwrap()).unwrap();
+    assert!(raw.starts_with(b"v=0\r\n"), "raw invitation keeps raw native reply");
     assert_eq!(ticket.native_id(), NativeCallId::from_bits(super::super::media_test_support::NATIVE_ID));
+}
+#[test]
+fn native_zlib_base64_invitation_is_bounded_inflated_and_answer_mirrors_standard_padded_wire() {
+    let (rpc, _, _, ticket, _) = accepted_context(ENDPOINT, CONTENT); let notice = notice(&rpc, &ticket, COMPRESSED_SDP);
+    let offer = PlainAudioOffer::native(&notice, &ticket, true).unwrap();
+    assert_eq!(offer.endpoint().unwrap(), "127.0.0.1:40000".parse().unwrap());
+    let local: SocketAddr = "127.0.0.1:49152".parse().unwrap();
+    let sip = offer.with_local_endpoint(&ticket, local).unwrap(); assert!(sip.starts_with(b"v=0\r\n"), "Trunk/UI see plain SDP");
+    let answer = PlainAudioOffer::trunk(&sip, true).unwrap();
+    let native = offer.native_answer(&answer, &ticket, local).unwrap();
+    assert!(!native.starts_with(b"v=0")); assert_eq!(native.len() % 4, 0); assert!(!native.iter().any(|byte| matches!(byte, b'-' | b'_')));
+    let decoded = inflate_wire(&native); let text = std::str::from_utf8(&decoded).unwrap();
+    assert!(text.contains("m=audio 49152 RTP/AVP 0 8")); assert!(text.contains("a=rtcp-mux\r\n"));
+}
+#[test]
+fn native_url_safe_base64_is_accepted_but_reply_uses_original_standard_alphabet_policy() {
+    let (rpc, _, _, ticket, _) = accepted_context(ENDPOINT, CONTENT); let notice = notice(&rpc, &ticket, URL_SAFE_COMPRESSED_SDP);
+    let offer = PlainAudioOffer::native(&notice, &ticket, true).unwrap(); let answer = PlainAudioOffer::trunk(SDP, true).unwrap();
+    let native = offer.native_answer(&answer, &ticket, "127.0.0.1:49153".parse().unwrap()).unwrap();
+    assert!(!native.iter().any(|byte| matches!(byte, b'-' | b'_'))); assert!(inflate_wire(&native).starts_with(b"v=0\r\n"));
+}
+#[test]
+fn malformed_mixed_trailing_and_expanding_compressed_sdp_fail_closed_before_call_admission() {
+    let (rpc, _, _, ticket, _) = accepted_context(ENDPOINT, CONTENT);
+    let mut mixed = URL_SAFE_COMPRESSED_SDP.to_vec(); let at = mixed.iter().position(|byte| *byte == b'-').unwrap(); mixed[at + 1] = b'/';
+    let not_zlib = STANDARD.encode(SDP); let mut trailing = STANDARD.decode(COMPRESSED_SDP).unwrap(); trailing.push(0); let trailing = STANDARD.encode(trailing);
+    for wire in [mixed, not_zlib.into_bytes(), trailing.into_bytes()] {
+        let notice = notice(&rpc, &ticket, &wire); assert_eq!(PlainAudioOffer::native(&notice, &ticket, true).err(), Some(MediaError::Protocol));
+    }
+    let oversized_plain = vec![b'x'; MAX_SDP + 1]; let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&oversized_plain).unwrap(); let bomb = STANDARD.encode(encoder.finish().unwrap());
+    let notice = notice(&rpc, &ticket, bomb.as_bytes()); assert_eq!(PlainAudioOffer::native(&notice, &ticket, true).err(), Some(MediaError::Protocol));
+    let too_large = vec![b'A'; MAX_NATIVE_SDP_WIRE + (4 - MAX_NATIVE_SDP_WIRE % 4)];
+    let notice = notice(&rpc, &ticket, &too_large); assert_eq!(PlainAudioOffer::native(&notice, &ticket, true).err(), Some(MediaError::Configuration));
+}
+#[test]
+fn security_attributes_remain_rejected_after_native_decompression() {
+    let (rpc, _, _, ticket, _) = accepted_context(ENDPOINT, CONTENT); let mut secure = SDP.to_vec(); secure.extend_from_slice(b"a=crypto:1 fixture\r\n");
+    let raw = Zeroizing::new(secure); let wire = encode_native_sdp(raw, NativeSdpWire::ZlibBase64).unwrap(); let notice = notice(&rpc, &ticket, &wire);
+    assert_eq!(PlainAudioOffer::native(&notice, &ticket, true).err(), Some(MediaError::Configuration));
 }
 #[test]
 fn caller_supplied_other_owner_same_numeric_call_cannot_borrow_original_offer_or_restore_revoked_ticket() {

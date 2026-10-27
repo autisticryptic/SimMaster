@@ -155,7 +155,7 @@ pub fn contract() -> CredentialContract {
             automatic_cleanup_supported: true, automatic_reconnect_implemented: true,
             implemented_operations: super::BASIC_INBOUND_OPERATIONS.iter().map(|operation| operation.as_str()).collect(),
             media_transport: "endpoint_tcp_mpath",
-            media_profile: "raw_rse_sdp_rtp_avp_rtcp_mux_passthrough",
+            media_profile: "raw_or_zlib_base64_rse_sdp_rtp_avp_rtcp_mux_passthrough",
             plain_media_opt_in_required: true,
             outbound_call_implemented: false, outbound_message_implemented: false,
             default_sdk_client_implemented: false,

@@ -1,28 +1,41 @@
 //! Strict basic incoming-audio SDP preflight over the native RseEx.SDP field.
-//! Native 5FA47C/60ED60 have an explicit raw-SDP branch. This module supports
-//! that branch only; compressed SDP, crypto, ICE/BUNDLE/video are not guessed.
+//! Native 613140/5FA164/60ED60 detect Base64 invitations, decode then zlib-
+//! inflate them; 5FA47C mirrors that invitation format with zlib+standard
+//! padded Base64. Raw invitations remain raw. This wire wrapper never relaxes
+//! the plain RTP/AVP SDP policy below, and is unrelated to ARC packet kinds.
 //! Native SDP network addresses never authorize a Jegotrip UDP destination.
 use super::{call_binding::OwnedCallNotice, call_control::CallControlTicket, media_endpoint::MediaError};
 use crate::connectivity::core::voice::{parse_audio_sdp, MediaDirection, MediaTransportKind, SdpAddrType, SdpAudioDescription};
-use std::{collections::BTreeSet, fmt, net::{IpAddr, SocketAddr}};
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE}, Engine};
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use std::{collections::BTreeSet, fmt, io::{Read, Write}, net::{IpAddr, SocketAddr}};
 use zeroize::Zeroizing;
 const MAX_SDP: usize = 16_384;
+// zlib's bounded overhead plus padded Base64 for MAX_SDP fits below this. Keep
+// an independent wire cap before allocation, then cap inflated output again.
+const MAX_NATIVE_SDP_WIRE: usize = (MAX_SDP + 66) / 3 * 4;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeSdpWire { Raw, ZlibBase64 }
 #[derive(Clone)]
 struct EventCodec { payload: u8, clock: u32, fmtp: Option<String> }
-pub(super) struct PlainAudioOffer { description: SdpAudioDescription, events: Vec<EventCodec> }
+pub(super) struct PlainAudioOffer { description: SdpAudioDescription, events: Vec<EventCodec>, wire: NativeSdpWire }
 impl fmt::Debug for PlainAudioOffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("PlainAudioOffer(<redacted>)") }
 }
 impl PlainAudioOffer {
     pub(super) fn native(notice: &OwnedCallNotice, ticket: &CallControlTicket, plain_media_enabled: bool) -> Result<Self, MediaError> {
         if !ticket.is_live() || notice.kind() != super::rpc_calls::CallNoticeKind::Invited || notice.native_id() != ticket.native_id() { return Err(MediaError::Scope); }
+        if !plain_media_enabled { return Err(MediaError::Configuration); }
         let data = notice.data_for(ticket.owner(), &ticket.connection_scope()).ok_or(MediaError::Scope)?;
         let raw = data.properties.iter().find(|property| property.key == b"RseEx.SDP").ok_or(MediaError::MissingProperty)?.value;
-        Self::parse(raw, plain_media_enabled, false)
+        let (body, wire) = decode_native_sdp(raw)?;
+        Self::parse(&body, true, false, wire)
     }
-    pub(super) fn trunk(body: &[u8], plain_media_enabled: bool) -> Result<Self, MediaError> { Self::parse(body, plain_media_enabled, true) }
-    fn parse(body: &[u8], enabled: bool, trunk: bool) -> Result<Self, MediaError> {
+    pub(super) fn trunk(body: &[u8], plain_media_enabled: bool) -> Result<Self, MediaError> {
+        Self::parse(body, plain_media_enabled, true, NativeSdpWire::Raw)
+    }
+    fn parse(body: &[u8], enabled: bool, trunk: bool, wire: NativeSdpWire) -> Result<Self, MediaError> {
         if !enabled || body.is_empty() || body.len() > MAX_SDP { return Err(MediaError::Configuration); }
         let text = std::str::from_utf8(body).map_err(|_| MediaError::Protocol)?;
         if !text.starts_with("v=0\r\n") || text.bytes().any(|byte| byte == 0 || byte < 32 && byte != b'\r' && byte != b'\n') {
@@ -80,7 +93,7 @@ impl PlainAudioOffer {
         // The current relay supports RTP/RTCP-mux only. Preserve this explicit
         // restriction instead of silently forwarding separate RTCP/crypto.
         if trunk && !lines.contains(&"a=rtcp-mux") { return Err(MediaError::Configuration); }
-        Ok(Self { description, events })
+        Ok(Self { description, events, wire })
     }
     pub(super) fn restrict(mut self, allow: &[String]) -> Result<Self, MediaError> {
         if !allow.is_empty() {
@@ -95,6 +108,17 @@ impl PlainAudioOffer {
         Ok(SocketAddr::new(address, self.description.media_port))
     }
     pub(super) fn with_local_endpoint(&self, ticket: &CallControlTicket, local: SocketAddr) -> Result<Zeroizing<Vec<u8>>, MediaError> {
+        self.render_local_endpoint(ticket, local)
+    }
+    /// Render the selected (usually SIP/HTTP) answer, then wrap it exactly as
+    /// the original native invitation was wrapped. A Trunk answer never grants
+    /// permission to choose a native wire mode itself.
+    pub(super) fn native_answer(&self, answer: &Self, ticket: &CallControlTicket, local: SocketAddr)
+        -> Result<Zeroizing<Vec<u8>>, MediaError> {
+        let raw = answer.render_local_endpoint(ticket, local)?;
+        encode_native_sdp(raw, self.wire)
+    }
+    fn render_local_endpoint(&self, ticket: &CallControlTicket, local: SocketAddr) -> Result<Zeroizing<Vec<u8>>, MediaError> {
         if !ticket.is_live() { return Err(MediaError::Scope); }
         if local.port() == 0 || local.ip().is_unspecified() || local.ip().is_multicast() { return Err(MediaError::Configuration); }
         let mut description = self.description.clone();
@@ -132,6 +156,43 @@ impl PlainAudioOffer {
         }
         if payloads.is_empty() { return Err(MediaError::Configuration); } Ok(payloads)
     }
+}
+
+/// Mirror native 5FA164's selection: nonempty, whole-quartet Base64 grammar is
+/// the compressed branch. The actual decoder then validates padding and zlib.
+fn decode_native_sdp(body: &[u8]) -> Result<(Zeroizing<Vec<u8>>, NativeSdpWire), MediaError> {
+    if body.is_empty() || body.len() > MAX_NATIVE_SDP_WIRE { return Err(MediaError::Configuration); }
+    let standard = body.iter().any(|byte| matches!(byte, b'+' | b'/'));
+    let url_safe = body.iter().any(|byte| matches!(byte, b'-' | b'_'));
+    let base64_grammar = body.len() % 4 == 0 && body.iter().all(|byte|
+        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_' | b'='));
+    if !base64_grammar {
+        if body.len() > MAX_SDP { return Err(MediaError::Configuration); }
+        return Ok((Zeroizing::new(body.to_vec()), NativeSdpWire::Raw));
+    }
+    if standard && url_safe { return Err(MediaError::Protocol); }
+    let decoded = if url_safe { URL_SAFE.decode(body) } else { STANDARD.decode(body) }
+        .map(Zeroizing::new).map_err(|_| MediaError::Protocol)?;
+    if decoded.is_empty() { return Err(MediaError::Protocol); }
+    let mut inflater = ZlibDecoder::new(decoded.as_slice());
+    let mut plain = Zeroizing::new(Vec::with_capacity(MAX_SDP.min(decoded.len().saturating_mul(4))));
+    {
+        let mut bounded = inflater.by_ref().take((MAX_SDP + 1) as u64);
+        bounded.read_to_end(&mut plain).map_err(|_| MediaError::Protocol)?;
+    }
+    if plain.len() > MAX_SDP || inflater.total_in() as usize != decoded.len() { return Err(MediaError::Protocol); }
+    Ok((plain, NativeSdpWire::ZlibBase64))
+}
+
+fn encode_native_sdp(raw: Zeroizing<Vec<u8>>, wire: NativeSdpWire) -> Result<Zeroizing<Vec<u8>>, MediaError> {
+    if wire == NativeSdpWire::Raw { return Ok(raw); }
+    if raw.is_empty() || raw.len() > MAX_SDP { return Err(MediaError::Configuration); }
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&raw).map_err(|_| MediaError::Protocol)?;
+    let compressed = Zeroizing::new(encoder.finish().map_err(|_| MediaError::Protocol)?);
+    let encoded = Zeroizing::new(STANDARD.encode(compressed.as_slice()).into_bytes());
+    if encoded.len() > MAX_NATIVE_SDP_WIRE { return Err(MediaError::Configuration); }
+    Ok(encoded)
 }
 #[cfg(test)]
 #[path = "native_audio_sdp_tests.rs"]

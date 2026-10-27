@@ -7,7 +7,9 @@ use super::super::{account_runtime::AccountManager,account_test_support::{TempDa
     rpc_calls::encode_notice_result,rpc_envelope::{decode_reply,decode_request},rpc_stream::Reader,
     tcp_mpath::{self,Input as MpathInput},tls_engine::tests::Certificates,transport_packets::CallKind};
 use crate::connectivity::app_voice::registry::{ProviderAvailability, ProviderRegistry, VoiceCapability};
-use std::time::Duration;
+use base64::{engine::general_purpose::STANDARD, Engine};
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use std::{io::{Read, Write}, time::Duration};
 use tokio::{net::{TcpListener,UdpSocket},sync::oneshot};
 use tokio_rustls::rustls;
 async fn bounded<F:Future>(future:F)->F::Output{tokio::time::timeout(Duration::from_secs(8),future).await.expect("bounded original account call fixture")}
@@ -15,6 +17,8 @@ async fn ready(manager:&AccountManager,line:&str){bounded(async{loop{if manager.
 async fn phase(manager:&AccountManager,line:&str,id:&str,expected:&str)->CallView{bounded(async{loop{let view=manager.call(line,id).await.unwrap();if view.phase==expected{return view;}tokio::task::yield_now().await;}}).await}
 async fn first_call(manager:&AccountManager,line:&str)->CallView{bounded(async{loop{let calls=manager.calls(line).await.unwrap();if let Some(call)=calls.into_iter().next(){if call.phase=="ringing"{return call;}}tokio::task::yield_now().await;}}).await}
 fn rtp(sequence:u16,fill:u8)->Vec<u8>{let mut packet=vec![0x80,0,0,0,0,0,0,160,0x12,0x34,0x56,0x78];packet[2..4].copy_from_slice(&sequence.to_be_bytes());packet.resize(173,fill);packet}
+fn compressed_sdp(input:&[u8])->Vec<u8>{let mut encoder=ZlibEncoder::new(Vec::new(),Compression::default());encoder.write_all(input).unwrap();STANDARD.encode(encoder.finish().unwrap()).into_bytes()}
+fn inflated_sdp(input:&[u8])->Vec<u8>{let compressed=STANDARD.decode(input).unwrap();let mut decoder=ZlibDecoder::new(compressed.as_slice());let mut plain=Vec::new();decoder.read_to_end(&mut plain).unwrap();plain}
 async fn receipt(peer:&mut super::super::runtime_backend::tests::Peer,id:i32,accepted:bool){let packet=next_non_poll(peer).await;assert_eq!(packet.kind,CallKind::Reply);
     let reply=decode_reply(packet.payload.expose_to_transport()).unwrap();assert_eq!(reply.call_id,id);assert_eq!(reply.result_stream,encode_notice_result(CallNoticeKind::Invited,accepted,&[]).unwrap().expose_to_transport());}
 fn original_endpoint(wire:&[u8]){let request=decode_request(wire).unwrap();assert_eq!(request.method,b"connect.Endpoint.Endpoint");let mut reader=Reader::versioned(request.arguments).unwrap();
@@ -73,6 +77,26 @@ async fn positive(operator_commands:bool){
 async fn account_api_answer_original_sdk_mpath_both_audio_directions_history_and_hangup_join(){positive(false).await;}
 #[tokio::test]
 async fn original_operator_trunk_commands_answer_hangup_same_call_with_real_bidirectional_audio(){positive(true).await;}
+#[tokio::test]
+async fn original_compressed_invitation_is_plain_for_operator_and_zlib_base64_again_for_native_accept(){
+    let temp=TempDatabase::new();let factory=Arc::new(QueuedFactory::default());let sdk=Certificates::generate("DNS:fixture.invalid");let media=Certificates::generate("IP:127.0.0.1");
+    let(mut peer,_,dropped)=sdk_peer(&sdk,&factory);let manager=AccountManager::with_factory(temp.database.clone(),factory);
+    let account=manager.create(call_config(&sdk.root,&media.root),100).await.unwrap().account;let(go,invite)=oneshot::channel();let(wire,observed)=oneshot::channel();let(done,stop)=oneshot::channel();
+    let offered=compressed_sdp(&sdp("127.0.0.1:5006".parse().unwrap()));
+    let sdk_task=tokio::spawn(async move{bounded(async move{peer.authenticate().await;peer.swap(Some(4),true).await;invite.await.unwrap();
+        notice(&mut peer,CallNoticeKind::Invited,101,&offered,b"fixture-domain").await;receipt(&mut peer,101,true).await;
+        let(id,_)=operation(&mut peer,CallOperation::Inform).await;reply_operation(&mut peer,id,CallOperation::Inform,true,None).await;
+        let(id,answer)=operation(&mut peer,CallOperation::Accept).await;wire.send(answer).unwrap();reply_operation(&mut peer,id,CallOperation::Accept,false,None).await;
+        let(id,_)=operation(&mut peer,CallOperation::Release).await;reply_operation(&mut peer,id,CallOperation::Release,true,None).await;
+        stop.await.unwrap();finish_sdk(peer).await;}).await});
+    bounded(manager.start(&account.line_id,account.revision,100)).await.unwrap();ready(&manager,&account.line_id).await;go.send(()).unwrap();let call=first_call(&manager,&account.line_id).await;
+    let public=call.sdp.as_ref().unwrap();assert!(public.starts_with("v=0\r\n"));assert!(PlainAudioOffer::trunk(public.as_bytes(),true).is_ok());
+    assert_eq!(bounded(manager.answer_call(&account.line_id,account.revision,&call.id,sdp("127.0.0.1:5008".parse().unwrap()),100)).await.err(),Some("app_account_call_rejected"));
+    let native=bounded(observed).await.unwrap();assert!(!native.starts_with(b"v=0"));assert_eq!(native.len()%4,0);
+    let plain=inflated_sdp(&native);let parsed=PlainAudioOffer::trunk(&plain,true).unwrap();assert_ne!(parsed.endpoint().unwrap(),"127.0.0.1:5008".parse().unwrap());
+    assert_eq!(phase(&manager,&account.line_id,&call.id,"ended").await.phase,"ended");
+    done.send(()).unwrap();bounded(manager.stop(&account.line_id,account.revision,100)).await.unwrap();bounded(sdk_task).await.unwrap();assert!(dropped.load(Ordering::SeqCst));
+}
 #[tokio::test]
 async fn unsupported_native_crypto_is_refused_on_original_receipt_before_history_inform_or_media(){
     let temp=TempDatabase::new();let factory=Arc::new(QueuedFactory::default());let sdk=Certificates::generate("DNS:fixture.invalid");let media=Certificates::generate("IP:127.0.0.1");
