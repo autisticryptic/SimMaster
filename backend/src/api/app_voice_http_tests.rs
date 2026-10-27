@@ -50,7 +50,7 @@ mod app_voice_accounts {
         assert_eq!(basic["automatic_cleanup_supported"], true); assert_eq!(basic["automatic_reconnect_implemented"], true);
         assert_eq!(basic["outbound_call_implemented"], false); assert_eq!(basic["outbound_message_implemented"], false);
         assert_eq!(basic["media_transport"], "endpoint_tcp_mpath");
-        assert_eq!(basic["media_profile"], "raw_rse_sdp_rtp_avp_rtcp_mux_passthrough");
+        assert_eq!(basic["media_profile"], "raw_or_zlib_base64_rse_sdp_rtp_avp_rtcp_mux_passthrough");
         assert_eq!(basic["implemented_operations"], serde_json::json!(["incoming_call", "answer_call", "hangup_call", "bidirectional_audio",
             "incoming_message", "message_history", "message_notification", "incoming_trunk"]));
         assert_eq!(contract["direct_sip_interoperability"], "unverified");
