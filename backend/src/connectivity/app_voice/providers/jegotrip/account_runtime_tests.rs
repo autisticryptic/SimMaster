@@ -19,6 +19,8 @@ mod maintenance_native;
 mod auto_cleanup;
 #[path = "account_long_reception_tests.rs"]
 mod long_direct;
+#[path = "account_long_batch_tests.rs"]
+mod long_batch;
 
 async fn phase(manager: &AccountManager, line: &str, wanted: &str) -> AccountView {
     tokio::time::timeout(Duration::from_secs(4), async {

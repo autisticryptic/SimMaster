@@ -55,7 +55,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), &'static str> {
         ("receiver_kind", "ALTER TABLE app_voice_inbox ADD COLUMN receiver_kind BLOB")] {
         if !columns.iter().any(|existing| existing == column) { conn.execute(statement, []).map_err(|_| STORAGE)?; }
     }
-    Ok(())
+    super::batch_retention::initialize_schema(conn)
 }
 fn valid_nonce(nonce: &str) -> bool {
     nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -155,6 +155,8 @@ impl InboxScope {
                     WHERE line_id=?1 AND revision=?2 AND run_nonce=?3 AND through_sequence>=?4)",
                     params![self.line_id,self.revision as i64,self.nonce,sequence], |row| row.get(0)).map_err(|_| STORAGE)?;
                 if retired { return Err("app_account_inbox_direct_retired"); }
+            } else if super::batch_retention::retired(&tx,&self.line_id,self.revision,&self.nonce,epoch,sequence)? {
+                return Err("app_account_inbox_batch_retired");
             }
             let (local,completed,total,stored): (i64,i64,i64,i64) = tx.query_row("SELECT
                 COALESCE(SUM(line_id=?1 AND (reply_state='pending' OR NOT EXISTS(SELECT 1 FROM app_voice_sms_projection p

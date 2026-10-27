@@ -6,6 +6,7 @@
 //! HTTP/SIP transport is provided. A real backend must implement the SDK path
 //! before this provider can be installed as available.
 pub mod batch_scheduler;
+mod batch_retention;
 pub mod arc_protocol;
 mod direct_history;
 #[cfg(test)]

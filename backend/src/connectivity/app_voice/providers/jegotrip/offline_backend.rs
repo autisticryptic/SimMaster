@@ -40,6 +40,7 @@ pub enum OfflineEvent {
     Callback(OwnedRpcCallback),
     Message(ScheduledIncomingMessage),
     DirectMessage(IncomingProtocolMessage),
+    BatchRetirement(super::batch_scheduler::BatchReplayRetirement),
     Call(IncomingCallDelivery),
     CallOperation(OwnedCallOperationReply),
     Outgoing(OwnedCallPackets),
@@ -194,10 +195,11 @@ impl OfflineBackend {
                 ProtocolEvent::Reply(ArcReply::Swap(reply)) => {
                     swaps.remove(&reply.call_id());
                     let Some(scheduler) = scheduler.as_mut() else { processing_error = Some(ProtocolError::Rpc(CodecError::InvalidField)); return; };
-                    let delivery = match scheduler.on_reply(&reply, now_ms) {
+                    let mut delivery = match scheduler.on_reply(&reply, now_ms) {
                         Ok(Some(delivery)) => delivery, Ok(None) => return,
                         Err(error) => { processing_error = Some(error.into()); return; }
                     };
+                    let retirement = delivery.retirement.take();
                     for callback in tracker.on_scheduled_delivery(&delivery) { events.push(OfflineEvent::Callback(callback)); }
                     for reply in tracker.take_unhosting_replies() { events.push(OfflineEvent::Unhosting(reply)); }
                     for incoming in delivery.requests {
@@ -236,6 +238,7 @@ impl OfflineBackend {
                             }
                         }
                     }
+                    if let Some(retirement) = retirement { events.push(OfflineEvent::BatchRetirement(retirement)); }
                 }
                 ProtocolEvent::Reply(ArcReply::Logout(reply)) => events.push(OfflineEvent::Logout(reply)),
                 ProtocolEvent::Reply(ArcReply::Call(reply))=>events.push(OfflineEvent::CallOperation(reply)),

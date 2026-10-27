@@ -175,9 +175,29 @@ impl fmt::Debug for IncomingBatchRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("IncomingBatchRequest(<redacted>)") }
 }
 
+/// Original authenticated ACK of result-bearing epochs plus a safe before-base
+/// prefix. Neither a queued result nor an outer RPC success can mint this.
+/// Private, non-serializable and inseparable from the original scheduler scope.
+pub(super) struct BatchReplayRetirement {
+    owner: AttemptOwner, connection: RpcConnectionScope,
+    peer_incarnation: u32, through: i32, acknowledged: Vec<i32>,
+}
+impl BatchReplayRetirement {
+    pub(super) fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
+        &self.owner == owner && self.connection.matches(scope) && scope.is_open()
+    }
+    pub(super) fn peer_incarnation(&self) -> u32 { self.peer_incarnation }
+    pub(super) fn through(&self) -> i32 { self.through }
+    pub(super) fn acknowledged(&self) -> &[i32] { &self.acknowledged }
+}
+impl fmt::Debug for BatchReplayRetirement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("BatchReplayRetirement(<redacted>)") }
+}
+
 pub struct BatchDelivery {
     pub requests: Vec<IncomingBatchRequest>,
     pub matched_result_sequences: Vec<i32>,
+    pub(super) retirement: Option<BatchReplayRetirement>,
     owner: AttemptOwner,
     connection: RpcConnectionScope,
     results: BTreeMap<i32, ResultData>,
@@ -246,6 +266,7 @@ pub struct BatchScheduler {
     peer_next: u32,
     peer_batches: u32,
     dedup: DedupWindow,
+    retired_through: i32,
     closed: bool,
 }
 
@@ -265,7 +286,7 @@ impl BatchScheduler {
             next_serial: Some(1), prepared: None, clock_ms: 0, history: BTreeMap::new(), working: Bucket::default(),
             pending_client: BTreeSet::new(), submitted_client: BTreeSet::new(),
             last_client_sequence: 0, pending_server: BTreeMap::new(),
-            peer_incarnation: None, peer_next: 0, peer_batches: 0, dedup: DedupWindow::default(), closed: false })
+            peer_incarnation: None, peer_next: 0, peer_batches: 0, dedup: DedupWindow::default(), retired_through: 0, closed: false })
     }
 
     pub fn is_open(&self) -> bool { !self.closed && self.connection.is_open() }
@@ -448,9 +469,14 @@ impl BatchScheduler {
             || fresh.iter().any(|(sequence, _)| self.pending_server.contains_key(sequence)) {
             return self.fail(BatchError::Backpressure);
         }
+        let mut acknowledged = BTreeSet::new();
         if words.ack_incarnation == self.local_incarnation {
             for bit in 0..32 {
-                if words.ack_batches & (1u32 << bit) != 0 { self.history.remove(&(words.ack_next_batch - 1 - bit)); }
+                if words.ack_batches & (1u32 << bit) != 0 {
+                    if let Some(epoch) = self.history.remove(&(words.ack_next_batch - 1 - bit)) {
+                        acknowledged.extend(epoch.bucket.results.keys().copied());
+                    }
+                }
             }
         }
         self.ensure_retention(now_ms)?;
@@ -477,7 +503,20 @@ impl BatchScheduler {
         let matched_result_sequences = results.keys().copied().collect();
         // Native epoch history holds immutable original calls until ACK/retention;
         // even an AgentCall result does not itself change the six ACK words.
-        Ok(Some(BatchDelivery { requests, matched_result_sequences, results,
+        // Before-base IDs can never re-enter this safe subset, but do not
+        // overtake an original pending request or unACKed result. Exact ACKed
+        // sparse IDs above the prefix stay independently retired in storage.
+        let blocking = self.pending_server.keys().chain(self.working.results.keys())
+            .chain(self.history.values().flat_map(|epoch| epoch.bucket.results.keys())).copied().min();
+        let through = (self.dedup.base.saturating_sub(1) as i32)
+            .min(blocking.map_or(i32::MAX, |sequence| sequence.saturating_sub(1)));
+        let retirement = if through > self.retired_through || !acknowledged.is_empty() {
+            self.retired_through = self.retired_through.max(through);
+            Some(BatchReplayRetirement { owner: self.owner.clone(), connection: self.connection.clone(),
+                peer_incarnation: words.incarnation, through: self.retired_through,
+                acknowledged: acknowledged.into_iter().collect() })
+        } else { None };
+        Ok(Some(BatchDelivery { requests, matched_result_sequences, retirement, results,
             owner: self.owner.clone(), connection: self.connection.clone() }))
     }
 

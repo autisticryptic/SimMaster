@@ -587,5 +587,55 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('no_protocol_frontier_keeps_classified_envelopes', sql)
 
 
+    def test_batch_retirement_requires_exact_ack_and_preserves_pending_gaps(self):
+        scheduler = (PROVIDER / 'batch_scheduler.rs').read_text(encoding='utf-8')
+        self.assertIn('acknowledged.extend(epoch.bucket.results.keys().copied())', scheduler)
+        self.assertIn('words.ack_next_batch - 1 - bit', scheduler)
+        self.assertIn('self.pending_server.keys().chain(self.working.results.keys())', scheduler)
+        self.assertIn('self.history.values().flat_map(|epoch| epoch.bucket.results.keys())', scheduler)
+        self.assertIn('self.dedup.base.saturating_sub(1)', scheduler)
+        self.assertIn('sequence.saturating_sub(1)', scheduler)
+        self.assertIn('through > self.retired_through || !acknowledged.is_empty()', scheduler)
+        backend = (PROVIDER / 'offline_backend.rs').read_text(encoding='utf-8')
+        self.assertLess(backend.index('scheduler.on_reply(&reply'), backend.index('delivery.retirement.take()'))
+        self.assertIn('events.push(OfflineEvent::BatchRetirement(retirement))', backend)
+        for filename in ['beta-validation.yml', 'build-release.yml']:
+            workflow = (ROOT / '.github' / 'workflows' / filename).read_text(encoding='utf-8')
+            self.assertIn('connectivity::app_voice::providers::jegotrip::batch_retention::tests', workflow)
+
+    def test_batch_sparse_gc_is_original_leased_atomic_and_not_direct_or_unknown_eviction(self):
+        retention = (PROVIDER / 'batch_retention.rs').read_text(encoding='utf-8')
+        for guard in ['proof.matches(owner,scope)', 'account.revision!=revision', 'account_runs::require_live',
+                      'app_voice_runtime_leases', 'proof.acknowledged()', 'MAX_SPARSE_PER_ACCOUNT: i64 = 2048',
+                      'MAX_SPARSE_TOTAL: i64 = 8192', "i.source_kind='batch' AND i.reply_state='batch_queued'",
+                      'app_voice_sms_projection', 'ORDER BY i.id DESC LIMIT -1 OFFSET 128']:
+            self.assertIn(guard, retention)
+        self.assertLess(retention.index('Transaction::new_unchecked'), retention.index('UPDATE app_voice_sms_projection'))
+        self.assertLess(retention.index('INSERT OR IGNORE INTO app_voice_batch_replay_ids'), retention.index('DELETE FROM app_voice_inbox'))
+        inbox = (PROVIDER / 'account_inbox.rs').read_text(encoding='utf-8')
+        self.assertLess(inbox.index('if let Some((id, matches)) = existing'), inbox.index('batch_retention::retired'))
+        runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
+        self.assertIn('BackendEventPayload::BatchRetirement(proof)', runtime)
+        self.assertIn('super::batch_retention::apply', runtime)
+        self.assertIn('*lock(&run.error)=Some(code);run.retire()', runtime)
+        runs = (PROVIDER / 'account_runs.rs').read_text(encoding='utf-8')
+        self.assertIn('batch_retention::delete_run(&tx,&token.line,token.revision,&token.nonce)', runs)
+
+    def test_batch_long_reception_regressions_use_same_actor_and_ack_before_gc(self):
+        sql = (PROVIDER / 'batch_retention_tests.rs').read_text(encoding='utf-8')
+        for name in ['rolling_2300_batch_sms', 'sparse_original_deleted_ticket', 'failed_post_ack_compaction',
+                     'foreign_closed_revision_or_missing_lease', 'unknown_and_pending_direct', 'sparse_retention_pressure']:
+            self.assertIn(name, sql)
+        tests = (PROVIDER / 'account_long_batch_tests.rs').read_text(encoding='utf-8')
+        self.assertIn('receive(&mut peer,600', tests)
+        self.assertIn('receive(&mut peer,129', tests)
+        self.assertIn('original result bytes follow raw/SMS/event commit', tests)
+        self.assertIn('already ACKed result must not be transmitted again', tests)
+        self.assertIn('inbox_nonce,nonce', tests)
+        self.assertIn('connector.connection_calls(),1', tests)
+        self.assertIn('factory.build_count(),1', tests)
+        self.assertIn('DROP TRIGGER fail_live_batch_gc', tests)
+
+
 if __name__ == '__main__':
     unittest.main()

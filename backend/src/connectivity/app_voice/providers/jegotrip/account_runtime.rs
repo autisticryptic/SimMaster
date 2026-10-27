@@ -760,6 +760,16 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                         if reason != BackendFailure::Disconnected || error.is_none() { *error = Some(failure_code(reason)); }
                         drop(error); run.retire();
                     }
+                    BackendEventPayload::BatchRetirement(proof) => {
+                        controller.tick(unix_now(), Instant::now());
+                        if controller.phase()!=Phase::Hosted || !run.accepting.load(Ordering::SeqCst) { continue; }
+                        // Same original consumer FIFO as the durable commit and
+                        // queued result. This event never emits another ACK.
+                        if let Err(code)=super::batch_retention::apply(&run.database,&run.line_id,run.revision,
+                            &run.inbox_nonce,&owner,&scope,&proof) {
+                            *lock(&run.error)=Some(code);run.retire();
+                        }
+                    }
                     BackendEventPayload::BatchMessage(message) => {
                         controller.tick(unix_now(), Instant::now());
                         handle_message(&run, &mut controller, PendingDelivery { owner, scope, message: PendingMessage::Batch(message) }, &mut pending).await;

@@ -273,6 +273,7 @@ pub enum BackendEventPayload {
     Callback(OwnedRpcCallback),
     BatchMessage(ScheduledIncomingMessage),
     DirectMessage(IncomingProtocolMessage),
+    BatchRetirement(super::batch_scheduler::BatchReplayRetirement),
     Call(IncomingCallDelivery),
     Terminal(BackendFailure),
 }
@@ -716,6 +717,12 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                                 terminal(&sender, &attempt, BackendFailure::Disconnected); return;
                             }
                             BackendEventPayload::BatchMessage(message)
+                        }
+                        OfflineEvent::BatchRetirement(retirement) => {
+                            if !retirement.matches(&attempt.owner, &attempt.scope) {
+                                terminal(&sender, &attempt, BackendFailure::Disconnected); return;
+                            }
+                            BackendEventPayload::BatchRetirement(retirement)
                         }
                         OfflineEvent::DirectMessage(message) => {
                             if message.owner() != &attempt.owner || !message.reply_ticket().matches(&attempt.owner, &attempt.scope) {

@@ -1,4 +1,6 @@
 use super::*;
+#[path="batch_replay_tests.rs"]
+mod replay;
 use crate::connectivity::app_voice::providers::jegotrip::{
     arc_session::{ArcLoginInputs, ArcReply, ArcRpcSession},
     rpc_envelope::{encode_reply, decode_request}, rpc_stream::Writer,
