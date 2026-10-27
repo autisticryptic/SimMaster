@@ -6,7 +6,12 @@
 
 ## 当前基线与工作规则
 
-- **当前代码 `aa87c18` 已验证**：Build40207983533/Beta40207983422/双架构success，officialSHA ZIP各544 Jegotrip＋31service/模板＋13HTTP/auth＋4SIP＋7DNS/原86矩阵，415static/mock、58warnings/17节选、Release skipped，首轮全过。新增本地per-account SQL排他/原nonce proof CAS，与run fence同事务admit、原actor+consumer Join/GC同事务release；跨manager/SQLite/legacy unknown不能start/CRUD/stop接管，不是remote principal/device lease或crash恢复。CallEx BE64/三通知/accept参数结果仅data codecs，原receiver/agent/pending/results及SDP/media/Trunk仍未接，不能当call-ready；后续保持完整native、独立action/cost/principal/renewal、真实process恢复/history open。
+- **当前无忧行范围：基础接电话/接短信，外呼/发短信只留接口。** `d0a2b67` 已推送并核验：Build40445960947/Beta40445960949、ARM64/AMD64成功，官方digest ZIP各699 Jegotrip＋7registry＋16HTTP＋42Trunk＋31通知＋4SIP＋7DNS/86矩阵逐名/source-run匹配，435static/mock通过，Release skipped。多任务Join取消重试、batch回执queued与Inform准入、应答/挂机入队前取消三项缺口已由新6项及双Join回归验证；不以旧4375a53成绩替代。
+- 基础入站已接原 receiver/control、实际 Endpoint TCP-Mpath↔UDP 音频、账号/API/Trunk、durable SMS与通知。当前不是登录 UI、默认完整 SDK 或付费外发项目；真实服务部署与资费仍未验收。实施/配置说明见[开发指南](DEVELOPER.md#当前基础托管配置与操作)。
+
+### 历史实施检查点（不覆盖当前范围与能力）
+
+以下为各旧提交当时的证据/缺口；其中“未实现来电/媒体/provider”与较宽的付费外发/全部SDK计划不代表当前状态，不能据此重做已接通组件或扩大本轮目标。
 
 - **前bootstrap代码 `7cc8b8f` 已验证**：Build40202373634/Beta40202373625/ARM64 AMD64 success，官方SHA测试ZIP各525 Jegotrip＋31通知service/模板＋12真实HTTP/auth＋4SIP＋7DNS/原86矩阵，410static/mock、58warnings/17节选、Release skipped，首轮全过。原matched getAppConfigs字段/引用→单独导入account trust和destination scope→原source actor Join后新connection/TLS/login已接真实AccountManager；raw DomainName与Client Domain/App/CC、原pwd/selector/device、双root/SNI/Scope/总deadline/取消和旧version1配置兼容均实际验证，不启provider/Channels/paidoutbound。完整locator/default选路/NetStream、call ingress/media/trunk及独立policy/principal并发/renewal、orphan与共享历史仍open，不能把此支持子集改称全backend或只剩实机。
 
@@ -18,7 +23,7 @@
 
 - **前显式驱动代码 `d593551` 已验证**（实现9809ae7，首E0618 callback fixture shadow修复）：Build40057801164/Beta40057801104、ARM64/AMD64成功，官方SHA测试ZIP各精确394 Jegotrip＋4共享/原SIP＋7原DNS/原86矩阵通过；391static/mock，57warnings/17Jegotrip excerpts保留，Release skipped。真实RuntimeConnector/PreparedRuntime/NativeHostingBackend原owner/physical scope接线、shared Hickory prepared DNS与逐poll gate、owned callback/poll/semantic unregister/SDKlogout/Join cleanup已实现，仅显式 supplied DirectTlsCarrier profile。不是默认SDK自动provision/locator、全Router/NetStream/媒体或已安装provider；Channels/外发仍false。状态及首失败见`.local/jegotrip/runtime-backend-implementation-evidence.md`。
 
-- **当前代码 `8e9a570` 已验证**：Build40045409934/Beta40045409943、ARM64/AMD64成功；两套官方SHA测试ZIP各逐名355 Jegotrip＋4共享/原SIP、原86矩阵通过，387本机static/mock，Release skipped，60warnings/20Jegotrip excerpts保留。原STATUS3内层结果与外层ACK/SDK logout/IO release分层；独立deadline覆盖所有后续IO及晚到结果，完整aggregate/queue admission在cancel guard前，同响应fallible发送/事件交付完成后才发布成功。两个readonly source reviews完成，main修复三具体缺口；不把source inspection或offline CI当实网/完整backend。Controller原backend_owner、commands-only clone、Secret Dropwipe与失败cleanup保留均保持，无设备/服务/部署/IDB写/target执行或本机Rust。
+- **历史注销代码 `8e9a570` 已验证**：Build40045409934/Beta40045409943、ARM64/AMD64成功；两套官方SHA测试ZIP各逐名355 Jegotrip＋4共享/原SIP、原86矩阵通过，387本机static/mock，Release skipped，60warnings/20Jegotrip excerpts保留。原STATUS3内层结果与外层ACK/SDK logout/IO release分层；独立deadline覆盖所有后续IO及晚到结果，完整aggregate/queue admission在cancel guard前，同响应fallible发送/事件交付完成后才发布成功。两个readonly source reviews完成，main修复三具体缺口；不把source inspection或offline CI当实网/完整backend。Controller原backend_owner、commands-only clone、Secret Dropwipe与失败cleanup保留均保持，无设备/服务/部署/IDB写/target执行或本机Rust。
 
 - `60c6c64`的341＋4/86已由Build40026210652/Beta40026210599及双架构/官方SHA核验；`65fad23`的315＋4/86由Build40017848477/Beta40017848512核验。Router/Channel kind2/3、2048-bit统计不drop duplicate、16-bit邻片、8/10header/LSB ACK/gap31/BE16/FE-FF为数据边界；缓存expiry/owned Dropwipe问题已修。尚未接完整liveNetStream/时序/路由/可信connector，不授provider/channel/outbound。先复用23日志中用户已开IDA后的139次只读调用与原SHA ELF，仅具体缺证据才请求同文件MCP，不能把旧gate或缺实网配置当停止理由。
 
@@ -38,6 +43,8 @@
 
 - **新增无忧行托管任务（静态分析）**：先走手动导入自有 root 手机凭据路线，不做登录/绑定 UI。SDK phone token 与 SIP 网关密码已定位；契约模块 d6381b3 已通过两套 Actions 各14项新测试/双架构；Linux backend、持久化/provider 接线、收短信/接打电话、计费/续期/设备并发仍未完成，不注册虚假 provider。详细参数与阶段见 [勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)；本轮不部署、不访问设备或无忧行服务。
 
+### IMS原任务与通用工作规则
+
 - **用户已校正本轮范围：基于EC20固件分析补齐SimAdmin IMS注册逻辑并复核查漏，不修改独立carrier_Bundles。** catalog/原生诊断不是必做项或阻塞；X2已做的额外诊断不作为注册兜底成果继续扩展。最新已验证代码d373ffa保留，注册相关基线/证据见[HANDOFF](HANDOFF.md)，未部署。
 - 设备历史基线仍为全局兜底修复 `c174551`，已通过 Actions 和 410 原 Globe 配置的初始注册验收。
   `7bd` 的运营商专用补丁及测试仍保持由 `0502395` 撤销的状态；当前成功不能替代中国移动同卡验收。
@@ -52,26 +59,26 @@
 
 ## P0：无忧行 backend 的实施顺序与原生证据关口
 
-用户要求持续规划并完成 backend，仅完成或确实需要手动 IDA 时汇报。当前已验证代码为 `aa87c18`；本地account runtime exclusion、原matched bootstrap到单独TLS账号scope的handoff、独立账号/显式profile runtime/Smgw文本/持久通知和原run释放回收已实现，但不是完整默认SDK客户端、所有SMS编码或通话媒体。后续不重复已验证组件，实施顺序与边界：
+用户恢复的目标是基础接电话（接收/应答/挂机/双向音频、账号/API/Trunk）与接短信（durable历史、查询/删除、通知、原ACK）。允许从自有 root 手机导入合法原参数，不要求本轮登录/绑定 UI；打电话/发短信只留接口，资费属于独立无忧行账号。继续完成这个完整基础目标，不以codec存在、hosting成功或仅安装descriptor替代业务链路。
 
-| 顺序 | 必须交付的实际行为 | 不能用什么替代 |
-| --- | --- | --- |
-| 1 | Router/NetStream 控制、序号环绕/乱序、缓存清退、重传/MTU/路径与真实流生命周期 | 已有数据codec/缓存、原样header或接上TcpStream |
-| 2 | 原导入/匹配 bootstrap 的 endpoint-authority-root 绑定、分连接 scope 与原 attempt 生命周期 | 从解密成功猜地址/根、复用旧 scope、替换活动 TLS IO |
-| 3 | 真正 HostingBackend 及 bounded event pump，SDK/hosting/channel ACK 分层、注销/取消/超时原归属 | submission receipt、模拟 callback 或仅安装 descriptor |
-| 4 | 独立 app-account line、私有凭据/配置持久化和脱敏管理 API、启动/停止/重建隔离 | 伪造 ICCID/五码/UICC、重启恢复 cached ready |
-| 5 | 核实 receiver-kind/消息编码和 SMS 分类；私有 durable inbox、SMS/event 原子提交后原 consumer ACK | generic recvOnlineMessage 字节按猜测 UTF-8/PDU 落 SMS，提前 ACK |
-| 6 | 真实邀请/应答/挂机/SDP/RTP/SRTP 与 per-account Trunk OperatorLink、独立 access/cost policy | 冒充 VoWiFi/普通 SIP REGISTER、hosting ACK 当 media-ready |
-| 7 | 独立费用/授权、已核实生命周期/续期与设备并发、普通失败恢复 | 将 app 通话/短信当 IMS 免费，force takeover、猜 TTL/renewal endpoint |
-| 8 | 两套 Actions/双架构、官方 SHA ZIP 精确清单/原86矩阵/旧SIP、固定手册与私有证据 | 静态、子agent 或 CI 绿灯充当实网完成 |
+| 必须交付的行为 | 当前实现/验证关注点 |
+| --- | --- |
+| 原受信连接与托管 | 显式 DirectTlsCarrier / 可选 matched bootstrap；原 authority/root/owner、SDK token与SipPwd分离、原source Join后才能handoff；不猜默认地址/信任 |
+| 独立账号生命周期 | 私有配置、revision/run nonce持久排他、auth/no-store API、手动start/stop；不恢复cached ready，不从其他manager或未知孤儿接管 |
+| 原来电应答/挂机 | CallClientEx/direct与batch原票据、Inform/Accept/Release及本地call history/event；本次修复queued批次回执不能被误当Inform已可提交 |
+| 真实媒体/Trunk | 原Endpoint TCP-Mpath与实际UDP双向RTP、匹配raw SDP及payload、同call的OperatorLink/SIP应答/BYE；只有原媒体活跃才connected |
+| 耐久接短信/通知 | 原Sip.Request严格分类，raw＋SMS＋事件＋通知计划同事务commit后原ACK，查询/删除/tombstone/目标指纹/有限重试；其他编码不猜 |
+| 取消、到期及能力边界 | queued Connected重核；任务入队前取消保持可重试；每个Join单独确认并移除；Voice/Messaging不互授，过期/换revision不移交旧grant |
+| 外发接口与费用隔离 | 有效reserved请求501，Asterisk/interactive/automation SMS或call均不能借入站ready走SIM/IMS/CS或免费WLAN规则 |
+| 证据与手册 | 新SHA两Actions实际逐名执行、官方digest ZIP/CRC/源码-run/86矩阵及双架构；原固定五手册、私有交接同步；不把静态/helper/绿灯当实网 |
 
-**本地account runtime排他、步骤2的matched bootstrap/direct-TLS handoff、步骤3的显式profile、步骤4、步骤5的Smgw文本/通知及正常run回收已验证。** aa87c18增加数据库连接共享的line/revision/nonce排他，原run fence和claim同事务、原actor+consumer proof CAS/GC/release同事务；未持有原run的manager不能stop/CRUD接管，旧live孤儿不凭PID/age视作释放。此不等于remote principal/device lease、跨账号同principal检测或真实crash-owner恢复。CallEx只新增精确BE64与通知/accept数据codec，完整ownership/result/media尚未接。
+**基础软件交付已验证**：`d0a2b67`的Build40445960947/Beta40445960949、ARM64/AMD64及官方digest ZIP核验通过，新增6项admission/batch和双Join取消场景均实际执行；各699 Jegotrip与原HTTP/Trunk/通知/SIP/DNS/86矩阵精确匹配，435本机static/mock通过。固定五手册记录当前配置/API及支持界限；文档收尾不改变编译输入。后续源码改变仍须新SHA验证，不能复用当前绿灯；详细清单见 `verified-native-d0a2b67.json`。以下是明确的扩展与实网验收工作，不再把已接通的基础来电/媒体/SMS写成未实现。
 
-7cc8b8f按原source/call-id捕获raw DomainName和Client DomainId/AppId/CC及Common reference，单独account authority/root/SNI与destination scope不可从回复猜出；原source owning Join结束才接新IO，取消保留两句柄，总期限及原TLS时钟不reset。旧JSON无bootstrap仍explicit、混合手工字段拒绝，真实双连接与AccountManager/HTTP已执行；原cfg不被derived字段覆写。其余locator/default选路与全部NetStream不是此子集承诺。原actor和consumer都join后，通过持久写fence回收已投影私有envelope且保留共享SMS；未知raw/无证明legacy-orphan不回收。128unknown/pending预算与512所有live identity预算分开，原direct协议自身128去重历史仍约束单连接，不承诺无限常驻或自动重连。通知配置在SQL外捕获、纯计划在SMS原事务入队、目标指纹冻结目的地；bounded worker、CAS/每channel单claim、删除/过期/未知结果不伪造成功，原字段不借SIM/modem。**仍未闭环**：有证据的跨进程/crash owner恢复、共享SMS历史保留策略与必要其他编码，无remote id的跨新run去重；完整默认provision/locator/NetStream/Router/Channel，真实call/media/trunk，独立费用/续期/设备并发。通知远端不可承诺exactly-once，已admitted发送不能召回；global provider/Channels/paidoutbound仍false，不能称全部backend或只剩实机。
+**明确但不伪装已完成的扩展**：当前原生/媒体支持显式raw `RseEx.SDP`、RTP/AVP sendrecv、RTCP-mux和编码passthrough。默认全部locator/Router/NetStream、压缩SDP/SRTP/ICE/BUNDLE/P2P、转码、自动token续期、remote principal/device全局lease、未知prior-process owner恢复、额外SMS编码及无限单连接历史不是本次已支持能力；付费外发尤其不是本轮必做项。原direct 128去重身份满则关闭scope；正常run原actor/consumer/媒体Join后回收已投影私有envelope且保留SMS，不承诺自动重连或跨新run exactly-once。
 
-**剩余原生关口**：Router数据controls/16-bit邻片/2048-bit统计与Channel header/SACK/record/retransmit descriptor已有证据及codec；原会话SDK logout和STATUS3 semantic ACK已验证。完整NetStream ready/时序/选路/重传生命周期、正常provision到endpoint-authority-root绑定、业务channel及call/media仍需闭环，不能用codec存在或ACK成功替代。原Smgw登记`Sip.Request`、SDK/app text/可选millis已确认；不能把所有generic消息或本地UUID自动当SMS类别/remote delivery ID，更不猜PDU/direct SIP/RTP/费用。
+**实网边界**：目前未使用真实服务、设备或账单。静态导入字段、isolated peer和native raw分支不能证明实际服务部署参数；以后经明确授权获得自有有效参数时，验证接收、双向音频、Trunk/通知、有效期/掉线/设备绑定与独立计费。若真实配置依赖当前未支持的模式，必须继续据证补实现，不能用改状态或放松TLS/owner门禁冒称兼容。
 
-此前用户已打开原SHA/base0的`.local/jegotrip/libmtc.so`，本轮又实际metadata匹配后只读分析。新增证实：Client580BA4对DomainId/AppId的原map值做Client解码，DomainName仍原map；60CAAC应答经4773C0/473AEC/477074为`accept.CallServerEx.CallEx`，保留原64-bit call id和RseEx.SDP等，477464版本类重试不等于媒体成功。Locator方法字符串仅注册元数据，不能拿常量3猜wire版本/locator结果。完整默认connector/媒体仍需证据与实现，定位见`.local/jegotrip/native-provision-call-frontier.md`。不因helper失败或未知字段要求重开IDA，不自行加载/改IDB；未执行SDK目标或真实服务。最新排他/CallEx data验证`verified-native-aa87c18.json`及`runtime-exclusion-call-evidence.md`；原bootstrap `verified-native-7cc8b8f.json`和前原run/通知/Smgw证据继续有效，完整backend保持open。
+**报告与工具**：第三方DOCX全段落/表格已只读核对，报告APK与本地APK字节不同；当前IDA仍为原libmtc/base0/相同SHA，只读复核相关SDP分支。报告HTTP加密/签名/Android信任策略不是native wire或授权证明。工具目前足够；需要新JADX/其他工具时先告知版本和用途，由用户手装，不因helper限流/超时而要求重开IDA或停止主线。
 
 ## P0：第一批补全的交付核验
 

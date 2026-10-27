@@ -5,7 +5,7 @@
 
 ## 1. 分支与编译约束
 
-- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF 和运行静态/mock；APK、提取库、账号 token、网关密码、SDK app key/部署值只留 `.local`，不提交。Rust `connectivity::app_voice::providers::jegotrip::{tests,controller::tests,rpc_arguments::tests,native_events::tests,rpc_stream::tests,rpc_envelope::tests,rpc_batch::tests,rpc_login::tests,rpc_pending::tests,rpc_bootstrap::tests,arc_session::tests,transport_packets::tests,arc_protocol::tests,batch_scheduler::tests,rpc_incoming::tests,offline_backend::tests,packet_stream::tests,router_packets::tests,packet_transport::tests,tls_engine::tests,tls_plaintext::tests,transport_actor::tests,legacy_config::tests,object_reference::tests,deployment::tests}` 由两套 Actions 执行；元数据 API 只描述凭据，不连服务。详见 [静态勘察](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行模块：本机只解析 APK/嵌套 DEX/ELF、运行静态/mock、核验制品；Rust、前端及编译后的协议 peer 仅在两套 Actions 执行。APK、提取库、第三方报告、账号 token、网关密码、SDK app key/部署值只留私有目录，不提交。静态 credential-contract 不读账号或连服务；实际账号连接只由显式 `/start` 发起。详见[托管契约与操作](#无忧行托管静态证据凭据与实现边界)。
 
 - 日常仅维护`master`，GitHub远端为`autisticryptic/SimMaster`（本地remote通常为`simmaster`）。
 - 不为每次验证长期留下分支。确需临时分支时，合并并确认提交已保留、CI通过后删除。
@@ -153,9 +153,9 @@ python3 -B offline-registration-sim/run.py --fallback --report offline-registrat
 
 ## 无忧行托管：静态证据、凭据与实现边界
 
-本页只描述用户提供的 APK 静态分析，不代表已经连接无忧行、注册成功或收发过业务。
-目标是让 SimAdmin 接入托管收短信和接打电话；登录/号码绑定界面暂缓，由用户从自己的
-root 手机取得现有凭据。计费独立于 IMS；接电话/收短信免费是用户给定需求，非实网验证。
+当前目标是**基础接电话、应答、挂机、双向音频与 Trunk，以及接短信、查询/删除、通知和原生回执**；外呼、发短信只保留接口。登录/号码绑定 UI 暂缓，由用户从自己的 root 手机取得现有参数。账号使用独立 `app_account` / `application_data` 线路，不借 SIM、五码、UICC、IMS/CS 或免费 WLAN 资费。
+
+当前源码 `d0a2b67` 已由两套 Actions、官方摘要产物和双架构构建核验，包含批次来电回执等待及取消/Join 修复。原邀请→应答→Endpoint TCP-Mpath↔UDP RTP→挂机、认证 HTTP、Asterisk 侧 SIP 与通话期间 SMS 整链均有执行证据。验证使用生产 Rust 路径和隔离协议 peer，**不是已连接无忧行、设备部署或资费验收**。用户所述入站免费不替代实际账单证据。
 
 ### 1. 纠正旧勘察结论
 
@@ -196,7 +196,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 | `sdk.server_address` | `config_key_server_address` | SDK 服务端配置，不要猜作 SIP SBC |
 | `sdk.root_der_base64` / `sdk.tls_only` | `config_key_root_der` / `config_key_use_tls_only` | 匹配部署信任与 TLS 策略 |
 | `sdk.device_id`（如已配置） | `config_key_device_id` | 保留原配置，设备绑定语义待验证 |
-| `sdk.selected_session_id`（如已配置） | `Mtc_CliApplySessId` / 原SDK会话配置 | login/swap方法第二串；不是phone token或返回ARC auth token，≤127字节，缺失不编造默认值 |
+| `sdk.selected_session_id`（原生账号运行必填） | `Mtc_CliApplySessId` / 原SDK会话配置 | login/swap方法第二串；不是phone token或返回ARC auth token，≤127字节；仅单独凭据结构兼容缺省，完整账号配置不允许缺失 |
 | `sdk.client_config_decode_key` / `sdk.reference_decode_key`（可选） | 原Client属性PBE配置 / 原Common对象引用PBE上下文 | 仅ENC配置unwrap，二者不合并/不当pwd/token/SipPwd或auth证明，缺失保持缺失，不复制内置值 |
 | `sdk.expires_at_unix_seconds`（若已知） | 后续确认的 token 到期信息 | 未知时留空，不虚构永久有效 |
 | `hosting.sip_number` | `SipNumber` / `getAreaCodeMobileNum` | 被托管号码 |
@@ -217,19 +217,82 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 - 来电：`JCCall`；接收消息：同一 `JCClient` 上的 `JCMessageChannel`，
   App 接收回调进入 Realm/未读/通知。短信发送和服务端计费流程尚未确认。
 
-当前模块 `connectivity::app_voice::providers::jegotrip` 已新增 **外部凭据和 SDK 适配契约**（原 d6381b3，本轮迁目录）：
-配置输入脱敏、两阶段登录/托管状态、每线路/每代回调归属、到期/撤销使 readiness 失效。
+`GET /api/non-3gpp/providers/app_voice/credential-contract` 返回静态实现/参数说明，不初始化 SDK、不读账号或发请求；当前 `transport_implemented=true` **仅指显式入站实现**。`basic_hosting` 明列 profile、手动启动、plain-media opt-in、独立计费主体、实现的入站操作及 `default_sdk_client_implemented=false`；外呼/发送均 false。它不是当前 readiness、服务可用性或收费授权。
 
-`GET /api/non-3gpp/providers/app_voice/credential-contract` 只返回字段说明和实现边界，
-不初始化 SDK、不读取账号、不发送网络请求；明确 `transport_implemented=false`。
+Main 在创建原账号 manager 后显式安装 Voice/Messaging provider。Registry 的汇总 availability 不能互授能力，调用方分别检查 `incoming_call_ready` / `incoming_message_ready`；SMS-only 不授 Voice，反之亦然。只读描述不会加载配置或自动启动会话。Android/AArch64 库不经 `dlopen` 冒充 Linux/AMD64 后端。
 
-**当前已实现支持子集** Linux显式TLS/native actor与原matched bootstrap handoff、独立账号私有存储/API、Smgw文本与耐久通知；`7cc8b8f`已验证，不等于完整SDK默认locator/NetStream、真实call/media/Trunk或独立资费续期/设备并发。模块仍不是全局可用provider，不自动注册、不改变下拉框可用状态或授paid outbound。不能dlopen APK中的Android/AArch64库冒充通用Linux/AMD64后端。
+### 当前基础托管配置与操作
+
+#### 私有导入形状
+
+创建请求为 `{"provider_id":"app_voice","config":完整配置}`。**上表的 `sdk.*`、`hosting.*` 实际位于 `config.credentials` 内**；不是请求顶层。`AccountConfig` 的类型定义在 `backend/src/connectivity/app_voice/providers/jegotrip/account_config.rs`，账号/profile/media 结构拒绝未知字段和不支持的组合；内嵌 trunk 沿用现有 `TrunkProfileConfig` 的兼容规则。以下是字段契约，不是可直接连接服务的示例参数。
+
+| 配置部分 | 必须提供的形状与来源 |
+| --- | --- |
+| `config.credentials.sdk` / `.hosting` | 上表对应的原账号材料；`tls_only=true`、`enrollment_confirmed=true` 不代替真实服务授权；已知过期时间必须有效，未知保持 null |
+| `profile.route`、`authority`、`enable_sni` | 仅 `direct_tls_carrier`；显式原 authority/SNI 与 `sdk.server_address`、原 DER 信任配对，不从 HTTP 域名猜 SDK 地址 |
+| `profile.identity_type`、`domain_name`、`domain_id`、`application_id`、`device_info_cc` | 无 bootstrap 时 domain_name/domain_id/application_id 必填；CC 可选；来自原配置，不借 SIP 号码或 token 替代 |
+| `profile.client_properties`、`include_device_id`、`login_routing` | 原 ClientId/Client 属性和路由；已导入 device_id 时必须保留，不能悄悄删去 |
+| `profile.gateway_uri`、`gateway_metadata`、`poll_routing`、`logout_routing` | 原托管网关与路由属性，不借 SIM/P-CSCF 配置 |
+| `profile.incoming`（接短信） | `{object_id, domain, receiver_kind}` 原绑定；可发布短信 readiness 的已实现 kind 是精确 `Sip.Request`，其他 kind 不猜成 SMS |
+| `profile.call_incoming`、`profile.call_control`（接电话） | 原 `{object_id, domain}` CallClientEx receiver，以及含原 `id` / `domain` 的控制属性数组；与 `call_media` 一起提供 |
+| 五个 `profile.*_timeout_ms` | `connect` 为 1..10000，`handshake` / `partial` / `io` 各 1..30000，`rpc` 为 1..60000 毫秒；都是显式有界预算，不推断 token 租期 |
+| `config.bootstrap`（可选） | 独立 `account_authority` / `account_root_der_base64` / `account_enable_sni`、`routing` 与 1..30000 的 `handoff_timeout_ms`；不能同时手填 profile 的 domain/app/CC 字段 |
+| `config.call_media`（接电话） | 独立 `authority` / `root_der_base64` / `enable_sni`、原 `routing` / `features` / `properties`，可选 `reference_decode_key`，显式 `audio_bind_ip`、`allow_plain_media=true` 和可选 `trunk` |
+
+属性数组的每项是 `{"key":[字节...],"value":[字节...]}`；receiver 的二进制字段同样用 JSON 字节数组，**不是字符串或 Base64**。`call_media.features` 每项是 `{"value":[字节...]}`。解码 key 只用于对应原 ENC 上下文；不合并 SDK、Client、reference 或 media 的信任/密钥。
+
+`audio_bind_ip` 是 SimAdmin 实际可绑定且媒体对端可达的本地地址，不可为未指定/组播地址。它不是 native `Client.Host` / `Client.ArcPort`：后两者可能是逻辑 Router 地址/端口，不能当 OS RTP 目的地。支持的媒体为 raw `RseEx.SDP`、单音频 `RTP/AVP` / `sendrecv` / `rtcp-mux`，匹配 payload 的编码 RTP 原样转发（含已支持的 Opus passthrough，不是转码器）。压缩 SDP、SRTP、ICE/BUNDLE/P2P 或不支持协商明确拒绝；TLS 信令不因此降为明文。
+
+#### 账号与业务 API
+
+以下 `A` 表示 `/api/non-3gpp/accounts/{line_id}`，`C` 表示 `A/calls/{call_id}`。沿用 SimAdmin 现有认证；此处不提供凭据，也不执行真实服务请求。管理/通话响应设置 `Cache-Control: no-store`；`line_id` 和 32-hex `call_id` 是本地不透明标识，不能用远端号码/64-bit native ID 替换。
+
+| 方法与路径 | 请求/返回语义 |
+| --- | --- |
+| `GET/POST /api/non-3gpp/accounts` | 列状态 / 单账号导入；创建不连接网络 |
+| `GET/PUT A` | 脱敏元数据 / `{"expected_revision":N,"config":完整新配置}` 全量 CAS 替换；旧 IO/consumer 未释放不能替换 |
+| `DELETE A?expected_revision=N` | CAS 删除；不能清除其他 manager 的原运行或强制接管 |
+| `POST A/start`、`POST A/stop` | `{"expected_revision":N}`；start 的 202 只是提交，stop 按原来电媒体/Trunk、status3、SDK logout 与 owning Join 清理 |
+| `GET A/inbox?limit=1..128` | 本地入站记录与回执层级，不导出 generic raw 或凭据 |
+| `GET A/messages?limit=1..128` | 已严格分类的短信正文、sender、时间与来源；不是所有 generic 消息 |
+| `GET A/notifications?limit=1..128` | 通知状态/次数/期限，不导出目的地、认证或 payload |
+| `GET A/calls`、`GET C` | 当前 run 的通话状态、history_id、经约束的来电 peer 和本地媒体 SDP；无账号材料 |
+| `POST C/answer` | `{"expected_revision":N,"sdp":"媒体对端的实际SDP应答"}`；≤16KiB，须与 offer 匹配；不是 WebRTC 浏览器音频接口 |
+| `POST C/hangup`、`POST C/reject` | `{"expected_revision":N}`；只清理原通话，不借当前配置重绑旧结果 |
+| `GET A/trunk` | 该账号原 Trunk 的只读状态 |
+| `POST A/outbound/calls` | `{"expected_revision":N,"target":"目标"}`，有效请求仍返回 501 / `app_account_outbound_unsupported` |
+| `POST A/outbound/messages` | 同上加 `"body":"正文"`；有效请求仍 501，不生成 outgoing history 或调用 SIM/IMS/CS |
+
+`GET /api/non-3gpp/providers` 只列安装/实现元数据，整体 `unknown` 不等于某账号断线；实时接收能力看 `GET A` 的分别就绪字段。`hosted`、`incoming_call_ready`、单通话 `media_active` 与 `outbound_authorized` 含义不同；最后一个本阶段始终 false。来电的 native 接受回包本身也不授 audio-ready，必须等待原 Endpoint 和实际媒体 actor。排队 Connected 在消费时再次检查原权限、revision/有效期和物理媒体，取消不借新 owner 接管。
+
+#### Asterisk/Trunk 与短信
+
+- 使用 `config.call_media.trunk` 的现有 `TrunkProfileConfig`；无需虚构 modem 或将账号绑到原 WLAN/SIM。启用时配置真实 Asterisk host/port、本地 SIP port、用户名/认证、`incoming_mode` / `incoming_binding` 和 `codec_allow`。隔离回归覆盖 `static_peer` / `bound_pending`、双向 RTP、双方 BYE 和实际端口释放；不冒称已在真实 PBX 部署。
+- `vowifi_only`、`allow_home_cellular_calls` 必须 false，`bound_immediate` 不支持；不能用 IMS 资费或提前应答策略给应用账号授权。Asterisk 发起的外呼被拒绝，接收就绪不改变此边界。
+- SMS 进入既有 `sms_messages`，transport=`app_voice`、pdu=null，可用原 `/api/sms/list?channel_id={line_id}`、conversation/statistics 及 `/api/sms/message/{id}?channel_id={line_id}` 删除接口；`/api/sms/channels` 将接收 `incoming_ready` 与发送授权分开。interactive/automation/Trunk 三路发送都先拒绝应用账号 fallback。
+- 原 receiver/owner/run 约束下，raw＋SMS＋事件＋通知计划同事务落库后才回复原 ticket。`batch_queued` 只是待传批次结果，`direct_submitted` 只是已提交，不伪称远端 ACK；新批次来电只对明确未入队的 `CallNotReady` 在固定预算内等待，不重发已提交 Inform。
+- 通知沿用已有 SMS 规则/模板；最多 8 目标，原 rule/channel 指纹冻结目的地，4 并发、每 channel 单 claim、最多 5 次/24h。改同名目的地、删除、过期或未知发送结果不改投、不冒称成功；已发网络字节不能召回，不能保证远端 exactly-once。
+
+#### 维护边界与证据
+
+私有 `data.db` 仍是本机明文存储，不是加密保险箱；API 不导出账号配置。换参数先 stop 并确认 `io_cleanup_required=false`，再 CAS replace/start。取消 stop 后只能继续等待同一 owner 的剩余 Join；已完成任务不得再次 poll。正常退出后回收已投影私有 envelope 并保留共享 SMS；删除 SMS 清逻辑 raw/tombstone，但不保证 SQLite/WAL/备份物理擦除。
+
+单账号配置/消息/任务均有界；direct receipt 的 128 个原身份历史满时关闭原 scope，不静默驱逐去重信息，**不承诺单连接无限常驻或自动重连**。未知 prior-process run 仍保持 `app_account_runtime_owner_unconfirmed`，不从 PID/年龄猜已退出、不提供 force-clear。默认 locator/所有原生模式、自动 token 续期、remote principal/device 全局租约及其他媒体模式是后续扩展，不伪装已支持，也不扩大为本轮付费外发必做项。
+
+当前源码 **`d0a2b675329489c72542bb3b3d382e02b6eda15a` 已验证**：Build40445960947 / Beta40445960949、ARM64/AMD64成功；官方 digest ZIP 各逐名匹配 **699 Jegotrip＋7 registry＋16 HTTP＋42 Trunk＋31通知＋4 SIP＋7 DNS/86矩阵**，435 本机 static/mock 通过。六项新 admission/batch 与强化的双 Join 取消回归均实际执行；首轮通过，保留65条编译warning，不声称零warning。官方测试 artifact：Build12708308718 / Beta12708966079；详细官方摘要、CRC、源码/run/矩阵指纹见私有 `verified-native-d0a2b67.json`。Publish Release skipped；这不是程序包部署或服务验收。文档收尾须保持与该已验源码相同的构建输入，不假称新二进制。
+
+用户提供的第三方 DOCX 只作线索：其 APK SHA/大小与本地样本不同。表格/工具说明已只读核对，当前原 `libmtc.so` 在 IDA 的 metadata 与本地/实际 APK 库字节相同；raw SDP 分支存在不代表远端实际选择。HTTP 加密/签名或 Android 信任策略不替代 native wire/授权证明。不照搬报告密钥，不运行其中服务示例；若需要 JADX/其他新工具，先说明版本和用途，由用户手装。
 
 ## 应用通话 provider 目录与下一阶段
 
 `connectivity/app_voice/providers/` 下各 provider 独立目录：`jegotrip`、`google_voice`、`telegram`、`imessage`。
 `registry.rs` 只共享能力/可用性接口，不共享登录、号码格式、信令、媒体或计费。IMS旧import保留re-export兼容。
 后3项当前仅声明，iMessage只声明消息能力，不假扮运营商或语音服务。
+
+## 历史协议组件与验证
+
+以下记录是**各指定提交当时**的实现与证据。旧 `transport_implemented=false`、未安装 provider、来电/媒体未接等状态不覆盖上方当前契约；中间失败、修正与原生格式细节保留供维护复核，不能直接重放旧命令或扩大本次授权。
 
 无忧行 `controller.rs` 新增真实 SDK 适配调用序列（31d3739 已验证）：外部凭据导入不连网，start提交login；
 SDK成功回调后才submit托管status=4，注销status=3后logout；请求/回调各有界超时，旧owner/错阶段忽略，

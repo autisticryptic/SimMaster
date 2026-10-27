@@ -426,6 +426,21 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 
 ## 非3GPP应用通话与IMS的边界
 
+### 当前基础入站契约
+
+- 无忧行使用独立 `app_account` / `application_data` 线路与账号资费，不冒充 SIM、五码、UICC 或 VoWiFi。当前目标是接电话（应答、挂机、双向音频/Trunk）与 durable 接短信；外呼/发送只保留接口，有效请求仍返回 501，三路 SMS 与 Asterisk 外呼均不得回退 IMS/CS。
+- 静态 `credential-contract.transport_implemented=true` 仅声明显式入站实现；default SDK client 与 paid outbound 均 false。main 显式安装 provider 不等于启动账号；导入/CRUD/重启不连接或恢复 cached ready，必须手动 start。
+- SDK 登录、托管 ACK、Voice/Messaging 各自接收能力、单通话媒体活跃及发送授权分别核验。原 owner、physical scope、receiver、run/revision/有效期和活消费者共同决定 readiness；汇总 available 不使 SMS/Voice 互授。排队 Connected 消费时再次核验原 service 和实际 media，不能把过去成功转交给新会话。
+- 来电严格保留原64-bit native ID、回执与 Inform/Accept/Release 的独立语义。批次 `BatchQueued` 不是回执已发送；只有 actor 明确未准入的 `CallNotReady` 才在同ticket/固定预算内等待，不重发已提交或被拒绝的 Inform。应答/挂机在任务入队后才承诺 queued；取消不丢原 owning task，每个已消费 Join 必须即时移除。
+- 媒体只支持显式 raw `RseEx.SDP`、RTP/AVP sendrecv、RTCP-mux、匹配payload的编码passthrough，原Endpoint TCP/TLS承载信令，TCP-Mpath连接实际本地UDP。须明确plain-media opt-in，不因此降低TLS校验；native `Client.Host/ArcPort` 的逻辑地址/端口不能推导为OS RTP地址。SRTP、压缩SDP、ICE/BUNDLE/P2P、转码及其他native模式不猜。
+- 原 `Sip.Request` 文本经过严格分类；raw/SMS/事件/通知计划同事务commit后原consumer ACK。`direct_submitted` / `batch_queued` 不等于peer已确认；未知kind/body不按猜测落SMS/PDU。删除保留原scope去重语义并清逻辑payload，不保证SQLite/WAL物理擦除；通知目标指纹、有限重试和不确定态不承诺远端exactly-once。
+- 原媒体/Trunk、controller/actor与consumer实际Join后，才能释放持久run fence及替换配置；别的manager或未知prior-process owner不能接管。direct 128身份历史满则关闭原scope，正常run结束回收已投影私有envelope并保留SMS；不承诺无限常驻/自动重连或续期，也不凭PID/年龄抹去未知持有者。
+- 当前源码 `d0a2b67`（435 static/mock）修复上述批次/取消边界，已由Build40445960947/Beta40445960949、双架构及官方摘要ZIP各699 Jegotrip和原回归逐名核验。完整参数/API、支持范围及后续互通条件见[开发指南](DEVELOPER.md#当前基础托管配置与操作)；未访问真实服务或设备，不把隔离peer/静态raw分支当生产互通、SIM费用或账单证明。
+
+### 历史协议演进（下述状态仅属于指定旧提交）
+
+旧阶段“尚无backend/provider/media”“transport_implemented=false”等说明不覆盖上方当前契约；保留格式、归属与失败证据供复核，不把曾经更宽的全部SDK/付费外发计划重置为本轮基础入站要求。
+
 无忧行位于 `connectivity/app_voice/providers/jegotrip/`，不借用3GPP REGISTER/EAP-AKA或五码身份。
 已证实的 `updateStatus.SipGatewayPub.SipGateway` 参数编码包含type0流标记和BE16版本表计数1/唯一版本0（不是major/minor，字节不变），仅为ObjectAgent入参，不是网络帧；
 Common请求/回包与swapCalls批次已补有界codec及原提交/连接scope关联（5d4bbb0已由95模块回归/双架构/官方SHA核验），返回码/terminal错误与各层boolean独立检查，结果流不重复版本。
@@ -455,7 +470,7 @@ Build40045409934/Beta40045409943/ARM64 AMD64 success，Release skipped；官方S
 
 ## 10. 验证清单与验收标准
 
-最新`aa87c18`：Build40207983533/Beta40207983422/双架构success，officialSHA ZIP各544 Jegotrip＋31service/模板＋13HTTP/auth＋4SIP＋7DNS/原86，415static/mock、58warnings/17节选、Release skipped，首轮全过。持久per-account line/revision/nonce lease与run fence原子admit，原actor+consumer Join proof/CAS/GC/release原子，foreign/reopened manager无owner不可start/CRUD/stop接管，legacy live不猜已退出。不是remote principal/device全局lease或自动crash恢复。CallEx精确BE64/三通知/accept data不授receiver/pending/results/媒体或独立付费权限；原SDP变换/CONNECTING分支仍待真实owner/media接线。全backend保持open，无本机Rust/设备服务/部署/NV/IDB写/unknown清理；证据`verified-native-aa87c18.json`及`runtime-exclusion-call-evidence.md`。
+当前已验源码 **`d0a2b675329489c72542bb3b3d382e02b6eda15a`**：Build40445960947/Beta40445960949、ARM64/AMD64成功，Publish Release skipped；官方digest ZIP/CRC/源码-run各逐名匹配699 Jegotrip＋7registry＋16HTTP＋42Trunk＋31通知＋4SIP＋7DNS/86矩阵。435static/mock通过，保留65条编译warning。认证HTTP应答/双向RTP/通话期间SMS原ACK、Asterisk侧SIP应答/双方BYE、能力隔离/排队Connected及新增delayed-batch/取消入队/多Join清理均已实际执行。Build artifact12708308718 SHA-256 `f3fadea44e27a3cf6299a29e9df662403c24362726969da7ca1f88c480a85254`；Beta artifact12708966079 SHA-256 `8cd779a34198b67f4a60d3664c176e86d3c1d2883b5e8672dd07db32e08a09ce`。以下较早条目只保留历史范围，软件验证不是原SDK执行或真实服务/设备/资费验收；文档收尾不改变该已验源码构建输入。
 
 前bootstrap`7cc8b8f`：Build40202373634/Beta40202373625/双架构success，officialSHA ZIP各525 Jegotrip＋31通知service/模板＋12HTTP/auth＋4SIP＋7DNS/原86矩阵，410static/mock、58warnings/17节选，Release skipped，首轮全过。原getAppConfigs成功/call-id/source快照、DomainName raw与独立Client/Common context、缺CC清空、不同root/SNI/scope、source Join后实际handoff及取消/总期限/旧JSON/CAS/no-store HTTP已执行。Scope flags/源reply不是release或SDK/hosting/media ACK，Derived不替代原凭据/trust/配置，不授paid outbound。证据`verified-native-7cc8b8f.json`/`bootstrap-handoff-implementation-evidence.md`；WSL GitHub路由失败已用有界WindowsHTTPS读取恢复，未放宽SHA，不本机Rust/真实服务设备/部署/NV/IDB写。
 
