@@ -86,7 +86,7 @@ fn terminal_actor_extraction_never_reopens_positive_acks_channels_or_other_owner
 #[test]
 fn historical_submission_correlation_after_close_is_not_an_open_io_or_ready_receipt() {
     let original = owner(); let scope = RpcConnectionScope::fresh();
-    let receipt = RuntimeReceipt { owner: original.clone(), scope: scope.clone(), call_id: Some(1) };
+    let receipt = RuntimeReceipt::new(original.clone(), scope.clone(), Some(1));
     assert!(receipt.matches(&original, &scope)); scope.close();
     assert!(!receipt.matches(&original, &scope)); assert!(receipt.submitted_on(&original, &scope));
     assert!(!receipt.submitted_on(&owner(), &scope)); assert!(!receipt.submitted_on(&original, &RpcConnectionScope::fresh()));

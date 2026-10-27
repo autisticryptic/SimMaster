@@ -4,6 +4,8 @@ use super::*;
 use super::super::{account_runtime::{local_nonce, unix_now}, account_test_support::{config, TempDatabase},
     session::HostingSession, tls_engine::tests::Certificates};
 use std::sync::Arc;
+#[path="account_direct_retention_tests.rs"]
+mod direct_retention;
 
 fn setup() -> (Arc<Database>, String, InboxScope) {
     let cert=Certificates::generate("DNS:fixture.invalid");

@@ -37,7 +37,11 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), &'static str> {
         reply_state TEXT NOT NULL DEFAULT 'pending' CHECK(reply_state IN ('pending','direct_submitted','batch_queued')),
         created_at TEXT NOT NULL,
         UNIQUE(line_id,revision,run_nonce,source_kind,peer_epoch,sequence));
-        CREATE INDEX IF NOT EXISTS idx_app_voice_inbox_line ON app_voice_inbox(line_id,id);")
+        CREATE INDEX IF NOT EXISTS idx_app_voice_inbox_line ON app_voice_inbox(line_id,id);
+        CREATE TABLE IF NOT EXISTS app_voice_direct_replay_fences(
+            line_id TEXT NOT NULL,revision INTEGER NOT NULL,run_nonce TEXT NOT NULL,
+            through_sequence INTEGER NOT NULL CHECK(through_sequence>0 AND through_sequence<=2147483647),
+            PRIMARY KEY(line_id,revision,run_nonce));")
         .map_err(|_| STORAGE)?;
     // Existing unclassified rows remain readable as unknown-context history;
     // the old provider binding cannot be reconstructed from a newer config.
@@ -146,6 +150,12 @@ impl InboxScope {
                 // receiver tombstone, not a request to recreate deleted text.
                 tx.commit().map_err(|_| STORAGE)?; return Ok((id,Vec::new()));
             }
+            if kind == "direct" {
+                let retired: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_direct_replay_fences
+                    WHERE line_id=?1 AND revision=?2 AND run_nonce=?3 AND through_sequence>=?4)",
+                    params![self.line_id,self.revision as i64,self.nonce,sequence], |row| row.get(0)).map_err(|_| STORAGE)?;
+                if retired { return Err("app_account_inbox_direct_retired"); }
+            }
             let (local,completed,total,stored): (i64,i64,i64,i64) = tx.query_row("SELECT
                 COALESCE(SUM(line_id=?1 AND (reply_state='pending' OR NOT EXISTS(SELECT 1 FROM app_voice_sms_projection p
                     WHERE p.inbox_id=i.id AND p.line_id=i.line_id AND p.revision=i.revision))),0),
@@ -178,7 +188,7 @@ impl InboxScope {
         })?;
         for event in events { database.publish_committed_app_event(event); }
         Ok(CommittedInbox { id, line_id: self.line_id.clone(), revision: self.revision, nonce: self.nonce.clone(),
-            kind, epoch, sequence, fingerprint })
+            owner: self.owner.clone(), scope: self.scope.clone(), kind, epoch, sequence, fingerprint })
     }
     #[cfg(test)]
     pub(super) fn commit_fixture(&self, database: &Database, sequence: i32, message: &IncomingMessage)
@@ -201,7 +211,7 @@ impl InboxScope {
         if !admission.load(Ordering::SeqCst) { return Ok(Completion::Retired); }
         match backend.complete_direct(&self.owner,&self.scope,message.reply_ticket(),true).await {
             Ok(receipt) if receipt.submitted_on(&self.owner,&self.scope) => {
-                Ok(if committed.record_reply(database,"direct_submitted").is_ok() { Completion::Recorded }
+                Ok(if committed.record_reply_with_frontier(database,"direct_submitted",receipt.direct_replay_frontier()).is_ok() { Completion::Recorded }
                     else { Completion::StatusUnrecorded })
             }
             Err(RuntimeError::Backpressure) => Ok(Completion::Backpressure),
@@ -229,14 +239,20 @@ pub(super) enum Completion { Recorded, Backpressure, StatusUnrecorded, Retired }
 
 /// Non-serializable commit proof, created ONLY after the transaction commits.
 pub(super) struct CommittedInbox {
-    id:i64,line_id:String,revision:u64,nonce:String,kind:&'static str,epoch:u32,sequence:i32,fingerprint:String,
+    id:i64,line_id:String,revision:u64,nonce:String,owner:AttemptOwner,scope:RpcConnectionScope,
+    kind:&'static str,epoch:u32,sequence:i32,fingerprint:String,
 }
 impl fmt::Debug for CommittedInbox {
     fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result { f.write_str("CommittedInbox(<redacted>)") }
 }
 impl CommittedInbox {
     fn record_reply(&self,database:&Database,state:&'static str)->Result<(), &'static str> {
+        self.record_reply_with_frontier(database, state, None)
+    }
+    fn record_reply_with_frontier(&self,database:&Database,state:&'static str,
+        frontier:Option<&super::arc_protocol::DirectReplayFrontier>)->Result<(), &'static str> {
         if !matches!((self.kind,state),("direct","direct_submitted")|("batch","batch_queued")) { return Err(INVALID); }
+        if frontier.is_some_and(|proof| self.kind!="direct" || !proof.matches(&self.owner,&self.scope)) { return Err(SCOPE); }
         database.with_conn(|conn| {
             let tx=Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
             require_account(&tx,&self.line_id,self.revision)?;
@@ -246,6 +262,35 @@ impl CommittedInbox {
                 params![state,self.id,&self.line_id,self.revision as i64,&self.nonce,self.kind,self.epoch as i64,self.sequence,&self.fingerprint])
                 .map_err(|_|STORAGE)?;
             if changed!=1 { return Err(SCOPE); }
+            if let Some(frontier) = frontier {
+                let held: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_runtime_leases
+                    WHERE line_id=?1 AND revision=?2 AND run_nonce=?3)", params![self.line_id,self.revision as i64,self.nonce],
+                    |row|row.get(0)).map_err(|_| STORAGE)?;
+                if !held { return Err(SCOPE); }
+                let through = frontier.through();
+                // This is original local replay retirement, not a peer ACK.
+                // Keep the watermark even when every classified envelope is
+                // detached, so a stale original ticket cannot recreate it.
+                tx.execute("INSERT INTO app_voice_direct_replay_fences(line_id,revision,run_nonce,through_sequence)
+                    VALUES(?1,?2,?3,?4) ON CONFLICT(line_id,revision,run_nonce) DO UPDATE
+                    SET through_sequence=MAX(through_sequence,excluded.through_sequence)",
+                    params![self.line_id,self.revision as i64,self.nonce,through]).map_err(|_| STORAGE)?;
+                // Keep the most recent 128 completed classified envelopes for
+                // the existing metadata API. Older copies can be detached only
+                // below this ORIGINAL protocol frontier; unknown/pending/batch
+                // rows are never capacity-evicted.
+                tx.execute("UPDATE app_voice_sms_projection SET envelope_retained=0 WHERE line_id=?1 AND revision=?2 AND inbox_id IN
+                    (SELECT i.id FROM app_voice_inbox i WHERE i.line_id=?1 AND i.revision=?2 AND i.run_nonce=?3 AND i.source_kind='direct'
+                        AND i.sequence<=?4 AND i.reply_state='direct_submitted' AND EXISTS(SELECT 1 FROM app_voice_sms_projection p
+                            WHERE p.inbox_id=i.id AND p.line_id=i.line_id AND p.revision=i.revision)
+                        ORDER BY i.sequence DESC LIMIT -1 OFFSET 128)",params![self.line_id,self.revision as i64,self.nonce,through]).map_err(|_| STORAGE)?;
+                tx.execute("DELETE FROM app_voice_inbox WHERE line_id=?1 AND revision=?2 AND run_nonce=?3 AND source_kind='direct'
+                    AND sequence<=?4 AND reply_state='direct_submitted' AND EXISTS(SELECT 1 FROM app_voice_sms_projection p
+                        WHERE p.inbox_id=app_voice_inbox.id AND p.line_id=app_voice_inbox.line_id AND p.revision=app_voice_inbox.revision AND p.envelope_retained=0)",
+                    params![self.line_id,self.revision as i64,self.nonce,through]).map_err(|_| STORAGE)?;
+                tx.execute("DELETE FROM app_voice_sms_projection WHERE line_id=?1 AND revision=?2 AND envelope_retained=0 AND deleted=1",
+                    params![self.line_id,self.revision as i64]).map_err(|_| STORAGE)?;
+            }
             tx.commit().map_err(|_|STORAGE)
         })
     }

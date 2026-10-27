@@ -135,6 +135,61 @@ fn failed_login_closes_rpc_and_fragment_assembler_before_delivering_failure() {
 }
 
 #[test]
+fn direct_frontier_does_not_overtake_pending_original_delivery_and_closes_with_scope() {
+    use super::super::long_reception_test_support as fixture;
+    let original=owner();let mut protocol=fixture::authenticated(original.clone());let scope=protocol.connection_scope();
+    let first=fixture::incoming(&mut protocol,&original,1,b"first");let second=fixture::incoming(&mut protocol,&original,2,b"second");
+    protocol.complete_incoming(second.reply_ticket(),true).unwrap().unwrap();
+    assert!(protocol.direct_replay_frontier().is_none(),"uncompleted id1 must block a later response frontier");
+    protocol.complete_incoming(first.reply_ticket(),true).unwrap().unwrap();let proof=protocol.direct_replay_frontier().unwrap();
+    assert_eq!(proof.through(),2);assert!(proof.matches(&original,&scope));assert!(!proof.matches(&owner(),&scope));
+    assert!(!proof.matches(&original,&RpcConnectionScope::fresh()));scope.close();assert!(!proof.matches(&original,&scope));
+    assert!(protocol.direct_replay_frontier().is_none());assert_eq!(format!("{proof:?}"),"DirectReplayFrontier(<redacted>)");
+}
+#[test]
+fn original_direct_ids_remain_nonreusable_after_history_window_rotation() {
+    use super::super::long_reception_test_support as fixture;
+    let original=owner();let mut protocol=fixture::authenticated(original.clone());let scope=protocol.connection_scope();
+    let first=fixture::incoming(&mut protocol,&original,1,b"first");protocol.complete_incoming(first.reply_ticket(),true).unwrap();
+    let now=Instant::now();protocol.on_plaintext_packet_at(&original,&scope,&[CallKind::Pong as u8],now+std::time::Duration::from_secs(181),|_|{}).unwrap();
+    protocol.on_plaintext_packet_at(&original,&scope,&[CallKind::Pong as u8],now+std::time::Duration::from_secs(362),|_|{}).unwrap();
+    let wire=fixture::wire(1,&[0,1],b"must-not-reenter");let packet=encode_call_packets(CallKind::Request,&wire,TLS_FRAGMENT_THRESHOLD).unwrap();
+    assert!(protocol.on_plaintext_packet_at(&original,&scope,packet[0].expose_to_transport(),now+std::time::Duration::from_secs(363),|_|panic!("old RPC id replay")).is_err());
+    assert_eq!(protocol.phase(),ArcPhase::Closed);
+}
+#[test]
+fn duplicate_magic_under_new_rpc_id_is_suppressed_and_that_id_cannot_be_reused() {
+    use super::super::long_reception_test_support as fixture;
+    let original=owner();let mut protocol=fixture::authenticated(original.clone());let scope=protocol.connection_scope();
+    let first=fixture::incoming(&mut protocol,&original,1,b"first");protocol.complete_incoming(first.reply_ticket(),true).unwrap();
+    let wire=fixture::wire(2,&1i32.to_be_bytes(),b"duplicate-magic");let packet=encode_call_packets(CallKind::Request,&wire,TLS_FRAGMENT_THRESHOLD).unwrap();
+    assert!(!protocol.on_plaintext_packet(&original,&scope,packet[0].expose_to_transport(),|_|panic!("magic replay")).unwrap());
+    assert_eq!(protocol.direct_last_id,2);assert_eq!(protocol.direct_seen.count(),1);
+    let wire=fixture::wire(2,&[9,9],b"cannot-reuse");let packet=encode_call_packets(CallKind::Request,&wire,TLS_FRAGMENT_THRESHOLD).unwrap();
+    assert!(!protocol.on_plaintext_packet(&original,&scope,packet[0].expose_to_transport(),|_|panic!("same RPC id")).unwrap());
+    assert!(scope.is_open());
+}
+#[test]
+fn old_scope_clock_input_cannot_rotate_a_current_direct_history() {
+    use super::super::long_reception_test_support as fixture;
+    let original=owner();let mut protocol=fixture::authenticated(original.clone());let scope=protocol.connection_scope();
+    let first=fixture::incoming(&mut protocol,&original,1,b"first");protocol.complete_incoming(first.reply_ticket(),true).unwrap();
+    let now=Instant::now()+std::time::Duration::from_secs(1000);
+    assert!(!protocol.on_plaintext_packet_at(&owner(),&scope,&[CallKind::Pong as u8],now,|_|panic!("foreign")).unwrap());
+    assert!(!protocol.on_plaintext_packet_at(&original,&RpcConnectionScope::fresh(),&[CallKind::Pong as u8],now,|_|panic!("foreign")).unwrap());
+    assert!(protocol.direct_seen.contains_id(1));assert!(scope.is_open());
+}
+#[test]
+fn pending_direct_replies_are_never_expired_to_make_room_in_rotating_history() {
+    use super::super::long_reception_test_support as fixture;
+    let original=owner();let mut protocol=fixture::authenticated(original.clone());let scope=protocol.connection_scope();
+    let first=fixture::incoming(&mut protocol,&original,1,b"pending");let now=Instant::now();
+    for seconds in [181,362,543]{protocol.on_plaintext_packet_at(&original,&scope,&[CallKind::Pong as u8],now+std::time::Duration::from_secs(seconds),|_|{}).unwrap();}
+    assert_eq!(protocol.direct_pending.len(),1);assert!(protocol.direct_replay_frontier().is_none());
+    assert!(protocol.complete_incoming(first.reply_ticket(),true).unwrap().is_some());assert_eq!(protocol.direct_pending.len(),0);
+}
+
+#[test]
 fn submission_encoding_has_no_tls_socket_or_channel_readiness_side_effect() {
     let protocol = ArcProtocol::new(owner());
     assert_eq!(protocol.phase(), ArcPhase::Initial);

@@ -21,7 +21,8 @@ use super::{
     session::AttemptOwner,
     transport_packets::{encode_call_packets, CallAssembler, CallKind, TransportBytes, TransportError, TLS_FRAGMENT_THRESHOLD},
 };
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, time::Instant};
+use super::direct_history::{self, DirectHistory};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolError { Rpc(CodecError), Transport(TransportError), Batch(BatchError) }
@@ -87,10 +88,24 @@ impl fmt::Debug for IncomingProtocolMessage {
 enum DirectResponse{Message,Call{kind:CallNoticeKind,native_id:NativeCallId}}
 struct PendingDirect { magic: Vec<u8>, response:DirectResponse }
 
+/// Private protocol replay boundary, NOT a server ACK, channel or new owner.
+/// Only the original authenticated protocol can mint it; pending lower IDs keep
+/// the frontier below them even if a later response was actually submitted.
+pub(super) struct DirectReplayFrontier { owner: AttemptOwner, scope: RpcConnectionScope, through: i32 }
+impl DirectReplayFrontier {
+    pub(super) fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
+        &self.owner == owner && self.scope.matches(scope) && scope.is_open()
+    }
+    pub(super) fn through(&self) -> i32 { self.through }
+}
+impl fmt::Debug for DirectReplayFrontier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("DirectReplayFrontier(<redacted>)") }
+}
+
 pub struct ArcProtocol {
     rpc: ArcRpcSession, assembler: CallAssembler, incoming: Option<IncomingDispatcher>,
     call_incoming:Option<CallDispatcher>,
-    direct_pending: BTreeMap<i32, PendingDirect>, direct_seen: BTreeMap<i32, Vec<u8>>, direct_last_id: i32,
+    direct_pending: BTreeMap<i32, PendingDirect>, direct_seen: DirectHistory, direct_last_id: i32,
 }
 
 impl fmt::Debug for ArcProtocol {
@@ -100,7 +115,7 @@ impl fmt::Debug for ArcProtocol {
 impl ArcProtocol {
     pub fn new(owner: AttemptOwner) -> Self {
         Self { rpc: ArcRpcSession::new(owner), assembler: CallAssembler::default(), incoming: None, call_incoming:None,
-            direct_pending: BTreeMap::new(), direct_seen: BTreeMap::new(), direct_last_id: 0 }
+            direct_pending: BTreeMap::new(), direct_seen: DirectHistory::new(Instant::now()), direct_last_id: 0 }
     }
 
     pub fn connection_scope(&self) -> RpcConnectionScope { self.rpc.connection_scope() }
@@ -192,8 +207,14 @@ impl ArcProtocol {
     pub fn on_plaintext_packet<F>(&mut self, owner: &AttemptOwner, connection: &RpcConnectionScope,
         packet: &[u8], deliver: F) -> Result<bool, ProtocolError>
         where F: for<'a> FnOnce(ProtocolEvent<'a>) {
+        self.on_plaintext_packet_at(owner, connection, packet, Instant::now(), deliver)
+    }
+    pub(super) fn on_plaintext_packet_at<F>(&mut self, owner: &AttemptOwner, connection: &RpcConnectionScope,
+        packet: &[u8], now: Instant, deliver: F) -> Result<bool, ProtocolError>
+        where F: for<'a> FnOnce(ProtocolEvent<'a>) {
         if self.rpc.phase() == ArcPhase::Closed { self.close(); return Ok(false); }
         if !self.rpc.accepts_scope(owner, connection) { return Ok(false); }
+        if let Err(error) = self.direct_seen.tick(now) { self.close(); return Err(error.into()); }
         let message = match self.assembler.on_packet(packet) {
             Ok(Some(message)) => message,
             Ok(None) => return Ok(false),
@@ -237,20 +258,21 @@ impl ArcProtocol {
         if request.method != super::rpc_incoming::ONLINE_MESSAGE_METHOD.as_bytes() && call_kind.is_none() {
             self.close(); return Err(TransportError::UnsupportedKind.into());
         }
-        if self.direct_pending.contains_key(&request.call_id) || self.direct_seen.contains_key(&request.call_id) { return Ok(false); }
+        if self.direct_pending.contains_key(&request.call_id) || self.direct_seen.contains_id(request.call_id) { return Ok(false); }
         if request.call_id <= self.direct_last_id { self.close(); return Err(CodecError::InvalidCallId.into()); }
         let Some(magic) = request.metadata.iter().find(|p| p.key == b"__magic").map(|p| p.value) else {
             self.close(); return Err(CodecError::InvalidField.into());
         };
         if magic.is_empty() { self.close(); return Err(CodecError::InvalidField.into()); }
-        if self.direct_pending.values().any(|p| p.magic == magic) || self.direct_seen.values().any(|prior| prior == magic) {
+        if self.direct_pending.values().any(|p| p.magic == magic) || self.direct_seen.refresh_duplicate(request.call_id, magic) {
+            self.direct_last_id = request.call_id; // a suppressed new RPC id may never be reused later
             return Ok(false);
         }
-        let retained_bytes = self.direct_pending.values().map(|p| p.magic.len()).sum::<usize>()
-            + self.direct_seen.values().map(Vec::len).sum::<usize>();
-        if self.direct_pending.len() + self.direct_seen.len() >= super::rpc_stream::MAX_MAP_ENTRIES
-            || magic.len() > 1024
-            || retained_bytes + magic.len() > super::rpc_stream::MAX_STREAM_BYTES {
+        let retained_bytes = self.direct_pending.values().map(|p| p.magic.len()).sum::<usize>() + self.direct_seen.bytes();
+        if self.direct_pending.len() >= super::rpc_stream::MAX_MAP_ENTRIES
+            || self.direct_seen.count() + self.direct_pending.len() >= direct_history::MAX_HISTORY
+            || magic.len() > direct_history::MAX_MAGIC_BYTES
+            || retained_bytes + magic.len() > direct_history::MAX_RETAINED_BYTES {
             self.close(); return Err(CodecError::TooLarge.into());
         }
         if let Some(kind)=call_kind{
@@ -289,9 +311,13 @@ impl ArcProtocol {
     }
 
     fn record_direct(&mut self, id: i32, magic: Vec<u8>) {
-        self.direct_seen.insert(id, magic);
-        // No eviction/replay shortcut. Capacity pressure terminates the scope
-        // before another inbox event, rather than forgetting duplicate keys.
+        self.direct_seen.record(id, magic);
+    }
+    pub(super) fn direct_replay_frontier(&self) -> Option<DirectReplayFrontier> {
+        if self.rpc.phase() != ArcPhase::Authenticated || !self.rpc.connection_scope().is_open() || self.direct_last_id <= 0 { return None; }
+        let through = self.direct_pending.keys().next().map_or(self.direct_last_id, |pending| pending.saturating_sub(1))
+            .min(self.direct_last_id);
+        (through > 0).then(|| DirectReplayFrontier { owner: self.rpc.owner().clone(), scope: self.rpc.connection_scope(), through })
     }
 
     pub fn complete_incoming(&mut self, ticket: &DirectReplyTicket, accepted: bool)

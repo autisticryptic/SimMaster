@@ -101,6 +101,10 @@ pub(super) fn release_and_compact(conn:&Connection,proof:&RunQuiescence)->Result
     }else{false};
     // A prior successful empty-run compaction may already have removed its
     // fence. The still-owned proof permits an idempotent repeat, never rebind.
+    // The same owning Join proof can retire this run's direct replay watermark;
+    // no other nonce/revision or pending/unknown run is implicitly swept.
+    tx.execute("DELETE FROM app_voice_direct_replay_fences WHERE line_id=?1 AND revision=?2 AND run_nonce=?3",
+        params![token.line,token.revision as i64,token.nonce]).map_err(|_|STORAGE)?;
     if state.is_none() {tx.commit().map_err(|_|STORAGE)?;return Ok(0);}
     if !matches!(state.as_deref(),Some("live"|"released")){return Err(SCOPE);}
     tx.execute("UPDATE app_voice_inbox_runs SET state='released' WHERE line_id=?1 AND revision=?2 AND run_nonce=?3",
@@ -132,7 +136,10 @@ pub(super) fn release_and_compact(conn:&Connection,proof:&RunQuiescence)->Result
 /// surviving shared SMS, or sweep another line/unknown user data to free space.
 pub(super) fn delete_account_state(conn:&Connection,line:&str)->Result<(), &'static str> {
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_voice_inbox_runs')",[],|row|row.get(0)).map_err(|_|STORAGE)?;
-    if exists {conn.execute("DELETE FROM app_voice_inbox_runs WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;}
+    if exists {
+        conn.execute("DELETE FROM app_voice_direct_replay_fences WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;
+        conn.execute("DELETE FROM app_voice_inbox_runs WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;
+    }
     Ok(())
 }
 

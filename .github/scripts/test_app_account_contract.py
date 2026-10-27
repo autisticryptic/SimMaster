@@ -533,5 +533,59 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('automatic_reconnect_implemented', http)
 
 
+    def test_direct_retention_is_native_time_window_and_pending_is_not_capacity_evicted(self):
+        history = (PROVIDER / 'direct_history.rs').read_text(encoding='utf-8')
+        self.assertIn('Duration::from_secs(180)', history)
+        self.assertIn('now.duration_since(self.rotated) > WINDOW', history)
+        self.assertIn('now < self.observed', history)
+        self.assertIn('self.current ^= 1', history)
+        self.assertIn('refresh_duplicate', history)
+        self.assertIn('Zeroizing<Vec<u8>>', history)
+        protocol = (PROVIDER / 'arc_protocol.rs').read_text(encoding='utf-8')
+        self.assertIn('self.direct_pending.len() >= super::rpc_stream::MAX_MAP_ENTRIES', protocol)
+        self.assertIn('self.direct_seen.count() + self.direct_pending.len()', protocol)
+        self.assertIn('request.call_id <= self.direct_last_id', protocol)
+        frontier = protocol.split('fn direct_replay_frontier', 1)[1].split('pub fn complete_incoming', 1)[0]
+        self.assertIn('self.direct_pending.keys().next()', frontier)
+        self.assertIn('pending.saturating_sub(1)', frontier)
+        self.assertIn('.min(self.direct_last_id)', frontier)
+        for path in ['.github/workflows/build-release.yml', '.github/workflows/beta-validation.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::direct_history::tests', source(path))
+
+    def test_direct_compaction_requires_original_written_response_and_durable_watermark(self):
+        actor = (PROVIDER / 'transport_actor.rs').read_text(encoding='utf-8')
+        command = actor.split('async fn command(', 1)[1].split('async fn send_wire', 1)[0]
+        self.assertLess(command.index('self.send_wire(&wire'), command.index('if is_response { receipt.direct'))
+        self.assertIn('direct: None', actor)
+        inbox = (PROVIDER / 'account_inbox.rs').read_text(encoding='utf-8')
+        self.assertIn('receipt.direct_replay_frontier()', inbox)
+        self.assertIn('proof.matches(&self.owner,&self.scope)', inbox)
+        self.assertIn('app_voice_direct_replay_fences', inbox)
+        self.assertIn('through_sequence=MAX(through_sequence,excluded.through_sequence)', inbox)
+        self.assertIn("AND i.reply_state='direct_submitted'", inbox)
+        self.assertIn('ORDER BY i.sequence DESC LIMIT -1 OFFSET 128', inbox)
+        self.assertIn('app_account_inbox_direct_retired', inbox)
+        self.assertLess(inbox.index('if let Some((id, matches)) = existing'), inbox.index('if kind == "direct"'))
+        runs = (PROVIDER / 'account_runs.rs').read_text(encoding='utf-8')
+        self.assertIn('DELETE FROM app_voice_direct_replay_fences WHERE line_id=?1 AND revision=?2 AND run_nonce=?3', runs)
+        self.assertNotIn('DELETE FROM sms_messages', runs)
+
+    def test_long_direct_regressions_use_same_actual_run_and_keep_failed_gc_ack_nonreplay(self):
+        tests = (PROVIDER / 'account_long_reception_tests.rs').read_text(encoding='utf-8')
+        self.assertIn('six_hundred_direct_sms_on_one_original_run', tests)
+        self.assertIn('for sequence in 1i32..=600', tests)
+        self.assertIn('assert_eq!(reply.call_id,rpc)', tests)
+        self.assertIn('count(&temp.database,"sms_messages"),600', tests)
+        self.assertIn('count(&temp.database,"app_voice_inbox"),128', tests)
+        self.assertIn('connector.connection_calls(),1', tests)
+        self.assertIn('inbox_nonce,original_nonce', tests)
+        self.assertIn('submitted_direct_reply_gc_failure_retires_original_run', tests)
+        self.assertIn('already submitted ACK may not be replayed', tests)
+        sql = (PROVIDER / 'account_direct_retention_tests.rs').read_text(encoding='utf-8')
+        self.assertIn('compacted_deleted_original_ticket_cannot_recreate', sql)
+        self.assertIn('lower_pending_id_blocks_compaction', sql)
+        self.assertIn('no_protocol_frontier_keeps_classified_envelopes', sql)
+
+
 if __name__ == '__main__':
     unittest.main()

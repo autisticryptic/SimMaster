@@ -176,8 +176,10 @@ impl Drop for UnhostingRetirement { fn drop(&mut self) { if !self.completed { se
 struct LogoutRetirement(RpcConnectionScope);
 impl Drop for LogoutRetirement { fn drop(&mut self) { self.0.close(); } }
 
-pub struct RuntimeReceipt { owner: AttemptOwner, scope: RpcConnectionScope, pub call_id: Option<i32> }
+pub struct RuntimeReceipt { owner: AttemptOwner, scope: RpcConnectionScope, pub call_id: Option<i32>, direct: Option<super::arc_protocol::DirectReplayFrontier> }
 impl RuntimeReceipt {
+    fn new(owner: AttemptOwner, scope: RpcConnectionScope, call_id: Option<i32>) -> Self { Self { owner, scope, call_id, direct: None } }
+    pub(super) fn direct_replay_frontier(&self) -> Option<&super::arc_protocol::DirectReplayFrontier> { self.direct.as_ref() }
     /// Correlation is not channel readiness. Login/register/poll return only
     /// transport submission; unregister/logout waits also require the original
     /// semantic result. None of these receipts grants a new connection or IO.
@@ -567,7 +569,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 let result = outcome.and_then(|()| {
                     if Instant::now() >= pending.deadline { return Err(RuntimeError::Timeout); }
                     if !self.scope.is_open() { return Err(RuntimeError::Closed); }
-                    Ok(RuntimeReceipt { owner: self.owner.clone(), scope: self.scope.clone(), call_id: Some(pending.outer_id) })
+                    Ok(RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), Some(pending.outer_id)))
                 });
                 let error = result.as_ref().err().copied();
                 if pending.completion.send(result).is_err() { return Err(RuntimeError::Cancelled); }
@@ -598,7 +600,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 OfflineEvent::Logout(reply) => {
                     let pending = self.logout_pending.take().ok_or(RuntimeError::Protocol)?;
                     let accepted = reply.matches(&self.owner, &self.scope) && reply.call_id() == pending.id && reply.accepted();
-                    let result = if accepted { Ok(RuntimeReceipt { owner: self.owner.clone(), scope: self.scope.clone(), call_id: Some(pending.id) }) }
+                    let result = if accepted { Ok(RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), Some(pending.id))) }
                         else { Err(RuntimeError::Protocol) };
                     if pending.completion.send(result).is_err() { return Err(RuntimeError::Cancelled); }
                     return Err(if accepted { RuntimeError::LoggedOut } else { RuntimeError::Protocol });
@@ -639,13 +641,13 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         let prepared = match command.operation {
             Operation::Configure(epoch, incoming) => {
                 let result = self.backend.configure(epoch, incoming.as_ref().map(Binding::borrowed)).map_err(|_| RuntimeError::Protocol);
-                let receipt = result.map(|()| RuntimeReceipt { owner: self.owner.clone(), scope: self.scope.clone(), call_id: None });
+                let receipt = result.map(|()| RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), None));
                 if command.completion.send(receipt).is_err() { return Err(RuntimeError::Cancelled); }
                 return Ok(());
             }
             Operation::ConfigureCallControl(routing)=>{
                 let result=self.backend.configure_call_control(&borrowed(&routing)).map_err(|_|RuntimeError::InvalidConfiguration);
-                if command.completion.send(result.map(|()|RuntimeReceipt{owner:self.owner.clone(),scope:self.scope.clone(),call_id:None})).is_err(){return Err(RuntimeError::Cancelled);}
+                if command.completion.send(result.map(|()|RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),None))).is_err(){return Err(RuntimeError::Cancelled);}
                 return Ok(());
             }
             Operation::Call(ticket,operation,properties,reply)=>{
@@ -659,14 +661,14 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             }
             Operation::ConfigureCalls(binding)=>{
                 let result=self.backend.configure_calls(binding.borrowed()).map_err(|_|RuntimeError::Protocol);
-                if command.completion.send(result.map(|()|RuntimeReceipt{owner:self.owner.clone(),scope:self.scope.clone(),call_id:None})).is_err(){return Err(RuntimeError::Cancelled);}
+                if command.completion.send(result.map(|()|RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),None))).is_err(){return Err(RuntimeError::Cancelled);}
                 return Ok(());
             }
             Operation::CompleteCall(ticket,accepted,properties)=>{
                 match self.backend.complete_call(&ticket,accepted,&borrowed(&properties)){
                     Ok(Some(super::offline_backend::CallCompletion::Direct(packets)))=>Ok(packets),
                     Ok(Some(super::offline_backend::CallCompletion::BatchQueued))=>{
-                        if command.completion.send(Ok(RuntimeReceipt{owner:self.owner.clone(),scope:self.scope.clone(),call_id:None})).is_err(){return Err(RuntimeError::Cancelled);}
+                        if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),None))).is_err(){return Err(RuntimeError::Cancelled);}
                         return Ok(());
                     }
                     _=>{let _=command.completion.send(Err(RuntimeError::Protocol));return Ok(());}
@@ -676,7 +678,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 let result = self.backend.complete_message(&ticket, accepted).and_then(|completed| {
                     if completed { Ok(()) } else { Err(super::arc_protocol::ProtocolError::Rpc(super::rpc_stream::CodecError::InvalidField)) }
                 }).map_err(|_| RuntimeError::Protocol);
-                if command.completion.send(result.map(|()| RuntimeReceipt { owner: self.owner.clone(), scope: self.scope.clone(), call_id: None })).is_err() {
+                if command.completion.send(result.map(|()| RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), None))).is_err() {
                     return Err(RuntimeError::Cancelled);
                 }
                 return Ok(());
@@ -731,7 +733,11 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             return Ok(());
         }
         if is_logout { self.logout_pending = Some(LogoutPending { id: packets.call_id, completion: command.completion }); return Ok(()); }
-        if command.completion.send(Ok(RuntimeReceipt { owner: self.owner.clone(), scope: self.scope.clone(), call_id: Some(packets.call_id) })).is_err() {
+        let mut receipt = RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), Some(packets.call_id));
+        // Only a completed original response WRITE can carry this local replay
+        // boundary. BatchQueued/login/poll receipts cannot mint compaction proof.
+        if is_response { receipt.direct = self.backend.direct_replay_frontier(); }
+        if command.completion.send(Ok(receipt)).is_err() {
             return Err(RuntimeError::Cancelled);
         }
         Ok(())

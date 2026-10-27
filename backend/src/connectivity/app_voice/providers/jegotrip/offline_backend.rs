@@ -270,6 +270,9 @@ impl OfflineBackend {
         } }
     }
 
+    pub(super) fn direct_replay_frontier(&self) -> Option<super::arc_protocol::DirectReplayFrontier> {
+        self.protocol.direct_replay_frontier()
+    }
     pub fn complete_direct_message(&mut self, ticket: &super::arc_protocol::DirectReplyTicket, accepted: bool)
         -> Result<Option<OwnedCallPackets>, ProtocolError> { self.protocol.complete_incoming(ticket, accepted) }
     pub(super) fn complete_call(&mut self,ticket:&CallReplyTicket,accepted:bool,properties:&[RpcProperty<'_>])->Result<Option<CallCompletion>,ProtocolError>{

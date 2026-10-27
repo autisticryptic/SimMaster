@@ -7,6 +7,9 @@
 //! before this provider can be installed as available.
 pub mod batch_scheduler;
 pub mod arc_protocol;
+mod direct_history;
+#[cfg(test)]
+pub(crate) mod long_reception_test_support;
 pub mod arc_session;
 pub mod account_config;
 pub mod account_store;
