@@ -30,6 +30,36 @@ fn cleanup_policy_rejects_null_truthy_strings_and_unknown_recovery_objects() {
     assert!(serde_json::from_value::<AccountConfig>(unknown).is_err());
 }
 
+#[test]
+fn reconnect_policy_requires_cleanup_bounds_and_survives_private_roundtrip_without_secrets() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let config = fixture(&cert.root);
+    let baseline: serde_json::Value = serde_json::from_str(&public_json(&config)).unwrap();
+    assert!(baseline.get("reconnect").is_none(), "legacy private JSON stays byte-compatible without a policy");
+    let policy = serde_json::json!({"max_attempts":3,"initial_delay_ms":1000,"max_delay_ms":4000});
+    let mut without_cleanup = baseline.clone(); without_cleanup["reconnect"] = policy.clone();
+    let parsed: AccountConfig = serde_json::from_value(without_cleanup).unwrap();
+    assert_eq!(parsed.validate(100).err(), Some(INVALID), "retry needs original-run cleanup first");
+    let mut json = baseline.clone(); json["cleanup_on_disconnect"] = serde_json::json!(true); json["reconnect"] = policy;
+    let enabled: AccountConfig = serde_json::from_value(json.clone()).unwrap(); assert!(enabled.validate(100).is_ok());
+    let policy = enabled.reconnect.unwrap();
+    assert_eq!([1,2,3,4].map(|n| policy.delay(n).as_millis()), [1000,2000,4000,4000]);
+    let bytes = enabled.encode_private().unwrap(); let loaded = AccountConfig::decode_private(&bytes).unwrap();
+    assert_eq!(loaded.reconnect, Some(policy)); assert_eq!(bytes.as_slice(), loaded.encode_private().unwrap().as_slice());
+    for bad in [serde_json::json!({"max_attempts":0,"initial_delay_ms":1000,"max_delay_ms":1000}),
+        serde_json::json!({"max_attempts":17,"initial_delay_ms":1000,"max_delay_ms":1000}),
+        serde_json::json!({"max_attempts":1,"initial_delay_ms":999,"max_delay_ms":1000}),
+        serde_json::json!({"max_attempts":1,"initial_delay_ms":2000,"max_delay_ms":1000}),
+        serde_json::json!({"max_attempts":1,"initial_delay_ms":1000,"max_delay_ms":3600001})] {
+        let mut invalid = json.clone(); invalid["reconnect"] = bad;
+        assert_eq!(serde_json::from_value::<AccountConfig>(invalid).unwrap().validate(100).err(), Some(INVALID));
+    }
+    for bad in [serde_json::json!(true), serde_json::json!({"max_attempts":1,"initial_delay_ms":1000,"max_delay_ms":1000,"renew_token":true}),
+        serde_json::json!({"max_attempts":"1","initial_delay_ms":1000,"max_delay_ms":1000})] {
+        let mut invalid = json.clone(); invalid["reconnect"] = bad;
+        assert!(serde_json::from_value::<AccountConfig>(invalid).is_err());
+    }
+}
+
 fn secret(json: &str) -> Secret { serde_json::from_str(json).unwrap() }
 fn fixture(root: &str) -> AccountConfig {
     let mut credentials = imported();
@@ -40,7 +70,7 @@ fn fixture(root: &str) -> AccountConfig {
     credentials.sdk.selected_session_id = Some(secret("\"fixture-original-selector\""));
     credentials.sdk.client_config_decode_key = Some(secret("\"fixture-client-context\""));
     credentials.sdk.reference_decode_key = Some(secret("\"fixture-reference-context\""));
-    AccountConfig { credentials, bootstrap:None, call_media:None, cleanup_on_disconnect:false, profile: ProfileConfig {
+    AccountConfig { credentials, bootstrap:None, call_media:None, cleanup_on_disconnect:false, reconnect:None, profile: ProfileConfig {
         route: ProfileRoute::DirectTlsCarrier, authority: secret("\"fixture.invalid\""), enable_sni: true,
         identity_type: secret("\"username\""), domain_name: Some(secret("\"fixture.invalid\"")),
         domain_id: Some(secret("\"fixture-domain\"")), application_id: Some(secret("\"fixture-app\"")),

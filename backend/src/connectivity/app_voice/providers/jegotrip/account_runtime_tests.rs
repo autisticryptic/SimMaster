@@ -21,6 +21,8 @@ mod auto_cleanup;
 mod long_direct;
 #[path = "account_long_batch_tests.rs"]
 mod long_batch;
+#[path = "account_reconnect_tests.rs"]
+mod reconnect;
 
 async fn phase(manager: &AccountManager, line: &str, wanted: &str) -> AccountView {
     tokio::time::timeout(Duration::from_secs(4), async {

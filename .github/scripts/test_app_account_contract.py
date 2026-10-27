@@ -637,5 +637,35 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('DROP TRIGGER fail_live_batch_gc', tests)
 
 
+    def test_reconnect_supervisor_is_opt_in_post_cleanup_fresh_start_and_bounded(self):
+        config = (PROVIDER / 'account_config.rs').read_text(encoding='utf-8')
+        self.assertIn('if !self.cleanup_on_disconnect { return Err(INVALID); }', config)
+        for bound in ['(1..=16).contains(&self.max_attempts)', '(1_000..=600_000).contains(&self.initial_delay_ms)', 'self.max_delay_ms > 3_600_000']:
+            self.assertIn(bound, config)
+        runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
+        cleanup = runtime.split('async fn automatic_cleanup', 1)[1].split('fn reconnect_retryable', 1)[0]
+        self.assertLess(cleanup.index('cleanup_original(&run'), cleanup.index('schedule_reconnect(&run)'))
+        self.assertIn('return; }\n    // Only after the original run finalized', cleanup)
+        retry = runtime.split('fn reconnect_retryable', 1)[1].split('fn schedule_reconnect', 1)[0]
+        self.assertIn('"app_account_disconnected" | "app_account_backend_unavailable" | "app_account_operation_timeout"', retry)
+        for forbidden in ['authentication', 'hosting_rejected', 'expired', 'revision', 'storage']:
+            self.assertNotIn(forbidden, retry)
+        schedule = runtime.split('fn schedule_reconnect', 1)[1].split('async fn reconnect_after', 1)[0]
+        for guard in ['run.manual_cleanup.load', '!run.finalized.load', 't.phase == Phase::Disconnected', 'credential_expiry', 'next > policy.max_attempts', 'run.supervisor.upgrade()']:
+            self.assertIn(guard, schedule)
+        start = runtime.split('async fn start_with', 1)[1].split('let metadata = self.check_revision', 1)[0]
+        self.assertIn('Arc::ptr_eq(&run, old)', start)
+        self.assertIn('old.cancel_reconnect()', start)
+        after = runtime.split('async fn reconnect_after', 1)[1].split('\nconst ', 1)[0]
+        self.assertIn('old.revision', after)
+        self.assertNotIn('import(', after)
+        self.assertIn('run.cancel_reconnect();', runtime.split('async fn cleanup_run', 1)[1].split('async fn cleanup_original', 1)[0])
+        self.assertIn('app_accounts.enable_reconnect_supervisor();', source('backend/src/state.rs'))
+        tests = (PROVIDER / 'account_reconnect_tests.rs').read_text(encoding='utf-8')
+        for name in ['disconnect_after_full_original_cleanup_starts_one_fresh_run', 'rejected_authentication_is_not_retried',
+                     'failed_fresh_starts_are_bounded_then_exhausted', 'stop_during_scheduled_delay_cancels_supervised_start']:
+            self.assertIn(name, tests)
+        self.assertIn('assert_ne!(fresh.inbox_nonce, original_nonce', tests)
+
 if __name__ == '__main__':
     unittest.main()

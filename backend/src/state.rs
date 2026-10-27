@@ -135,6 +135,8 @@ impl AppState {
             shutdown,
         } = dependencies;
         let app_accounts = Arc::new(crate::connectivity::app_voice::providers::jegotrip::account_runtime::AccountManager::with_notifications(database.clone(),notification_sender.clone()));
+        // Opt-in per account; enabling supervision starts nothing by itself.
+        app_accounts.enable_reconnect_supervisor();
         Self {
             dbus_conn,
             modem_radio,

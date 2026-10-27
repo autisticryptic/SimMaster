@@ -28,6 +28,33 @@ pub struct AccountConfig {
     /// run. Never automatic SDK startup/reconnect or unowned process takeover.
     #[serde(default)]
     pub cleanup_on_disconnect: bool,
+    /// Opt-in bounded supervisor: after THIS manager's retired run completed
+    /// cleanup and every original Join, repeat an explicit fresh start with the
+    /// same stored revision. Not token renewal, session resume or takeover.
+    #[serde(default)]
+    pub reconnect: Option<ReconnectPolicy>,
+}
+
+/// Bounded retry of a disconnected run. Authentication, hosting rejection,
+/// expiry, revision/owner or storage failures are never retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconnectPolicy {
+    pub max_attempts: u32,
+    pub initial_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+impl ReconnectPolicy {
+    pub(super) fn validate(&self) -> Result<(), &'static str> {
+        if !(1..=16).contains(&self.max_attempts) || !(1_000..=600_000).contains(&self.initial_delay_ms)
+            || self.max_delay_ms < self.initial_delay_ms || self.max_delay_ms > 3_600_000 { return Err(INVALID); }
+        Ok(())
+    }
+    /// attempt is 1-based; exponential, saturating at max_delay_ms.
+    pub(super) fn delay(&self, attempt: u32) -> Duration {
+        let shift = attempt.saturating_sub(1).min(20);
+        Duration::from_millis(self.initial_delay_ms.saturating_mul(1u64 << shift).min(self.max_delay_ms))
+    }
 }
 impl fmt::Debug for AccountConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("AccountConfig(<redacted>)") }
@@ -253,6 +280,12 @@ impl AccountConfig {
         }
         // Constructing the profile is bounded and validates all property maps,
         // incoming binding, required text, supported route and explicit deadlines.
+        if let Some(policy) = &self.reconnect {
+            // Retry needs the original-run cleanup proof first; never a
+            // second owner racing an uncleaned retired run.
+            if !self.cleanup_on_disconnect { return Err(INVALID); }
+            policy.validate()?;
+        }
         let _profile = self.runtime_profile()?;
         let _calls = self.runtime_calls()?;
         let key = self.reference_key()?;
@@ -306,7 +339,9 @@ struct PrivateEnvelope { format_version: u32, config: AccountConfig }
 struct PrivateEnvelopeRef<'a> { format_version: u32, config: PrivateConfigRef<'a> }
 #[derive(Serialize)]
 struct PrivateConfigRef<'a> { credentials: PrivateCredentialsRef<'a>, profile: PrivateProfileRef<'a>, bootstrap:Option<PrivateBootstrapRef<'a>>,
-    call_media: Option<PrivateCallMediaRef<'a>>, cleanup_on_disconnect: bool }
+    call_media: Option<PrivateCallMediaRef<'a>>, cleanup_on_disconnect: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reconnect: Option<ReconnectPolicy> }
 #[derive(Serialize)]
 struct PrivateCallMediaRef<'a> { authority: &'a str, root_der_base64: &'a str, enable_sni: bool,
     routing: PrivateProperties<'a>, features: PrivateFeatures<'a>, properties: PrivateProperties<'a>, reference_decode_key: Option<&'a str>,
@@ -405,6 +440,7 @@ impl<'a> PrivateConfigRef<'a> {
                 partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
             },
             cleanup_on_disconnect: config.cleanup_on_disconnect,
+            reconnect: config.reconnect,
             call_media: config.call_media.as_ref().map(|media| PrivateCallMediaRef { authority: media.authority.expose_to_backend(),
                 root_der_base64: media.root_der_base64.expose_to_backend(), enable_sni: media.enable_sni,
                 routing: PrivateProperties(&media.routing), features: PrivateFeatures(&media.features), properties: PrivateProperties(&media.properties),

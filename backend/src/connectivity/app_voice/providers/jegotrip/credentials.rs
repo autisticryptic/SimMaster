@@ -152,7 +152,7 @@ pub fn contract() -> CredentialContract {
         basic_hosting: BasicHostingContract {
             account_line_kind: "app_account", access: "application_data", billing_account: "jegotrip_account",
             explicit_profile_required: true, manual_start_required: true,
-            automatic_cleanup_supported: true, automatic_reconnect_implemented: false,
+            automatic_cleanup_supported: true, automatic_reconnect_implemented: true,
             implemented_operations: super::BASIC_INBOUND_OPERATIONS.iter().map(|operation| operation.as_str()).collect(),
             media_transport: "endpoint_tcp_mpath",
             media_profile: "raw_rse_sdp_rtp_avp_rtcp_mux_passthrough",
@@ -183,6 +183,7 @@ pub fn contract() -> CredentialContract {
             ParameterContract { field: "hosting.delete_int_code", source: "DeleteIntCode", purpose: "Preserve supplied string policy", secret: false },
             ParameterContract { field: "hosting.enrollment_confirmed", source: "Existing account hosting enrollment", purpose: "Import does not enable server entitlement", secret: false },
             ParameterContract { field: "config.profile", source: "Original explicit native connection, routing and receiver bindings", purpose: "Required by the native account runtime; no guessed endpoint, authority, receiver or current readiness", secret: true },
+            ParameterContract { field: "config.reconnect (optional)", source: "Explicit local policy {max_attempts 1..16, initial_delay_ms 1000..600000, max_delay_ms<=3600000}; requires cleanup_on_disconnect", purpose: "Bounded fresh restart of the same stored revision only after this manager's retired run fully cleaned up; disconnect/timeout/unavailable only, never auth/hosting rejection/expiry, token renewal or session resume", secret: false },
             ParameterContract { field: "config.cleanup_on_disconnect (optional)", source: "Explicit local account lifecycle policy; default false", purpose: "Bounded cleanup of this manager's retired original run only; no automatic restart, token renewal or prior-process takeover", secret: false },
             ParameterContract { field: "config.call_media (optional)", source: "Original Endpoint authority/root/routing and explicit local audio/Trunk settings", purpose: "Required for incoming voice; plain-media opt-in, current original call binding and supported SDP, never a SIM cost grant", secret: true },
         ],

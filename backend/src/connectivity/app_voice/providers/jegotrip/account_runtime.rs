@@ -59,6 +59,14 @@ pub struct AccountView {
     pub cleanup_on_disconnect: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup_error: Option<&'static str>,
+    /// Supervisor observation only: 1-based fresh-start attempt of this run
+    /// chain, and scheduled/exhausted/not_retryable/start_rejected/unsupervised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnect_attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnect_state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnect_error: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<&'static str>,
 }
@@ -67,7 +75,8 @@ fn view(metadata: AccountMetadata, phase: Phase, cleanup: bool, error: Option<&'
         phase: phase_name(phase), io_cleanup_required: cleanup,
         // A hosted SDK acknowledgement is not verified SMS/call/media support.
         incoming_call_ready: false, incoming_message_ready: false, outbound_authorized: false,
-        provider_availability: "unsupported", manual_start_required: true, cleanup_on_disconnect: None, cleanup_error: None, last_error: error }
+        provider_availability: "unsupported", manual_start_required: true, cleanup_on_disconnect: None, cleanup_error: None,
+        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, last_error: error }
 }
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
@@ -130,6 +139,15 @@ struct ManagedRun {
     sms_supported: bool,
     credential_expiry: Option<u64>,
     cleanup_on_disconnect: bool,
+    reconnect: Option<super::account_config::ReconnectPolicy>,
+    /// 1 for an explicit start; carried and incremented only by the supervisor,
+    /// reset after the run's own successful original HostingAck.
+    reconnect_attempt: u32,
+    hosted_once: AtomicBool,
+    supervisor: std::sync::Weak<AccountManager>,
+    reconnect_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    reconnect_state: Mutex<Option<&'static str>>,
+    reconnect_error: Mutex<Option<&'static str>>,
     cleanup_work: AsyncMutex<()>,
     cleanup_changed: tokio::sync::Notify,
     cleanup_task: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
@@ -180,6 +198,12 @@ impl ManagedRun {
         self.task.try_lock().is_ok_and(|task| task.as_ref().is_some_and(|task| !task.is_finished()))
             && self.calls.as_ref().is_some_and(|calls| calls.ready())
     }
+    /// User stop/start/shutdown owns the account: no supervised start may follow.
+    fn cancel_reconnect(&self) {
+        if let Some(task) = lock(&self.reconnect_task).take() { task.abort(); }
+        let mut state = lock(&self.reconnect_state);
+        if *state == Some("scheduled") { *state = None; }
+    }
     fn retire(&self) {
         self.accepting.store(false, Ordering::SeqCst);
         self.cleanup_changed.notify_waiters();
@@ -193,6 +217,9 @@ impl Drop for ManagedRun {
         self.retire();
         if let Some(task) = self.task.get_mut().take() { task.abort(); }
         if let Some(task) = self.cleanup_task.get_mut().take() { task.abort(); }
+        // A pending fresh start belongs to this run chain; never let it outlive
+        // the retired run. (Aborting the currently running task is harmless.)
+        if let Some(task) = lock(&self.reconnect_task).take() { task.abort(); }
     }
 }
 struct Retirement { run: Arc<ManagedRun>, armed: bool }
@@ -216,6 +243,9 @@ pub struct AccountManager {
     shutting_down: AtomicBool,
     shutdown_changed: tokio::sync::Notify,
     slots: Mutex<BTreeMap<String, Arc<AccountSlot>>>,
+    /// Set only when an owning Arc explicitly enables supervision. Without it
+    /// an opted-in policy is reported as unsupervised, never silently ignored.
+    supervisor: Mutex<std::sync::Weak<AccountManager>>,
 }
 impl fmt::Debug for AccountManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("AccountManager(<redacted>)") }
@@ -230,8 +260,12 @@ impl AccountManager {
         let mut manager=Self::with_factory(database,factory);manager.notifications=Some(notifications);manager
     }
     pub(crate) fn with_factory(database: Arc<Database>, factory: Arc<dyn AccountBackendFactory>) -> Self {
-        Self { database, factory, notifications: None, shutting_down:AtomicBool::new(false), shutdown_changed:tokio::sync::Notify::new(), slots: Mutex::new(BTreeMap::new()) }
+        Self { database, factory, notifications: None, shutting_down:AtomicBool::new(false), shutdown_changed:tokio::sync::Notify::new(), slots: Mutex::new(BTreeMap::new()),
+            supervisor: Mutex::new(std::sync::Weak::new()) }
     }
+    /// The process owner enables the bounded reconnect supervisor after wrapping
+    /// the manager. No account is started by this call.
+    pub(crate) fn enable_reconnect_supervisor(self: &Arc<Self>) { *lock(&self.supervisor) = Arc::downgrade(self); }
     fn metadata(&self, line_id: &str) -> Result<AccountMetadata, &'static str> {
         if !account_store::valid_line_id(line_id) { return Err("app_account_line_invalid"); }
         self.database.with_conn(|conn| account_store::metadata(conn, line_id))?.ok_or("app_account_not_found")
@@ -273,6 +307,11 @@ impl AccountManager {
         let mut snapshot = view(metadata, observed_phase, !controller.resources_released() || !run.finalized.load(Ordering::SeqCst), error);
         snapshot.cleanup_on_disconnect = Some(run.cleanup_on_disconnect);
         snapshot.cleanup_error = *lock(&run.cleanup_error);
+        if run.reconnect.is_some() {
+            snapshot.reconnect_attempt = Some(run.reconnect_attempt);
+            snapshot.reconnect_state = *lock(&run.reconnect_state);
+            snapshot.reconnect_error = *lock(&run.reconnect_error);
+        }
         // SDK hosting success alone is not enough: only the exact supported
         // receiver + live original durable consumer publishes SMS readiness.
         if controller.phase() == Phase::Hosted && run.message_ready(now) {
@@ -443,9 +482,25 @@ impl AccountManager {
         Ok(())
     }
     pub async fn start(&self, line_id: &str, expected_revision: u64, now: u64) -> Result<AccountView, &'static str> {
+        self.start_with(line_id, expected_revision, now, None).await
+    }
+    /// `previous` is only the supervisor's own retired run: the fresh start is
+    /// abandoned if the user stopped/replaced/deleted it, or another run exists.
+    async fn start_with(&self, line_id: &str, expected_revision: u64, now: u64,
+        previous: Option<(&Arc<ManagedRun>, u32)>) -> Result<AccountView, &'static str> {
         if self.shutting_down.load(Ordering::SeqCst){return Err("app_account_shutting_down");}
         let slot = self.slot(line_id)?; let _operation = slot.operation.lock().await;
         if self.shutting_down.load(Ordering::SeqCst){return Err("app_account_shutting_down");}
+        if let Some((old, _)) = previous {
+            let current = lock(&slot.run).clone();
+            if old.manual_cleanup.load(Ordering::SeqCst) || !current.is_some_and(|run| Arc::ptr_eq(&run, old)) {
+                return Err("app_account_reconnect_superseded");
+            }
+        } else if let Some(old) = lock(&slot.run).clone() {
+            // An explicit user start owns this account again: cancel any
+            // pending supervised start of the previous, finalized run.
+            old.cancel_reconnect();
+        }
         let metadata = self.check_revision(line_id, expected_revision)?;
         self.require_released(line_id,&slot).await?;
         let StoredAccount { metadata: stored, config } = self.database.with_conn(|conn| account_store::load(conn, line_id))?
@@ -456,6 +511,8 @@ impl AccountManager {
         let sms_supported = config.profile.incoming.as_ref().is_some_and(|binding| binding.receiver_kind == super::smgw_text::SMGW_RECEIVER);
         let credential_expiry = config.credentials.sdk.expires_at_unix_seconds;
         let cleanup_on_disconnect = config.cleanup_on_disconnect;
+        let reconnect = config.reconnect;
+        let reconnect_attempt = previous.map_or(1, |(_, attempt)| attempt);
         let call_settings = config.runtime_calls()?;
         let (backend, events) = self.factory.build(&config)?;
         let mut controller = HostingController::new(line_id.to_owned(), Some(backend.clone()));
@@ -465,6 +522,8 @@ impl AccountManager {
         let run = Arc::new(ManagedRun { line_id: line_id.to_owned(), database: self.database.clone(), revision: metadata.revision,
             inbox_nonce, run_token, finalized: AtomicBool::new(false), notifications:self.notifications.clone(),
             sms_supported, credential_expiry, cleanup_on_disconnect,
+            reconnect, reconnect_attempt, hosted_once: AtomicBool::new(false), supervisor: lock(&self.supervisor).clone(),
+            reconnect_task: Mutex::new(None), reconnect_state: Mutex::new(None), reconnect_error: Mutex::new(None),
             cleanup_work: AsyncMutex::new(()), cleanup_changed: tokio::sync::Notify::new(), cleanup_task: AsyncMutex::new(None),
             manual_cleanup: AtomicBool::new(false), terminal_observation: Mutex::new(None), cleanup_error: Mutex::new(None),
             messaging_readiness: Mutex::new(None), calls, controller: AsyncMutex::new(controller), backend,
@@ -514,6 +573,7 @@ impl AccountManager {
     }
     async fn cleanup_run(&self,run:&Arc<ManagedRun>,now:u64)->Result<Phase,&'static str>{
         run.manual_cleanup.store(true, Ordering::SeqCst);
+        run.cancel_reconnect();
         *lock(&run.terminal_observation) = None;
         let result = Self::cleanup_original(run, now).await;
         Self::join_automatic_cleanup(run).await?;
@@ -608,7 +668,8 @@ impl Drop for AccountManager {
 }
 
 /// One bounded cleanup attempt after this live manager's own run retires.
-/// Never a reconnect/renewal worker and never a prior-process takeover proof.
+/// Not itself a reconnect/renewal worker or prior-process takeover proof; an
+/// opted-in policy may only schedule a fresh start after this cleanup finalized.
 async fn automatic_cleanup(weak: std::sync::Weak<ManagedRun>) {
     let Some(run) = weak.upgrade() else { return; };
     loop {
@@ -642,7 +703,47 @@ async fn automatic_cleanup(weak: std::sync::Weak<ManagedRun>) {
     }).await.unwrap_or(Err("app_account_cleanup_unconfirmed"));
     // A negative teardown verdict remains visible separately from the terminal
     // cause, even when local IO release and durable finalization are confirmed.
-    if let Err(code) = result { *lock(&run.cleanup_error) = Some(code); }
+    if let Err(code) = result { *lock(&run.cleanup_error) = Some(code); return; }
+    // Only after the original run finalized (actual Joins + fence release):
+    // never a second owner beside an uncleaned run.
+    schedule_reconnect(&run);
+}
+
+/// Error codes from which a FRESH login on the same stored revision may succeed.
+/// Authentication/hosting rejection, expiry, revision/owner, storage, channel or
+/// protocol failures need user action and are never retried automatically.
+fn reconnect_retryable(code: &str) -> bool {
+    matches!(code, "app_account_disconnected" | "app_account_backend_unavailable" | "app_account_operation_timeout")
+}
+fn schedule_reconnect(run: &Arc<ManagedRun>) {
+    let Some(policy) = run.reconnect else { return; };
+    if run.manual_cleanup.load(Ordering::SeqCst) || !run.finalized.load(Ordering::SeqCst) { return; }
+    let terminal = *lock(&run.terminal_observation);
+    let retryable = terminal.is_some_and(|t| t.phase == Phase::Disconnected && reconnect_retryable(t.error))
+        && run.credential_expiry.is_none_or(|at| at > unix_now());
+    if !retryable { *lock(&run.reconnect_state) = Some("not_retryable"); return; }
+    // A run that reached its own HostingAck starts a new failure series.
+    let next = if run.hosted_once.load(Ordering::SeqCst) { 1 } else { run.reconnect_attempt.saturating_add(1) };
+    if next > policy.max_attempts { *lock(&run.reconnect_state) = Some("exhausted"); return; }
+    let Some(manager) = run.supervisor.upgrade() else { *lock(&run.reconnect_state) = Some("unsupervised"); return; };
+    if manager.shutting_down.load(Ordering::SeqCst) { return; }
+    let delay = policy.delay(next);
+    let (weak_manager, weak_run) = (Arc::downgrade(&manager), Arc::downgrade(run));
+    let mut task = lock(&run.reconnect_task);
+    *lock(&run.reconnect_state) = Some("scheduled");
+    *task = Some(tokio::spawn(reconnect_after(weak_manager, weak_run, next, delay)));
+}
+async fn reconnect_after(manager: std::sync::Weak<AccountManager>, run: std::sync::Weak<ManagedRun>, attempt: u32, delay: Duration) {
+    tokio::time::sleep(delay).await;
+    let (Some(manager), Some(old)) = (manager.upgrade(), run.upgrade()) else { return; };
+    if manager.shutting_down.load(Ordering::SeqCst) || old.manual_cleanup.load(Ordering::SeqCst) { return; }
+    // Same stored revision as the retired original run; a replaced config is a
+    // different user decision and fails the revision check, never rebinds.
+    match manager.start_with(&old.line_id, old.revision, unix_now(), Some((&old, attempt))).await {
+        Ok(_) => { *lock(&old.reconnect_state) = Some("restarted"); }
+        Err("app_account_reconnect_superseded") => { *lock(&old.reconnect_state) = None; }
+        Err(code) => { *lock(&old.reconnect_error) = Some(code); *lock(&old.reconnect_state) = Some("start_rejected"); }
+    }
 }
 
 const MAX_PENDING_MESSAGES: usize = 16;
@@ -732,6 +833,7 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                         let hosted = matches!(callback.callback, Callback::HostingAck { success: true });
                         match controller.on_callback(&owner, callback.callback, unix_now()).await {
                             Ok(true) if hosted && controller.phase() == Phase::Hosted => {
+                                run.hosted_once.store(true, Ordering::SeqCst);
                                 run.install_message_readiness(&owner, &scope);
                                 if let Some(calls) = &run.calls { if let Err(code) = calls.start(&owner,&scope).await { *lock(&run.error)=Some(code);run.retire(); } }
                             },

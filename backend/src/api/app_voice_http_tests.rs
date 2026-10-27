@@ -47,7 +47,7 @@ mod app_voice_accounts {
         assert_eq!(basic["billing_account"], "jegotrip_account"); assert_eq!(basic["manual_start_required"], true);
         assert_eq!(basic["explicit_profile_required"], true); assert_eq!(basic["plain_media_opt_in_required"], true);
         assert_eq!(basic["default_sdk_client_implemented"], false);
-        assert_eq!(basic["automatic_cleanup_supported"], true); assert_eq!(basic["automatic_reconnect_implemented"], false);
+        assert_eq!(basic["automatic_cleanup_supported"], true); assert_eq!(basic["automatic_reconnect_implemented"], true);
         assert_eq!(basic["outbound_call_implemented"], false); assert_eq!(basic["outbound_message_implemented"], false);
         assert_eq!(basic["media_transport"], "endpoint_tcp_mpath");
         assert_eq!(basic["media_profile"], "raw_rse_sdp_rtp_avp_rtcp_mux_passthrough");
