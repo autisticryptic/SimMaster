@@ -140,14 +140,26 @@ impl CallService {
             }
         }
     }
+    /// Acquire/reap admission before changing a call's queued state. A caller
+    /// cancelled while this lock is pending has not admitted an operation.
+    async fn task_admission(&self) -> Option<tokio::sync::MutexGuard<'_, Vec<JoinHandle<()>>>> {
+        if !self.accepting.load(Ordering::SeqCst) { return None; }
+        let mut tasks = self.tasks.lock().await; let mut index = 0;
+        while index < tasks.len() {
+            if tasks[index].is_finished() {
+                let result = (&mut tasks[index]).await;
+                // Remove each consumed Join immediately, including if a later
+                // join/lock acquisition is cancelled. Never repoll a ready Join.
+                tasks.swap_remove(index);
+                if result.is_err() { self.retire(); }
+            } else { index += 1; }
+        }
+        if !self.accepting.load(Ordering::SeqCst) || tasks.len() >= 512 { return None; }
+        Some(tasks)
+    }
     async fn spawn_task<F>(&self,future:F)->bool where F:Future<Output=()>+Send+'static {
-        if !self.accepting.load(Ordering::SeqCst){return false;}
-        let mut tasks=self.tasks.lock().await;let mut index=0;
-        while index<tasks.len(){if tasks[index].is_finished(){
-            let mut task=tasks.swap_remove(index);if (&mut task).await.is_err(){self.retire();}
-        }else{index+=1;}}
-        if !self.accepting.load(Ordering::SeqCst)||tasks.len()>=512{return false;}
-        tasks.push(tokio::spawn(future));true
+        let Some(mut tasks) = self.task_admission().await else { return false; };
+        tasks.push(tokio::spawn(future)); true
     }
     async fn publish_state<T>(&self,call:&Call,work:impl FnOnce(&mut State)->T)->Result<T,&'static str>{
         let deadline=Instant::now()+std::time::Duration::from_millis(250);let mut work=Some(work);
@@ -164,8 +176,31 @@ impl CallService {
         }
     }
     async fn ring(&self,call:&Arc<Call>)->Result<(),&'static str>{
-        if !self.active(call){return Err(SCOPE);}
-        let scope=call.ticket.connection_scope();let result=self.backend.call(call.ticket.owner(),&scope,&call.ticket,CallOperation::Inform,&[]).await.map_err(call_error)?;
+        let scope = call.ticket.connection_scope();
+        let deadline = tokio::time::Instant::now() + self.settings.profile.rpc_timeout;
+        // Batch completion may only queue the original invitation receipt.
+        // CallNotReady is the actor's explicit PRE-admission result: no Inform
+        // bytes/pending id were created. Retry only that result on the same
+        // owner/ticket, under one fixed budget; never replay a submitted RPC.
+        let result = loop {
+            if !self.active(call) { return Err(SCOPE); }
+            if tokio::time::Instant::now() >= deadline { return Err("app_account_call_timeout"); }
+            let attempt = tokio::time::timeout_at(deadline, self.backend.call(
+                call.ticket.owner(), &scope, &call.ticket, CallOperation::Inform, &[],
+            )).await.map_err(|_| "app_account_call_timeout")?;
+            match attempt {
+                Ok(result) => break result,
+                Err(RuntimeError::CallNotReady) => {
+                    let wake = (tokio::time::Instant::now() + std::time::Duration::from_millis(10)).min(deadline);
+                    tokio::select! { biased;
+                        _ = call.ticket.revoked() => return Err(SCOPE),
+                        _ = self.stopped() => return Err(SCOPE),
+                        _ = tokio::time::sleep_until(wake) => {},
+                    }
+                }
+                Err(error) => return Err(call_error(error)),
+            }
+        };
         if !result.accepted()||!self.active(call){return Err("app_account_call_rejected");}
         let socket=BoundAudioSocket::bind(&call.ticket,self.settings.bind_ip).await.map_err(|error|error.code())?;
         let address=socket.address(&call.ticket).ok_or(SCOPE)?;let body=call.offer.with_local_endpoint(&call.ticket,address).map_err(|error|error.code())?;
@@ -177,14 +212,17 @@ impl CallService {
     pub(super) async fn accept(self:&Arc<Self>,id:&str,body:Vec<u8>)->Result<OperationWaiter,&'static str>{
         let call=self.find(id)?;if !self.active(&call)||lock(&call.state).phase!=Phase::Ringing{return Err(SCOPE);}
         let answer=PlainAudioOffer::trunk(&body,true).map_err(|error|error.code())?;call.offer.matching_payloads(&answer).map_err(|error|error.code())?;
+        let mut tasks = self.task_admission().await.ok_or(SCOPE)?;
+        if !self.active(&call) { return Err(SCOPE); }
         {let mut state=lock(&call.state);if state.phase!=Phase::Ringing||state.accept_queued{return Err("app_account_call_operation_pending");}state.accept_queued=true;}
+        // No suspension between queued-state mutation, retaining the task, and
+        // constructing its cancellation-owning waiter.
         let(sender,receiver)=oneshot::channel();let service=self.clone();let original=call.clone();
-        let admitted=self.spawn_task(async move{let _guard=original.operation.lock().await;
+        tasks.push(tokio::spawn(async move{let _guard=original.operation.lock().await;
             let result=service.accept_original(&original,answer).await;
             if let Err(code)=result{lock(&original.state).error=Some(code);let _=service.finish(&original,true).await;}
             let _=sender.send(result.map(|_|original.view()));
-        }).await;
-        if !admitted{return Err(SCOPE);}
+        }));
         Ok(OperationWaiter{call,service:Arc::downgrade(self),receiver,delivered:false})
     }
     async fn accept_original(self:&Arc<Self>,call:&Arc<Call>,answer:PlainAudioOffer)->Result<(),&'static str>{
@@ -209,11 +247,15 @@ impl CallService {
     }
     pub(super) async fn hangup(self:&Arc<Self>,id:&str)->Result<OperationWaiter,&'static str>{
         let call=self.find(id)?;if !self.original(&call.ticket){return Err(SCOPE);}
+        let mut tasks = self.task_admission().await.ok_or(SCOPE)?;
+        if !self.original(&call.ticket) { return Err(SCOPE); }
         {let mut state=lock(&call.state);if state.end_queued{return Err("app_account_call_operation_pending");}state.end_queued=true;}
         call.retire();
-        let(sender,receiver)=oneshot::channel();let service=self.clone();let original=call.clone();let admitted=self.spawn_task(async move{
+        let(sender,receiver)=oneshot::channel();let service=self.clone();let original=call.clone();
+        tasks.push(tokio::spawn(async move{
             let _guard=original.operation.lock().await;let result=service.finish(&original,true).await.map(|_|original.view());let _=sender.send(result);
-        }).await;if !admitted{return Err(SCOPE);}Ok(OperationWaiter{call,service:Arc::downgrade(self),receiver,delivered:false})
+        }));
+        Ok(OperationWaiter{call,service:Arc::downgrade(self),receiver,delivered:false})
     }
     async fn finish(&self,call:&Call,release:bool)->Result<(),&'static str>{
         let(media,answered,duration)={let mut state=lock(&call.state);if state.phase==Phase::Ended{return Ok(());}
@@ -236,7 +278,14 @@ impl CallService {
         self.trunk.activate_profile(&crate::platform::config::TrunkProfileConfig::default()).await;
         // Original operation tasks retain their handles across cancellation.
         // They can finish/reject, but retirement prevents new media owners.
-        let mut tasks=self.tasks.lock().await;for task in tasks.iter_mut(){let _=task.await;}tasks.clear();drop(tasks);
+        let mut tasks=self.tasks.lock().await;
+        while let Some(task)=tasks.first_mut(){
+            let _=task.await;
+            // A completed JoinHandle cannot be polled twice. Commit each join
+            // before the next await, retaining only unfinished obligations.
+            tasks.remove(0);
+        }
+        drop(tasks);
         let calls=lock(&self.calls).values().cloned().collect::<Vec<_>>();let mut failed=None;let mut complete=true;
         for call in calls{
             {let _guard=call.operation.lock().await;if let Err(code)=self.finish(&call,true).await{

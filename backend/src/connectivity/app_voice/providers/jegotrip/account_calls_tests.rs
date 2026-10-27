@@ -116,3 +116,5 @@ fn call_media_import_is_explicit_pure_secret_preserving_and_rejects_cellular_cos
 mod trunk;
 #[path="account_calls_lifecycle_tests.rs"]
 mod lifecycle;
+#[path="account_calls_admission_tests.rs"]
+mod admission;

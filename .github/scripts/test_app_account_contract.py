@@ -418,5 +418,50 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('account_runs::ownership_pending', lifecycle)
 
 
+    def test_call_task_admission_precedes_state_mutation_and_retains_cleanup_owner(self):
+        calls = (PROVIDER / 'account_calls.rs').read_text(encoding='utf-8')
+        answer = calls.split('pub(super) async fn accept(', 1)[1].split('async fn accept_original', 1)[0]
+        hangup = calls.split('pub(super) async fn hangup(', 1)[1].split('async fn finish', 1)[0]
+        for operation, marker in [(answer, 'state.accept_queued=true'), (hangup, 'state.end_queued=true')]:
+            self.assertLess(operation.index('self.task_admission().await'), operation.index(marker))
+            submission = operation.split(marker, 1)[1].split('tasks.push(tokio::spawn', 1)[0]
+            self.assertNotIn('.await', submission)
+            self.assertIn('Ok(OperationWaiter', operation)
+            self.assertNotIn('self.spawn_task', operation)
+        tests = (PROVIDER / 'account_calls_admission_tests.rs').read_text(encoding='utf-8')
+        for name in ['cancelled_answer_before_task_admission', 'cancelled_hangup_before_task_admission']:
+            self.assertIn(name, tests)
+        self.assertIn('assert!(!state.accept_queued && !state.end_queued)', tests)
+
+    def test_original_task_joins_are_removed_individually_before_next_cancel_point(self):
+        calls = (PROVIDER / 'account_calls.rs').read_text(encoding='utf-8')
+        close = calls.split('pub(super) async fn close(', 1)[1].split('pub(super) fn resources_released', 1)[0]
+        self.assertIn('while let Some(task)=tasks.first_mut()', close)
+        self.assertLess(close.index('let _=task.await'), close.index('tasks.remove(0)'))
+        self.assertNotIn('for task in tasks.iter_mut()', close)
+        admission = calls.split('async fn task_admission', 1)[1].split('async fn spawn_task', 1)[0]
+        self.assertLess(admission.index('(&mut tasks[index]).await'), admission.index('tasks.swap_remove(index)'))
+        lifecycle = (PROVIDER / 'account_calls_lifecycle_tests.rs').read_text(encoding='utf-8')
+        self.assertIn('extend([first,join])', lifecycle)
+        self.assertIn('service.tasks.lock().await.len(),1', lifecycle)
+
+    def test_batch_call_receipt_retries_only_nonadmitted_inform_under_one_deadline(self):
+        calls = (PROVIDER / 'account_calls.rs').read_text(encoding='utf-8')
+        ring = calls.split('async fn ring', 1)[1].split('pub(super) async fn accept(', 1)[0]
+        self.assertLess(ring.index('let deadline ='), ring.index('let result = loop'))
+        self.assertIn('tokio::time::timeout_at(deadline', ring)
+        self.assertIn('Err(RuntimeError::CallNotReady)', ring)
+        self.assertIn('Err(error) => return Err(call_error(error))', ring)
+        self.assertIn('if !self.active(call)', ring)
+        self.assertIn('call.ticket.revoked()', ring)
+        tests = (PROVIDER / 'account_calls_admission_tests.rs').read_text(encoding='utf-8')
+        for name in ['delayed_batch_receipt_precedes_one_inform', 'delayed_batch_receipt_does_not_retry_a_submitted',
+                     'delayed_batch_receipt_expires_one_fixed_budget', 'cancelled_batch_receipt_wait_releases_original']:
+            self.assertIn(name, tests)
+        self.assertIn('pause_original_polls_for_test', tests)
+        self.assertIn('payload.results[&1].result_stream', tests)
+        self.assertIn('assert_eq!(payload.expose_to_transport(), native_up)', tests)
+
+
 if __name__ == '__main__':
     unittest.main()

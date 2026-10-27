@@ -33,8 +33,17 @@ async fn cancelled_account_stop_retains_original_supervisor_join_and_runtime_lea
     let(mut peer,_,dropped)=sdk_peer(&sdk,&factory);let manager=AccountManager::with_factory(temp.database.clone(),factory);let account=manager.create(call_config(&sdk.root,&media.root),100).await.unwrap().account;
     let sdk_task=tokio::spawn(async move{bounded(async move{peer.authenticate().await;peer.swap(Some(4),true).await;peer.drain_until_eof().await;}).await});
     bounded(manager.start(&account.line_id,account.revision,100)).await.unwrap();ready(&manager,&account.line_id).await;let service=manager.original_call_service(&account.line_id).unwrap();
-    let socket=UdpSocket::bind(("127.0.0.1",0)).await.unwrap();let local=socket.local_addr().unwrap();let(resume,resumed)=oneshot::channel();let join=tokio::spawn(async move{let _socket=socket;resumed.await.unwrap();});service.tasks.lock().await.push(join);
-    {let future=manager.stop(&account.line_id,account.revision,100);tokio::pin!(future);let pending=std::future::poll_fn(|cx|Poll::Ready(Future::poll(future.as_mut(),cx).is_pending())).await;assert!(pending);}
+    // The first task is already ready; cancellation happens while joining the
+    // second. Keeping both handles would repoll the consumed first JoinHandle.
+    let first=tokio::spawn(async {});bounded(async{while !first.is_finished(){tokio::task::yield_now().await;}}).await;
+    let socket=UdpSocket::bind(("127.0.0.1",0)).await.unwrap();let local=socket.local_addr().unwrap();let(resume,resumed)=oneshot::channel();let join=tokio::spawn(async move{let _socket=socket;resumed.await.unwrap();});service.tasks.lock().await.extend([first,join]);
+    {let future=manager.stop(&account.line_id,account.revision,100);tokio::pin!(future);
+        bounded(async{loop{tokio::select!{biased;
+            result=future.as_mut()=>panic!("cleanup must retain the second blocked task: {result:?}"),
+            _=tokio::task::yield_now()=>{if service.tasks.try_lock().is_err(){break;}}
+        }}}).await;
+    }
+    assert_eq!(service.tasks.lock().await.len(),1,"the first completed Join was removed before cancellation");
     assert!(!service.resources_released());assert!(temp.database.with_conn(|conn|account_runs::runtime_held(conn,&account.line_id)).unwrap());
     assert_eq!(manager.start(&account.line_id,account.revision,100).await.err(),Some("app_account_stop_before_replace"));assert!(UdpSocket::bind(local).await.is_err());
     resume.send(()).unwrap();let result=bounded(manager.stop(&account.line_id,account.revision,100)).await;

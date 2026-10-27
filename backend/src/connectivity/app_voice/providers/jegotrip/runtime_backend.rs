@@ -294,6 +294,8 @@ impl fmt::Debug for BackendEventPayload {
 struct AttemptState {
     retired: bool, configured: bool, unregister_started: bool, unregister_result: Option<Result<(), BackendFailure>>,
     logout_started: bool, logout_result: Option<Result<(), BackendFailure>>, released: bool,
+    #[cfg(test)]
+    polls_paused: bool,
 }
 struct Attempt {
     owner: AttemptOwner, scope: RpcConnectionScope, incarnation: u32,
@@ -366,6 +368,15 @@ impl NativeHostingBackend {
         let Ok(attempt) = self.original(owner) else { return false; };
         attempt.scope.matches(scope) && scope.is_open() && lock(&attempt.state).configured
             && self.profile.call_incoming.is_some() && self.profile.call_control.is_some()
+    }
+    #[cfg(test)]
+    pub(super) fn pause_original_polls_for_test(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, paused: bool) -> Result<(), RuntimeError> {
+        // Scheduling barrier only: the actual actor, original callback/receipt
+        // and all RPC admission checks still execute unchanged in the fixture.
+        let attempt = self.original(owner).map_err(|_| RuntimeError::Scope)?;
+        if !attempt.scope.matches(scope) || !scope.is_open() { return Err(RuntimeError::Scope); }
+        lock(&attempt.state).polls_paused = paused;
+        Ok(())
     }
     fn original(&self, owner: &AttemptOwner) -> Result<Arc<Attempt>, BackendFailure> {
         lock(&self.state).slot.as_ref().filter(|a| &a.owner == owner).cloned().ok_or(BackendFailure::Disconnected)
@@ -730,7 +741,12 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                 // to obtain its nested result after the outer ACK retired.
                 // Only serialize poll ADMISSION with starting SDK logout.
                 let _poll_admission = attempt.poll_work.lock().await;
-                let poll = { let state = lock(&attempt.state); state.configured && !state.retired && !state.logout_started };
+                let poll = {
+                    let state = lock(&attempt.state);
+                    #[cfg(test)]
+                    if state.polls_paused { continue; }
+                    state.configured && !state.retired && !state.logout_started
+                };
                 if !poll { continue; }
                 let commands = match attempt.commands(&attempt.owner, &attempt.scope) {
                     Ok(commands) => commands, Err(_) => { terminal(&sender, &attempt, BackendFailure::Disconnected); return; }
