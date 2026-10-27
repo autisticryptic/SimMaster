@@ -118,3 +118,5 @@ mod trunk;
 mod lifecycle;
 #[path="account_calls_admission_tests.rs"]
 mod admission;
+#[path="account_calls_retirement_tests.rs"]
+mod retirement;

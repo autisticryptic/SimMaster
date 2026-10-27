@@ -74,7 +74,8 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_limit" | "app_account_run_limit" | "app_account_entropy_unavailable" | "app_account_backend_unavailable"
             | "app_account_authentication_rejected" | "app_account_disconnected" | "app_account_hosting_rejected"
             | "app_account_operation_timeout" | "app_account_shutting_down" | "app_account_cleanup_unconfirmed"
-            | "app_account_call_runtime_unavailable" | "app_account_call_cleanup_unconfirmed" => StatusCode::SERVICE_UNAVAILABLE,
+            | "app_account_call_runtime_unavailable" | "app_account_call_cleanup_unconfirmed"
+            | "app_account_call_trunk_delivery_unconfirmed" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
     }
 }

@@ -4,11 +4,12 @@ use std::{
     net::IpAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc, Mutex, RwLock, Weak,
     },
+    time::Duration,
 };
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot, Notify};
 
 use super::bridge::{OperatorCommand, OperatorEvent};
 use crate::connectivity::core::media::MediaRelayMetrics;
@@ -38,11 +39,49 @@ struct OperatorLinkInner {
     ip_connect_mode: RwLock<TrunkIpConnectMode>,
     commands: broadcast::Sender<OperatorCommand>,
     events: broadcast::Sender<OperatorEvent>,
+    trunk_dispatch: broadcast::Sender<TrunkDispatch>,
+    trunk_consumer: Mutex<Option<Weak<TrunkConsumer>>>,
     call_observations: broadcast::Sender<OperatorEvent>,
     sms_requests: broadcast::Sender<SmsRequest>,
     sms_deliveries: broadcast::Sender<SmsDelivery>,
     metrics: Arc<OperatorMediaMetrics>,
 }
+
+// A private FIFO fence for the actual SIP driver, not an observation subscriber
+// and not a peer ACK. Old/dropped driver identities cannot acknowledge new work.
+struct TrunkConsumer { live: AtomicBool, changed: Notify }
+impl TrunkConsumer {
+    fn close(&self) { self.live.store(false, Ordering::SeqCst); self.changed.notify_waiters(); }
+    async fn closed(&self) {
+        loop {
+            let changed = self.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+            if !self.live.load(Ordering::SeqCst) { return; } changed.await;
+        }
+    }
+}
+struct TrunkFence { consumer: Arc<TrunkConsumer>, completion: Mutex<Option<oneshot::Sender<()>>> }
+#[derive(Clone)]
+enum TrunkDispatch { Event(OperatorEvent), Fence(Arc<TrunkFence>) }
+pub(super) struct TrunkEventReceiver { receiver: broadcast::Receiver<TrunkDispatch>, consumer: Arc<TrunkConsumer> }
+impl TrunkEventReceiver {
+    pub(super) async fn recv(&mut self) -> Result<Option<OperatorEvent>, broadcast::error::RecvError> {
+        if !self.consumer.live.load(Ordering::SeqCst) { return Err(broadcast::error::RecvError::Closed); }
+        let dispatch = match self.receiver.recv().await {
+            Ok(dispatch) => dispatch,
+            Err(error) => { self.consumer.close(); return Err(error); }
+        };
+        match dispatch {
+            TrunkDispatch::Event(event) => Ok(Some(event)),
+            TrunkDispatch::Fence(fence) => {
+                if Arc::ptr_eq(&fence.consumer, &self.consumer) && self.consumer.live.load(Ordering::SeqCst) {
+                    if let Ok(mut completion) = fence.completion.lock() { if let Some(sender) = completion.take() { let _ = sender.send(()); } }
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+impl Drop for TrunkEventReceiver { fn drop(&mut self) { self.consumer.close(); } }
 
 #[derive(Default)]
 pub struct OperatorMediaMetrics {
@@ -143,6 +182,7 @@ impl Default for OperatorLink {
     fn default() -> Self {
         let (commands, _) = broadcast::channel(32);
         let (events, _) = broadcast::channel(32);
+        let (trunk_dispatch, _) = broadcast::channel(128);
         let (call_observations, _) = broadcast::channel(64);
         let (sms_requests, _) = broadcast::channel(32);
         let (sms_deliveries, _) = broadcast::channel(32);
@@ -158,6 +198,8 @@ impl Default for OperatorLink {
                 ip_connect_mode: RwLock::new(TrunkIpConnectMode::default()),
                 commands,
                 events,
+                trunk_dispatch,
+                trunk_consumer: Mutex::new(None),
                 call_observations,
                 sms_requests,
                 sms_deliveries,
@@ -284,6 +326,37 @@ impl OperatorLink {
         self.inner.events.subscribe()
     }
 
+    pub(super) fn subscribe_trunk_events(&self) -> Result<TrunkEventReceiver, &'static str> {
+        let receiver = self.inner.trunk_dispatch.subscribe();
+        let mut current = self.inner.trunk_consumer.lock().map_err(|_| "trunk_operator_consumer_unavailable")?;
+        if current.as_ref().and_then(Weak::upgrade).is_some_and(|consumer| consumer.live.load(Ordering::SeqCst)) {
+            return Err("trunk_operator_consumer_busy");
+        }
+        let consumer = Arc::new(TrunkConsumer { live: AtomicBool::new(true), changed: Notify::new() });
+        *current = Some(Arc::downgrade(&consumer));
+        Ok(TrunkEventReceiver { receiver, consumer })
+    }
+
+    pub(crate) fn has_trunk_consumer(&self) -> bool {
+        self.inner.trunk_consumer.lock().ok().and_then(|current| current.as_ref().and_then(Weak::upgrade))
+            .is_some_and(|consumer| consumer.live.load(Ordering::SeqCst))
+    }
+
+    /// Complete only after this original SIP driver handled all preceding
+    /// events (including their local sends). Never rebind to a replacement.
+    pub(crate) async fn drain_trunk_events(&self, timeout: Duration) -> Result<(), &'static str> {
+        let consumer = self.inner.trunk_consumer.lock().ok().and_then(|current| current.as_ref().and_then(Weak::upgrade))
+            .filter(|consumer| consumer.live.load(Ordering::SeqCst)).ok_or("trunk_operator_consumer_unavailable")?;
+        let (completion, receipt) = oneshot::channel();
+        let fence = Arc::new(TrunkFence { consumer: consumer.clone(), completion: Mutex::new(Some(completion)) });
+        self.inner.trunk_dispatch.send(TrunkDispatch::Fence(fence)).map_err(|_| "trunk_operator_consumer_unavailable")?;
+        tokio::select! { biased;
+            _ = consumer.closed() => Err("trunk_operator_consumer_unavailable"),
+            result = tokio::time::timeout(timeout, receipt) => result.map_err(|_| "trunk_operator_drain_timeout")?
+                .map_err(|_| "trunk_operator_consumer_unavailable"),
+        }
+    }
+
     pub fn subscribe_sms_requests(&self) -> broadcast::Receiver<SmsRequest> {
         self.inner.sms_requests.subscribe()
     }
@@ -346,6 +419,7 @@ impl OperatorLink {
             return; // No SIP bridge, call-history or media side effects.
         }
         let is_dtmf = matches!(&event, OperatorEvent::Dtmf { .. });
+        let _ = self.inner.trunk_dispatch.send(TrunkDispatch::Event(event.clone()));
         let _ = self.inner.events.send(event);
         self.inner
             .metrics
@@ -363,6 +437,55 @@ impl OperatorLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{future::Future, task::Poll};
+
+    #[tokio::test]
+    async fn original_trunk_fence_waits_for_fifo_and_observers_cannot_ack() {
+        let link = OperatorLink::default(); let mut observer = link.subscribe_events();
+        let mut driver = link.subscribe_trunk_events().unwrap(); assert!(link.has_trunk_consumer());
+        link.send_event(OperatorEvent::Ended { call_id: "fixture-first".into() });
+        let fence = link.drain_trunk_events(Duration::from_secs(1)); tokio::pin!(fence);
+        assert!(std::future::poll_fn(|cx| Poll::Ready(fence.as_mut().poll(cx).is_pending())).await);
+        assert!(matches!(observer.recv().await.unwrap(), OperatorEvent::Ended { .. }));
+        assert!(observer.try_recv().is_err(), "a fence is not a public/observation event");
+        assert!(matches!(driver.recv().await.unwrap(), Some(OperatorEvent::Ended { .. })));
+        assert!(std::future::poll_fn(|cx| Poll::Ready(fence.as_mut().poll(cx).is_pending())).await);
+        assert_eq!(driver.recv().await.unwrap(), None); assert_eq!(fence.await, Ok(()));
+        assert_eq!(link.diagnostics().event_count, 1); assert!(!link.is_available());
+    }
+
+    #[tokio::test]
+    async fn dropped_trunk_consumer_fence_cannot_transfer_to_replacement() {
+        let link = OperatorLink::default(); let original = link.subscribe_trunk_events().unwrap();
+        assert_eq!(link.subscribe_trunk_events().err(), Some("trunk_operator_consumer_busy"));
+        let fence = link.drain_trunk_events(Duration::from_secs(1)); tokio::pin!(fence);
+        assert!(std::future::poll_fn(|cx| Poll::Ready(fence.as_mut().poll(cx).is_pending())).await);
+        drop(original); let mut replacement = link.subscribe_trunk_events().unwrap();
+        assert_eq!(fence.await, Err("trunk_operator_consumer_unavailable"));
+        let next = link.drain_trunk_events(Duration::from_secs(1)); tokio::pin!(next);
+        assert!(std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx).is_pending())).await);
+        assert_eq!(replacement.recv().await.unwrap(), None); assert_eq!(next.await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn lagged_trunk_consumer_cannot_ack_after_losing_prior_end_events() {
+        let link = OperatorLink::default(); let mut driver = link.subscribe_trunk_events().unwrap();
+        for _ in 0..130 { link.send_event(OperatorEvent::Ended { call_id: "fixture-backpressure".into() }); }
+        let fence = link.drain_trunk_events(Duration::from_secs(1)); tokio::pin!(fence);
+        assert!(std::future::poll_fn(|cx| Poll::Ready(fence.as_mut().poll(cx).is_pending())).await);
+        assert!(matches!(driver.recv().await, Err(broadcast::error::RecvError::Lagged(_))));
+        assert!(!link.has_trunk_consumer());
+        assert_eq!(fence.await, Err("trunk_operator_consumer_unavailable"));
+        assert!(matches!(driver.recv().await, Err(broadcast::error::RecvError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn unconsumed_trunk_fence_expires_without_claiming_dispatch_success() {
+        let link = OperatorLink::default(); let mut driver = link.subscribe_trunk_events().unwrap();
+        assert_eq!(link.drain_trunk_events(Duration::from_millis(10)).await, Err("trunk_operator_drain_timeout"));
+        assert!(link.has_trunk_consumer()); assert_eq!(driver.recv().await.unwrap(), None);
+        assert_eq!(link.diagnostics().event_count, 0);
+    }
 
     #[test]
     fn observation_metadata_does_not_add_command_consumers_or_bridge_events() {

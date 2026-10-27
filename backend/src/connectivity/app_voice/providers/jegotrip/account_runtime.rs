@@ -54,6 +54,11 @@ pub struct AccountView {
     pub outbound_authorized: bool,
     pub provider_availability: &'static str,
     pub manual_start_required: bool,
+    /// Runtime policy observation only; stopped metadata never decodes secrets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_on_disconnect: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_error: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<&'static str>,
 }
@@ -62,7 +67,7 @@ fn view(metadata: AccountMetadata, phase: Phase, cleanup: bool, error: Option<&'
         phase: phase_name(phase), io_cleanup_required: cleanup,
         // A hosted SDK acknowledgement is not verified SMS/call/media support.
         incoming_call_ready: false, incoming_message_ready: false, outbound_authorized: false,
-        provider_availability: "unsupported", manual_start_required: true, last_error: error }
+        provider_availability: "unsupported", manual_start_required: true, cleanup_on_disconnect: None, cleanup_error: None, last_error: error }
 }
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
@@ -111,6 +116,8 @@ pub(super) fn test_quiescence(token: RunToken) -> RunQuiescence { RunQuiescence 
 /// Runtime-only evidence that the exact native Smgw receiver and durable
 /// consumer belong to the current hosted owner. Never restored from storage.
 struct MessagingReadiness { owner: AttemptOwner, scope: RpcConnectionScope }
+#[derive(Clone, Copy)]
+struct TerminalObservation { phase: Phase, error: &'static str }
 
 struct ManagedRun {
     line_id: String,
@@ -122,6 +129,13 @@ struct ManagedRun {
     notifications: Option<Arc<dyn NoticePlanner>>,
     sms_supported: bool,
     credential_expiry: Option<u64>,
+    cleanup_on_disconnect: bool,
+    cleanup_work: AsyncMutex<()>,
+    cleanup_changed: tokio::sync::Notify,
+    cleanup_task: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
+    manual_cleanup: AtomicBool,
+    terminal_observation: Mutex<Option<TerminalObservation>>,
+    cleanup_error: Mutex<Option<&'static str>>,
     messaging_readiness: Mutex<Option<MessagingReadiness>>,
     calls: Option<Arc<CallService>>,
     controller: AsyncMutex<HostingController>,
@@ -168,6 +182,7 @@ impl ManagedRun {
     }
     fn retire(&self) {
         self.accepting.store(false, Ordering::SeqCst);
+        self.cleanup_changed.notify_waiters();
         *lock(&self.messaging_readiness) = None;
         if let Some(calls) = &self.calls { calls.retire(); }
         self.backend.retire_current();
@@ -177,6 +192,7 @@ impl Drop for ManagedRun {
     fn drop(&mut self) {
         self.retire();
         if let Some(task) = self.task.get_mut().take() { task.abort(); }
+        if let Some(task) = self.cleanup_task.get_mut().take() { task.abort(); }
     }
 }
 struct Retirement { run: Arc<ManagedRun>, armed: bool }
@@ -248,9 +264,15 @@ impl AccountManager {
         }
         let mut controller = run.controller.lock().await;
         controller.tick(now, Instant::now());
-        let error = if controller.phase() == Phase::CredentialExpired { Some("app_account_credential_expired") }
-            else { *lock(&run.error) };
-        let mut snapshot = view(metadata, controller.phase(), !controller.resources_released() || !run.finalized.load(Ordering::SeqCst), error);
+        let terminal = *lock(&run.terminal_observation);
+        let observed_phase = terminal.map_or(controller.phase(), |terminal| terminal.phase);
+        let error = terminal.map(|terminal| terminal.error).or_else(|| {
+            if controller.phase() == Phase::CredentialExpired { Some("app_account_credential_expired") }
+            else { *lock(&run.error) }
+        });
+        let mut snapshot = view(metadata, observed_phase, !controller.resources_released() || !run.finalized.load(Ordering::SeqCst), error);
+        snapshot.cleanup_on_disconnect = Some(run.cleanup_on_disconnect);
+        snapshot.cleanup_error = *lock(&run.cleanup_error);
         // SDK hosting success alone is not enough: only the exact supported
         // receiver + live original durable consumer publishes SMS readiness.
         if controller.phase() == Phase::Hosted && run.message_ready(now) {
@@ -393,6 +415,7 @@ impl AccountManager {
             if !run.controller.lock().await.resources_released() || !run.finalized.load(Ordering::SeqCst) {
                 return Err("app_account_stop_before_replace");
             }
+            Self::join_automatic_cleanup(&run).await?;
         }
         if self.database.with_conn(|conn|account_runs::ownership_pending(conn,line_id))? {
             return Err("app_account_stop_before_replace");
@@ -432,6 +455,7 @@ impl AccountManager {
         let inbox_nonce = local_nonce()?;
         let sms_supported = config.profile.incoming.as_ref().is_some_and(|binding| binding.receiver_kind == super::smgw_text::SMGW_RECEIVER);
         let credential_expiry = config.credentials.sdk.expires_at_unix_seconds;
+        let cleanup_on_disconnect = config.cleanup_on_disconnect;
         let call_settings = config.runtime_calls()?;
         let (backend, events) = self.factory.build(&config)?;
         let mut controller = HostingController::new(line_id.to_owned(), Some(backend.clone()));
@@ -440,16 +464,25 @@ impl AccountManager {
         let calls = call_settings.map(|settings| CallService::new(self.database.clone(),run_token.clone(),backend.clone(),settings,credential_expiry));
         let run = Arc::new(ManagedRun { line_id: line_id.to_owned(), database: self.database.clone(), revision: metadata.revision,
             inbox_nonce, run_token, finalized: AtomicBool::new(false), notifications:self.notifications.clone(),
-            sms_supported, credential_expiry, messaging_readiness: Mutex::new(None), calls, controller: AsyncMutex::new(controller), backend,
+            sms_supported, credential_expiry, cleanup_on_disconnect,
+            cleanup_work: AsyncMutex::new(()), cleanup_changed: tokio::sync::Notify::new(), cleanup_task: AsyncMutex::new(None),
+            manual_cleanup: AtomicBool::new(false), terminal_observation: Mutex::new(None), cleanup_error: Mutex::new(None),
+            messaging_readiness: Mutex::new(None), calls, controller: AsyncMutex::new(controller), backend,
             accepting: AtomicBool::new(true), stopping: AtomicBool::new(false), error: Mutex::new(None), task: AsyncMutex::new(None) });
         // Retain the owning backend BEFORE any await that can create IO. A
         // cancelled HTTP future leaves this same run available for stop/retry.
         *lock(&slot.run) = Some(run.clone());
         let mut retirement = Retirement::new(run.clone());
         let weak = Arc::downgrade(&run);
-        let mut task_slot = run.task.lock().await;
+        let mut task_slot = run.task.try_lock().expect("new original event consumer");
         *task_slot = Some(tokio::spawn(consume_events(weak, events)));
         drop(task_slot);
+        if run.cleanup_on_disconnect {
+            // This fresh slot has not escaped to a cleanup caller. Retain the
+            // owning task without a suspension between spawn and publication.
+            let mut cleanup = run.cleanup_task.try_lock().expect("new original cleanup owner");
+            *cleanup = Some(tokio::spawn(automatic_cleanup(Arc::downgrade(&run))));
+        }
         let mut controller = run.controller.lock().await;
         let started=tokio::select!{biased;
             _=self.shutdown_requested()=>{*lock(&run.error)=Some("app_account_shutting_down");return Err("app_account_shutting_down");},
@@ -480,9 +513,22 @@ impl AccountManager {
         Ok(view(metadata,phase,!run.finalized.load(Ordering::SeqCst),None))
     }
     async fn cleanup_run(&self,run:&Arc<ManagedRun>,now:u64)->Result<Phase,&'static str>{
+        run.manual_cleanup.store(true, Ordering::SeqCst);
+        *lock(&run.terminal_observation) = None;
+        let result = Self::cleanup_original(run, now).await;
+        Self::join_automatic_cleanup(run).await?;
+        if result.is_ok() { *lock(&run.error) = None; *lock(&run.cleanup_error) = None; }
+        result
+    }
+    async fn cleanup_original(run:&Arc<ManagedRun>,now:u64)->Result<Phase,&'static str>{
+        // Manual stop, shutdown and the optional retirement worker serialize on
+        // this ORIGINAL run, not a newly loaded account/configuration/owner.
+        let _cleanup = run.cleanup_work.lock().await;
+        if run.finalized.load(Ordering::SeqCst) { return Ok(run.controller.lock().await.phase()); }
         // Original retained resource owner, not current database configuration.
         run.stopping.store(true, Ordering::SeqCst);
         run.accepting.store(false, Ordering::SeqCst);
+        run.cleanup_changed.notify_waiters();
         let mut retirement = Retirement::new(run.clone());
         let calls_error = if let Some(calls) = &run.calls { calls.close().await.err() } else { None };
         let calls_released = run.calls.as_ref().is_none_or(|calls| calls.resources_released());
@@ -500,7 +546,7 @@ impl AccountManager {
             *task_slot=None;
             drop(task_slot);
             let proof=RunQuiescence { token:run.run_token.clone() };
-            if let Err(code)=self.database.with_conn(|conn|account_runs::release_and_compact(conn,&proof)) {
+            if let Err(code)=run.database.with_conn(|conn|account_runs::release_and_compact(conn,&proof)) {
                 *lock(&run.error)=Some(code);return Err(code);
             }
             run.finalized.store(true,Ordering::SeqCst);
@@ -508,13 +554,22 @@ impl AccountManager {
         }
         match result {
             Ok(()) => {
-                if !released||!run.finalized.load(Ordering::SeqCst){return Err("app_account_cleanup_unconfirmed");}
                 *lock(&run.error) = calls_error;
                 if let Some(code) = calls_error { return Err(code); }
+                if !released||!run.finalized.load(Ordering::SeqCst){return Err("app_account_cleanup_unconfirmed");}
                 Ok(phase)
             }
             Err(reason) => { let code = controller_error(reason); *lock(&run.error) = Some(code); Err(code) }
         }
+    }
+    async fn join_automatic_cleanup(run: &ManagedRun) -> Result<(), &'static str> {
+        let mut slot = run.cleanup_task.lock().await;
+        if let Some(task) = slot.as_mut() {
+            let result = task.await;
+            slot.take(); // only after the individual original Join completed
+            if result.is_err() { return Err("app_account_cleanup_unconfirmed"); }
+        }
+        Ok(())
     }
     async fn shutdown_requested(&self){
         loop {
@@ -550,6 +605,44 @@ impl Drop for AccountManager {
     fn drop(&mut self) {
         for slot in lock(&self.slots).values() { if let Some(run) = lock(&slot.run).as_ref() { run.retire(); } }
     }
+}
+
+/// One bounded cleanup attempt after this live manager's own run retires.
+/// Never a reconnect/renewal worker and never a prior-process takeover proof.
+async fn automatic_cleanup(weak: std::sync::Weak<ManagedRun>) {
+    let Some(run) = weak.upgrade() else { return; };
+    loop {
+        let changed = run.cleanup_changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+        if !run.accepting.load(Ordering::SeqCst) || run.finalized.load(Ordering::SeqCst) { break; }
+        changed.await;
+    }
+    if run.finalized.load(Ordering::SeqCst) { return; }
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut controller = run.controller.lock().await;
+        controller.tick(unix_now(), Instant::now());
+        let phase = match controller.phase() {
+            Phase::CredentialExpired => Phase::CredentialExpired,
+            Phase::AuthenticationFailed => Phase::AuthenticationFailed,
+            _ => Phase::Disconnected,
+        };
+        let error = if phase == Phase::CredentialExpired { "app_account_credential_expired" }
+            else { (*lock(&run.error)).unwrap_or("app_account_disconnected") };
+        drop(controller);
+        {
+            let mut terminal = lock(&run.terminal_observation);
+            if !run.manual_cleanup.load(Ordering::SeqCst) { *terminal = Some(TerminalObservation { phase, error }); }
+        }
+        let first = AccountManager::cleanup_original(&run, unix_now()).await;
+        if first.is_err() && !run.finalized.load(Ordering::SeqCst) {
+            // As with process shutdown, a native negative may precede confirmed
+            // release. Retry only the same retained cleanup once, never start,
+            // rebind or replay an already-attempted unregister/Release/logout.
+            AccountManager::cleanup_original(&run, unix_now()).await
+        } else { first }
+    }).await.unwrap_or(Err("app_account_cleanup_unconfirmed"));
+    // A negative teardown verdict remains visible separately from the terminal
+    // cause, even when local IO release and durable finalization are confirmed.
+    if let Err(code) = result { *lock(&run.cleanup_error) = Some(code); }
 }
 
 const MAX_PENDING_MESSAGES: usize = 16;

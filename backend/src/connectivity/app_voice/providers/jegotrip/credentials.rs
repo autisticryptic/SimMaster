@@ -123,6 +123,8 @@ pub struct BasicHostingContract {
     pub billing_account: &'static str,
     pub explicit_profile_required: bool,
     pub manual_start_required: bool,
+    pub automatic_cleanup_supported: bool,
+    pub automatic_reconnect_implemented: bool,
     pub implemented_operations: Vec<&'static str>,
     pub media_transport: &'static str,
     pub media_profile: &'static str,
@@ -150,6 +152,7 @@ pub fn contract() -> CredentialContract {
         basic_hosting: BasicHostingContract {
             account_line_kind: "app_account", access: "application_data", billing_account: "jegotrip_account",
             explicit_profile_required: true, manual_start_required: true,
+            automatic_cleanup_supported: true, automatic_reconnect_implemented: false,
             implemented_operations: super::BASIC_INBOUND_OPERATIONS.iter().map(|operation| operation.as_str()).collect(),
             media_transport: "endpoint_tcp_mpath",
             media_profile: "raw_rse_sdp_rtp_avp_rtcp_mux_passthrough",
@@ -180,6 +183,7 @@ pub fn contract() -> CredentialContract {
             ParameterContract { field: "hosting.delete_int_code", source: "DeleteIntCode", purpose: "Preserve supplied string policy", secret: false },
             ParameterContract { field: "hosting.enrollment_confirmed", source: "Existing account hosting enrollment", purpose: "Import does not enable server entitlement", secret: false },
             ParameterContract { field: "config.profile", source: "Original explicit native connection, routing and receiver bindings", purpose: "Required by the native account runtime; no guessed endpoint, authority, receiver or current readiness", secret: true },
+            ParameterContract { field: "config.cleanup_on_disconnect (optional)", source: "Explicit local account lifecycle policy; default false", purpose: "Bounded cleanup of this manager's retired original run only; no automatic restart, token renewal or prior-process takeover", secret: false },
             ParameterContract { field: "config.call_media (optional)", source: "Original Endpoint authority/root/routing and explicit local audio/Trunk settings", purpose: "Required for incoming voice; plain-media opt-in, current original call binding and supported SDP, never a SIM cost grant", secret: true },
         ],
     }

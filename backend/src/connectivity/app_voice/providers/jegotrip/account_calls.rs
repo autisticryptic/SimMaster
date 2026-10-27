@@ -27,7 +27,7 @@ enum Phase { Checking, Ringing, Accepting, Connected, Ending, Ended, Failed }
 impl Phase { fn name(self) -> &'static str { match self { Self::Checking=>"checking",Self::Ringing=>"ringing",Self::Accepting=>"accepting",Self::Connected=>"connected",Self::Ending=>"ending",Self::Ended=>"ended",Self::Failed=>"failed" } } }
 struct State { phase: Phase, error: Option<&'static str>, socket: Option<BoundAudioSocket>, local:Option<std::net::SocketAddr>, media: Option<Arc<AudioHandle>>, connected: Option<Instant>, release_attempted:bool, accept_queued:bool, end_queued:bool }
 struct Call { id: String, ticket: CallControlTicket, offer: PlainAudioOffer, caller: String, history: HistoryTicket,
-    received: u64, cancelled: AtomicBool, operation: AsyncMutex<()>, state: Mutex<State>, watch: AsyncMutex<Option<JoinHandle<()>>> }
+    received: u64, cancelled: AtomicBool, changed: tokio::sync::Notify, operation: AsyncMutex<()>, state: Mutex<State>, watch: AsyncMutex<Option<JoinHandle<()>>> }
 impl Call {
     fn retire(&self) { self.cancelled.store(true,Ordering::SeqCst); self.ticket.revoke(); let mut state=lock(&self.state);
         state.socket.take(); if let Some(media)=&state.media { media.retire(); } }
@@ -68,7 +68,8 @@ impl CallService {
         if !self.accepting.load(Ordering::SeqCst)||!self.operator.incoming_call_allowed()||!self.configuration_current(){return false;}
         let current=lock(&self.bound).as_ref().is_some_and(|bound|bound.scope.is_open()
             &&self.backend.original_call_receiver_ready(&bound.owner,&bound.scope));
-        current&&self.operator.has_command_consumer()&&(!self.settings.trunk.as_ref().is_some_and(|profile|profile.enabled)||self.operator.trunk_local_ip().is_some())
+        current&&self.operator.has_command_consumer()&&(!self.settings.trunk.as_ref().is_some_and(|profile|profile.enabled)
+            ||self.operator.trunk_local_ip().is_some()&&self.operator.has_trunk_consumer())
     }
     pub(super) async fn start(self:&Arc<Self>,owner:&AttemptOwner,scope:&RpcConnectionScope)->Result<(),&'static str> {
         if !scope.is_open()||!self.configuration_current()||!self.backend.original_call_receiver_ready(owner,scope){return Err(SCOPE);}
@@ -92,6 +93,28 @@ impl CallService {
     pub(super) fn get(&self,id:&str)->Result<CallView,&'static str>{if !self.configuration_current(){return Err(SCOPE);}Ok(self.find(id)?.view())}
     pub(super) fn operator(&self)->OperatorLink{self.operator.clone()}
     pub(super) async fn trunk_status(&self)->crate::services::trunk::runtime::TrunkRuntimeStatus{self.trunk.status().await}
+    /// Install once, before publishing the call. Ringing has no media actor yet,
+    /// but still owns history/Trunk state which must end with its original scope.
+    fn watch_original(self: &Arc<Self>, call: &Arc<Call>) {
+        let weak = Arc::downgrade(self); let original = call.clone();
+        let mut watch = call.watch.try_lock().expect("unpublished original call watcher");
+        debug_assert!(watch.is_none());
+        *watch = Some(tokio::spawn(async move {
+            loop {
+                let changed = original.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+                let media = lock(&original.state).media.as_ref().map(|media| media.scope());
+                tokio::select! { biased;
+                    _ = original.ticket.revoked() => break,
+                    _ = async { if let Some(scope) = media { scope.closed().await; } else { std::future::pending::<()>().await; } } => break,
+                    _ = changed => {},
+                }
+            }
+            if let Some(service) = weak.upgrade() {
+                let _guard = original.operation.lock().await;
+                if let Err(code) = service.finish(&original, true).await { lock(&original.state).error = Some(code); }
+            }
+        }));
+    }
     pub(super) async fn delivery(self:&Arc<Self>,incoming:&IncomingCallDelivery)->Result<(),&'static str>{
         let owner=incoming.owner();let scope=incoming.connection_scope();
         if !self.matches(owner,&scope){return Err(SCOPE);}
@@ -130,8 +153,9 @@ impl CallService {
                     self.backend.complete_call(owner,&scope,incoming.ticket(),false,&[]).await.map_err(|_|SCOPE)?;return Ok(());
                 }
                 let history=history::insert(&self.database,&self.run,&id,&caller)?;
-                let call=Arc::new(Call{id:id.clone(),ticket:ticket.captured_copy(),offer,caller,history,received:super::account_runtime::unix_now(),cancelled:AtomicBool::new(false),
+                let call=Arc::new(Call{id:id.clone(),ticket:ticket.captured_copy(),offer,caller,history,received:super::account_runtime::unix_now(),cancelled:AtomicBool::new(false),changed:tokio::sync::Notify::new(),
                     operation:AsyncMutex::new(()),state:Mutex::new(State{phase:Phase::Checking,error:None,socket:None,local:None,media:None,connected:None,release_attempted:false,accept_queued:false,end_queued:false}),watch:AsyncMutex::new(None)});
+                self.watch_original(&call);
                 lock(&self.calls).insert(id,call.clone());
                 if self.backend.complete_call(owner,&scope,incoming.ticket(),true,&[]).await.is_err(){call.retire();return Err(SCOPE);}
                 let weak=Arc::downgrade(self);let admitted=self.spawn_task(async move{if let Some(service)=weak.upgrade(){
@@ -235,15 +259,13 @@ impl CallService {
         let relay=socket.for_peer(&call.ticket,&call.offer,&answer,Some(self.operator.media_metrics())).map_err(|error|error.code())?;
         let(handle,ready)=audio::spawn(plan,self.settings.connector.clone(),relay).map_err(|error|error.code())?;let handle=Arc::new(handle);
         lock(&call.state).media=Some(handle.clone());
+        call.changed.notify_waiters();
         let ready=ready.await.map_err(|error|error.code())?;
         if !self.active(call)||!ready.original(&call.ticket,&handle.scope()){return Err(SCOPE);}
         self.publish_state(call,|state|{state.phase=Phase::Connected;state.connected=Some(Instant::now());}).await?;
         history::connected(&self.database,&call.history)?;
         call.ticket.with_media_gate(||self.operator.send_event(OperatorEvent::Connected{call_id:call.id.clone()})).ok_or(SCOPE)?;
-        let weak=Arc::downgrade(self);let original=call.clone();let mut watch=call.watch.lock().await;
-        *watch=Some(tokio::spawn(async move{handle.scope().closed().await;if let Some(service)=weak.upgrade(){
-            let _guard=original.operation.lock().await;let _=service.finish(&original,true).await;
-        }}));Ok(())
+        Ok(())
     }
     pub(super) async fn hangup(self:&Arc<Self>,id:&str)->Result<OperationWaiter,&'static str>{
         let call=self.find(id)?;if !self.original(&call.ticket){return Err(SCOPE);}
@@ -274,8 +296,10 @@ impl CallService {
     }
     pub(super) async fn close(self:&Arc<Self>)->Result<(),&'static str>{
         self.retire();
+        if self.quiescent.load(Ordering::SeqCst) { return Ok(()); }
         let mut commands=self.commands.lock().await;if let Some(task)=commands.as_mut(){let _=task.await;}commands.take();drop(commands);
-        self.trunk.activate_profile(&crate::platform::config::TrunkProfileConfig::default()).await;
+        // Keep the original SIP driver alive until preceding call endings have
+        // been handled. Otherwise a queued CANCEL/BYE can be lost on shutdown.
         // Original operation tasks retain their handles across cancellation.
         // They can finish/reject, but retirement prevents new media owners.
         let mut tasks=self.tasks.lock().await;
@@ -289,9 +313,21 @@ impl CallService {
         let calls=lock(&self.calls).values().cloned().collect::<Vec<_>>();let mut failed=None;let mut complete=true;
         for call in calls{
             {let _guard=call.operation.lock().await;if let Err(code)=self.finish(&call,true).await{
-                if code=="app_account_call_cleanup_unconfirmed"{complete=false;}failed.get_or_insert(code);
+                // IO retirement alone is not completed call history/Ended.
+                // Retain this run if finalization failed before the Ended state;
+                // retry may finish SQL without replaying an attempted Release.
+                if lock(&call.state).phase!=Phase::Ended{complete=false;}failed.get_or_insert(code);
             }}
             let mut watch=call.watch.lock().await;if let Some(task)=watch.as_mut(){let _=task.await;}watch.take();
+        }
+        if complete {
+            if self.settings.trunk.as_ref().is_some_and(|profile| profile.enabled) {
+                let budget = self.settings.profile.io_timeout.min(std::time::Duration::from_secs(1));
+                if self.operator.drain_trunk_events(budget).await.is_err() {
+                    failed.get_or_insert("app_account_call_trunk_delivery_unconfirmed");
+                }
+            }
+            self.trunk.activate_profile(&crate::platform::config::TrunkProfileConfig::default()).await;
         }
         self.quiescent.store(complete,Ordering::SeqCst);
         failed.map_or(Ok(()),Err)

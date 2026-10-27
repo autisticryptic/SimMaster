@@ -47,6 +47,7 @@ mod app_voice_accounts {
         assert_eq!(basic["billing_account"], "jegotrip_account"); assert_eq!(basic["manual_start_required"], true);
         assert_eq!(basic["explicit_profile_required"], true); assert_eq!(basic["plain_media_opt_in_required"], true);
         assert_eq!(basic["default_sdk_client_implemented"], false);
+        assert_eq!(basic["automatic_cleanup_supported"], true); assert_eq!(basic["automatic_reconnect_implemented"], false);
         assert_eq!(basic["outbound_call_implemented"], false); assert_eq!(basic["outbound_message_implemented"], false);
         assert_eq!(basic["media_transport"], "endpoint_tcp_mpath");
         assert_eq!(basic["media_profile"], "raw_rse_sdp_rtp_avp_rtcp_mux_passthrough");
@@ -63,6 +64,75 @@ mod app_voice_accounts {
         // an account. Static implemented metadata cannot mint runtime proof.
         assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
         assert!(crate::connectivity::app_voice::registry::registry().is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticated_cleanup_opt_in_preserves_terminal_state_sms_and_requires_explicit_restart() {
+        use crate::connectivity::app_voice::providers::jegotrip::{account_runtime::AccountManager,
+            account_test_support::{peer, QueuedFactory}, runtime_backend::tests::next_non_poll, transport_packets::CallKind};
+        let mut state = build_test_router().await.expect("Actions private D-Bus required; no skip");
+        let cert = Certificates::generate("DNS:fixture.invalid"); let factory = Arc::new(QueuedFactory::default());
+        let (mut peer, _, dropped) = peer(&cert, &factory);
+        state.app.app_accounts = Arc::new(AccountManager::with_factory(state.app.database.clone(), factory.clone()));
+        let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+        let served = serve(build_router(state.app.clone(), cors)).await; let cookie = authenticate(&served).await;
+        let mut config = config_json(&cert.root); config["cleanup_on_disconnect"] = serde_json::json!(true);
+        config["profile"]["incoming"]["receiver_kind"] = serde_json::json!(b"Sip.Request");
+        for bad in [serde_json::json!("true"), serde_json::json!(null), serde_json::json!(1)] {
+            let mut invalid = config.clone(); invalid["cleanup_on_disconnect"] = bad;
+            let (status, headers, body) = account_request(&served, reqwest::Method::POST, "/api/non-3gpp/accounts",
+                Some(serde_json::json!({"provider_id":"app_voice","config":invalid})), Some(&cookie)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST); no_store(&headers); no_secrets(&body);
+        }
+        let (status, headers, body) = account_request(&served, reqwest::Method::POST, "/api/non-3gpp/accounts",
+            Some(serde_json::json!({"provider_id":"app_voice","config":config})), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::CREATED); no_store(&headers); no_secrets(&body); let line = created_line(&body);
+        let path = format!("/api/non-3gpp/accounts/{line}");
+        assert!(state.app.database.with_conn(|conn| account_store::load(conn, &line)).unwrap().unwrap().config.cleanup_on_disconnect);
+        assert_eq!(factory.build_count(), 0, "import policy never starts a session");
+        let (received, receipt) = tokio::sync::oneshot::channel(); let (disconnect, disconnected) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move { tokio::time::timeout(std::time::Duration::from_secs(8), async move {
+            peer.authenticate().await; peer.swap(Some(4), true).await;
+            peer.incoming_with_fields(91, b"Sip.Request", b"fixture-preserved-SMS", Some(b"fixture-sender"), None).await;
+            let packet = next_non_poll(&mut peer).await; assert_eq!(packet.kind, CallKind::Reply);
+            received.send(()).unwrap(); disconnected.await.unwrap(); drop(peer);
+        }).await.unwrap() });
+        let (status, headers, body) = account_request(&served, reqwest::Method::POST, &format!("{path}/start"),
+            Some(serde_json::json!({"expected_revision":1})), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::ACCEPTED); no_store(&headers); no_secrets(&body);
+        tokio::time::timeout(std::time::Duration::from_secs(4), receipt).await.unwrap().unwrap();
+        let (status, headers, body) = account_request(&served, reqwest::Method::GET, &path, None, Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK); no_store(&headers); no_secrets(&body);
+        let active: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(active["data"]["cleanup_on_disconnect"], true); assert_eq!(active["data"]["incoming_message_ready"], true);
+        disconnect.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(8), async { loop {
+            let (status, headers, body) = account_request(&served, reqwest::Method::GET, &path, None, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::OK); no_store(&headers); no_secrets(&body);
+            let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if view["data"]["io_cleanup_required"] == false {
+                assert_eq!(view["data"]["phase"], "disconnected"); assert_eq!(view["data"]["last_error"], "app_account_disconnected");
+                assert_eq!(view["data"]["cleanup_on_disconnect"], true); assert!(view["data"].get("cleanup_error").is_none());
+                for field in ["incoming_message_ready", "incoming_call_ready", "outbound_authorized"] { assert_eq!(view["data"][field], false); }
+                break;
+            }
+            tokio::task::yield_now().await;
+        }}).await.unwrap();
+        worker.await.unwrap(); assert!(dropped.load(Ordering::SeqCst)); assert_eq!(factory.build_count(), 1);
+        let (status, headers, body) = account_request(&served, reqwest::Method::GET, &format!("{path}/messages"), None, Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK); no_store(&headers);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"][0]["content"], "fixture-preserved-SMS");
+        let held: bool = state.app.database.with_conn(|conn| conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_voice_runtime_leases WHERE line_id=?1)", [&line], |row| row.get(0)
+        ).map_err(|_| "test_query_failed")).unwrap();
+        assert!(!held, "the original runtime lease is released only after actual cleanup");
+        let (status, headers, body) = account_request(&served, reqwest::Method::POST, &format!("{path}/stop"),
+            Some(serde_json::json!({"expected_revision":1})), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK); no_store(&headers); no_secrets(&body);
+        assert_eq!(factory.build_count(), 1);
+        let (status, headers, body) = account_request(&served, reqwest::Method::DELETE, &format!("{path}?expected_revision=1"), None, Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK); no_store(&headers); no_secrets(&body);
+        assert_eq!(state.app.database.get_sms_messages_for_channel(50, 0, None, Some(&line)).unwrap().len(), 1);
     }
 
     #[tokio::test]

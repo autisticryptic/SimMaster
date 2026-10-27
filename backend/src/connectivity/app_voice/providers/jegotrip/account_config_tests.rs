@@ -3,6 +3,33 @@
 use super::*;
 use super::super::{tests::imported, tls_engine::tests::Certificates};
 
+#[test]
+fn cleanup_policy_defaults_to_manual_and_explicit_opt_in_survives_private_roundtrip() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let config = fixture(&cert.root);
+    let mut json: serde_json::Value = serde_json::from_str(&public_json(&config)).unwrap();
+    assert_eq!(json["cleanup_on_disconnect"], false);
+    json.as_object_mut().unwrap().remove("cleanup_on_disconnect");
+    let legacy: AccountConfig = serde_json::from_value(json.clone()).unwrap();
+    assert!(!legacy.cleanup_on_disconnect); assert!(legacy.validate(100).is_ok());
+    json["cleanup_on_disconnect"] = serde_json::json!(true);
+    let enabled: AccountConfig = serde_json::from_value(json).unwrap(); assert!(enabled.validate(100).is_ok());
+    let bytes = enabled.encode_private().unwrap(); let loaded = AccountConfig::decode_private(&bytes).unwrap();
+    assert!(loaded.cleanup_on_disconnect); assert_eq!(bytes.as_slice(), loaded.encode_private().unwrap().as_slice());
+    assert_eq!(format!("{enabled:?}"), "AccountConfig(<redacted>)");
+}
+
+#[test]
+fn cleanup_policy_rejects_null_truthy_strings_and_unknown_recovery_objects() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let config = fixture(&cert.root);
+    let baseline: serde_json::Value = serde_json::from_str(&public_json(&config)).unwrap();
+    for value in [serde_json::json!(null), serde_json::json!("true"), serde_json::json!(1), serde_json::json!({"reconnect":true})] {
+        let mut json = baseline.clone(); json["cleanup_on_disconnect"] = value;
+        assert!(serde_json::from_value::<AccountConfig>(json).is_err());
+    }
+    let mut unknown = baseline; unknown["automatic_reconnect"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<AccountConfig>(unknown).is_err());
+}
+
 fn secret(json: &str) -> Secret { serde_json::from_str(json).unwrap() }
 fn fixture(root: &str) -> AccountConfig {
     let mut credentials = imported();
@@ -13,7 +40,7 @@ fn fixture(root: &str) -> AccountConfig {
     credentials.sdk.selected_session_id = Some(secret("\"fixture-original-selector\""));
     credentials.sdk.client_config_decode_key = Some(secret("\"fixture-client-context\""));
     credentials.sdk.reference_decode_key = Some(secret("\"fixture-reference-context\""));
-    AccountConfig { credentials, bootstrap:None, call_media:None, profile: ProfileConfig {
+    AccountConfig { credentials, bootstrap:None, call_media:None, cleanup_on_disconnect:false, profile: ProfileConfig {
         route: ProfileRoute::DirectTlsCarrier, authority: secret("\"fixture.invalid\""), enable_sni: true,
         identity_type: secret("\"username\""), domain_name: Some(secret("\"fixture.invalid\"")),
         domain_id: Some(secret("\"fixture-domain\"")), application_id: Some(secret("\"fixture-app\"")),

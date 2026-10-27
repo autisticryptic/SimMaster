@@ -463,5 +463,75 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('assert_eq!(payload.expose_to_transport(), native_up)', tests)
 
 
+    def test_whole_original_call_watcher_covers_ringing_and_is_never_replaced_by_media(self):
+        calls = (PROVIDER / 'account_calls.rs').read_text(encoding='utf-8')
+        delivery = calls.split('pub(super) async fn delivery', 1)[1].split('async fn task_admission', 1)[0]
+        self.assertLess(delivery.index('self.watch_original(&call)'), delivery.index('lock(&self.calls).insert'))
+        watcher = calls.split('fn watch_original', 1)[1].split('pub(super) async fn delivery', 1)[0]
+        self.assertIn('original.ticket.revoked()', watcher)
+        self.assertIn('original.changed.notified()', watcher)
+        self.assertIn('original.operation.lock().await', watcher)
+        self.assertIn('service.finish(&original, true).await', watcher)
+        answer = calls.split('async fn accept_original', 1)[1].split('pub(super) async fn hangup', 1)[0]
+        self.assertIn('call.changed.notify_waiters()', answer)
+        self.assertNotIn('call.watch.lock()', answer)
+        self.assertNotIn('tokio::spawn', answer)
+        retirement = (PROVIDER / 'account_calls_retirement_tests.rs').read_text(encoding='utf-8')
+        for name in ['ringing_original_connection_loss', 'ringing_credential_expiry', 'ringing_revision_change',
+                     'one_original_watcher_survives', 'failed_call_history_end_retains_original_run']:
+            self.assertIn(name, retirement)
+        close = calls.split('pub(super) async fn close', 1)[1].split('pub(super) fn resources_released', 1)[0]
+        self.assertIn('if lock(&call.state).phase!=Phase::Ended{complete=false;}', close)
+
+    def test_optional_original_cleanup_never_starts_replacement_or_takes_unowned_runtime(self):
+        config = (PROVIDER / 'account_config.rs').read_text(encoding='utf-8')
+        self.assertIn('#[serde(default)]\n    pub cleanup_on_disconnect: bool', config)
+        self.assertIn('cleanup_on_disconnect: config.cleanup_on_disconnect', config)
+        runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
+        worker = runtime.split('async fn automatic_cleanup', 1)[1].split('const MAX_PENDING_MESSAGES', 1)[0]
+        self.assertIn('run.cleanup_changed.notified()', worker)
+        self.assertIn('timeout(Duration::from_secs(20)', worker)
+        self.assertIn('AccountManager::cleanup_original(&run', worker)
+        self.assertIn('run.finalized.load(Ordering::SeqCst)', worker)
+        self.assertIn('run.terminal_observation', worker)
+        self.assertIn('run.cleanup_error', worker)
+        self.assertNotIn('.start(', worker)
+        self.assertNotIn('.connect(', worker)
+        self.assertNotIn('account_store::load', worker)
+        cleanup = runtime.split('async fn cleanup_original', 1)[1].split('async fn join_automatic_cleanup', 1)[0]
+        self.assertIn('run.cleanup_work.lock().await', cleanup)
+        self.assertLess(cleanup.index('task.abort(); let _=task.await'), cleanup.index('account_runs::release_and_compact'))
+        self.assertIn('controller.resources_released() && calls_released', cleanup)
+        tests = (PROVIDER / 'account_auto_cleanup_tests.rs').read_text(encoding='utf-8')
+        for name in ['opt_in_cleanup_keeps_consumer_join_fence', 'cancelled_manual_stop_does_not_detach',
+                     'automatic_gc_failure_is_visible', 'persisted_cleanup_opt_in_never_reclaims']:
+            self.assertIn(name, tests)
+        self.assertIn('factory.build_count(), 1', tests)
+        self.assertIn('count(&temp.database, "sms_messages"), 2', tests)
+
+    def test_trunk_end_event_drain_precedes_driver_shutdown_and_is_original_consumer_bound(self):
+        calls = (PROVIDER / 'account_calls.rs').read_text(encoding='utf-8')
+        close = calls.split('pub(super) async fn close', 1)[1].split('pub(super) fn resources_released', 1)[0]
+        self.assertLess(close.index('self.finish(&call,true).await'), close.index('drain_trunk_events'))
+        self.assertLess(close.index('drain_trunk_events'), close.index('self.trunk.activate_profile'))
+        self.assertIn('app_account_call_trunk_delivery_unconfirmed', close)
+        operator = source('backend/src/services/trunk/operator.rs')
+        self.assertIn('Arc::ptr_eq(&fence.consumer, &self.consumer)', operator)
+        self.assertIn('consumer.closed()', operator)
+        self.assertIn('trunk_operator_drain_timeout', operator)
+        self.assertIn('impl Drop for TrunkEventReceiver', operator)
+        self.assertIn('lagged_trunk_consumer_cannot_ack', operator)
+        driver = source('backend/src/services/trunk/driver.rs')
+        self.assertIn('subscribe_trunk_events()', driver)
+        self.assertIn('trunk_operator_events_lost', driver)
+        tests = (PROVIDER / 'account_calls_trunk_tests.rs').read_text(encoding='utf-8')
+        self.assertIn('ringing_disconnect_sends_original_asterisk_cancel', tests)
+        self.assertIn('assert!(cancel.starts_with(b"CANCEL sip:"))', tests)
+        self.assertIn('assert!(!link.has_trunk_consumer())', tests)
+        http = source('backend/src/api/app_voice_http_tests.rs')
+        self.assertIn('authenticated_cleanup_opt_in_preserves_terminal_state_sms', http)
+        self.assertIn('automatic_reconnect_implemented', http)
+
+
 if __name__ == '__main__':
     unittest.main()

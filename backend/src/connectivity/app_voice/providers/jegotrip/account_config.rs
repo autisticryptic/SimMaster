@@ -24,6 +24,10 @@ pub struct AccountConfig {
     pub profile: ProfileConfig,
     pub bootstrap: Option<BootstrapConfig>,
     pub call_media: Option<CallMediaConfig>,
+    /// Opt in to bounded cleanup of this manager's already-retired original
+    /// run. Never automatic SDK startup/reconnect or unowned process takeover.
+    #[serde(default)]
+    pub cleanup_on_disconnect: bool,
 }
 impl fmt::Debug for AccountConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("AccountConfig(<redacted>)") }
@@ -302,7 +306,7 @@ struct PrivateEnvelope { format_version: u32, config: AccountConfig }
 struct PrivateEnvelopeRef<'a> { format_version: u32, config: PrivateConfigRef<'a> }
 #[derive(Serialize)]
 struct PrivateConfigRef<'a> { credentials: PrivateCredentialsRef<'a>, profile: PrivateProfileRef<'a>, bootstrap:Option<PrivateBootstrapRef<'a>>,
-    call_media: Option<PrivateCallMediaRef<'a>> }
+    call_media: Option<PrivateCallMediaRef<'a>>, cleanup_on_disconnect: bool }
 #[derive(Serialize)]
 struct PrivateCallMediaRef<'a> { authority: &'a str, root_der_base64: &'a str, enable_sni: bool,
     routing: PrivateProperties<'a>, features: PrivateFeatures<'a>, properties: PrivateProperties<'a>, reference_decode_key: Option<&'a str>,
@@ -400,6 +404,7 @@ impl<'a> PrivateConfigRef<'a> {
                 connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
                 partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
             },
+            cleanup_on_disconnect: config.cleanup_on_disconnect,
             call_media: config.call_media.as_ref().map(|media| PrivateCallMediaRef { authority: media.authority.expose_to_backend(),
                 root_der_base64: media.root_der_base64.expose_to_backend(), enable_sni: media.enable_sni,
                 routing: PrivateProperties(&media.routing), features: PrivateFeatures(&media.features), properties: PrivateProperties(&media.properties),

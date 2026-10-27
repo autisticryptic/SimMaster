@@ -15,6 +15,8 @@ mod inbox_native;
 mod smgw_native;
 #[path = "account_maintenance_native_tests.rs"]
 mod maintenance_native;
+#[path = "account_auto_cleanup_tests.rs"]
+mod auto_cleanup;
 
 async fn phase(manager: &AccountManager, line: &str, wanted: &str) -> AccountView {
     tokio::time::timeout(Duration::from_secs(4), async {

@@ -225,7 +225,7 @@ async fn run_static_peer(
         })
         .await;
     let mut next_keepalive = tokio::time::Instant::now() + STATIC_KEEPALIVE;
-    let mut operator_events = operator.subscribe_events();
+    let mut operator_events = operator.subscribe_trunk_events().map_err(str::to_owned)?;
     let mut sms_deliveries = operator.subscribe_sms_deliveries();
     loop {
         if !state.is_current() || *shutdown.borrow() {
@@ -243,8 +243,10 @@ async fn run_static_peer(
                 Err(error) => return Err(error),
             },
             event = operator_events.recv() => {
-                if let Ok(event) = event {
-                    handle_operator_event(&transport, bridge, event, state).await?;
+                match event {
+                    Ok(Some(event)) => handle_operator_event(&transport, bridge, event, state).await?,
+                    Ok(None) => {}, // original FIFO fence, no SIP frame of its own
+                    Err(_) => return Err("trunk_operator_events_lost".to_owned()),
                 }
             },
             delivery = sms_deliveries.recv() => {
@@ -281,7 +283,7 @@ async fn run_outbound_register(
     operator: &OperatorLink,
 ) -> Result<(), String> {
     let mut dialog = sip::RegisterDialog::fresh();
-    let mut operator_events = operator.subscribe_events();
+    let mut operator_events = operator.subscribe_trunk_events().map_err(str::to_owned)?;
     let mut sms_deliveries = operator.subscribe_sms_deliveries();
     loop {
         let expiry =
@@ -319,8 +321,10 @@ async fn run_outbound_register(
                     Err(error) => return Err(error),
                 },
                 event = operator_events.recv() => {
-                    if let Ok(event) = event {
-                        handle_operator_event(&transport, bridge, event, state).await?;
+                    match event {
+                        Ok(Some(event)) => handle_operator_event(&transport, bridge, event, state).await?,
+                        Ok(None) => {},
+                        Err(_) => return Err("trunk_operator_events_lost".to_owned()),
                     }
                 },
                 delivery = sms_deliveries.recv() => {

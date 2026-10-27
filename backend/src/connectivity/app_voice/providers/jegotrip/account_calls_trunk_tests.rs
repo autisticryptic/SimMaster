@@ -61,3 +61,57 @@ async fn real_trunk(native_hangup:bool){
 async fn asterisk_sip_answer_bidirectional_audio_bye_releases_only_original_sdk_call_and_both_ports(){real_trunk(false).await;}
 #[tokio::test]
 async fn original_native_remote_release_acks_once_sends_asterisk_bye_and_never_replays_sdk_release(){real_trunk(true).await;}
+
+#[tokio::test]
+async fn ringing_disconnect_sends_original_asterisk_cancel_before_opt_in_trunk_shutdown() {
+    let temp = TempDatabase::new(); let factory = Arc::new(QueuedFactory::default());
+    let sdk = Certificates::generate("DNS:fixture.invalid"); let media = Certificates::generate("IP:127.0.0.1");
+    let asterisk = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap(); let remote = asterisk.local_addr().unwrap();
+    let reserved = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap(); let local_sip = reserved.local_addr().unwrap(); drop(reserved);
+    let mut config = call_config(&sdk.root, &media.root); config.cleanup_on_disconnect = true;
+    config.call_media.as_mut().unwrap().trunk = Some(TrunkProfileConfig {
+        enabled: true, registration_mode: TrunkRegistrationMode::StaticPeer, asterisk_host: remote.ip().to_string(),
+        asterisk_port: remote.port(), local_port: local_sip.port(), username: "41000".into(), incoming_binding: "6108".into(),
+        incoming_mode: TrunkIncomingMode::BoundPending, codec_allow: vec!["pcmu".into()], ..TrunkProfileConfig::default()
+    });
+    let (mut peer, _, dropped) = sdk_peer(&sdk, &factory);
+    let manager = AccountManager::with_factory(temp.database.clone(), factory.clone());
+    let account = manager.create(config, 100).await.unwrap().account;
+    let (go, invited) = oneshot::channel(); let (lose, lost) = oneshot::channel();
+    let sdk_task = tokio::spawn(async move { bounded(async move {
+        peer.authenticate().await; peer.swap(Some(4), true).await; invited.await.unwrap();
+        notice(&mut peer, CallNoticeKind::Invited, 101, &sdp("127.0.0.1:5006".parse().unwrap()), b"fixture-domain").await;
+        receipt(&mut peer, 101, true).await;
+        let (id, _) = operation(&mut peer, CallOperation::Inform).await; reply_operation(&mut peer, id, CallOperation::Inform, true, None).await;
+        lost.await.unwrap(); drop(peer);
+    }).await });
+    bounded(manager.start(&account.line_id, account.revision, 100)).await.unwrap(); ready(&manager, &account.line_id).await;
+    let service = manager.original_call_service(&account.line_id).unwrap(); let link = service.operator();
+    assert!(link.has_trunk_consumer()); go.send(()).unwrap();
+    let (invite, source) = sip_frame_from(&asterisk).await; assert!(invite.starts_with(b"INVITE sip:")); assert_eq!(source, local_sip);
+    let offered = PlainAudioOffer::trunk(sip_frame::body(&invite), true).unwrap().endpoint().unwrap();
+    let call_id = sip_frame::header_value(&invite, "Call-ID").unwrap().to_owned();
+    let via = sip_frame::header_value(&invite, "Via").unwrap(); let from = sip_frame::header_value(&invite, "From").unwrap();
+    let to = sip_frame::header_value(&invite, "To").unwrap(); let cseq = sip_frame::header_value(&invite, "CSeq").unwrap();
+    let ringing = format!("SIP/2.0 180 Ringing\r\nVia: {via}\r\nFrom: {from}\r\nTo: {to};tag=fixture-pbx\r\nCall-ID: {call_id}\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n");
+    asterisk.send_to(ringing.as_bytes(), source).await.unwrap();
+    let view = first_call(&manager, &account.line_id).await; lose.send(()).unwrap();
+    let (cancel, cancel_source) = sip_frame_from(&asterisk).await;
+    assert!(cancel.starts_with(b"CANCEL sip:")); assert_eq!(cancel_source, source);
+    assert_eq!(sip_frame::header_value(&cancel, "Call-ID").unwrap(), call_id);
+    let ended = bounded(async { loop {
+        let view = manager.get(&account.line_id, 100).await.unwrap();
+        if !view.io_cleanup_required { break view; } tokio::task::yield_now().await;
+    }}).await;
+    assert_eq!(ended.phase, "disconnected"); assert_eq!(ended.cleanup_on_disconnect, Some(true)); assert!(ended.cleanup_error.is_none());
+    assert!(!ended.incoming_call_ready && !ended.incoming_message_ready && !ended.outbound_authorized);
+    bounded(sdk_task).await.unwrap(); assert!(dropped.load(Ordering::SeqCst)); assert!(service.resources_released());
+    assert!(!link.has_trunk_consumer()); assert!(link.trunk_local_ip().is_none());
+    let row = temp.database.get_call_by_id(view.history_id).unwrap().unwrap(); assert!(!row.answered && row.end_time.is_some());
+    assert!(manager.call(&account.line_id, &view.id).await.unwrap().phase == "ended");
+    assert!(!temp.database.with_conn(|conn| account_runs::ownership_pending(conn, &account.line_id)).unwrap());
+    let reused = UdpSocket::bind(source).await.unwrap(); assert_eq!(reused.local_addr().unwrap(), source);
+    let audio = UdpSocket::bind(offered).await.unwrap(); assert_eq!(audio.local_addr().unwrap(), offered);
+    assert_eq!(factory.build_count(), 1);
+    assert!(!bounded(manager.stop(&account.line_id, account.revision, 100)).await.unwrap().io_cleanup_required);
+}
