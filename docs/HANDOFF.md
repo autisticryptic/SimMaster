@@ -10,9 +10,16 @@
 4. IDA 仅只读使用用户已打开的原 `libmtc.so`，调用前核对 metadata；不自行启动/加载、修改或保存 IDB。新 JADX/其他工具须先说明版本/用途，由用户手动安装。
 5. 保持原 UI 布局；本轮是后端，不做登录/绑定 UI。公共文档只更新原五手册。报告、APK/固件、JSONL、`.local`、私有交接和凭据不提交。
 
-## 当前：基础入站后端已获软件整链验证
+## 当前：断线来电收尾与可选原运行清理已验证
 
-- **最新源码 `d0a2b675329489c72542bb3b3d382e02b6eda15a` 已推送**：修复批次邀请回执只 queued 时过早 Inform；只对明确未入队的 `CallNotReady` 按同 owner/ticket 和固定预算等待，不重放已提交 RPC。应答/挂机先取得任务入队位置再改变 queued 状态；取消前未入队保持可重试。每个已完成 Join 即时移除，取消停用后不再重复 poll 已消费句柄。
+- **最新源码 `b13223ab8f8515a9e27b84a64c12f0a68809e90a` 已推送并核验**：CallService从Checking/Ringing起保留唯一watch，原ticket/account/媒体scope结束即按原operation收尾history/Ended/Join。`cleanup_on_disconnect`缺省false，显式true只在本manager原run退休后20秒有界清理，不自动start/reconnect/renew或清unknown orphan。
+- 原Trunk的私有FIFO fence保证Ended/CANCEL/BYE本地处理后才停driver；普通observer或替换/drop/lag消费者不能假确认。不确定发送单独报错；call history SQL失败不释放lease，重等原owner不重放Release。
+- Build **40458126579** / Beta **40458126681**、ARM64/AMD64成功；官方digest ZIP/CRC/逐名/source-run各 **711 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86矩阵**，**438 static/mock通过**，65warnings保留，Publish Release skipped。新振铃断线/expiry/revision、原watch不替换、失败清理/consumerJoin/人工取消/显式重启、unknownowner拒绝、actual SIP CANCEL和HTTP均实际执行。
+- 首e78a7b1两Actions一个新fixture误在最终lease释放后unwrap当前callquery，现保留原对象/SQLite Ended并断言旧query必须拒绝；仅fixture修复，不放宽原owner/FIFO/Join，官方失败ZIP保留。证据`.local/jegotrip/verified-native-b13223a.json`和`continuation-20261027/{retirement-implementation.md,retirement-verification-summary.json,retirement-first-failure.md}`。
+
+### 前基础整链检查点（仍有效，不代替最新源码验证）
+
+- **前源码 `d0a2b675329489c72542bb3b3d382e02b6eda15a` 已推送**：修复批次邀请回执只 queued 时过早 Inform；只对明确未入队的 `CallNotReady` 按同 owner/ticket 和固定预算等待，不重放已提交 RPC。应答/挂机先取得任务入队位置再改变 queued 状态；取消前未入队保持可重试。每个已完成 Join 即时移除，取消停用后不再重复 poll 已消费句柄。
 - 新增 6 项原生协议/任务入队回归，另将停用取消夹具扩展为“已完成第一个任务＋第二个持有 socket 的阻塞任务”。**435 本机 static/mock 通过**；Build **40445960947** / Beta **40445960949** 首轮成功，官方 digest ZIP/CRC/逐名/source-run 各精确匹配 **699 Jegotrip＋7 registry＋16 HTTP＋42 Trunk＋31通知＋4 SIP＋7 DNS /86矩阵**。新回归全部实际通过，ARM64/AMD64成功，Publish Release skipped；保留65条编译warning。
 - **前整链提交 `4375a53e90ab88a73bba1a32c48288c37973ba86` 也已独立复核**：Build **40374831389** / Beta **40374831552** 的官方 digest ZIP、CRC、逐名清单和源码/run 指纹匹配，各 693 Jegotrip＋7 registry＋16 HTTP＋42 Trunk＋31通知＋4 SIP＋7 DNS /86矩阵；ARM64/AMD64成功，Publish Release skipped。其 432 static/mock 已再次运行通过，但不能替代新修复验证。
 - 已有整链覆盖生产 Rust 驱动与隔离 native peer：认证 HTTP 应答、原 Endpoint TCP-Mpath 与实际 UDP 双向 RTP、通话期间 SMS 落库/原 ACK、Asterisk 侧 SIP 应答/双方 BYE、原端口释放。**不是原 Android SDK 执行、实网/PBX部署或资费验收**。
@@ -24,7 +31,8 @@
 | --- | --- |
 | 独立账号 | `app_account` / `application_data`；私有参数导入、随机本地 line_id、revision CAS、显式 start/stop；不伪造 ICCID/UICC，不恢复 cached ready |
 | 原来电 | 原 receiver、64-bit native ID、owner/scope/run 关联的邀请、Inform/Accept/Release；SDK/hosting 接受不等于媒体就绪 |
-| 音频与 Trunk | 原 Endpoint TCP/TLS＋独立 Mpath media、实际本地 UDP、原 payload/peer 校验；应答/挂机、call history/event、OperatorLink/Trunk 和真实 Join 清理 |
+| 音频与 Trunk | 原 Endpoint TCP/TLS＋独立 Mpath media、实际本地 UDP、原 payload/peer 校验；全call watcher、应答/挂机/history/event和Join；先原driver处理结束事件再停Trunk |
+| 原运行清理 | `cleanup_on_disconnect`可选、defaultfalse；只清本manager退休run并保留原因/cleanup_error，不自动重连/renew，不猜未知进程退出 |
 | 接短信 | 精确 `Sip.Request` 严格文本分类；raw/SMS/事件/通知计划同事务 commit 后才回原 ticket；未知 kind/编码不猜 SMS/PDU |
 | 查询与通知 | 既有 SMS 历史、删除/逻辑 raw 清除、通知目标指纹与有界重试；删除或改同名目的地不重放/改投旧短信 |
 | 能力隔离 | Voice/Messaging 各自实时原 proof；汇总 available 不互授；排队 Connected 消费时重核原权限、版本/有效期和物理媒体 |
@@ -39,6 +47,7 @@
 - 支持原参数显式导入和可选 matched bootstrap handoff；本地存储是明文私有 `data.db`，不是加密保险箱。参数替换前先完成原 stop/Join，备份与目录权限仍需保护。
 - 媒体限原 raw `RseEx.SDP`、RTP/AVP sendrecv、RTCP-mux、匹配编码 RTP passthrough。须 `allow_plain_media=true` 和明确本地 bind IP；信令 TLS 不降级。压缩 SDP、SRTP、ICE/BUNDLE/P2P、转码及所有原生选路模式不假装支持。
 - `Client.Host/ArcPort` 可能是逻辑 Router 地址/端口，不是 OS UDP/RTP 目的地。原 raw SDP 分支存在，**不证明服务当前选择了这个分支**。
+- 可选断线清理20秒有界，与人工stop/关机同原run串行。history失败保lease、consumer/actor/媒体/Trunk原Join后才finalize；自动清理后GET账号保留终端原因与cleanup_error。运行期calls接口不从已release租约重获owner，已结束数据库历史保留。Trunk FIFO只确认本地driver处理/发送，不是远端ACK；发送不确定不能冒称成功。
 - 单连接/账号/队列有显式限额。direct 原 receipt 历史 128 个身份满时关闭原 scope，不驱逐去重信息；不是无限常驻、自动重连或 token 续期。正常原 run Join 后回收已投影私有 envelope，保留 SMS；未知 prior-process owner 不凭 PID/年龄强制清除。
 - 默认 locator/全部 Router-NetStream、自动续期、remote principal/device 全局租约及其他媒体组合是后续扩展；用户本轮没有要求实现付费外发。通知不能承诺远端 exactly-once，已发字节不可召回，删除不是 SQLite/WAL/备份物理擦除。
 - 真实账号/服务/媒体部署、网络条件、双向音频、通知目的地、有效期/并发和账单仍无验收证据；以后须明确授权及自有有效参数。当前不要求用户贴出秘密或安装新工具。
@@ -50,8 +59,8 @@
 ## 本轮软件交付与后续验收
 
 1. 基础接电话/应答/挂机/双向音频/Trunk、durable短信/查询删除/通知原ACK，以及新取消/批次缺口已有新SHA两Actions整链证据；不是仅codec或单个信令阶段。
-2. 公共收尾只更新原五手册，构建输入保持与已验 `d0a2b67` 相同；文档不代表另一个二进制。后续改源码仍须新SHA执行/产物核验，原失败证据不能删去。
-3. 真实部署/服务/网络条件、账户绑定/有效期与账单仍未验收；若实际参数使用不支持的模式，需要据证继续实现。不沿用旧日志的失效Goal工具ID或设备授权，也不把可选完整SDK/付费外发当本轮已完成。
+2. 公共收尾只更新原五手册，构建输入保持与已验 `b13223a` 相同；文档不代表另一个二进制。后续改源码仍须新SHA执行/产物核验，原失败证据不能删去。
+3. 持续接收的direct128去重窗口与私有inbox512身份保留仍需联合native/durable证明；本次清理不冒称已解除容量或实现自动重连/续期。后续这项软件工作与实际部署/服务/账户/账单验收分开，不复用失效Goal工具ID或旧设备授权。
 
 ## IMS 注册主线：历史软件基线保持
 

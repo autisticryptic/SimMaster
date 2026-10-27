@@ -155,7 +155,7 @@ python3 -B offline-registration-sim/run.py --fallback --report offline-registrat
 
 当前目标是**基础接电话、应答、挂机、双向音频与 Trunk，以及接短信、查询/删除、通知和原生回执**；外呼、发短信只保留接口。登录/号码绑定 UI 暂缓，由用户从自己的 root 手机取得现有参数。账号使用独立 `app_account` / `application_data` 线路，不借 SIM、五码、UICC、IMS/CS 或免费 WLAN 资费。
 
-当前源码 `d0a2b67` 已由两套 Actions、官方摘要产物和双架构构建核验，包含批次来电回执等待及取消/Join 修复。原邀请→应答→Endpoint TCP-Mpath↔UDP RTP→挂机、认证 HTTP、Asterisk 侧 SIP 与通话期间 SMS 整链均有执行证据。验证使用生产 Rust 路径和隔离协议 peer，**不是已连接无忧行、设备部署或资费验收**。用户所述入站免费不替代实际账单证据。
+当前源码 `b13223a` 已由两套 Actions、官方摘要产物和双架构核验，在已接通基础入站整链上补齐全生命周期来电收尾、可选断线清理和原 Trunk 结束事件排空。之前 `d0a2b67` 的批次回执等待及取消/Join 修复仍有独立证据。原邀请→应答→Endpoint TCP-Mpath↔UDP RTP→挂机、认证 HTTP、Asterisk 侧 SIP 与通话期间 SMS 均有隔离执行证据，**不是已连接无忧行、设备部署或资费验收**。用户所述入站免费不替代实际账单证据。
 
 ### 1. 纠正旧勘察结论
 
@@ -217,7 +217,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 - 来电：`JCCall`；接收消息：同一 `JCClient` 上的 `JCMessageChannel`，
   App 接收回调进入 Realm/未读/通知。短信发送和服务端计费流程尚未确认。
 
-`GET /api/non-3gpp/providers/app_voice/credential-contract` 返回静态实现/参数说明，不初始化 SDK、不读账号或发请求；当前 `transport_implemented=true` **仅指显式入站实现**。`basic_hosting` 明列 profile、手动启动、plain-media opt-in、独立计费主体、实现的入站操作及 `default_sdk_client_implemented=false`；外呼/发送均 false。它不是当前 readiness、服务可用性或收费授权。
+`GET /api/non-3gpp/providers/app_voice/credential-contract` 返回静态实现/参数说明，不初始化 SDK、不读账号或发请求；当前 `transport_implemented=true` **仅指显式入站实现**。`basic_hosting` 明列 profile、手动启动、plain-media opt-in、独立计费主体、实现的入站操作及 `default_sdk_client_implemented=false`；`automatic_cleanup_supported=true` 仅指下面的可选原运行清理，`automatic_reconnect_implemented=false`，外呼/发送均 false。它不是当前 readiness、服务可用性或收费授权。
 
 Main 在创建原账号 manager 后显式安装 Voice/Messaging provider。Registry 的汇总 availability 不能互授能力，调用方分别检查 `incoming_call_ready` / `incoming_message_ready`；SMS-only 不授 Voice，反之亦然。只读描述不会加载配置或自动启动会话。Android/AArch64 库不经 `dlopen` 冒充 Linux/AMD64 后端。
 
@@ -239,6 +239,7 @@ Main 在创建原账号 manager 后显式安装 Voice/Messaging provider。Regis
 | 五个 `profile.*_timeout_ms` | `connect` 为 1..10000，`handshake` / `partial` / `io` 各 1..30000，`rpc` 为 1..60000 毫秒；都是显式有界预算，不推断 token 租期 |
 | `config.bootstrap`（可选） | 独立 `account_authority` / `account_root_der_base64` / `account_enable_sni`、`routing` 与 1..30000 的 `handoff_timeout_ms`；不能同时手填 profile 的 domain/app/CC 字段 |
 | `config.call_media`（接电话） | 独立 `authority` / `root_der_base64` / `enable_sni`、原 `routing` / `features` / `properties`，可选 `reference_decode_key`，显式 `audio_bind_ip`、`allow_plain_media=true` 和可选 `trunk` |
+| `config.cleanup_on_disconnect`（可选） | JSON boolean，缺省 false；仅清理本 manager 已退休的原 run，不自动 start/reconnect/renew 或清除未知前进程 owner |
 
 属性数组的每项是 `{"key":[字节...],"value":[字节...]}`；receiver 的二进制字段同样用 JSON 字节数组，**不是字符串或 Base64**。`call_media.features` 每项是 `{"value":[字节...]}`。解码 key 只用于对应原 ENC 上下文；不合并 SDK、Client、reference 或 media 的信任/密钥。
 
@@ -278,9 +279,19 @@ Main 在创建原账号 manager 后显式安装 Voice/Messaging provider。Regis
 
 私有 `data.db` 仍是本机明文存储，不是加密保险箱；API 不导出账号配置。换参数先 stop 并确认 `io_cleanup_required=false`，再 CAS replace/start。取消 stop 后只能继续等待同一 owner 的剩余 Join；已完成任务不得再次 poll。正常退出后回收已投影私有 envelope 并保留共享 SMS；删除 SMS 清逻辑 raw/tombstone，但不保证 SQLite/WAL/备份物理擦除。
 
+来电现在从 Checking/Ringing 起就保留唯一原 watcher，不等到媒体连接后才监听。原 ticket/account scope 断开、过期或媒体 scope 关闭时，经原 operation 锁结束历史与 Ended，不覆盖/丢弃 watcher、不重复 Release。即使 SDK 断线发生在振铃，也不会只丢端口却留下未结束通话。
+
+设置 `cleanup_on_disconnect=true` 后，本 manager 的原 run 退休会触发最多20秒的自动清理（最多一次同 owner 清理重等），与人工 stop/关机在原 run 上串行；媒体、call任务、原 SIP driver、actor/controller 与 consumer 的实际 Join 后才提交 nonce fence/回收 envelope。它不会发送新的登录、自动重连或续期，不会按 PID/年龄清除未知前进程。缺省 false 保持人工 stop 行为；配置仅存在数据库而没有本 manager 原运行时，不能自动清理或授 readiness。
+
+原 Trunk 驱动通过私有 FIFO fence 确认先前 Ended 的本地处理/发送后再停止；普通事件观察者、替换/丢弃/落后 driver 不能假确认。失败显示 `app_account_call_trunk_delivery_unconfirmed`（HTTP503），不宣称远端已收到 CANCEL/BYE。SQL/历史结束失败保留原运行 lease，修复后只能重等该 owner，不重放已尝试的 Release。局部 socket 关闭不等于历史提交或原资源全释放。
+
+`GET A` 在该 manager 持有 run 时可观察 `cleanup_on_disconnect`；自动清理后保留原 disconnected/expired 等原因和独立 `cleanup_error`。`io_cleanup_required` 表示本地原资源/fence 义务，`cleanup_error` 可能含局部已释放后的不确定远端/Trunk结果，两者不能互代。人工 stop 可重等/清除该原运行状态；最终租约释放后 `A/calls` 是运行期接口，不能再当作活跃旧call查询（`app_account_runtime_owner_unconfirmed`），已结束通话/短信历史仍在既有数据库/历史 API，下一次显式 start 才创建新 owner。
+
 单账号配置/消息/任务均有界；direct receipt 的 128 个原身份历史满时关闭原 scope，不静默驱逐去重信息，**不承诺单连接无限常驻或自动重连**。未知 prior-process run 仍保持 `app_account_runtime_owner_unconfirmed`，不从 PID/年龄猜已退出、不提供 force-clear。默认 locator/所有原生模式、自动 token 续期、remote principal/device 全局租约及其他媒体模式是后续扩展，不伪装已支持，也不扩大为本轮付费外发必做项。
 
-当前源码 **`d0a2b675329489c72542bb3b3d382e02b6eda15a` 已验证**：Build40445960947 / Beta40445960949、ARM64/AMD64成功；官方 digest ZIP 各逐名匹配 **699 Jegotrip＋7 registry＋16 HTTP＋42 Trunk＋31通知＋4 SIP＋7 DNS/86矩阵**，435 本机 static/mock 通过。六项新 admission/batch 与强化的双 Join 取消回归均实际执行；首轮通过，保留65条编译warning，不声称零warning。官方测试 artifact：Build12708308718 / Beta12708966079；详细官方摘要、CRC、源码/run/矩阵指纹见私有 `verified-native-d0a2b67.json`。Publish Release skipped；这不是程序包部署或服务验收。文档收尾须保持与该已验源码相同的构建输入，不假称新二进制。
+最新源码 **`b13223ab8f8515a9e27b84a64c12f0a68809e90a` 已验证**：Build40458126579 / Beta40458126681、ARM64/AMD64成功，官方digest ZIP/CRC/逐名/source-run各 **711 Jegotrip＋7 registry＋17 HTTP＋46 Trunk＋31通知＋4 SIP＋7 DNS/86矩阵**，438 static/mock通过，65条compile warning保留；Release skipped。新增12 Jegotrip、4原Trunk FIFO和1认证HTTP实际执行，原双向音频/接短信/通知/归属回归保持。Build artifact12713424118摘要`d2bcd976c01d43d6a1a8bcdef33332cdf163926074c5a18788765b7b56e3eabc`，Beta12713408030摘要`07212f43c97a1ed7e9e5598d202b0a8e4acf72e7239b18fe788cf0e6555611a1`；清单见私有`verified-native-b13223a.json`。首e78a7b1两Actions编译成功但一新fixture在最终lease释放后错误unwrap当前call query，已仅修fixture为原对象/SQL历史与旧query应拒绝的断言，失败ZIP/全文保留，不弱化生产owner/TLS/Join/FIFO。
+
+前源码 **`d0a2b675329489c72542bb3b3d382e02b6eda15a` 已验证**：Build40445960947 / Beta40445960949、ARM64/AMD64成功；官方 digest ZIP 各逐名匹配 **699 Jegotrip＋7 registry＋16 HTTP＋42 Trunk＋31通知＋4 SIP＋7 DNS/86矩阵**，435 本机 static/mock 通过。六项新 admission/batch 与强化的双 Join 取消回归均实际执行；首轮通过，保留65条编译warning，不声称零warning。官方测试 artifact：Build12708308718 / Beta12708966079；详细官方摘要、CRC、源码/run/矩阵指纹见私有 `verified-native-d0a2b67.json`。Publish Release skipped；这不是程序包部署或服务验收。文档收尾须保持与该已验源码相同的构建输入，不假称新二进制。
 
 用户提供的第三方 DOCX 只作线索：其 APK SHA/大小与本地样本不同。表格/工具说明已只读核对，当前原 `libmtc.so` 在 IDA 的 metadata 与本地/实际 APK 库字节相同；raw SDP 分支存在不代表远端实际选择。HTTP 加密/签名或 Android 信任策略不替代 native wire/授权证明。不照搬报告密钥，不运行其中服务示例；若需要 JADX/其他新工具，先说明版本和用途，由用户手装。
 

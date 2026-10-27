@@ -435,7 +435,10 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 - 媒体只支持显式 raw `RseEx.SDP`、RTP/AVP sendrecv、RTCP-mux、匹配payload的编码passthrough，原Endpoint TCP/TLS承载信令，TCP-Mpath连接实际本地UDP。须明确plain-media opt-in，不因此降低TLS校验；native `Client.Host/ArcPort` 的逻辑地址/端口不能推导为OS RTP地址。SRTP、压缩SDP、ICE/BUNDLE/P2P、转码及其他native模式不猜。
 - 原 `Sip.Request` 文本经过严格分类；raw/SMS/事件/通知计划同事务commit后原consumer ACK。`direct_submitted` / `batch_queued` 不等于peer已确认；未知kind/body不按猜测落SMS/PDU。删除保留原scope去重语义并清逻辑payload，不保证SQLite/WAL物理擦除；通知目标指纹、有限重试和不确定态不承诺远端exactly-once。
 - 原媒体/Trunk、controller/actor与consumer实际Join后，才能释放持久run fence及替换配置；别的manager或未知prior-process owner不能接管。direct 128身份历史满则关闭原scope，正常run结束回收已投影私有envelope并保留SMS；不承诺无限常驻/自动重连或续期，也不凭PID/年龄抹去未知持有者。
-- 当前源码 `d0a2b67`（435 static/mock）修复上述批次/取消边界，已由Build40445960947/Beta40445960949、双架构及官方摘要ZIP各699 Jegotrip和原回归逐名核验。完整参数/API、支持范围及后续互通条件见[开发指南](DEVELOPER.md#当前基础托管配置与操作)；未访问真实服务或设备，不把隔离peer/静态raw分支当生产互通、SIM费用或账单证明。
+- 来电从Checking/Ringing起持有唯一原watch，ticket/account/media scope退休经原operation收尾history/Ended，不覆盖旧watch。原Trunk只由private原consumer FIFO fence确认先前Ended本地处理/发送后停driver；observer/替换/drop/lag/timeout不假成功，local send不当peerACK。history/event SQL失败保原lease，retry不重发已尝试Release。
+- `cleanup_on_disconnect`为明确local opt-in、defaultfalse；只有本manager实际原run能在退休后20秒有界清理并保terminal原因/cleanup_error，最多一次同owner清理重等。manual stop/shutdown同原run锁串行，call/media/Trunk/actor/controller/consumer实际Join后才release nonce及回收已投影envelope。不会自动start/reconnect/renew或凭PID/年龄接管unknownorphan；关闭lease后旧运行期call query继续拒绝，数据库历史不擦除。
+- 最新源码`b13223a`已由Build40458126579/Beta40458126681/双架构及officialdigest711回归验证；direct128/DB512长收件限制仍有独立native/durable工作，不把本次自动清理宣称无限常驻。
+- 前源码 `d0a2b67`（435 static/mock）修复上述批次/取消边界，已由Build40445960947/Beta40445960949、双架构及官方摘要ZIP各699 Jegotrip和原回归逐名核验。完整参数/API、支持范围及后续互通条件见[开发指南](DEVELOPER.md#当前基础托管配置与操作)；未访问真实服务或设备，不把隔离peer/静态raw分支当生产互通、SIM费用或账单证明。
 
 ### 历史协议演进（下述状态仅属于指定旧提交）
 
@@ -470,7 +473,9 @@ Build40045409934/Beta40045409943/ARM64 AMD64 success，Release skipped；官方S
 
 ## 10. 验证清单与验收标准
 
-当前已验源码 **`d0a2b675329489c72542bb3b3d382e02b6eda15a`**：Build40445960947/Beta40445960949、ARM64/AMD64成功，Publish Release skipped；官方digest ZIP/CRC/源码-run各逐名匹配699 Jegotrip＋7registry＋16HTTP＋42Trunk＋31通知＋4SIP＋7DNS/86矩阵。435static/mock通过，保留65条编译warning。认证HTTP应答/双向RTP/通话期间SMS原ACK、Asterisk侧SIP应答/双方BYE、能力隔离/排队Connected及新增delayed-batch/取消入队/多Join清理均已实际执行。Build artifact12708308718 SHA-256 `f3fadea44e27a3cf6299a29e9df662403c24362726969da7ca1f88c480a85254`；Beta artifact12708966079 SHA-256 `8cd779a34198b67f4a60d3664c176e86d3c1d2883b5e8672dd07db32e08a09ce`。以下较早条目只保留历史范围，软件验证不是原SDK执行或真实服务/设备/资费验收；文档收尾不改变该已验源码构建输入。
+最新已验源码 **`b13223ab8f8515a9e27b84a64c12f0a68809e90a`**：Build40458126579/Beta40458126681、ARM64/AMD64成功、Release skipped；officialdigest ZIP/CRC/逐名/source-run各711 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86矩阵，438static/mock，65warnings保留。新增wholecallwatch/opt-incleanup/原FIFO/actual SIP CANCEL/SQL失败与consumerJoin/取消/明确restart/unknownorphan拒绝和认证HTTP均实际执行。Build12713424118摘要`d2bcd976c01d43d6a1a8bcdef33332cdf163926074c5a18788765b7b56e3eabc`，Beta12713408030摘要`07212f43c97a1ed7e9e5598d202b0a8e4acf72e7239b18fe788cf0e6555611a1`；首e78fixture误在lease释放后要求livequery，原production拒绝保持，仅fixture修并保留失败ZIP。不是实网/部署/远端ACK、无限接收/自动重连/续期或未知进程接管证明。
+
+前已验源码 **`d0a2b675329489c72542bb3b3d382e02b6eda15a`**：Build40445960947/Beta40445960949、ARM64/AMD64成功，Publish Release skipped；官方digest ZIP/CRC/源码-run各逐名匹配699 Jegotrip＋7registry＋16HTTP＋42Trunk＋31通知＋4SIP＋7DNS/86矩阵。435static/mock通过，保留65条编译warning。认证HTTP应答/双向RTP/通话期间SMS原ACK、Asterisk侧SIP应答/双方BYE、能力隔离/排队Connected及新增delayed-batch/取消入队/多Join清理均已实际执行。Build artifact12708308718 SHA-256 `f3fadea44e27a3cf6299a29e9df662403c24362726969da7ca1f88c480a85254`；Beta artifact12708966079 SHA-256 `8cd779a34198b67f4a60d3664c176e86d3c1d2883b5e8672dd07db32e08a09ce`。以下较早条目只保留历史范围，软件验证不是原SDK执行或真实服务/设备/资费验收；文档收尾不改变该已验源码构建输入。
 
 前bootstrap`7cc8b8f`：Build40202373634/Beta40202373625/双架构success，officialSHA ZIP各525 Jegotrip＋31通知service/模板＋12HTTP/auth＋4SIP＋7DNS/原86矩阵，410static/mock、58warnings/17节选，Release skipped，首轮全过。原getAppConfigs成功/call-id/source快照、DomainName raw与独立Client/Common context、缺CC清空、不同root/SNI/scope、source Join后实际handoff及取消/总期限/旧JSON/CAS/no-store HTTP已执行。Scope flags/源reply不是release或SDK/hosting/media ACK，Derived不替代原凭据/trust/配置，不授paid outbound。证据`verified-native-7cc8b8f.json`/`bootstrap-handoff-implementation-evidence.md`；WSL GitHub路由失败已用有界WindowsHTTPS读取恢复，未放宽SHA，不本机Rust/真实服务设备/部署/NV/IDB写。
 
