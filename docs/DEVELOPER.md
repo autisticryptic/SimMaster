@@ -288,6 +288,12 @@ Main 在创建原账号 manager 后显式安装 Voice/Messaging provider。Regis
 
 `GET A` 在该 manager 持有 run 时可观察 `cleanup_on_disconnect`；自动清理后保留原 disconnected/expired 等原因和独立 `cleanup_error`。`io_cleanup_required` 表示本地原资源/fence 义务，`cleanup_error` 可能含局部已释放后的不确定远端/Trunk结果，两者不能互代。人工 stop 可重等/清除该原运行状态；最终租约释放后 `A/calls` 是运行期接口，不能再当作活跃旧call查询（`app_account_runtime_owner_unconfirmed`），已结束通话/短信历史仍在既有数据库/历史 API，下一次显式 start 才创建新 owner。
 
+#### 退出进程运行回收（`1401be0f0add6f1bf89d17152a43c227b406f90f`（实现04c585d）已验证）
+
+进程启动时（任何账号start与通知worker之前）对`data.db.app-voice-owner.lock`取非阻塞独占flock；之后注册的运行租约标记本进程实例。成功取得锁即证明此前打标记的进程都已退出（它们存活时都持有同一把锁），于是释放其遗留租约：未结束的应用来电写结束时间并发`call.ended`(recovered)事件，`sending`通知改为uncertain并清正文，按原规则回收已分类envelope，短信历史与未知raw保留，并发`app_voice.runtime_recovered`事件。不按PID/运行时长推断；锁被另一存活进程持有时不做任何回收；无标记的旧版本租约仍是`runtime_owner_unconfirmed`；恢复不启动任何会话。
+
+Build40525320619/Beta40525320712、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各752 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，446static/mock，67warnings保留，Release skipped。首轮04c585d的Build有一项旧DIRECT测试在GC失败后人工stop收到原生如实的`app_account_disconnected`（同提交Beta及此前三轮均通过）；按既有"同owner再等一次"约定只修夹具（batch同类夹具同步），失败官方ZIP保留，生产代码未改。
+
 #### 可选有界自动重连（`e5ef46dab3254016ab1ec2ba2aba316f4d407b1e`已验证）
 
 可选`config.reconnect`（须同时`cleanup_on_disconnect=true`；`max_attempts`1..16、`initial_delay_ms`1000..600000、`max_delay_ms`≤3600000，指数退避）：只有本manager原run完成实际Join与fence释放后，才对同一已存revision做一次全新start（新nonce/owner/登录/托管），不是token续期或会话恢复。仅disconnected/backend_unavailable/operation_timeout可重试；鉴权/托管拒绝、过期、revision/owner/存储错误不重试。自身HostingAck后重置计数；人工stop/start、replace/delete、关机取消或取代待执行重启；未启用supervisor时报`unsupervised`。`GET A`在策略存在时给出`reconnect_attempt`/`reconnect_state`/`reconnect_error`。跨新run的重投与原生一样是至少一次，不承诺exactly-once。

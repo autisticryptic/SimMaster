@@ -10,7 +10,12 @@
 4. IDA 仅只读使用用户已打开的原 `libmtc.so`，调用前核对 metadata；不自行启动/加载、修改或保存 IDB。新 JADX/其他工具须先说明版本/用途，由用户手动安装。
 5. 保持原 UI 布局；本轮是后端，不做登录/绑定 UI。公共文档只更新原五手册。报告、APK/固件、JSONL、`.local`、私有交接和凭据不提交。
 
-## 当前：可选有界自动重连已验证
+## 当前：OS锁证明的退出进程运行回收已验证
+
+- **最新源码 `1401be0f0add6f1bf89d17152a43c227b406f90f`（实现04c585d） 已推送并核验**：进程启动时（任何账号start与通知worker之前）对`data.db.app-voice-owner.lock`取非阻塞独占flock；之后注册的运行租约标记本进程实例。成功取得锁即证明此前打标记的进程都已退出（它们存活时都持有同一把锁），于是释放其遗留租约：未结束的应用来电写结束时间并发`call.ended`(recovered)事件，`sending`通知改为uncertain并清正文，按原规则回收已分类envelope，短信历史与未知raw保留，并发`app_voice.runtime_recovered`事件。不按PID/运行时长推断；锁被另一存活进程持有时不做任何回收；无标记的旧版本租约仍是`runtime_owner_unconfirmed`；恢复不启动任何会话。
+- Build40525320619/Beta40525320712、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各752 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，446static/mock，67warnings保留，Release skipped；3项新native恢复测试与原回归实际通过。首轮04c585d的Build有一项旧DIRECT测试在GC失败后人工stop收到原生如实的`app_account_disconnected`（同提交Beta及此前三轮均通过）；按既有"同owner再等一次"约定只修夹具（batch同类夹具同步），失败官方ZIP保留，生产代码未改。
+
+## 前检查点：可选有界自动重连已验证
 
 - **最新源码 `e5ef46dab3254016ab1ec2ba2aba316f4d407b1e` 已推送并核验**：可选`config.reconnect`（须同时`cleanup_on_disconnect=true`；`max_attempts`1..16、`initial_delay_ms`1000..600000、`max_delay_ms`≤3600000，指数退避）：只有本manager原run完成实际Join与fence释放后，才对同一已存revision做一次全新start（新nonce/owner/登录/托管），不是token续期或会话恢复。仅disconnected/backend_unavailable/operation_timeout可重试；鉴权/托管拒绝、过期、revision/owner/存储错误不重试。自身HostingAck后重置计数；人工stop/start、replace/delete、关机取消或取代待执行重启；未启用supervisor时报`unsupervised`。`GET A`在策略存在时给出`reconnect_attempt`/`reconnect_state`/`reconnect_error`。跨新run的重投与原生一样是至少一次，不承诺exactly-once。
 - Build40517095074/Beta40517094859、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各749 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，445static/mock，67warnings保留，Release skipped；新增4项真实native（断线后单次全新run、鉴权拒绝不重试、失败次数耗尽、延迟期间stop取消/无supervisor）与1项配置回归实际通过。凭据续期仍为手工重新导入。
@@ -60,7 +65,7 @@
 - 媒体限原 raw `RseEx.SDP`、RTP/AVP sendrecv、RTCP-mux、匹配编码 RTP passthrough。须 `allow_plain_media=true` 和明确本地 bind IP；信令 TLS 不降级。压缩 SDP、SRTP、ICE/BUNDLE/P2P、转码及所有原生选路模式不假装支持。
 - `Client.Host/ArcPort` 可能是逻辑 Router 地址/端口，不是 OS UDP/RTP 目的地。原 raw SDP 分支存在，**不证明服务当前选择了这个分支**。
 - 可选断线清理20秒有界，与人工stop/关机同原run串行。history失败保lease、consumer/actor/媒体/Trunk原Join后才finalize；自动清理后GET账号保留终端原因与cleanup_error。运行期calls接口不从已release租约重获owner，已结束数据库历史保留。Trunk FIFO只确认本地driver处理/发送，不是远端ACK；发送不确定不能冒称成功。
-- 单连接/账号/队列仍有显式限额。DIRECT双180秒窗口/4096 burst与128 pending及原字节预算，batch32epoch/45秒未ACK与2048/account稀疏身份均有界；及时完成/ACK的已分类收件不再因终身累计128/512停止。低未完成gap、未知raw或过量burst仍可失败关闭；正常原run Join后回收已投影副本，保留SMS，不承诺无限磁盘、token续期或跨run exactly-once；自动重连只按可选策略全新start。未知prior-process owner不凭PID/年龄清除。
+- 单连接/账号/队列仍有显式限额。DIRECT双180秒窗口/4096 burst与128 pending及原字节预算，batch32epoch/45秒未ACK与2048/account稀疏身份均有界；及时完成/ACK的已分类收件不再因终身累计128/512停止。低未完成gap、未知raw或过量burst仍可失败关闭；正常原run Join后回收已投影副本，保留SMS，不承诺无限磁盘、token续期或跨run exactly-once；自动重连只按可选策略全新start。未知prior-process owner不凭PID/年龄清除；只有持OS锁的新进程可回收打过本机制标记的退出进程运行。
 - 默认 locator/全部 Router-NetStream、自动续期、remote principal/device 全局租约及其他媒体组合是后续扩展；用户本轮没有要求实现付费外发。通知不能承诺远端 exactly-once，已发字节不可召回，删除不是 SQLite/WAL/备份物理擦除。
 - 真实账号/服务/媒体部署、网络条件、双向音频、通知目的地、有效期/并发和账单仍无验收证据；以后须明确授权及自有有效参数。当前不要求用户贴出秘密或安装新工具。
 
@@ -71,7 +76,7 @@
 ## 本轮软件交付与后续验收
 
 1. 基础接电话/应答/挂机/双向音频/Trunk、durable短信/查询删除/通知原ACK，以及新取消/批次缺口已有新SHA两Actions整链证据；不是仅codec或单个信令阶段。
-2. 公共收尾只更新原五手册，构建输入保持与已验 `e5ef46d` 相同；文档不代表另一个二进制。后续改源码仍须新SHA执行/产物核验，原失败证据不能删去。
+2. 公共收尾只更新原五手册，构建输入保持与已验 `1401be0` 相同；文档不代表另一个二进制。后续改源码仍须新SHA执行/产物核验，原失败证据不能删去。
 3. DIRECT/batch长期接收已分别取得原protocol与durable回收证明，不能互用ACK或清除pending/unknown。可选重连已由e5ef46d实现；凭据/token续期、其他native/media模式与真实部署/账户/账单仍需独立证据和授权；不把这些增量称为续期或整个实网目标已经完成，不复用失效Goal工具ID或旧设备授权。
 
 ## IMS 注册主线：历史软件基线保持

@@ -6,7 +6,8 @@
 
 ## 当前基线与工作规则
 
-- **当前自动重连增量 `e5ef46d` 已核验**：Build40517095074/Beta40517094859、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各749 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，445static/mock，67warnings保留，Release skipped。opt-in、cleanup完成后同revision全新start、错误分类与次数有界、stop/start/replace/关机取消；不是凭据续期或会话恢复。
+- **当前退出进程回收增量 `1401be0` 已核验**：Build40525320619/Beta40525320712、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各752 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，446static/mock，67warnings保留，Release skipped。flock证明退出、仅回收本机制标记的租约，旧版无标记租约与存活锁持有者不动。
+- **前自动重连增量 `e5ef46d` 已核验**：Build40517095074/Beta40517094859、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各749 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，445static/mock，67warnings保留，Release skipped。opt-in、cleanup完成后同revision全新start、错误分类与次数有界、stop/start/replace/关机取消；不是凭据续期或会话恢复。
 - **前长期收件增量 `c6f0ba1` 已核验**：Build40499505183/Beta40499505215、ARM64/AMD64成功，officialdigest ZIP/CRC/逐名各744 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，444static/mock、67warnings。DIRECT原双180秒窗口及实际响应write后frontier；batch原result-bearing epoch精确ACK→FIFO私有retirement/sparse身份与before-base水位，不过pending/unACKed result。各保最近128完成envelope与全部SMS、未知/pending不清，稀疏2048/account+8192global仅按proof退休；GC失败不重发原ACK/result。新14项含同run600batch、2300ring滚动、partialACK/低gap/删除不复活和129postACK GC失败；DIRECT600及前回归保持，详见DEVELOPER。
 - **前断线托管增量 `b13223a` 已核验**：Build40458126579/Beta40458126681、ARM64/AMD64成功，officialdigest ZIP/CRC/逐名各711 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，438static/mock。全call watcher补振铃断线/过期/版本变化；可选cleanup_on_disconnect defaultfalse只清本manager退休原run、20秒有界/同owner最多重等一次，不自动start/reconnect/renew/清unknownorphan。原Trunk FIFO先处理/发Ended/CANCEL/BYE再停，history SQL失败保lease，terminal原因和cleanup_error分开。首fixture在release后查询当前call的错误已修、原失败ZIP保留；详见DEVELOPER。
 - **前无忧行基础范围：接电话/接短信，外呼/发短信只留接口。** `d0a2b67` 已推送并核验：Build40445960947/Beta40445960949、ARM64/AMD64成功，官方digest ZIP各699 Jegotrip＋7registry＋16HTTP＋42Trunk＋31通知＋4SIP＋7DNS/86矩阵逐名/source-run匹配，435static/mock通过，Release skipped。多任务Join取消重试、batch回执queued与Inform准入、应答/挂机入队前取消三项缺口已由新6项及双Join回归验证；不以旧4375a53成绩替代。
@@ -77,7 +78,7 @@
 
 **当前长期接收已分别验证**：c6f0ba1两Actions/双架构及officialdigest744/17HTTP/46Trunk等清单通过；cb33653的DIRECT730项也有独立证据。直接窗口、真实response write后frontier、batch精确result-epoch ACK与durable sparse/before-base证明解决及时完成的已分类收件终身128/512限制；不驱逐unknown/pending，不靠新nonce/重连掩盖容量，低gap/burst/未ACK与磁盘仍有限。原watch/cleanup/FIFO能力保留。后续工作保持：
 
-1. 自动重连已由e5ef46d以opt-in有界全新start实现；凭据/token续期仍需原服务刷新证据，当前保持手工重新导入。remote lease、crash owner接管与跨run exactly-once仍不提供。
+1. 自动重连已由e5ef46d以opt-in有界全新start实现；凭据/token续期仍需原服务刷新证据，当前保持手工重新导入。带标记的退出进程运行已由1401be0在OS锁证明下回收；remote lease、无标记旧版owner接管与跨run exactly-once仍不提供。
 2. 默认locator/全部native或其他SDP/媒体模式仍须根据原目标及实际参数证据补实现，不放松TLS/归属或复制报告常量。已实现basic入站与这些扩展分别验收。
 3. 真实账号参数/服务/Trunk/通知/账单验收需新明确授权；当前没有设备/服务/部署执行。源码改变继续新SHA Actions/official artifact验证，docs-only收尾编译输入同c6f0ba1。
 
