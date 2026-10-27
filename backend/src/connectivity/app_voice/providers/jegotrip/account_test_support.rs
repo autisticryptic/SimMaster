@@ -79,7 +79,7 @@ impl TempDatabase {
 impl Drop for TempDatabase {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
-        for suffix in ["-journal", "-wal", "-shm"] {
+        for suffix in ["-journal", "-wal", "-shm", ".lock"] {
             let mut path = self.path.as_os_str().to_os_string(); path.push(suffix);
             let _ = std::fs::remove_file(PathBuf::from(path));
         }

@@ -243,7 +243,8 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('CREATE TABLE IF NOT EXISTS app_voice_runtime_leases', runs)
         self.assertIn('line_id TEXT PRIMARY KEY NOT NULL', runs)
         self.assertIn('exclusive_runtime: bool', runs)
-        self.assertIn('register_inner(conn,line,revision,nonce,true)', runs)
+        self.assertIn('register_inner(conn,line,revision,nonce,true,None)', runs)
+        self.assertIn('register_inner(conn,line,revision,nonce,true,holder)', runs)
         self.assertIn('ownership_pending(&tx,line)?', runs)
         self.assertIn('revision=?2 AND run_nonce=?3', runs)
         self.assertNotIn('lease_until', runs)
@@ -256,10 +257,10 @@ class AppAccountContractTests(unittest.TestCase):
         runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
         self.assertIn('app_account_runtime_owner_unconfirmed', runtime)
         self.assertIn('account_runs::runtime_matches(conn,&self.run_token)', runtime)
-        self.assertIn('account_runs::register_runtime(conn,line_id,metadata.revision,&inbox_nonce)', runtime)
+        self.assertIn('account_runs::register_runtime_held(conn,line_id,metadata.revision,&inbox_nonce,holder.as_deref())', runtime)
         start = runtime.split('pub async fn start(', 1)[1].split('pub async fn stop(', 1)[0]
         self.assertLess(start.index('self.require_released(line_id,&slot)'), start.index('self.factory.build(&config)'))
-        self.assertLess(start.index('account_runs::register_runtime('), start.index('controller.start(now)'))
+        self.assertLess(start.index('account_runs::register_runtime_held('), start.index('controller.start(now)'))
         tests = (PROVIDER / 'account_runtime_tests.rs').read_text(encoding='utf-8')
         self.assertIn('second_manager_cannot_start_stop_or_mutate_original_account', tests)
         self.assertIn('foreign_manager_stop_never_closes_hosted_original_actor', tests)
@@ -276,7 +277,9 @@ class AppAccountContractTests(unittest.TestCase):
         self.assertIn('held.as_ref().is_some_and', release)
         self.assertIn('token.exclusive_runtime', release)
         self.assertIn('if removed!=1{return Err(SCOPE);}', release)
-        self.assertLess(release.index('DELETE FROM app_voice_runtime_leases'), release.rindex('tx.commit()'))
+        compact = release.split('fn release_in', 1)[0]
+        self.assertLess(compact.index('release_in(&tx,proof.token())'), compact.index('tx.commit()'))
+        self.assertIn('DELETE FROM app_voice_runtime_leases', release.split('fn release_in', 1)[1])
         tests = (PROVIDER / 'account_runs_tests.rs').read_text(encoding='utf-8')
         self.assertIn('failed_runtime_release_rolls_back_original_fence', tests)
         self.assertIn('stale_joined_proof_cannot_release_a_new_run', tests)
@@ -666,6 +669,34 @@ class AppAccountContractTests(unittest.TestCase):
                      'failed_fresh_starts_are_bounded_then_exhausted', 'stop_during_scheduled_delay_cancels_supervised_start']:
             self.assertIn(name, tests)
         self.assertIn('assert_ne!(fresh.inbox_nonce, original_nonce', tests)
+
+    def test_orphan_recovery_is_os_lock_proven_and_never_pid_age_or_legacy_inference(self):
+        runtime = (PROVIDER / 'account_runtime.rs').read_text(encoding='utf-8')
+        claim = runtime.split('fn claim_process_ownership', 1)[1].split('fn metadata(', 1)[0]
+        self.assertIn('libc::LOCK_EX | libc::LOCK_NB', claim)
+        self.assertIn('O_NOFOLLOW', claim)
+        self.assertIn('app_account_claim_after_start', claim)
+        self.assertLess(claim.index('libc::flock'), claim.index('orphaned_leases'))
+        self.assertIn('Transaction::new_unchecked', claim)
+        for forbidden in ['pid', 'getpid', 'kill(', 'elapsed', 'created_at']:
+            self.assertNotIn(forbidden, claim)
+        runs = (PROVIDER / 'account_runs.rs').read_text(encoding='utf-8')
+        orphans = runs.split('fn orphaned_leases', 1)[1].split('fn release_orphan', 1)[0]
+        self.assertIn('holder IS NOT NULL AND holder!=?1', orphans)
+        release = runs.split('fn release_orphan', 1)[1]
+        self.assertIn('AND holder=?4', release)
+        self.assertIn('release_in(tx,&token)', release)
+        self.assertIn('"recovered":true', release)
+        self.assertIn('app_voice.runtime_recovered', release)
+        notify = (PROVIDER / 'account_notifications.rs').read_text(encoding='utf-8')
+        sending = notify.split('fn recover_orphaned_sending', 1)[1].split('pub(super) fn cancel_account', 1)[0]
+        self.assertIn("SET state='uncertain'", sending)
+        self.assertNotIn("state='pending'", sending)
+        main = source('backend/src/main.rs')
+        self.assertLess(main.index('claim_process_ownership'), main.index('NotificationWorker::spawn'))
+        tests = (PROVIDER / 'account_recovery_tests.rs').read_text(encoding='utf-8')
+        for name in ['exited_lock_holder_run_is_released', 'live_lock_owner_blocks_second_claim', 'claim_after_a_local_start_is_refused']:
+            self.assertIn(name, tests)
 
 if __name__ == '__main__':
     unittest.main()

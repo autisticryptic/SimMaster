@@ -29,7 +29,14 @@ pub fn initialize_schema(conn:&Connection)->Result<(), &'static str> {
         PRIMARY KEY(line_id,revision,run_nonce));
         CREATE TABLE IF NOT EXISTS app_voice_runtime_leases(
         line_id TEXT PRIMARY KEY NOT NULL,revision INTEGER NOT NULL CHECK(revision>0),
-        run_nonce TEXT NOT NULL CHECK(length(run_nonce)=32));").map_err(|_|STORAGE)
+        run_nonce TEXT NOT NULL CHECK(length(run_nonce)=32));").map_err(|_|STORAGE)?;
+    // Process-instance tag for OS-lock-proven orphan recovery. NULL = legacy
+    // holder from a binary without the claim; never recovered automatically.
+    let mut query=conn.prepare("PRAGMA table_info(app_voice_runtime_leases)").map_err(|_|STORAGE)?;
+    let columns=query.query_map([],|row|row.get::<_,String>(1)).map_err(|_|STORAGE)?.collect::<Result<Vec<_>,_>>().map_err(|_|STORAGE)?;
+    drop(query);
+    if !columns.iter().any(|column|column=="holder"){conn.execute("ALTER TABLE app_voice_runtime_leases ADD COLUMN holder TEXT",[]).map_err(|_|STORAGE)?;}
+    Ok(())
 }
 fn valid_nonce(value:&str)->bool {
     value.len()==32 && value.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))
@@ -53,12 +60,17 @@ pub(super) fn runtime_matches(conn:&Connection,token:&RunToken)->Result<bool,&'s
 /// Fence-only fixture registration does not grant production runtime ownership.
 #[cfg(test)]
 pub(super) fn register(conn:&Connection,line:&str,revision:u64,nonce:&str)->Result<RunToken,&'static str> {
-    register_inner(conn,line,revision,nonce,false)
+    register_inner(conn,line,revision,nonce,false,None)
 }
 pub(super) fn register_runtime(conn:&Connection,line:&str,revision:u64,nonce:&str)->Result<RunToken,&'static str> {
-    register_inner(conn,line,revision,nonce,true)
+    register_inner(conn,line,revision,nonce,true,None)
 }
-fn register_inner(conn:&Connection,line:&str,revision:u64,nonce:&str,exclusive_runtime:bool)->Result<RunToken,&'static str> {
+/// Same exclusive registration, tagged with the OS-locked process instance.
+pub(super) fn register_runtime_held(conn:&Connection,line:&str,revision:u64,nonce:&str,holder:Option<&str>)->Result<RunToken,&'static str> {
+    if holder.is_some_and(|holder|!valid_nonce(holder)){return Err(SCOPE);}
+    register_inner(conn,line,revision,nonce,true,holder)
+}
+fn register_inner(conn:&Connection,line:&str,revision:u64,nonce:&str,exclusive_runtime:bool,holder:Option<&str>)->Result<RunToken,&'static str> {
     if !account_store::valid_line_id(line)||revision==0||revision>i64::MAX as u64||!valid_nonce(nonce){return Err(SCOPE);}
     let tx=Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
     let original=account_store::metadata(&tx,line)?.ok_or(SCOPE)?;
@@ -72,7 +84,7 @@ fn register_inner(conn:&Connection,line:&str,revision:u64,nonce:&str,exclusive_r
     if exists{return Err(SCOPE);}
     tx.execute("INSERT INTO app_voice_inbox_runs(line_id,revision,run_nonce,state) VALUES(?1,?2,?3,'live')",params![line,revision as i64,nonce]).map_err(|_|STORAGE)?;
     if exclusive_runtime {
-        tx.execute("INSERT INTO app_voice_runtime_leases(line_id,revision,run_nonce) VALUES(?1,?2,?3)",params![line,revision as i64,nonce]).map_err(|_|STORAGE)?;
+        tx.execute("INSERT INTO app_voice_runtime_leases(line_id,revision,run_nonce,holder) VALUES(?1,?2,?3,?4)",params![line,revision as i64,nonce,holder]).map_err(|_|STORAGE)?;
     }
     tx.commit().map_err(|_|STORAGE)?;
     Ok(RunToken{line:line.to_owned(),revision,nonce:nonce.to_owned(),exclusive_runtime})
@@ -88,8 +100,10 @@ pub(super) fn require_live(conn:&Connection,line:&str,revision:u64,nonce:&str)->
 /// The durable fence is committed WITH compaction: a late writer either
 /// committed first, or sees no live run. It cannot resurrect reclaimed rows.
 pub(super) fn release_and_compact(conn:&Connection,proof:&RunQuiescence)->Result<usize,&'static str> {
-    let token=proof.token();
     let tx=Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
+    let count=release_in(&tx,proof.token())?;tx.commit().map_err(|_|STORAGE)?;Ok(count)
+}
+fn release_in(tx:&Transaction<'_>,token:&RunToken)->Result<usize,&'static str> {
     let state:Option<String>=tx.query_row("SELECT state FROM app_voice_inbox_runs WHERE line_id=?1 AND revision=?2 AND run_nonce=?3",
         params![token.line,token.revision as i64,token.nonce],|row|row.get(0)).optional().map_err(|_|STORAGE)?;
     let leased=if token.exclusive_runtime {
@@ -106,7 +120,7 @@ pub(super) fn release_and_compact(conn:&Connection,proof:&RunQuiescence)->Result
     super::batch_retention::delete_run(&tx,&token.line,token.revision,&token.nonce)?;
     tx.execute("DELETE FROM app_voice_direct_replay_fences WHERE line_id=?1 AND revision=?2 AND run_nonce=?3",
         params![token.line,token.revision as i64,token.nonce]).map_err(|_|STORAGE)?;
-    if state.is_none() {tx.commit().map_err(|_|STORAGE)?;return Ok(0);}
+    if state.is_none() {return Ok(0);}
     if !matches!(state.as_deref(),Some("live"|"released")){return Err(SCOPE);}
     tx.execute("UPDATE app_voice_inbox_runs SET state='released' WHERE line_id=?1 AND revision=?2 AND run_nonce=?3",
         params![token.line,token.revision as i64,token.nonce]).map_err(|_|STORAGE)?;
@@ -130,7 +144,44 @@ pub(super) fn release_and_compact(conn:&Connection,proof:&RunQuiescence)->Result
             params![token.line,token.revision as i64,token.nonce]).map_err(|_|STORAGE)?;
         if removed!=1{return Err(SCOPE);}
     }
-    tx.commit().map_err(|_|STORAGE)?;Ok(count)
+    Ok(count)
+}
+
+/// Leases tagged by ANOTHER process instance. Only meaningful to a caller that
+/// holds the exclusive OS lock over this database, which every tagging process
+/// held while it lived: the lock itself is the proof that holder has exited.
+pub(super) fn orphaned_leases(conn:&Connection,me:&str)->Result<Vec<(String,u64,String,String)>,&'static str> {
+    let mut query=conn.prepare("SELECT line_id,revision,run_nonce,holder FROM app_voice_runtime_leases WHERE holder IS NOT NULL AND holder!=?1 ORDER BY line_id")
+        .map_err(|_|STORAGE)?;
+    let rows=query.query_map([me],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)? as u64,row.get::<_,String>(2)?,row.get::<_,String>(3)?)))
+        .map_err(|_|STORAGE)?.collect::<Result<Vec<_>,_>>().map_err(|_|STORAGE)?;
+    Ok(rows)
+}
+/// Release one dead-process run: finish its still-open app calls (duration
+/// unknown -> 0, recovered flag) and apply the ordinary release/compaction.
+/// Unknown raw rows, SMS history and notification audit are retained.
+pub(super) fn release_orphan(tx:&Transaction<'_>,lease:&(String,u64,String,String),now:&str)
+    ->Result<Vec<crate::platform::db::AppEventEntry>,&'static str> {
+    let (line,revision,nonce,holder)=lease;
+    let still:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_runtime_leases WHERE line_id=?1 AND revision=?2 AND run_nonce=?3 AND holder=?4)",
+        params![line,*revision as i64,nonce,holder],|row|row.get(0)).map_err(|_|STORAGE)?;
+    if !still{return Ok(Vec::new());}
+    let mut events=Vec::new();
+    let open={
+        let mut query=tx.prepare("SELECT id,answered FROM call_history WHERE line_id=?1 AND app_call_token IS NOT NULL AND end_time IS NULL").map_err(|_|STORAGE)?;
+        let rows=query.query_map([line],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?))).map_err(|_|STORAGE)?
+            .collect::<Result<Vec<_>,_>>().map_err(|_|STORAGE)?;rows
+    };
+    for (id,answered) in open {
+        tx.execute("UPDATE call_history SET end_time=?2 WHERE id=?1 AND end_time IS NULL",params![id,now]).map_err(|_|STORAGE)?;
+        let payload=serde_json::json!({"call_id":id,"duration":serde_json::Value::Null,"answered":answered!=0,"transport":"app_voice","recovered":true}).to_string();
+        events.push(crate::platform::db::insert_app_event_for_conn(tx,"call.ended",Some(line.as_str()),Some("app_voice"),&payload,now).map_err(|_|STORAGE)?);
+    }
+    let token=RunToken{line:line.clone(),revision:*revision,nonce:nonce.clone(),exclusive_runtime:true};
+    release_in(tx,&token)?;
+    let payload=serde_json::json!({"recovered_run":true,"reason":"previous_process_exited"}).to_string();
+    events.push(crate::platform::db::insert_app_event_for_conn(tx,"app_voice.runtime_recovered",Some(line.as_str()),Some("app_voice"),&payload,now).map_err(|_|STORAGE)?);
+    Ok(events)
 }
 
 /// Explicit account deletion owns its history-removal decision. Do not erase

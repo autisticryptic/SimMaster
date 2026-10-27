@@ -1180,6 +1180,16 @@ async fn main() -> Result<()> {
         connectivity::app_voice::providers::jegotrip::message_provider::MessagingProvider::for_accounts(&app_state.app_accounts),
     )).map_err(anyhow::Error::msg)?;
 
+    // Before any account start or notification worker: an exclusive flock beside
+    // data.db proves earlier tagged holders exited, so their leases are released
+    // (open app calls ended, sending notices uncertain). A held lock means another
+    // live SimAdmin owns the database; nothing is recovered or taken over.
+    let mut app_owner_lock = get_data_db_path().into_os_string(); app_owner_lock.push(".app-voice-owner.lock");
+    match app_state.app_accounts.claim_process_ownership(std::path::Path::new(&app_owner_lock)) {
+        Ok(report) => info!(recovered = report.recovered_runs, uncertain = report.uncertain_notifications,
+            legacy = report.legacy_unconfirmed_leases, "Application account process ownership claimed"),
+        Err(code) => warn!(code, "Application account orphan recovery unavailable"),
+    }
     // Kept out of the router's state so session teardown can still run after
     // `serve` returns and the state itself has been consumed.
     let shutdown_registry = Arc::clone(&app_state.line_registry);

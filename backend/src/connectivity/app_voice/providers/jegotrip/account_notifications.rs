@@ -217,6 +217,18 @@ pub(super) fn metadata(conn:&Connection,line:&str,limit:usize)->Result<Vec<Notic
     }Ok(statuses)
 }
 
+/// Called ONCE by the OS-lock owner before this process starts any notification
+/// worker. A 'sending' claim then belongs to an exited process: its remote
+/// outcome is unknown, so it becomes uncertain (never replayed as pending).
+pub(super) fn recover_orphaned_sending(conn:&Connection)->Result<usize,&'static str>{
+    let mut query=conn.prepare("SELECT DISTINCT sms_id,line_id FROM app_voice_notification_jobs WHERE state='sending'").map_err(|_|STORAGE)?;
+    let rows=query.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|_|STORAGE)?.collect::<Result<Vec<_>,_>>().map_err(|_|STORAGE)?;
+    drop(query);
+    let changed=conn.execute("UPDATE app_voice_notification_jobs SET state='uncertain',claim=NULL,title='',body='' WHERE state='sending'",[]).map_err(|_|STORAGE)?;
+    for (sms,line) in rows{aggregate_sms(conn,sms,&line)?;}
+    prune_terminal(conn)?;Ok(changed)
+}
+
 pub(super) fn cancel_account(conn:&Connection,line:&str)->Result<(),&'static str>{
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_voice_notification_jobs')",[],|r|r.get(0)).map_err(|_|STORAGE)?;
     if exists{

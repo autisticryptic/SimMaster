@@ -246,7 +246,13 @@ pub struct AccountManager {
     /// Set only when an owning Arc explicitly enables supervision. Without it
     /// an opted-in policy is reported as unsupervised, never silently ignored.
     supervisor: Mutex<std::sync::Weak<AccountManager>>,
+    /// Exclusive OS lock over this database for the process lifetime. Only its
+    /// holder tags leases and may recover leases tagged by exited instances.
+    claim: Mutex<Option<ProcessClaim>>,
 }
+struct ProcessClaim { _lock: std::fs::File, instance: String }
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct RecoveryReport { pub recovered_runs: usize, pub uncertain_notifications: usize, pub legacy_unconfirmed_leases: usize }
 impl fmt::Debug for AccountManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("AccountManager(<redacted>)") }
 }
@@ -261,11 +267,41 @@ impl AccountManager {
     }
     pub(crate) fn with_factory(database: Arc<Database>, factory: Arc<dyn AccountBackendFactory>) -> Self {
         Self { database, factory, notifications: None, shutting_down:AtomicBool::new(false), shutdown_changed:tokio::sync::Notify::new(), slots: Mutex::new(BTreeMap::new()),
-            supervisor: Mutex::new(std::sync::Weak::new()) }
+            supervisor: Mutex::new(std::sync::Weak::new()), claim: Mutex::new(None) }
     }
     /// The process owner enables the bounded reconnect supervisor after wrapping
     /// the manager. No account is started by this call.
     pub(crate) fn enable_reconnect_supervisor(self: &Arc<Self>) { *lock(&self.supervisor) = Arc::downgrade(self); }
+    /// Take the non-blocking exclusive flock beside data.db, then recover runs
+    /// tagged by exited instances. Every tagging process held this same lock
+    /// while alive, so acquiring it proves those holders exited; no PID/age
+    /// inference. Untagged (legacy) leases stay `runtime_owner_unconfirmed`.
+    /// Must run before this process starts accounts or the notification worker.
+    pub(crate) fn claim_process_ownership(&self, lock_path: &std::path::Path) -> Result<RecoveryReport, &'static str> {
+        use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
+        if lock(&self.claim).is_some() { return Err("app_account_process_claim_present"); }
+        if lock(&self.slots).values().any(|slot| lock(&slot.run).is_some()) { return Err("app_account_claim_after_start"); }
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(lock_path).map_err(|_| "app_account_process_lock_failed")?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err("app_account_process_lock_owned");
+        }
+        let instance = local_nonce()?;
+        let (report, events) = self.database.with_conn(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).map_err(|_| "app_account_run_storage_failed")?;
+            let now = chrono::Utc::now().to_rfc3339(); let mut events = Vec::new();
+            let leases = account_runs::orphaned_leases(&tx, &instance)?;
+            for lease in &leases { events.extend(account_runs::release_orphan(&tx, lease, &now)?); }
+            let legacy: i64 = tx.query_row("SELECT COUNT(*) FROM app_voice_runtime_leases WHERE holder IS NULL", [], |row| row.get(0))
+                .map_err(|_| "app_account_run_storage_failed")?;
+            let uncertain = super::account_notifications::recover_orphaned_sending(&tx)?;
+            tx.commit().map_err(|_| "app_account_run_storage_failed")?;
+            Ok((RecoveryReport { recovered_runs: leases.len(), uncertain_notifications: uncertain, legacy_unconfirmed_leases: legacy as usize }, events))
+        })?;
+        for event in events { self.database.publish_committed_app_event(event); }
+        *lock(&self.claim) = Some(ProcessClaim { _lock: file, instance });
+        Ok(report)
+    }
     fn metadata(&self, line_id: &str) -> Result<AccountMetadata, &'static str> {
         if !account_store::valid_line_id(line_id) { return Err("app_account_line_invalid"); }
         self.database.with_conn(|conn| account_store::metadata(conn, line_id))?.ok_or("app_account_not_found")
@@ -517,7 +553,8 @@ impl AccountManager {
         let (backend, events) = self.factory.build(&config)?;
         let mut controller = HostingController::new(line_id.to_owned(), Some(backend.clone()));
         controller.import(config.credentials, now).map_err(controller_error)?;
-        let run_token=Arc::new(self.database.with_conn(|conn|account_runs::register_runtime(conn,line_id,metadata.revision,&inbox_nonce))?);
+        let holder = lock(&self.claim).as_ref().map(|claim| claim.instance.clone());
+        let run_token=Arc::new(self.database.with_conn(|conn|account_runs::register_runtime_held(conn,line_id,metadata.revision,&inbox_nonce,holder.as_deref()))?);
         let calls = call_settings.map(|settings| CallService::new(self.database.clone(),run_token.clone(),backend.clone(),settings,credential_expiry));
         let run = Arc::new(ManagedRun { line_id: line_id.to_owned(), database: self.database.clone(), revision: metadata.revision,
             inbox_nonce, run_token, finalized: AtomicBool::new(false), notifications:self.notifications.clone(),
