@@ -95,7 +95,9 @@ async fn ringing_disconnect_sends_original_asterisk_cancel_before_opt_in_trunk_s
     let to = sip_frame::header_value(&invite, "To").unwrap(); let cseq = sip_frame::header_value(&invite, "CSeq").unwrap();
     let ringing = format!("SIP/2.0 180 Ringing\r\nVia: {via}\r\nFrom: {from}\r\nTo: {to};tag=fixture-pbx\r\nCall-ID: {call_id}\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n");
     asterisk.send_to(ringing.as_bytes(), source).await.unwrap();
-    let view = first_call(&manager, &account.line_id).await; lose.send(()).unwrap();
+    let view = first_call(&manager, &account.line_id).await;
+    let original_call = service.find(&view.id).unwrap();
+    lose.send(()).unwrap();
     let (cancel, cancel_source) = sip_frame_from(&asterisk).await;
     assert!(cancel.starts_with(b"CANCEL sip:")); assert_eq!(cancel_source, source);
     assert_eq!(sip_frame::header_value(&cancel, "Call-ID").unwrap(), call_id);
@@ -108,7 +110,11 @@ async fn ringing_disconnect_sends_original_asterisk_cancel_before_opt_in_trunk_s
     bounded(sdk_task).await.unwrap(); assert!(dropped.load(Ordering::SeqCst)); assert!(service.resources_released());
     assert!(!link.has_trunk_consumer()); assert!(link.trunk_local_ip().is_none());
     let row = temp.database.get_call_by_id(view.history_id).unwrap().unwrap(); assert!(!row.answered && row.end_time.is_some());
-    assert!(manager.call(&account.line_id, &view.id).await.unwrap().phase == "ended");
+    assert!(lock(&original_call.state).phase == Phase::Ended);
+    assert!(!original_call.ticket.is_live());
+    // Finalization releases the runtime lease. Historical SQLite state remains,
+    // but the old manager may not expose it as a currently-owned live call.
+    assert_eq!(manager.call(&account.line_id, &view.id).await.err(), Some("app_account_runtime_owner_unconfirmed"));
     assert!(!temp.database.with_conn(|conn| account_runs::ownership_pending(conn, &account.line_id)).unwrap());
     let reused = UdpSocket::bind(source).await.unwrap(); assert_eq!(reused.local_addr().unwrap(), source);
     let audio = UdpSocket::bind(offered).await.unwrap(); assert_eq!(audio.local_addr().unwrap(), offered);
