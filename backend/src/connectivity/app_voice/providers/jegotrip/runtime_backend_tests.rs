@@ -609,7 +609,12 @@ async fn durable_inbox_rejects_foreign_tickets_and_retired_admission_keeps_origi
     let unbound = InboxScope::original(&line, 1, &local_nonce().unwrap(), &original, &scope).unwrap();
     assert_eq!(unbound.commit_direct(&database, &message).err(), Some("app_account_inbox_message_invalid"));
     assert!(database.get_recent_app_events(Some(&line), 10).unwrap().is_empty());
-    let context = super::super::account_test_support::registered_inbox_scope(&database,&line,1,&original,&scope)
+    // This is an actual original actor-write receipt, not a fence-only SQL
+    // fixture. Match the account runtime's exclusive lease before attempting
+    // to persist its replay frontier; a bare live inbox run grants no lease.
+    let nonce = local_nonce().unwrap();
+    database.with_conn(|conn| super::super::account_runs::register_runtime(conn, &line, 1, &nonce)).unwrap();
+    let context = InboxScope::original(&line, 1, &nonce, &original, &scope).unwrap()
         .with_receiver(backend.original_incoming_binding(&original, &scope).unwrap()).unwrap();
     let admission = AtomicBool::new(false);
     assert_eq!(context.accept_direct(&database, &backend, &message, &admission).await.unwrap(), Completion::Retired);
@@ -617,6 +622,15 @@ async fn durable_inbox_rejects_foreign_tickets_and_retired_admission_keeps_origi
     assert_eq!(database.get_recent_app_events(Some(&line), 10).unwrap().len(), 1);
     admission.store(true, Ordering::SeqCst); resume.send(()).unwrap();
     assert_eq!(context.accept_direct(&database, &backend, &message, &admission).await.unwrap(), Completion::Recorded);
+    let durable: (String, i32, bool) = database.with_conn(|conn| conn.query_row(
+        "SELECT i.reply_state,f.through_sequence,EXISTS(SELECT 1 FROM app_voice_runtime_leases l
+            WHERE l.line_id=i.line_id AND l.revision=i.revision AND l.run_nonce=i.run_nonce)
+         FROM app_voice_inbox i JOIN app_voice_direct_replay_fences f
+            ON f.line_id=i.line_id AND f.revision=i.revision AND f.run_nonce=i.run_nonce
+         WHERE i.line_id=?1 AND i.run_nonce=?2 AND i.sequence=17",
+        rusqlite::params![&line, &nonce], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .map_err(|_| "fixture-storage-failed")).unwrap();
+    assert_eq!(durable, ("direct_submitted".into(), 17, true));
     assert_eq!(database.get_recent_app_events(Some(&line), 10).unwrap().len(), 1);
     backend.retire(&original); backend.logout(original).await.unwrap();
     assert!(dropped.load(Ordering::SeqCst)); serving.await.unwrap();

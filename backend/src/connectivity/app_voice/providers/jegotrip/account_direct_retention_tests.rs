@@ -80,6 +80,18 @@ fn foreign_scope_or_revision_frontier_cannot_mark_or_compact_original_account_ro
     assert_eq!(count(&temp.database,"app_voice_direct_replay_fences"),0);assert_eq!(count(&temp.database,"app_voice_inbox"),1);
 }
 #[test]
+fn original_frontier_without_matching_runtime_lease_rolls_back_reply_state_and_gc() {
+    let(temp,line,mut protocol,owner,context)=original();
+    let message=wire::incoming(&mut protocol,&owner,1,b"durable original before reply");
+    let committed=context.commit_direct(&temp.database,&message).unwrap();complete(&mut protocol,&message);
+    temp.database.with_conn(|conn|conn.execute("DELETE FROM app_voice_runtime_leases WHERE line_id=?1",[&line]).map_err(|_|STORAGE)).unwrap();
+    assert!(temp.database.with_conn(|conn|account_runs::require_live(conn,&line,1,&context.nonce)).is_ok());
+    assert_eq!(committed.record_reply_with_frontier(&temp.database,"direct_submitted",protocol.direct_replay_frontier().as_ref()),Err(SCOPE));
+    let state:String=temp.database.with_conn(|conn|conn.query_row("SELECT reply_state FROM app_voice_inbox WHERE id=?1",[committed.id],|row|row.get(0)).map_err(|_|STORAGE)).unwrap();
+    assert_eq!(state,"pending");assert_eq!(count(&temp.database,"app_voice_direct_replay_fences"),0);
+    assert_eq!(count(&temp.database,"app_voice_inbox"),1);assert_eq!(count(&temp.database,"sms_messages"),1);
+}
+#[test]
 fn no_protocol_frontier_keeps_classified_envelopes_and_does_not_guess_retired_sequence() {
     let(temp,_,mut protocol,owner,context)=original();
     for id in 1..=140 {let message=wire::incoming(&mut protocol,&owner,id,b"retained without proof");let committed=context.commit_direct(&temp.database,&message).unwrap();complete(&mut protocol,&message);committed.record_reply(&temp.database,"direct_submitted").unwrap();}
