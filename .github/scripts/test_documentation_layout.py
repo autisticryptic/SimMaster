@@ -31,6 +31,9 @@ class DocumentationLayoutTests(unittest.TestCase):
             'NATIVE_BACKEND_STATUS.md', 'IMS_REGISTRATION_POLICY.md',
             'IMS_MM_EXACT_FAMILY_LEASE_DESIGN.md', 'IMS_DIAGNOSTICS.md',
             'QCM410_BAM_DMUX_MODEM_CRASH.md', 'archive/README.md',
+            # User-requested consolidated reverse-engineering result, not a
+            # dated handoff page or a private APK/credential dump.
+            'JEGOTRIP_REVERSE_ENGINEERING_SUMMARY.md',
         }
         # This private, untracked report belongs to the user and is not part of
         # the maintained public documentation set.
