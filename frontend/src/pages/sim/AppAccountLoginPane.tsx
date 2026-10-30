@@ -11,10 +11,11 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
   const [attempt, setAttempt] = useState<AppLoginAttempt | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const generation = useRef(0)
+  const generation = useRef({ active: false })
 
   useEffect(() => {
-    const scope = ++generation.current
+    const scope = { active: open }
+    generation.current = scope
     setDraft(emptyDraft())
     setAttempt(null)
     setSubmitting(false)
@@ -22,12 +23,12 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
     setSetup(null)
     if (open) {
       void api.getAppLoginSetup().then((response) => {
-        if (generation.current === scope) setSetup(response.data ?? null)
+        if (scope.active) setSetup(response.data ?? null)
       }).catch(() => {
-        if (generation.current === scope) setError('无法读取后台账号登录配置。')
+        if (scope.active) setError('无法读取后台账号登录配置。')
       })
     }
-    return () => { generation.current++ }
+    return () => { scope.active = false }
   }, [open])
 
   const attemptId = attempt && appLoginNeedsPolling(attempt) ? attempt.attempt_id : undefined
@@ -64,6 +65,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
   const submit = async () => {
     if (submitting || !setup?.accepting || !canSubmitAppLogin(draft) || (attempt && appLoginNeedsPolling(attempt))) return
     const scope = generation.current
+    if (!scope.active) return
     const bytes = new Uint8Array(16)
     if (!globalThis.crypto?.getRandomValues) { setError('浏览器不支持安全随机标识，请使用 HTTPS 和现代浏览器。'); return }
     globalThis.crypto.getRandomValues(bytes)
@@ -73,7 +75,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
     setAttempt(null)
     try {
       const response = await api.submitAppLogin(appLoginInput(id, draft))
-      if (generation.current === scope) {
+      if (scope.active) {
         if (!response.data) throw new Error('missing attempt')
         setAttempt(response.data)
       }
@@ -82,12 +84,12 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
       // Read the original client-generated ID; never resubmit automatically.
       try {
         const existing = await api.getAppLoginAttempt(id)
-        if (generation.current === scope && existing.data) setAttempt(existing.data)
+        if (scope.active && existing.data) setAttempt(existing.data)
       } catch {
-        if (generation.current === scope) setError(appLoginError(failure))
+        if (scope.active) setError(appLoginError(failure))
       }
     } finally {
-      if (generation.current === scope) {
+      if (scope.active) {
         setDraft((value) => ({ ...value, password: '', consent: false }))
         setSubmitting(false)
       }
