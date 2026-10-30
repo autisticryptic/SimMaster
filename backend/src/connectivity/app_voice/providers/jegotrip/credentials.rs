@@ -9,6 +9,9 @@ use zeroize::Zeroize;
 pub struct Secret(String);
 
 impl Secret {
+    /// Internal material obtained through the owned, authenticated App flow.
+    /// This constructor grants no SDK/session/readiness authority.
+    pub(super) fn from_owned(value: String) -> Self { Self(value) }
     pub fn expose_to_backend(&self) -> &str { &self.0 }
 }
 

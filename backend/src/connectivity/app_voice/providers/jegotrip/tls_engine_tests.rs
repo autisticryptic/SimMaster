@@ -28,11 +28,13 @@ impl Certificates {
         let der = std::fs::read(directory.join("cert.der")).unwrap(); let root = STANDARD.encode(&der);
         Self { certificate: CertificateDer::from(der), key: std::fs::read(directory.join("key.der")).unwrap(), root, directory }
     }
-    pub(crate) fn server(&self, version: &'static rustls::SupportedProtocolVersion) -> rustls::ServerConnection {
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    pub(crate) fn server_config(&self, version: &'static rustls::SupportedProtocolVersion) -> Arc<rustls::ServerConfig> {
+        Arc::new(rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_protocol_versions(&[version]).unwrap().with_no_client_auth()
-            .with_single_cert(vec![self.certificate.clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key.clone()))).unwrap();
-        rustls::ServerConnection::new(Arc::new(config)).unwrap()
+            .with_single_cert(vec![self.certificate.clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key.clone()))).unwrap())
+    }
+    pub(crate) fn server(&self, version: &'static rustls::SupportedProtocolVersion) -> rustls::ServerConnection {
+        rustls::ServerConnection::new(self.server_config(version)).unwrap()
     }
 }
 fn owner() -> AttemptOwner {

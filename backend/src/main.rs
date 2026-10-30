@@ -1190,15 +1190,24 @@ async fn main() -> Result<()> {
             legacy = report.legacy_unconfirmed_leases, "Application account process ownership claimed"),
         Err(code) => warn!(code, "Application account orphan recovery unavailable"),
     }
+    // Private installation context, not user SDK tokens. Only explicit login
+    // reads the file or contacts a service; setup/recovery creates no sessions.
+    let app_login_path = get_data_db_path().with_file_name("jegotrip-login.json");
+    if let Err(code) = app_state.app_logins.initialize(app_login_path) {
+        warn!(code, "Application account login unavailable");
+    }
     // Kept out of the router's state so session teardown can still run after
     // `serve` returns and the state itself has been consumed.
     let shutdown_registry = Arc::clone(&app_state.line_registry);
     let mut app_notification_worker=connectivity::app_voice::providers::jegotrip::account_notifications::NotificationWorker::spawn(
         app_state.database.clone(),app_state.notification_sender.clone(),app_state.shutdown.clone());
     let account_shutdown={
-        let accounts=app_state.app_accounts.clone();let mut shutdown=app_state.shutdown.clone();
+        let accounts=app_state.app_accounts.clone();let logins=app_state.app_logins.clone();let mut shutdown=app_state.shutdown.clone();
         tokio::spawn(async move {
             shutdown.wait().await;
+            // Retire provisioning first so no new receiver can start after the
+            // original account teardown. Interrupted business writes stay unknown.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(8),logins.shutdown()).await;
             tokio::time::timeout(std::time::Duration::from_secs(20),accounts.shutdown_all()).await
         })
     };

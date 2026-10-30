@@ -55,6 +55,9 @@ pub struct AppState {
     /// Independent non-SIM application accounts. Construction never starts a
     /// connection or installs an available voice/messaging provider.
     pub app_accounts: Arc<crate::connectivity::app_voice::providers::jegotrip::account_runtime::AccountManager>,
+    /// Explicit App login attempts. Construction never reads deployment secrets
+    /// or contacts a service; initialization requires the original OS claim.
+    pub app_logins: Arc<crate::connectivity::app_voice::providers::jegotrip::app_login::AppLoginManager>,
     pub config_manager: Arc<ConfigManager>,
     /// 通知发送器（用于转发 SMS、通话和 DDNS 通知）
     pub notification_sender: Arc<NotificationSender>,
@@ -137,11 +140,13 @@ impl AppState {
         let app_accounts = Arc::new(crate::connectivity::app_voice::providers::jegotrip::account_runtime::AccountManager::with_notifications(database.clone(),notification_sender.clone()));
         // Opt-in per account; enabling supervision starts nothing by itself.
         app_accounts.enable_reconnect_supervisor();
+        let app_logins = Arc::new(crate::connectivity::app_voice::providers::jegotrip::app_login::AppLoginManager::new(database.clone(), Arc::downgrade(&app_accounts)));
         Self {
             dbus_conn,
             modem_radio,
             database,
             app_accounts,
+            app_logins,
             config_manager,
             notification_sender,
             system_event_emitter,
@@ -175,6 +180,10 @@ impl FromRef<AppState> for Arc<Connection> {
 
 impl FromRef<AppState> for Arc<crate::connectivity::app_voice::providers::jegotrip::account_runtime::AccountManager> {
     fn from_ref(state: &AppState) -> Self { state.app_accounts.clone() }
+}
+
+impl FromRef<AppState> for Arc<crate::connectivity::app_voice::providers::jegotrip::app_login::AppLoginManager> {
+    fn from_ref(state: &AppState) -> Self { state.app_logins.clone() }
 }
 
 impl FromRef<AppState> for Arc<Database> {

@@ -11,7 +11,7 @@
     "lint:fix": "eslint . --fix",
     "test:e2e": "playwright test",
     "test:esim": "playwright test --config playwright.esim.config.ts",
-    "test:unit": "node --experimental-strip-types --test tests/imsRegistrationPolicy.test.ts tests/imsDiagnosticsFormat.test.ts tests/cellularImsErrorFormat.test.ts tests/automationConfig.test.ts tests/automationOutcome.test.ts tests/uiWorkflows.test.ts tests/esimManager.test.ts",
+    "test:unit": "node --experimental-strip-types --test tests/imsRegistrationPolicy.test.ts tests/imsDiagnosticsFormat.test.ts tests/cellularImsErrorFormat.test.ts tests/automationConfig.test.ts tests/automationOutcome.test.ts tests/uiWorkflows.test.ts tests/esimManager.test.ts tests/appLogin.test.ts",
     "preview": "vite preview",
     "type-check": "tsc -b --noEmit"
   },

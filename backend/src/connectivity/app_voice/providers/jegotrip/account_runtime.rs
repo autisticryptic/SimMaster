@@ -302,6 +302,17 @@ impl AccountManager {
         *lock(&self.claim) = Some(ProcessClaim { _lock: file, instance });
         Ok(report)
     }
+    /// Internal proof that this process holds the original database OS lock.
+    /// Never an API response, remote device lease or account-readiness grant.
+    pub(crate) fn login_process_owner(&self) -> Option<String> {
+        lock(&self.claim).as_ref().map(|claim| claim.instance.clone())
+    }
+    pub(crate) fn login_preflight_create(&self) -> Result<(), &'static str> {
+        if self.shutting_down.load(Ordering::SeqCst) { return Err("app_account_shutting_down"); }
+        let accounts = self.database.with_conn(account_store::list)?;
+        if accounts.len() >= account_store::MAX_ACCOUNTS as usize { return Err("app_account_limit"); }
+        Ok(())
+    }
     fn metadata(&self, line_id: &str) -> Result<AccountMetadata, &'static str> {
         if !account_store::valid_line_id(line_id) { return Err("app_account_line_invalid"); }
         self.database.with_conn(|conn| account_store::metadata(conn, line_id))?.ok_or("app_account_not_found")

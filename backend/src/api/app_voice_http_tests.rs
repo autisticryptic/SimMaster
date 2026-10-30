@@ -32,6 +32,51 @@ mod app_voice_accounts {
     }
 
     #[tokio::test]
+    async fn app_login_routes_require_auth_and_setup_exports_no_deployment_or_passwords() {
+        let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");
+        let served = serve(state.router.clone()).await;
+        let attempt = "0123456789abcdef0123456789abcdef";
+        for (method, path) in [
+            (reqwest::Method::GET, "/api/non-3gpp/app-login/setup".to_owned()),
+            (reqwest::Method::GET, "/api/non-3gpp/app-login/attempts".to_owned()),
+            (reqwest::Method::POST, "/api/non-3gpp/app-login/attempts".to_owned()),
+            (reqwest::Method::GET, format!("/api/non-3gpp/app-login/attempts/{attempt}")),
+        ] {
+            let (status, _, body) = account_request(&served, method, &path, None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED); no_secrets(&body);
+        }
+        let cookie = authenticate(&served).await;
+        let (status, headers, body) = account_request(&served, reqwest::Method::GET,
+            "/api/non-3gpp/app-login/setup", None, Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK); no_store(&headers); no_secrets(&body);
+        let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(view["data"]["implemented"], true);
+        assert_eq!(view["data"]["accepting"], false);
+        assert_eq!(view["data"]["deployment_present"], false);
+        assert_eq!(view["data"]["manual_sdk_credentials_required"], false);
+    }
+
+    #[tokio::test]
+    async fn app_login_rejects_unknown_fields_and_uninitialized_requests_without_echoing_secrets() {
+        let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");
+        let served = serve(state.router.clone()).await; let cookie = authenticate(&served).await;
+        let request = serde_json::json!({"attempt_id":"0123456789abcdef0123456789abcdef", "username":"fixture-user@example.invalid",
+            "password":"fixture-password", "country_code":null, "enable_hosting":true, "start_receiver":true});
+        let (status, headers, body) = account_request(&served, reqwest::Method::POST,
+            "/api/non-3gpp/app-login/attempts", Some(request.clone()), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE); no_store(&headers); no_secrets(&body);
+        assert!(body.contains("app_login_unavailable"));
+        for key in ["phone_login_token", "sip_password", "enrollment_confirmed", "callback", "deployment"] {
+            let mut bad = request.clone(); bad[key] = serde_json::json!("fixture-forbidden");
+            let (status, headers, body) = account_request(&served, reqwest::Method::POST,
+                "/api/non-3gpp/app-login/attempts", Some(bad), Some(&cookie)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST); no_store(&headers); no_secrets(&body);
+        }
+        assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+        assert!(state.app.app_logins.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn credential_metadata_exposes_only_explicit_inbound_implementation_without_start_or_ready_grants() {
         let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");
         let served = serve(state.router.clone()).await; let cookie = authenticate(&served).await;

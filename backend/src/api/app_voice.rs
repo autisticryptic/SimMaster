@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use crate::{
     api::models::ApiResponse,
-    connectivity::app_voice::providers::jegotrip::{account_config::AccountConfig, account_runtime::AccountManager, PROVIDER_ID},
+    connectivity::app_voice::providers::jegotrip::{account_config::AccountConfig, account_runtime::AccountManager, app_login::{AppLoginManager, LoginRequest}, PROVIDER_ID},
     state::AppState,
 };
 
@@ -43,6 +43,9 @@ fn default_inbox_limit() -> usize { 50 }
 /// Merged into main's protected routes BEFORE its existing auth middleware.
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/non-3gpp/app-login/setup", get(app_login_setup))
+        .route("/api/non-3gpp/app-login/attempts", get(app_login_attempts).post(app_login_submit))
+        .route("/api/non-3gpp/app-login/attempts/{attempt_id}", get(app_login_attempt))
         .route("/api/non-3gpp/accounts", get(list_accounts).post(create_account))
         .route("/api/non-3gpp/accounts/{line_id}", get(get_account).put(replace_account).delete(delete_account))
         .route("/api/non-3gpp/accounts/{line_id}/start", post(start_account))
@@ -66,6 +69,11 @@ fn no_store(mut response: Response) -> Response {
 }
 fn error_status(code: &str) -> StatusCode {
     match code {
+        "app_login_attempt_exists" => StatusCode::CONFLICT,
+        "app_login_busy" | "app_login_attempt_limit" | "app_login_rate_limited" => StatusCode::TOO_MANY_REQUESTS,
+        "app_login_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
+        "app_login_unavailable" | "app_login_deployment_missing" | "app_login_deployment_invalid"
+            | "app_login_shutting_down" => StatusCode::SERVICE_UNAVAILABLE,
         "app_account_not_found" | "app_account_call_not_found" => StatusCode::NOT_FOUND,
         "app_account_revision_conflict" | "app_account_stop_before_replace" | "app_account_call_operation_pending" => StatusCode::CONFLICT,
         "app_account_provider_unsupported" | "app_account_outbound_unsupported" => StatusCode::NOT_IMPLEMENTED,
@@ -89,6 +97,23 @@ fn success<T: Serialize>(status: StatusCode, result: Result<T, &'static str>) ->
     }
 }
 fn now() -> u64 { chrono::Utc::now().timestamp().max(0) as u64 }
+
+pub async fn app_login_setup(State(manager): State<Arc<AppLoginManager>>) -> Response {
+    success(StatusCode::OK, Ok(manager.setup()))
+}
+pub async fn app_login_attempts(State(manager): State<Arc<AppLoginManager>>) -> Response {
+    success(StatusCode::OK, manager.list())
+}
+pub async fn app_login_attempt(State(manager): State<Arc<AppLoginManager>>, Path(id): Path<String>) -> Response {
+    success(StatusCode::OK, manager.get(&id))
+}
+pub async fn app_login_submit(State(manager): State<Arc<AppLoginManager>>, request: Result<Json<LoginRequest>, JsonRejection>) -> Response {
+    let Ok(Json(request)) = request else { return failure("app_login_request_invalid"); };
+    match manager.submit(request) {
+        Ok(view) => success(StatusCode::ACCEPTED, Ok(view)),
+        Err(error) => failure(error.code),
+    }
+}
 
 pub async fn list_accounts(State(manager): State<Arc<AccountManager>>) -> Response {
     success(StatusCode::OK, manager.list(now()).await)

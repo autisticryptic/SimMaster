@@ -149,12 +149,15 @@ impl Peer {
         let envelope = encode_reply(id, 0, stream).unwrap(); self.send_call(CallKind::Reply, envelope.expose_to_transport()).await;
     }
     pub(crate) async fn authenticate(&mut self) {
+        self.authenticate_as(b"[username:fixture-account@fixture.invalid]", b"fixture-original-pwd").await;
+    }
+    pub(crate) async fn authenticate_as(&mut self, expected_identity: &[u8], expected_pwd: &[u8]) {
         let message = self.receive().await.unwrap(); let request = decode_request(message.payload.expose_to_transport()).unwrap();
         assert_eq!(request.method, super::super::rpc_login::LOGIN_SESSION_METHOD.as_bytes());
-        assert_eq!(request.metadata.iter().find(|p| p.key == b"pwd").unwrap().value, b"fixture-original-pwd");
+        assert_eq!(request.metadata.iter().find(|p| p.key == b"pwd").unwrap().value, expected_pwd);
         assert!(!request.metadata.iter().any(|p| p.key == b"token"));
         let mut args = Reader::versioned(request.arguments).unwrap();
-        assert_eq!(args.bytes().unwrap(), b"[username:fixture-account@fixture.invalid]");
+        assert_eq!(args.bytes().unwrap(), expected_identity);
         assert_eq!(args.bytes().unwrap(), b"fixture-original-selector");
         let props = args.properties().unwrap(); args.finish().unwrap();
         for (key, expected) in [(b"ClientId".as_slice(), b"fixture-exact-client-id".as_slice()),

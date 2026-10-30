@@ -31,7 +31,7 @@ url = "2.5"
 ring = "0.17.14"
 num-bigint = "0.4"
 num-traits = "0.2"
-aes = "0.8"
+aes = { version = "0.8", features = ["zeroize"] }
 cbc = { version = "0.1", features = ["alloc"] }
 # Legacy APK ENC configuration unwrap ONLY; never a TLS/SIP/auth fallback.
 des = { version = "0.8.1", features = ["zeroize"] }

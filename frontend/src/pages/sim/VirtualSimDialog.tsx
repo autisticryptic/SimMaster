@@ -4,11 +4,14 @@ import {
   FormControl, FormHelperText, InputLabel, MenuItem, Select, Stack, TextField, Typography,
 } from '@mui/material'
 import { api, type Non3gppProviderView, type VirtualSimProfileView } from '../../api/current'
+import AppAccountLoginPane from './AppAccountLoginPane'
 
 interface Props {
   open: boolean
   onClose: () => void
   onSaved: (profile: VirtualSimProfileView) => void
+  onAppSaved?: () => void
+  initialAccess?: AccessKind
 }
 
 type AccessKind = 'five_codes' | 'app_voice'
@@ -49,7 +52,7 @@ function describeError(error: unknown) {
   return text || '保存失败'
 }
 
-export default function VirtualSimDialog({ open, onClose, onSaved }: Props) {
+export default function VirtualSimDialog({ open, onClose, onSaved, onAppSaved, initialAccess = 'five_codes' }: Props) {
   const [accessKind, setAccessKind] = useState<AccessKind>('five_codes')
   const [draft, setDraft] = useState<Draft>(emptyDraft)
   const [providers, setProviders] = useState<Non3gppProviderView[]>([])
@@ -60,7 +63,7 @@ export default function VirtualSimDialog({ open, onClose, onSaved }: Props) {
   useEffect(() => {
     if (!open) return
     setDraft(emptyDraft)
-    setAccessKind('five_codes')
+    setAccessKind(initialAccess)
     setError(null)
     let cancelled = false
     api
@@ -74,7 +77,7 @@ export default function VirtualSimDialog({ open, onClose, onSaved }: Props) {
     return () => {
       cancelled = true
     }
-  }, [open])
+  }, [open, initialAccess])
 
   const validation = useMemo(() => {
     const iccid = digitsOk(draft.iccid, 18, 22)
@@ -93,7 +96,7 @@ export default function VirtualSimDialog({ open, onClose, onSaved }: Props) {
   }, [draft])
 
   const submit = async () => {
-    if (!validation.ready || saving) return
+    if (accessKind !== 'five_codes' || !validation.ready || saving) return
     setSaving(true)
     setError(null)
     try {
@@ -130,12 +133,13 @@ export default function VirtualSimDialog({ open, onClose, onSaved }: Props) {
               labelId="virtual-access-kind-label"
               label="接入类型"
               value={accessKind}
-              onChange={(event) => setAccessKind(event.target.value as AccessKind)}
+              onChange={(event) => setAccessKind(event.target.value === 'app_voice' ? 'app_voice' : 'five_codes')}
             >
               <MenuItem value="five_codes">五码（虚拟 SIM）</MenuItem>
-              {providers.map((provider) => (
+              <MenuItem value="app_voice">{providers.find((provider) => provider.id === 'app_voice')?.label ?? '无忧行'}（账号登录）</MenuItem>
+              {providers.filter((provider) => provider.id !== 'app_voice').map((provider) => (
                 <MenuItem key={provider.id} value={`provider:${provider.id}`} disabled>
-                  {provider.label}（{provider.availability === 'unsupported' ? '接口已预留，未接入' : '未接入'}）
+                  {provider.label}（接口已预留，未接入）
                 </MenuItem>
               ))}
             </Select>
@@ -144,6 +148,7 @@ export default function VirtualSimDialog({ open, onClose, onSaved }: Props) {
             </FormHelperText>
           </FormControl>
 
+          {accessKind === 'five_codes' ? <>
           <Box>
             <Typography variant="subtitle2" sx={{ mb: 1 }}>
               身份
@@ -220,15 +225,16 @@ export default function VirtualSimDialog({ open, onClose, onSaved }: Props) {
           </Box>
 
           {error ? <Alert severity="error">{error}</Alert> : null}
+          </> : <AppAccountLoginPane open={open} onCreated={onAppSaved} />}
         </Stack>
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose} disabled={saving}>
           取消
         </Button>
-        <Button variant="contained" onClick={() => void submit()} disabled={!validation.ready || saving}>
+        {accessKind === 'five_codes' && <Button variant="contained" onClick={() => void submit()} disabled={!validation.ready || saving}>
           {saving ? <CircularProgress size={18} color="inherit" /> : '保存并启用'}
-        </Button>
+        </Button>}
       </DialogActions>
     </Dialog>
   )

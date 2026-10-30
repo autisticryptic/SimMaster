@@ -35,6 +35,7 @@ import { maskedIccid, modemSlotLabel, modemSlotSourceLabel, shortLineId, stableM
 import TrunkProfileDialog from './TrunkProfileDialog'
 import VowifiLineDialog from './VowifiLineDialog'
 import VirtualSimDialog from './VirtualSimDialog'
+import AppAccountsPanel from './AppAccountsPanel'
 import DataProxyDialog from './DataProxyDialog'
 import CellularImsProfileDialog from './CellularImsProfileDialog'
 import { LineActivityLog, LineTrunkDetails, LineCellularImsDetails, LineVowifiDetails } from './LineRuntimeDetails'
@@ -276,6 +277,8 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
   const [virtualSimOpen, setVirtualSimOpen] = useState(false)
+  const [virtualSimAccess, setVirtualSimAccess] = useState<'five_codes' | 'app_voice'>('five_codes')
+  const [appAccountsRefresh, setAppAccountsRefresh] = useState(0)
 
   const [vowifiEvents, setVowifiEvents] = useState<VowifiRuntimeEventEntry[]>([])
   const [activityMessages, setActivityMessages] = useState<SmsMessage[]>([])
@@ -779,7 +782,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
         action={
           <Stack direction="row" spacing={0.5} alignItems="center">
             <Tooltip title="新建 WLAN 线路">
-              <IconButton onClick={() => setVirtualSimOpen(true)} disabled={savingKey !== null}>
+              <IconButton onClick={() => { setVirtualSimAccess('five_codes'); setVirtualSimOpen(true) }} disabled={savingKey !== null}>
                 <Add />
               </IconButton>
             </Tooltip>
@@ -1314,6 +1317,11 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
         </Box>
       ) : lineContent}
 
+      <AppAccountsPanel refreshKey={appAccountsRefresh} onLogin={() => {
+        setVirtualSimAccess('app_voice')
+        setVirtualSimOpen(true)
+      }} />
+
       <TrunkProfileDialog
         open={editingTrunkLine !== null}
         line={editingTrunkLine}
@@ -1332,6 +1340,8 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
       />
       <VirtualSimDialog
         open={virtualSimOpen}
+        initialAccess={virtualSimAccess}
+        onAppSaved={() => setAppAccountsRefresh((value) => value + 1)}
         onClose={() => setVirtualSimOpen(false)}
         onSaved={() => {
           void load(true)

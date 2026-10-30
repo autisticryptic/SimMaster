@@ -187,6 +187,47 @@ export interface Non3gppProviderView {
   availability: string
 }
 
+export interface AppLoginSetup {
+  implemented: boolean
+  deployment_present: boolean
+  accepting: boolean
+  manual_sdk_credentials_required: boolean
+}
+
+export interface AppLoginInput {
+  attempt_id: string
+  username: string
+  password: string
+  country_code: string | null
+  enable_hosting: boolean
+  start_receiver: boolean
+}
+
+export interface AppLoginAttempt {
+  attempt_id: string
+  phase: string
+  business_state: string
+  completed: boolean
+  line_id: string | null
+  masked_number: string | null
+  error: string | null
+  server_code: number | null
+  created_at: number
+  updated_at: number
+}
+
+export interface AppAccountView {
+  line_id: string
+  provider_id: string
+  revision: number
+  phase: string
+  io_cleanup_required: boolean
+  incoming_call_ready: boolean
+  incoming_message_ready: boolean
+  outbound_authorized: boolean
+  last_error?: string
+}
+
 async function request<T>(
   url: string,
   options: RequestOptions = {},
@@ -823,6 +864,34 @@ class SimAdminCurrentAPI {
 
   async getNon3gppProviders() {
     return request<ApiResponse<Non3gppProviderView[]>>('/non-3gpp/providers')
+  }
+
+  async getAppLoginSetup() {
+    return request<ApiResponse<AppLoginSetup>>('/non-3gpp/app-login/setup')
+  }
+
+  async submitAppLogin(input: AppLoginInput) {
+    return request<ApiResponse<AppLoginAttempt>>('/non-3gpp/app-login/attempts', {
+      method: 'POST', body: JSON.stringify(input), timeoutMs: 15000,
+    })
+  }
+
+  async getAppLoginAttempt(attemptId: string) {
+    return request<ApiResponse<AppLoginAttempt>>(`/non-3gpp/app-login/attempts/${encodeURIComponent(attemptId)}`)
+  }
+
+  async getAppLoginAttempts() {
+    return request<ApiResponse<AppLoginAttempt[]>>('/non-3gpp/app-login/attempts')
+  }
+
+  async getAppAccounts() {
+    return request<ApiResponse<AppAccountView[]>>('/non-3gpp/accounts')
+  }
+
+  async setAppAccountRunning(lineId: string, revision: number, running: boolean) {
+    return request<ApiResponse<AppAccountView>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/${running ? 'start' : 'stop'}`, {
+      method: 'POST', body: JSON.stringify({ expected_revision: revision }), timeoutMs: 30000,
+    })
   }
 
   async getVowifiLine(lineId: string) {
