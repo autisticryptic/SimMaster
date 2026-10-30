@@ -2,8 +2,9 @@
 //!
 //! Native identities may have slash-prefix components and balanced []/{} /<>
 //! groups. A reference is identity-only, identity@adapter$locator, or identity:
-//! a semicolon-delimited endpoint list. Only explicit -h/-p endpoint fields are
-//! supported here; aliases/options/proxies/port-ranges are not guessed away.
+//! a semicolon-delimited endpoint list. Explicit -h/-p and the recovered -ri
+//! property are preserved as DATA. Parsing does not select a transport, trust
+//! anchor, Router session or receive binding; other options are not guessed away.
 use super::rpc_stream::MAX_FIELD_BYTES;
 use std::fmt;
 use zeroize::Zeroize;
@@ -25,11 +26,29 @@ impl ReferenceError {
     }
 }
 
-pub struct ReferenceEndpoint { scheme: Vec<u8>, host: Vec<u8>, port: u16 }
+struct RouterIdentifier { value: i32, literal: Vec<u8> }
+impl Drop for RouterIdentifier { fn drop(&mut self) { self.literal.zeroize(); } }
+
+pub struct ReferenceEndpoint { scheme: Vec<u8>, host: Vec<u8>, port: u16, router_id: Option<RouterIdentifier> }
 impl ReferenceEndpoint {
     pub fn scheme(&self) -> &[u8] { &self.scheme }
     pub fn host(&self) -> &[u8] { &self.host }
     pub fn port(&self) -> u16 { self.port }
+    /// Original numeric Router association, NOT a port, ARC id or ready proof.
+    pub fn router_id(&self) -> Option<i32> { self.router_id.as_ref().map(|id| id.value) }
+}
+
+/// Bounded data-only grouping of an explicit Router:tls/-ri reference. Native
+/// RouterClientI skips clientLoad for these groups; a future owning startup task
+/// must still establish the original Router paths and authenticated callbacks.
+/// No TX/RX route is synthesized from the integer or reversed from an endpoint.
+pub struct RouterEndpointGroup<'a> { router_id: i32, endpoints: Vec<&'a ReferenceEndpoint> }
+impl<'a> RouterEndpointGroup<'a> {
+    pub fn router_id(&self) -> i32 { self.router_id }
+    pub fn endpoints(&self) -> &[&'a ReferenceEndpoint] { &self.endpoints }
+}
+impl fmt::Debug for RouterEndpointGroup<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RouterEndpointGroup(<redacted>)") }
 }
 impl Drop for ReferenceEndpoint { fn drop(&mut self) { self.scheme.zeroize(); self.host.zeroize(); } }
 impl fmt::Debug for ReferenceEndpoint {
@@ -65,10 +84,25 @@ impl ObjectReference {
     /// native tls/http/udp/proxy endpoint is NOT silently mapped to that route.
     pub fn direct_raw_tcp(&self) -> Result<&[ReferenceEndpoint], ReferenceError> {
         match &self.target {
-            ReferenceTarget::Direct(endpoints) if endpoints.iter().all(|e| e.scheme == b"tcp") => Ok(endpoints),
+            ReferenceTarget::Direct(endpoints) if endpoints.iter().all(|e| e.scheme == b"tcp" && e.router_id.is_none()) => Ok(endpoints),
             ReferenceTarget::Direct(_) => Err(ReferenceError::UnsupportedEndpoint),
             _ => Err(ReferenceError::NoDirectEndpoints),
         }
+    }
+    /// Preserve each original endpoint/Router association. Mixed transports,
+    /// absent ids and native synthesized-negative-id discovery are unsupported;
+    /// the entire reference fails rather than silently dropping an endpoint.
+    pub fn explicit_tls_router_groups(&self) -> Result<Vec<RouterEndpointGroup<'_>>, ReferenceError> {
+        if self.identity != b"Router" { return Err(ReferenceError::UnsupportedEndpoint); }
+        let ReferenceTarget::Direct(endpoints) = &self.target else { return Err(ReferenceError::NoDirectEndpoints); };
+        let mut groups = std::collections::BTreeMap::<i32, Vec<&ReferenceEndpoint>>::new();
+        for endpoint in endpoints {
+            let id = endpoint.router_id().ok_or(ReferenceError::UnsupportedEndpoint)?;
+            // Native RouterClientI 0xd51ba4 admits id >= -999 and id != 0.
+            if endpoint.scheme != b"tls" || id < -999 || id == 0 { return Err(ReferenceError::UnsupportedEndpoint); }
+            groups.entry(id).or_default().push(endpoint);
+        }
+        Ok(groups.into_iter().map(|(router_id, endpoints)| RouterEndpointGroup { router_id, endpoints }).collect())
     }
     pub fn encode_native(&self) -> Result<ReferenceBytes, ReferenceError> {
         let mut bytes = self.identity.clone();
@@ -83,7 +117,9 @@ impl ObjectReference {
                 for endpoint in endpoints {
                     bytes.extend_from_slice(&endpoint.scheme); bytes.extend_from_slice(b" -h ");
                     bytes.extend_from_slice(&endpoint.host); bytes.extend_from_slice(b" -p ");
-                    bytes.extend_from_slice(endpoint.port.to_string().as_bytes()); bytes.push(b';');
+                    bytes.extend_from_slice(endpoint.port.to_string().as_bytes());
+                    if let Some(id) = &endpoint.router_id { bytes.extend_from_slice(b" -ri "); bytes.extend_from_slice(&id.literal); }
+                    bytes.push(b';');
                 }
             }
         }
@@ -136,6 +172,28 @@ fn token(bytes: &[u8]) -> Result<(&[u8], Option<u8>, &[u8]), ReferenceError> {
     Ok((bytes, None, &[]))
 }
 
+/// Endpoint parser 0xe84c58 uses Common's strtoll(base=0) helper 0xe73c2c,
+/// then RouterClientI consumes a signed W-register id. Preserve the literal so
+/// octal/hex/sign syntax is not silently changed by a decimal-only parser.
+/// Overflow/wrapping is deliberately not supported by this bounded subset.
+fn router_identifier(bytes: &[u8]) -> Result<RouterIdentifier, ReferenceError> {
+    if bytes.is_empty() || bytes.len() > 32 { return Err(ReferenceError::Malformed); }
+    let (negative, digits) = match bytes[0] {
+        b'-' => (true, &bytes[1..]), b'+' => (false, &bytes[1..]), _ => (false, bytes),
+    };
+    let (radix, digits) = if digits.starts_with(b"0x") || digits.starts_with(b"0X") {
+        (16, &digits[2..])
+    } else if digits.starts_with(b"0") && digits.len() > 1 { (8, &digits[1..]) } else { (10, digits) };
+    if digits.is_empty() || !digits.iter().all(|byte| match radix {
+        16 => byte.is_ascii_hexdigit(), 8 => (b'0'..=b'7').contains(byte), _ => byte.is_ascii_digit(),
+    }) { return Err(ReferenceError::Malformed); }
+    let text = std::str::from_utf8(digits).map_err(|_| ReferenceError::Malformed)?;
+    let magnitude = i64::from_str_radix(text, radix).map_err(|_| ReferenceError::Malformed)?;
+    let value = i32::try_from(if negative { -magnitude } else { magnitude }).map_err(|_| ReferenceError::Malformed)?;
+    if value == 0 { return Err(ReferenceError::Malformed); }
+    Ok(RouterIdentifier { value, literal: bytes.to_vec() })
+}
+
 fn endpoints(bytes: &[u8]) -> Result<Vec<ReferenceEndpoint>, ReferenceError> {
     let mut endpoints = Vec::new(); let mut entries = bytes.split(|&b| b == b';').peekable();
     while let Some(entry) = entries.next() {
@@ -147,14 +205,14 @@ fn endpoints(bytes: &[u8]) -> Result<Vec<ReferenceEndpoint>, ReferenceError> {
         if endpoints.len() >= MAX_ENDPOINTS { return Err(ReferenceError::TooLarge); }
         let mut words = Vec::new();
         for word in entry.split(|&b| space(b)).filter(|w| !w.is_empty()) {
-            if words.len() >= 5 { return Err(ReferenceError::UnsupportedEndpoint); }
+            if words.len() >= 7 { return Err(ReferenceError::UnsupportedEndpoint); }
             words.push(word);
         }
         let Some(&scheme) = words.first() else { return Err(ReferenceError::Malformed); };
         if scheme.is_empty() || scheme.len() > 16 || !scheme.iter().all(u8::is_ascii_alphanumeric) {
             return Err(ReferenceError::UnsupportedEndpoint);
         }
-        let mut host = None; let mut port = None; let mut offset = 1;
+        let mut host = None; let mut port = None; let mut router_id = None; let mut offset = 1;
         while offset < words.len() {
             let value = words.get(offset + 1).ok_or(ReferenceError::Malformed)?;
             match words[offset] {
@@ -167,12 +225,18 @@ fn endpoints(bytes: &[u8]) -> Result<Vec<ReferenceEndpoint>, ReferenceError> {
                     let number = std::str::from_utf8(value).ok().and_then(|v| v.parse::<u16>().ok()).filter(|n| *n != 0).ok_or(ReferenceError::Malformed)?;
                     port = Some(number);
                 }
-                b"-h" | b"-p" => return Err(ReferenceError::Malformed),
+                b"-ri" if router_id.is_none() => {
+                    // Native rejects -ri for arc/varc/sarc/svarc. Only its proven
+                    // tcp/tls startup subset is admitted here, not other schemes.
+                    if scheme != b"tcp" && scheme != b"tls" { return Err(ReferenceError::UnsupportedEndpoint); }
+                    router_id = Some(router_identifier(value)?);
+                }
+                b"-h" | b"-p" | b"-ri" => return Err(ReferenceError::Malformed),
                 _ => return Err(ReferenceError::UnsupportedEndpoint),
             }
             offset += 2;
         }
-        endpoints.push(ReferenceEndpoint { scheme: scheme.to_vec(), host: host.ok_or(ReferenceError::Malformed)?, port: port.ok_or(ReferenceError::Malformed)? });
+        endpoints.push(ReferenceEndpoint { scheme: scheme.to_vec(), host: host.ok_or(ReferenceError::Malformed)?, port: port.ok_or(ReferenceError::Malformed)?, router_id });
     }
     if endpoints.is_empty() { return Err(ReferenceError::Malformed); }
     Ok(endpoints)

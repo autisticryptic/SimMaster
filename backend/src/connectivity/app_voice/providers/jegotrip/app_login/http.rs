@@ -56,6 +56,15 @@ impl BoundNumber {
 }
 pub(super) struct AppClient { config:HttpDeployment, transport:Arc<dyn Transport>, session:Option<Secret> }
 impl AppClient {
+    /// Private stable identity key for this App realm and the server-returned
+    /// bound number. Neither this key nor the full number is a public DTO.
+    pub fn account_key(&self,bound:&BoundNumber)->Result<Vec<u8>,Error> {
+        let realm=self.config.endpoint(&self.config.endpoints.login)?;
+        let identity=bound.identity();
+        let mut hash=ring::digest::Context::new(&ring::digest::SHA256);
+        hash.update(realm.as_str().as_bytes());hash.update(&[0]);hash.update(identity.as_bytes());
+        Ok(hash.finish().as_ref().to_vec())
+    }
     pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None}) }
     fn nonce(&self)->Result<String,Error> {
         let mut byte=[0];

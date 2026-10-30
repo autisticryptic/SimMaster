@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use crate::{
     api::models::ApiResponse,
-    connectivity::app_voice::providers::jegotrip::{account_config::AccountConfig, account_runtime::AccountManager, app_login::{AppLoginManager, LoginRequest}, PROVIDER_ID},
+    connectivity::app_voice::providers::jegotrip::{account_config::AccountConfig, account_runtime::AccountManager, app_login::{AppLoginManager, LoginRequest, JegotripLoginRequest, ConfigurationWriteRequest}, PROVIDER_ID},
     state::AppState,
 };
 
@@ -43,6 +43,11 @@ fn default_inbox_limit() -> usize { 50 }
 /// Merged into main's protected routes BEFORE its existing auth middleware.
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/jegotrip/config", get(jegotrip_configuration).put(jegotrip_configure).delete(jegotrip_clear_configuration))
+        .route("/api/jegotrip/accounts", get(jegotrip_accounts))
+        .route("/api/jegotrip/login/setup", get(app_login_setup))
+        .route("/api/jegotrip/login/attempts", get(app_login_attempts).post(jegotrip_login_submit))
+        .route("/api/jegotrip/login/attempts/{attempt_id}", get(app_login_attempt))
         .route("/api/non-3gpp/app-login/setup", get(app_login_setup))
         .route("/api/non-3gpp/app-login/attempts", get(app_login_attempts).post(app_login_submit))
         .route("/api/non-3gpp/app-login/attempts/{attempt_id}", get(app_login_attempt))
@@ -69,11 +74,11 @@ fn no_store(mut response: Response) -> Response {
 }
 fn error_status(code: &str) -> StatusCode {
     match code {
-        "app_login_attempt_exists" => StatusCode::CONFLICT,
-        "app_login_busy" | "app_login_attempt_limit" | "app_login_rate_limited" => StatusCode::TOO_MANY_REQUESTS,
+        "app_login_attempt_exists" | "app_login_configuration_revision_conflict" | "app_login_migration_conflict" => StatusCode::CONFLICT,
+        "app_login_busy" | "app_login_attempt_limit" | "app_login_account_limit" | "app_login_rate_limited" => StatusCode::TOO_MANY_REQUESTS,
         "app_login_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_login_unavailable" | "app_login_deployment_missing" | "app_login_deployment_invalid"
-            | "app_login_shutting_down" => StatusCode::SERVICE_UNAVAILABLE,
+            | "app_login_native_configuration_missing" | "app_login_shutting_down" => StatusCode::SERVICE_UNAVAILABLE,
         "app_account_not_found" | "app_account_call_not_found" => StatusCode::NOT_FOUND,
         "app_account_revision_conflict" | "app_account_stop_before_replace" | "app_account_call_operation_pending" => StatusCode::CONFLICT,
         "app_account_provider_unsupported" | "app_account_outbound_unsupported" => StatusCode::NOT_IMPLEMENTED,
@@ -97,6 +102,25 @@ fn success<T: Serialize>(status: StatusCode, result: Result<T, &'static str>) ->
     }
 }
 fn now() -> u64 { chrono::Utc::now().timestamp().max(0) as u64 }
+
+pub async fn jegotrip_configuration(State(manager):State<Arc<AppLoginManager>>)->Response {
+    success(StatusCode::OK,manager.configuration())
+}
+pub async fn jegotrip_configure(State(manager):State<Arc<AppLoginManager>>,request:Result<Json<ConfigurationWriteRequest>,JsonRejection>)->Response {
+    let Ok(Json(request))=request else{return failure("app_login_deployment_invalid");};
+    match manager.configure(request) {Ok(view)=>success(StatusCode::OK,Ok(view)),Err(e)=>failure(e.code)}
+}
+pub async fn jegotrip_clear_configuration(State(manager):State<Arc<AppLoginManager>>,request:Result<Query<RevisionRequest>,QueryRejection>)->Response {
+    let Ok(Query(request))=request else{return failure("app_login_request_invalid");};
+    match manager.clear_configuration(request.expected_revision) {Ok(view)=>success(StatusCode::OK,Ok(view)),Err(e)=>failure(e.code)}
+}
+pub async fn jegotrip_accounts(State(manager):State<Arc<AppLoginManager>>)->Response {
+    success(StatusCode::OK,manager.app_accounts())
+}
+pub async fn jegotrip_login_submit(State(manager):State<Arc<AppLoginManager>>,request:Result<Json<JegotripLoginRequest>,JsonRejection>)->Response {
+    let Ok(Json(request))=request else{return failure("app_login_request_invalid");};
+    match manager.submit_jegotrip(request) {Ok(view)=>success(StatusCode::ACCEPTED,Ok(view)),Err(e)=>failure(e.code)}
+}
 
 pub async fn app_login_setup(State(manager): State<Arc<AppLoginManager>>) -> Response {
     success(StatusCode::OK, Ok(manager.setup()))

@@ -343,7 +343,7 @@ struct PrivateConfigRef<'a> { credentials: PrivateCredentialsRef<'a>, profile: P
     #[serde(skip_serializing_if = "Option::is_none")]
     reconnect: Option<ReconnectPolicy> }
 #[derive(Serialize)]
-struct PrivateCallMediaRef<'a> { authority: &'a str, root_der_base64: &'a str, enable_sni: bool,
+pub(super) struct PrivateCallMediaRef<'a> { authority: &'a str, root_der_base64: &'a str, enable_sni: bool,
     routing: PrivateProperties<'a>, features: PrivateFeatures<'a>, properties: PrivateProperties<'a>, reference_decode_key: Option<&'a str>,
     audio_bind_ip: IpAddr, allow_plain_media: bool, trunk: Option<&'a crate::platform::config::TrunkProfileConfig> }
 #[derive(Serialize)]
@@ -356,7 +356,7 @@ impl Serialize for PrivateFeatures<'_> {
     }
 }
 #[derive(Serialize)]
-struct PrivateBootstrapRef<'a>{account_authority:&'a str,account_root_der_base64:&'a str,account_enable_sni:bool,
+pub(super) struct PrivateBootstrapRef<'a>{account_authority:&'a str,account_root_der_base64:&'a str,account_enable_sni:bool,
     routing:PrivateProperties<'a>,handoff_timeout_ms:u64}
 #[derive(Serialize)]
 struct PrivateCredentialsRef<'a> { sdk: PrivateSdkRef<'a>, hosting: PrivateHostingRef<'a> }
@@ -389,7 +389,7 @@ struct PrivateIncomingRef<'a> { object_id: &'a [u8], domain: &'a [u8], receiver_
 #[derive(Serialize)]
 struct PrivateCallIncomingRef<'a>{object_id:&'a [u8],domain:&'a [u8]}
 #[derive(Serialize)]
-struct PrivateProfileRef<'a> {
+pub(super) struct PrivateProfileRef<'a> {
     route: &'static str, authority: &'a str, enable_sni: bool, identity_type: &'a str,
     domain_name: Option<&'a str>, domain_id: Option<&'a str>, application_id: Option<&'a str>, device_info_cc: Option<&'a str>,
     client_properties: PrivateProperties<'a>, include_device_id: bool,
@@ -451,6 +451,36 @@ impl<'a> PrivateConfigRef<'a> {
                 routing:private_properties(&b.routing),handoff_timeout_ms:b.handoff_timeout_ms}),
         }
     }
+}
+
+/// Internal storage mirrors shared with the provider's installation tables.
+/// Deliberately do not implement Serialize for Secret/AccountConfig or expose
+/// these values through a public configuration view.
+pub(super) fn private_profile_ref(p: &ProfileConfig) -> PrivateProfileRef<'_> {
+    PrivateProfileRef {
+        route: match p.route { ProfileRoute::DirectTlsCarrier => "direct_tls_carrier" },
+        authority: p.authority.expose_to_backend(), enable_sni: p.enable_sni,
+        identity_type: p.identity_type.expose_to_backend(), domain_name: exposed(&p.domain_name),
+        domain_id: exposed(&p.domain_id), application_id: exposed(&p.application_id),
+        device_info_cc: exposed(&p.device_info_cc), client_properties: private_properties(&p.client_properties),
+        include_device_id: p.include_device_id, login_routing: private_properties(&p.login_routing),
+        gateway_uri: p.gateway_uri.expose_to_backend(), gateway_metadata: private_properties(&p.gateway_metadata),
+        poll_routing: private_properties(&p.poll_routing), logout_routing: private_properties(&p.logout_routing),
+        incoming: p.incoming.as_ref().map(|b| PrivateIncomingRef { object_id: &b.object_id, domain: &b.domain, receiver_kind: &b.receiver_kind }),
+        call_incoming: p.call_incoming.as_ref().map(|b| PrivateCallIncomingRef { object_id: &b.object_id, domain: &b.domain }),
+        call_control: p.call_control.as_deref().map(private_properties),
+        connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
+        partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
+    }
+}
+pub(super) fn private_bootstrap_ref(b: &BootstrapConfig) -> PrivateBootstrapRef<'_> {
+    PrivateBootstrapRef { account_authority: b.account_authority.expose_to_backend(), account_root_der_base64: b.account_root_der_base64.expose_to_backend(),
+        account_enable_sni: b.account_enable_sni, routing: private_properties(&b.routing), handoff_timeout_ms: b.handoff_timeout_ms }
+}
+pub(super) fn private_call_media_ref(m: &CallMediaConfig) -> PrivateCallMediaRef<'_> {
+    PrivateCallMediaRef { authority: m.authority.expose_to_backend(), root_der_base64: m.root_der_base64.expose_to_backend(), enable_sni: m.enable_sni,
+        routing: PrivateProperties(&m.routing), features: PrivateFeatures(&m.features), properties: PrivateProperties(&m.properties),
+        reference_decode_key: exposed(&m.reference_decode_key), audio_bind_ip: m.audio_bind_ip, allow_plain_media: m.allow_plain_media, trunk: m.trunk.as_ref() }
 }
 
 #[cfg(test)]

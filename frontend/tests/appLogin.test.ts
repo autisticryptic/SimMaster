@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { appLoginInput, canSubmitAppLogin, appLoginError, appBusinessLabel, appLoginPhase, appLoginNeedsPolling, type AppLoginDraft } from '../src/policies/appLogin.ts'
+import { appLoginInput, canSubmitAppLogin, jegotripLoginInput, canSubmitJegotripLogin, emptyAppLoginDraft, appLoginError, appBusinessLabel, appLoginPhase, appLoginNeedsPolling, type AppLoginDraft } from '../src/policies/appLogin.ts'
 import type { AppLoginAttempt } from '../src/api/current.ts'
 
 const id = '0123456789abcdef0123456789abcdef'
@@ -46,4 +46,43 @@ void test('a finalization error stops UI polling without fabricating durable com
   assert.equal(value.completed, false)
   assert.equal(appLoginNeedsPolling({ ...value, error: null }), true)
   assert.equal(appLoginNeedsPolling({ ...value, error: null, completed: true }), false)
+})
+
+void test('primary Jegotrip form defaults to login, enable hosting and start receiver with explicit consent', () => {
+  const primary = emptyAppLoginDraft()
+  assert.equal(primary.intent, 'enable_hosting')
+  assert.equal(primary.startReceiver, true)
+  assert.equal(primary.consent, false)
+  assert.equal(canSubmitJegotripLogin(primary), false)
+  const submitted = jegotripLoginInput(id, { ...primary, username: '7700900123', password: ' p@ss ', consent: true })
+  assert.equal(submitted.intent, 'enable_hosting')
+  assert.equal(submitted.start_receiver, true)
+  assert.equal(submitted.password, ' p@ss ')
+})
+void test('omitted intent stays full hosting while authentication-only requires explicit selection', () => {
+  assert.equal(jegotripLoginInput(id, draft).intent, 'enable_hosting')
+  assert.equal(jegotripLoginInput(id, draft).start_receiver, true)
+  assert.equal(canSubmitJegotripLogin({ ...draft, intent: 'unknown' as AppLoginDraft['intent'] }), false)
+})
+
+void test('dedicated Jegotrip authentication does not silently request business enablement', () => {
+  const auth: AppLoginDraft = { ...draft, intent: 'authenticate', startReceiver: false }
+  assert.deepEqual(jegotripLoginInput(id, auth), { attempt_id: id, username: 'user@example.invalid', password: ' p@ss ', country_code: null,
+    intent: 'authenticate', consent: true, start_receiver: false })
+  assert.equal('enable_hosting' in jegotripLoginInput(id, auth), false)
+  assert.equal(canSubmitJegotripLogin({ ...auth, startReceiver: true }), false)
+  assert.equal(canSubmitJegotripLogin({ ...auth, consent: false }), false)
+})
+void test('dedicated hosting intent remains explicit and does not accept personal SDK inputs', () => {
+  const hosting: AppLoginDraft = { ...draft, intent: 'enable_hosting' }
+  assert.equal(jegotripLoginInput(id, hosting).intent, 'enable_hosting')
+  for (const key of ['phone_login_token', 'sip_password', 'deployment', 'callback']) assert.equal(key in jegotripLoginInput(id, hosting), false)
+  assert.throws(() => jegotripLoginInput('bad-id', hosting))
+})
+void test('database configuration and App-only summary labels do not claim phone readiness', () => {
+  assert.match(appLoginError('app_login_configuration_revision_conflict'), /版本已变化/)
+  assert.match(appLoginError('app_login_migration_conflict'), /保留原记录/)
+  assert.match(appLoginError('app_login_native_configuration_missing'), /未开启托管/)
+  assert.match(appLoginPhase('saving_app_account'), /最近 App 认证/)
+  assert.equal(appLoginPhase('saving_app_account').includes('就绪'), false)
 })

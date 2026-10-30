@@ -4,7 +4,7 @@ use super::super::{
     credentials::{Secret, SdkCredentials, HostingCredentials, ImportedCredentials},
     account_config::{AccountConfig, ProfileConfig, BootstrapConfig, CallMediaConfig, ReconnectPolicy},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{fmt, io::Read, path::Path};
 use zeroize::Zeroizing;
 use url::Url;
@@ -17,10 +17,45 @@ pub(super) struct Deployment {
     pub runtime: RuntimeTemplate,
 }
 impl fmt::Debug for Deployment { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("AppLoginDeployment(<redacted>)") } }
+
+/// Private database installation context. HTTP-only configuration permits App
+/// authentication, never native/hosting readiness or a placeholder SDK login.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DatabaseConfiguration {
+    pub(super) version: u32,
+    pub(super) http: HttpDeployment,
+    pub(super) runtime: Option<RuntimeTemplate>,
+}
+impl fmt::Debug for DatabaseConfiguration { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("JegotripDatabaseConfiguration(<redacted>)") } }
+impl From<Deployment> for DatabaseConfiguration {
+    fn from(value: Deployment) -> Self { Self { version:value.version, http:value.http, runtime:Some(value.runtime) } }
+}
+impl DatabaseConfiguration {
+    pub(super) fn validate(&self) -> Result<(), Error> {
+        if self.version != 1 { return Err(Error::new("app_login_deployment_invalid")); }
+        self.http.validate()
+    }
+    pub(super) fn encode_private(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
+        self.validate()?;
+        let mirror = PrivateDatabaseRef { version: self.version, http: PrivateHttpRef::new(&self.http),
+            runtime: self.runtime.as_ref().map(RuntimeTemplate::private_mirror) };
+        // Bound the serializer itself, not only its completed allocation. Secret
+        // never implements Serialize; only private borrowed mirrors write here.
+        let mut bytes = Zeroizing::new(Vec::with_capacity(256 * 1024));
+        serde_json::to_writer(PrivateDatabaseWriter(&mut bytes), &mirror).map_err(|_| Error::new("app_login_deployment_invalid"))?;
+        Ok(bytes)
+    }
+    pub(super) fn decode_private(bytes:&[u8]) -> Result<Self,Error> {
+        if bytes.is_empty() || bytes.len()>256*1024 { return Err(Error::new("app_login_deployment_invalid")); }
+        let value:Self=serde_json::from_slice(bytes).map_err(|_|Error::new("app_login_deployment_invalid"))?;
+        value.validate()?; Ok(value)
+    }
+}
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct BodyProtection { pub secret_id: Secret, pub secret_value: Secret }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Endpoints {
     pub login: String, pub user_info: String, pub phone_token: String,
@@ -103,6 +138,19 @@ pub(super) struct RuntimeTemplate {
     pub reconnect: Option<ReconnectPolicy>,
 }
 impl RuntimeTemplate {
+    fn private_mirror(&self) -> impl Serialize + '_ {
+        use super::super::account_config::{private_profile_ref, private_bootstrap_ref, private_call_media_ref};
+        PrivateRuntimeRef {
+            sdk: PrivateSdkContextRef { application_key: self.sdk.application_key.expose_to_backend(), server_address: self.sdk.server_address.expose_to_backend(),
+                device_id: self.sdk.device_id.as_ref().map(Secret::expose_to_backend), selected_session_id: self.sdk.selected_session_id.as_ref().map(Secret::expose_to_backend),
+                root_der_base64: self.sdk.root_der_base64.expose_to_backend(), client_config_decode_key: self.sdk.client_config_decode_key.as_ref().map(Secret::expose_to_backend),
+                reference_decode_key: self.sdk.reference_decode_key.as_ref().map(Secret::expose_to_backend) },
+            hosting: PrivateHostingContextRef { authname_prefix: self.hosting.authname_prefix.expose_to_backend(), channel_id: self.hosting.channel_id.expose_to_backend(),
+                delete_int_code: &self.hosting.delete_int_code },
+            profile: private_profile_ref(&self.profile), bootstrap: self.bootstrap.as_ref().map(private_bootstrap_ref),
+            call_media: self.call_media.as_ref().map(private_call_media_ref), cleanup_on_disconnect: self.cleanup_on_disconnect, reconnect: self.reconnect,
+        }
+    }
     /// Pure construction and validation before the business request. The result
     /// stays private to the attempt and cannot be stored/started until the server
     /// has confirmed business enablement. No placeholder account credentials.
@@ -122,6 +170,45 @@ impl RuntimeTemplate {
         };
         Ok(config)
     }
+}
+
+#[derive(Serialize)]
+struct PrivateDatabaseRef<'a, R: Serialize> { version: u32, http: PrivateHttpRef<'a>, runtime: Option<R> }
+#[derive(Serialize)]
+struct PrivateBodyProtectionRef<'a> { secret_id: &'a str, secret_value: &'a str }
+#[derive(Serialize)]
+struct PrivateHttpRef<'a> {
+    base_url: &'a str, anonymous_token: &'a str, signature_salt: &'a str, password_salt: &'a str,
+    sip_password_key: &'a str, device_id: &'a str, endpoints: &'a Endpoints,
+    body_protection: Option<PrivateBodyProtectionRef<'a>>, root_der_base64: Option<&'a str>, user_agent: Option<&'a str>, enroll_id: Option<&'a str>,
+}
+impl<'a> PrivateHttpRef<'a> {
+    fn new(h: &'a HttpDeployment) -> Self {
+        Self { base_url: h.base_url.expose_to_backend(), anonymous_token: h.anonymous_token.expose_to_backend(),
+            signature_salt: h.signature_salt.expose_to_backend(), password_salt: h.password_salt.expose_to_backend(),
+            sip_password_key: h.sip_password_key.expose_to_backend(), device_id: h.device_id.expose_to_backend(), endpoints: &h.endpoints,
+            body_protection: h.body_protection.as_ref().map(|b| PrivateBodyProtectionRef { secret_id: b.secret_id.expose_to_backend(), secret_value: b.secret_value.expose_to_backend() }),
+            root_der_base64: h.root_der_base64.as_ref().map(Secret::expose_to_backend), user_agent: h.user_agent.as_ref().map(Secret::expose_to_backend),
+            enroll_id: h.enroll_id.as_ref().map(Secret::expose_to_backend) }
+    }
+}
+#[derive(Serialize)]
+struct PrivateSdkContextRef<'a> { application_key: &'a str, server_address: &'a str, device_id: Option<&'a str>, selected_session_id: Option<&'a str>,
+    root_der_base64: &'a str, client_config_decode_key: Option<&'a str>, reference_decode_key: Option<&'a str> }
+#[derive(Serialize)]
+struct PrivateHostingContextRef<'a> { authname_prefix: &'a str, channel_id: &'a str, delete_int_code: &'a str }
+#[derive(Serialize)]
+struct PrivateRuntimeRef<'a, P: Serialize, B: Serialize, M: Serialize> { sdk: PrivateSdkContextRef<'a>, hosting: PrivateHostingContextRef<'a>,
+    profile: P, bootstrap: Option<B>, call_media: Option<M>, cleanup_on_disconnect: bool, reconnect: Option<ReconnectPolicy> }
+pub(super) struct PrivateDatabaseWriter<'a>(pub(super) &'a mut Zeroizing<Vec<u8>>);
+impl std::io::Write for PrivateDatabaseWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > (256 * 1024usize).saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("app_login_deployment_invalid"));
+        }
+        self.0.extend_from_slice(bytes); Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
 pub(super) fn read_deployment(path: &Path) -> Result<Deployment,Error> {

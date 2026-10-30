@@ -1,16 +1,21 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Alert, Box, Button, Chip, Paper, Stack, Typography } from '@mui/material'
-import { api, type AppAccountView, type AppLoginAttempt } from '../../api/current'
+import { api, type AppAccountView, type AppLoginAttempt, type JegotripAccountView, type JegotripConfigurationView } from '../../api/current'
+import JegotripConfigurationDialog from './JegotripConfigurationDialog'
 import { appBusinessLabel, appLoginError, appLoginPhase } from '../../policies/appLogin'
 
 export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin: () => void; refreshKey?: number }) {
   const [accounts, setAccounts] = useState<AppAccountView[]>([])
   const [attempts, setAttempts] = useState<AppLoginAttempt[]>([])
+  const [summaries, setSummaries] = useState<JegotripAccountView[]>([])
+  const [configuration, setConfiguration] = useState<JegotripConfigurationView | null>(null)
+  const [configurationOpen, setConfigurationOpen] = useState(false)
+  const [settingsRefresh, setSettingsRefresh] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const load = useCallback(async () => {
-    const [a, b] = await Promise.all([api.getAppAccounts(), api.getAppLoginAttempts()])
-    return { accounts: a.data ?? [], attempts: b.data ?? [] }
+    const [a, b, c, d] = await Promise.all([api.getAppAccounts(), api.getJegotripLoginAttempts(), api.getJegotripAccounts(), api.getJegotripConfiguration().catch(() => ({ data: null }))])
+    return { accounts: a.data ?? [], attempts: b.data ?? [], summaries: c.data ?? [], configuration: d.data ?? null }
   }, [])
 
   useEffect(() => {
@@ -22,6 +27,8 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
         if (!active) return
         setAccounts(data.accounts)
         setAttempts(data.attempts)
+        setSummaries(data.summaries)
+        setConfiguration(data.configuration)
         setError(null)
       } catch {
         if (active) setError('无法读取应用账号状态，暂不提供运行操作。')
@@ -30,7 +37,7 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
     }
     void poll()
     return () => { active = false; if (timer) clearTimeout(timer) }
-  }, [load, refreshKey])
+  }, [load, refreshKey, settingsRefresh])
 
   const operate = async (account: AppAccountView, running: boolean) => {
     if (busy || error) return
@@ -40,6 +47,8 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
       const data = await load()
       setAccounts(data.accounts)
       setAttempts(data.attempts)
+      setSummaries(data.summaries)
+      setConfiguration(data.configuration)
       setError(null)
     } catch (failure) {
       setError(appLoginError(failure))
@@ -54,10 +63,19 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
             <Typography variant="subtitle1">无忧行应用账号</Typography>
             <Typography variant="caption" color="text.secondary">独立于 SIM/五码线路；业务开通、SDK 在线和接收就绪分别显示。</Typography>
           </Box>
-          <Button size="small" variant="outlined" onClick={onLogin}>账号登录</Button>
+          <Stack direction="row" spacing={1}>
+            <Button size="small" onClick={() => setConfigurationOpen(true)}>安装配置</Button>
+            <Button size="small" variant="outlined" onClick={onLogin}>登录并启动无忧行</Button>
+          </Stack>
         </Stack>
+        {configuration && <Typography variant="caption" color="text.secondary">专用数据库配置：{configuration.configuration_source} · 版本 {configuration.revision} · App HTTP {configuration.http_configured ? '已录入' : '未配置'} · 电话模板 {configuration.native_configured ? '已录入，运行时另核验' : '尚未配置'}</Typography>}
+        {summaries.map((summary) => <Box key={summary.account_id} sx={{ borderTop: 1, borderColor: 'divider', pt: 1 }}>
+          <Typography variant="body2">{summary.masked_login_name} · {summary.masked_number} · 账号 {summary.account_id.slice(-8)}</Typography>
+          <Typography variant="caption" color="text.secondary">最近 App 认证：{new Date(summary.last_authenticated_at * 1000).toLocaleString()} · {summary.voice_line_id ? '已关联接收配置，状态见下方' : '尚无已关联接收器，不代表托管业务或接收已就绪'}</Typography>
+        </Box>)}
         {error && <Alert severity="warning">{error}</Alert>}
-        {!accounts.length && !error && <Typography variant="body2" color="text.secondary">暂无应用账号，可登录已绑定号码的无忧行账号。</Typography>}
+        {!accounts.length && !summaries.length && !error && <Typography variant="body2" color="text.secondary">暂无无忧行账号，可登录已绑定号码的账号并自动启动无忧行接收器。</Typography>}
+        {!!accounts.length && <Typography variant="caption" color="text.secondary">接收器运行（与最近 App 认证分开）</Typography>}
         {accounts.map((account) => {
           const attempt = attempts.find((a) => a.line_id === account.line_id)
           return (
@@ -82,6 +100,7 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
         ))}
         {!!accounts.length && <Typography variant="caption" color="text.secondary">停止接收只注销本客户端，不取消服务端托管/呼转。短信可在原短信记录中查看；外呼和发短信仍未开放。</Typography>}
       </Stack>
+      <JegotripConfigurationDialog open={configurationOpen} onClose={() => setConfigurationOpen(false)} onSaved={() => setSettingsRefresh((value) => value + 1)} />
     </Paper>
   )
 }

@@ -192,6 +192,39 @@ export interface AppLoginSetup {
   deployment_present: boolean
   accepting: boolean
   manual_sdk_credentials_required: boolean
+  accepting_authenticate?: boolean
+  native_configured?: boolean
+  configuration_source?: string
+  configuration_revision?: number
+  configuration_error?: string | null
+}
+
+export type JegotripLoginIntent = 'authenticate' | 'enable_hosting'
+export interface JegotripConfigurationView {
+  configuration_source: string
+  revision: number
+  initialized: boolean
+  http_configured: boolean
+  native_configured: boolean
+  accepting_authenticate: boolean
+  accepting_enable_hosting: boolean
+}
+export interface JegotripLoginInput {
+  attempt_id: string
+  username: string
+  password: string
+  country_code: string | null
+  intent: JegotripLoginIntent
+  consent: boolean
+  start_receiver: boolean
+}
+export interface JegotripAccountView {
+  account_id: string
+  masked_login_name: string
+  masked_number: string
+  last_authenticated_at: number
+  configuration_revision: number
+  voice_line_id: string | null
 }
 
 export interface AppLoginInput {
@@ -214,6 +247,8 @@ export interface AppLoginAttempt {
   server_code: number | null
   created_at: number
   updated_at: number
+  intent?: JegotripLoginIntent
+  account_id?: string | null
 }
 
 export interface AppAccountView {
@@ -864,6 +899,42 @@ class SimAdminCurrentAPI {
 
   async getNon3gppProviders() {
     return request<ApiResponse<Non3gppProviderView[]>>('/non-3gpp/providers')
+  }
+
+  async getJegotripConfiguration() {
+    return request<ApiResponse<JegotripConfigurationView>>('/jegotrip/config')
+  }
+
+  async saveJegotripConfiguration(revision: number, configuration: unknown) {
+    return request<ApiResponse<JegotripConfigurationView>>('/jegotrip/config', {
+      method: 'PUT', body: JSON.stringify({ expected_revision: revision, configuration }), timeoutMs: 15000,
+    })
+  }
+
+  async clearJegotripConfiguration(revision: number) {
+    return request<ApiResponse<JegotripConfigurationView>>(`/jegotrip/config?expected_revision=${revision}`, { method: 'DELETE' })
+  }
+
+  async getJegotripAccounts() {
+    return request<ApiResponse<JegotripAccountView[]>>('/jegotrip/accounts')
+  }
+
+  async getJegotripLoginSetup() {
+    return request<ApiResponse<AppLoginSetup>>('/jegotrip/login/setup')
+  }
+
+  async submitJegotripLogin(input: JegotripLoginInput) {
+    return request<ApiResponse<AppLoginAttempt>>('/jegotrip/login/attempts', {
+      method: 'POST', body: JSON.stringify(input), timeoutMs: 15000,
+    })
+  }
+
+  async getJegotripLoginAttempt(attemptId: string) {
+    return request<ApiResponse<AppLoginAttempt>>(`/jegotrip/login/attempts/${encodeURIComponent(attemptId)}`)
+  }
+
+  async getJegotripLoginAttempts() {
+    return request<ApiResponse<AppLoginAttempt[]>>('/jegotrip/login/attempts')
   }
 
   async getAppLoginSetup() {

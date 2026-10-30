@@ -108,6 +108,92 @@ fn reference_path_endpoint_and_group_resource_caps_are_local_not_network_limits(
 }
 
 #[test]
+fn explicit_tls_router_ids_roundtrip_without_stripping_or_tcp_downgrade() {
+    let input = b"Router:tls -h fixture-one.invalid -p 443 -ri 101;tls -ri 202 -p 9443 -h fixture-two.invalid;";
+    let reference = parse_object_reference(input).unwrap();
+    assert_eq!(reference.direct_raw_tcp().err(), Some(ReferenceError::UnsupportedEndpoint));
+    let groups = reference.explicit_tls_router_groups().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].router_id(), 101); assert_eq!(groups[0].endpoints()[0].host(), b"fixture-one.invalid");
+    assert_eq!(groups[1].router_id(), 202); assert_eq!(groups[1].endpoints()[0].port(), 9443);
+    assert_eq!(reference.encode_native().unwrap().expose_to_backend(),
+        b"Router:tls -h fixture-one.invalid -p 443 -ri 101;tls -h fixture-two.invalid -p 9443 -ri 202;");
+}
+
+#[test]
+fn router_grouping_preserves_associations_even_when_host_ports_are_identical() {
+    let reference = parse_object_reference(b"Router:tls -h fixture.invalid -p 443 -ri 202;tls -h fixture.invalid -p 443 -ri 101;tls -h fixture-alt.invalid -p 9443 -ri 202;").unwrap();
+    let groups = reference.explicit_tls_router_groups().unwrap();
+    assert_eq!(groups.iter().map(RouterEndpointGroup::router_id).collect::<Vec<_>>(), vec![101, 202]);
+    assert_eq!(groups[1].endpoints().len(), 2);
+    assert_eq!(groups[1].endpoints()[0].host(), b"fixture.invalid");
+    assert_eq!(groups[1].endpoints()[1].host(), b"fixture-alt.invalid");
+}
+
+#[test]
+fn native_router_id_base_zero_conversion_preserves_original_literal() {
+    for (literal, expected) in [("0x65", 101), ("0XCA", 202), ("0145", 101), ("+101", 101), ("-077", -63), ("-999", -999), ("2147483647", i32::MAX)] {
+        let input = format!("Router:tls -h fixture.invalid -p 443 -ri {literal};");
+        let reference = parse_object_reference(input.as_bytes()).unwrap();
+        assert_eq!(reference.explicit_tls_router_groups().unwrap()[0].router_id(), expected);
+        assert_eq!(reference.encode_native().unwrap().expose_to_backend(), input.as_bytes());
+    }
+}
+
+#[test]
+fn zero_malformed_or_wrapping_router_ids_fail_closed() {
+    for literal in ["0", "-0", "+0", "0x0", "00", "0x", "08", "1junk", "1.0", "--1", "+", "-", "2147483648", "4294967297", "-2147483649", "0x100000001", "99999999999999999999999999999999999"] {
+        let input = format!("Router:tls -h fixture.invalid -p 443 -ri {literal};");
+        assert!(parse_object_reference(input.as_bytes()).is_err(), "invalid Router fixture");
+    }
+    assert!(parse_object_reference(b"Router:tls -h fixture.invalid -p 443 -ri;").is_err());
+    assert!(parse_object_reference(b"Router:tls -h fixture.invalid -p 443 -ri 1 -ri 2;").is_err());
+}
+
+#[test]
+fn parser_preserves_negative_router_ids_but_does_not_synthesize_discovery_groups() {
+    for literal in ["-1000", "-2147483648"] {
+        let input = format!("Router:tls -h fixture.invalid -p 443 -ri {literal};");
+        let reference = parse_object_reference(input.as_bytes()).unwrap();
+        assert_eq!(reference.encode_native().unwrap().expose_to_backend(), input.as_bytes());
+        assert_eq!(reference.explicit_tls_router_groups().err(), Some(ReferenceError::UnsupportedEndpoint));
+        assert_eq!(reference.direct_raw_tcp().err(), Some(ReferenceError::UnsupportedEndpoint));
+    }
+}
+
+#[test]
+fn entire_tls_router_reference_rejects_mixed_or_missing_route_associations() {
+    for input in [b"Router:tls -h a.invalid -p 443;".as_slice(),
+        b"Router:tls -h a.invalid -p 443 -ri 1;tls -h b.invalid -p 443;",
+        b"Router:tls -h a.invalid -p 443 -ri 1;tcp -h b.invalid -p 443 -ri 2;",
+        b"Other:tls -h a.invalid -p 443 -ri 1;", b"Router@fixture-adapter"] {
+        let reference = parse_object_reference(input).unwrap();
+        assert!(reference.explicit_tls_router_groups().is_err());
+        assert!(reference.direct_raw_tcp().is_err());
+    }
+    // tcp/-ri is valid reference data but must not enter the old direct actor.
+    let reference = parse_object_reference(b"Router:tcp -h a.invalid -p 443 -ri 1;").unwrap();
+    assert_eq!(reference.direct_raw_tcp().err(), Some(ReferenceError::UnsupportedEndpoint));
+}
+
+#[test]
+fn arc_scheme_router_option_is_not_reinterpreted_as_an_endpoint_route() {
+    for scheme in ["arc", "varc", "sarc", "svarc", "udp", "https"] {
+        let input = format!("Router:{scheme} -h fixture.invalid -p 443 -ri 101;");
+        assert_eq!(parse_object_reference(input.as_bytes()).err(), Some(ReferenceError::UnsupportedEndpoint));
+    }
+}
+
+#[test]
+fn router_group_debug_hides_hosts_and_private_numeric_associations() {
+    let reference = parse_object_reference(b"Router:tls -h fixture-private.invalid -p 443 -ri 123456789;").unwrap();
+    let groups = reference.explicit_tls_router_groups().unwrap();
+    for text in [format!("{reference:?}"), format!("{:?}", reference.target()), format!("{:?}", groups[0]), format!("{:?}", groups[0].endpoints()[0]), format!("{:?}", reference.encode_native().unwrap())] {
+        assert!(!text.contains("fixture")); assert!(!text.contains("123456789"));
+    }
+}
+
+#[test]
 fn debug_does_not_dump_account_id_adapter_host_or_native_reference() {
     let parsed = parse_object_reference(b"#fixture-private-account:tcp -h fixture.invalid -p 443;").unwrap();
     for output in [format!("{parsed:?}"), format!("{:?}", parsed.target()), format!("{:?}", parsed.direct_raw_tcp().unwrap()[0]), format!("{:?}", parsed.encode_native().unwrap())] {

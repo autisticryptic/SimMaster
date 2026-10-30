@@ -1,4 +1,4 @@
-import type { AppLoginAttempt, AppLoginInput } from '../api/current'
+import type { AppLoginAttempt, AppLoginInput, JegotripLoginInput, JegotripLoginIntent } from '../api/current'
 
 export type AppLoginMode = 'account' | 'phone'
 export interface AppLoginDraft {
@@ -8,6 +8,11 @@ export interface AppLoginDraft {
   country: string
   consent: boolean
   startReceiver: boolean
+  intent?: JegotripLoginIntent
+}
+
+export function emptyAppLoginDraft(): AppLoginDraft {
+  return { mode: 'phone', username: '', password: '', country: '86', consent: false, startReceiver: true, intent: 'enable_hosting' }
 }
 
 export function canSubmitAppLogin(draft: AppLoginDraft): boolean {
@@ -31,6 +36,20 @@ export function appLoginInput(attemptId: string, draft: AppLoginDraft): AppLogin
   }
 }
 
+export function canSubmitJegotripLogin(draft: AppLoginDraft): boolean {
+  const intent = draft.intent ?? 'enable_hosting'
+  return canSubmitAppLogin(draft) && (intent === 'enable_hosting' || (intent === 'authenticate' && !draft.startReceiver))
+}
+
+export function jegotripLoginInput(attemptId: string, draft: AppLoginDraft): JegotripLoginInput {
+  if (!/^[a-f0-9]{32}$/.test(attemptId) || !canSubmitJegotripLogin(draft)) throw new Error('app_login_request_invalid')
+  return {
+    attempt_id: attemptId, username: draft.username.trim(), password: draft.password,
+    country_code: draft.mode === 'phone' ? draft.country.trim().replace(/^\+/, '') : null,
+    intent: draft.intent ?? 'enable_hosting', consent: draft.consent, start_receiver: draft.startReceiver,
+  }
+}
+
 const errors: Record<string, string> = {
   app_login_request_invalid: '请检查账号、密码、区号并确认授权。',
   app_login_deployment_missing: '后台尚未提供无忧行部署配置。',
@@ -39,6 +58,10 @@ const errors: Record<string, string> = {
   app_login_busy: '已有登录任务正在处理，请先查看任务结果。',
   app_login_attempt_exists: '该登录任务已存在，请查看原任务；不会重复提交开通。',
   app_login_attempt_limit: '登录任务记录已达上限，需要管理员检查。',
+  app_login_account_limit: '无忧行账号摘要已达上限，需要管理员检查。',
+  app_login_configuration_revision_conflict: '安装配置版本已变化，请重新读取后再保存。',
+  app_login_migration_conflict: '新旧无忧行任务表同时有数据，迁移已保留原记录并停止，请管理员核对。',
+  app_login_native_configuration_missing: '完整原生启动配置尚未就绪，未开启托管或启动无忧行；不会退回仅保存认证摘要。',,
   app_login_verification_required: '服务要求额外安全验证，尚未开启接收；不会伪造验证通过。',
   app_login_existing_business_action_required: '服务要求处理既有业务状态；程序未自动关闭原托管或呼转。',
   app_login_migration_required: '该账号需要先完成原服务的账号迁移。',
@@ -73,6 +96,7 @@ export function appBusinessLabel(state: string): string {
 }
 export function appLoginPhase(phase: string): string {
   return ({ queued: '已入队', authenticating: '登录 App 账号', reading_bound_number: '核对绑定号码', fetching_credentials: '后台取得通话凭据',
+    saving_app_account: '保存最近 App 认证摘要',
     checking_business: '查询托管业务', enabling_business: '提交开通请求', confirming_business: '确认业务状态', creating_account: '保存独立账号',
     starting_receiver: '提交接收器启动', completed: '登录配置任务完成', failed: '任务失败', interrupted: '任务中断' } as Record<string, string>)[phase] ?? '未知任务状态'
 }
