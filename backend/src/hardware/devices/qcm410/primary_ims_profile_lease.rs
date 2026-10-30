@@ -1060,22 +1060,47 @@ fn require_no_bearer_receipts() -> Result<(), String> {
     Ok(())
 }
 
+/// The canonical systemd initializer never serves the management API or owns
+/// LineRuntime workers. Match its complete two-argument CLI record, not a
+/// substring or a process name. A still-running initializer keeps its old inode
+/// after an in-place upgrade, so procfs may append " (deleted)" to its exe path.
+/// Unknown/partial records remain competing managers. The CLI/unit contract is
+/// also checked by mm_startup_policy_tests in the binary entry point.
+pub(crate) fn is_device_initializer_process(executable: &Path, cmdline: &[u8]) -> bool {
+    let executable_name = executable.file_name().and_then(|name| name.to_str());
+    if !matches!(executable_name, Some("simadmin" | "simadmin (deleted)"))
+        || cmdline.is_empty()
+        || cmdline.len() > 16_384
+    {
+        return false;
+    }
+    let Ok(cmdline) = std::str::from_utf8(cmdline) else {
+        return false;
+    };
+    let mut args = cmdline.split('\0');
+    let Some(program) = args.next() else {
+        return false;
+    };
+    Path::new(program).file_name().and_then(|name| name.to_str()) == Some("simadmin")
+        && args.next() == Some("device-init")
+        && args.next() == Some("")
+        && args.next().is_none()
+}
+
 /// A process whose network namespace differs from ours is a UE worker, not a
-/// competing SimAdmin instance.
-fn runs_in_ue_namespace(pid: u32) -> bool {
-    let theirs = fs::read_link(format!("/proc/{pid}/ns/net"));
-    let ours = fs::read_link("/proc/self/ns/net");
+/// competing SimAdmin instance. The root parameter is only a procfs fixture
+/// seam; production always reads /proc without executing or stopping a process.
+fn runs_in_ue_namespace(proc_root: &Path, pid: u32) -> bool {
+    let theirs = fs::read_link(proc_root.join(format!("{pid}/ns/net")));
+    let ours = fs::read_link(proc_root.join("self/ns/net"));
     match (theirs, ours) {
         (Ok(theirs), Ok(ours)) => theirs != ours,
         _ => false,
     }
 }
 
-fn require_stopped() -> Result<(), String> {
-    require_no_bearer_receipts()?;
-    // Maintenance must not race any manager process, including beta8 started
-    // manually. Inspect cmdline/exe locally; never print their values.
-    for item in fs::read_dir("/proc").map_err(|_| ERROR)? {
+fn require_no_competing_manager(proc_root: &Path, current_pid: u32) -> Result<(), String> {
+    for item in fs::read_dir(proc_root).map_err(|_| ERROR)? {
         let item = item.map_err(|_| ERROR)?;
         let Some(pid) = item
             .file_name()
@@ -1084,13 +1109,11 @@ fn require_stopped() -> Result<(), String> {
         else {
             continue;
         };
-        if pid == std::process::id() {
+        if pid == current_pid {
             continue;
         }
-        // UE workers are this same binary re-executed inside a per-line network
-        // namespace. They are children of the service, not a second instance,
-        // and an orphaned worker must not block recovery of the physical line.
-        if runs_in_ue_namespace(pid) {
+        // Existing UE namespace exclusion remains separate from CLI role.
+        if runs_in_ue_namespace(proc_root, pid) {
             continue;
         }
         if let Ok(exe) = fs::read_link(item.path().join("exe")) {
@@ -1098,11 +1121,23 @@ fn require_stopped() -> Result<(), String> {
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy().contains("simadmin"))
             {
-                return Err("mm_ims_profile_lease_other_simadmin_running".into());
+                let initializer = fs::read(item.path().join("cmdline"))
+                    .ok()
+                    .is_some_and(|cmdline| is_device_initializer_process(&exe, &cmdline));
+                if !initializer {
+                    return Err("mm_ims_profile_lease_other_simadmin_running".into());
+                }
             }
         }
     }
     Ok(())
+}
+
+fn require_stopped() -> Result<(), String> {
+    // Do not weaken bearer ownership or maintenance exclusion. Only the
+    // positively identified non-manager device initializer is no competitor.
+    require_no_bearer_receipts()?;
+    require_no_competing_manager(Path::new("/proc"), std::process::id())
 }
 
 /// Root-only explicit diagnostic command. Only `probe` activates a bearer;
@@ -1323,6 +1358,85 @@ mod dbus_tests;
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicI32;
+
+    struct ProcFixture(PathBuf);
+    impl ProcFixture {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "simadmin-process-role-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::create_dir_all(root.join("self/ns")).unwrap();
+            std::os::unix::fs::symlink("net:[host]", root.join("self/ns/net")).unwrap();
+            Self(root)
+        }
+        fn process(&self, pid: u32, executable: &str, cmdline: Option<&[u8]>, namespace: &str) {
+            let root = self.0.join(pid.to_string());
+            fs::create_dir_all(root.join("ns")).unwrap();
+            std::os::unix::fs::symlink(executable, root.join("exe")).unwrap();
+            std::os::unix::fs::symlink(namespace, root.join("ns/net")).unwrap();
+            if let Some(cmdline) = cmdline {
+                fs::write(root.join("cmdline"), cmdline).unwrap();
+            }
+        }
+    }
+    impl Drop for ProcFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn device_initializer_does_not_block_same_namespace_startup_recovery() {
+        let proc = ProcFixture::new();
+        proc.process(354, "/opt/simadmin/simadmin", Some(b"/opt/simadmin/simadmin\0device-init\0"), "net:[host]");
+        proc.process(1099, "/opt/simadmin/simadmin", Some(b"/opt/simadmin/simadmin\0"), "net:[host]");
+        assert_eq!(require_no_competing_manager(&proc.0, 1099), Ok(()));
+    }
+
+    #[test]
+    fn initializer_old_inode_after_atomic_upgrade_remains_non_manager() {
+        let proc = ProcFixture::new();
+        proc.process(354, "/opt/simadmin/simadmin (deleted)", Some(b"/opt/simadmin/simadmin\0device-init\0"), "net:[host]");
+        assert_eq!(require_no_competing_manager(&proc.0, 1099), Ok(()));
+    }
+
+    #[test]
+    fn true_second_manager_still_blocks_with_initializer_present() {
+        let proc = ProcFixture::new();
+        proc.process(354, "/opt/simadmin/simadmin", Some(b"/opt/simadmin/simadmin\0device-init\0"), "net:[host]");
+        proc.process(1200, "/opt/simadmin/simadmin", Some(b"/opt/simadmin/simadmin\0serve\0--port\x003001\0"), "net:[host]");
+        assert_eq!(require_no_competing_manager(&proc.0, 1099), Err("mm_ims_profile_lease_other_simadmin_running".into()));
+    }
+
+    #[test]
+    fn ambiguous_initializer_metadata_does_not_bypass_manager_exclusion() {
+        for (executable, cmdline) in [
+            ("/opt/simadmin/simadmin", Some(b"simadmin\0device-init\0serve\0".as_slice())),
+            ("/opt/simadmin/simadmin", Some(b"simadmin\0device-init".as_slice())),
+            ("/opt/simadmin/simadmin", Some(b"simadmin\0device-init-extra\0".as_slice())),
+            ("/opt/simadmin/simadmin", Some(b"other\0device-init\0".as_slice())),
+            ("/opt/simadmin/not-simadmin", Some(b"simadmin\0device-init\0".as_slice())),
+            ("/opt/simadmin/simadmin", None),
+        ] {
+            let proc = ProcFixture::new();
+            proc.process(354, executable, cmdline, "net:[host]");
+            assert_eq!(require_no_competing_manager(&proc.0, 1099), Err("mm_ims_profile_lease_other_simadmin_running".into()));
+        }
+        assert!(!is_device_initializer_process(Path::new("/opt/simadmin/simadmin"), &[0xff, 0]));
+        assert!(!is_device_initializer_process(Path::new("/opt/simadmin/simadmin"), &vec![0; 16_385]));
+    }
+
+    #[test]
+    fn existing_ue_namespace_exclusion_and_self_pid_are_preserved() {
+        let proc = ProcFixture::new();
+        proc.process(1099, "/opt/simadmin/simadmin", Some(b"simadmin\0"), "net:[host]");
+        proc.process(1200, "/opt/simadmin/simadmin", Some(b"simadmin\0ue-worker\0"), "net:[ue]");
+        assert_eq!(require_no_competing_manager(&proc.0, 1099), Ok(()));
+    }
 
     fn baseline() -> Snapshot {
         Snapshot {

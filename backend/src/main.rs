@@ -353,6 +353,29 @@ mod mm_startup_policy_tests {
         .is_err());
     }
     #[test]
+    fn secondary_device_initializer_cli_is_not_a_management_server() {
+        let cli = Cli::try_parse_from(["simadmin", "device-init"]).unwrap();
+        assert!(matches!(cli.command, Some(CliCommand::DeviceInit { write_udev_rule: true, dry_run: false })));
+        let unit = include_str!("../../deploy/devices/qcm410/system/simadmin-secondary-qmi.service");
+        assert!(unit.lines().any(|line| line == "ExecStart=/opt/simadmin/simadmin device-init"));
+        for path in ["/opt/simadmin/simadmin", "/opt/simadmin/simadmin (deleted)"] {
+            assert!(hardware::devices::qcm410::mm_ims_profile_lease::is_device_initializer_process(
+                std::path::Path::new(path), b"/opt/simadmin/simadmin\0device-init\0"
+            ));
+        }
+    }
+
+    #[test]
+    fn actual_management_server_cli_remains_a_competing_process() {
+        let cli = Cli::try_parse_from(["simadmin", "serve", "--port", "3001"]).unwrap();
+        assert!(matches!(cli.command, Some(CliCommand::Serve(ServeArgs { port: 3001, .. }))));
+        assert!(!hardware::devices::qcm410::mm_ims_profile_lease::is_device_initializer_process(
+            std::path::Path::new("/opt/simadmin/simadmin"),
+            b"/opt/simadmin/simadmin\0serve\0--port\x003001\0"
+        ));
+    }
+
+    #[test]
     fn running_debug_with_platform_options_is_preserved() {
         assert!(modemmanager_debug_command(
             std::path::Path::new("/usr/sbin/ModemManager"),
