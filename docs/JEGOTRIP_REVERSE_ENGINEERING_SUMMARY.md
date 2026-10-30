@@ -1,14 +1,15 @@
 # 无忧行 APK 与原生通信协议逆向成果总结
 
-> 整理基线：2026-10-28；对象为本项目持有的无忧行 APK 样本及其中的 ARM64 `libmtc.so`。
-> 已核验源码：`2986a3d8b1283d8aaa428d252ab83098a1f311bf`；对应手册检查点：`9901cd1f2fa0cd43a2211914539affa9c185bc08`。
+> 初始整理：2026-10-28；对象为本项目持有的无忧行 APK、ARM64 `libmtc.so` 与账号登录保护层 `libidss-cn.so`。
+> 后续补齐业务开通/号码验证边界及NAOP原生入口，并实现App账号登录接线；最新已核验源码为 `d44916340b87e8562a046f782fc706d6711a6790`（实现8dd159f，前端生命周期修复d449163）。
+> 本文区分静态还原、隔离软件验证与真实服务验收；完整私有部署上下文和实网验收仍未完成。
 > 本文汇总逆向事实、已落地实现及验证边界，不包含账号凭据、SDK 内置密钥、私钥或可直接重放的服务请求。最新项目状态仍以 [HANDOFF](HANDOFF.md) 为准。
 
 ## 1. 核心结论
 
 1. **无忧行托管不是直接复用 SIM 的 IMS/VoWiFi 注册。** App 使用 Juphoon/Justalk SDK；已还原的路径是应用账号登录、原生 ARC/Common RPC、SipGateway 托管、CallEx 来电及 Endpoint/Mpath 媒体。发现 `SipGateway` 名称不等于证明可以对某个公网 SIP SBC 直接注册。
 2. **凭据至少分为 App API 会话、电话 SDK 登录、原生 ARC 会话和托管网关四个层次。** 它们的 token、会话选择器、应用配置和 SIP 密码不能互换。
-3. **基础入站链路已在 Rust 后端落地。** 包括显式参数导入、登录/托管、接短信与历史/通知、来电应答/挂机、双向音频和 Trunk，以及原运行清理、有界重连和带标记的退出进程恢复。
+3. **基础入站链路及App密码登录接线已在Rust后端落地。** 新入口用已绑定号码的App账号获取个人phone token/SipPwd，提交正常认证的开通请求并读回确认，再创建独立账号/可启动原接收器；高级显式导入仍保留。来电应答/挂机、短信历史/通知、双向音频/Trunk、重连和退出恢复均有隔离验证。**安装侧私有部署上下文仍必需；不自动取消旧业务、重新绑号、完成额外安全挑战或推断实网可用。**
 4. **原生 `RseEx.SDP` 有 raw 与压缩编码两条路径。** 已追踪 Base64 检测、解码/解压和按邀请格式回复；后端实现 raw 或 zlib＋Base64，Trunk/API 始终使用 raw SDP。
 5. **静态分析不等于服务验收。** 已执行的是 SimAdmin 与隔离协议对端的测试，不是运行原 Android SDK，也不是连接真实无忧行服务。当前仍没有真实账号、部署、账单或长期在线互通验收结论。
 6. **仍有可继续研究的未知分支。** 自动续期、完整 Locator/NetStream、其他媒体组合及远端设备并发语义尚未闭合；不能把“尚未找到引用”写成“代码不存在”，也不能把已实现子集写成完整 SDK 的等价重实现。
@@ -30,6 +31,7 @@
 | `com.cmi.jegotrip.apk` | 132422053 | `9874f23c3cfde41cecfc23b67b6da7d81e161a81cc875d05fc33483b89478a1e` |
 | APK 外层 `classes.dex` | 47202304 | `6fc989494a528b43bb060e60b941cd44c01c812e3a3112bddeb270c78da946e4` |
 | `lib/arm64-v8a/libmtc.so` | 24598088 | `57086cd624d8227dc1b1b64a63d7c8b2258f87b261779b681a9bfd306ad9d2e8` |
+| `lib/arm64-v8a/libidss-cn.so` | 2854912 | `36532a37ecbd38269b5d9432ea0cea3118568b0dc9619553bc4966a7d0957498` |
 
 外层 `classes.dex` 中重新定位并校验了 **7 个嵌套 DEX**，而不是只分析外层少量类。下列偏移均相对于该外层 DEX，不是 APK ZIP 文件偏移或运行时地址：
 
@@ -48,7 +50,7 @@
 ### 2.2 分析边界
 
 - DEX 使用已有 Androguard 4.1.4 只读解析，未执行 APK 或反序列化不受信任的 Java 对象。
-- IDA 只读使用用户已打开的原 `libmtc.so`；核对文件 SHA-256 与基址 `0`，未 patch、rename、修改类型或保存 IDB。
+- IDA只读使用用户手动打开的原`libmtc.so`/`libidss-cn.so`，分别核对SHA-256和基址；未patch、rename、创建函数、修改类型或保存IDB。NAOP派生image只在私有目录做数据解析/Capstone分析，不执行或擅自加载到IDA。
 - 用 ELF 重定位、FDE 函数边界和 ARM64 指令交叉核对反编译，避免把合并的异常处理入口或虚表中段误认成函数。
 - Rust、前端及编译后的协议对端仅在 GitHub Actions 执行；本机仅做静态/mock 检查与文件/制品核验。
 - 所有 native 地址仅是**上述样本的证据定位**，不是生产程序硬编码地址，也不能移用于不同版本。
@@ -84,6 +86,51 @@ JustalkManager → JCClientImpl → MtcEngine → JNI → libmtc
 
 正常停止需要区分：托管注销 `status=3` 的原请求结果、SDK `logoutSession` 的结果、原 actor/consumer/媒体/Trunk 的实际退出，以及本地持久运行记录的释放。不能只看到 socket 关闭就宣称所有清理成功。
 
+### 3.1 业务开通、设备验证与在线注册是不同层
+
+“托管”在 App 中不只指 `JCAccount.updateStatus(4)`。2026-10-29 对实际样本的业务与 SDK 两个嵌套 DEX 补查，确认以下区别：
+
+| 层次 | APK 中的实际路径 | SimAdmin 当前范围 |
+| --- | --- | --- |
+| 业务开关/呼转状态 | `TrusteeShipOperateActivity.openOrCloseCallState → CallLogic.setVoipCsState`，通过 App HTTP 提交 `cs_forward`、`device_id`；成功回调更新状态并触发在线注册 | 新App登录入口已接正常认证开通/读回确认；不自动关闭旧业务 |
+| 号码/安全设备验证 | `TrusteeShipVerActivitiy → MobileAuthUtil → AuthnHelper`，另有 `querySafeDevice` 与 `sendSecurityVerify` 的服务端验证 | 已定位原调用与结果门槛；**未移植认证流程** |
+| 电话 SDK 登录 | 原账号身份＋`phone_login_token`，成功取得原生会话认证结果 | 已实现显式凭据路径，须真实原回包 |
+| 在线网关注册/注销 | `RegisterTimer → JustalkManager.updateStatus → JCAccount.updateStatus`；注册 `4`、注销 `3` | 已实现，和登录、接收通道及媒体就绪分开 |
+| 来电/短信接收 | CallEx / Sip.Request / Endpoint-Mpath | 已实现受支持子集并隔离验证，尚无实网验收 |
+
+**普通账号的 `start/stop` 仍只管理本客户端在线注册/注销与资源，不开通或取消服务端托管/呼转；新App登录入口是独立、明确授权的业务开通操作。** 高级导入的`hosting.enrollment_confirmed`仍是用户声明，设为true不创造权益。新流程不会从该布尔值、SDK回执或Android UI验证标志推断业务成功，而是检查原App会话的服务响应与业务状态。
+
+### 3.2 “不插卡”能确认到哪一步
+
+**本机不需要 SIM，与服务端无需授权，是两回事。**
+
+- 实际 `SysApplication.getMobilePhone()` 取 `User.getMobile()`，`getAreaCodeMobileNum()` 再拼接账号区号；已追踪的登录/网关注册使用账号与缓存凭据，不是在这条路径中调用 `getLine1Number()` 读取本机 SIM 号码。当前 Rust 客户端同样使用独立 `app_account` / `application_data`，不依赖本机 modem、ICCID 或 SIM AKA。
+- 但 App 的号码验证页还会检查电话状态权限并调用 `MobileAuthUtil.getTokenImp`。这里得到的是**号码/安全设备认证 token**，不是 `csb/token` 返回、用于 `JCClient.login` 的 phone-login token。
+- 已确认 `TrusteeShipVerActivitiy.receiveFail()` 会转入安全设备后备查询，**不是直接宣布验证成功**。`querySafeDevice` 的回调要求服务响应 `code == "0"`、body 存在且 `authentication_code == "1"` 才进入成功分支；后续 `sendSecurityVerify` 的回调也有相同结果门槛。这证明存在后备校验，不证明无卡请求会被服务器接受。
+- 本次没有运行这些 HTTP 请求，没有改 App 的检测、缓存或服务器状态，也没有验证第三方所谓“绕过”脚本。未出现某个 SIM getter 不能作为全 App 无插卡限制的证明。
+
+| 常见说法 | 当前结论 |
+| --- | --- |
+| SimAdmin 主机可以不插实体 SIM | 客户端架构不依赖本机卡；实际使用仍需自有有效凭据、已开通业务及受支持的服务部署 |
+| 已开通后，拔卡/换设备仍一定能收电话短信 | 尚无实网证据，不能承诺设备绑定、撤销、到期或并发条件下的表现 |
+| 不验证号码、不开通业务、无有效凭据也可接管号码 | 没有证据支持，当前实现不提供这种能力 |
+
+本次只读扫描覆盖已定位的 `0x8E0000`、`0x1AA0000` 两个 DEX，共 16628 类、112251 个方法定义，并验证 DEX SHA-1/Adler-32；这是正向调用链核查，不是所有反射、动态代码或服务端规则的穷尽证明。主要定位（**解压后 `classes.dex` 中的 code_item 偏移，不是 native 地址**）：`getMobilePhone 0xED321C`、业务开关 `0xF13148 → 0x113E1D4`、号码认证 `0xF14460 → 0x1141E44`、后备查询 `0xF14C00 → 0x113DF28`、两个服务结果消费者 `0xF13CC8 / 0xF13E84`。
+
+### 3.3 账号登录原生入口恢复与已验证接线
+
+用户要求的主要使用方式现已接入：**登录已绑定相应手机号的App账号，由程序获取通话凭据并请求开启托管**，而不是手工提取个人SDK token/SipPwd。软件验证不等于当前服务器接受任意账号或部署参数已齐备。
+
+实际APK三个登录入口为`private native`、DEX `code_off=0`。用户打开原`libidss-cn.so`后，已通过只读IDA追到NAOP加载器并静态恢复内层模块的1049符号，独立SysV哈希查找和原函数字节比较通过：账号入口内层RVA`0xC15E0`，手机号密码入口`0xCD594`，验证码入口`0xC9500`。这些是**内层模块RVA，不是当前外层libidss的IDA地址**。
+
+实际JNI调用及实参确认：通用账号用户名trim、口令不trim；口令经`UIHelper.doMd5Encrypt → DES.md5Pwd`，使用原salt前缀＋口令的MD5小写hex。两个密码入口均设置userType字符串`0`、site默认1，手机号入口另设countryCode；不能从字段名猜成原文密码或userType 1/2。原salt和部署值不在本文公开。该入口本身不先调用本机一键号码认证，但服务仍可能返回额外安全验证、迁移或既有业务处理分支，不能忽略。
+
+**`d449163`已完成正常密码入口的API/UI接线和隔离验证。** 后台通过原App会话读取绑定号码、获取phone token和SipPwd，并以明确用户授权请求开通；预查原已开启则不重复写，否则在接受后再次查询`cs_forward=2`才创建账号。不会调用或伪造手机一键验证，也不复制原密码埋点或因`2006`自动关闭旧呼转；`88001`安全挑战、迁移、拒绝等仍停止并如实报告。
+
+实现使用固定HTTPS origin、独立App/SDK密钥上下文和持久登录任务ID；2并发、120秒预算、4096条ID记录，先标`request_uncertain`再发业务写请求，超时/进程退出不重放。只保留脱敏任务信息；SDK成功、hosting、短信/来电ready和媒体各自核验。新入口创建新line，不自动覆盖原运行或实现token续期。
+
+入口与一次性私有`jegotrip-login.json`格式见[开发指南](DEVELOPER.md#app账号登录主入口与一次性部署配置)。**仍需实际匹配的App/原生部署上下文；本机仅提取了共享HTTP默认值的private partial context，不能当完整配置。** 没有运行原APK/SDK或访问真实服务，未改原SO/IDB。原生还原证据见`account-login-20261029/idss-research/verified-recovery.json`，新实现验证见`verified-native-d449163.json`。
+
 ## 4. 凭据、配置与 token 续期
 
 ### 4.1 不能混用的字段
@@ -91,6 +138,7 @@ JustalkManager → JCClientImpl → MtcEngine → JNI → libmtc
 | 材料 | 静态来源/使用位置 | 用途与限制 |
 | --- | --- | --- |
 | App API 会话 token | HTTP 配置或已登录 `User` 对象 | 认证 App HTTP 请求；不是电话 SDK 登录 token |
+| 号码/安全设备认证 token | `MobileAuthUtil` / `AuthnHelper` 的原回调 | 用于 App 号码/安全设备核验；不是 SDK phone-login token，当前不作为 SimAdmin 凭据字段导入 |
 | 电话登录 token | `csb/token` 的 `body.token`，原本地偏好；另一路为 `CallUserInfo.cstToken` | `JCClient.login` 第二参数；原生登录 metadata 的 `pwd` |
 | SIP 网关密码 | `VoipStatus.sipPassword`，经 `decryptThreeDESECB` 处理 | 托管 `SipPwd`；不能直接用缓存密文或电话 token 替代 |
 | SDK application key | `JCClient.create` 的原配置 | 标识 SDK 应用上下文；不是用户授权或免认证凭据 |
@@ -309,7 +357,8 @@ App 显式设置 server address，**不等于证明 native 内部永远不会解
 
 | 功能 | 当前状态/边界 |
 | --- | --- |
-| 独立账号 | `app_account` / `application_data`，私有配置、revision CAS、显式 start/stop；导入不授 readiness |
+| 独立账号 | `app_account` / `application_data`；App密码登录或高级参数导入、revision CAS、显式接收器start/stop；导入/HTTP接受不授readiness |
+| 业务开通/安全设备认证 | 新登录入口已接正常开通请求/状态确认；不自动完成额外安全验证或取消旧业务，原start/stop语义不变 |
 | 接短信 | 原 `Sip.Request` 文本、durable 落库、历史查询/删除、通知与原回执 |
 | 接电话 | 原 CallEx 邀请、应答/拒绝/挂机、history/event、Endpoint/Mpath 与双向 RTP/Trunk |
 | 媒体格式 | native raw 或 zlib＋Base64 SDP；API/Trunk raw，支持范围见第 7 节 |
@@ -336,23 +385,28 @@ App 显式设置 server address，**不等于证明 native 内部永远不会解
 
 | 项目 | 记录 |
 | --- | --- |
-| 源码提交 | `2986a3d8b1283d8aaa428d252ab83098a1f311bf` |
-| Build-Release | [40585189198](https://github.com/autisticryptic/SimMaster/actions/runs/40585189198) |
-| Validate Beta Refactor | [40585189753](https://github.com/autisticryptic/SimMaster/actions/runs/40585189753) |
+| 源码提交 | `d44916340b87e8562a046f782fc706d6711a6790`（实现8dd159f） |
+| Build-Release | [41002428358](https://github.com/autisticryptic/SimMaster/actions/runs/41002428358) |
+| Validate Beta Refactor | [41002428390](https://github.com/autisticryptic/SimMaster/actions/runs/41002428390) |
 | 体系结构 | ARM64 / AMD64 构建成功 |
 | 发布 | `Publish Release` 按预期 skipped，不是部署或新 Release 验收 |
-| 每套核验集合 | 757 Jegotrip、7 registry、17 account HTTP、46 Trunk、31 notification、4 SIP、7 DNS；保留 86 场景矩阵 |
-| 该检查点本机检查 | 447 项 Python static/mock 通过；不是本机 Rust 执行 |
+| 每套核验集合 | 780 Jegotrip（23项新App登录）、7 registry、19 account HTTP、46 Trunk、31 notification、4 SIP、7 DNS；保留86场景矩阵 |
+| 该检查点本机检查 | 453项Python static/mock单次通过；不是本机Rust执行 |
+| 前端检查 | 两作业执行lint/build/type-check/test:unit成功，含7项新Node测试；不当浏览器E2E证明 |
 | 编译警告 | 每工作流保留 67 条 warning 记录，不声称零 warning |
 
 上述回归集合可能重叠，**不可直接相加当成不重复的测试总数**。核验除了工作流成功，还包括源码提交、逐名测试清单、官方 artifact digest、ZIP CRC 和矩阵结果。Actions artifact 有保留期限，未来不可下载不改变当时本地留存的核验记录。
 
 | 测试制品 | Artifact ID | SHA-256 |
 | --- | ---: | --- |
-| Build `ims-refresh-tests` | 12772387707 | `2e8e4150867c4b31ffc2e9da720a655d2a1a4efd92a68936a83eaccc238d8477` |
-| Beta `beta-refactor-tests` | 12771222636 | `8fa4eda1c46cf697ce3d5f39db44d46dd493bd9f3cb10d10384e5ffca588cafc` |
+| Build `ims-refresh-tests` | 12954725911 | `6534b64151874ac834611aa9f52792adacd4cfd9c183cb5649256fff049f1c3e` |
+| Beta `beta-refactor-tests` | 12954795258 | `bea6ba8f3a10a290eb587a3dc78428d1e063593667b84928f081b86563ec2939` |
 
 ### 10.2 测试证明了什么
+
+- 新增App登录回归覆盖独立crypto固定向量、绑定号码不一致、额外挑战、真实隔离HTTPS/错误根/不跟重定向、业务原已开启不重写、开通不确定不重放、重启/关机和状态落库失败。完整账号夹具以获取的phone token/SipPwd进入实际原native TLS/Common peer，完成原SDK认证、短信/原ACK及注销Join；不是只测试helper返回成功。
+- 首8dd159f的两个前端作业因effect cleanup读取变化的ref触发lint失败，Beta后端已过但整体仍失败；d449163仅修原scope对象生命周期，没有关闭规则，最终两套全部通过。原annotations/失败ZIP及WSL发布路径/审计网络恢复记录保留。
+- 原压缩SDP检查点为2986a3d（Build40585189198/Beta40585189753，各757项）；下述既有覆盖在新780项中保留，不把旧子阶段结果换算成新实网证明。
 
 - 已有基础链路测试覆盖生产账号管理器、隔离 TLS/native 协议对端、HTTP 认证、SIP/OperatorLink、实际 loopback UDP 双向 RTP、短信提交/回执、通知及原资源 Join。
 - 压缩增量新增 5 项回归：固定 zlib 数据、URL-safe 输入/标准输出、混合/尾随/超限拒绝、解压后 crypto 属性拒绝、实际账号收到压缩邀请后对 API 暴露 raw 并发送压缩 native Accept。
@@ -368,6 +422,8 @@ App 显式设置 server address，**不等于证明 native 内部永远不会解
 | 未闭合问题 | 需要什么 | 当前处理 |
 | --- | --- | --- |
 | 自动 token 续期 | 自有账号的授权请求/响应、TTL/轮换/撤销错误、设备绑定、活动会话交接 | 手工重新导入；重连不冒充续期 |
+| 额外安全验证/迁移、原地重新认证 | 原服务挑战续接、认证材料/撤销与旧运行交接证据 | 已实现正常密码登录/开通；挑战只报告，暂不自动完成或覆盖旧line |
+| 默认部署上下文自动装配 | 实际匹配的HTTP/native完整配置和原始选择证据 | 仍需安装侧私有上下文；partial共享HTTP提取物不是完整配置 |
 | 实际部署参数与长期在线 | 原账号完整参数、服务选择的模式、断线/到期/长时间接收观察 | 不从静态常量或缓存状态猜 readiness |
 | 压缩 wire 的完整互通 | 实际邀请/应答样本与原 SDK 上下文，必要时核对预置字典或流状态 | 当前支持有界普通 zlib＋Base64 子集 |
 | Locator / NetStream / 全部 Router-Channel | 原调用者、wire schema、路由/缓存/重传与释放状态机 | 局部结构/codec 不扩充为完整 runtime |
@@ -386,6 +442,7 @@ App 显式设置 server address，**不等于证明 native 内部永远不会解
 
 | 主题 | 主要模块 |
 | --- | --- |
+| App账号登录 | `app_login/{mod,config,crypto,http,store,tests}.rs`：持久任务、私有部署、原App密码/HTTPS/业务结果及原账号接线 |
 | 凭据与阶段 | `credentials.rs`、`session.rs`、`controller.rs` |
 | Common/RPC | `rpc_stream.rs`、`rpc_envelope.rs`、`rpc_login.rs`、`rpc_batch.rs`、`rpc_arguments.rs`、`rpc_logout.rs` |
 | 下层边界与 TLS | `packet_stream.rs`、`router_packets.rs`、`tls_plaintext.rs`、`tls_engine.rs`、`transport_actor.rs` |
@@ -439,6 +496,13 @@ App 显式设置 server address，**不等于证明 native 内部永远不会解
 .local/jegotrip/static-20261028/compressed-sdp-verification-summary.json
 .local/jegotrip/static-20261028/compressed-sdp-first-failure.md
 .local/jegotrip/verified-native-2986a3d.json
+.local/jegotrip/verified-native-d449163.json
+.local/jegotrip/account-login-20261029/idss-research/verified-recovery.json
+.local/jegotrip/account-login-20261029/implementation-verification.json
+.local/jegotrip/account-login-20261029/first-failure-and-recovery.md
+.local/jegotrip/resume-20261029/hosting-findings.md
+.local/jegotrip/resume-20261029/hosting-manifest.json
+.local/jegotrip/resume-20261029/hosting-selected-disassembly.txt
 ```
 
 旧证据文件中的“尚未实现”只属于其记录的提交阶段；查当前功能时应结合源码基线和 [HANDOFF](HANDOFF.md)。反过来，后续摘要中的简化表述也不能抹去更早的正向字节证据，例如 NetStream 的 GOT/base＋offset 构造定位。

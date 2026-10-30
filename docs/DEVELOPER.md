@@ -153,9 +153,9 @@ python3 -B offline-registration-sim/run.py --fallback --report offline-registrat
 
 ## 无忧行托管：静态证据、凭据与实现边界
 
-当前目标是**基础接电话、应答、挂机、双向音频与 Trunk，以及接短信、查询/删除、通知和原生回执**；外呼、发短信只保留接口。登录/号码绑定 UI 暂缓，由用户从自己的 root 手机取得现有参数。账号使用独立 `app_account` / `application_data` 线路，不借 SIM、五码、UICC、IMS/CS 或免费 WLAN 资费。
+当前目标是**基础接电话、应答、挂机、双向音频与 Trunk，以及接短信、查询/删除、通知和原生回执**；外呼、发短信只保留接口。现支持**已绑定号码的App账号登录，由程序取得电话凭据并请求开启托管**，高级手工参数导入保留兼容。账号登录接线已经`d449163`软件验证，但仍需一次性私有部署上下文，尚未访问真实服务或验收实际号码。账号使用独立 `app_account` / `application_data` 线路，不借 SIM、五码、UICC、IMS/CS 或免费 WLAN 资费。
 
-当前源码 `c6f0ba1` 已由两套 Actions、官方摘要产物和双架构核验；在基础入站整链、全生命周期来电收尾、可选断线清理和原 Trunk 排空之上，补齐DIRECT与batch长期接收的独立回收证明。原邀请→应答→Endpoint TCP-Mpath↔UDP RTP→挂机、认证 HTTP、Asterisk 侧 SIP 与通话期间 SMS 均有隔离执行证据，**不是已连接无忧行、设备部署或资费验收**。用户所述入站免费不替代实际账单证据。
+当前运行时源码基线为 `d449163`（账号登录实现8dd159f、后续仅修前端生命周期），两套Actions/双架构及官方digest ZIP逐名各780 Jegotrip、19HTTP和原回归通过；其中 `c6f0ba1` 在基础入站整链、全生命周期来电收尾、可选断线清理和原 Trunk 排空之上，补齐DIRECT与batch长期接收的独立回收证明。原邀请→应答→Endpoint TCP-Mpath↔UDP RTP→挂机、认证 HTTP、Asterisk 侧 SIP 与通话期间 SMS 均有隔离执行证据，**不是已连接无忧行、设备部署或资费验收**。用户所述入站免费不替代实际账单证据。
 
 ### 1. 纠正旧勘察结论
 
@@ -183,10 +183,53 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 另有 `loginUnLoginApp` 使用 `CallUserInfo.cstToken`，但已见调用用途包括免费/紧急呼叫；
 不能把它解释为“未登录也能无条件托管本人 SIM”。
 
-因此 SimAdmin 可以设计为“导入现有凭据 → SDK 会话 → 托管网关注册”，不实现登录 UI。
+既有显式导入路径继续保留。新的账号登录接入已验证：原libidss NAOP恢复出的实际密码处理为原salt前缀＋密码的MD5小写hex，userType=`0`、site默认1；后台通过原App会话读取绑定号码和个人电话凭据，提交正常认证的开通请求并确认业务状态后才创建账号。Android本机一键号码认证不是该新入口前置步骤，但真实服务器的挑战或拒绝仍会停止流程，不能据软件测试承诺免所有验证。
 是否实际可用仍取决于服务端托管开通、凭据有效性、设备/会话绑定以及续期。
 
-### 3. 手动取得的必要参数（只列名字，不提供用户或 App 内置值）
+#### 业务开通与本机无卡的区别
+
+2026-10-29 补查实际APK：`setVoipCsState`通过App HTTP操作托管/呼转业务状态，`TrusteeShipVerActivitiy`经`MobileAuthUtil/AuthnHelper`及安全设备接口核验；它们不是`JCAccount.updateStatus(4)`。新账号登录入口已接入正常业务开通请求，但不自动完成额外安全设备/号码验证；高级导入的`hosting.enrollment_confirmed`仍只是用户声明，不是远端开通接口。
+
+- 当前`start`只启动在线登录/网关注册，`stop`只注销原客户端并清理资源；**不等于开通/取消号码的服务端托管或呼转**。
+- 已追踪号码来自`User.getMobile()`，独立app-account无需本机SIM/modem；这不能证明未开通、换设备、拔卡、到期后仍获服务许可。
+- APK号码认证失败会进入服务端后备校验，而非直接成功；两个相关回调仍检查`code=0`与`authentication_code=1`。本机号码认证token与SDK phone-login token不能互换，后备路径未做实网验证。
+
+完整静态定位与范围见[逆向总结](JEGOTRIP_REVERSE_ENGINEERING_SUMMARY.md#31-业务开通设备验证与在线注册是不同层)。新入口不伪造`authentication_code=1`，而是用已登录App账号请求并检查服务器结果；业务原已开启则不重复开通。
+
+### App账号登录：主入口与一次性部署配置
+
+在原工作台的**无忧行应用账号 → 账号登录**，或**新建WLAN线路 → 无忧行（账号登录）**选择通用账号/手机号密码模式。填写账号、密码和手机号模式的区号，并明确勾选登录/开通授权；用户不填写个人SDK phone token或SipPwd。提交后可关闭窗口，任务继续在后台有界执行，结果可从应用账号区找回；不要因浏览器未收到POST响应而重复提交。
+
+后台读取与`data.db`同目录的 **`jegotrip-login.json`**。这是一份安装侧私有上下文，不是每个用户的电话凭据，也不是公开示例；需匹配原App与已支持的native部署。文件应限制为服务用户可读（建议0600），不是加密存储；不要把密钥、原APK或该文件提交Git。初始化只恢复任务元数据，**显式登录时才读文件/访问服务**；缺文件、格式错误或未取得原数据库OS锁则拒绝登录。
+
+| 配置块 | 字段与要求 |
+| --- | --- |
+| 顶层 | `version: 1`、`http`、`runtime`；拒绝未知字段 |
+| `http`基本上下文 | `base_url`为可信HTTPS基础URL且以`/`结尾；`anonymous_token`、`signature_salt`、`password_salt`来自原App配置；`device_id`为明确的安装/设备标识，不读取本机SIM或伪造已知手机验证 |
+| `http.endpoints` | `login`、`user_info`、`phone_token`、`voip_status`、`call_status`、`enable_hosting`为同origin的相对路径；不接受协议、查询串、fragment、`..`或响应重定向 |
+| `http.body_protection` | 原isEntryBody选择；关闭为`null`（HTTPS内的普通JSON），启用为`{secret_id, secret_value}`；不合并到SDK密码或TLS信任 |
+| 其他HTTP字段 | `sip_password_key`须为JCA DESedeKeySpec实际使用的前24个UTF-8字节；`root_der_base64`可null用HTTP客户端默认公有CA信任，提供时只信任给定DER；`user_agent`、`enroll_id`可null。Body封装的AES/MD5/3DES只是旧协议兼容，不降级TLS/IMS算法 |
+| `runtime.sdk` | `application_key`、`server_address`、`device_id`、`selected_session_id`、`root_der_base64`、两个可选配置解包key；**不包含account_identity/phone_login_token或过期时间**，这些由本次绑定资料/凭据流程构造 |
+| `runtime.hosting` | 只含`authname_prefix`、`channel_id`、`delete_int_code`；**不含SipNumber/SipPwd/enrollment_confirmed** |
+| `runtime`其余项 | 原`profile`，可选`bootstrap`/`call_media`/`reconnect`及`cleanup_on_disconnect`；形状与下方高级配置相同，原生校验在业务开通请求之前进行 |
+
+默认SDK全部参数自动发现尚未实现，不能只凭账号猜出原生profile或把fixture值用于真实服务。当前本机仅提取了原APK共享HTTP默认上下文的私有partial文件（标记`_partial_not_deployment`），**它不是完整的可启用部署配置**；还需要实际匹配的native模板、设备标识和当前App配置选择。用户不必手动取得个人phone token/SipPwd，但安装侧配置与实网验证不能省略。
+
+| API | 语义 |
+| --- | --- |
+| `GET /api/non-3gpp/app-login/setup` | 只显示实现、文件存在及当前是否接受提交；文件存在不是配置已验证/服务可用 |
+| `POST /api/non-3gpp/app-login/attempts` | `{attempt_id, username, password, country_code, enable_hosting, start_receiver}`；attempt_id为客户端生成的32个小写hex字符（128位随机ID）；country_code为手机号区号数字或通用账号的null；enable_hosting须明确true。202只是持久入队 |
+| `GET .../attempts`、`GET .../attempts/{attempt_id}` | 最近32项/指定原任务；只返回阶段、业务结果、masked_number、本地line_id和稳定错误，不回显配置/口令/token/原服务正文 |
+
+任务有2并发、120秒预算，保留最多4096个ID而不自动驱逐去重记录；同ID再次提交409，不重放开通。`request_uncertain`在发请求前持久记录；`accepted_unconfirmed`表示已获接受但未读回确认，不能启动账号；只有读回`cs_forward=2`或原已开启才继续。超时/关闭窗口/进程退出都不自动重放，不自动关闭已有业务作为补偿。原OS锁证明下把遗留任务记interrupted；不按PID/年龄接管。状态落库失败可报告本manager观察到的错误，但不假称持久完成。
+
+正常密码登录`code=0`之外，`88001`额外验证、`2006`既有业务处置、`2044`迁移、维护/踢线等分别返回错误；不复制原App的密码埋点，也不因2006自动调用closeVoipForward。口令在App认证后清理，App会话只保留于原尝试；取得的个人SDK材料按原私有AccountConfig存储。App `expiredAt`不冒充SDK TTL，未知仍unknown。
+
+本次创建新本地line，不自动覆盖已有运行或实现原位续期。`start_receiver=true`只继续提交原接收器启动；SDK登录、HostingAck、短信/来电各自ready仍分开。界面只按原运行时就绪字段显示，不把任务completed当媒体已连通。`start/stop`仍只管客户端，不取消服务端托管；外呼/发短信仍501。
+
+已验`d449163`：Build41002428358/Beta41002428390、ARM64/AMD64、官方digest/CRC/逐名各780 Jegotrip＋19HTTP＋7registry＋46Trunk＋31通知＋4SIP＋7DNS/86矩阵；新增23回归含真实隔离HTTPS、错误根/不跟重定向、Crypto独立固定向量、任务重放/中断/持久化失败与App凭据→实际原生登录/短信/原ACK/注销Join。前端build/type-check/unit成功（7新Node测试），453本机static/mock通过，67warnings保留；不是浏览器E2E/真实App SDK/真实服务/新Release部署。
+
+### 3. 高级手工导入的必要参数（只列名字，不提供用户或 App 内置值）
 
 | 参数 | 静态来源 | 用途 |
 |---|---|---|

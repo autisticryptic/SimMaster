@@ -9,7 +9,7 @@
 
 - 应用接入位于 `connectivity/app_voice`，与 `modems/ims` 并列。无忧行/Google Voice/Telegram/iMessage分别实现，不能共享AKA/CS兜底/资费；旧import仅兼容。无忧行controller调度SDK（31d3739已由两套Actions各8项调度回归验证）不等于实现wire transport，iMessage不是语音运营商。
 
-- 无忧行托管与IMS/AKA分离：SDK phone token与托管SipPwd是两层凭据，App登录UI可暂缓但不省服务开通/到期。当前独立账号、显式TLS/ARC、来电/双向音频/Trunk、Smgw短信/通知、长期收件、可选重连和OS锁退出回收均有各阶段证据；`2986a3d`再支持按邀请镜像的raw或zlib＋Base64 SDP。这仍不是default Locator/NetStream、自动token续期、真实服务/账单或付费外发授权，不授SIM/IMS/CS兜底。[支持子集和参数](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行托管与IMS/AKA分离：SDK phone token与托管SipPwd是两层凭据；`d449163`已加入App账号登录/后台取个人电话凭据及正常业务开通入口，仍需一次性私有部署上下文，不能省略服务授权/到期。当前独立账号、显式TLS/ARC、来电/双向音频/Trunk、Smgw短信/通知、长期收件、可选重连和OS锁退出回收均有各阶段证据；`2986a3d`再支持按邀请镜像的raw或zlib＋Base64 SDP。这仍不是default Locator/NetStream、自动token续期、真实服务/账单或付费外发授权，不授SIM/IMS/CS兜底。[支持子集和参数](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - 蜂窝 IMS 是语音、短信、补充业务共享的接入；VoLTE/VoNR 是语音能力，不是注册开关。
 - 已实现接入协调、协商门禁、受保护续期和按来源解析 profile；不承诺所有网络互通。
@@ -428,6 +428,11 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 
 ### 当前基础入站契约
 
+- App账号登录接线已由`d449163`两Actions、双架构与官方摘要制品核验（各780 Jegotrip＋19HTTP及原回归/86矩阵，前端检查通过）。新入口在后台获取个人电话凭据，不要求用户填SDK token/SipPwd；一次性私有App/native部署上下文仍必需，不等于默认SDK自动配置或实网已验收。
+
+- **业务开通不等于在线注册。** 新账号登录入口可按明确用户操作提交`setVoipCsState`正常认证请求，并在服务器接受/读回开启后创建账号；不调用或伪造手机一键认证、不把`authentication_code`置1，服务器挑战/迁移/拒绝照实返回，不因2006自动关闭旧业务。普通账号`start/stop`仍只管理网关/SDK和原资源，不开通/取消号码业务；高级导入的`enrollment_confirmed`仍不是服务端权益证明。详见[开发指南](DEVELOPER.md#app账号登录主入口与一次性部署配置)。
+- 登录任务先持久化ID及阶段，先标记`request_uncertain`才发开通，超时/断线/关机不重放或补偿关闭。原OS锁证明下仅标记退出进程的任务interrupted；未获本进程claim不得初始化。HTTP业务接受、账号落库、原生登录/hosting与Voice/Messaging readiness各自独立；口令/App token不进任务表，App expiredAt不冒充SDK TTL。
+
 - 无忧行使用独立 `app_account` / `application_data` 线路与账号资费，不冒充 SIM、五码、UICC 或 VoWiFi。当前目标是接电话（应答、挂机、双向音频/Trunk）与 durable 接短信；外呼/发送只保留接口，有效请求仍返回 501，三路 SMS 与 Asterisk 外呼均不得回退 IMS/CS。
 - 静态 `credential-contract.transport_implemented=true` 仅声明显式入站实现；default SDK client 与 paid outbound 均 false。main 显式安装 provider 不等于启动账号；导入/CRUD/重启不连接或恢复 cached ready，必须手动 start。
 - SDK 登录、托管 ACK、Voice/Messaging 各自接收能力、单通话媒体活跃及发送授权分别核验。原 owner、physical scope、receiver、run/revision/有效期和活消费者共同决定 readiness；汇总 available 不使 SMS/Voice 互授。排队 Connected 消费时再次核验原 service 和实际 media，不能把过去成功转交给新会话。
@@ -437,7 +442,7 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 - 原媒体/Trunk、controller/actor与consumer实际Join后，才能释放持久run fence及替换配置；别的manager或未知prior-process owner不能接管。DIRECT双180秒magic窗口与实际response write后frontier、batch精确result-bearing epoch ACK与sparse/before-base证明分别支持同run长期已分类收件；回收不擦SMS或改变通知策略，unknown/pending不容量清除。pending/burst/未ACK/稀疏身份及磁盘仍有限，不承诺无限常驻、自动重连/续期或跨run exactly-once，也不凭PID/年龄抹去未知持有者。
 - 来电从Checking/Ringing起持有唯一原watch，ticket/account/media scope退休经原operation收尾history/Ended，不覆盖旧watch。原Trunk只由private原consumer FIFO fence确认先前Ended本地处理/发送后停driver；observer/替换/drop/lag/timeout不假成功，local send不当peerACK。history/event SQL失败保原lease，retry不重发已尝试Release。
 - `cleanup_on_disconnect`为明确local opt-in、defaultfalse；只有本manager实际原run能在退休后20秒有界清理并保terminal原因/cleanup_error，最多一次同owner清理重等。manual stop/shutdown同原run锁串行，call/media/Trunk/actor/controller/consumer实际Join后才release nonce及回收已投影envelope。不会自动start/reconnect/renew或凭PID/年龄接管unknownorphan；关闭lease后旧运行期call query继续拒绝，数据库历史不擦除。
-- 最新源码`2986a3d`（Build40585189198/Beta40585189753、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各757 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings保留，Release skipped）新增有界zlib＋Base64 SDP：识别标准/URL-safe输入，解码/解压后沿用严格plain-media策略，Trunk/UI raw，native Accept按邀请格式且标准Base64输出；尾随、混合字母表、解压膨胀和安全属性均拒绝。当前APK静态还确认`csb/token body.token`活跃链、未调用`refreshToken` helper、登录后SRTP/DirectConnect关闭及显式server；这些不等于实网续期或未来版本证明。
+- 前源码`2986a3d`（Build40585189198/Beta40585189753、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各757 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings保留，Release skipped）新增有界zlib＋Base64 SDP：识别标准/URL-safe输入，解码/解压后沿用严格plain-media策略，Trunk/UI raw，native Accept按邀请格式且标准Base64输出；尾随、混合字母表、解压膨胀和安全属性均拒绝。当前APK静态还确认`csb/token body.token`活跃链、未调用`refreshToken` helper、登录后SRTP/DirectConnect关闭及显式server；这些不等于实网续期或未来版本证明。
 - 前源码`1401be0`（Build40525320619/Beta40525320712、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各752 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，446static/mock，67warnings保留，Release skipped）新增退出进程运行回收：独占flock证明打标记的前进程已退出后释放其租约、结束开放来电并把发送中通知记为uncertain；不凭PID/年龄，不碰存活锁持有者或无标记旧版租约，不启动会话、不授付费外发。
 - 前源码`e5ef46d`（Build40517095074/Beta40517094859、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各749 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，445static/mock，67warnings保留，Release skipped）新增可选有界重连：cleanup_on_disconnect完成原run Join/fence后，同revision全新start，仅断线/不可用/超时重试，鉴权/到期/版本错误不重试，人工操作取消；不续期token、不恢复会话、不授付费外发。
 - 前源码`c6f0ba1`已由Build40499505183/Beta40499505215/双架构及officialdigest744回归验证，DIRECT730前提交cb33653也有独立核验。batch_queued/外层成功不授回收：原精确epoch ACK经同consumer FIFO与当前line/revision/run lease事务落稀疏身份，before-base不越pending/working/unACKed result；2048/account+8192global稀疏只按proof前缀退休，原票据/删除不复活，失败不重发已ACK结果。各保128近期完成副本与完整SMS，能力和费用不随回收互授。
@@ -476,7 +481,9 @@ Build40045409934/Beta40045409943/ARM64 AMD64 success，Release skipped；官方S
 
 ## 10. 验证清单与验收标准
 
-最新已验源码 **`2986a3d8b1283d8aaa428d252ab83098a1f311bf`**：Build40585189198/Beta40585189753、ARM64/AMD64成功、Release skipped；officialdigest ZIP/CRC/逐名各757 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings保留。5项压缩SDP回归实际通过；Build artifact12772387707 SHA`2e8e4150867c4b31ffc2e9da720a655d2a1a4efd92a68936a83eaccc238d8477`，Beta12771222636 SHA`8fa4eda1c46cf697ce3d5f39db44d46dd493bd9f3cb10d10384e5ffca588cafc`。首7350f5f编译/静态失败与9a0e1ca漏HTTP旧字符串均只修测试契约，失败制品保留；不是实网、自动续期、SRTP/direct-connect或default Locator/NetStream验收。
+最新已验源码 **`d44916340b87e8562a046f782fc706d6711a6790`**：Build41002428358/Beta41002428390、ARM64/AMD64成功，官方digest/CRC/源码-run逐名各780 Jegotrip＋19HTTP＋7registry＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings保留，Release skipped。新增23登录回归及7前端Node测试；首8dd前端ref-cleanup lint失败，修生命周期对象而非关闭规则后全过。实际服务、部署和默认SDK自动配置仍未验收。
+
+前已验源码 **`2986a3d8b1283d8aaa428d252ab83098a1f311bf`**：Build40585189198/Beta40585189753、ARM64/AMD64成功、Release skipped；officialdigest ZIP/CRC/逐名各757 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings保留。5项压缩SDP回归实际通过；Build artifact12772387707 SHA`2e8e4150867c4b31ffc2e9da720a655d2a1a4efd92a68936a83eaccc238d8477`，Beta12771222636 SHA`8fa4eda1c46cf697ce3d5f39db44d46dd493bd9f3cb10d10384e5ffca588cafc`。首7350f5f编译/静态失败与9a0e1ca漏HTTP旧字符串均只修测试契约，失败制品保留；不是实网、自动续期、SRTP/direct-connect或default Locator/NetStream验收。
 
 长期收件检查点源码 **`c6f0ba13bf2277910cc33834bcc1ea6fcd63f6b6`**：Build40499505183/Beta40499505215、ARM64/AMD64成功、Release skipped；officialdigest ZIP/CRC/逐名/source-run各744 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，444static/mock及10SQL语法mock、67warnings保留。新14batch回归含原同manager/ARC/nonce600短信、2300ring滚动、partialACK/低pending gap/未见乱序、未知/direct不清、删除不复活、稀疏cap与129条postACK GC失败不重放；前DIRECT600和音频Trunk等仍通过。Build artifact12733490387摘要`18d49e76cd6a6a6798041529e28992c63c6b437d65e2cdbd2892073cc35bfa7b`，Beta12732930975摘要`de9e9b66e51b5c532b270a4851ac7ae6b009087a87b93daddfd7bb04484665c0`。前cb33653各730项/双架构独立通过；首9d0原TLS夹具缺lease而生产frontier拒绝，仅夹具按原runtime注册并强化SQL/原ACK，加缺lease负例，失败ZIP保留。不是实网、自动reconnect/renew、默认全SDK或未知owner恢复验收。
 

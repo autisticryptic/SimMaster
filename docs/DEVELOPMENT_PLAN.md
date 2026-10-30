@@ -6,13 +6,14 @@
 
 ## 当前基线与工作规则
 
-- **当前静态续查/压缩SDP增量 `2986a3d` 已核验**：Build40585189198/Beta40585189753、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各757 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings保留，Release skipped。原邀请Base64检测→解码→zlib inflate、回复同格式zlib deflate→标准Base64已实现，解码后plain-media门禁不放宽；5项新回归含实际账号/Trunk/native Accept。APK静态确认csb/token活跃获取链，但refreshToken helper无调用/响应语义；SRTP/DirectConnect被当前APK显式关闭，server显式，NetStream/Locator无已证call path。
+- **当前账号登录增量`d449163`已核验**：Build41002428358/Beta41002428390、双架构、官方digest/CRC/source-run各780 Jegotrip＋19HTTP及原Trunk/通知/SIP/DNS/86矩阵，前端lint/type-check/unit通过。新入口用App账号密码取得绑定号码和个人电话凭据，并提交正常业务开通/读回确认、可启动原接收器；持久任务ID/不确定状态不重放，安全挑战不伪造通过。需一次性私有部署上下文，实际配置/服务仍未验收，不宣称默认SDK全自动配置。
+- **前静态续查/压缩SDP增量 `2986a3d` 已核验**：Build40585189198/Beta40585189753、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各757 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings保留，Release skipped。原邀请Base64检测→解码→zlib inflate、回复同格式zlib deflate→标准Base64已实现，解码后plain-media门禁不放宽；5项新回归含实际账号/Trunk/native Accept。APK静态确认csb/token活跃获取链，但refreshToken helper无调用/响应语义；SRTP/DirectConnect被当前APK显式关闭，server显式，NetStream/Locator无已证call path。
 - **前退出进程回收增量 `1401be0` 已核验**：Build40525320619/Beta40525320712、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各752 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，446static/mock，67warnings保留，Release skipped。flock证明退出、仅回收本机制标记的租约，旧版无标记租约与存活锁持有者不动。
 - **前自动重连增量 `e5ef46d` 已核验**：Build40517095074/Beta40517094859、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各749 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，445static/mock，67warnings保留，Release skipped。opt-in、cleanup完成后同revision全新start、错误分类与次数有界、stop/start/replace/关机取消；不是凭据续期或会话恢复。
 - **前长期收件增量 `c6f0ba1` 已核验**：Build40499505183/Beta40499505215、ARM64/AMD64成功，officialdigest ZIP/CRC/逐名各744 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，444static/mock、67warnings。DIRECT原双180秒窗口及实际响应write后frontier；batch原result-bearing epoch精确ACK→FIFO私有retirement/sparse身份与before-base水位，不过pending/unACKed result。各保最近128完成envelope与全部SMS、未知/pending不清，稀疏2048/account+8192global仅按proof退休；GC失败不重发原ACK/result。新14项含同run600batch、2300ring滚动、partialACK/低gap/删除不复活和129postACK GC失败；DIRECT600及前回归保持，详见DEVELOPER。
 - **前断线托管增量 `b13223a` 已核验**：Build40458126579/Beta40458126681、ARM64/AMD64成功，officialdigest ZIP/CRC/逐名各711 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，438static/mock。全call watcher补振铃断线/过期/版本变化；可选cleanup_on_disconnect defaultfalse只清本manager退休原run、20秒有界/同owner最多重等一次，不自动start/reconnect/renew/清unknownorphan。原Trunk FIFO先处理/发Ended/CANCEL/BYE再停，history SQL失败保lease，terminal原因和cleanup_error分开。首fixture在release后查询当前call的错误已修、原失败ZIP保留；详见DEVELOPER。
 - **前无忧行基础范围：接电话/接短信，外呼/发短信只留接口。** `d0a2b67` 已推送并核验：Build40445960947/Beta40445960949、ARM64/AMD64成功，官方digest ZIP各699 Jegotrip＋7registry＋16HTTP＋42Trunk＋31通知＋4SIP＋7DNS/86矩阵逐名/source-run匹配，435static/mock通过，Release skipped。多任务Join取消重试、batch回执queued与Inform准入、应答/挂机入队前取消三项缺口已由新6项及双Join回归验证；不以旧4375a53成绩替代。
-- 基础入站已接原 receiver/control、实际 Endpoint TCP-Mpath↔UDP 音频、账号/API/Trunk、durable SMS与通知。当前不是登录 UI、默认完整 SDK 或付费外发项目；真实服务部署与资费仍未验收。实施/配置说明见[开发指南](DEVELOPER.md#当前基础托管配置与操作)。
+- 基础入站已接原 receiver/control、实际 Endpoint TCP-Mpath↔UDP 音频、账号/API/Trunk、durable SMS与通知。当前已加入账号登录UI/API，但仍不是默认完整SDK或付费外发实现；真实服务部署与资费仍未验收。实施/配置说明见[开发指南](DEVELOPER.md#当前基础托管配置与操作)。
 
 ### 历史实施检查点（不覆盖当前范围与能力）
 
@@ -64,7 +65,9 @@
 
 ## P0：无忧行 backend 的实施顺序与原生证据关口
 
-用户恢复的目标是基础接电话（接收/应答/挂机/双向音频、账号/API/Trunk）与接短信（durable历史、查询/删除、通知、原ACK）。允许从自有 root 手机导入合法原参数，不要求本轮登录/绑定 UI；打电话/发短信只留接口，资费属于独立无忧行账号。继续完成这个完整基础目标，不以codec存在、hosting成功或仅安装descriptor替代业务链路。
+用户恢复的目标是基础接电话（接收/应答/挂机/双向音频、账号/API/Trunk）与接短信（durable历史、查询/删除、通知、原ACK）。既有路径允许从自有 root 手机导入合法原参数；用户现已追加App账号登录、自动取得通话凭据和开通托管的要求，登录UI进入本轮范围，不新增号码绑定；打电话/发短信只留接口，资费属于独立无忧行账号。继续完成这个完整基础目标，不以codec存在、hosting成功或仅安装descriptor替代业务链路。
+
+**业务前提须单独说明：**高级导入以已有合法开通/参数为前提；新App账号登录入口可按用户授权提交正常业务开通并读回确认，不先强迫手机蜂窝一键认证，也不伪造`authentication_code`或忽略服务器挑战。普通账号`start/stop`仍只管理客户端，不取消业务，导入布尔值不当开通证明。安装侧原HTTP/native私有上下文、真实账户资格与支持模式仍是前提，不以账号字段猜SDK参数，详见[开发指南](DEVELOPER.md#app账号登录主入口与一次性部署配置)。
 
 | 必须交付的行为 | 当前实现/验证关注点 |
 | --- | --- |
@@ -81,7 +84,8 @@
 
 1. APK静态已确认活跃phone token由认证`csb/token`的`body.token`获取并供下一次login使用；`refreshToken` helper无直接调用、TTL/响应/活动会话交接证据，因此自动续期仍需原服务授权证据，当前保持手工重新导入。自动重连只是在清理后全新start。带标记退出进程运行已由1401be0用OS锁证明回收；remote lease、无标记旧版owner接管与跨run exactly-once仍不提供。
 2. zlib＋Base64 SDP已由2986a3d实现；当前APK显式关闭SRTP/DirectConnect且显式server。未来SDK的default Locator/Router/NetStream、SRTP/ICE/BUNDLE/P2P或其他媒体仍须新证据，不放松TLS/归属或复制报告常量。
-3. 真实账号参数/服务/Trunk/通知/账单验收需新明确授权；当前没有设备/服务/部署执行。源码改变继续新SHA Actions/official artifact验证，docs-only收尾编译输入同2986a3d。
+3. 真实账号参数/服务/Trunk/通知/账单验收需新明确授权；当前没有设备/服务/部署执行。源码改变继续新SHA Actions/official artifact验证，docs-only收尾编译输入同d449163。
+4. App密码登录/绑定资料/phone token/SipPwd/正常开通及原接收器接线已软件验证，不再作为未实现入口重做。下一步需要实际完整私有部署上下文与授权实网验收；后续自动默认SDK配置、原地重新认证/自动续期、额外验证码/迁移/安全挑战处理仍需独立实现和证据。现有入口创建新line，不自动替换旧运行，不重放结果不确定的业务写请求。
 
 **前基础软件交付已验证**：`d0a2b67`的Build40445960947/Beta40445960949、ARM64/AMD64及官方digest ZIP核验通过，新增6项admission/batch和双Join取消场景均实际执行；各699 Jegotrip与原HTTP/Trunk/通知/SIP/DNS/86矩阵精确匹配，435本机static/mock通过。固定五手册记录当前配置/API及支持界限；文档收尾不改变编译输入。后续源码改变仍须新SHA验证，不能复用当前绿灯；详细清单见 `verified-native-d0a2b67.json`。以下是明确的扩展与实网验收工作，不再把已接通的基础来电/媒体/SMS写成未实现。
 

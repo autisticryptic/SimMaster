@@ -7,12 +7,28 @@
 1. 本轮恢复原无忧行目标：**基础接电话（应答、挂机、双向音频、Trunk）＋接短信（落库、查询、通知、原回执）**。外呼、发短信仅留接口，计费属于独立无忧行账号，不借 SIM/IMS/CS。
 2. 唯一开发目录 `SimAdmin`，只维护 `master`，普通 push `simmaster`；不强推、不清理未知用户文件。编译、Rust/前端测试、编译后的协议 peer 和注册模拟**仅在 GitHub Actions**执行。
 3. 本机只做编辑、静态/mock、Git 与只读源码/制品分析。**未部署、未访问设备或真实无忧行服务、未改 NV**；旧设备授权不延续。
-4. IDA 仅只读使用用户已打开的原 `libmtc.so`，调用前核对 metadata；不自行启动/加载、修改或保存 IDB。新 JADX/其他工具须先说明版本/用途，由用户手动安装。
-5. 保持原 UI 布局；本轮是后端，不做登录/绑定 UI。公共文档只更新原五手册。报告、APK/固件、JSONL、`.local`、私有交接和凭据不提交。
+4. IDA 仅只读使用用户手动打开的原样本：通话协议为 `libmtc.so`，本轮账号登录为 `libidss-cn.so`；调用前核对 metadata。不自行启动/加载、修改或保存 IDB。新 JADX/其他工具须先说明版本/用途，由用户手动安装。
+5. 保持原 UI 布局；用户已追加**登录已绑定号码的App账号、自动取得通话凭据并开启托管**，此前登录UI暂缓不再限制本任务。现有手工导入保留兼容，不新增号码绑定或付费外发。公共文档维护原五手册及用户授权的逆向总结；报告、APK/固件、JSONL、`.local`、私有交接和凭据不提交。
 
-## 当前：APK/IDA续查与zlib＋Base64 SDP已验证
+## 当前：App账号登录接线已软件验证，实网未验收
 
-- **最新源码 `2986a3d8b1283d8aaa428d252ab83098a1f311bf`（实现7350f5f、两次仅测试契约修正）已推送并核验**：原 `0x613140→0x5fa164/0x251958→0x60ed60` 证明邀请若为完整Base64语法则先Base64解码、再zlib inflate；`0x5fa47c`按同一邀请格式以zlib deflate＋标准有padding Base64回复，raw邀请仍raw。后端现在有独立wire/解压上限，解码后仍严格只接受单音频RTP/AVP sendrecv/RTCP-mux及匹配payload；Trunk/UI看到raw SDP，只有原native Accept镜像邀请编码，crypto/ICE/BUNDLE等解码后仍拒绝。
+- **源码`d44916340b87e8562a046f782fc706d6711a6790`已推送并验证**（实现8dd159f，后一次只修前端effect生命周期）：支持账号/手机号＋密码→绑定号码核对→后台取phone token/SipPwd→正常认证开通请求与状态确认→创建独立账号并可启动原接收器。现有页面新增账号登录与应用账号区，不输入个人SDK token/SipPwd，不伪造SIM。
+- 后台一次性读取`data.db`旁的私有`jegotrip-login.json`：App HTTP/密码预处理上下文与原显式native template分开；不是仅有账号就能猜出所有SDK配置。缺文件/无原OS锁则拒绝登录。APK共享HTTP默认值已另存私有partial context，但**尚无实际完整部署上下文或实网验收**；不把partial文件当可启用配置。
+- 2并发、120秒固定尝试预算，4096条持久任务ID防重复提交；先记录`request_uncertain`才发送开通，接受后再次查询状态为2才创建账号。中断/超时不重放或自动关闭原业务；重启仅在原OS锁证明下标中断。口令/请求体不入任务表，原SDK/hosting/接收readiness仍独立。新入口不调用手机一键认证，也不伪造`authentication_code=1`；额外挑战/迁移/既有业务处置如实报错。
+- Build41002428358/Beta41002428390、ARM64/AMD64成功，official digest ZIP/CRC/source-run逐名各**780 Jegotrip（23新）＋19HTTP＋7registry＋46Trunk＋31通知＋4SIP＋7DNS/86矩阵**通过；前端lint/type-check/unit成功含7新Node测试。453本机static/mock单次通过，67warnings保留，Release skipped；不是浏览器E2E、原SDK执行或真实服务验收。
+- Build artifact12954725911 SHA`6534b64151874ac834611aa9f52792adacd4cfd9c183cb5649256fff049f1c3e`；Beta12954795258 SHA`bea6ba8f3a10a290eb587a3dc78428d1e063593667b84928f081b86563ec2939`。首轮8dd前端lint失败，Beta后端已过；仅改原scope清理对象后两整套通过，没有屏蔽lint/改断言。证据`verified-native-d449163.json`及`account-login-20261029/{implementation-verification.json,first-failure-and-recovery.md}`。
+
+## 前次研究：托管业务与本机无卡边界
+
+以下“未移植”描述的是当时阶段；新的正常账号登录/业务开关以上方为准，安全验证不自动完成。
+
+- 2026-10-29 补查旧会话未答问题。实际APK的两个业务/SDK DEX（16628类、112251方法）只读扫描及SHA-1/Adler-32校验：业务开关`setVoipCsState`、号码/安全设备认证与`JCAccount.updateStatus(4)`在线注册是不同层；前两者**尚未移植到Rust**，当前采用已有合法凭据导入。
+- 号码来自App用户对象，当前Rust客户端不依赖本机SIM/modem；但这不是服务端授权绕过。APK号码认证失败后会走安全设备后备查询，成功仍须服务响应`code=0`、`authentication_code=1`，不是无卡直接放行；该认证token也不是SDK phone-login token。
+- `enrollment_confirmed`仅是用户声明，不开通服务；`start/stop`不代替号码托管/呼转业务的开通/取消。未访问真实服务、未安装新工具或改运行时代码；源码基线仍`2986a3d`，本轮文档补充不代表新的功能/实网验收。详见[逆向总结第3节](JEGOTRIP_REVERSE_ENGINEERING_SUMMARY.md#31-业务开通设备验证与在线注册是不同层)，私有证据`resume-20261029/hosting-findings.md`。
+
+## 前检查点：APK/IDA续查与zlib＋Base64 SDP已验证
+
+- **该检查点源码 `2986a3d8b1283d8aaa428d252ab83098a1f311bf`（实现7350f5f、两次仅测试契约修正）已推送并核验**：原 `0x613140→0x5fa164/0x251958→0x60ed60` 证明邀请若为完整Base64语法则先Base64解码、再zlib inflate；`0x5fa47c`按同一邀请格式以zlib deflate＋标准有padding Base64回复，raw邀请仍raw。后端现在有独立wire/解压上限，解码后仍严格只接受单音频RTP/AVP sendrecv/RTCP-mux及匹配payload；Trunk/UI看到raw SDP，只有原native Accept镜像邀请编码，crypto/ICE/BUNDLE等解码后仍拒绝。
 - Build40585189198/Beta40585189753、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各757 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings保留，Release skipped；5项新增压缩SDP回归（固定zlib、URL-safe输入/标准输出、畸形/尾随/解压膨胀、解压后安全属性拒绝、实际账号邀请→Trunk raw→native压缩Accept）均实际通过。Build artifact12772387707 SHA`2e8e4150867c4b31ffc2e9da720a655d2a1a4efd92a68936a83eaccc238d8477`；Beta12771222636 SHA`8fa4eda1c46cf697ce3d5f39db44d46dd493bd9f3cb10d10384e5ffca588cafc`。
 - 本地APK的Java静态链确认活跃phone token来自认证的`service/voip/v1/csb/token`：请求`accountId`，成功取`body.token`写原偏好，下一次`JCClient.login`使用；`service/voip/v1/refreshToken`只有URL初始化与`requestDelayTokenValid` helper，在应用DEX 8567类中无直接调用、无响应解析/TTL/活动会话交接。因此续期仍须手工重新导入，不能只凭方法名调用真实服务。
 - 同一APK在成功login后无条件`closeAudioSrtp()`（crypto type 0/auth false），`MtcEngine.login`无条件关闭DirectConnect，且总是显式设置server address；SRTP配置getter无调用，NetStream无Java/已证call-path引用，Locator仍只有方法注册名。故当前不实现SRTP、ICE/P2P、default Locator或NetStream，而不是等待凭据后盲猜。首7350f5f为测试局部变量遮蔽＋旧契约断言导致编译/静态失败，第二9a0e1ca仅漏一个HTTP旧字符串；两轮官方失败制品保留，生产算法未因夹具修正改变。
@@ -53,7 +69,8 @@
 
 | 项目 | 当前实现与不变量 |
 | --- | --- |
-| 独立账号 | `app_account` / `application_data`；私有参数导入、随机本地 line_id、revision CAS、显式 start/stop；不伪造 ICCID/UICC，不恢复 cached ready |
+| 独立账号 | `app_account` / `application_data`；App账号登录或高级私有参数导入、随机本地 line_id、revision CAS、显式 start/stop；不伪造 ICCID/UICC，不恢复 cached ready |
+| 业务开通/安全设备认证 | 新登录入口可提交正常认证的开通请求并读回确认；安全挑战只报告、不自动绕过。原账号start/stop仍只管接收器，不取消服务端业务 |
 | 原来电 | 原 receiver、64-bit native ID、owner/scope/run 关联的邀请、Inform/Accept/Release；SDK/hosting 接受不等于媒体就绪 |
 | 音频与 Trunk | 原 Endpoint TCP/TLS＋独立 Mpath media、实际本地 UDP、原 payload/peer 校验；全call watcher、应答/挂机/history/event和Join；先原driver处理结束事件再停Trunk |
 | 原运行清理/重连 | `cleanup_on_disconnect`可选、defaultfalse；只清本manager退休run并保留原因/cleanup_error。另可选`reconnect`在清理完成后同revision全新start（有界、仅断线类错误）；不renew token，不猜未知进程退出 |
@@ -68,7 +85,7 @@
 
 ### 明确的支持与验收边界
 
-- 支持原参数显式导入和可选 matched bootstrap handoff；本地存储是明文私有 `data.db`，不是加密保险箱。参数替换前先完成原 stop/Join，备份与目录权限仍需保护。
+- 新入口支持正常App密码登录及自动获取个人电话凭据，需先配置匹配的私有部署文件；本次创建新line，不原地替换旧运行或自动续期，旧历史仍归原line。高级参数导入和matched bootstrap保留。本地`data.db`/部署文件是明文私有存储，不是加密保险箱；管理界面应走HTTPS或可信本机，替换原参数仍须stop/Join，备份与目录权限需保护。
 - 媒体限原 raw 或 zlib＋Base64 `RseEx.SDP`（回复镜像邀请格式）；解码后仍只接受RTP/AVP sendrecv、RTCP-mux、匹配编码 RTP passthrough。须 `allow_plain_media=true` 和明确本地 bind IP；信令 TLS 不降级。SRTP、ICE/BUNDLE/P2P、转码及其他原生选路模式不假装支持。
 - `Client.Host/ArcPort` 可能是逻辑 Router 地址/端口，不是 OS UDP/RTP 目的地。压缩分支是邀请内容的有界wire包装，不证明服务当前选择哪一分支，也不授权其他媒体模式。
 - 可选断线清理20秒有界，与人工stop/关机同原run串行。history失败保lease、consumer/actor/媒体/Trunk原Join后才finalize；自动清理后GET账号保留终端原因与cleanup_error。运行期calls接口不从已release租约重获owner，已结束数据库历史保留。Trunk FIFO只确认本地driver处理/发送，不是远端ACK；发送不确定不能冒称成功。
@@ -83,7 +100,7 @@
 ## 本轮软件交付与后续验收
 
 1. 基础接电话/应答/挂机/双向音频/Trunk、durable短信/查询删除/通知原ACK，以及新取消/批次缺口已有新SHA两Actions整链证据；不是仅codec或单个信令阶段。
-2. 公共收尾只更新原五手册，构建输入保持与已验 `2986a3d` 相同；文档不代表另一个二进制。后续改源码仍须新SHA执行/产物核验，原失败证据不能删去。
+2. 公共收尾维护原五手册及用户另行要求的逆向总结，构建输入保持与已验 `d449163` 相同；文档不代表另一个二进制。后续改源码仍须新SHA执行/产物核验，原失败证据不能删去。
 3. DIRECT/batch长期接收、退出回收、重连与raw/压缩SDP已分别取得原protocol/durable/静态及Actions证明，不能互用ACK、清除pending/unknown或扩大媒体授权。凭据自动续期仍缺原服务响应/TTL/活动会话语义；default Locator/NetStream、未来版本SRTP/direct-connect与真实部署/账户/账单仍需独立证据和授权；不把静态helper称为续期或整个实网目标已经完成。
 
 ## IMS 注册主线：历史软件基线保持
