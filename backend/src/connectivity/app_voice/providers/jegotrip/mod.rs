@@ -64,6 +64,8 @@ pub mod tls_engine;
 pub mod tls_plaintext;
 pub mod transport_actor;
 pub mod runtime_connector;
+pub(crate) mod router_connector;
+pub(crate) mod router_runtime;
 pub mod runtime_provision;
 pub mod runtime_backend;
 pub mod legacy_config;
