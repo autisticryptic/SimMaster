@@ -200,3 +200,85 @@ fn debug_does_not_dump_account_id_adapter_host_or_native_reference() {
         assert!(!output.contains("fixture"));
     }
 }
+
+#[test]
+fn original_arc_query_is_scheme_specific_and_strips_exactly_one_prefix() {
+    for scheme in ["arc", "sarc", "varc", "svarc"] {
+        let input = format!("AccountEntry:{scheme} -h arc@AccountEntry -p 98;");
+        let reference = parse_object_reference(input.as_bytes()).unwrap();
+        let ReferenceTarget::Direct(endpoints) = reference.target() else { panic!("explicit endpoint required") };
+        assert!(matches!(endpoints[0].router_host().unwrap(), RouterHost::Query(b"AccountEntry")));
+        assert_eq!(endpoints[0].host(), b"arc@AccountEntry");
+        assert_eq!(endpoints[0].port(), 98);
+        assert_eq!(reference.encode_native().unwrap().expose_to_backend(), input.as_bytes());
+        assert_eq!(reference.direct_raw_tcp().err(), Some(ReferenceError::UnsupportedEndpoint));
+        assert!(reference.explicit_tls_router_groups().is_err());
+    }
+}
+
+#[test]
+fn arc_query_does_not_relax_tcp_tls_hosts_or_accept_nested_and_empty_queries() {
+    for scheme in ["tcp", "tls", "https", "udp", "sArc"] {
+        let input = format!("id:{scheme} -h arc@AccountEntry -p 98;");
+        assert_eq!(parse_object_reference(input.as_bytes()).err(), Some(ReferenceError::UnsupportedEndpoint));
+    }
+    for host in ["arc@", "arc@arc@AccountEntry", "ARC@AccountEntry", "arc@a/b", "arc@a?b", "arc@a:b", "arc@${host}", "arc@ENC(value)"] {
+        let input = format!("id:sarc -h {host} -p 98;");
+        assert!(parse_object_reference(input.as_bytes()).is_err());
+    }
+    let input = format!("id:sarc -h arc@{} -p 98;", "x".repeat(250));
+    assert!(parse_object_reference(input.as_bytes()).is_err());
+}
+
+#[test]
+fn native_numeric_router_host_uses_first_dot_base_zero_and_mixed_field_ranges() {
+    for (host, network, node) in [("1", 1, 0), ("1.2", 1, 2), ("0x12.010", 18, 8),
+        ("+7.+9", 7, 9), ("0177.0xfffffffe", 127, u32::MAX - 1), ("65535.0", 65535, 0), ("0.0", 0, 0)] {
+        let parsed = RouterLogicalHost::parse(host.as_bytes()).unwrap();
+        assert_eq!(parsed.network(), network); assert_eq!(parsed.node(), node);
+        let input = format!("id:sarc -h {host} -p 98;");
+        let reference = parse_object_reference(input.as_bytes()).unwrap();
+        let ReferenceTarget::Direct(endpoints) = reference.target() else { panic!("endpoint required") };
+        assert!(matches!(endpoints[0].router_host().unwrap(), RouterHost::Address(value) if value == parsed));
+        assert_eq!(reference.encode_native().unwrap().expose_to_backend(), input.as_bytes());
+    }
+}
+
+#[test]
+fn numeric_router_host_rejects_truncation_negative_sentinel_and_extra_dot() {
+    for host in ["", " ", ".1", "1.", "1.2.3", "-1", "1.-2", "65536.1", "0x10000.1",
+        "1.4294967295", "1.4294967296", "1.0xffffffff", "1.0x100000001", "08.1", "1.08", "0x.1",
+        "1.2junk", "1.++2", "1.+ 2", "1.2\0", "1.2\u{000b}"] {
+        assert!(RouterLogicalHost::parse(host.as_bytes()).is_err(), "invalid numeric host");
+    }
+    assert!(RouterLogicalHost::parse(&[b'1'; 254]).is_err());
+    let spaced = RouterLogicalHost::parse(b"\t0x12 . 010\r\n").unwrap();
+    assert_eq!((spaced.network(), spaced.node()), (18, 8));
+}
+
+#[test]
+fn dns_reference_data_does_not_implicitly_become_a_logical_router_destination() {
+    let reference = parse_object_reference(b"id:sarc -h fixture.invalid -p 98;").unwrap();
+    let ReferenceTarget::Direct(endpoints) = reference.target() else { panic!("endpoint required") };
+    assert_eq!(endpoints[0].router_host().err(), Some(ReferenceError::UnsupportedEndpoint));
+    let tcp = parse_object_reference(b"id:tcp -h 1.2 -p 443;").unwrap();
+    assert_eq!(tcp.direct_raw_tcp().unwrap()[0].host(), b"1.2");
+    assert_eq!(tcp.direct_raw_tcp().unwrap()[0].router_host().err(), Some(ReferenceError::UnsupportedEndpoint));
+}
+
+#[test]
+fn arc_security_overrides_are_rejected_not_silently_discarded_by_logical_host_support() {
+    for options in ["-S 0", "-S 3", "-kx 1", "-ri 101", "-lp 10000"] {
+        let input = format!("id:sarc -h arc@AccountEntry -p 98 {options};");
+        assert_eq!(parse_object_reference(input.as_bytes()).err(), Some(ReferenceError::UnsupportedEndpoint));
+    }
+}
+
+#[test]
+fn logical_host_debug_does_not_disclose_query_or_numeric_route_identity() {
+    let host = RouterLogicalHost::parse(b"4660.305419896").unwrap();
+    for value in [format!("{host:?}"), format!("{:?}", RouterHost::Address(host)),
+        format!("{:?}", RouterHost::Query(b"private-router-query"))] {
+        assert!(!value.contains("4660")); assert!(!value.contains("305419896")); assert!(!value.contains("private-router-query"));
+    }
+}

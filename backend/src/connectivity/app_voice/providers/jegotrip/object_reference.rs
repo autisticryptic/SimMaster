@@ -5,6 +5,8 @@
 //! a semicolon-delimited endpoint list. Explicit -h/-p and the recovered -ri
 //! property are preserved as DATA. Parsing does not select a transport, trust
 //! anchor, Router session or receive binding; other options are not guessed away.
+//! arc@ queries and numeric Router hosts are accepted only for ARC schemes;
+//! they never pass the ordinary TCP/TLS DNS/authority validation path.
 use super::rpc_stream::MAX_FIELD_BYTES;
 use std::fmt;
 use zeroize::Zeroize;
@@ -26,6 +28,57 @@ impl ReferenceError {
     }
 }
 
+/// Native Router host storage (D57D78), NOT an OS address or an authorization.
+/// Its two fields must later be paired with the ORIGINAL endpoint's port/scope.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RouterLogicalHost { network: u16, node: u32 }
+impl RouterLogicalHost {
+    pub fn network(self) -> u16 { self.network }
+    pub fn node(self) -> u32 { self.node }
+    pub fn parse(bytes: &[u8]) -> Result<Self, ReferenceError> {
+        if bytes.is_empty() || bytes.len() > 253 || !bytes.is_ascii()
+            || bytes.iter().any(|b| b.is_ascii_control() && !space(*b)) {
+            return Err(ReferenceError::Malformed);
+        }
+        let mut parts = bytes.split(|&b| b == b'.');
+        let network = router_unsigned(parts.next().ok_or(ReferenceError::Malformed)?)?;
+        let node = parts.next().map(router_unsigned).transpose()?.unwrap_or(0);
+        if parts.next().is_some() || network > u16::MAX as u64 || node >= u32::MAX as u64 {
+            return Err(ReferenceError::Malformed);
+        }
+        Ok(Self { network: network as u16, node: node as u32 })
+    }
+}
+impl fmt::Debug for RouterLogicalHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RouterLogicalHost(<redacted>)") }
+}
+
+pub enum RouterHost<'a> { Query(&'a [u8]), Address(RouterLogicalHost) }
+impl fmt::Debug for RouterHost<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RouterHost(<redacted>)") }
+}
+fn arc_scheme(scheme: &[u8]) -> bool { matches!(scheme, b"arc" | b"sarc" | b"varc" | b"svarc") }
+fn router_query(host: &[u8]) -> Option<&[u8]> {
+    let query = host.strip_prefix(b"arc@")?;
+    // Explicit bounded name subset, not a DNS lookup or recursive prefix strip.
+    if host.len() > 253 || query.is_empty() || !query.iter().all(|b|
+        b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'-' | b'.')) { return None; }
+    Some(query)
+}
+fn router_unsigned(bytes: &[u8]) -> Result<u64, ReferenceError> {
+    let bytes = trim(bytes);
+    let digits = bytes.strip_prefix(b"+").unwrap_or(bytes);
+    if digits.is_empty() || digits.len() > 32 { return Err(ReferenceError::Malformed); }
+    let (radix, digits) = if digits.starts_with(b"0x") || digits.starts_with(b"0X") {
+        (16, &digits[2..])
+    } else if digits.len() > 1 && digits[0] == b'0' { (8, &digits[1..]) } else { (10, digits) };
+    if digits.is_empty() || !digits.iter().all(|b| match radix {
+        16 => b.is_ascii_hexdigit(), 8 => (b'0'..=b'7').contains(b), _ => b.is_ascii_digit(),
+    }) { return Err(ReferenceError::Malformed); }
+    u64::from_str_radix(std::str::from_utf8(digits).map_err(|_| ReferenceError::Malformed)?, radix)
+        .map_err(|_| ReferenceError::Malformed)
+}
+
 struct RouterIdentifier { value: i32, literal: Vec<u8> }
 impl Drop for RouterIdentifier { fn drop(&mut self) { self.literal.zeroize(); } }
 
@@ -36,6 +89,13 @@ impl ReferenceEndpoint {
     pub fn port(&self) -> u16 { self.port }
     /// Original numeric Router association, NOT a port, ARC id or ready proof.
     pub fn router_id(&self) -> Option<i32> { self.router_id.as_ref().map(|id| id.value) }
+    /// Classify only a proven ARC logical target. Unprefixed DNS-looking names
+    /// remain reference data but are not guessed into Router or OS destinations.
+    pub fn router_host(&self) -> Result<RouterHost<'_>, ReferenceError> {
+        if !arc_scheme(&self.scheme) || self.router_id.is_some() { return Err(ReferenceError::UnsupportedEndpoint); }
+        if let Some(query) = router_query(&self.host) { return Ok(RouterHost::Query(query)); }
+        RouterLogicalHost::parse(&self.host).map(RouterHost::Address).map_err(|_| ReferenceError::UnsupportedEndpoint)
+    }
 }
 
 /// Bounded data-only grouping of an explicit Router:tls/-ri reference. Native
@@ -217,7 +277,8 @@ fn endpoints(bytes: &[u8]) -> Result<Vec<ReferenceEndpoint>, ReferenceError> {
             let value = words.get(offset + 1).ok_or(ReferenceError::Malformed)?;
             match words[offset] {
                 b"-h" if host.is_none() => {
-                    if !valid_host(value) { return Err(ReferenceError::UnsupportedEndpoint); }
+                    let logical = arc_scheme(scheme) && (router_query(value).is_some() || RouterLogicalHost::parse(value).is_ok());
+                    if !logical && !valid_host(value) { return Err(ReferenceError::UnsupportedEndpoint); }
                     host = Some(value.to_vec());
                 }
                 b"-p" if port.is_none() => {
