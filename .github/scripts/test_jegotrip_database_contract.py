@@ -87,6 +87,19 @@ class JegotripDatabaseContractTests(unittest.TestCase):
         self.assertNotIn('Secret::from_owned(cert.root)', fixture)
         self.assertIn('TlsAcceptor::from(server_config.clone())', fixture)
 
+    def test_configuration_write_input_errors_do_not_reclassify_stored_deployment_errors(self):
+        api = (ROOT / 'backend/src/api/app_voice.rs').read_text()
+        handler = api.split('pub async fn jegotrip_configure(', 1)[1].split('pub async fn jegotrip_clear_configuration(', 1)[0]
+        self.assertIn('request else{return failure("app_login_request_invalid")', handler)
+        self.assertIn('if e.code=="app_login_deployment_invalid" {"app_login_request_invalid"}', handler)
+        status = api.split('fn error_status(', 1)[1].split('fn failure(', 1)[0]
+        self.assertIn('"app_login_deployment_invalid"', status)
+        self.assertIn('=> StatusCode::SERVICE_UNAVAILABLE', status)
+        http = (ROOT / 'backend/src/api/app_voice_http_tests.rs').read_text()
+        for forbidden in ['fixture-not-a-root', 'fixture-short', 'fixture-must-not-echo']:
+            self.assertIn(forbidden, http)
+        self.assertIn('assert_eq!(status,StatusCode::BAD_REQUEST,"{field}")', http)
+
     def test_primary_api_defaults_to_full_hosting_but_still_requires_consent(self):
         source = (P / 'mod.rs').read_text()
         self.assertIn('pub enum LoginIntent { Authenticate, #[default] EnableHosting }', source)

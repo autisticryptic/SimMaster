@@ -107,8 +107,14 @@ pub async fn jegotrip_configuration(State(manager):State<Arc<AppLoginManager>>)-
     success(StatusCode::OK,manager.configuration())
 }
 pub async fn jegotrip_configure(State(manager):State<Arc<AppLoginManager>>,request:Result<Json<ConfigurationWriteRequest>,JsonRejection>)->Response {
-    let Ok(Json(request))=request else{return failure("app_login_deployment_invalid");};
-    match manager.configure(request) {Ok(view)=>success(StatusCode::OK,Ok(view)),Err(e)=>failure(e.code)}
+    let Ok(Json(request))=request else{return failure("app_login_request_invalid");};
+    match manager.configure(request) {
+        Ok(view)=>success(StatusCode::OK,Ok(view)),
+        // Invalid input to this write API is a client error, unlike a missing
+        // or corrupt stored deployment read by setup/login. Keep the latter
+        // 503 classification and the original initialization/CAS guards.
+        Err(e)=>failure(if e.code=="app_login_deployment_invalid" {"app_login_request_invalid"} else {e.code}),
+    }
 }
 pub async fn jegotrip_clear_configuration(State(manager):State<Arc<AppLoginManager>>,request:Result<Query<RevisionRequest>,QueryRejection>)->Response {
     let Ok(Query(request))=request else{return failure("app_login_request_invalid");};

@@ -68,10 +68,27 @@ mod app_voice_accounts {
             "password_salt":"fixture-password-salt","sip_password_key":"0123456789abcdefABCDEFGH","device_id":"fixture-device",
             "endpoints":{"login":"login","user_info":"user","phone_token":"csb/token","voip_status":"voip","call_status":"state","enable_hosting":"enable"},
             "body_protection":null,"root_der_base64":null,"user_agent":null,"enroll_id":null}});
-        let (status,headers,body)=account_request(&served,reqwest::Method::PUT,"/api/jegotrip/config",Some(serde_json::json!({"expected_revision":0,"configuration":configuration})),Some(&cookie)).await;
+        let (status,headers,body)=account_request(&served,reqwest::Method::PUT,"/api/jegotrip/config",Some(serde_json::json!({"expected_revision":0,"configuration":configuration.clone()})),Some(&cookie)).await;
         assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
         let view:serde_json::Value=serde_json::from_str(&body).unwrap();assert_eq!(view["data"]["configuration_source"],"database");assert_eq!(view["data"]["revision"],1);
         assert_eq!(view["data"]["accepting_authenticate"],true);assert_eq!(view["data"]["accepting_enable_hosting"],false);
+        for (field,value) in [
+            ("version",serde_json::json!(0)),
+            ("http.base_url",serde_json::json!("http://fixture-app.invalid/")),
+            ("http.root_der_base64",serde_json::json!("fixture-not-a-root")),
+            ("http.sip_password_key",serde_json::json!("fixture-short")),
+            ("unknown",serde_json::json!("fixture-must-not-echo")),
+        ] {
+            let mut invalid=configuration.clone();
+            if let Some(key)=field.strip_prefix("http.") {invalid["http"][key]=value;} else {invalid[field]=value;}
+            let (status,headers,body)=account_request(&served,reqwest::Method::PUT,"/api/jegotrip/config",
+                Some(serde_json::json!({"expected_revision":1,"configuration":invalid})),Some(&cookie)).await;
+            assert_eq!(status,StatusCode::BAD_REQUEST,"{field}");no_store(&headers);no_secrets(&body);
+            assert!(body.contains("app_login_request_invalid"));
+        }
+        let (status,headers,body)=account_request(&served,reqwest::Method::GET,"/api/jegotrip/config",None,Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["revision"],1);
         let (status,headers,body)=account_request(&served,reqwest::Method::GET,"/api/jegotrip/login/setup",None,Some(&cookie)).await;
         assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
         let view:serde_json::Value=serde_json::from_str(&body).unwrap();assert_eq!(view["data"]["accepting_authenticate"],true);assert_eq!(view["data"]["accepting"],false);
