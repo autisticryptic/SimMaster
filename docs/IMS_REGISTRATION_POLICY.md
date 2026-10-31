@@ -428,7 +428,7 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 
 ### 当前基础入站契约
 
-- 当前专用数据库登录`ff87712`已由两Actions、双架构、官方digest/CRC/source-run逐名各807 Jegotrip＋21HTTP及原回归/86矩阵核验；前端检查成功，469static/mock，66warnings。默认enable_hosting/start_receiver=true，不要求个人SDK token/SipPwd；HTTP-only兼容不替代主流程，原App TLS/Router及完整自动配置仍未完成。
+- 当前原生组件`8bd0439`已由两Actions、双架构、官方digest/CRC/source-run逐名各821 Jegotrip（14新增）＋21HTTP及原回归/86核验；477static/mock、前端检查成功、67首编译warnings。独立endpoint TLS/PacketSender和原TLS品牌关联的Router控制已实现，逻辑ID不是SDK/接收ready；生产TCP/原IO Join、完整Router path/动态account/receiver与共享自动装配仍未完成。数据库主流程默认来自已验ff87712，不要求个人SDK材料，不用HTTP-only兼容替代。
 - 安装配置、脱敏账号摘要和持久登录任务分别使用`jegotrip_login_settings/accounts/login_attempts`；旧任务ID/不确定结果迁移保留，CAS和清空墓碑不回启旧文件，原SIM/IMS/history与运行归属表不替换。仅无配置行才兼容旧JSON，配置响应不回显秘密；非法PUT输入400、原锁/存储部署不可用503、CAS409，各自分开。
 
 - **业务开通不等于在线注册。** 新账号登录入口可按明确用户操作提交`setVoipCsState`正常认证请求，并在服务器接受/读回开启后创建账号；不调用或伪造手机一键认证、不把`authentication_code`置1，服务器挑战/迁移/拒绝照实返回，不因2006自动关闭旧业务。普通账号`start/stop`仍只管理网关/SDK和原资源，不开通/取消号码业务；高级导入的`enrollment_confirmed`仍不是服务端权益证明。详见[开发指南](DEVELOPER.md#app账号登录主入口与一次性部署配置)。
@@ -482,7 +482,7 @@ Build40045409934/Beta40045409943/ARM64 AMD64 success，Release skipped；官方S
 
 ## 10. 验证清单与验收标准
 
-最新已验源码 **`ff877127e745fd2274ea7138a2307a2738b00a64`**：Build41157401567/Beta41157401553、ARM64/AMD64成功，官方digest/CRC/source-run逐名各807 Jegotrip（42登录）＋21HTTP＋7registry＋46Trunk＋31通知＋4SIP＋7DNS/86，66warnings，Release skipped；前端检查与469static/mock通过。独立表/旧任务迁移、配置CAS/墓碑和主流程默认已验证；前端语法/类型及nonce/Drop夹具、非法配置写入503误分类均已修，原失败制品保留，不削弱断言。原App TLS/Router自动启动、实网与本次部署仍未验收；410原授权安装5250123有独立历史证据。
+最新已验源码 **`8bd0439952c9dba66392bfd09f2b625ce24cedf0`**：Build41165670060/Beta41165670082、ARM64/AMD64成功，官方digest/CRC/source-run逐名各821 Jegotrip（14新增、42登录）＋21HTTP＋7registry＋46Trunk＋31通知＋4SIP＋7DNS/86，67首编译warnings，Release skipped；前端检查与477static/mock通过。Endpoint包品牌与Common包分离，原Router控制只在匹配TLS scope/ID/footer和整组有效时发逻辑赋值；不授SDK/hosting/Voice/Messaging权限。生产TCP/path完整时序/动态account/receiver及自动装配未接入，实网和新部署未验；前数据库门禁失败制品/保护保持。
 
 前已验源码 **`2986a3d8b1283d8aaa428d252ab83098a1f311bf`**：Build40585189198/Beta40585189753、ARM64/AMD64成功、Release skipped；officialdigest ZIP/CRC/逐名各757 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings保留。5项压缩SDP回归实际通过；Build artifact12772387707 SHA`2e8e4150867c4b31ffc2e9da720a655d2a1a4efd92a68936a83eaccc238d8477`，Beta12771222636 SHA`8fa4eda1c46cf697ce3d5f39db44d46dd493bd9f3cb10d10384e5ffca588cafc`。首7350f5f编译/静态失败与9a0e1ca漏HTTP旧字符串均只修测试契约，失败制品保留；不是实网、自动续期、SRTP/direct-connect或default Locator/NetStream验收。
 

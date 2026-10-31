@@ -155,7 +155,7 @@ python3 -B offline-registration-sim/run.py --fallback --report offline-registrat
 
 当前目标是**基础接电话、应答、挂机、双向音频与 Trunk，以及接短信、查询/删除、通知和原生回执**；外呼、发短信只保留接口。账号主入口要求**登录已绑定号码的App账号→自动取得电话凭据→确认业务→启动无忧行接收器**，不是仅保存认证摘要。`ff87712`已验证专用数据库/API/UI接线和该默认流程，但实际App的TLS/Router启动与完整默认参数装配仍未完成，尚无实网账号验收。高级手工导入保留兼容，账号使用独立 `app_account` / `application_data` 线路，不借 SIM、五码、UICC、IMS/CS 或免费 WLAN 资费。
 
-当前运行时源码基线为 `ff87712`（原账号登录d449163、专用数据库58c0764及门禁修复），两套Actions/双架构及官方digest ZIP逐名各807 Jegotrip、21HTTP和原回归通过；其中 `c6f0ba1` 补齐DIRECT与batch长期接收的独立回收证明。原邀请→应答→Endpoint TCP-Mpath↔UDP RTP→挂机、认证 HTTP、Asterisk 侧 SIP 与通话期间 SMS 均有隔离执行证据，**不是无忧行实网或账单验收**。410在此前授权窗口已验部署`5250123`，本次新版本未部署；用户所述入站免费不替代实际账单证据。
+当前运行时源码基线为 `8bd0439`（数据库登录ff87712之上新增独立endpoint TLS/Router控制组件），两套Actions/双架构及官方digest ZIP逐名各821 Jegotrip、21HTTP和原回归通过。新组件的原TLS/PacketSender/Router请求与回包已在内存TLS中执行，**尚未接到主流程的生产TCP选择/动态配置/接收器**；不把组件通过当作默认SDK已启动。其中 `c6f0ba1` 补齐DIRECT与batch长期接收，既有音频/HTTP/SIP/短信隔离证据保持；不是无忧行实网或账单验收。410此前授权窗口已验5250123，本次新版本未部署。
 
 ### 1. 纠正旧勘察结论
 
@@ -217,7 +217,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 | `runtime.hosting` | 只含`authname_prefix`、`channel_id`、`delete_int_code`；**不含SipNumber/SipPwd/enrollment_confirmed** |
 | `runtime`其余项 | 原`profile`，可选`bootstrap`/`call_media`/`reconnect`及`cleanup_on_disconnect`；形状与下方高级配置相同，原生校验在业务开通请求之前进行 |
 
-共享SDK application key、证书、服务器和托管参数已从实际APK私有提取；原fresh会话选择为`<UnifiedSession>`，MD5(username)前11位只是本地profile名。**原App的TLS/`-ri`路径与自动完整装配仍未完成**：其`tls→tlsp`在endpoint TLS内加BE32 PacketSender，不同于旧FF FF06内层TLS承载。Router的`clientConnect1/3`及返回逻辑ID/原path关联已定位，不能删除参数、猜`id/domain`回调或用fixture冒充实际安装上下文。用户不手提个人phone token/SipPwd，完整主链仍须据原证据补齐，见[逆向总结](JEGOTRIP_REVERSE_ENGINEERING_SUMMARY.md#54-tcproutertls-与-common-边界)。
+`8bd0439`已实现`EndpointTlsEngine`与原TLS品牌关联的Router连接控制，保留原信任/归属、fresh控制路由和结果逻辑ID，不生成SDK/hosting/接收就绪。PacketSender位于endpoint TLS内，端点包不能投成旧Common/ARC数据；原生明文解码器退休时清除缓冲。**尚缺生产TCP/原IO Join、完整Router path与动态account/回调和共享自动装配**，现有Profile仍不接受默认App Router路径。`RouterClient.AccessKey`是原逗号两项共享配置，不能把24字符SDK App key或phone token/SipPwd盲当该值；不得删参数、编造ready或复制fixture填满模板。详见[逆向总结](JEGOTRIP_REVERSE_ENGINEERING_SUMMARY.md#54-tcproutertls-与-common-边界)。
 
 | API | 语义 |
 | --- | --- |
@@ -236,7 +236,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 
 本次创建新本地line，不自动覆盖已有运行或实现原位续期。`start_receiver=true`只继续提交原接收器启动；SDK登录、HostingAck、短信/来电各自ready仍分开。界面只按原运行时就绪字段显示，不把任务completed当媒体已连通。`start/stop`仍只管客户端，不取消服务端托管；外呼/发短信仍501。
 
-已验`ff87712`：Build41157401567/Beta41157401553、ARM64/AMD64、官方digest/CRC/source-run逐名各807 Jegotrip（42登录）＋21HTTP＋7registry＋46Trunk＋31通知＋4SIP＋7DNS/86；前端build/lint/type-check/unit成功，469本机static/mock单次全过，66warnings保留。前几轮语法/类型/Drop/HTTP分类失败已修并留存原官方制品，原断言不削弱。这证明数据库接线及原受支持流程，不是原App TLS/Router自动启动、浏览器E2E/SDK执行、实网或新410部署验收。
+已验`8bd0439`：Build41165670060/Beta41165670082、ARM64/AMD64、官方digest/CRC/source-run逐名各821 Jegotrip（14新增端点/Router、42登录）＋21HTTP＋7registry＋46Trunk＋31通知＋4SIP＋7DNS/86；前端检查成功，477本机static/mock一次全过，67首编译warnings保留。新14项覆盖真实内存TLS分层发送/回包、品牌/旧scope/超时/零ID及后续坏包抑制；前失败制品/断言保持。不是生产TCP/默认SDK全自动启动、浏览器E2E/SDK执行、实网或新410部署验收。
 
 ### 3. 高级手工导入的必要参数（只列名字，不提供用户或 App 内置值）
 

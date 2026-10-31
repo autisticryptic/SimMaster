@@ -212,7 +212,7 @@ DeepLinkUtil.getPhoneLoginToken(Context)
 | 原生方法 | 用途 |
 | --- | --- |
 | `getAppConfigs.AccountEntry.Account` | 使用原应用配置上下文取得账号入口及属性 |
-| `clientConnect1.RouterClient.Common` / `clientConnect3.RouterClient.Common` | 已定位原Router连接控制及返回逻辑ID；当前runtime未接入，不能当SDK/hosting成功 |
+| `clientConnect1.RouterClient.Common` / `clientConnect3.RouterClient.Common` | 已实现原TLS品牌的内部Router连接控制/逻辑ID核验；尚未接到主SDK生产driver，不当SDK/hosting成功 |
 | `loginSession.AccountEntry.Account` | 原 SDK 会话登录；返回用户标识、ARC token 和属性 |
 | `swapCalls.AccountEntry.Account` | 交换批次请求、结果和 ACK 状态 |
 | `logoutSession.AccountEntry.Account` | 原 SDK 会话注销 |
@@ -245,9 +245,11 @@ DeepLinkUtil.getPhoneLoginToken(Context)
 | TLS | 原 NetSsl 使用 memory BIO；TLS plaintext read 不保证一读一包 | SimAdmin 要求显式 root/authority、证书验证与固定预算，不采用宽松 verifier |
 | Common | 已支持模式的请求/结果流可由长度/计数自定界；mode 3 有原分片规则 | 不能凭 TLS read 边界分包，也不能擅加内层 BE32 长度 |
 
-**当前App的endpoint TLS路径还不能套用旧适配器。** 原`ClientPathI::connect 0xD2E034`把tls交给下层tlsp；`NetDriverI::connect`在`0xE1000C`创建真实TLS TCP对象，`0xE10064`再包PacketSender。`0xDFF2A8→0xE712DC`先在应用packet前加BE32长度，交给该TLS对象；密文回调直接写socket。因此此分支是**packet→BE32 PacketSender→endpoint TLS→raw socket**，不是在TLS密文外加FF FF06和PacketSender。此结论只覆盖已追踪分支，不证明所有传输模式等价。
+**`8bd0439`已移植当前App的endpoint TLS与Router控制组件，但主启动链还未完成。** 原`ClientPathI::connect 0xD2E034`把tls交给tlsp；`0xE1000C`先创建真实TLS TCP对象，`0xE10064`再包PacketSender；`0xDFF2A8→0xE712DC`先加BE32长度再交TLS。所以此分支为**packet→BE32 PacketSender→endpoint TLS→raw socket**，不能套用密文外的FF FF06/PacketSender。新端点包品牌不能投成Common/ARC plaintext，root/authority/SNI/原scope/固定deadline及校验保持；原生明文缓冲退休清除，不推断所有传输等价。
 
-`-ri`保留每个端点的原Router ID关联。原path连上后取得Router agent，状态2→3走`clientConnect1.RouterClient.Common`（正ID：三个BE32状态词）或`clientConnect3.RouterClient.Common`（负ID：两个状态词）；原结果bool/分配逻辑ID/Common footer和当前path关联都必须核对，零ID/失败不成功。这些ID不是OS地址、RTP端口或SDK授权。具体定位`0xD45248→0xE40698/0xE40AE4→0xE33D2C/0xE34AEC`、结果`0xE23BD0/0xE23F1C→0xD4A57C/0xD49EE8`；尚未移植为完整自动启动链，不从本地notify或可解析回包猜remote receiver。
+`-ri`保留端点原Router关联。新原控制状态机编码正ID三个BE32词或负ID两个词、原版本和`id=Router/arcVer`，只接受原endpoint TLS品牌、匹配call-id/bool/非零逻辑ID/footer和完整有效组，不把后续坏包藏在早期赋值后。控制fresh路由12个零字节来自`D619A0/D614F8/D61FB8`原构造，不是猜OS地址；分配ID不是SDK/媒体权限。ConnectionI factory返回base+328 API子对象，其createAgent在`D89880→D894AC`；primary槽+24却是setSecurity，不能混用。ObjectAgent直接调用`DCC42C→DA88B8`把原渲染对象写入id，正向证实Router目标。
+
+`RouterClient.AccessKey`原设置器`D2CCEC`按首逗号分两项/trim，均非空才存共享上下文；`D29BCC`可添加accessKey/accessAuth。此前提取的24字符SDK App keys没有逗号，不能盲当该组合或phone token/SipPwd。生产TCP/原IO Join、完整Router path时序、动态account/receiver与实际共享装配仍须完成。新组件14项与原回归已两Actions/双架构逐名821核验，477static/mock；不是原SDK执行、实网或完整默认账号接收器。
 
 原 Router 的部分序号 bitmap 只做统计；Mpath 的 bitmap 则参与丢弃重复媒体数据。两个机制不能因都是 bitmap 就互相代用。完整拥塞控制、其他代理/传输、安全变体不在当前支持承诺内。
 
