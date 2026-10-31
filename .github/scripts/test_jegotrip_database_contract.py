@@ -80,6 +80,13 @@ class JegotripDatabaseContractTests(unittest.TestCase):
         self.assertIn('ring::rand::SecureRandom::fill', fixture)
         self.assertIn('claim_process_ownership(&lock_path)', fixture)
 
+    def test_https_database_fixture_retains_the_drop_owned_certificate(self):
+        tests = (P / 'tests.rs').read_text()
+        fixture = tests.split('async fn database_app_only_login_uses_real_https_and_never_builds_a_native_peer()', 1)[1].split('\nasync fn https_once(', 1)[0]
+        self.assertIn('Secret::from_owned(cert.root.clone())', fixture)
+        self.assertNotIn('Secret::from_owned(cert.root)', fixture)
+        self.assertIn('TlsAcceptor::from(server_config.clone())', fixture)
+
     def test_primary_api_defaults_to_full_hosting_but_still_requires_consent(self):
         source = (P / 'mod.rs').read_text()
         self.assertIn('pub enum LoginIntent { Authenticate, #[default] EnableHosting }', source)

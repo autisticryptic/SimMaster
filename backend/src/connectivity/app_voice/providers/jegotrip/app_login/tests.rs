@@ -541,7 +541,7 @@ async fn database_app_only_login_uses_real_https_and_never_builds_a_native_peer(
     let f=Fixture::new(vec![],false);let manager=Arc::new(AppLoginManager::new(f.temp.database.clone(),Arc::downgrade(&f.accounts)));
     manager.initialize(f.temp.path.with_extension("no-install-file.json")).unwrap();
     let mut configuration=database_configuration(&f,false);configuration.http.base_url=Secret::from_owned(format!("https://127.0.0.1:{port}/"));
-    configuration.http.root_der_base64=Some(Secret::from_owned(cert.root));
+    configuration.http.root_der_base64=Some(Secret::from_owned(cert.root.clone()));
     manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration}).unwrap();let id=id();manager.submit_jegotrip(app_only_request(&id)).unwrap();
     let view=terminal(&manager,&id).await;assert_eq!(view.phase,"completed");assert_eq!(view.line_id,None);assert_eq!(view.business_state,"not_requested");assert_redacted(&view);
     assert_eq!(worker.await.unwrap(),["/login","/user"]);assert_eq!(manager.app_accounts().unwrap().len(),1);assert_eq!(f.factory.build_count(),0);
