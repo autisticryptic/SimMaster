@@ -66,6 +66,18 @@ enum CapturedRoute {
 pub struct OwnedWireFrames { owner: AttemptOwner, connection: RpcConnectionScope, frames: Vec<TransportBytes> }
 
 impl OwnedWireFrames {
+    /// Raw endpoint-TLS ciphertext for the separately selected native tlsp
+    /// path. No PacketSender/FF FF06 wrapping belongs OUTSIDE endpoint TLS.
+    /// This is scoped output data, never a TLS or SDK authentication proof.
+    pub(super) fn endpoint_tls_output(owner: &AttemptOwner, connection: &RpcConnectionScope,
+        bytes: &[u8]) -> Result<Option<Self>, TransportError> {
+        if !connection.is_open() { return Ok(None); }
+        if bytes.is_empty() { return Err(TransportError::InvalidPacket); }
+        if bytes.len() > super::packet_stream::MAX_NETWORK_PACKET_BYTES { return Err(TransportError::TooLarge); }
+        Ok(Some(Self { owner: owner.clone(), connection: connection.clone(),
+            frames: vec![TransportBytes::from_bytes(bytes.to_vec())] }))
+    }
+
     /// Checked snapshot for the original writer task, NOT a revocable IO lease.
     /// Close/drop blocks NEW access, but cannot revoke a previously borrowed or
     /// copied slice. A future writer must serialize close/cancellation with

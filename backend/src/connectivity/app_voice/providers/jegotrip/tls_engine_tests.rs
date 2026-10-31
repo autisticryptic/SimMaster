@@ -330,6 +330,152 @@ fn verified_tls_login_roundtrip_reaches_only_original_offline_sdk_callback() {
     assert!(!format!("{engine:?}").contains("fixture")); assert!(!format!("{backend:?}").contains("fixture"));
 }
 
+fn endpoint_raw_wire(wire: &[OwnedWireFrames], original: &AttemptOwner, scope: &RpcConnectionScope) -> Vec<u8> {
+    wire.iter().flat_map(|item| item.frames_for(original, scope).unwrap().iter()
+        .flat_map(|frame| frame.expose_to_transport().to_vec())).collect()
+}
+fn endpoint_receive(engine: &mut EndpointTlsEngine, original: &AttemptOwner, scope: &RpcConnectionScope,
+    ciphertext: &[u8], chunk_size: usize, now: Instant) -> Result<(Vec<TransportBytes>, Vec<OwnedWireFrames>), TlsError> {
+    let mut packets = Vec::new(); let mut output = Vec::new();
+    for chunk in ciphertext.chunks(chunk_size) {
+        let progress = engine.on_wire_bytes(original, scope, chunk, now)?.unwrap();
+        for packet in progress.plaintext.packets_for(original, scope).unwrap() {
+            packets.push(TransportBytes::from_bytes(packet.expose_to_transport().to_vec()));
+        }
+        output.extend(progress.wire);
+    }
+    Ok((packets, output))
+}
+fn endpoint_handshake(engine: &mut EndpointTlsEngine, original: &AttemptOwner, scope: &RpcConnectionScope,
+    server: &mut rustls::ServerConnection, now: Instant) -> Result<(), TlsError> {
+    let mut outgoing = engine.take_wire_output(original, scope, now)?;
+    for _ in 0..20 {
+        let raw = endpoint_raw_wire(&outgoing, original, scope); if !raw.is_empty() { server_input(server, &raw); }
+        let raw = server_output(server); outgoing = Vec::new();
+        if !raw.is_empty() { outgoing = endpoint_receive(engine, original, scope, &raw, 97, now)?.1; }
+        if engine.phase() == TlsPhase::Verified && !server.is_handshaking() && outgoing.is_empty() { return Ok(()); }
+    }
+    panic!("bounded raw endpoint TLS handshake did not finish")
+}
+fn endpoint_setup(cert: &Certificates, version: &'static rustls::SupportedProtocolVersion)
+    -> (ArcProtocol, AttemptOwner, RpcConnectionScope, EndpointTlsEngine, rustls::ServerConnection, Instant) {
+    let original = owner(); let protocol = ArcProtocol::new(original.clone()); let scope = protocol.connection_scope(); let now = Instant::now();
+    let mut engine = EndpointTlsEngine::for_original(original.clone(), scope.clone(), parameters("fixture.invalid", &cert.root), now).unwrap();
+    let mut server = cert.server(version); endpoint_handshake(&mut engine, &original, &scope, &mut server, now).unwrap();
+    (protocol, original, scope, engine, server, now)
+}
+
+#[test]
+fn endpoint_tls12_tls13_handshake_ciphertext_is_raw_not_a_carrier_or_stream_frame() {
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        let original = owner(); let protocol = ArcProtocol::new(original.clone()); let scope = protocol.connection_scope(); let now = Instant::now();
+        let mut engine = EndpointTlsEngine::for_original(original.clone(), scope.clone(), parameters("fixture.invalid", &cert.root), now).unwrap();
+        let wire = engine.take_wire_output(&original, &scope, now).unwrap(); let raw = endpoint_raw_wire(&wire, &original, &scope);
+        assert_eq!(raw[0], 22); assert_eq!(raw[1], 3);
+        let mut server = cert.server(version); server_input(&mut server, &raw);
+        let cipher = server_output(&mut server); let (_, pending) = endpoint_receive(&mut engine, &original, &scope, &cipher, 17, now).unwrap();
+        let pending = endpoint_raw_wire(&pending, &original, &scope); if !pending.is_empty() { server_input(&mut server, &pending); }
+        endpoint_handshake(&mut engine, &original, &scope, &mut server, now).unwrap();
+        assert_eq!(engine.phase(), TlsPhase::Verified); assert_eq!(protocol.phase(), ArcPhase::Initial);
+    }
+}
+
+#[test]
+fn endpoint_packets_have_encrypted_be32_lengths_and_preserve_opaque_binary_payloads() {
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    let (protocol, original, scope, mut engine, mut server, now) = endpoint_setup(&cert, &rustls::version::TLS13);
+    let packets = vec![TransportBytes::from_bytes(vec![0xff, 0xff, 6, 0, 2, 0xff]), TransportBytes::from_bytes(vec![0, 7])];
+    let expected = packets.iter().flat_map(|p| encode_packet_stream_frame(p.expose_to_transport()).unwrap().expose_to_transport().to_vec()).collect::<Vec<_>>();
+    let wire = engine.encrypt_packets(&original, &scope, &packets, now).unwrap().unwrap();
+    server_input(&mut server, &endpoint_raw_wire(&wire, &original, &scope));
+    assert_eq!(server_plaintext(&mut server), expected);
+    assert_eq!(protocol.phase(), ArcPhase::Initial);
+    assert_eq!(engine.engine.encrypt_packets(&original, &scope, &packets, None, now).err(), Some(TlsError::InvalidConfiguration));
+    assert_eq!(engine.engine.on_wire_bytes(&original, &scope, &[], None, now).err(), Some(TlsError::InvalidConfiguration));
+}
+
+#[test]
+fn endpoint_packet_prefix_and_body_cross_tls_records_without_common_brand_or_false_ready() {
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    let (protocol, original, scope, mut engine, mut server, now) = endpoint_setup(&cert, &rustls::version::TLS13);
+    let first = encode_packet_stream_frame(&[0, 0xff, 7, 0]).unwrap(); let second = encode_packet_stream_frame(&[2]).unwrap();
+    let raw = first.expose_to_transport(); server.writer().write_all(&raw[..2]).unwrap();
+    let cipher = server_output(&mut server); assert!(endpoint_receive(&mut engine, &original, &scope, &cipher, 1, now).unwrap().0.is_empty());
+    assert!(engine.next_deadline().is_some());
+    server.writer().write_all(&raw[2..]).unwrap(); server.writer().write_all(second.expose_to_transport()).unwrap();
+    let cipher = server_output(&mut server); let (packets, _) = endpoint_receive(&mut engine, &original, &scope, &cipher, 11, now).unwrap();
+    assert_eq!(packets.iter().map(|p| p.expose_to_transport()).collect::<Vec<_>>(), vec![&[0, 0xff, 7, 0][..], &[2][..]]);
+    assert!(engine.next_deadline().is_none()); assert_eq!(protocol.phase(), ArcPhase::Initial);
+}
+
+#[test]
+fn endpoint_large_packet_spans_tls_records_and_invalid_later_send_emits_nothing() {
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    let (protocol, original, scope, mut engine, mut server, now) = endpoint_setup(&cert, &rustls::version::TLS13);
+    let large = vec![0xa5; 30_000]; let packet = TransportBytes::from_bytes(large.clone());
+    let wire = engine.encrypt_packets(&original, &scope, &[packet], now).unwrap().unwrap(); let cipher = endpoint_raw_wire(&wire, &original, &scope);
+    assert!(CipherRecords::default().feed(&cipher).unwrap().len() >= 2); server_input(&mut server, &cipher);
+    assert_eq!(server_plaintext(&mut server), encode_packet_stream_frame(&large).unwrap().expose_to_transport());
+    let invalid = [TransportBytes::from_bytes(vec![1]), TransportBytes::from_bytes(Vec::new())];
+    assert_eq!(engine.encrypt_packets(&original, &scope, &invalid, now).err(), Some(TlsError::Transport(TransportError::InvalidPacket)));
+    assert!(engine.take_wire_output(&original, &scope, now).unwrap().is_empty());
+    assert_eq!(engine.phase(), TlsPhase::Verified); assert_eq!(protocol.phase(), ArcPhase::Initial);
+}
+
+#[test]
+fn endpoint_wrong_root_wrong_identity_and_wildcard_fail_before_packet_delivery() {
+    let cert = Certificates::generate("DNS:fixture.invalid"); let other = Certificates::generate("DNS:fixture.invalid");
+    for (authority, root) in [("other.invalid", &cert.root), ("fixture.invalid", &other.root)] {
+        let original = owner(); let scope = RpcConnectionScope::fresh(); let now = Instant::now();
+        let mut engine = EndpointTlsEngine::for_original(original.clone(), scope.clone(), parameters(authority, root), now).unwrap();
+        assert_eq!(engine.encrypt_packets(&original, &scope, &[TransportBytes::from_bytes(vec![1])], now).err(), Some(TlsError::NotReady));
+        assert_eq!(endpoint_handshake(&mut engine, &original, &scope, &mut cert.server(&rustls::version::TLS13), now), Err(TlsError::HandshakeFailed));
+        assert!(!scope.is_open());
+    }
+    let wildcard = Certificates::generate("DNS:*.fixture.invalid"); let original = owner(); let scope = RpcConnectionScope::fresh(); let now = Instant::now();
+    let mut engine = EndpointTlsEngine::for_original(original.clone(), scope.clone(), parameters("host.fixture.invalid", &wildcard.root), now).unwrap();
+    assert_eq!(endpoint_handshake(&mut engine, &original, &scope, &mut wildcard.server(&rustls::version::TLS13), now), Err(TlsError::HandshakeFailed));
+}
+
+#[test]
+fn endpoint_stale_owner_scope_and_fixed_partial_deadline_do_not_rebind_delivery() {
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    let (_protocol, original, scope, mut engine, mut server, now) = endpoint_setup(&cert, &rustls::version::TLS13);
+    assert!(engine.on_wire_bytes(&owner(), &scope, &[0xff], now - Duration::from_secs(10)).unwrap().is_none());
+    assert!(engine.on_wire_bytes(&original, &RpcConnectionScope::fresh(), &[0xff], now - Duration::from_secs(10)).unwrap().is_none());
+    server.writer().write_all(&[0, 0]).unwrap(); let cipher = server_output(&mut server);
+    endpoint_receive(&mut engine, &original, &scope, &cipher, 97, now).unwrap();
+    server.writer().write_all(&[0]).unwrap(); let cipher = server_output(&mut server);
+    endpoint_receive(&mut engine, &original, &scope, &cipher, 97, now + Duration::from_millis(999)).unwrap();
+    assert_eq!(engine.tick(&original, &scope, now + Duration::from_secs(1)), Err(TlsError::Timeout)); assert!(!scope.is_open());
+}
+
+#[test]
+fn endpoint_malformed_or_overfull_authenticated_packets_suppress_whole_step_and_close() {
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    for raw in [vec![0, 0, 0, 1, 7, 0, 0, 0, 0], vec![0, 0, 0, 1, 7].repeat(super::super::packet_stream::MAX_PACKETS_PER_INPUT + 1)] {
+        let (_protocol, original, scope, mut engine, mut server, now) = endpoint_setup(&cert, &rustls::version::TLS13);
+        server.writer().write_all(&raw).unwrap(); let cipher = server_output(&mut server);
+        assert!(engine.on_wire_bytes(&original, &scope, &cipher, now).is_err()); assert!(!scope.is_open());
+    }
+}
+
+#[test]
+fn endpoint_scoped_packet_brand_eof_and_drop_never_authorize_another_owner_or_arc() {
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    let (protocol, original, scope, mut engine, mut server, now) = endpoint_setup(&cert, &rustls::version::TLS13);
+    server.writer().write_all(encode_packet_stream_frame(&[2]).unwrap().expose_to_transport()).unwrap(); let cipher = server_output(&mut server);
+    let progress = engine.on_wire_bytes(&original, &scope, &cipher, now).unwrap().unwrap();
+    assert!(progress.plaintext.packets_for(&owner(), &scope).is_none()); assert!(progress.plaintext.packets_for(&original, &RpcConnectionScope::fresh()).is_none());
+    let wire = engine.encrypt_packets(&original, &scope, &[TransportBytes::from_bytes(vec![7])], now).unwrap().unwrap();
+    drop(engine); assert!(progress.plaintext.packets_for(&original, &scope).is_none()); assert!(wire[0].frames_for(&original, &scope).is_none());
+    assert_eq!(protocol.phase(), ArcPhase::Closed);
+    let (_protocol, original, scope, mut engine, mut server, now) = endpoint_setup(&cert, &rustls::version::TLS13);
+    server.writer().write_all(&[0, 0]).unwrap(); let cipher = server_output(&mut server); endpoint_receive(&mut engine, &original, &scope, &cipher, 97, now).unwrap();
+    assert_eq!(engine.finish_eof(&original, &scope), Err(TlsError::Transport(TransportError::Truncated)));
+}
+
 #[test]
 fn checked_tls_plaintext_scope_cannot_be_rebound_to_new_arc_or_delivered_after_close() {
     let cert = Certificates::generate("DNS:fixture.invalid"); let (mut protocol, original, scope, mut engine, mut server, now) = setup(&cert, &rustls::version::TLS13);

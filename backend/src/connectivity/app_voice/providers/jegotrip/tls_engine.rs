@@ -1,12 +1,15 @@
-//! Trusted, original-ARC-owned TLS over recovered opaque carrier packets.
+//! Trusted, original-owned TLS with two explicitly distinct native boundaries.
 //!
-//! Uses rustls with ONLY the explicitly imported root and original authority.
-//! TLS readiness is not SDK login, hosting, a message channel or paid-service
-//! authorization. No socket is opened. Standard TLS records are accumulated
-//! before verification; verified plaintext is parsed by the recovered Common
-//! format rather than treating a TLS record/read as a call-packet boundary.
+//! The existing ARC engine uses opaque FF FF06 carriers outside inner TLS.
+//! The separate endpoint engine uses raw TLS ciphertext on its IO and the
+//! recovered BE32 PacketSender framing INSIDE endpoint TLS (native tls->tlsp).
+//! Endpoint packets have a distinct brand and cannot be delivered as verified
+//! Common/ARC plaintext. Neither engine opens sockets or grants SDK, hosting,
+//! message, call or paid-service readiness; both require the original root,
+//! authority/SNI, owner/scope and fixed handshake/partial-input deadlines.
 use super::{
     packet_transport::{OwnedPacketTransport, OwnedWireFrames, PacketRoute, RouterTiming},
+    packet_stream::{encode_packet_stream_frame, PacketStreamDecoder},
     rpc_pending::RpcConnectionScope,
     session::AttemptOwner,
     tls_plaintext::PlaintextPacketDecoder,
@@ -125,15 +128,57 @@ impl Write for BoundedTlsOutput {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
+/// One private mode selection controls BOTH sides of the native boundary.
+/// It is not inferred from received bytes or exposed through a public DTO.
+enum WireTransport { Carrier(OwnedPacketTransport), Endpoint }
+impl WireTransport {
+    fn has_partial(&self) -> bool { match self { Self::Carrier(t) => t.has_partial(), Self::Endpoint => false } }
+    fn close(&mut self) { if let Self::Carrier(t) = self { t.close(); } }
+    fn encode_tls_bytes(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope,
+        bytes: &[u8], timing: Option<RouterTiming>) -> Result<Option<OwnedWireFrames>, TransportError> {
+        match self {
+            Self::Carrier(t) => t.encode_tls_bytes(owner, scope, bytes, timing),
+            Self::Endpoint => {
+                if timing.is_some() { return Err(TransportError::InvalidPacket); }
+                OwnedWireFrames::endpoint_tls_output(owner, scope, bytes)
+            }
+        }
+    }
+    fn on_bytes(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope,
+        bytes: &[u8]) -> Result<Vec<TransportBytes>, TlsError> {
+        match self {
+            Self::Carrier(t) => t.on_bytes(owner, scope, bytes)?.into_iter().map(|input| {
+                let raw = input.bytes_for_tls(owner, scope).ok_or(TlsError::Closed)?;
+                Ok(TransportBytes::from_bytes(raw.to_vec()))
+            }).collect(),
+            Self::Endpoint => {
+                if bytes.len() > MAX_TLS_IO_BYTES { return Err(TlsError::TooLarge); }
+                if bytes.is_empty() { Ok(Vec::new()) }
+                else { Ok(vec![TransportBytes::from_bytes(bytes.to_vec())]) }
+            }
+        }
+    }
+}
+enum PlaintextDecoder { Common(PlaintextPacketDecoder), Endpoint(PacketStreamDecoder) }
+impl PlaintextDecoder {
+    fn is_endpoint(&self) -> bool { matches!(self, Self::Endpoint(_)) }
+    fn has_partial(&self) -> bool { match self { Self::Common(d) => d.has_partial(), Self::Endpoint(d) => d.has_partial() } }
+    fn close(&mut self) { match self { Self::Common(d) => d.close(), Self::Endpoint(d) => d.close() } }
+    fn on_bytes(&mut self, bytes: &[u8]) -> Result<Vec<TransportBytes>, TransportError> {
+        match self { Self::Common(d) => d.on_bytes(bytes), Self::Endpoint(d) => d.on_bytes(bytes) }
+    }
+}
+struct ReceivedTls { became_verified: bool, wire: Vec<OwnedWireFrames>, packets: Vec<TransportBytes> }
+
 pub struct TlsEngine {
     owner: AttemptOwner,
     scope: RpcConnectionScope,
-    transport: OwnedPacketTransport,
+    transport: WireTransport,
     connection: Option<rustls::ClientConnection>,
     authority: String,
     phase: TlsPhase,
     records: CipherRecords,
-    plaintext: PlaintextPacketDecoder,
+    plaintext: PlaintextDecoder,
     handshake_deadline: Instant,
     partial_deadline: Option<Instant>,
     partial_timeout: Duration,
@@ -147,6 +192,10 @@ impl fmt::Debug for TlsEngine {
 
 impl TlsEngine {
     pub(super) fn for_arc_session(owner: AttemptOwner, scope: RpcConnectionScope, route: PacketRoute<'_>,
+        parameters: TlsParameters<'_>, now: Instant) -> Result<Self, TlsError> {
+        Self::create(owner, scope, Some(route), parameters, now)
+    }
+    fn create(owner: AttemptOwner, scope: RpcConnectionScope, carrier: Option<PacketRoute<'_>>,
         parameters: TlsParameters<'_>, now: Instant) -> Result<Self, TlsError> {
         if !scope.is_open() { return Err(TlsError::Closed); }
         if !parameters.tls_only || !valid_authority(parameters.authority)
@@ -172,9 +221,13 @@ impl TlsEngine {
         let mut connection = rustls::ClientConnection::new(Arc::new(config), name).map_err(|_| TlsError::InvalidConfiguration)?;
         connection.set_buffer_limit(Some(MAX_TLS_IO_BYTES));
         let handshake_deadline = now.checked_add(parameters.handshake_timeout).ok_or(TlsError::InvalidConfiguration)?;
-        let transport = OwnedPacketTransport::for_arc_session(owner.clone(), scope.clone(), route)?;
+        let (transport, plaintext) = match carrier {
+            Some(route) => (WireTransport::Carrier(OwnedPacketTransport::for_arc_session(owner.clone(), scope.clone(), route)?),
+                PlaintextDecoder::Common(PlaintextPacketDecoder::default())),
+            None => (WireTransport::Endpoint, PlaintextDecoder::Endpoint(PacketStreamDecoder::default())),
+        };
         Ok(Self { owner, scope, transport, connection: Some(connection), authority: parameters.authority.to_owned(),
-            phase: TlsPhase::Handshaking, records: CipherRecords::default(), plaintext: PlaintextPacketDecoder::default(),
+            phase: TlsPhase::Handshaking, records: CipherRecords::default(), plaintext,
             handshake_deadline, partial_deadline: None, partial_timeout: parameters.partial_timeout, last_now: now })
     }
     pub(super) fn next_deadline(&self) -> Option<Instant> {
@@ -240,17 +293,19 @@ impl TlsEngine {
         timing: Option<RouterTiming>, now: Instant) -> Result<Option<TlsProgress>, TlsError> {
         if !self.scope.is_open() { self.close(); return Ok(None); }
         if !self.accepts(owner, scope) { return Ok(None); }
+        if self.plaintext.is_endpoint() { return Err(TlsError::InvalidConfiguration); }
         let result = self.receive(bytes, timing, now);
         if result.is_err() { self.close(); }
-        result.map(Some)
+        result.map(|value| Some(TlsProgress { became_verified: value.became_verified, wire: value.wire,
+            plaintext: VerifiedPlaintextPackets { owner: self.owner.clone(), scope: self.scope.clone(), packets: value.packets } }))
     }
-    fn receive(&mut self, bytes: &[u8], timing: Option<RouterTiming>, now: Instant) -> Result<TlsProgress, TlsError> {
+    fn receive(&mut self, bytes: &[u8], timing: Option<RouterTiming>, now: Instant) -> Result<ReceivedTls, TlsError> {
         self.check_time(now)?;
         let was_verified = self.phase == TlsPhase::Verified;
         let input = self.transport.on_bytes(&self.owner, &self.scope, bytes)?;
         let mut packets = Vec::new(); let mut record_count = 0usize;
         for input in input {
-            let raw = input.bytes_for_tls(&self.owner, &self.scope).ok_or(TlsError::Closed)?;
+            let raw = input.expose_to_transport();
             // Allowance is shared across all carrier packets in this step.
             // Handshake ciphertext counts as well as application records.
             for record in self.records.feed(raw)? {
@@ -290,8 +345,7 @@ impl TlsEngine {
         self.update_partial(now)?;
         let wire = self.drain_wire(timing)?;
         if !self.scope.is_open() { return Err(TlsError::Closed); }
-        Ok(TlsProgress { became_verified: !was_verified && self.phase == TlsPhase::Verified, wire,
-            plaintext: VerifiedPlaintextPackets { owner: self.owner.clone(), scope: self.scope.clone(), packets } })
+        Ok(ReceivedTls { became_verified: !was_verified && self.phase == TlsPhase::Verified, wire, packets })
     }
 
     /// Validate the entire canonical Common group BEFORE encrypting. Each
@@ -303,6 +357,7 @@ impl TlsEngine {
         if !self.accepts(owner, scope) { return Ok(None); }
         if let Err(error) = self.check_time(now) { self.close(); return Err(error); }
         if self.phase != TlsPhase::Verified { return Err(TlsError::NotReady); }
+        if self.plaintext.is_endpoint() { return Err(TlsError::InvalidConfiguration); }
         let mut validator = PlaintextPacketDecoder::default();
         if packets.is_empty() || packets.len() > super::packet_stream::MAX_PACKETS_PER_INPUT { return Err(TlsError::TooLarge); }
         let mut total = 0usize;
@@ -345,6 +400,89 @@ impl TlsEngine {
     }
 }
 impl Drop for TlsEngine { fn drop(&mut self) { self.close(); } }
+
+/// TLS-authenticated endpoint packet data, NOT Common/ARC plaintext. No API can
+/// convert this brand into VerifiedPlaintextPackets or SDK/hosting readiness.
+pub struct VerifiedEndpointPackets { owner: AttemptOwner, scope: RpcConnectionScope, packets: Vec<TransportBytes> }
+impl VerifiedEndpointPackets {
+    /// Scoped snapshot; a live actor must still serialize final consumption/IO
+    /// with retirement. Previously borrowed/copied bytes are not revocable.
+    pub fn packets_for(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Option<&[TransportBytes]> {
+        if &self.owner == owner && self.scope.matches(scope) && self.scope.is_open() { Some(&self.packets) } else { None }
+    }
+}
+impl fmt::Debug for VerifiedEndpointPackets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("VerifiedEndpointPackets(<redacted>)") }
+}
+pub struct EndpointTlsProgress {
+    pub became_verified: bool,
+    pub wire: Vec<OwnedWireFrames>,
+    pub plaintext: VerifiedEndpointPackets,
+}
+impl fmt::Debug for EndpointTlsProgress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("EndpointTlsProgress(<redacted>)") }
+}
+
+/// Explicit native tls->tlsp engine: BE32(packet.len()) is encrypted, while
+/// handshake/control ciphertext goes straight to the original IO. The private
+/// constructor takes a caller-owned physical scope; it does not create a new
+/// owner, pick endpoints, register a Router, or enable a default SDK profile.
+pub struct EndpointTlsEngine { engine: TlsEngine }
+impl fmt::Debug for EndpointTlsEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EndpointTlsEngine").field("phase", &self.phase()).field("materials", &"<redacted>").finish()
+    }
+}
+impl EndpointTlsEngine {
+    pub(super) fn for_original(owner: AttemptOwner, scope: RpcConnectionScope,
+        parameters: TlsParameters<'_>, now: Instant) -> Result<Self, TlsError> {
+        Ok(Self { engine: TlsEngine::create(owner, scope, None, parameters, now)? })
+    }
+    pub fn phase(&self) -> TlsPhase { self.engine.phase() }
+    pub fn close(&mut self) { self.engine.close(); }
+    pub(super) fn next_deadline(&self) -> Option<Instant> { self.engine.next_deadline() }
+    pub fn tick(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope, now: Instant) -> Result<bool, TlsError> {
+        self.engine.tick(owner, scope, now)
+    }
+    pub fn take_wire_output(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope, now: Instant)
+        -> Result<Vec<OwnedWireFrames>, TlsError> {
+        self.engine.take_wire_output(owner, scope, None, now)
+    }
+    pub fn on_wire_bytes(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope, bytes: &[u8], now: Instant)
+        -> Result<Option<EndpointTlsProgress>, TlsError> {
+        if !self.engine.scope.is_open() { self.close(); return Ok(None); }
+        if !self.engine.accepts(owner, scope) { return Ok(None); }
+        let result = self.engine.receive(bytes, None, now);
+        if result.is_err() { self.close(); }
+        result.map(|value| Some(EndpointTlsProgress { became_verified: value.became_verified, wire: value.wire,
+            plaintext: VerifiedEndpointPackets { owner: self.engine.owner.clone(), scope: self.engine.scope.clone(), packets: value.packets } }))
+    }
+    pub fn encrypt_packets(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope,
+        packets: &[TransportBytes], now: Instant) -> Result<Option<Vec<OwnedWireFrames>>, TlsError> {
+        if !self.engine.scope.is_open() { self.close(); return Ok(None); }
+        if !self.engine.accepts(owner, scope) { return Ok(None); }
+        if let Err(error) = self.engine.check_time(now) { self.close(); return Err(error); }
+        if self.phase() != TlsPhase::Verified { return Err(TlsError::NotReady); }
+        if packets.is_empty() || packets.len() > super::packet_stream::MAX_PACKETS_PER_INPUT { return Err(TlsError::TooLarge); }
+        // Validate aggregate bounds BEFORE framing/encrypting any packet. A
+        // malformed later member cannot emit the earlier members of this call.
+        let mut total = 0usize;
+        for packet in packets {
+            let raw = packet.expose_to_transport();
+            if raw.is_empty() { return Err(TransportError::InvalidPacket.into()); }
+            if raw.len() > super::packet_stream::MAX_NETWORK_PACKET_BYTES { return Err(TlsError::TooLarge); }
+            total = total.checked_add(raw.len() + 4).ok_or(TlsError::TooLarge)?;
+            if total > MAX_TLS_IO_BYTES { return Err(TlsError::TooLarge); }
+        }
+        let framed = packets.iter().map(|p| encode_packet_stream_frame(p.expose_to_transport())).collect::<Result<Vec<_>, _>>()?;
+        let result = self.engine.encrypt(&framed, None);
+        if result.is_err() { self.close(); }
+        result.map(Some)
+    }
+    pub fn finish_eof(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Result<bool, TlsError> {
+        self.engine.finish_eof(owner, scope)
+    }
+}
 
 pub(super) fn valid_authority(authority: &str) -> bool {
     if authority.is_empty() || authority.len() > 253 || authority.bytes().any(|b| b <= 32 || b >= 127) { return false; }

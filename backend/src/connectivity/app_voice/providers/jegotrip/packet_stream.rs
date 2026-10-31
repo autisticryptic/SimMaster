@@ -6,6 +6,7 @@
 //! Bounds below are local policies, smaller than the native 64 MiB maximum.
 use super::transport_packets::{TransportBytes, TransportError, MAX_CARRIER_BYTES};
 use std::fmt;
+use zeroize::Zeroize;
 
 /// Allows the bounded TLS carrier plus the supported Router header/routing.
 pub const MAX_NETWORK_PACKET_BYTES: usize = MAX_CARRIER_BYTES + 64;
@@ -45,7 +46,7 @@ impl fmt::Debug for PacketStreamDecoder {
 impl PacketStreamDecoder {
     pub fn close(&mut self) {
         self.prefix = [0; 4]; self.prefix_length = 0;
-        self.expected = None; self.partial.clear(); self.closed = true;
+        self.expected = None; self.partial.zeroize(); self.closed = true;
     }
 
     pub fn is_closed(&self) -> bool { self.closed }
@@ -72,6 +73,10 @@ impl PacketStreamDecoder {
                 let expected = u32::from_be_bytes(self.prefix) as usize;
                 if expected == 0 { return Err(TransportError::InvalidPacket); }
                 if expected > MAX_NETWORK_PACKET_BYTES { return Err(TransportError::TooLarge); }
+                // This decoder is also used INSIDE authenticated endpoint TLS.
+                // Allocate the validated bounded size once; incremental packet
+                // copies must not reallocate and free unwiped plaintext buffers.
+                self.partial.reserve_exact(expected);
                 self.expected = Some(expected);
             }
             let expected = self.expected.ok_or(TransportError::InvalidPacket)?;
@@ -93,6 +98,8 @@ impl PacketStreamDecoder {
         if incomplete { Err(TransportError::Truncated) } else { Ok(()) }
     }
 }
+
+impl Drop for PacketStreamDecoder { fn drop(&mut self) { self.close(); } }
 
 #[cfg(test)]
 #[path = "packet_stream_tests.rs"]
