@@ -55,7 +55,9 @@ mod app_voice_accounts {
     #[tokio::test]
     async fn authenticated_jegotrip_configuration_is_database_backed_cas_and_http_only_without_file() {
         let state=build_test_router().await.expect("Actions private D-Bus required; no skip");
-        let nonce=crate::connectivity::app_voice::providers::jegotrip::account_runtime::local_nonce().unwrap();
+        let mut random = [0u8; 16];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random).unwrap();
+        let nonce = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         let lock_path=std::env::temp_dir().join(format!("jegotrip-config-api-{nonce}.lock"));
         state.app.app_accounts.claim_process_ownership(&lock_path).unwrap();
         state.app.app_logins.initialize(std::env::temp_dir().join(format!("missing-jegotrip-{nonce}.json"))).unwrap();

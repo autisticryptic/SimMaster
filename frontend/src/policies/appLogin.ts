@@ -61,7 +61,7 @@ const errors: Record<string, string> = {
   app_login_account_limit: '无忧行账号摘要已达上限，需要管理员检查。',
   app_login_configuration_revision_conflict: '安装配置版本已变化，请重新读取后再保存。',
   app_login_migration_conflict: '新旧无忧行任务表同时有数据，迁移已保留原记录并停止，请管理员核对。',
-  app_login_native_configuration_missing: '完整原生启动配置尚未就绪，未开启托管或启动无忧行；不会退回仅保存认证摘要。',,
+  app_login_native_configuration_missing: '完整原生启动配置尚未就绪，未开启托管或启动无忧行；不会退回仅保存认证摘要。',
   app_login_verification_required: '服务要求额外安全验证，尚未开启接收；不会伪造验证通过。',
   app_login_existing_business_action_required: '服务要求处理既有业务状态；程序未自动关闭原托管或呼转。',
   app_login_migration_required: '该账号需要先完成原服务的账号迁移。',

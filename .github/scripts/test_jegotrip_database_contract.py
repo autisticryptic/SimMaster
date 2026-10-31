@@ -60,6 +60,26 @@ class JegotripDatabaseContractTests(unittest.TestCase):
         self.assertIn('登录并启动无忧行', pane)
         self.assertIn("setText('')", config)
 
+    def test_login_frontend_declares_draft_type_and_has_no_empty_error_map_entry(self):
+        pane = (ROOT / 'frontend/src/pages/sim/AppAccountLoginPane.tsx').read_text()
+        policy = (ROOT / 'frontend/src/policies/appLogin.ts').read_text()
+        self.assertIn('type AppLoginDraft', pane.split("from '../../policies/appLogin'", 1)[0])
+        self.assertNotIn("',,", policy)
+        # Source guards are supplemental; both Actions still execute TypeScript
+        # and lint rather than treating these checks as compilation evidence.
+        for name in ['build-release.yml', 'beta-validation.yml']:
+            self.assertIn('pnpm run type-check', (ROOT / '.github/workflows' / name).read_text())
+
+    def test_http_configuration_fixture_does_not_broaden_private_nonce_visibility(self):
+        native = ROOT / 'backend/src/connectivity/app_voice/providers/jegotrip'
+        runtime = (native / 'account_runtime.rs').read_text()
+        http = (ROOT / 'backend/src/api/app_voice_http_tests.rs').read_text()
+        fixture = http.split('async fn authenticated_jegotrip_configuration_is_database_backed_cas_and_http_only_without_file()', 1)[1].split('\n    #[tokio::test]', 1)[0]
+        self.assertIn('pub(super) fn local_nonce()', runtime)
+        self.assertNotIn('account_runtime::local_nonce()', fixture)
+        self.assertIn('ring::rand::SecureRandom::fill', fixture)
+        self.assertIn('claim_process_ownership(&lock_path)', fixture)
+
     def test_primary_api_defaults_to_full_hosting_but_still_requires_consent(self):
         source = (P / 'mod.rs').read_text()
         self.assertIn('pub enum LoginIntent { Authenticate, #[default] EnableHosting }', source)
