@@ -25,6 +25,9 @@ impl PortClock {
             .map_err(|_| PortError::Exhausted)?;
         Ok(PortOrder { inner: self.inner.clone(), value: previous + 1 })
     }
+    pub fn origin_matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
+        &self.owner == owner && self.scope.matches(scope) && self.scope.is_open()
+    }
     pub fn owns(&self, order: &PortOrder) -> bool { Arc::ptr_eq(&self.inner, &order.inner) }
     fn value_for(&self, order: &PortOrder) -> Option<u64> {
         self.owns(order).then_some(order.value)
@@ -101,7 +104,7 @@ impl State {
 
 struct LeaseInner {
     state: Weak<Mutex<State>>, owner: AttemptOwner, scope: RpcConnectionScope,
-    port: u16, generation: u64,
+    port: u16, generation: u64, birth: PortOrder,
 }
 impl Drop for LeaseInner {
     fn drop(&mut self) {
@@ -128,12 +131,31 @@ impl PortLease {
         if state.closed { return None; }
         state.ports.get(&self.inner.port).filter(|entry| entry.generation == self.inner.generation)?.address
     }
+    pub fn address_for_clock(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, clock: &PortClock) -> Option<LogicalAddress> {
+        if !clock.origin_matches(owner, scope) || !clock.owns(&self.inner.birth) { return None; }
+        self.address_for(owner, scope)
+    }
+    pub fn transmit_permit(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, clock: &PortClock) -> Option<PortTransmitPermit> {
+        let address = self.address_for_clock(owner, scope, clock)?;
+        Some(PortTransmitPermit { lease: Arc::downgrade(&self.inner), address })
+    }
     pub fn release(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
         if !self.original(owner, scope) { return false; }
         let Some(state) = self.inner.state.upgrade() else { return false; };
         let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
         state.release(self.inner.port, self.inner.generation)
     }
+}
+
+pub(super) struct PortTransmitPermit { lease: Weak<LeaseInner>, address: LogicalAddress }
+impl PortTransmitPermit {
+    pub fn address_for(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Option<LogicalAddress> {
+        let lease = PortLease { inner: self.lease.upgrade()? };
+        (lease.address_for(owner, scope)? == self.address).then_some(self.address)
+    }
+}
+impl fmt::Debug for PortTransmitPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("PortTransmitPermit(<redacted>)") }
 }
 
 pub(super) struct PortDelivery {
@@ -222,8 +244,8 @@ impl RouterPorts {
         let generation = state.next_generation.ok_or(PortError::Exhausted)?;
         let address = state.fresh_host(now).map(|(network, node)| LogicalAddress { network, node, port });
         if address.is_some_and(|address| state.addresses.contains_key(&address)) { return Err(PortError::InUse); }
-        let birth_order = self.clock.stamp()?.value;
-        let inner = Arc::new(LeaseInner { state: Arc::downgrade(&self.state), owner: self.owner.clone(), scope: self.scope.clone(), port, generation });
+        let birth = self.clock.stamp()?; let birth_order = birth.value;
+        let inner = Arc::new(LeaseInner { state: Arc::downgrade(&self.state), owner: self.owner.clone(), scope: self.scope.clone(), port, generation, birth });
         state.next_generation = generation.checked_add(1);
         state.ports.insert(port, Entry { generation, birth_order, protocol, deadline: address.is_none().then_some(deadline), address, lease: Arc::downgrade(&inner) });
         if let Some(address) = address { state.addresses.insert(address, generation); }

@@ -105,6 +105,63 @@ impl RouterPath {
             self.send_control(&response,deadline).await?;
         } Ok(())
     }
+    /// Resolve and negotiate one immutable logical endpoint on this ORIGINAL
+    /// Router tracker. Its alternate hint is retained but never used for DNS,
+    /// a new socket, an authority replacement or a silent endpoint rewrite.
+    pub(super) async fn connect_peer(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,
+        endpoint:&super::object_reference::ReferenceEndpoint,index:usize,deadline:Instant)
+        ->Result<Option<super::router_peer::PeerBinding>,RouterIoError>{
+        if !self.original(owner,scope){return Ok(None);}
+        let now=Instant::now();
+        if deadline.checked_duration_since(now).is_none_or(|left|left.is_zero()||left>Duration::from_secs(30)){return Err(RouterIoError::Configuration);}
+        let query=matches!(endpoint.router_host().map_err(|_|RouterIoError::Configuration)?,super::object_reference::RouterHost::Query(_));
+        let mut cancelled=CancelGuard{scope:self.scope.clone(),armed:true};
+        let result=async {
+            if query {
+                let timing=self.timing();
+                let request=self.tracker.prepare_resolve(owner,scope,endpoint,timing,deadline,Instant::now())?.ok_or(RouterIoError::Scope)?;
+                if !self.send(owner,scope,request.packets_for(owner,scope).ok_or(RouterIoError::Scope)?,deadline).await?{return Err(RouterIoError::Scope);}
+            }
+            let target=loop {
+                match self.tracker.capture_peer_target(owner,scope,endpoint,index,Instant::now()) {
+                    Ok(Some(target))=>break target,
+                    Ok(None)=>return Err(RouterIoError::Scope),
+                    Err(RouterConnectError::Pending)=>{if !self.drive_routing(owner,scope,deadline).await?{return Err(RouterIoError::Scope);}},
+                    Err(error)=>return Err(error.into()),
+                }
+            };
+            let timing=self.timing();
+            let request=self.tracker.prepare_peer(owner,scope,&target,timing,deadline,Instant::now())?.ok_or(RouterIoError::Scope)?;
+            if !self.send(owner,scope,request.packets_for(owner,scope).ok_or(RouterIoError::Scope)?,deadline).await?{return Err(RouterIoError::Scope);}
+            loop {
+                if let Some(binding)=self.tracker.take_peer_binding(owner,scope,&target){return Ok(Some(binding));}
+                if !self.drive_routing(owner,scope,deadline).await?{return Err(RouterIoError::Scope);}
+            }
+        }.await;
+        if result.is_ok(){cancelled.armed=false;}else{self.close();}result
+    }
+    /// A still-live original port and negotiated peer are required for every
+    /// normal Router datagram. Waiting for a route report does not create a new
+    /// RPC/business request or renew the caller's absolute deadline.
+    pub(super) async fn send_datagram(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,lease:&PortLease,
+        peer:&super::router_peer::PeerBinding,tag:u32,priority:u8,payload:&[u8],deadline:Instant)->Result<bool,RouterIoError>{
+        if !self.original(owner,scope){return Ok(false);}
+        if priority>3||payload.is_empty(){return Err(RouterIoError::Configuration);}
+        let mut cancelled=CancelGuard{scope:self.scope.clone(),armed:true};
+        let result=async {
+            loop {
+                let now=Instant::now();if now>=deadline{return Err(RouterIoError::Timeout);}
+                let timing=self.timing();
+                match self.tracker.prepare_datagram(owner,scope,lease,peer,tag,priority,payload,timing,now) {
+                    Ok(Some(data))=>return self.send(owner,scope,data.packets_for(owner,scope).ok_or(RouterIoError::Scope)?,deadline).await,
+                    Ok(None)=>return Err(RouterIoError::Scope),
+                    Err(RouterConnectError::Pending)=>{if !self.drive_routing(owner,scope,deadline).await?{return Err(RouterIoError::Scope);}},
+                    Err(error)=>return Err(error.into()),
+                }
+            }
+        }.await;
+        if result.is_ok(){cancelled.armed=false;}else{self.close();}result
+    }
     /// Reserve under this ORIGINAL tracker/book, then wait for actual node
     /// traffic. This returns a logical listen, never a Channel/SDK-ready grant.
     pub(super) async fn listen(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,protocol:ListenProtocol,

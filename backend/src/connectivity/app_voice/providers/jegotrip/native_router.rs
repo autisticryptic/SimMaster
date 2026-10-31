@@ -42,6 +42,21 @@ fn packet(header: RouterHeader, body: &[u8]) -> Result<TransportBytes, Transport
     Ok(TransportBytes::from_bytes(bytes))
 }
 
+/// Native normal packets split into balanced adjacent halves with u16 wrap.
+/// The older ordered/strict router_packets API intentionally remains unchanged.
+pub(super) fn encode_path_packets(header: RouterHeader, body: &[u8], mtu: usize) -> Result<Vec<TransportBytes>, TransportError> {
+    validate(&header)?;
+    if header.packet_kind > 1 || header.fragment_part != 1 || body.is_empty() || !(16..=MAX_NETWORK_PACKET_BYTES).contains(&mtu) {
+        return Err(TransportError::InvalidPacket);
+    }
+    if body.len() > MAX_ROUTED_BODY_BYTES { return Err(TransportError::TooLarge); }
+    if body.len() + HEADER_BYTES < mtu { return Ok(vec![packet(header, body)?]); }
+    let half = body.len() / 2;
+    if half == 0 || body.len() - half + HEADER_BYTES > mtu { return Err(TransportError::TooLarge); }
+    Ok(vec![packet(RouterHeader { fragment_part: 2, ..header }, &body[..half])?,
+        packet(RouterHeader { sequence: header.sequence.wrapping_add(1), fragment_part: 3, ..header }, &body[half..])?])
+}
+
 pub struct TimingProbe { pub peer_send_time: u16, pub peer_sequence: u16 }
 impl fmt::Debug for TimingProbe { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("TimingProbe(<redacted>)") } }
 /// A path-level probe can have no body or exactly two BE16 echoed peer words.
@@ -214,6 +229,20 @@ impl fmt::Debug for PreparedRouterControl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("PreparedRouterControl(<redacted>)") }
 }
 
+pub(super) struct PreparedRouterDatagram {
+    owner: super::session::AttemptOwner, scope: super::rpc_pending::RpcConnectionScope,
+    permit: super::router_ports::PortTransmitPermit, packets: Vec<TransportBytes>,
+}
+impl PreparedRouterDatagram {
+    pub fn packets_for(&self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope) -> Option<&[TransportBytes]> {
+        if &self.owner != owner || !self.scope.matches(scope) || !self.scope.is_open() { return None; }
+        self.permit.address_for(owner, scope)?; Some(&self.packets)
+    }
+}
+impl fmt::Debug for PreparedRouterDatagram {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("PreparedRouterDatagram(<redacted>)") }
+}
+
 pub struct RouterAssignment {
     owner: super::session::AttemptOwner,
     scope: super::rpc_pending::RpcConnectionScope,
@@ -232,6 +261,7 @@ impl fmt::Debug for RouterAssignment {
 
 /// Original endpoint/query capture, not a mutable current-account lookup.
 struct PendingResolve { call_id: i32, scheme: Vec<u8>, query: Vec<u8>, port: u16, deadline: Instant }
+struct PendingPeer { call_id: i32, target: super::router_peer::PeerTarget, local: (u32, u32), deadline: Instant }
 impl Drop for PendingResolve { fn drop(&mut self) { self.scheme.zeroize(); self.query.zeroize(); } }
 
 pub struct PreparedRouterResolve {
@@ -304,6 +334,8 @@ pub struct RouterConnectTracker {
     access: Vec<(&'static [u8], zeroize::Zeroizing<Vec<u8>>)>,
     next_control_id: Option<i32>,
     pending_resolve: Option<PendingResolve>,
+    pending_peer: Option<PendingPeer>,
+    peer_binding: Option<super::router_peer::PeerBinding>,
     resolution: Option<RouterResolution>,
     data: Vec<VerifiedRouterData>,
     port_clock: super::router_ports::PortClock,
@@ -343,7 +375,7 @@ impl RouterConnectTracker {
         }).collect();
         let port_clock = super::router_ports::PortClock::for_original(owner.clone(), scope.clone());
         Ok(Self { owner, scope, router_id, nonce, access, mtu, sequence, port_clock, assigned_ids: None, node_levels: [0; 4], node_report: None, pending_feedback: 0,
-            next_control_id: Some(2), pending_resolve: None, resolution: None, data: Vec::new(), data_bytes: 0,
+            next_control_id: Some(2), pending_resolve: None, pending_peer: None, peer_binding: None, resolution: None, data: Vec::new(), data_bytes: 0,
             deadline: now.checked_add(timeout).ok_or(RouterConnectError::Configuration)?, last_now: now,
             phase: RouterConnectPhase::Initial, receiver: PathReceiver::default(), common: super::transport_packets::CallAssembler::default() })
     }
@@ -358,7 +390,7 @@ impl RouterConnectTracker {
     pub fn phase(&self) -> RouterConnectPhase { if self.scope.is_open() { self.phase } else { RouterConnectPhase::Closed } }
     pub fn close(&mut self) {
         self.phase = RouterConnectPhase::Closed; self.scope.close(); self.receiver.close(); self.common.close(); self.access.clear();
-        self.pending_resolve = None; self.resolution = None; self.data.clear(); self.data_bytes = 0;
+        self.pending_resolve = None; self.pending_peer = None; self.peer_binding = None; self.resolution = None; self.data.clear(); self.data_bytes = 0;
         self.assigned_ids = None; self.node_levels.fill(0); self.node_report = None; self.pending_feedback = 0;
     }
     fn accepts(&self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope) -> bool {
@@ -367,7 +399,8 @@ impl RouterConnectTracker {
     fn check_time(&mut self, now: Instant) -> Result<(), RouterConnectError> {
         let error = if now < self.last_now { Some(RouterConnectError::ClockRollback) }
             else if (self.phase != RouterConnectPhase::Connected && now >= self.deadline)
-                || self.pending_resolve.as_ref().is_some_and(|pending| now >= pending.deadline) { Some(RouterConnectError::Timeout) } else { None };
+                || self.pending_resolve.as_ref().is_some_and(|pending| now >= pending.deadline)
+                || self.pending_peer.as_ref().is_some_and(|pending| now >= pending.deadline) { Some(RouterConnectError::Timeout) } else { None };
         if let Some(error) = error { self.close(); return Err(error); }
         self.last_now = now; Ok(())
     }
@@ -378,8 +411,8 @@ impl RouterConnectTracker {
     }
     pub fn next_deadline(&self) -> Option<Instant> {
         if !self.scope.is_open() { return None; }
-        self.pending_resolve.as_ref().map(|pending| pending.deadline)
-            .or_else(|| (self.phase != RouterConnectPhase::Connected).then_some(self.deadline))
+        [self.pending_resolve.as_ref().map(|pending| pending.deadline), self.pending_peer.as_ref().map(|pending| pending.deadline),
+            (self.phase != RouterConnectPhase::Connected).then_some(self.deadline)].into_iter().flatten().min()
     }
     pub fn prepare(&mut self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope,
         timing: super::packet_transport::RouterTiming, now: Instant) -> Result<Option<PreparedRouterConnect>, RouterConnectError> {
@@ -415,7 +448,7 @@ impl RouterConnectTracker {
                 address1: super::router_packets::RouterAddress { mask: 0, label: 0, bytes: &[0, 0] },
                 address2: super::router_packets::RouterAddress { mask: 0, label: 0, bytes: &[0, 0] } };
             let body = super::router_packets::encode_routed_body(&route, item.expose_to_transport()).map_err(|_| RouterConnectError::Configuration)?;
-            let mut framed = super::router_packets::encode_router_packets(RouterHeader { sequence, word1: timing.word1,
+            let mut framed = encode_path_packets(RouterHeader { sequence, word1: timing.word1,
                 word2: timing.word2, byte6: timing.byte6, packet_kind: 1, fragment_part: 1 }, body.expose_to_transport(), self.mtu)
                 .map_err(|_| RouterConnectError::Configuration)?;
             sequence = sequence.wrapping_add(framed.len() as u16); packets.append(&mut framed);
@@ -431,7 +464,8 @@ impl RouterConnectTracker {
         -> Result<Option<PreparedRouterResolve>, RouterConnectError> {
         if !self.accepts(owner, scope) { return Ok(None); }
         self.check_time(now)?;
-        if self.phase != RouterConnectPhase::Connected || self.pending_resolve.is_some() || self.resolution.is_some() {
+        if self.phase != RouterConnectPhase::Connected || self.pending_resolve.is_some() || self.resolution.is_some()
+            || self.pending_peer.is_some() || self.peer_binding.is_some() {
             return Err(RouterConnectError::Pending);
         }
         if deadline.checked_duration_since(now).is_none_or(|remaining| remaining.is_zero() || remaining > Duration::from_secs(30)) {
@@ -447,6 +481,60 @@ impl RouterConnectTracker {
         self.next_control_id = call_id.checked_add(1);
         self.pending_resolve = Some(PendingResolve { call_id, scheme: endpoint.scheme().to_vec(), query: query.to_vec(), port: endpoint.port(), deadline });
         Ok(Some(PreparedRouterResolve { owner: self.owner.clone(), scope: self.scope.clone(), call_id, packets }))
+    }
+    /// Capture only this tracker's unconsumed resolution, never a replacement
+    /// tracker relabeled with the original scope. Numeric ARC endpoints require
+    /// no name query but are still captured with this tracker's private clock.
+    pub(super) fn capture_peer_target(&mut self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope,
+        endpoint: &ReferenceEndpoint, index: usize, now: Instant) -> Result<Option<super::router_peer::PeerTarget>, RouterConnectError> {
+        if !self.accepts(owner, scope) { return Ok(None); }
+        self.check_time(now)?;
+        if self.phase != RouterConnectPhase::Connected || self.pending_resolve.is_some() || self.pending_peer.is_some() {
+            return Err(RouterConnectError::Pending);
+        }
+        let target = super::router_peer::PeerTarget::capture(owner, scope, &self.port_clock, endpoint, self.resolution.as_ref(), index)?;
+        self.resolution = None; Ok(Some(target))
+    }
+    pub(super) fn prepare_peer(&mut self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope,
+        target: &super::router_peer::PeerTarget, timing: super::packet_transport::RouterTiming, deadline: Instant, now: Instant)
+        -> Result<Option<PreparedRouterResolve>, RouterConnectError> {
+        if !self.accepts(owner, scope) { return Ok(None); }
+        let Some((network, node, _)) = target.ids_for(owner, scope, &self.port_clock) else { return Ok(None); };
+        self.check_time(now)?;
+        if self.phase != RouterConnectPhase::Connected || self.pending_peer.is_some() || self.peer_binding.is_some()
+            || self.pending_resolve.is_some() || self.resolution.is_some() { return Err(RouterConnectError::Pending); }
+        if deadline.checked_duration_since(now).is_none_or(|left| left.is_zero() || left > Duration::from_secs(30)) { return Err(RouterConnectError::Configuration); }
+        let local = self.assigned_ids.ok_or(RouterConnectError::Pending)?;
+        let arguments = super::router_peer::encode_peer_arguments(self.router_id, local, self.nonce, (network, node))?;
+        let call_id = self.next_control_id.ok_or(RouterConnectError::Configuration)?;
+        let packets = self.control_packets(call_id, arguments.method, arguments.bytes.expose_to_transport(), timing)?;
+        self.next_control_id = call_id.checked_add(1);
+        self.pending_peer = Some(PendingPeer { call_id, target: target.clone(), local, deadline });
+        Ok(Some(PreparedRouterResolve { owner: self.owner.clone(), scope: self.scope.clone(), call_id, packets }))
+    }
+    pub(super) fn take_peer_binding(&mut self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope,
+        target: &super::router_peer::PeerTarget) -> Option<super::router_peer::PeerBinding> {
+        if !self.accepts(owner, scope) { return None; }
+        self.peer_binding.as_ref()?.reply_for(owner, scope, &self.port_clock, target)?;
+        self.peer_binding.take()
+    }
+    pub(super) fn prepare_datagram(&mut self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope,
+        lease: &super::router_ports::PortLease, peer: &super::router_peer::PeerBinding, tag: u32, priority: u8,
+        payload: &[u8], timing: super::packet_transport::RouterTiming, now: Instant) -> Result<Option<PreparedRouterDatagram>, RouterConnectError> {
+        if !self.accepts(owner, scope) { return Ok(None); }
+        let Some(ids) = peer.target().ids_for(owner, scope, &self.port_clock) else { return Ok(None); };
+        let Some(reply) = peer.reply_for(owner, scope, &self.port_clock, peer.target()) else { return Ok(None); };
+        let Some(local) = lease.address_for_clock(owner, scope, &self.port_clock) else { return Ok(None); };
+        let Some(permit) = lease.transmit_permit(owner, scope, &self.port_clock) else { return Ok(None); };
+        self.check_time(now)?;
+        if self.local_node()? != (local.network, local.node) { return Err(RouterConnectError::Protocol); }
+        if payload.is_empty() { return Err(RouterConnectError::Configuration); }
+        let route = super::router_peer::relay_routing(local, ids, reply, self.node_report.as_ref().map(|(report, _)| report), tag, priority)?;
+        let body = super::native_routing::encode_routing_body(&route, payload).map_err(|_| RouterConnectError::Configuration)?;
+        let packets = encode_path_packets(RouterHeader { sequence: self.sequence, word1: timing.word1, word2: timing.word2,
+            byte6: timing.byte6, packet_kind: 0, fragment_part: 1 }, body.expose_to_transport(), self.mtu).map_err(|_| RouterConnectError::Configuration)?;
+        self.sequence = self.sequence.wrapping_add(packets.len() as u16);
+        Ok(Some(PreparedRouterDatagram { owner: self.owner.clone(), scope: self.scope.clone(), permit, packets }))
     }
     pub(super) fn report_for(&self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope)
         -> Option<(&super::router_control::RouterReport, Instant)> {
@@ -541,6 +629,7 @@ impl RouterConnectTracker {
     fn consume(&mut self, packets: &[TransportBytes], now: Instant) -> Result<Option<RouterAssignment>, RouterConnectError> {
         let mut assignment: Option<RouterAssignment> = None; let mut resolution: Option<RouterResolution> = None;
         let mut node_report: Option<super::router_control::RouterReport> = None;
+        let mut peer_reply: Option<super::router_peer::PeerReply> = None;
         for raw in packets {
             let path = self.receiver.on_packet(raw.expose_to_transport(), now).map_err(|_| RouterConnectError::Protocol)?;
             let message = match path {
@@ -618,6 +707,11 @@ impl RouterConnectTracker {
                     resolution = Some(RouterResolution { owner: self.owner.clone(), scope: self.scope.clone(), call_id: pending.call_id,
                         scheme: pending.scheme.clone(), query: pending.query.clone(), port: pending.port, hosts });
                 }
+            } else if let Some(pending) = self.pending_peer.as_ref().filter(|pending| pending.call_id == reply.call_id) {
+                if reply.result_code != 0 { return Err(RouterConnectError::Rejected); }
+                let decoded = super::router_peer::decode_peer_reply(reply.result_stream, self.router_id, pending.local)?;
+                if peer_reply.as_ref().is_some_and(|prior| prior != &decoded) { return Err(RouterConnectError::Protocol); }
+                peer_reply = Some(decoded);
             }
         }
         // Publish only after the ENTIRE endpoint-TLS group has parsed. Later
@@ -625,6 +719,10 @@ impl RouterConnectTracker {
         if assignment.is_some() { self.phase = RouterConnectPhase::Connected; self.assigned_ids = assignment.as_ref().map(|original| (original.router, original.node)); }
         if let Some(report) = node_report { self.node_levels = report.levels; self.node_report = Some((report, now)); }
         if let Some(resolution) = resolution { self.pending_resolve = None; self.resolution = Some(resolution); }
+        if let Some(reply) = peer_reply {
+            let pending = self.pending_peer.take().ok_or(RouterConnectError::Protocol)?;
+            self.peer_binding = Some(super::router_peer::PeerBinding::from_matched(pending.call_id, pending.target, reply));
+        }
         Ok(assignment)
     }
 }

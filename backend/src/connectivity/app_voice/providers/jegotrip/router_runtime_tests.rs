@@ -166,3 +166,61 @@ async fn closing_scope_while_listen_waits_retires_owned_socket_before_task_join(
  ready_rx.await.unwrap();scope.close();let result=tokio::time::timeout(Duration::from_secs(2),task).await.unwrap().unwrap();
  assert!(result.is_err());assert!(!scope.is_open());worker.await.unwrap();
 }
+
+fn rpc_result_wire(id:i32,result:&[u8])->Vec<u8>{
+ let rpc=encode_reply(id,0,result).unwrap();let common=encode_call_packets(CallKind::Reply,rpc.expose_to_transport(),TLS_FRAGMENT_THRESHOLD).unwrap();assert_eq!(common.len(),1);
+ let mut raw=vec![0,60,0,10,0,0,0,0x11];raw.extend_from_slice(&[0;12]);raw.extend_from_slice(common[0].expose_to_transport());
+ encode_packet_stream_frame(&raw).unwrap().expose_to_transport().to_vec()
+}
+async fn original_peer_flow(query:bool){
+ let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
+ let p=policy(&cert.root,listener.local_addr().unwrap().port());let server=cert.server_config(&tokio_rustls::rustls::version::TLS13);
+ let worker=tokio::spawn(async move{tokio::time::timeout(Duration::from_secs(12),async move{
+  let(tcp,_)=listener.accept().await.unwrap();let mut tls=tokio_rustls::TlsAcceptor::from(server).accept(tcp).await.unwrap();
+  let first=packet(&mut tls).await;let(_,body)=decode_path_header(&first).unwrap();let route=decode_routed_body(body).unwrap();
+  let connect=decode_request(&route.payload[1..]).unwrap();let nonce=connect.arguments[9..13].to_vec();
+  tls.write_all(&reply()).await.unwrap();tls.flush().await.unwrap();let mut resolved=!query;let mut negotiated=false;let mut delivered=false;
+  while !delivered {
+   let raw=packet(&mut tls).await;let(header,body)=decode_path_header(&raw).unwrap();
+   if header.packet_kind==1 {
+    let route=decode_routed_body(body).unwrap();let request=decode_request(&route.payload[1..]).unwrap();let mut result=Writer::new();
+    if request.method==b"clientResolveHosts.RouterClient.Common" {
+     assert!(query);assert!(!resolved);assert_eq!(request.call_id,2);assert_eq!(&request.arguments[9..],b"AccountEntry");
+     result.boolean(true).unwrap();result.u32(1).unwrap();result.bytes(b"42.7").unwrap();result.bytes(b"").unwrap();resolved=true;
+    }else{
+     assert!(resolved);assert_eq!(request.method,b"clientConnect2.RouterClient.Common");assert_eq!(request.call_id,if query{3}else{2});
+     assert_eq!(&request.arguments[5..9],&12345u32.to_be_bytes());assert_eq!(&request.arguments[9..13],nonce.as_slice());
+     assert_eq!(&request.arguments[13..],&[0,0,0x2e,0xe1,0,0,0,42,0,0,0,7]);
+     result.boolean(true).unwrap();result.u32(12345).unwrap();for value in [1,2,3,4,5,6,7,8]{result.u16(value).unwrap();}
+     // This unapproved hint must not change the original live TLS socket.
+     result.bytes(b"Router:tls -h ignored.invalid -p 1 -ri 9;").unwrap();result.bytes(b"").unwrap();negotiated=true;
+    }
+    tls.write_all(&rpc_result_wire(request.call_id,result.finish().expose_to_transport())).await.unwrap();tls.flush().await.unwrap();
+   }else if header.fragment_part==0{
+    assert_node_packet(&raw,0);tls.write_all(&node_wire(61,1)).await.unwrap();tls.flush().await.unwrap();
+   }else{
+    assert!(negotiated);assert_eq!((header.packet_kind,header.fragment_part),(0,1));
+    let route=crate::connectivity::app_voice::providers::jegotrip::native_routing::decode_routing_body(body).unwrap();
+    assert_eq!((route.routing.source.mask,route.routing.source.port),(0,12000));
+    assert_eq!((route.routing.destination.network,route.routing.destination.node,route.routing.destination.port),(42,7,98));
+    assert_eq!((route.routing.destination.network_tag,route.routing.destination.node_tag),(1,5));assert_eq!(route.routing.tag,77);
+    assert_eq!(route.payload,b"channel-frame-not-sdk-ready");delivered=true;
+   }
+  }
+  let mut end=[0;1];assert!(matches!(tls.read(&mut end).await,Ok(0)|Err(_)));
+ }).await.unwrap()});
+ let original=owner();let scope=RpcConnectionScope::fresh();let mut path=RouterPath::open(original.clone(),scope.clone(),&p,&[],timeouts()).await.unwrap();
+ let reference=crate::connectivity::app_voice::providers::jegotrip::object_reference::parse_object_reference(
+  if query{b"AccountEntry:sarc -h arc@AccountEntry -p 98;"}else{b"AccountEntry:sarc -h 42.7 -p 98;"}).unwrap();
+ let crate::connectivity::app_voice::providers::jegotrip::object_reference::ReferenceTarget::Direct(endpoints)=reference.target() else{panic!("endpoint")};
+ let deadline=Instant::now()+Duration::from_secs(8);let peer=path.connect_peer(&original,&scope,&endpoints[0],0,deadline).await.unwrap().unwrap();
+ let lease=path.listen(&original,&scope,ListenProtocol::Arc,Some(12000),false,deadline).await.unwrap().unwrap();
+ assert!(path.send_datagram(&original,&scope,&lease,&peer,77,0,b"channel-frame-not-sdk-ready",deadline).await.unwrap());
+ assert_eq!(path.ids(),Some((12001,12345)));drop(path);assert!(!scope.is_open());worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn original_tcp_tls_numeric_peer_negotiation_and_owned_data_keep_same_socket(){original_peer_flow(false).await;}
+
+#[tokio::test]
+async fn original_tcp_tls_logical_resolution_peer_negotiation_and_owned_data_keep_same_socket(){original_peer_flow(true).await;}
