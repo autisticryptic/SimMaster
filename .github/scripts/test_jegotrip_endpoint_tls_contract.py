@@ -47,6 +47,47 @@ class EndpointTlsContractTests(unittest.TestCase):
         self.assertIn('self.partial.zeroize()', source)
         self.assertIn('impl Drop for PacketStreamDecoder', source)
 
+    def test_router_connect_control_keeps_original_agent_identity_and_credential_namespaces(self):
+        source = (NATIVE / 'native_router.rs').read_text()
+        self.assertIn('clientConnect1.RouterClient.Common', source)
+        self.assertIn('clientConnect3.RouterClient.Common', source)
+        self.assertIn('key: b"id", value: b"Router"', source)
+        self.assertIn('key: b"arcVer", value: b"16777216"', source)
+        self.assertIn('args.u32(0)', source)
+        self.assertIn('args.u32(self.nonce)', source)
+        self.assertIn('accessKey', source)
+        self.assertIn('accessAuth', source)
+        for forbidden in ['phone_login_token', 'sip_password', 'Callback::', 'TcpStream', 'from_utf8_lossy']:
+            self.assertNotIn(forbidden, source)
+
+    def test_router_assignment_requires_current_endpoint_tls_brand_and_complete_group(self):
+        source = (NATIVE / 'native_router.rs').read_text()
+        self.assertIn('input: super::tls_engine::VerifiedEndpointPackets', source)
+        body = source.split('pub fn on_packets(', 1)[1].split('fn consume(', 1)[0]
+        self.assertLess(body.index('self.accepts(owner, scope)'), body.index('input.packets_for(owner, scope)'))
+        self.assertLess(body.index('input.packets_for(owner, scope)'), body.index('self.check_time(now)'))
+        self.assertIn('reply.call_id != 1', source)
+        self.assertIn('reply.result_code != 0', source)
+        self.assertIn('router == 0 || node == 0', source)
+        self.assertIn('reader.finish()', source)
+        self.assertIn('if assignment.is_some() { self.phase = RouterConnectPhase::Connected', source)
+        self.assertIn('self.scope.close()', source)
+
+    def test_router_control_tests_use_synthetic_ids_and_original_layered_tls(self):
+        source = (NATIVE / 'native_router_tests.rs').read_text()
+        self.assertIn('const ROUTER_FIXTURE_ID: i32 = 12001', source)
+        self.assertNotIn('mem::forget', source)
+        for name in [
+            'actual_endpoint_tls_router_connect_assigns_only_logical_ids_after_matched_reply',
+            'router_connect_rejected_zero_or_nonzero_outer_results_never_assign_or_grant_sdk',
+            'router_connect_foreign_tls_brand_is_ignored_before_clock_or_parsing_and_budget_is_fixed',
+            'router_connect_valid_reply_followed_by_bad_router_packet_suppresses_assignment',
+        ]:
+            self.assertIn('fn ' + name, source)
+        for workflow in ['build-release.yml', 'beta-validation.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::native_router::tests',
+                (ROOT / '.github/workflows' / workflow).read_text())
+
     def test_original_and_new_compiled_regressions_remain_selected_in_both_workflows(self):
         tests = (NATIVE / 'tls_engine_tests.rs').read_text()
         for name in [

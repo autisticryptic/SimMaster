@@ -55,16 +55,16 @@ fn raw_wire(wire: &[OwnedWireFrames], original: &AttemptOwner, scope: &RpcConnec
     }
     assert!(!decoder.has_partial()); out
 }
-fn server_input(server: &mut rustls::ServerConnection, bytes: &[u8]) {
+pub(crate) fn server_input(server: &mut rustls::ServerConnection, bytes: &[u8]) {
     let mut cursor = Cursor::new(bytes);
     while cursor.position() < bytes.len() as u64 {
         assert!(server.read_tls(&mut cursor).unwrap() > 0); server.process_new_packets().unwrap();
     }
 }
-fn server_output(server: &mut rustls::ServerConnection) -> Vec<u8> {
+pub(crate) fn server_output(server: &mut rustls::ServerConnection) -> Vec<u8> {
     let mut out = vec![]; while server.wants_write() { assert!(server.write_tls(&mut out).unwrap() > 0); } out
 }
-fn server_plaintext(server: &mut rustls::ServerConnection) -> Vec<u8> {
+pub(crate) fn server_plaintext(server: &mut rustls::ServerConnection) -> Vec<u8> {
     let mut plaintext = Vec::new(); let mut buffer = [0; 16_384];
     loop {
         match server.reader().read(&mut buffer) {
@@ -330,7 +330,7 @@ fn verified_tls_login_roundtrip_reaches_only_original_offline_sdk_callback() {
     assert!(!format!("{engine:?}").contains("fixture")); assert!(!format!("{backend:?}").contains("fixture"));
 }
 
-fn endpoint_raw_wire(wire: &[OwnedWireFrames], original: &AttemptOwner, scope: &RpcConnectionScope) -> Vec<u8> {
+pub(crate) fn endpoint_raw_wire(wire: &[OwnedWireFrames], original: &AttemptOwner, scope: &RpcConnectionScope) -> Vec<u8> {
     wire.iter().flat_map(|item| item.frames_for(original, scope).unwrap().iter()
         .flat_map(|frame| frame.expose_to_transport().to_vec())).collect()
 }
@@ -357,7 +357,7 @@ fn endpoint_handshake(engine: &mut EndpointTlsEngine, original: &AttemptOwner, s
     }
     panic!("bounded raw endpoint TLS handshake did not finish")
 }
-fn endpoint_setup(cert: &Certificates, version: &'static rustls::SupportedProtocolVersion)
+pub(crate) fn endpoint_setup(cert: &Certificates, version: &'static rustls::SupportedProtocolVersion)
     -> (ArcProtocol, AttemptOwner, RpcConnectionScope, EndpointTlsEngine, rustls::ServerConnection, Instant) {
     let original = owner(); let protocol = ArcProtocol::new(original.clone()); let scope = protocol.connection_scope(); let now = Instant::now();
     let mut engine = EndpointTlsEngine::for_original(original.clone(), scope.clone(), parameters("fixture.invalid", &cert.root), now).unwrap();

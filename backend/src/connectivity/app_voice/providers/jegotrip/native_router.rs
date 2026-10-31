@@ -177,6 +177,167 @@ impl PathReceiver {
     }
 }
 
+/// Original Router-agent connection control over the separately verified
+/// endpoint packet boundary. This is NOT an SDK login or incoming grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouterConnectError { Configuration, Pending, Timeout, ClockRollback, Rejected, Protocol }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouterConnectPhase { Initial, Pending, Connected, Closed }
+
+pub struct PreparedRouterConnect {
+    owner: super::session::AttemptOwner,
+    scope: super::rpc_pending::RpcConnectionScope,
+    packets: Vec<TransportBytes>,
+}
+impl PreparedRouterConnect {
+    pub fn packets_for(&self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope) -> Option<&[TransportBytes]> {
+        if &self.owner == owner && self.scope.matches(scope) && self.scope.is_open() { Some(&self.packets) } else { None }
+    }
+}
+impl fmt::Debug for PreparedRouterConnect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("PreparedRouterConnect(<redacted>)") }
+}
+pub struct RouterAssignment {
+    owner: super::session::AttemptOwner,
+    scope: super::rpc_pending::RpcConnectionScope,
+    router: u32,
+    node: u32,
+}
+impl RouterAssignment {
+    /// Logical native IDs, not an OS address/port or SDK/hosting permission.
+    pub fn ids_for(&self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope) -> Option<(u32, u32)> {
+        if &self.owner == owner && self.scope.matches(scope) && self.scope.is_open() { Some((self.router, self.node)) } else { None }
+    }
+}
+impl fmt::Debug for RouterAssignment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RouterAssignment(<redacted>)") }
+}
+
+pub struct RouterConnectTracker {
+    owner: super::session::AttemptOwner,
+    scope: super::rpc_pending::RpcConnectionScope,
+    router_id: i32,
+    nonce: u32,
+    access: Vec<(&'static [u8], zeroize::Zeroizing<Vec<u8>>)>,
+    mtu: usize,
+    sequence: u16,
+    deadline: Instant,
+    last_now: Instant,
+    phase: RouterConnectPhase,
+    receiver: PathReceiver,
+    common: super::transport_packets::CallAssembler,
+}
+impl fmt::Debug for RouterConnectTracker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RouterConnectTracker(<redacted>)") }
+}
+impl RouterConnectTracker {
+    /// Bind before any IO. ri is captured from the original selected endpoint;
+    /// accessKey/accessAuth must be a proven shared-context pair, never a phone
+    /// token/SipPwd substitute. Fresh native node is zero. No default host/root,
+    /// reverse address or original-owner replacement is inferred here.
+    pub(super) fn for_original(owner: super::session::AttemptOwner, scope: super::rpc_pending::RpcConnectionScope,
+        router_id: i32, nonce: u32, access: &[super::rpc_stream::RpcProperty<'_>], mtu: usize,
+        sequence: u16, timeout: Duration, now: Instant) -> Result<Self, RouterConnectError> {
+        if !scope.is_open() || router_id < -999 || router_id == 0 || nonce == 0 || !(16..=MAX_NETWORK_PACKET_BYTES).contains(&mtu)
+            || timeout.is_zero() || timeout > Duration::from_secs(30) { return Err(RouterConnectError::Configuration); }
+        if !access.is_empty() && (access.len() != 2 || ![b"accessKey".as_slice(), b"accessAuth".as_slice()].iter()
+            .all(|key| access.iter().filter(|p| p.key == *key && !p.value.is_empty() && p.value.len() <= 4096).count() == 1)) {
+            return Err(RouterConnectError::Configuration);
+        }
+        let access = access.iter().map(|p| {
+            let key = if p.key == b"accessKey" { b"accessKey".as_slice() } else { b"accessAuth".as_slice() };
+            (key, zeroize::Zeroizing::new(p.value.to_vec()))
+        }).collect();
+        Ok(Self { owner, scope, router_id, nonce, access, mtu, sequence,
+            deadline: now.checked_add(timeout).ok_or(RouterConnectError::Configuration)?, last_now: now,
+            phase: RouterConnectPhase::Initial, receiver: PathReceiver::default(), common: super::transport_packets::CallAssembler::default() })
+    }
+    pub fn phase(&self) -> RouterConnectPhase { if self.scope.is_open() { self.phase } else { RouterConnectPhase::Closed } }
+    pub fn close(&mut self) { self.phase = RouterConnectPhase::Closed; self.scope.close(); self.receiver.close(); self.common.close(); self.access.clear(); }
+    fn accepts(&self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope) -> bool {
+        &self.owner == owner && self.scope.matches(scope) && self.scope.is_open()
+    }
+    fn check_time(&mut self, now: Instant) -> Result<(), RouterConnectError> {
+        let error = if now < self.last_now { Some(RouterConnectError::ClockRollback) }
+            else if self.phase != RouterConnectPhase::Connected && now >= self.deadline { Some(RouterConnectError::Timeout) } else { None };
+        if let Some(error) = error { self.close(); return Err(error); }
+        self.last_now = now; Ok(())
+    }
+    pub fn prepare(&mut self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope,
+        timing: super::packet_transport::RouterTiming, now: Instant) -> Result<Option<PreparedRouterConnect>, RouterConnectError> {
+        if !self.accepts(owner, scope) { return Ok(None); }
+        self.check_time(now)?;
+        if self.phase != RouterConnectPhase::Initial { return Err(RouterConnectError::Pending); }
+        use super::rpc_stream::{RpcProperty, Writer};
+        let mut args = Writer::versioned().map_err(|_| RouterConnectError::Configuration)?;
+        args.u32(0).map_err(|_| RouterConnectError::Configuration)?;
+        args.u32(self.nonce).map_err(|_| RouterConnectError::Configuration)?;
+        let method = if self.router_id > 0 {
+            args.u32(self.router_id as u32).map_err(|_| RouterConnectError::Configuration)?;
+            b"clientConnect1.RouterClient.Common".as_slice()
+        } else { b"clientConnect3.RouterClient.Common".as_slice() };
+        let args = args.finish();
+        let mut metadata = vec![RpcProperty { key: b"id", value: b"Router" }, RpcProperty { key: b"arcVer", value: b"16777216" }];
+        metadata.extend(self.access.iter().map(|(key, value)| RpcProperty { key, value }));
+        let request = super::rpc_envelope::encode_request(1, &metadata, method, args.expose_to_transport()).map_err(|_| RouterConnectError::Configuration)?;
+        let common = super::transport_packets::encode_call_packets(super::transport_packets::CallKind::Request,
+            request.expose_to_transport(), super::transport_packets::TLS_FRAGMENT_THRESHOLD).map_err(|_| RouterConnectError::Configuration)?;
+        let mut packets = Vec::new(); let mut sequence = self.sequence;
+        for item in common {
+            // D619A0/D614F8 + D63F98 use the fresh, zero-tag/no-path/zero
+            // address control routing, NOT guessed OS addresses or remote IDs.
+            let route = super::router_packets::RouterRouting { tag: 0, flags: 0, path_words: &[],
+                address1: super::router_packets::RouterAddress { mask: 0, label: 0, bytes: &[0, 0] },
+                address2: super::router_packets::RouterAddress { mask: 0, label: 0, bytes: &[0, 0] } };
+            let body = super::router_packets::encode_routed_body(&route, item.expose_to_transport()).map_err(|_| RouterConnectError::Configuration)?;
+            let mut framed = super::router_packets::encode_router_packets(RouterHeader { sequence, word1: timing.word1,
+                word2: timing.word2, byte6: timing.byte6, packet_kind: 1, fragment_part: 1 }, body.expose_to_transport(), self.mtu)
+                .map_err(|_| RouterConnectError::Configuration)?;
+            sequence = sequence.wrapping_add(framed.len() as u16); packets.append(&mut framed);
+        }
+        self.sequence = sequence; self.phase = RouterConnectPhase::Pending;
+        Ok(Some(PreparedRouterConnect { owner: self.owner.clone(), scope: self.scope.clone(), packets }))
+    }
+    pub fn on_packets(&mut self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope,
+        input: super::tls_engine::VerifiedEndpointPackets, now: Instant) -> Result<Option<RouterAssignment>, RouterConnectError> {
+        if !self.accepts(owner, scope) { return Ok(None); }
+        let Some(packets) = input.packets_for(owner, scope) else { return Ok(None); };
+        if self.phase == RouterConnectPhase::Connected { return Ok(None); }
+        self.check_time(now)?;
+        let result = self.consume(packets, now);
+        if result.is_err() { self.close(); }
+        result
+    }
+    fn consume(&mut self, packets: &[TransportBytes], now: Instant) -> Result<Option<RouterAssignment>, RouterConnectError> {
+        let mut assignment = None;
+        for raw in packets {
+            let path = self.receiver.on_packet(raw.expose_to_transport(), now).map_err(|_| RouterConnectError::Protocol)?;
+            let PathInput::Data { message: Some(message), .. } = path else { continue; };
+            if message.first_header.packet_kind != 1 { return Err(RouterConnectError::Protocol); }
+            let route = super::router_packets::decode_routed_body(message.body.expose_to_transport()).map_err(|_| RouterConnectError::Protocol)?;
+            let Some(common) = self.common.on_packet(route.payload).map_err(|_| RouterConnectError::Protocol)? else { continue; };
+            if matches!(common.kind, super::transport_packets::CallKind::Ping | super::transport_packets::CallKind::Pong) { continue; }
+            if common.kind != super::transport_packets::CallKind::Reply { return Err(RouterConnectError::Protocol); }
+            let reply = super::rpc_envelope::decode_reply(common.payload.expose_to_transport()).map_err(|_| RouterConnectError::Protocol)?;
+            if self.phase != RouterConnectPhase::Pending || reply.call_id != 1 || assignment.is_some() { continue; }
+            if reply.result_code != 0 { return Err(RouterConnectError::Rejected); }
+            let mut reader = super::rpc_stream::Reader::new(reply.result_stream).map_err(|_| RouterConnectError::Protocol)?;
+            let accepted = reader.boolean().map_err(|_| RouterConnectError::Protocol)?;
+            let router = if self.router_id > 0 { self.router_id as u32 } else { reader.u32().map_err(|_| RouterConnectError::Protocol)? };
+            let node = reader.u32().map_err(|_| RouterConnectError::Protocol)?;
+            let footer = super::rpc_stream::read_footer(&mut reader).map_err(|_| RouterConnectError::Protocol)?;
+            reader.finish().map_err(|_| RouterConnectError::Protocol)?;
+            if !accepted || !footer.reason.is_empty() || router == 0 || node == 0 { return Err(RouterConnectError::Rejected); }
+            assignment = Some(RouterAssignment { owner: self.owner.clone(), scope: self.scope.clone(), router, node });
+        }
+        // The whole TLS-delivered group must parse before a logical assignment
+        // can be published; no later malformed packet is hidden by an early ACK.
+        if assignment.is_some() { self.phase = RouterConnectPhase::Connected; self.access.clear(); }
+        Ok(assignment)
+    }
+}
+impl Drop for RouterConnectTracker { fn drop(&mut self) { self.close(); } }
+
 #[cfg(test)]
 #[path = "native_router_tests.rs"]
 mod tests;
