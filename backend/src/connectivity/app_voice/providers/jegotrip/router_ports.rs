@@ -25,8 +25,9 @@ impl PortClock {
             .map_err(|_| PortError::Exhausted)?;
         Ok(PortOrder { inner: self.inner.clone(), value: previous + 1 })
     }
+    pub fn owns(&self, order: &PortOrder) -> bool { Arc::ptr_eq(&self.inner, &order.inner) }
     fn value_for(&self, order: &PortOrder) -> Option<u64> {
-        Arc::ptr_eq(&self.inner, &order.inner).then_some(order.value)
+        self.owns(order).then_some(order.value)
     }
 }
 
@@ -142,6 +143,7 @@ impl fmt::Debug for PortDelivery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("PortDelivery(<redacted>)") }
 }
 impl PortDelivery {
+    pub fn retained_bytes(&self) -> usize { self.payload.expose_to_transport().len() }
     /// Admission to one logical listen only. The payload is still unaccepted
     /// Channel/NetStream data, never VerifiedRpcPlaintext. In particular, the
     /// on-wire Router address carries NO local allocation generation; delayed

@@ -688,3 +688,134 @@ fn identical_connect_reply_in_same_tls_group_is_fully_parsed_but_assigns_only_on
     assert_eq!(tracker.on_packets(&owner,&scope,input,now).unwrap().unwrap().ids_for(&owner,&scope),Some((12001,7)));
     assert_eq!(protocol.phase(),super::super::arc_session::ArcPhase::Initial);
 }
+
+fn node_control_fixture(payload: &[u8]) -> Vec<u8> {
+    let mut body = vec![0;12]; body.extend_from_slice(payload); wire(42,0,0,&body)
+}
+
+#[test]
+fn native_node_type_zero_is_unfragmented_and_does_not_relax_old_strict_header_codec() {
+    let bytes = node_control_fixture(&[0]); let (header,_) = decode_path_header(&bytes).unwrap();
+    assert_eq!((header.packet_kind,header.fragment_part),(0,0));
+    let mut receiver = PathReceiver::default(); let message = data(receiver.on_packet(&bytes,Instant::now()).unwrap()).unwrap();
+    assert_eq!(message.first_header.fragment_part,0); assert!(!receiver.has_partial());
+    assert!(super::super::router_packets::decode_header(&bytes).is_err());
+    for kind in [1,2,3] { let mut bad=bytes.clone(); bad[7]=kind; assert!(decode_path_header(&bad).is_err()); }
+}
+
+#[test]
+fn node_probe_matches_native_type_zero_byte_payload_and_keeps_rpc_allocator_separate() {
+    use super::super::tls_engine::tests::{Certificates,endpoint_setup};
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    let (protocol,owner,scope,mut engine,mut server,now)=endpoint_setup(&cert,&tokio_rustls::rustls::version::TLS13);
+    let mut tracker=tracker(&owner,&scope,ROUTER_FIXTURE_ID,now);
+    assert_eq!(tracker.prepare_node_probe(&owner,&scope,timing(),now).err(),Some(RouterConnectError::Pending));
+    finish_fixture_connect(&mut tracker,&owner,&scope,&mut engine,&mut server,now);
+    let request=tracker.prepare_node_probe(&owner,&scope,timing(),now).unwrap().unwrap();
+    let mut expected=vec![0,11,0,1,0,1,0,0]; expected.extend_from_slice(&[0;12]); expected.push(0);
+    assert_eq!(request.packets_for(&owner,&scope).unwrap()[0].expose_to_transport(),expected);
+    assert_eq!(tracker.next_control_id,Some(2)); assert_eq!(tracker.sequence,12);
+    assert_eq!(protocol.phase(),super::super::arc_session::ArcPhase::Initial);
+    tracker.close(); assert!(request.packets_for(&owner,&scope).is_none());
+}
+
+#[test]
+fn real_endpoint_tls_node_probe_produces_original_reply_and_alive_never_ping_pongs() {
+    use super::super::tls_engine::tests::{Certificates,endpoint_setup};
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    let (_protocol,owner,scope,mut engine,mut server,now)=endpoint_setup(&cert,&tokio_rustls::rustls::version::TLS13);
+    let mut tracker=tracker(&owner,&scope,ROUTER_FIXTURE_ID,now);
+    finish_fixture_connect(&mut tracker,&owner,&scope,&mut engine,&mut server,now);
+    let request=node_control_fixture(&[0]); let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&request],now);
+    tracker.on_packets(&owner,&scope,input,now).unwrap(); let captured=tracker.take_data(&owner,&scope).unwrap();
+    let reply=tracker.prepare_node_reply(&owner,&scope,&captured[0],timing(),now).unwrap().unwrap();
+    let bytes=reply.packets_for(&owner,&scope).unwrap()[0].expose_to_transport(); assert_eq!(bytes[7],0);
+    assert_eq!(&bytes[8..20],&[0;12]); assert_eq!(&bytes[20..],&[1]);
+    let alive=node_control_fixture(&[1]); let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&alive],now);
+    tracker.on_packets(&owner,&scope,input,now).unwrap(); let captured=tracker.take_data(&owner,&scope).unwrap();
+    assert!(tracker.prepare_node_reply(&owner,&scope,&captured[0],timing(),now).unwrap().is_none());
+}
+
+#[test]
+fn pre_assignment_node_controls_are_ignored_without_port_grant_or_deadline_renewal() {
+    use super::super::tls_engine::tests::{Certificates,endpoint_setup};
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    let (_protocol,owner,scope,mut engine,mut server,now)=endpoint_setup(&cert,&tokio_rustls::rustls::version::TLS13);
+    let mut tracker=tracker(&owner,&scope,ROUTER_FIXTURE_ID,now); tracker.prepare(&owner,&scope,timing(),now).unwrap();
+    let probe=node_control_fixture(&[0]); let later=now+Duration::from_secs(4);
+    let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&probe],later);
+    assert!(tracker.on_packets(&owner,&scope,input,later).unwrap().is_none());
+    assert!(tracker.take_data(&owner,&scope).unwrap().is_empty()); assert!(tracker.assigned_ids.is_none());
+    assert_eq!(tracker.next_deadline(),Some(now+Duration::from_secs(5)));
+    assert_eq!(tracker.tick(&owner,&scope,now+Duration::from_secs(5)).err(),Some(RouterConnectError::Timeout));
+}
+
+#[test]
+fn node_report_levels_are_applied_after_whole_group_and_echoed_as_destination_label() {
+    use super::super::tls_engine::tests::{Certificates,endpoint_setup};
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    let (_protocol,owner,scope,mut engine,mut server,now)=endpoint_setup(&cert,&tokio_rustls::rustls::version::TLS13);
+    let mut tracker=tracker(&owner,&scope,ROUTER_FIXTURE_ID,now);
+    finish_fixture_connect(&mut tracker,&owner,&scope,&mut engine,&mut server,now);
+    let report=node_control_fixture(&[4,0,2,3,4,5,0,0,0,0,0,0,0,0]);
+    let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&report],now);
+    tracker.on_packets(&owner,&scope,input,now).unwrap(); assert_eq!(tracker.node_levels,[2,3,4,5]);
+    let request=tracker.prepare_node_probe(&owner,&scope,timing(),now).unwrap().unwrap();
+    let raw=request.packets_for(&owner,&scope).unwrap()[0].expose_to_transport();
+    assert_eq!(raw[14],0); assert_eq!(raw[15],2); // source/destination labels
+    let bad=node_control_fixture(&[4,0,2]); let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&report,&bad],now);
+    assert_eq!(tracker.on_packets(&owner,&scope,input,now).err(),Some(RouterConnectError::Protocol));
+    assert_eq!(tracker.node_levels,[0;4]); assert!(request.packets_for(&owner,&scope).is_none());
+}
+
+#[test]
+fn normal_port_zero_data_is_not_reinterpreted_as_node_control() {
+    use super::super::tls_engine::tests::{Certificates,endpoint_setup};
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    let (_protocol,owner,scope,mut engine,mut server,now)=endpoint_setup(&cert,&tokio_rustls::rustls::version::TLS13);
+    let mut tracker=tracker(&owner,&scope,ROUTER_FIXTURE_ID,now);
+    finish_fixture_connect(&mut tracker,&owner,&scope,&mut engine,&mut server,now);
+    let mut normal=node_control_fixture(&[0]); normal[7]=0x10;
+    let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&normal],now);
+    tracker.on_packets(&owner,&scope,input,now).unwrap(); let captured=tracker.take_data(&owner,&scope).unwrap();
+    assert!(captured[0].node_control_for(&owner,&scope).is_none());
+    assert!(tracker.prepare_node_reply(&owner,&scope,&captured[0],timing(),now).unwrap().is_none());
+}
+
+#[test]
+fn stale_or_foreign_node_probe_cannot_generate_a_reply_on_this_path() {
+    use super::super::tls_engine::tests::{Certificates,endpoint_setup};
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    let (_protocol,owner,scope,mut engine,mut server,now)=endpoint_setup(&cert,&tokio_rustls::rustls::version::TLS13);
+    let mut tracker=tracker(&owner,&scope,ROUTER_FIXTURE_ID,now);
+    finish_fixture_connect(&mut tracker,&owner,&scope,&mut engine,&mut server,now);
+    let raw=node_control_fixture(&[0]); let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&raw],now);
+    tracker.on_packets(&owner,&scope,input,now).unwrap(); let captured=tracker.take_data(&owner,&scope).unwrap();
+    assert!(tracker.prepare_node_reply(&control_owner(),&scope,&captured[0],timing(),now-Duration::from_secs(1)).unwrap().is_none());
+    assert!(tracker.prepare_node_reply(&owner,&scope,&captured[0],timing(),now+Duration::from_secs(6)).unwrap().is_none());
+    assert_eq!(tracker.sequence,11); assert!(scope.is_open());
+}
+
+#[test]
+fn original_timing_probe_queues_one_type_one_feedback_without_local_node_or_rpc_id() {
+    use super::super::tls_engine::tests::{Certificates,endpoint_setup};
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    let (_protocol,owner,scope,mut engine,mut server,now)=endpoint_setup(&cert,&tokio_rustls::rustls::version::TLS13);
+    let mut tracker=tracker(&owner,&scope,ROUTER_FIXTURE_ID,now);tracker.prepare(&owner,&scope,timing(),now).unwrap();
+    let probe=wire(42,2,1,&[]);let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&probe],now);
+    tracker.on_packets(&owner,&scope,input,now).unwrap();assert_eq!(tracker.pending_feedback,1);assert!(tracker.assigned_ids.is_none());
+    let feedback=tracker.prepare_feedback(&owner,&scope,timing(),now).unwrap().unwrap();
+    assert_eq!(feedback.packets_for(&owner,&scope).unwrap()[0].expose_to_transport(),[0,11,0,1,0,1,0,0x13]);
+    assert!(tracker.prepare_feedback(&owner,&scope,timing(),now).unwrap().is_none());assert_eq!(tracker.next_control_id,Some(2));
+}
+
+#[test]
+fn later_bad_tls_group_packet_revokes_timing_feedback_instead_of_sending_partial_success() {
+    use super::super::tls_engine::tests::{Certificates,endpoint_setup};
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    let (_protocol,owner,scope,mut engine,mut server,now)=endpoint_setup(&cert,&tokio_rustls::rustls::version::TLS13);
+    let mut tracker=tracker(&owner,&scope,ROUTER_FIXTURE_ID,now);tracker.prepare(&owner,&scope,timing(),now).unwrap();
+    let probe=wire(42,2,1,&[]);let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&probe,&[0xff]],now);
+    assert_eq!(tracker.on_packets(&owner,&scope,input,now).err(),Some(RouterConnectError::Protocol));
+    assert_eq!(tracker.pending_feedback,0);assert!(tracker.prepare_feedback(&owner,&scope,timing(),now).unwrap().is_none());
+}

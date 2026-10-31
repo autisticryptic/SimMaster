@@ -74,6 +74,7 @@ pub mod deployment;
 pub mod native_router;
 pub(crate) mod native_routing;
 pub(crate) mod router_ports;
+pub(crate) mod router_control;
 pub mod native_channel;
 
 // Keep the existing API/provider id stable while moving the implementation.
