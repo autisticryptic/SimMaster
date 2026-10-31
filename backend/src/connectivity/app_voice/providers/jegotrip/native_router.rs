@@ -443,7 +443,8 @@ impl RouterConnectTracker {
             if matches!(common.kind, super::transport_packets::CallKind::Ping | super::transport_packets::CallKind::Pong) { continue; }
             if common.kind != super::transport_packets::CallKind::Reply { return Err(RouterConnectError::Protocol); }
             let reply = super::rpc_envelope::decode_reply(common.payload.expose_to_transport()).map_err(|_| RouterConnectError::Protocol)?;
-            if self.phase == RouterConnectPhase::Pending && reply.call_id == 1 && assignment.is_none() {
+            if self.phase == RouterConnectPhase::Pending && reply.call_id != 1 { continue; }
+            if self.phase == RouterConnectPhase::Pending && assignment.is_none() {
                 if reply.result_code != 0 { return Err(RouterConnectError::Rejected); }
                 let mut reader = super::rpc_stream::Reader::new(reply.result_stream).map_err(|_| RouterConnectError::Protocol)?;
                 let accepted = reader.boolean().map_err(|_| RouterConnectError::Protocol)?;

@@ -541,6 +541,25 @@ fn router_resolve_preserves_same_group_data_under_original_scope_without_common_
 }
 
 #[test]
+fn router_connect_unmatched_call_id_cannot_assign_before_original_reply() {
+    use super::super::tls_engine::tests::{Certificates, endpoint_setup};
+    let cert = Certificates::generate("DNS:fixture.invalid");
+    let (protocol, owner, scope, mut engine, mut server, now) = endpoint_setup(&cert, &tokio_rustls::rustls::version::TLS13);
+    let mut tracker = tracker(&owner, &scope, ROUTER_FIXTURE_ID, now);
+    tracker.prepare(&owner, &scope, timing(), now).unwrap().unwrap();
+    let unrelated = control_reply(2, 0, true, None, 0x55667788, b"");
+    let input = endpoint_peer_group(&owner, &scope, &mut engine, &mut server, &[&unrelated], now);
+    assert!(tracker.on_packets(&owner, &scope, input, now).unwrap().is_none());
+    assert_eq!(tracker.phase(), RouterConnectPhase::Pending);
+    assert!(tracker.take_resolution(&owner, &scope).is_none());
+    assert_eq!(protocol.phase(), super::super::arc_session::ArcPhase::Initial);
+    let original = control_reply(1, 0, true, None, 0x55667788, b"");
+    let input = endpoint_peer_group(&owner, &scope, &mut engine, &mut server, &[&original], now);
+    assert_eq!(tracker.on_packets(&owner, &scope, input, now).unwrap().unwrap().ids_for(&owner, &scope),
+        Some((ROUTER_FIXTURE_ID as u32, 0x55667788)));
+}
+
+#[test]
 fn router_data_retention_limit_and_later_bad_packet_revoke_queued_data() {
     use super::super::tls_engine::tests::{Certificates, endpoint_setup};
     let cert = Certificates::generate("DNS:fixture.invalid");
