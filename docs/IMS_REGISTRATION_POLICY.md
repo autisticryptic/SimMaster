@@ -9,7 +9,7 @@
 
 - 应用接入位于 `connectivity/app_voice`，与 `modems/ims` 并列。无忧行/Google Voice/Telegram/iMessage分别实现，不能共享AKA/CS兜底/资费；旧import仅兼容。无忧行controller调度SDK（31d3739已由两套Actions各8项调度回归验证）不等于实现wire transport，iMessage不是语音运营商。
 
-- 无忧行托管与IMS/AKA分离：SDK phone token与托管SipPwd是两层凭据；`d449163`已加入App账号登录/后台取个人电话凭据及正常业务开通入口，仍需一次性私有部署上下文，不能省略服务授权/到期。当前独立账号、显式TLS/ARC、来电/双向音频/Trunk、Smgw短信/通知、长期收件、可选重连和OS锁退出回收均有各阶段证据；`2986a3d`再支持按邀请镜像的raw或zlib＋Base64 SDP。这仍不是default Locator/NetStream、自动token续期、真实服务/账单或付费外发授权，不授SIM/IMS/CS兜底。[支持子集和参数](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
+- 无忧行托管与IMS/AKA分离：SDK phone token与托管SipPwd是两层凭据；`ff87712`已验证专用jegotrip表与账号登录/取凭据/确认业务/启动的主流程默认，但原App的TLS/`-ri` Router路径与完整自动装配仍未接入，不能用仅认证替代。当前独立账号、显式TLS/ARC、来电/双向音频/Trunk、Smgw短信/通知、长期收件、重连和OS锁退出回收均有阶段证据；2986a3d支持raw或zlib＋Base64 SDP。这不是自动token续期、真实服务/账单或付费授权，不授SIM/IMS/CS兜底。[支持子集和参数](DEVELOPER.md#无忧行托管静态证据凭据与实现边界)。
 
 - 蜂窝 IMS 是语音、短信、补充业务共享的接入；VoLTE/VoNR 是语音能力，不是注册开关。
 - 已实现接入协调、协商门禁、受保护续期和按来源解析 profile；不承诺所有网络互通。
@@ -428,7 +428,8 @@ AccessIdentityPolicy 允许 `omit/static/dynamic_if_known/required_dynamic`，�
 
 ### 当前基础入站契约
 
-- App账号登录接线已由`d449163`两Actions、双架构与官方摘要制品核验（各780 Jegotrip＋19HTTP及原回归/86矩阵，前端检查通过）。新入口在后台获取个人电话凭据，不要求用户填SDK token/SipPwd；一次性私有App/native部署上下文仍必需，不等于默认SDK自动配置或实网已验收。
+- 当前专用数据库登录`ff87712`已由两Actions、双架构、官方digest/CRC/source-run逐名各807 Jegotrip＋21HTTP及原回归/86矩阵核验；前端检查成功，469static/mock，66warnings。默认enable_hosting/start_receiver=true，不要求个人SDK token/SipPwd；HTTP-only兼容不替代主流程，原App TLS/Router及完整自动配置仍未完成。
+- 安装配置、脱敏账号摘要和持久登录任务分别使用`jegotrip_login_settings/accounts/login_attempts`；旧任务ID/不确定结果迁移保留，CAS和清空墓碑不回启旧文件，原SIM/IMS/history与运行归属表不替换。仅无配置行才兼容旧JSON，配置响应不回显秘密；非法PUT输入400、原锁/存储部署不可用503、CAS409，各自分开。
 
 - **业务开通不等于在线注册。** 新账号登录入口可按明确用户操作提交`setVoipCsState`正常认证请求，并在服务器接受/读回开启后创建账号；不调用或伪造手机一键认证、不把`authentication_code`置1，服务器挑战/迁移/拒绝照实返回，不因2006自动关闭旧业务。普通账号`start/stop`仍只管理网关/SDK和原资源，不开通/取消号码业务；高级导入的`enrollment_confirmed`仍不是服务端权益证明。详见[开发指南](DEVELOPER.md#app账号登录主入口与一次性部署配置)。
 - 登录任务先持久化ID及阶段，先标记`request_uncertain`才发开通，超时/断线/关机不重放或补偿关闭。原OS锁证明下仅标记退出进程的任务interrupted；未获本进程claim不得初始化。HTTP业务接受、账号落库、原生登录/hosting与Voice/Messaging readiness各自独立；口令/App token不进任务表，App expiredAt不冒充SDK TTL。
@@ -481,7 +482,7 @@ Build40045409934/Beta40045409943/ARM64 AMD64 success，Release skipped；官方S
 
 ## 10. 验证清单与验收标准
 
-最新已验源码 **`d44916340b87e8562a046f782fc706d6711a6790`**：Build41002428358/Beta41002428390、ARM64/AMD64成功，官方digest/CRC/源码-run逐名各780 Jegotrip＋19HTTP＋7registry＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings保留，Release skipped。新增23登录回归及7前端Node测试；首8dd前端ref-cleanup lint失败，修生命周期对象而非关闭规则后全过。实际服务、部署和默认SDK自动配置仍未验收。
+最新已验源码 **`ff877127e745fd2274ea7138a2307a2738b00a64`**：Build41157401567/Beta41157401553、ARM64/AMD64成功，官方digest/CRC/source-run逐名各807 Jegotrip（42登录）＋21HTTP＋7registry＋46Trunk＋31通知＋4SIP＋7DNS/86，66warnings，Release skipped；前端检查与469static/mock通过。独立表/旧任务迁移、配置CAS/墓碑和主流程默认已验证；前端语法/类型及nonce/Drop夹具、非法配置写入503误分类均已修，原失败制品保留，不削弱断言。原App TLS/Router自动启动、实网与本次部署仍未验收；410原授权安装5250123有独立历史证据。
 
 前已验源码 **`2986a3d8b1283d8aaa428d252ab83098a1f311bf`**：Build40585189198/Beta40585189753、ARM64/AMD64成功、Release skipped；officialdigest ZIP/CRC/逐名各757 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings保留。5项压缩SDP回归实际通过；Build artifact12772387707 SHA`2e8e4150867c4b31ffc2e9da720a655d2a1a4efd92a68936a83eaccc238d8477`，Beta12771222636 SHA`8fa4eda1c46cf697ce3d5f39db44d46dd493bd9f3cb10d10384e5ffca588cafc`。首7350f5f编译/静态失败与9a0e1ca漏HTTP旧字符串均只修测试契约，失败制品保留；不是实网、自动续期、SRTP/direct-connect或default Locator/NetStream验收。
 

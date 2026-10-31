@@ -125,11 +125,17 @@ JustalkManager → JCClientImpl → MtcEngine → JNI → libmtc
 
 实际JNI调用及实参确认：通用账号用户名trim、口令不trim；口令经`UIHelper.doMd5Encrypt → DES.md5Pwd`，使用原salt前缀＋口令的MD5小写hex。两个密码入口均设置userType字符串`0`、site默认1，手机号入口另设countryCode；不能从字段名猜成原文密码或userType 1/2。原salt和部署值不在本文公开。该入口本身不先调用本机一键号码认证，但服务仍可能返回额外安全验证、迁移或既有业务处理分支，不能忽略。
 
-**`d449163`已完成正常密码入口的API/UI接线和隔离验证。** 后台通过原App会话读取绑定号码、获取phone token和SipPwd，并以明确用户授权请求开通；预查原已开启则不重复写，否则在接受后再次查询`cs_forward=2`才创建账号。不会调用或伪造手机一键验证，也不复制原密码埋点或因`2006`自动关闭旧呼转；`88001`安全挑战、迁移、拒绝等仍停止并如实报告。
+**前`d449163`已完成正常密码入口的API/UI接线和隔离验证；当前`ff87712`另验证专用数据库接线与默认完整流程。** 后台通过原App会话读取绑定号码、获取phone token和SipPwd，并以明确用户授权请求开通；预查原已开启则不重复写，否则在接受后再次查询`cs_forward=2`才创建账号。不会调用或伪造手机一键验证，也不复制原密码埋点或因`2006`自动关闭旧呼转；`88001`安全挑战、迁移、拒绝等仍停止并如实报告。
 
 实现使用固定HTTPS origin、独立App/SDK密钥上下文和持久登录任务ID；2并发、120秒预算、4096条ID记录，先标`request_uncertain`再发业务写请求，超时/进程退出不重放。只保留脱敏任务信息；SDK成功、hosting、短信/来电ready和媒体各自核验。新入口创建新line，不自动覆盖原运行或实现token续期。
 
-入口与一次性私有`jegotrip-login.json`格式见[开发指南](DEVELOPER.md#app账号登录主入口与一次性部署配置)。**仍需实际匹配的App/原生部署上下文；本机仅提取了共享HTTP默认值的private partial context，不能当完整配置。** 没有运行原APK/SDK或访问真实服务，未改原SO/IDB。原生还原证据见`account-login-20261029/idss-research/verified-recovery.json`，新实现验证见`verified-native-d449163.json`。
+入口与数据库/旧私有文件兼容形状见[开发指南](DEVELOPER.md#app账号登录主入口与一次性部署配置)。**专用表不是完整原生上下文，更不是就绪证明。** 共享HTTP及SDK默认值已私有提取，仍须把当前原App的TLS/Router与动态字段接入，不能用partial/fixture补齐。未运行原APK/SDK或访问真实服务，未改SO/IDB；证据`verified-recovery.json`及当前`verified-native-ff87712.json`。
+
+### 3.4 专用数据库主流程与实际App启动缺口
+
+`ff87712`在现有data.db使用`jegotrip_login_settings`、`jegotrip_accounts`、`jegotrip_login_attempts`，保留原登录ID/不确定结果、CAS和清空墓碑；密码/App token不持久保存。主入口默认enable_hosting/start_receiver=true，不交付仅认证替代品。两Actions逐名各807 Jegotrip/21HTTP与原回归、双架构/前端成功，469static/mock、66warnings；这是受支持接线的软件证据，未证明当前App默认原生启动或实网。
+
+SDK配置初始化器与getter证明fresh会话选择为`<UnifiedSession>`；`MtcEngine.login`的MD5(username)前11位只是本地profile选择，不是ARC session/token。该默认不证明App/profile永远不能覆盖，也不能据此合成其他字段。当前重点继续原App TLS/`-ri`、Router连接原path和动态account/回调，见下方5.4。
 
 ## 4. 凭据、配置与 token 续期
 
@@ -206,6 +212,7 @@ DeepLinkUtil.getPhoneLoginToken(Context)
 | 原生方法 | 用途 |
 | --- | --- |
 | `getAppConfigs.AccountEntry.Account` | 使用原应用配置上下文取得账号入口及属性 |
+| `clientConnect1.RouterClient.Common` / `clientConnect3.RouterClient.Common` | 已定位原Router连接控制及返回逻辑ID；当前runtime未接入，不能当SDK/hosting成功 |
 | `loginSession.AccountEntry.Account` | 原 SDK 会话登录；返回用户标识、ARC token 和属性 |
 | `swapCalls.AccountEntry.Account` | 交换批次请求、结果和 ACK 状态 |
 | `logoutSession.AccountEntry.Account` | 原 SDK 会话注销 |
@@ -237,6 +244,10 @@ DeepLinkUtil.getPhoneLoginToken(Context)
 | Router | 8 字节头、序号/时钟/分片字段、路由数据和部分控制包 | 地址保持协议数据；不从逻辑路由猜 OS 端点或媒体权限 |
 | TLS | 原 NetSsl 使用 memory BIO；TLS plaintext read 不保证一读一包 | SimAdmin 要求显式 root/authority、证书验证与固定预算，不采用宽松 verifier |
 | Common | 已支持模式的请求/结果流可由长度/计数自定界；mode 3 有原分片规则 | 不能凭 TLS read 边界分包，也不能擅加内层 BE32 长度 |
+
+**当前App的endpoint TLS路径还不能套用旧适配器。** 原`ClientPathI::connect 0xD2E034`把tls交给下层tlsp；`NetDriverI::connect`在`0xE1000C`创建真实TLS TCP对象，`0xE10064`再包PacketSender。`0xDFF2A8→0xE712DC`先在应用packet前加BE32长度，交给该TLS对象；密文回调直接写socket。因此此分支是**packet→BE32 PacketSender→endpoint TLS→raw socket**，不是在TLS密文外加FF FF06和PacketSender。此结论只覆盖已追踪分支，不证明所有传输模式等价。
+
+`-ri`保留每个端点的原Router ID关联。原path连上后取得Router agent，状态2→3走`clientConnect1.RouterClient.Common`（正ID：三个BE32状态词）或`clientConnect3.RouterClient.Common`（负ID：两个状态词）；原结果bool/分配逻辑ID/Common footer和当前path关联都必须核对，零ID/失败不成功。这些ID不是OS地址、RTP端口或SDK授权。具体定位`0xD45248→0xE40698/0xE40AE4→0xE33D2C/0xE34AEC`、结果`0xE23BD0/0xE23F1C→0xD4A57C/0xD49EE8`；尚未移植为完整自动启动链，不从本地notify或可解析回包猜remote receiver。
 
 原 Router 的部分序号 bitmap 只做统计；Mpath 的 bitmap 则参与丢弃重复媒体数据。两个机制不能因都是 bitmap 就互相代用。完整拥塞控制、其他代理/传输、安全变体不在当前支持承诺内。
 

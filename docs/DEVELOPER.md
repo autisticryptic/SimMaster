@@ -153,9 +153,9 @@ python3 -B offline-registration-sim/run.py --fallback --report offline-registrat
 
 ## 无忧行托管：静态证据、凭据与实现边界
 
-当前目标是**基础接电话、应答、挂机、双向音频与 Trunk，以及接短信、查询/删除、通知和原生回执**；外呼、发短信只保留接口。现支持**已绑定号码的App账号登录，由程序取得电话凭据并请求开启托管**，高级手工参数导入保留兼容。账号登录接线已经`d449163`软件验证，但仍需一次性私有部署上下文，尚未访问真实服务或验收实际号码。账号使用独立 `app_account` / `application_data` 线路，不借 SIM、五码、UICC、IMS/CS 或免费 WLAN 资费。
+当前目标是**基础接电话、应答、挂机、双向音频与 Trunk，以及接短信、查询/删除、通知和原生回执**；外呼、发短信只保留接口。账号主入口要求**登录已绑定号码的App账号→自动取得电话凭据→确认业务→启动无忧行接收器**，不是仅保存认证摘要。`ff87712`已验证专用数据库/API/UI接线和该默认流程，但实际App的TLS/Router启动与完整默认参数装配仍未完成，尚无实网账号验收。高级手工导入保留兼容，账号使用独立 `app_account` / `application_data` 线路，不借 SIM、五码、UICC、IMS/CS 或免费 WLAN 资费。
 
-当前运行时源码基线为 `d449163`（账号登录实现8dd159f、后续仅修前端生命周期），两套Actions/双架构及官方digest ZIP逐名各780 Jegotrip、19HTTP和原回归通过；其中 `c6f0ba1` 在基础入站整链、全生命周期来电收尾、可选断线清理和原 Trunk 排空之上，补齐DIRECT与batch长期接收的独立回收证明。原邀请→应答→Endpoint TCP-Mpath↔UDP RTP→挂机、认证 HTTP、Asterisk 侧 SIP 与通话期间 SMS 均有隔离执行证据，**不是已连接无忧行、设备部署或资费验收**。用户所述入站免费不替代实际账单证据。
+当前运行时源码基线为 `ff87712`（原账号登录d449163、专用数据库58c0764及门禁修复），两套Actions/双架构及官方digest ZIP逐名各807 Jegotrip、21HTTP和原回归通过；其中 `c6f0ba1` 补齐DIRECT与batch长期接收的独立回收证明。原邀请→应答→Endpoint TCP-Mpath↔UDP RTP→挂机、认证 HTTP、Asterisk 侧 SIP 与通话期间 SMS 均有隔离执行证据，**不是无忧行实网或账单验收**。410在此前授权窗口已验部署`5250123`，本次新版本未部署；用户所述入站免费不替代实际账单证据。
 
 ### 1. 纠正旧勘察结论
 
@@ -200,7 +200,11 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 
 在原工作台的**无忧行应用账号 → 账号登录**，或**新建WLAN线路 → 无忧行（账号登录）**选择通用账号/手机号密码模式。填写账号、密码和手机号模式的区号，并明确勾选登录/开通授权；用户不填写个人SDK phone token或SipPwd。提交后可关闭窗口，任务继续在后台有界执行，结果可从应用账号区找回；不要因浏览器未收到POST响应而重复提交。
 
-后台读取与`data.db`同目录的 **`jegotrip-login.json`**。这是一份安装侧私有上下文，不是每个用户的电话凭据，也不是公开示例；需匹配原App与已支持的native部署。文件应限制为服务用户可读（建议0600），不是加密存储；不要把密钥、原APK或该文件提交Git。初始化只恢复任务元数据，**显式登录时才读文件/访问服务**；缺文件、格式错误或未取得原数据库OS锁则拒绝登录。
+安装侧私有上下文优先来自`data.db`中的 **`jegotrip_login_settings`**，通过应用账号区的**安装配置**对话框录入完整JSON；旧秘密不回显，保存/关闭后清空输入。配置有revision/CAS，清空留下递增墓碑，不能重新启用旧文件。只有数据库没有配置行才整份兼容同目录`jegotrip-login.json`，不混用两个来源。
+
+`jegotrip_accounts`只存脱敏近期认证摘要及可选原voice-line关联，不保存密码/App token；旧`app_voice_login_attempts`迁为`jegotrip_login_attempts`，保留ID、阶段和不确定结果，双表冲突停止而不丢记录。原SIM/IMS表、SMS/call history和`app_voice_*`运行归属表不替换。数据库/旧私有文件均不是加密保险箱，须限制服务用户权限，不提交Git；初始化不重放登录，只有明确提交才访问服务。
+
+主入口默认`intent=enable_hosting`、`start_receiver=true`，仍须明确consent。`runtime=null`仅保留高级HTTP-only兼容能力，不让主入口退回仅认证；未取得原数据库OS锁或缺完整native模板时拒绝主流程。`native_configured`只是模板存在标志，实际校验/接收就绪另由原运行时证明。
 
 | 配置块 | 字段与要求 |
 | --- | --- |
@@ -213,13 +217,18 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 | `runtime.hosting` | 只含`authname_prefix`、`channel_id`、`delete_int_code`；**不含SipNumber/SipPwd/enrollment_confirmed** |
 | `runtime`其余项 | 原`profile`，可选`bootstrap`/`call_media`/`reconnect`及`cleanup_on_disconnect`；形状与下方高级配置相同，原生校验在业务开通请求之前进行 |
 
-默认SDK全部参数自动发现尚未实现，不能只凭账号猜出原生profile或把fixture值用于真实服务。当前本机仅提取了原APK共享HTTP默认上下文的私有partial文件（标记`_partial_not_deployment`），**它不是完整的可启用部署配置**；还需要实际匹配的native模板、设备标识和当前App配置选择。用户不必手动取得个人phone token/SipPwd，但安装侧配置与实网验证不能省略。
+共享SDK application key、证书、服务器和托管参数已从实际APK私有提取；原fresh会话选择为`<UnifiedSession>`，MD5(username)前11位只是本地profile名。**原App的TLS/`-ri`路径与自动完整装配仍未完成**：其`tls→tlsp`在endpoint TLS内加BE32 PacketSender，不同于旧FF FF06内层TLS承载。Router的`clientConnect1/3`及返回逻辑ID/原path关联已定位，不能删除参数、猜`id/domain`回调或用fixture冒充实际安装上下文。用户不手提个人phone token/SipPwd，完整主链仍须据原证据补齐，见[逆向总结](JEGOTRIP_REVERSE_ENGINEERING_SUMMARY.md#54-tcproutertls-与-common-边界)。
 
 | API | 语义 |
 | --- | --- |
-| `GET /api/non-3gpp/app-login/setup` | 只显示实现、文件存在及当前是否接受提交；文件存在不是配置已验证/服务可用 |
-| `POST /api/non-3gpp/app-login/attempts` | `{attempt_id, username, password, country_code, enable_hosting, start_receiver}`；attempt_id为客户端生成的32个小写hex字符（128位随机ID）；country_code为手机号区号数字或通用账号的null；enable_hosting须明确true。202只是持久入队 |
-| `GET .../attempts`、`GET .../attempts/{attempt_id}` | 最近32项/指定原任务；只返回阶段、业务结果、masked_number、本地line_id和稳定错误，不回显配置/口令/token/原服务正文 |
+| `GET /api/jegotrip/config` | 只返回来源、revision、初始化/HTTP/native模板存在与当前提交条件，不回显秘密 |
+| `PUT /api/jegotrip/config` | `{expected_revision, configuration}`；完整version1配置写入专用表。错误JSON/字段/URL/证书/key/版本为脱敏400，CAS冲突409，无原运行锁503；失败不增加revision |
+| `DELETE /api/jegotrip/config?expected_revision=N` | CAS清空并保留递增墓碑，不删除账号/历史、停止原运行或撤销已入队快照 |
+| `GET /api/jegotrip/accounts` | 脱敏近期认证摘要和可选voice-line关联，不能恢复cached ready |
+| `GET /api/jegotrip/login/setup` | 配置来源/版本与提交条件；模板存在不是服务/接收就绪 |
+| `POST /api/jegotrip/login/attempts` | `{attempt_id, username, password, country_code, consent, intent?, start_receiver?}`；32小写hex随机ID、默认enable_hosting/true，consent必需。202只表示原持久任务入队 |
+| `GET .../attempts`、`GET .../attempts/{attempt_id}` | 最近32项/指定原任务；只返回阶段、intent、业务结果、脱敏号码、account_id/line_id和稳定错误，不回显秘密 |
+| 旧 `/api/non-3gpp/app-login/*` | 保留原setup/任务协议；旧POST的enable_hosting和start_receiver仍需显式提供，不替代新主入口 |
 
 任务有2并发、120秒预算，保留最多4096个ID而不自动驱逐去重记录；同ID再次提交409，不重放开通。`request_uncertain`在发请求前持久记录；`accepted_unconfirmed`表示已获接受但未读回确认，不能启动账号；只有读回`cs_forward=2`或原已开启才继续。超时/关闭窗口/进程退出都不自动重放，不自动关闭已有业务作为补偿。原OS锁证明下把遗留任务记interrupted；不按PID/年龄接管。状态落库失败可报告本manager观察到的错误，但不假称持久完成。
 
@@ -227,7 +236,7 @@ SDK 本身没有 App 登录页面依赖；`loginWithPassWord` 直接转发 SDK �
 
 本次创建新本地line，不自动覆盖已有运行或实现原位续期。`start_receiver=true`只继续提交原接收器启动；SDK登录、HostingAck、短信/来电各自ready仍分开。界面只按原运行时就绪字段显示，不把任务completed当媒体已连通。`start/stop`仍只管客户端，不取消服务端托管；外呼/发短信仍501。
 
-已验`d449163`：Build41002428358/Beta41002428390、ARM64/AMD64、官方digest/CRC/逐名各780 Jegotrip＋19HTTP＋7registry＋46Trunk＋31通知＋4SIP＋7DNS/86矩阵；新增23回归含真实隔离HTTPS、错误根/不跟重定向、Crypto独立固定向量、任务重放/中断/持久化失败与App凭据→实际原生登录/短信/原ACK/注销Join。前端build/type-check/unit成功（7新Node测试），453本机static/mock通过，67warnings保留；不是浏览器E2E/真实App SDK/真实服务/新Release部署。
+已验`ff87712`：Build41157401567/Beta41157401553、ARM64/AMD64、官方digest/CRC/source-run逐名各807 Jegotrip（42登录）＋21HTTP＋7registry＋46Trunk＋31通知＋4SIP＋7DNS/86；前端build/lint/type-check/unit成功，469本机static/mock单次全过，66warnings保留。前几轮语法/类型/Drop/HTTP分类失败已修并留存原官方制品，原断言不削弱。这证明数据库接线及原受支持流程，不是原App TLS/Router自动启动、浏览器E2E/SDK执行、实网或新410部署验收。
 
 ### 3. 高级手工导入的必要参数（只列名字，不提供用户或 App 内置值）
 

@@ -6,7 +6,8 @@
 
 ## 当前基线与工作规则
 
-- **当前账号登录增量`d449163`已核验**：Build41002428358/Beta41002428390、双架构、官方digest/CRC/source-run各780 Jegotrip＋19HTTP及原Trunk/通知/SIP/DNS/86矩阵，前端lint/type-check/unit通过。新入口用App账号密码取得绑定号码和个人电话凭据，并提交正常业务开通/读回确认、可启动原接收器；持久任务ID/不确定状态不重放，安全挑战不伪造通过。需一次性私有部署上下文，实际配置/服务仍未验收，不宣称默认SDK全自动配置。
+- **当前专用数据库登录增量`ff87712`已核验**：Build41157401567/Beta41157401553、双架构、官方digest/CRC/source-run各807 Jegotrip（42登录）＋21HTTP及原Trunk/通知/SIP/DNS/86矩阵，前端检查成功、469本机static/mock单次全过，66warnings。`jegotrip_*`独立表/迁移、CAS/清空墓碑、默认enable_hosting/start_receiver=true已接线；前三轮语法/类型/Drop/HTTP错误分类失败已修，原失败证据保留。**原App实际TLS/Router启动与共享参数自动装配仍是当前必做缺口**，不是仅待实网；新版本未部署，410日志已验安装为5250123。
+- **前账号登录增量`d449163`已核验**：Build41002428358/Beta41002428390、双架构、官方digest/CRC/source-run各780 Jegotrip＋19HTTP及原回归，前端检查成功。原App账号密码→绑定号码/电话凭据→正常业务开通/读回确认→显式原接收器接线已验证；安全挑战不伪造通过，原不确定写请求不重放。该检查点的文件配置已由新数据库优先/整份旧文件兼容取代，不宣称默认SDK全自动配置。
 - **前静态续查/压缩SDP增量 `2986a3d` 已核验**：Build40585189198/Beta40585189753、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各757 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，67warnings保留，Release skipped。原邀请Base64检测→解码→zlib inflate、回复同格式zlib deflate→标准Base64已实现，解码后plain-media门禁不放宽；5项新回归含实际账号/Trunk/native Accept。APK静态确认csb/token活跃获取链，但refreshToken helper无调用/响应语义；SRTP/DirectConnect被当前APK显式关闭，server显式，NetStream/Locator无已证call path。
 - **前退出进程回收增量 `1401be0` 已核验**：Build40525320619/Beta40525320712、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各752 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，446static/mock，67warnings保留，Release skipped。flock证明退出、仅回收本机制标记的租约，旧版无标记租约与存活锁持有者不动。
 - **前自动重连增量 `e5ef46d` 已核验**：Build40517095074/Beta40517094859、ARM64/AMD64成功，官方digest ZIP/CRC/逐名各749 Jegotrip＋7registry＋17HTTP＋46Trunk＋31通知＋4SIP＋7DNS/86，445static/mock，67warnings保留，Release skipped。opt-in、cleanup完成后同revision全新start、错误分类与次数有界、stop/start/replace/关机取消；不是凭据续期或会话恢复。
@@ -71,7 +72,7 @@
 
 | 必须交付的行为 | 当前实现/验证关注点 |
 | --- | --- |
-| 原受信连接与托管 | 显式 DirectTlsCarrier / 可选 matched bootstrap；原 authority/root/owner、SDK token与SipPwd分离、原source Join后才能handoff；不猜默认地址/信任 |
+| 原受信连接与托管 | 既有显式DirectTlsCarrier/matched bootstrap保持；当前必须另接原App endpoint TLS/`-ri` Router启动、动态字段/回调，不能删除参数、换TCP或编造profile。保留原authority/root/owner、token/SipPwd分层和Join |
 | 独立账号生命周期 | 私有配置、revision/run nonce持久排他、auth/no-store API、手动start/stop；不恢复cached ready，不从其他manager或未知孤儿接管 |
 | 原来电应答/挂机 | CallClientEx/direct与batch原票据、Inform/Accept/Release及本地call history/event；本次修复queued批次回执不能被误当Inform已可提交 |
 | 真实媒体/Trunk | 原Endpoint TCP-Mpath与实际UDP双向RTP、raw或zlib＋Base64 native SDP按邀请镜像，解码后匹配RTP/AVP/payload、同call的OperatorLink/SIP应答/BYE；只有原媒体活跃才connected |
@@ -83,15 +84,15 @@
 **当前长期接收已分别验证**：c6f0ba1两Actions/双架构及officialdigest744/17HTTP/46Trunk等清单通过；cb33653的DIRECT730项也有独立证据。直接窗口、真实response write后frontier、batch精确result-epoch ACK与durable sparse/before-base证明解决及时完成的已分类收件终身128/512限制；不驱逐unknown/pending，不靠新nonce/重连掩盖容量，低gap/burst/未ACK与磁盘仍有限。原watch/cleanup/FIFO能力保留。后续工作保持：
 
 1. APK静态已确认活跃phone token由认证`csb/token`的`body.token`获取并供下一次login使用；`refreshToken` helper无直接调用、TTL/响应/活动会话交接证据，因此自动续期仍需原服务授权证据，当前保持手工重新导入。自动重连只是在清理后全新start。带标记退出进程运行已由1401be0用OS锁证明回收；remote lease、无标记旧版owner接管与跨run exactly-once仍不提供。
-2. zlib＋Base64 SDP已由2986a3d实现；当前APK显式关闭SRTP/DirectConnect且显式server。未来SDK的default Locator/Router/NetStream、SRTP/ICE/BUNDLE/P2P或其他媒体仍须新证据，不放松TLS/归属或复制报告常量。
-3. 真实账号参数/服务/Trunk/通知/账单验收需新明确授权；当前没有设备/服务/部署执行。源码改变继续新SHA Actions/official artifact验证，docs-only收尾编译输入同d449163。
-4. App密码登录/绑定资料/phone token/SipPwd/正常开通及原接收器接线已软件验证，不再作为未实现入口重做。下一步需要实际完整私有部署上下文与授权实网验收；后续自动默认SDK配置、原地重新认证/自动续期、额外验证码/迁移/安全挑战处理仍需独立实现和证据。现有入口创建新line，不自动替换旧运行，不重放结果不确定的业务写请求。
+2. zlib＋Base64 SDP已由2986a3d实现；当前APK显式关闭SRTP/DirectConnect且显式server。**当前App的TLS/Router路径不是未来可选扩展**：已追tls→tlsp→TLS内PacketSender及原clientConnect1/3，下一步接正确层次、原path/返回逻辑ID和动态account/回调，再自动装配共享配置。后续Locator/NetStream或其他媒体须独立证据，不放松TLS/归属。
+3. 用户已授权410程序/前端及相关数据库升级且要求不做回滚备份，已验安装5250123；ff87712尚未部署。真实账号/服务/Trunk/通知/账单另需明确授权。后续源码保持新SHA Actions/official artifact核验，docs-only编译输入同ff87712。
+4. 专用表与主流程默认已软件验证，但不能交付默认仅认证、空表或手工SDK凭据替代品。**优先完成当前原App完整自动启动链**：登录→绑定资料→phone token/SipPwd→正常业务确认→原接收器，保留原owner/Join/ACK与Voice/Messaging/media分层；之后按授权部署到410供用户测试。额外验证码/迁移/安全挑战、自动续期/原地替换仍独立，不重放结果不确定的业务请求。
 
 **前基础软件交付已验证**：`d0a2b67`的Build40445960947/Beta40445960949、ARM64/AMD64及官方digest ZIP核验通过，新增6项admission/batch和双Join取消场景均实际执行；各699 Jegotrip与原HTTP/Trunk/通知/SIP/DNS/86矩阵精确匹配，435本机static/mock通过。固定五手册记录当前配置/API及支持界限；文档收尾不改变编译输入。后续源码改变仍须新SHA验证，不能复用当前绿灯；详细清单见 `verified-native-d0a2b67.json`。以下是明确的扩展与实网验收工作，不再把已接通的基础来电/媒体/SMS写成未实现。
 
 **明确但不伪装已完成的扩展**：当前原生/媒体支持raw或zlib＋Base64 `RseEx.SDP`（按邀请格式回复）、解码后严格RTP/AVP sendrecv、RTCP-mux和编码passthrough。当前APK无条件关闭SRTP/DirectConnect并显式server，但这不证明未来版本；default Locator/Router/NetStream、SRTP/ICE/BUNDLE/P2P、转码、自动token续期、remote principal/device全局lease、无标记旧版owner恢复、额外SMS编码及无限单连接历史仍不是已支持能力。付费外发尤其不是本轮必做项。DIRECT/batch已按原回执和durable证明回收完成副本，但pending/unknown/burst/未ACK及磁盘保持有界；正常run原actor/consumer/媒体Join后继续回收已投影私有envelope且保留SMS，不承诺跨新run exactly-once。
 
-**实网边界**：目前未使用真实服务、设备或账单。静态导入字段、isolated peer和已还原的raw/压缩SDP分支不能证明实际服务部署参数或当前选择；以后经明确授权获得自有有效参数时，验证接收、双向音频、Trunk/通知、有效期/掉线/设备绑定与独立计费。若真实配置依赖当前未支持的模式，必须继续据证补实现，不能用改状态或放松TLS/owner门禁冒称兼容。
+**实网边界**：目前未实际登录无忧行服务或验收账单；410程序5250123曾在用户授权窗口部署验证，本次新版本未部署。静态导入字段、isolated peer和raw/压缩SDP分支不能证明服务实际参数或当前选择。以后经明确授权及自有有效账号验证接收、双向音频、Trunk/通知、有效期/掉线/绑定与独立计费；真实配置依赖未支持模式时继续据证实现，不能改状态或放松TLS/owner门禁冒称兼容。
 
 **报告与工具**：第三方DOCX全段落/表格已只读核对，报告APK与本地APK字节不同；已有Androguard 4.1.4已完成7 DEX的token/refresh/mode xref扫描，当前IDA仍为原libmtc/base0/相同SHA并闭合zlib＋Base64 SDP算法。报告HTTP加密/签名/Android信任策略不是native wire或授权证明。现阶段无需JADX；需要其他新工具时先告知版本和用途，由用户手装。
 

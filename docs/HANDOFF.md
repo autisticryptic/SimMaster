@@ -6,11 +6,19 @@
 
 1. 本轮恢复原无忧行目标：**基础接电话（应答、挂机、双向音频、Trunk）＋接短信（落库、查询、通知、原回执）**。外呼、发短信仅留接口，计费属于独立无忧行账号，不借 SIM/IMS/CS。
 2. 唯一开发目录 `SimAdmin`，只维护 `master`，普通 push `simmaster`；不强推、不清理未知用户文件。编译、Rust/前端测试、编译后的协议 peer 和注册模拟**仅在 GitHub Actions**执行。
-3. 本机只做编辑、静态/mock、Git 与只读源码/制品分析。**未部署、未访问设备或真实无忧行服务、未改 NV**；旧设备授权不延续。
+3. 本机只做编辑、静态/mock、Git 与只读源码/制品分析。用户已明确授权410程序/前端及相关数据库升级，并要求**不做回滚备份**；保留SIM/IMS配置、历史、unit及辅助服务。已验部署为`5250123`，本次新版本尚未部署；真实无忧行登录/业务、付费外发与NV未授权。
 4. IDA 仅只读使用用户手动打开的原样本：通话协议为 `libmtc.so`，本轮账号登录为 `libidss-cn.so`；调用前核对 metadata。不自行启动/加载、修改或保存 IDB。新 JADX/其他工具须先说明版本/用途，由用户手动安装。
 5. 保持原 UI 布局；用户已追加**登录已绑定号码的App账号、自动取得通话凭据并开启托管**，此前登录UI暂缓不再限制本任务。现有手工导入保留兼容，不新增号码绑定或付费外发。公共文档维护原五手册及用户授权的逆向总结；报告、APK/固件、JSONL、`.local`、私有交接和凭据不提交。
 
-## 当前：App账号登录接线已软件验证，实网未验收
+## 当前：专用数据库登录接线已验证，原App启动路径仍未完成
+
+- 已验源码 **`ff877127e745fd2274ea7138a2307a2738b00a64`** 已普通推送：`data.db`中独立`jegotrip_login_settings`、`jegotrip_accounts`、`jegotrip_login_attempts`；原登录任务ID/不确定状态保留，配置revision/CAS与清空墓碑不重新启用旧文件，不保存密码/App token。主入口默认**登录→取电话凭据→确认业务→启动原接收器**，不是仅认证摘要。
+- Build **41157401567** / Beta **41157401553**、ARM64/AMD64成功；官方digest ZIP/CRC/source-run逐名各 **807 Jegotrip（42登录）＋21HTTP＋7registry＋46Trunk＋31通知＋4SIP＋7DNS/86矩阵**。前端build/lint/type-check/unit通过；469本机static/mock单次全过，66编译warnings保留，Release skipped。先前前端语法/类型、HTTP夹具私有nonce和Drop移出错误已修；随后配置PUT非法输入503误分类改400，保留存储部署/运行锁503和原CAS保护，原失败制品留存。
+- 配置API为`/api/jegotrip/config`，登录为`/api/jegotrip/login/*`；数据库优先，只有无配置行才兼容`jegotrip-login.json`。HTTP-only兼容配置不能让主入口退回仅登录，模板存在也不是接收ready；详见[开发指南](DEVELOPER.md#app账号登录主入口与一次性部署配置)。
+- 原App实际`tls/-ri`路径**尚未接入**：只读原libmtc已追到`tls→tlsp→TLS内BE32 PacketSender`及`clientConnect1/3.RouterClient.Common`、原path/返回逻辑ID校验，不能用旧FF FF06内层TLS适配器、删除`-ri`或编造回调替代。共享默认参数已私有提取，但自动装配完整原生上下文仍待完成。
+- 本轮未访问410或真实服务；日志已验安装仍`5250123`，配置/历史及辅助服务保持。新表、成功fixture或旧部署不证明一键实网可用，不交付仅认证替代品。证据`verified-native-ff87712.json`及`resume-20261031-01a18672/CHECKPOINT.md`。
+
+## 前App账号登录检查点（d449163，实网未验收）
 
 - **源码`d44916340b87e8562a046f782fc706d6711a6790`已推送并验证**（实现8dd159f，后一次只修前端effect生命周期）：支持账号/手机号＋密码→绑定号码核对→后台取phone token/SipPwd→正常认证开通请求与状态确认→创建独立账号并可启动原接收器。现有页面新增账号登录与应用账号区，不输入个人SDK token/SipPwd，不伪造SIM。
 - 后台一次性读取`data.db`旁的私有`jegotrip-login.json`：App HTTP/密码预处理上下文与原显式native template分开；不是仅有账号就能猜出所有SDK配置。缺文件/无原OS锁则拒绝登录。APK共享HTTP默认值已另存私有partial context，但**尚无实际完整部署上下文或实网验收**；不把partial文件当可启用配置。
@@ -100,7 +108,7 @@
 ## 本轮软件交付与后续验收
 
 1. 基础接电话/应答/挂机/双向音频/Trunk、durable短信/查询删除/通知原ACK，以及新取消/批次缺口已有新SHA两Actions整链证据；不是仅codec或单个信令阶段。
-2. 公共收尾维护原五手册及用户另行要求的逆向总结，构建输入保持与已验 `d449163` 相同；文档不代表另一个二进制。后续改源码仍须新SHA执行/产物核验，原失败证据不能删去。
+2. 公共手册同步专用数据库入口、默认完整流程和原App启动缺口；docs-only编译输入保持与已验 `ff87712` 相同。文档不代表另一个二进制，后续源码仍须新SHA执行/产物核验，原失败证据不删。
 3. DIRECT/batch长期接收、退出回收、重连与raw/压缩SDP已分别取得原protocol/durable/静态及Actions证明，不能互用ACK、清除pending/unknown或扩大媒体授权。凭据自动续期仍缺原服务响应/TTL/活动会话语义；default Locator/NetStream、未来版本SRTP/direct-connect与真实部署/账户/账单仍需独立证据和授权；不把静态helper称为续期或整个实网目标已经完成。
 
 ## IMS 注册主线：历史软件基线保持
