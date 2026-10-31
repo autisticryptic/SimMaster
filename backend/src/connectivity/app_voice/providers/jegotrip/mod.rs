@@ -72,6 +72,8 @@ pub mod legacy_config;
 pub mod object_reference;
 pub mod deployment;
 pub mod native_router;
+pub(crate) mod native_routing;
+pub(crate) mod router_ports;
 pub mod native_channel;
 
 // Keep the existing API/provider id stable while moving the implementation.

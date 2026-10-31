@@ -260,10 +260,15 @@ impl fmt::Debug for RouterResolution {
 /// application traffic. This boundary deliberately grants no Common plaintext.
 pub struct VerifiedRouterData {
     owner: super::session::AttemptOwner, scope: super::rpc_pending::RpcConnectionScope, message: PathMessage,
+    port_order: super::router_ports::PortOrder, received_at: Instant,
 }
 impl VerifiedRouterData {
     pub fn message_for(&self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope) -> Option<&PathMessage> {
         if &self.owner == owner && self.scope.matches(scope) && self.scope.is_open() { Some(&self.message) } else { None }
+    }
+    pub(super) fn admission_for(&self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope)
+        -> Option<(&PathMessage, &super::router_ports::PortOrder, Instant)> {
+        Some((self.message_for(owner, scope)?, &self.port_order, self.received_at))
     }
 }
 impl fmt::Debug for VerifiedRouterData {
@@ -280,6 +285,7 @@ pub struct RouterConnectTracker {
     pending_resolve: Option<PendingResolve>,
     resolution: Option<RouterResolution>,
     data: Vec<VerifiedRouterData>,
+    port_clock: super::router_ports::PortClock,
     data_bytes: usize,
     mtu: usize,
     sequence: u16,
@@ -310,10 +316,19 @@ impl RouterConnectTracker {
             let key = if p.key == b"accessKey" { b"accessKey".as_slice() } else { b"accessAuth".as_slice() };
             (key, zeroize::Zeroizing::new(p.value.to_vec()))
         }).collect();
-        Ok(Self { owner, scope, router_id, nonce, access, mtu, sequence,
+        let port_clock = super::router_ports::PortClock::for_original(owner.clone(), scope.clone());
+        Ok(Self { owner, scope, router_id, nonce, access, mtu, sequence, port_clock,
             next_control_id: Some(2), pending_resolve: None, resolution: None, data: Vec::new(), data_bytes: 0,
             deadline: now.checked_add(timeout).ok_or(RouterConnectError::Configuration)?, last_now: now,
             phase: RouterConnectPhase::Initial, receiver: PathReceiver::default(), common: super::transport_packets::CallAssembler::default() })
+    }
+    /// Exactly one logical port book shares this original tracker's ingress
+    /// order. A new tracker/book cannot borrow already received data simply by
+    /// carrying the same scope; queued data predates any replacement lease.
+    pub(super) fn create_ports(&self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope,
+        first_candidate: u16, now: Instant) -> Result<Option<super::router_ports::RouterPorts>, super::router_ports::PortError> {
+        if !self.accepts(owner, scope) { return Ok(None); }
+        super::router_ports::RouterPorts::for_original(owner.clone(), scope.clone(), self.port_clock.clone(), first_candidate, now).map(Some)
     }
     pub fn phase(&self) -> RouterConnectPhase { if self.scope.is_open() { self.phase } else { RouterConnectPhase::Closed } }
     pub fn close(&mut self) {
@@ -424,17 +439,18 @@ impl RouterConnectTracker {
         result
     }
     fn consume(&mut self, packets: &[TransportBytes], now: Instant) -> Result<Option<RouterAssignment>, RouterConnectError> {
-        let mut assignment = None; let mut resolution: Option<RouterResolution> = None;
+        let mut assignment: Option<RouterAssignment> = None; let mut resolution: Option<RouterResolution> = None;
         for raw in packets {
             let path = self.receiver.on_packet(raw.expose_to_transport(), now).map_err(|_| RouterConnectError::Protocol)?;
             let PathInput::Data { message: Some(message), .. } = path else { continue; };
             if message.first_header.packet_kind == 0 {
                 if self.phase != RouterConnectPhase::Connected && assignment.is_none() { return Err(RouterConnectError::Protocol); }
-                super::router_packets::decode_routed_body(message.body.expose_to_transport()).map_err(|_| RouterConnectError::Protocol)?;
+                super::native_routing::decode_routing_body(message.body.expose_to_transport()).map_err(|_| RouterConnectError::Protocol)?;
                 let bytes = message.body.expose_to_transport().len();
                 if self.data.len() >= 64 || bytes > MAX_CACHED_BYTES - self.data_bytes { return Err(RouterConnectError::Protocol); }
                 self.data_bytes += bytes;
-                self.data.push(VerifiedRouterData { owner: self.owner.clone(), scope: self.scope.clone(), message });
+                let port_order = self.port_clock.stamp().map_err(|_| RouterConnectError::Protocol)?;
+                self.data.push(VerifiedRouterData { owner: self.owner.clone(), scope: self.scope.clone(), message, port_order, received_at: now });
                 continue;
             }
             if message.first_header.packet_kind != 1 { return Err(RouterConnectError::Protocol); }
@@ -444,7 +460,7 @@ impl RouterConnectTracker {
             if common.kind != super::transport_packets::CallKind::Reply { return Err(RouterConnectError::Protocol); }
             let reply = super::rpc_envelope::decode_reply(common.payload.expose_to_transport()).map_err(|_| RouterConnectError::Protocol)?;
             if self.phase == RouterConnectPhase::Pending && reply.call_id != 1 { continue; }
-            if self.phase == RouterConnectPhase::Pending && assignment.is_none() {
+            if self.phase == RouterConnectPhase::Pending {
                 if reply.result_code != 0 { return Err(RouterConnectError::Rejected); }
                 let mut reader = super::rpc_stream::Reader::new(reply.result_stream).map_err(|_| RouterConnectError::Protocol)?;
                 let accepted = reader.boolean().map_err(|_| RouterConnectError::Protocol)?;
@@ -453,7 +469,11 @@ impl RouterConnectTracker {
                 let footer = super::rpc_stream::read_footer(&mut reader).map_err(|_| RouterConnectError::Protocol)?;
                 reader.finish().map_err(|_| RouterConnectError::Protocol)?;
                 if !accepted || !footer.reason.is_empty() || router == 0 || node == 0 { return Err(RouterConnectError::Rejected); }
-                assignment = Some(RouterAssignment { owner: self.owner.clone(), scope: self.scope.clone(), router, node });
+                if let Some(prior) = &assignment {
+                    if prior.router != router || prior.node != node { return Err(RouterConnectError::Protocol); }
+                } else {
+                    assignment = Some(RouterAssignment { owner: self.owner.clone(), scope: self.scope.clone(), router, node });
+                }
             } else if let Some(pending) = self.pending_resolve.as_ref().filter(|pending| pending.call_id == reply.call_id) {
                 if reply.result_code != 0 { return Err(RouterConnectError::Rejected); }
                 let mut reader = super::rpc_stream::Reader::new(reply.result_stream).map_err(|_| RouterConnectError::Protocol)?;
