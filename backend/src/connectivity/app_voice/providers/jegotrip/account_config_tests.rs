@@ -460,3 +460,62 @@ fn call_control_auth_keys_or_unparsed_endpoint_substitutes_fail_before_any_origi
         config.profile.call_control=Some(vec![ProfileProperty{key:b"id".to_vec(),value:b"#fixture-server".to_vec()},ProfileProperty{key:b"domain".to_vec(),value:b"fixture-domain".to_vec()},ProfileProperty{key:key.to_vec(),value:b"not-sdk-secret".to_vec()}]);assert_eq!(config.validate(100),Err(INVALID));
     }
 }
+
+pub(crate) fn native_fixture(root:&str,host:&str,port:u16)->AccountConfig{
+    let mut config=fixture(root);config.credentials.sdk.server_address=Secret::from_owned("AccountEntry:sarc -h 42.7 -p 98;".into());
+    config.profile.authority=Secret::from_owned(String::new());config.profile.enable_sni=false;
+    config.profile.route=ProfileRoute::RouterCommon(Box::new(RouterProfileConfig{
+        reference:Secret::from_owned(format!("Router:tls -h {host} -p {port} -ri 12001;")),
+        anchors:vec![RouterProfileAnchor{router_id:12001,host:Secret::from_owned(host.to_owned()),port,authority:Secret::from_owned(host.to_owned()),root_der_base64:Secret::from_owned(root.to_owned()),enable_sni:false}],
+        access:vec![],endpoint_index:0,resolved_host_index:0,startup_timeout_ms:5000,attempt_timeout_ms:8000,compress_above:None,
+    }));config
+}
+#[test]
+fn native_private_route_roundtrip_preserves_router_identity_roots_and_logical_entry(){
+    let cert=Certificates::generate("DNS:fixture.invalid");let config=native_fixture(&cert.root,"fixture.invalid",443);assert_eq!(config.validate(100),Ok(()));
+    let bytes=config.encode_private().unwrap();let loaded=AccountConfig::decode_private(&bytes).unwrap();assert_eq!(loaded.validate(100),Ok(()));assert_eq!(bytes.as_slice(),loaded.encode_private().unwrap().as_slice());
+    let ProfileRoute::RouterCommon(route)=&loaded.profile.route else{panic!("native route")};assert!(route.reference.expose_to_backend().contains("-ri 12001"));assert_eq!(route.anchors[0].root_der_base64.expose_to_backend(),cert.root);
+    assert_eq!(loaded.credentials.sdk.server_address.expose_to_backend(),"AccountEntry:sarc -h 42.7 -p 98;");assert!(loaded.runtime_profile().is_ok());
+}
+#[test]
+fn native_capture_does_not_modify_stored_binary_routing_or_turn_it_into_a_direct_tls_profile(){
+    let cert=Certificates::generate("DNS:fixture.invalid");let config=native_fixture(&cert.root,"fixture.invalid",443);let before=config.encode_private().unwrap();config.runtime_profile().unwrap();
+    assert_eq!(config.profile.login_routing.len(),1);assert_eq!(config.profile.login_routing[0].key,[0xfe]);assert_eq!(before.as_slice(),config.encode_private().unwrap().as_slice());
+    let view=serde_json::to_value(private_profile_ref(&config.profile)).unwrap();assert!(view["route"]["router_common"].is_object());assert_eq!(view["route"]["router_common"]["anchors"][0]["router_id"],12001);
+    let legacy=fixture(&cert.root);let view=serde_json::to_value(private_profile_ref(&legacy.profile)).unwrap();assert_eq!(view["route"],"direct_tls_carrier");
+}
+#[test]
+fn native_unknown_fields_or_incomplete_trust_do_not_fall_back_to_legacy_transport(){
+    let cert=Certificates::generate("DNS:fixture.invalid");let config=native_fixture(&cert.root,"fixture.invalid",443);let base:serde_json::Value=serde_json::from_str(&public_json(&config)).unwrap();
+    for key in ["reference","anchors","access","endpoint_index","resolved_host_index","startup_timeout_ms","attempt_timeout_ms"]{
+        let mut json=base.clone();json["profile"]["route"]["router_common"].as_object_mut().unwrap().remove(key);assert!(serde_json::from_value::<AccountConfig>(json).is_err());
+    }
+    let mut json=base.clone();json["profile"]["route"]["router_common"]["infer_trust"]=serde_json::json!(true);assert!(serde_json::from_value::<AccountConfig>(json).is_err());
+    let mut json=base;json["profile"]["route"]["router_common"]["anchors"][0]["unknown"]=serde_json::json!(true);assert!(serde_json::from_value::<AccountConfig>(json).is_err());
+}
+#[test]
+fn native_anchor_ri_authority_or_missing_groups_fail_entire_config_before_io(){
+    let cert=Certificates::generate("DNS:fixture.invalid");let base=native_fixture(&cert.root,"fixture.invalid",443);
+    for which in 0..4{let mut config=base.clone();let ProfileRoute::RouterCommon(route)=&mut config.profile.route else{unreachable!()};match which{
+        0=>route.anchors[0].router_id=12002,1=>route.anchors[0].authority=Secret::from_owned("another.invalid".into()),2=>route.anchors.clear(),_=>route.reference=Secret::from_owned("Router:tls -h fixture.invalid -p 443;".into()),
+    }assert_eq!(config.validate(100),Err(INVALID));}
+}
+#[test]
+fn native_config_rejects_inner_tls_fields_and_legacy_bootstrap_instead_of_ignoring_them(){
+    let cert=Certificates::generate("DNS:fixture.invalid");let base=native_fixture(&cert.root,"fixture.invalid",443);
+    let mut config=base.clone();config.profile.authority=Secret::from_owned("fixture.invalid".into());assert_eq!(config.validate(100),Err(INVALID));
+    let mut config=base.clone();config.profile.enable_sni=true;assert_eq!(config.validate(100),Err(INVALID));
+    let mut config=base;config.bootstrap=bootstrap_fixture(&cert.root,&cert.root).bootstrap;assert_eq!(config.validate(100),Err(INVALID));
+}
+#[test]
+fn native_logical_entry_scheme_selection_and_timeout_bounds_are_not_guessed(){
+    let cert=Certificates::generate("DNS:fixture.invalid");let base=native_fixture(&cert.root,"fixture.invalid",443);
+    for entry in ["AccountEntry:tcp -h fixture.invalid -p 443;","AccountEntry:sarc -h missing.invalid -p 98;"]{let mut config=base.clone();config.credentials.sdk.server_address=Secret::from_owned(entry.into());assert_eq!(config.validate(100),Err(INVALID));}
+    for which in 0..4{let mut config=base.clone();let ProfileRoute::RouterCommon(route)=&mut config.profile.route else{unreachable!()};match which{0=>route.endpoint_index=1,1=>route.resolved_host_index=1,2=>route.attempt_timeout_ms=120001,_=>route.startup_timeout_ms=0};assert_eq!(config.validate(100),Err(INVALID));}
+}
+#[test]
+fn native_route_debug_redacts_shared_router_access_and_tls_material(){
+    let cert=Certificates::generate("DNS:fixture.invalid");let mut config=native_fixture(&cert.root,"fixture.invalid",443);let ProfileRoute::RouterCommon(route)=&mut config.profile.route else{unreachable!()};
+    route.access=vec![ProfileProperty{key:b"accessKey".to_vec(),value:b"private-router-key".to_vec()},ProfileProperty{key:b"accessAuth".to_vec(),value:b"private-router-auth".to_vec()}];
+    let text=format!("{route:?} {:?}",route.anchors[0]);assert!(!text.contains("private-router"));assert!(!text.contains("fixture.invalid"));assert!(!text.contains(&cert.root));assert_eq!(config.validate(100),Ok(()));
+}

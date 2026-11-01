@@ -64,7 +64,10 @@ fn sdk_request_cannot_retarget_captured_native_profile_to_an_equal_looking_new_e
 }
 #[tokio::test]
 async fn shared_hosting_backend_selects_native_actor_without_calling_legacy_connector(){
-    let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=profile(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
+    let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
+    let stored=super::super::account_config::tests::native_fixture(&cert.root,"127.0.0.1",listener.local_addr().unwrap().port());
+    let encoded=stored.encode_private().unwrap();let loaded=super::super::account_config::AccountConfig::decode_private(&encoded).unwrap();assert_eq!(loaded.validate(100),Ok(()));
+    let p=loaded.runtime_profile().unwrap();let config=cert.server_config(&TLS13);
     let server=async move{tokio::time::timeout(Duration::from_secs(12),async move{let mut peer=CommonPeer::open(listener,config).await;let packet=peer.next().await.unwrap();let call=decode_request(&packet[1..]).unwrap();assert_eq!(call.method,b"loginSession.AccountEntry.Account");assert_eq!(call.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"AccountEntry");peer.send(&[reply(call.call_id,&login_result())]).await;
         let packet=peer.next().await.unwrap();let call=decode_request(&packet[1..]).unwrap();assert_eq!(call.method,b"logoutSession.AccountEntry.Account");assert_eq!(call.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"AccountEntry");peer.send(&[reply(call.call_id,b"\0\x01\0\0\0\0")]).await;peer.no_more_common().await;}).await.unwrap()};
     let client=async move{let connector=Arc::new(LegacyDenied{calls:AtomicUsize::new(0)});let(backend,mut events)=NativeHostingBackend::new(p,connector.clone());let original=owner();backend.login(original.clone(),request(&cert.root)).await.unwrap();let scope=backend.original_scope(&original).unwrap();backend.pause_original_polls_for_test(&original,&scope,true).unwrap();

@@ -474,6 +474,13 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('tokio::time::timeout_at(end.into(),operation)', profile)
         transport = (MOD / 'packet_transport.rs').read_text(encoding='utf-8')
         self.assertIn('PacketRoute::NativeCommon => return Err(TransportError::UnsupportedRoute)', transport)
+        config = (MOD / 'account_config.rs').read_text(encoding='utf-8')
+        self.assertIn('RouterCommon(Box<RouterProfileConfig>)', config)
+        self.assertIn('RouterPolicy::supplied(native.reference.expose_to_backend(),&anchors)', config)
+        self.assertIn('account_reference:self.credentials.sdk.server_address.expose_to_backend()', config)
+        self.assertIn('route: private_route(&p.route)', config)
+        self.assertLess(config.index('let _profile = self.runtime_profile()?'),
+                        config.index('if matches!(&self.profile.route,ProfileRoute::RouterCommon(_)){return Ok(());}'))
         for name in ['beta-validation.yml', 'build-release.yml']:
             self.assertIn('connectivity::app_voice::providers::jegotrip::runtime_backend::common_tests',
                           (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))

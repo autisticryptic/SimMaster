@@ -6,7 +6,7 @@ use super::{
     legacy_config::ConfigDecodeKey,
     packet_transport::PacketRoute,
     rpc_stream::{RpcProperty, MAX_FIELD_BYTES, MAX_MAP_ENTRIES},
-    runtime_backend::{RuntimeBootstrapInputs, RuntimeProfile, RuntimeProfileInputs},
+    runtime_backend::{RuntimeBootstrapInputs, RuntimeCommonInputs, RuntimeProfile, RuntimeProfileInputs},
     runtime_provision::{AccountTrust, AccountTrustInputs},
     runtime_connector::{validate_explicit_profile, ConnectionInput},
 };
@@ -60,13 +60,28 @@ impl fmt::Debug for AccountConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("AccountConfig(<redacted>)") }
 }
 
-/// Only the already-supported, explicit native TLS carrier can be imported.
-#[derive(Clone, Copy, Deserialize)]
+/// Native Common requires its own explicit physical Router trust/access.
+///The legacy string representation is retained for old directTLS profiles.
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProfileRoute { DirectTlsCarrier }
+pub enum ProfileRoute { DirectTlsCarrier, RouterCommon(Box<RouterProfileConfig>) }
 impl fmt::Debug for ProfileRoute {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("ProfileRoute(<redacted>)") }
 }
+
+#[derive(Clone,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouterProfileAnchor{
+    pub router_id:i32,pub host:Secret,pub port:u16,pub authority:Secret,pub root_der_base64:Secret,pub enable_sni:bool,
+}
+impl fmt::Debug for RouterProfileAnchor{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RouterProfileAnchor(<redacted>)")}}
+#[derive(Clone,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouterProfileConfig{
+    pub reference:Secret,pub anchors:Vec<RouterProfileAnchor>,pub access:Vec<ProfileProperty>,
+    pub endpoint_index:usize,pub resolved_host_index:usize,pub startup_timeout_ms:u64,pub attempt_timeout_ms:u64,pub compress_above:Option<usize>,
+}
+impl fmt::Debug for RouterProfileConfig{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RouterProfileConfig(<redacted>)")}}
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -190,8 +205,12 @@ impl AccountConfig {
     pub fn runtime_profile(&self) -> Result<RuntimeProfile, &'static str> {
         let p = &self.profile;
         p.validate_timeouts()?;
-        for required in [&p.authority, &p.identity_type, &p.gateway_uri] {
+        for required in [&p.identity_type, &p.gateway_uri] {
             if required.expose_to_backend().trim().is_empty() { return Err(INVALID); }
+        }
+        match &p.route{
+            ProfileRoute::DirectTlsCarrier=>if p.authority.expose_to_backend().trim().is_empty(){return Err(INVALID);},
+            ProfileRoute::RouterCommon(_)=>if !p.authority.expose_to_backend().is_empty()||p.enable_sni||self.bootstrap.is_some(){return Err(INVALID);},
         }
         let (domain_name,domain_id,application_id,cc)=if self.bootstrap.is_some(){
             if [&p.domain_name,&p.domain_id,&p.application_id,&p.device_info_cc].iter().any(|value|value.is_some()){return Err(INVALID);}
@@ -204,7 +223,7 @@ impl AccountConfig {
         let poll = borrowed(&p.poll_routing)?;
         let logout = borrowed(&p.logout_routing)?;
         let inputs=RuntimeProfileInputs {
-            route: match p.route { ProfileRoute::DirectTlsCarrier => PacketRoute::DirectTlsCarrier },
+            route: match &p.route { ProfileRoute::DirectTlsCarrier => PacketRoute::DirectTlsCarrier, ProfileRoute::RouterCommon(_)=>PacketRoute::NativeCommon },
             authority: p.authority.expose_to_backend(), enable_sni: p.enable_sni,
             identity_type: p.identity_type.expose_to_backend(), domain_name,
             domain_id, application_id,
@@ -221,7 +240,16 @@ impl AccountConfig {
             io_timeout: Duration::from_millis(p.io_timeout_ms),
             rpc_timeout: Duration::from_millis(p.rpc_timeout_ms),
         };
-        let profile=if let Some(bootstrap)=&self.bootstrap{
+        let profile=if let ProfileRoute::RouterCommon(native)=&p.route{
+            if native.anchors.is_empty()||native.anchors.len()>16{return Err(INVALID);}
+            let anchors:Vec<_>=native.anchors.iter().map(|a|super::router_connector::RouterAnchor{router_id:a.router_id,host:a.host.expose_to_backend(),port:a.port,
+                authority:a.authority.expose_to_backend(),root:a.root_der_base64.expose_to_backend(),enable_sni:a.enable_sni}).collect();
+            let router=super::router_connector::RouterPolicy::supplied(native.reference.expose_to_backend(),&anchors).map_err(|_|INVALID)?;
+            let access=borrowed(&native.access)?;
+            RuntimeProfile::supplied_common(inputs,RuntimeCommonInputs{router,account_reference:self.credentials.sdk.server_address.expose_to_backend(),access:&access,
+                endpoint_index:native.endpoint_index,resolved_host_index:native.resolved_host_index,connect_timeout:Duration::from_millis(p.connect_timeout_ms),
+                startup_timeout:Duration::from_millis(native.startup_timeout_ms),attempt_timeout:Duration::from_millis(native.attempt_timeout_ms),compress_above:native.compress_above}).map_err(|_|INVALID)?
+        }else if let Some(bootstrap)=&self.bootstrap{
             if bootstrap.handoff_timeout_ms==0||bootstrap.handoff_timeout_ms>30_000
                 ||bootstrap.account_root_der_base64.expose_to_backend().len()>16_384{return Err(INVALID);}
             let routing=borrowed(&bootstrap.routing)?;
@@ -288,6 +316,10 @@ impl AccountConfig {
         }
         let _profile = self.runtime_profile()?;
         let _calls = self.runtime_calls()?;
+        // Native profile construction already checked the ENTIRE logical
+        //entry and separate original Router anchors; never feed it to the
+        //legacy rawTCP/innerTLS connector validation or infer reverse routes.
+        if matches!(&self.profile.route,ProfileRoute::RouterCommon(_)){return Ok(());}
         let key = self.reference_key()?;
         validate_explicit_profile(ConnectionInput {
             server_reference: sdk.server_address.expose_to_backend(),
@@ -389,8 +421,29 @@ struct PrivateIncomingRef<'a> { object_id: &'a [u8], domain: &'a [u8], receiver_
 #[derive(Serialize)]
 struct PrivateCallIncomingRef<'a>{object_id:&'a [u8],domain:&'a [u8]}
 #[derive(Serialize)]
+#[serde(rename_all="snake_case")]
+enum PrivateProfileRoute<'a>{DirectTlsCarrier,RouterCommon(PrivateRouterProfile<'a>)}
+#[derive(Serialize)]
+struct PrivateRouterProfile<'a>{reference:&'a str,anchors:PrivateRouterAnchors<'a>,access:PrivateProperties<'a>,
+    endpoint_index:usize,resolved_host_index:usize,startup_timeout_ms:u64,attempt_timeout_ms:u64,compress_above:Option<usize>}
+#[derive(Serialize)]
+struct PrivateRouterAnchor<'a>{router_id:i32,host:&'a str,port:u16,authority:&'a str,root_der_base64:&'a str,enable_sni:bool}
+struct PrivateRouterAnchors<'a>(&'a [RouterProfileAnchor]);
+impl Serialize for PrivateRouterAnchors<'_>{
+    fn serialize<S:Serializer>(&self,serializer:S)->Result<S::Ok,S::Error>{
+        let mut seq=serializer.serialize_seq(Some(self.0.len()))?;
+        for a in self.0{seq.serialize_element(&PrivateRouterAnchor{router_id:a.router_id,host:a.host.expose_to_backend(),port:a.port,
+            authority:a.authority.expose_to_backend(),root_der_base64:a.root_der_base64.expose_to_backend(),enable_sni:a.enable_sni})?;}seq.end()
+    }
+}
+fn private_route(route:&ProfileRoute)->PrivateProfileRoute<'_>{match route{
+    ProfileRoute::DirectTlsCarrier=>PrivateProfileRoute::DirectTlsCarrier,
+    ProfileRoute::RouterCommon(route)=>PrivateProfileRoute::RouterCommon(PrivateRouterProfile{reference:route.reference.expose_to_backend(),anchors:PrivateRouterAnchors(&route.anchors),access:PrivateProperties(&route.access),
+        endpoint_index:route.endpoint_index,resolved_host_index:route.resolved_host_index,startup_timeout_ms:route.startup_timeout_ms,attempt_timeout_ms:route.attempt_timeout_ms,compress_above:route.compress_above}),
+}}
+#[derive(Serialize)]
 pub(super) struct PrivateProfileRef<'a> {
-    route: &'static str, authority: &'a str, enable_sni: bool, identity_type: &'a str,
+    route: PrivateProfileRoute<'a>, authority: &'a str, enable_sni: bool, identity_type: &'a str,
     domain_name: Option<&'a str>, domain_id: Option<&'a str>, application_id: Option<&'a str>, device_info_cc: Option<&'a str>,
     client_properties: PrivateProperties<'a>, include_device_id: bool,
     login_routing: PrivateProperties<'a>, gateway_uri: &'a str,
@@ -425,7 +478,7 @@ impl<'a> PrivateConfigRef<'a> {
                 },
             },
             profile: PrivateProfileRef {
-                route: match p.route { ProfileRoute::DirectTlsCarrier => "direct_tls_carrier" },
+                route: private_route(&p.route),
                 authority: p.authority.expose_to_backend(), enable_sni: p.enable_sni,
                 identity_type: p.identity_type.expose_to_backend(), domain_name: exposed(&p.domain_name),
                 domain_id: exposed(&p.domain_id), application_id: exposed(&p.application_id),
@@ -458,7 +511,7 @@ impl<'a> PrivateConfigRef<'a> {
 /// these values through a public configuration view.
 pub(super) fn private_profile_ref(p: &ProfileConfig) -> PrivateProfileRef<'_> {
     PrivateProfileRef {
-        route: match p.route { ProfileRoute::DirectTlsCarrier => "direct_tls_carrier" },
+        route: private_route(&p.route),
         authority: p.authority.expose_to_backend(), enable_sni: p.enable_sni,
         identity_type: p.identity_type.expose_to_backend(), domain_name: exposed(&p.domain_name),
         domain_id: exposed(&p.domain_id), application_id: exposed(&p.application_id),
@@ -485,4 +538,4 @@ pub(super) fn private_call_media_ref(m: &CallMediaConfig) -> PrivateCallMediaRef
 
 #[cfg(test)]
 #[path = "account_config_tests.rs"]
-mod tests;
+pub(crate) mod tests;
