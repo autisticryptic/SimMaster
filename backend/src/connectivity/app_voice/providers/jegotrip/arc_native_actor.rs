@@ -29,13 +29,14 @@ impl PreparedCommonRuntime{
     pub fn connection_scope(&self)->RpcConnectionScope{self.scope.clone()}
     /// No actor is spawned here. The caller first acquires its owning-handle
     ///slot, then consumes ConnectedCommonRuntime::attach with no await gap.
-    pub async fn connect(mut self,router_policy:&RouterPolicy,access:&[RpcProperty<'_>],endpoint:&ReferenceEndpoint,index:usize,
+    pub async fn connect(mut self,router_policy:&RouterPolicy,access:&[RpcProperty<'_>],identity:&[u8],endpoint:&ReferenceEndpoint,index:usize,
         mut timeouts:RouterTimeouts,compress_above:Option<usize>)->Result<ConnectedCommonRuntime,RuntimeError>{
         if !self.scope.is_open(){return Err(RuntimeError::Scope);}
         let now=Instant::now();if now>=self.attempt_end{return Err(RuntimeError::Timeout);}
         if !matches!(endpoint.scheme(),b"arc"|b"sarc")||index>=32||compress_above.is_some_and(|value|value==0||value>MAX_PARAMETER_BYTES){return Err(RuntimeError::InvalidConfiguration);}
         let host=endpoint.router_host().map_err(|_|RuntimeError::InvalidConfiguration)?;
         if matches!(host,super::super::object_reference::RouterHost::Address(_))&&index!=0{return Err(RuntimeError::InvalidConfiguration);}
+        self.backend.as_mut().ok_or(RuntimeError::Closed)?.bind_common_identity(identity).map_err(|_|RuntimeError::InvalidConfiguration)?;
         timeouts.startup=timeouts.startup.min(self.attempt_end.duration_since(now));
         let connecting=async{
             let router=RouterPath::open(self.owner.clone(),self.scope.clone(),router_policy,access,timeouts).await.map_err(router_error)?;

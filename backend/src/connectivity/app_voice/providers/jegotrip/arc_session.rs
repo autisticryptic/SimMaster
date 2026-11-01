@@ -75,6 +75,7 @@ pub struct ArcRpcSession {
     hosting_tracker_taken: bool,
     batch_scheduler_taken: bool,
     packet_transport_taken: bool,
+    common_transport_claimed:bool,common_identity:Option<Vec<u8>>,
     call_book:CallBook,
 }
 
@@ -182,7 +183,7 @@ impl ArcRpcSession {
         let connection=RpcConnectionScope::fresh();let call_book=CallBook::new(owner.clone(),connection.clone());
         Self { owner, connection, phase: ArcPhase::Initial,
             next_id: Some(1), pending: BTreeMap::new(), authentication: None, hosting_tracker_taken: false,
-            batch_scheduler_taken: false, packet_transport_taken: false,call_book }
+            batch_scheduler_taken: false, packet_transport_taken: false,common_transport_claimed:false,common_identity:None,call_book }
     }
 
     pub fn connection_scope(&self) -> RpcConnectionScope { self.connection.clone() }
@@ -220,7 +221,23 @@ impl ArcRpcSession {
     ///actor must build its physical CommonPath with this same owned scope.
     pub(super) fn claim_common_transport(&mut self)->Result<(),TransportError>{
         if self.phase()!=ArcPhase::Initial||!self.pending.is_empty()||self.packet_transport_taken{return Err(TransportError::InvalidPacket);}
-        self.packet_transport_taken=true;Ok(())
+        self.packet_transport_taken=true;self.common_transport_claimed=true;Ok(())
+    }
+    pub(super) fn bind_common_identity(&mut self,identity:&[u8])->Result<(),CodecError>{
+        if !self.common_transport_claimed||self.phase()!=ArcPhase::Initial||!self.pending.is_empty()||self.common_identity.is_some(){return Err(CodecError::InvalidField);}
+        validate_bytes(identity,true)?;self.common_identity=Some(identity.to_vec());Ok(())
+    }
+    /// Account metadata on a Common incarnation must carry the SAME entry
+    ///identity that was bound before the physical connection. A caller-supplied
+    ///conflicting id is refused instead of being rewritten or duplicated.
+    fn account_metadata<'c>(&self,properties:&[RpcProperty<'c>],identity:Option<&'c [u8]>)->Result<Vec<RpcProperty<'c>>,CodecError>{
+        let mut result=properties.to_vec();
+        if self.common_transport_claimed{
+            let identity=identity.ok_or(CodecError::InvalidField)?;
+            if properties.iter().any(|p|p.key==b"id"&&p.value!=identity){return Err(CodecError::InvalidField);}
+            if !properties.iter().any(|p|p.key==b"id"){result.push(RpcProperty{key:b"id",value:identity});}
+        }
+        Ok(result)
     }
     /// One tracker per ARC incarnation keeps nested sequences unique and binds
     /// owner/connection at construction, never when a batch arrives.
@@ -282,7 +299,8 @@ impl ArcRpcSession {
         if self.phase() == ArcPhase::Closed { return Err(CodecError::InvalidField); }
         if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
         let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
-        let bytes = encode_request(id, metadata, method, arguments)?;
+        let metadata=self.account_metadata(metadata,self.common_identity.as_deref())?;
+        let bytes = encode_request(id, &metadata, method, arguments)?;
         self.next_id = id.checked_add(1);
         self.pending.insert(id, pending);
         Ok((id, bytes))
@@ -349,7 +367,7 @@ impl ArcRpcSession {
         reject_auth_keys(routing)?;
         let auth = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
         let arguments = encode_logout_session(&auth.user_id, &auth.selected_session_id)?;
-        let mut metadata = routing.to_vec(); metadata.push(RpcProperty { key: b"token", value: &auth.token });
+        let mut metadata = self.account_metadata(routing,self.common_identity.as_deref())?; metadata.push(RpcProperty { key: b"token", value: &auth.token });
         let bytes = encode_request(self.next_id.ok_or(CodecError::InvalidCallId)?, &metadata, LOGOUT_SESSION_METHOD.as_bytes(), arguments.expose_to_transport())?;
         let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
         self.next_id = id.checked_add(1); self.pending.clear();self.call_book.close();
@@ -380,7 +398,7 @@ impl ArcRpcSession {
         reject_auth_keys(routing)?;
         let auth = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
         let arguments = encode_swap_calls(&auth.user_id, &auth.selected_session_id, payload)?;
-        let mut metadata = routing.to_vec();
+        let mut metadata = self.account_metadata(routing,self.common_identity.as_deref())?;
         metadata.push(RpcProperty { key: b"token", value: &auth.token });
         let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
         if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
@@ -402,6 +420,7 @@ impl ArcRpcSession {
         self.phase = ArcPhase::Closed;
         self.connection.close();
         self.authentication = None;
+        if let Some(identity)=&mut self.common_identity{identity.zeroize();}self.common_identity=None;
         self.pending.clear();self.call_book.close();
     }
 

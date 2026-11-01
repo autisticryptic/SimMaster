@@ -23,7 +23,7 @@ use super::{
     rpc_pending::{OwnedRpcCallback, RpcConnectionScope},
     rpc_stream::{RpcProperty, MAX_FIELD_BYTES, MAX_MAP_ENTRIES},
     runtime_connector::{ConnectionInput, RuntimeConnector},
-    runtime_provision::{AccountTrust, ProvisionedLogin},
+    runtime_provision::{AccountTrust, ProvisionedCommonLogin, ProvisionedLogin},
     session::{AttemptOwner, BackendFailure, BackendFuture, GatewayRegistration, HostingBackend,
         SdkLoginRequest, STATUS_REGISTER, STATUS_UNREGISTER},
     tls_engine::{valid_authority, TlsError, TlsParameters},
@@ -135,6 +135,10 @@ struct BootstrapProfile {
     account_trust: AccountTrust, routing:Vec<Property>, client_key:Option<ConfigDecodeKey>, handoff_timeout:Duration,
 }
 
+pub struct RuntimeCommonBootstrapInputs<'a>{pub routing:&'a [RpcProperty<'a>],pub client_config_decode_key:Option<ConfigDecodeKey>,pub handoff_timeout:Duration}
+impl fmt::Debug for RuntimeCommonBootstrapInputs<'_>{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RuntimeCommonBootstrapInputs(<redacted>)")}}
+struct CommonBootstrapProfile{routing:Vec<Property>,client_key:Option<ConfigDecodeKey>,handoff_timeout:Duration}
+
 /// Explicit physical Router trust/access plus the original logical SDK entry.
 ///This is deployment data, not a handshake/authentication/hosting grant.
 pub struct RuntimeCommonInputs<'a>{
@@ -147,35 +151,44 @@ pub struct RuntimeCommonInputs<'a>{
 }
 impl fmt::Debug for RuntimeCommonInputs<'_>{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RuntimeCommonInputs(<redacted>)")}}
 struct CommonProfile{
-    router:super::router_connector::RouterPolicy,entry:super::object_reference::ObjectReference,reference:Zeroizing<String>,access:Vec<Property>,
+    router:super::router_connector::RouterPolicy,entry:Option<super::object_reference::ObjectReference>,reference:Option<Zeroizing<String>>,access:Vec<Property>,
     endpoint_index:usize,resolved_host_index:usize,connect_timeout:Duration,startup_timeout:Duration,attempt_timeout:Duration,compress_above:Option<usize>,
 }
 impl CommonProfile{
-    fn capture(input:RuntimeCommonInputs<'_>,key:Option<&ConfigDecodeKey>,total:&mut usize)->Result<Self,ProfileError>{
-        if input.account_reference.is_empty()||input.account_reference.len()>MAX_FIELD_BYTES||input.account_reference.chars().any(char::is_control)
+    /// Either the original logical entry is supplied directly, or it is left
+    /// unknown until a matched bootstrap returns it. Nothing is inferred from
+    /// DomainName, a host string or a default endpoint in either mode.
+    fn identity(&self)->Option<&[u8]>{self.entry.as_ref().map(|entry|entry.identity())}
+    fn endpoint(&self)->Option<&super::object_reference::ReferenceEndpoint>{
+        let super::object_reference::ReferenceTarget::Direct(endpoints)=self.entry.as_ref()?.target()else{return None};
+        endpoints.get(self.endpoint_index)
+    }
+    fn capture(input:RuntimeCommonInputs<'_>,key:Option<&ConfigDecodeKey>,total:&mut usize,bootstrap:bool)->Result<Self,ProfileError>{
+        if (!bootstrap&&input.account_reference.is_empty())||input.account_reference.len()>MAX_FIELD_BYTES||input.account_reference.chars().any(char::is_control)
             ||input.resolved_host_index>=32||input.compress_above.is_some_and(|limit|limit==0||limit>MAX_PROFILE_BYTES){return Err(ProfileError::InvalidConfiguration);}
+        if bootstrap&&(input.endpoint_index!=0||input.resolved_host_index!=0){return Err(ProfileError::InvalidConfiguration);}
         for(timeout,max)in[(input.connect_timeout,10),(input.startup_timeout,30),(input.attempt_timeout,120)]{
             if timeout.is_zero()||timeout>Duration::from_secs(max){return Err(ProfileError::InvalidConfiguration);}
         }
-        let decoded=super::legacy_config::decode_configuration(input.account_reference.as_bytes(),key).map_err(|_|ProfileError::InvalidConfiguration)?;
-        let entry=super::object_reference::parse_object_reference(decoded.expose_to_backend()).map_err(|_|ProfileError::UnsupportedTransport)?;
-        let super::object_reference::ReferenceTarget::Direct(endpoints)=entry.target()else{return Err(ProfileError::UnsupportedTransport);};
-        if endpoints.is_empty()||endpoints.len()>16||input.endpoint_index>=endpoints.len(){return Err(ProfileError::UnsupportedTransport);}
-        for endpoint in endpoints{
-            if !matches!(endpoint.scheme(),b"arc"|b"sarc")||endpoint.router_host().is_err(){return Err(ProfileError::UnsupportedTransport);}
-        }
-        if matches!(endpoints[input.endpoint_index].router_host(),Ok(super::object_reference::RouterHost::Address(_)))&&input.resolved_host_index!=0{return Err(ProfileError::InvalidConfiguration);}
         if !input.access.is_empty() && (input.access.len()!=2||![b"accessKey".as_slice(),b"accessAuth".as_slice()].iter().all(|key|input.access.iter().any(|p|p.key==*key&&!p.value.is_empty()))){return Err(ProfileError::InvalidConfiguration);}
-        let encoded=entry.encode_native().map_err(|_|ProfileError::InvalidConfiguration)?;
-        let reference=std::str::from_utf8(encoded.expose_to_backend()).map_err(|_|ProfileError::InvalidConfiguration)?;
-        add_bytes(total,input.router.retained_bytes())?;add_bytes(total,reference.len()*2)?;
+        let(entry,reference)=if bootstrap{(None,None)}else{
+            let decoded=super::legacy_config::decode_configuration(input.account_reference.as_bytes(),key).map_err(|_|ProfileError::InvalidConfiguration)?;
+            let entry=super::object_reference::parse_object_reference(decoded.expose_to_backend()).map_err(|_|ProfileError::UnsupportedTransport)?;
+            let super::object_reference::ReferenceTarget::Direct(endpoints)=entry.target()else{return Err(ProfileError::UnsupportedTransport);};
+            if endpoints.is_empty()||endpoints.len()>16||input.endpoint_index>=endpoints.len(){return Err(ProfileError::UnsupportedTransport);}
+            for endpoint in endpoints{
+                if !matches!(endpoint.scheme(),b"arc"|b"sarc")||endpoint.router_host().is_err(){return Err(ProfileError::UnsupportedTransport);}
+            }
+            if matches!(endpoints[input.endpoint_index].router_host(),Ok(super::object_reference::RouterHost::Address(_)))&&input.resolved_host_index!=0{return Err(ProfileError::InvalidConfiguration);}
+            let encoded=entry.encode_native().map_err(|_|ProfileError::InvalidConfiguration)?;
+            let reference=std::str::from_utf8(encoded.expose_to_backend()).map_err(|_|ProfileError::InvalidConfiguration)?;
+            add_bytes(total,reference.len()*2)?;
+            (Some(entry),Some(Zeroizing::new(reference.to_owned())))
+        };
+        add_bytes(total,input.router.retained_bytes())?;
         let access=properties(input.access,total)?;
-        Ok(Self{router:input.router,entry,reference:Zeroizing::new(reference.to_owned()),access,endpoint_index:input.endpoint_index,resolved_host_index:input.resolved_host_index,
+        Ok(Self{router:input.router,entry,reference,access,endpoint_index:input.endpoint_index,resolved_host_index:input.resolved_host_index,
             connect_timeout:input.connect_timeout,startup_timeout:input.startup_timeout,attempt_timeout:input.attempt_timeout,compress_above:input.compress_above})
-    }
-    fn endpoint(&self)->&super::object_reference::ReferenceEndpoint{
-        let super::object_reference::ReferenceTarget::Direct(endpoints)=self.entry.target()else{unreachable!("captured logical entry")};
-        &endpoints[self.endpoint_index]
     }
 }
 
@@ -187,7 +200,7 @@ pub struct RuntimeProfile {
     login_routing: Vec<Property>, gateway_uri: Zeroizing<String>, gateway_metadata: Vec<Property>,
     poll_routing: Vec<Property>, logout_routing: Vec<Property>, incoming: Option<Binding>,
     reference_decode_key: Option<ConfigDecodeKey>, handshake_timeout: Duration, partial_timeout: Duration,
-    io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>, byte_length:usize,
+    io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>, byte_length:usize,
 }
 impl fmt::Debug for RuntimeProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RuntimeProfile(<redacted>)") }
@@ -209,17 +222,22 @@ impl RuntimeProfile {
         super::call_control::validate_routing(routing).map_err(|_|ProfileError::InvalidConfiguration)?;
         self.call_control=Some(properties(routing,&mut self.byte_length)?);Ok(self)
     }
-    pub fn supplied(input: RuntimeProfileInputs<'_>) -> Result<Self, ProfileError> { Self::capture(input,None,None) }
-    pub fn supplied_common(input:RuntimeProfileInputs<'_>,common:RuntimeCommonInputs<'_>)->Result<Self,ProfileError>{Self::capture(input,None,Some(common))}
+    pub fn supplied(input: RuntimeProfileInputs<'_>) -> Result<Self, ProfileError> { Self::capture(input,None,None,None) }
+    pub fn supplied_common(input:RuntimeProfileInputs<'_>,common:RuntimeCommonInputs<'_>)->Result<Self,ProfileError>{Self::capture(input,None,Some(common),None)}
+    pub fn supplied_common_bootstrap(input:RuntimeProfileInputs<'_>,common:RuntimeCommonInputs<'_>,bootstrap:RuntimeCommonBootstrapInputs<'_>)->Result<Self,ProfileError>{
+        if [input.domain_name,input.domain_id,input.application_id,input.device_info_cc].iter().any(|value|!value.is_empty())
+            ||bootstrap.handoff_timeout.is_zero()||bootstrap.handoff_timeout>Duration::from_secs(120){return Err(ProfileError::InvalidConfiguration);}
+        Self::capture(input,None,Some(common),Some(bootstrap))
+    }
     /// Exact imported bootstrap TLS anchor plus separately imported account
     /// trust. Login domain/app/CC must come from the matched bootstrap, never
     /// placeholder/manual values silently substituted for returned properties.
     pub fn supplied_bootstrap(input:RuntimeProfileInputs<'_>,bootstrap:RuntimeBootstrapInputs<'_>)->Result<Self,ProfileError>{
         if [input.domain_name,input.domain_id,input.application_id,input.device_info_cc].iter().any(|value|!value.is_empty())
             ||bootstrap.handoff_timeout.is_zero()||bootstrap.handoff_timeout>Duration::from_secs(30){return Err(ProfileError::InvalidConfiguration);}
-        Self::capture(input,Some(bootstrap),None)
+        Self::capture(input,Some(bootstrap),None,None)
     }
-    fn capture(input:RuntimeProfileInputs<'_>,bootstrap:Option<RuntimeBootstrapInputs<'_>>,common:Option<RuntimeCommonInputs<'_>>)->Result<Self,ProfileError>{
+    fn capture(input:RuntimeProfileInputs<'_>,bootstrap:Option<RuntimeBootstrapInputs<'_>>,common:Option<RuntimeCommonInputs<'_>>,common_bootstrap:Option<RuntimeCommonBootstrapInputs<'_>>)->Result<Self,ProfileError>{
         let native=common.is_some();
         if native{
             // InnerTLS authority/SNI have no meaning on native Common. Require
@@ -243,15 +261,24 @@ impl RuntimeProfile {
             return Err(ProfileError::InvalidConfiguration);
         }
         let mut total = 0;
-        let common=common.map(|route|CommonProfile::capture(route,input.reference_decode_key.as_ref(),&mut total)).transpose()?;
+        let common=common.map(|route|CommonProfile::capture(route,input.reference_decode_key.as_ref(),&mut total,common_bootstrap.is_some())).transpose()?;
         if let Some(common)=&common{
             // Original reference identity is not replaceable through a profile
             //metadata map. Fill an absent id below; reject any conflicting one.
+            //Before a matched bootstrap the identity is still unknown, so a
+            //profile-carried id cannot be honoured or guessed either.
             for fields in [input.login_routing,input.poll_routing,input.logout_routing]{
-                if fields.iter().any(|p|p.key==b"id"&&p.value!=common.entry.identity()){return Err(ProfileError::InvalidConfiguration);}
+                if common_bootstrap.is_some(){if fields.iter().any(|p|p.key==b"id"){return Err(ProfileError::InvalidConfiguration);}}
+                else if let Some(identity)=common.identity(){if fields.iter().any(|p|p.key==b"id"&&p.value!=identity){return Err(ProfileError::InvalidConfiguration);}}
             }
         }
-        let from_bootstrap=bootstrap.is_some();
+        let from_bootstrap=bootstrap.is_some()||common_bootstrap.is_some();
+        let common_bootstrap=common_bootstrap.map(|bootstrap|->Result<CommonBootstrapProfile,ProfileError>{
+            let native=common.as_ref().ok_or(ProfileError::InvalidConfiguration)?;
+            if native.identity().is_some(){return Err(ProfileError::InvalidConfiguration);}
+            if bootstrap.routing.iter().any(|p|p.key==b"id"){return Err(ProfileError::InvalidConfiguration);}
+            Ok(CommonBootstrapProfile{routing:routing(bootstrap.routing,&mut total)?,client_key:bootstrap.client_config_decode_key,handoff_timeout:bootstrap.handoff_timeout})
+        }).transpose()?;
         if !from_bootstrap && input.domain_name.bytes().any(|b| matches!(b, b'@' | b'[' | b']')) {
             return Err(ProfileError::InvalidConfiguration);
         }
@@ -273,10 +300,10 @@ impl RuntimeProfile {
         }).transpose()?;
         let account_routing=|fields:&[RpcProperty<'_>],total:&mut usize|->Result<Vec<Property>,ProfileError>{
             let mut result=routing(fields,total)?;
-            if let Some(common)=&common{if !fields.iter().any(|p|p.key==b"id"){
-                if result.len()>=MAX_MAP_ENTRIES{return Err(ProfileError::ResourceLimit);}add_bytes(total,2+common.entry.identity().len())?;
-                result.push(Property{key:b"id".to_vec(),value:common.entry.identity().to_vec()});
-            }}Ok(result)
+            if let Some(common)=&common{if let(Some(identity),None)=(common.identity(),&common_bootstrap){if !fields.iter().any(|p|p.key==b"id"){
+                if result.len()>=MAX_MAP_ENTRIES{return Err(ProfileError::ResourceLimit);}add_bytes(total,2+identity.len())?;
+                result.push(Property{key:b"id".to_vec(),value:identity.to_vec()});
+            }}}Ok(result)
         };
         let login_routing=account_routing(input.login_routing,&mut total)?;let poll_routing=account_routing(input.poll_routing,&mut total)?;let logout_routing=account_routing(input.logout_routing,&mut total)?;
         Ok(Self {
@@ -289,7 +316,7 @@ impl RuntimeProfile {
             gateway_metadata: routing(input.gateway_metadata, &mut total)?,
             poll_routing, logout_routing, incoming, reference_decode_key: input.reference_decode_key,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
-            io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, call_incoming:None,call_control:None,byte_length:total,
+            io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,byte_length:total,
         })
     }
 }
@@ -314,10 +341,12 @@ impl LoginCapture {
         if typed.len() > MAX_FIELD_BYTES { return Err(BackendFailure::Unavailable); }
         let reference=reference_text(request.server_address,&mut total).map_err(invalid)?;
         if let Some(common)=&profile.common{
-            let decoded=super::legacy_config::decode_configuration(reference.as_bytes(),profile.reference_decode_key.as_ref()).map_err(|_|BackendFailure::Unavailable)?;
-            let parsed=super::object_reference::parse_object_reference(decoded.expose_to_backend()).map_err(|_|BackendFailure::Unavailable)?;
-            let encoded=parsed.encode_native().map_err(|_|BackendFailure::Unavailable)?;
-            if encoded.expose_to_backend()!=common.reference.as_bytes(){return Err(BackendFailure::Unavailable);}
+            if let Some(expected)=&common.reference{
+                let decoded=super::legacy_config::decode_configuration(reference.as_bytes(),profile.reference_decode_key.as_ref()).map_err(|_|BackendFailure::Unavailable)?;
+                let parsed=super::object_reference::parse_object_reference(decoded.expose_to_backend()).map_err(|_|BackendFailure::Unavailable)?;
+                let encoded=parsed.encode_native().map_err(|_|BackendFailure::Unavailable)?;
+                if encoded.expose_to_backend()!=expected.as_bytes(){return Err(BackendFailure::Unavailable);}
+            }
         }
         Ok(Self { identity: typed,
             password: text(request.phone_login_token, false, &mut total).map_err(invalid)?,
@@ -479,7 +508,15 @@ impl NativeHostingBackend {
     async fn login_common_original(&self,owner:AttemptOwner,request:SdkLoginRequest<'_>)->Result<(),BackendFailure>{
         let captured=LoginCapture::capture(request,&self.profile)?;let common=self.profile.common.as_ref().ok_or(BackendFailure::Unavailable)?;
         let begin=Instant::now();let end=begin.checked_add(common.attempt_timeout).ok_or(BackendFailure::Unavailable)?;
-        let prepared=transport_actor::native::prepare_common(owner.clone(),RuntimePolicy{io_timeout:self.profile.io_timeout,rpc_timeout:self.profile.rpc_timeout},end).map_err(|_|BackendFailure::Unavailable)?;
+        let policy=RuntimePolicy{io_timeout:self.profile.io_timeout,rpc_timeout:self.profile.rpc_timeout};
+        let destination=transport_actor::native::prepare_common(owner.clone(),policy,end).map_err(|_|BackendFailure::Unavailable)?;
+        // A matched bootstrap always uses its OWN Common incarnation. That
+        //actor is released before the destination dials; its returned data
+        //cannot replace Router hosts/SNI/roots/access or the destination scope.
+        let bootstrap=match self.profile.common_bootstrap.is_some(){
+            true=>Some(transport_actor::native::prepare_common(owner.clone(),policy,end).map_err(|_|BackendFailure::Unavailable)?),false=>None};
+        if bootstrap.as_ref().is_some_and(|bootstrap|bootstrap.connection_scope().matches(&destination.connection_scope())){return Err(BackendFailure::Unavailable);}
+        let bootstrap_scope=bootstrap.as_ref().map(|bootstrap|bootstrap.connection_scope());
         let attempt={
             let mut state=lock(&self.state);
             if state.slot.as_ref().is_some_and(|a|!lock(&a.state).released)||state.owners.iter().any(|old|old==&owner)||state.owners.len()>=MAX_ATTEMPTS{return Err(BackendFailure::Unavailable);}
@@ -487,15 +524,25 @@ impl NativeHostingBackend {
             for _ in 0..16{let mut bytes=[0;4];SystemRandom::new().fill(&mut bytes).map_err(|_|BackendFailure::Unavailable)?;let value=u32::from_ne_bytes(bytes);
                 if value!=0&&!state.incarnations.contains(&value){incarnation=Some(value);break;}}
             let incarnation=incarnation.ok_or(BackendFailure::Unavailable)?;
-            let attempt=Arc::new(Attempt{owner:owner.clone(),scope:prepared.connection_scope(),incarnation,state:Mutex::new(AttemptState::default()),commands:Mutex::new(None),
-                handle:AsyncMutex::new(None),bootstrap_scope:None,bootstrap_handle:AsyncMutex::new(None),work:AsyncMutex::new(()),poll_work:AsyncMutex::new(())});
+            let attempt=Arc::new(Attempt{owner:owner.clone(),scope:destination.connection_scope(),incarnation,state:Mutex::new(AttemptState::default()),commands:Mutex::new(None),
+                handle:AsyncMutex::new(None),bootstrap_scope,bootstrap_handle:AsyncMutex::new(None),work:AsyncMutex::new(()),poll_work:AsyncMutex::new(())});
             state.owners.push(owner);state.incarnations.push(incarnation);state.slot=Some(attempt.clone());attempt
         };
         let mut retirement=Retirement::new(attempt.clone());let _work=attempt.work.lock().await;
         let operation=async{
             if !attempt.scope.is_open()||lock(&attempt.state).retired{return Err(BackendFailure::Disconnected);}
+            let plan=match bootstrap{Some(bootstrap)=>Some(self.bootstrap_common_original(&attempt,&captured,bootstrap).await?),None=>None};
+            // Only a matched bootstrap may supply the logical entry. Directly
+            //supplied Common profiles keep their own single captured entry.
+            let(resolved,entry,endpoint)=match &plan{
+                Some(plan)=>{let entry=plan.entry_for(&attempt.owner,&attempt.scope,&common.router).map_err(|_|BackendFailure::Unavailable)?;
+                    let super::object_reference::ReferenceTarget::Direct(endpoints)=entry.target()else{return Err(BackendFailure::Unavailable);};
+                    let endpoint=endpoints.first().ok_or(BackendFailure::Unavailable)?;(0,entry,endpoint)}
+                None=>(common.resolved_host_index,common.entry.as_ref().ok_or(BackendFailure::Unavailable)?,
+                    common.endpoint().ok_or(BackendFailure::Unavailable)?),
+            };
             let access=borrowed(&common.access);
-            let connected=prepared.connect(&common.router,&access,common.endpoint(),common.resolved_host_index,super::router_runtime::RouterTimeouts{
+            let connected=destination.connect(&common.router,&access,entry.identity(),endpoint,resolved,super::router_runtime::RouterTimeouts{
                 connect:common.connect_timeout,handshake:self.profile.handshake_timeout,partial:self.profile.partial_timeout,io:self.profile.io_timeout,startup:common.startup_timeout},common.compress_above)
                 .await.map_err(|_|BackendFailure::Disconnected)?;
             if !connected.connection_scope().matches(&attempt.scope){return Err(BackendFailure::Disconnected);}
@@ -509,11 +556,81 @@ impl NativeHostingBackend {
             let mut client=borrowed(&self.profile.client_properties);
             if self.profile.include_device_id{if let Some(device)=&captured.device{client.push(RpcProperty{key:b"DeviceId",value:device.as_bytes()});}}
             let routing=borrowed(&self.profile.login_routing);
-            let submitted=commands.login(&attempt.owner,&attempt.scope,captured.login(&self.profile,&client),&routing).await.map_err(|_|BackendFailure::Disconnected)?;
+            let derived=plan.as_ref().map(|plan|plan.fields_for(&attempt.owner,&attempt.scope,&common.router)).transpose().map_err(|_|BackendFailure::Unavailable)?;
+            let login=||match &derived{
+                Some(fields)=>ArcLoginInputs{typed_identity:captured.identity.as_bytes(),domain_name:fields.domain_name,
+                    selected_session_id:captured.selector.as_bytes(),phone_login_token:captured.password.as_bytes(),application_key:captured.appkey.as_bytes(),
+                    domain_id:fields.domain_id,application_id:fields.application_id,device_info_cc:fields.device_info_cc,client_properties:&client},
+                None=>captured.login(&self.profile,&client)};
+            let submitted=commands.login(&attempt.owner,&attempt.scope,login(),&routing).await.map_err(|_|BackendFailure::Disconnected)?;
             if !submitted.submitted_on(&attempt.owner,&attempt.scope){return Err(BackendFailure::Disconnected);}Ok(())
         };
-        tokio::time::timeout_at(end.into(),operation).await.map_err(|_|BackendFailure::Disconnected)??;
+        let deadline=match &self.profile.common_bootstrap{Some(bootstrap)=>begin.checked_add(bootstrap.handoff_timeout).ok_or(BackendFailure::Unavailable)?.min(end),None=>end};
+        tokio::time::timeout_at(deadline.into(),operation).await.map_err(|_|BackendFailure::Disconnected)??;
         retirement.disarm();Ok(())
+    }
+    /// One matched bootstrap over the ORIGINAL Common/Router transport. Only
+    ///decoded data leaves this scoped actor; the returned DomainId/AppId/CC are
+    ///login arguments, never a new Router policy, root, or hosting grant.
+    async fn bootstrap_common_original(&self,attempt:&Arc<Attempt>,captured:&LoginCapture,
+        prepared:transport_actor::native::PreparedCommonRuntime)->Result<ProvisionedCommonLogin,BackendFailure>{
+        let profile=self.profile.as_ref();let bootstrap=profile.common_bootstrap.as_ref().ok_or(BackendFailure::Unavailable)?;
+        let common=profile.common.as_ref().ok_or(BackendFailure::Unavailable)?;
+        let scope=attempt.bootstrap_scope.as_ref().ok_or(BackendFailure::Unavailable)?;
+        if prepared.connection_scope().matches(&attempt.scope)||!prepared.connection_scope().matches(scope){return Err(BackendFailure::Unavailable);}
+        // The SDK reference only names the ORIGINAL bootstrap entry. Its TLS
+        //authority/root never replaces the explicit physical Router trust.
+        let decoded=super::legacy_config::decode_configuration(captured.reference.as_bytes(),profile.reference_decode_key.as_ref()).map_err(|_|BackendFailure::Unavailable)?;
+        let entry=super::object_reference::parse_object_reference(decoded.expose_to_backend()).map_err(|_|BackendFailure::Unavailable)?;
+        let super::object_reference::ReferenceTarget::Direct(endpoints)=entry.target()else{return Err(BackendFailure::Unavailable);};
+        if endpoints.is_empty()||endpoints.len()>16||endpoints.iter().any(|endpoint|!matches!(endpoint.scheme(),b"arc"|b"sarc")||endpoint.router_host().is_err()){
+            return Err(BackendFailure::Unavailable);
+        }
+        let access=borrowed(&common.access);
+        let connected=prepared.connect(&common.router,&access,entry.identity(),&endpoints[0],0,super::router_runtime::RouterTimeouts{
+            connect:common.connect_timeout,handshake:profile.handshake_timeout,partial:profile.partial_timeout,io:profile.io_timeout,startup:common.startup_timeout},common.compress_above)
+            .await.map_err(|_|BackendFailure::Disconnected)?;
+        if !connected.connection_scope().matches(scope){return Err(BackendFailure::Disconnected);}
+        let mut owning=attempt.bootstrap_handle.lock().await;
+        if !scope.is_open()||lock(&attempt.state).retired{return Err(BackendFailure::Disconnected);}
+        let(handle,mut events)=connected.attach().map_err(|_|BackendFailure::Disconnected)?;
+        let commands=handle.command_handle();*owning=Some(handle);drop(owning);
+        let routing=borrowed(&bootstrap.routing);
+        let submitted=loop{
+            match commands.bootstrap(&attempt.owner,scope,captured.appkey.as_bytes(),&routing).await{
+                Err(RuntimeError::Tls(TlsError::NotReady))=>tokio::time::sleep(TLS_RETRY_CADENCE).await,
+                Ok(receipt) if receipt.submitted_on(&attempt.owner,scope)=>break receipt,
+                _=>return Err(BackendFailure::Unavailable),
+            }
+        };
+        let call_id=submitted.call_id.ok_or(BackendFailure::Unavailable)?;
+        let plan=loop{
+            let event=tokio::select!{biased;
+                _=self.events.closed()=>return Err(BackendFailure::Disconnected),
+                event=events.recv()=>event.ok_or(BackendFailure::Unavailable)?,
+            };
+            if event.terminal_failure(&attempt.owner,scope).is_some(){return Err(BackendFailure::Unavailable);}
+            let visible=event.into_events(&attempt.owner,scope).ok_or(BackendFailure::Disconnected)?;
+            let mut reply=None;
+            for event in visible{match event{
+                OfflineEvent::Bootstrap(value) if value.call_id()==call_id&&reply.is_none()=>reply=Some(value),
+                OfflineEvent::Control(_)=>{},_=>return Err(BackendFailure::Unavailable),
+            }}
+            if let Some(reply)=reply{
+                break ProvisionedCommonLogin::from_reply(&reply,&attempt.owner,scope,&attempt.scope,&common.router,
+                    profile.reference_decode_key.as_ref(),bootstrap.client_key.as_ref()).map_err(|_|BackendFailure::Unavailable)?;
+            }
+        };
+        if !plan.original_source_scope().matches(scope){return Err(BackendFailure::Unavailable);}
+        // Immutable data is captured while the source is still open. Release
+        //that owning actor before ANY destination connect; a cancelled Join
+        //stays in this exact slot for logout cleanup instead of being replaced.
+        let mut owning=attempt.bootstrap_handle.lock().await;
+        let release=owning.as_mut().ok_or(BackendFailure::Disconnected)?.close().await;
+        if !release.io_released(){return Err(BackendFailure::Disconnected);}
+        *owning=None;
+        if !attempt.scope.is_open()||lock(&attempt.state).retired{return Err(BackendFailure::Disconnected);}
+        Ok(plan)
     }
     async fn login_original(&self, owner: AttemptOwner, request: SdkLoginRequest<'_>) -> Result<(), BackendFailure> {
         if self.profile.common.is_some(){return self.login_common_original(owner,request).await;}

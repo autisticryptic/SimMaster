@@ -86,6 +86,51 @@ impl ProvisionedLogin {
     pub fn bootstrap_call_id(&self)->i32{self.call_id}
 }
 
+/// Native Router/SARC handoff. The already selected physical Router policy
+///is retained by identity; returned DomainName/logical addresses cannot replace
+///its OS hosts, SNI, roots or access credentials. Source data survives close,
+///but use still requires the pre-created ORIGINAL destination scope.
+pub(super) struct ProvisionedCommonLogin{
+    owner:AttemptOwner,source:RpcConnectionScope,destination:RpcConnectionScope,policy:super::router_connector::RouterPolicyIdentity,call_id:i32,
+    entry:super::object_reference::ObjectReference,domain_name:Zeroizing<Vec<u8>>,domain_id:Zeroizing<Vec<u8>>,app_id:Zeroizing<Vec<u8>>,cc:Zeroizing<Vec<u8>>,
+}
+impl fmt::Debug for ProvisionedCommonLogin{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ProvisionedCommonLogin(<redacted>)")}}
+impl ProvisionedCommonLogin{
+    pub fn from_reply(reply:&OwnedBootstrapReply,owner:&AttemptOwner,source:&RpcConnectionScope,destination:&RpcConnectionScope,
+        router:&super::router_connector::RouterPolicy,reference_key:Option<&ConfigDecodeKey>,client_key:Option<&ConfigDecodeKey>)->Result<Self,ProvisionError>{
+        if source.matches(destination)||!destination.is_open(){return Err(ProvisionError::Scope);}
+        let material=reply.material_for(owner,source).ok_or(ProvisionError::Scope)?;
+        let deployment=BootstrapDeployment::from_reply(reply,owner,source,reference_key).map_err(|_|ProvisionError::Configuration)?;
+        let reference=deployment.account_reference_for(owner,source).ok_or(ProvisionError::Scope)?;
+        let encoded=reference.encode_native().map_err(|_|ProvisionError::UnsupportedReference)?;
+        let entry=super::object_reference::parse_object_reference(encoded.expose_to_backend()).map_err(|_|ProvisionError::UnsupportedReference)?;
+        let super::object_reference::ReferenceTarget::Direct(endpoints)=entry.target()else{return Err(ProvisionError::UnsupportedReference);};
+        if endpoints.is_empty()||endpoints.len()>16||endpoints.iter().any(|endpoint|!matches!(endpoint.scheme(),b"arc"|b"sarc")||endpoint.router_host().is_err()){
+            return Err(ProvisionError::UnsupportedReference);
+        }
+        let raw_domain=material.properties.iter().find(|p|p.key==b"DomainName").ok_or(ProvisionError::MissingProperty)?.value;
+        let mut total=encoded.expose_to_backend().len();let domain_name=field(raw_domain,false,&mut total)?;
+        if domain_name.iter().any(|b|matches!(b,b'@'|b'['|b']')){return Err(ProvisionError::InvalidProperty);}
+        let decoded=|name:&[u8]|deployment.property_for(owner,source,name,client_key).map_err(|_|ProvisionError::Configuration);
+        let domain=decoded(b"DomainId")?.ok_or(ProvisionError::MissingProperty)?;let domain_id=field(domain.expose_to_backend(),false,&mut total)?;
+        let app=decoded(b"AppId")?.ok_or(ProvisionError::MissingProperty)?;let app_id=field(app.expose_to_backend(),false,&mut total)?;
+        let cc=decoded(b"CC")?;let cc=field(cc.as_ref().map_or(b"".as_slice(),|value|value.expose_to_backend()),true,&mut total)?;
+        Ok(Self{owner:reply.owner().clone(),source:source.clone(),destination:destination.clone(),policy:router.original_identity(),call_id:reply.call_id(),entry,domain_name,domain_id,app_id,cc})
+    }
+    fn matches(&self,owner:&AttemptOwner,destination:&RpcConnectionScope,router:&super::router_connector::RouterPolicy)->bool{
+        &self.owner==owner&&self.destination.matches(destination)&&destination.is_open()&&self.policy.matches(router)
+    }
+    pub fn entry_for(&self,owner:&AttemptOwner,destination:&RpcConnectionScope,router:&super::router_connector::RouterPolicy)->Result<&super::object_reference::ObjectReference,ProvisionError>{
+        if !self.matches(owner,destination,router){return Err(ProvisionError::Scope);}Ok(&self.entry)
+    }
+    pub fn fields_for(&self,owner:&AttemptOwner,destination:&RpcConnectionScope,router:&super::router_connector::RouterPolicy)->Result<ProvisionedFields<'_>,ProvisionError>{
+        if !self.matches(owner,destination,router){return Err(ProvisionError::Scope);}
+        Ok(ProvisionedFields{domain_name:&self.domain_name,domain_id:&self.domain_id,application_id:&self.app_id,device_info_cc:&self.cc})
+    }
+    pub fn original_source_scope(&self)->RpcConnectionScope{self.source.clone()}
+    pub fn bootstrap_call_id(&self)->i32{self.call_id}
+}
+
 #[cfg(test)]
 #[path="runtime_provision_tests.rs"]
 mod tests;

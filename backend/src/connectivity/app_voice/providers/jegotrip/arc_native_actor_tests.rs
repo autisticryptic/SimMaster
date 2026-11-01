@@ -14,7 +14,7 @@ fn login_result(accepted:bool)->Vec<u8>{let mut w=Writer::new();w.boolean(accept
 fn reply(id:i32,result:&[u8])->Vec<u8>{let envelope=encode_reply(id,0,result).unwrap();let mut packet=vec![1];packet.extend_from_slice(envelope.expose_to_transport());packet}
 async fn connected(p:&RouterPolicy,original:AttemptOwner,end:Instant)->ConnectedCommonRuntime{
     let prepared=prepare_common(original,rpc_policy(),end).unwrap();let scope=prepared.connection_scope();let r=reference(false);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
-    let connected=prepared.connect(p,&[],&endpoints[0],0,timeouts(),None).await.unwrap();assert!(connected.connection_scope().matches(&scope));connected
+    let connected=prepared.connect(p,&[],r.identity(),&endpoints[0],0,timeouts(),None).await.unwrap();assert!(connected.connection_scope().matches(&scope));connected
 }
 async fn authenticated(handle:&RuntimeHandle,events:&mut mpsc::Receiver<RuntimeEvent>,original:&AttemptOwner,scope:&RpcConnectionScope){
     let receipt=handle.login(original,scope,login(),&[RpcProperty{key:b"id",value:b"AccountEntry"}]).await.unwrap();assert!(receipt.submitted_on(original,scope));assert_eq!(receipt.call_id,Some(1));
@@ -45,7 +45,7 @@ async fn unsupported_logical_endpoint_or_selection_fails_before_router_tcp_io(){
         (b"AccountEntry:sarc -h 42.7 -p 98;".as_slice(),1,None),(b"AccountEntry:sarc -h 42.7 -p 98;".as_slice(),0,Some(0))]{
         let prepared=prepare_common(owner(),rpc_policy(),Instant::now()+Duration::from_secs(4)).unwrap();let scope=prepared.connection_scope();
         let r=super::super::super::object_reference::parse_object_reference(text).unwrap();let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
-        assert_eq!(prepared.connect(&p,&[],&endpoints[0],index,timeouts(),compression).await.err(),Some(RuntimeError::InvalidConfiguration));assert!(!scope.is_open());
+        assert_eq!(prepared.connect(&p,&[],r.identity(),&endpoints[0],index,timeouts(),compression).await.err(),Some(RuntimeError::InvalidConfiguration));assert!(!scope.is_open());
     }
     assert!(tokio::time::timeout(Duration::from_millis(20),listener.accept()).await.is_err());
 }
@@ -149,7 +149,7 @@ async fn explicit_plain_arc_uses_outer_endpoint_tls_without_guessing_seeded_reco
         let packet=peer.next().await.unwrap();assert_eq!(packet[0],0);let request=decode_request(&packet[1..]).unwrap();assert_eq!(request.call_id,1);peer.send(&[reply(1,&login_result(true))]).await;peer.no_more_common().await;}).await.unwrap()};
     let client=async move{let original=owner();let prepared=prepare_common(original.clone(),rpc_policy(),Instant::now()+Duration::from_secs(6)).unwrap();let scope=prepared.connection_scope();
         let r=super::super::super::object_reference::parse_object_reference(b"AccountEntry:arc -h 42.7 -p 98;").unwrap();let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
-        let connected=prepared.connect(&p,&[],&endpoints[0],0,timeouts(),None).await.unwrap();let(mut handle,mut events)=connected.attach().unwrap();authenticated(&handle,&mut events,&original,&scope).await;assert!(handle.close().await.io_released());};tokio::join!(server,client);
+        let connected=prepared.connect(&p,&[],r.identity(),&endpoints[0],0,timeouts(),None).await.unwrap();let(mut handle,mut events)=connected.attach().unwrap();authenticated(&handle,&mut events,&original,&scope).await;assert!(handle.close().await.io_released());};tokio::join!(server,client);
 }
 #[tokio::test]
 async fn continuous_slow_control_replies_cannot_starve_a_really_queued_native_login(){

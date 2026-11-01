@@ -18,6 +18,9 @@ impl Target { fn same_origin(&self,a:&RouterAnchor<'_>)->bool {
     self.router_id==a.router_id && self.host.as_str()==a.host && self.port==a.port
 } }
 pub struct RouterPolicy { reference:Zeroizing<String>, targets:Vec<Target>, identity:Arc<()> }
+pub(super) struct RouterPolicyIdentity(Arc<()>);
+impl RouterPolicyIdentity{pub fn matches(&self,policy:&RouterPolicy)->bool{Arc::ptr_eq(&self.0,&policy.identity)}}
+impl fmt::Debug for RouterPolicyIdentity{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RouterPolicyIdentity(<redacted>)")}}
 impl fmt::Debug for RouterPolicy {fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {f.write_str("RouterPolicy(<redacted>)")} }
 impl RouterPolicy {
     /// All anchors are installation data, NOT inferred from decoded DomainName,
@@ -44,6 +47,7 @@ impl RouterPolicy {
         if targets.is_empty() || used.iter().any(|used|!*used) {return Err(ConnectError::InvalidConfiguration);}
         Ok(Self{reference:Zeroizing::new(reference.to_owned()),targets,identity:Arc::new(())})
     }
+    pub(super) fn original_identity(&self)->RouterPolicyIdentity{RouterPolicyIdentity(self.identity.clone())}
     pub(super) fn len(&self)->usize {self.targets.len()}
     pub(super) fn retained_bytes(&self)->usize {
         self.reference.len()+self.targets.iter().map(|target|target.host.len()+target.authority.len()+target.root.len()).sum::<usize>()

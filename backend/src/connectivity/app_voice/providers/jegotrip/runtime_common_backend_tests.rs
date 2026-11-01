@@ -1,12 +1,106 @@
 //! Actions-only native profile -> shared HostingBackend/actor integration.
 use super::*;
 use super::super::{common_runtime::tests::CommonPeer,netstream_runtime::tests::{owner,policy},
-    tls_engine::tests::Certificates,rpc_envelope::{encode_reply,decode_request},rpc_stream::Writer,
+    tls_engine::tests::Certificates,rpc_envelope::{encode_reply,decode_request},rpc_stream::{Writer,Reader},
     runtime_connector::{ConnectFuture,ConnectError}};
 use std::sync::atomic::{AtomicUsize,Ordering};
 use tokio::{net::TcpListener,io::AsyncReadExt};
 use tokio_rustls::rustls::version::TLS13;
 const ENTRY:&str="AccountEntry:sarc -h 42.7 -p 98;";
+const BOOTSTRAP_SDK:&str="BootEntry:sarc -h 42.7 -p 98;";
+const DESTINATION:&str="DestEntry:sarc -h 42.7 -p 98;";
+fn bootstrap_inputs()->RuntimeProfileInputs<'static>{RuntimeProfileInputs{domain_name:"",domain_id:"",application_id:"",device_info_cc:"",..inputs()}}
+fn bootstrap_common(root:&str,port:u16)->RuntimeCommonInputs<'static>{RuntimeCommonInputs{account_reference:"",..common(root,port)}}
+fn bootstrap_route()->RuntimeCommonBootstrapInputs<'static>{RuntimeCommonBootstrapInputs{routing:&[],client_config_decode_key:None,handoff_timeout:Duration::from_secs(10)}}
+fn bootstrap_result()->Vec<u8>{
+    let properties=[RpcProperty{key:b"DomainName",value:b"account-domain.invalid"},RpcProperty{key:b"DomainId",value:b"fixture-domain"},
+        RpcProperty{key:b"AppId",value:b"fixture-app"},RpcProperty{key:b"CC",value:b"fixture-cc"}];
+    let mut w=Writer::new();w.boolean(true).unwrap();w.properties(&properties).unwrap();w.bytes(DESTINATION.as_bytes()).unwrap();
+    w.bytes(b"").unwrap();w.bytes(b"").unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()
+}
+#[test]
+fn common_bootstrap_profile_never_preknows_identity_destination_or_offsets(){
+    let cert=Certificates::generate("IP:127.0.0.1");
+    let p=RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),bootstrap_common(&cert.root,12345),bootstrap_route()).unwrap();
+    let route=p.common.as_ref().unwrap();assert!(route.entry.is_none());assert!(route.reference.is_none());assert!(route.access.is_empty());
+    for fields in [&p.login_routing,&p.poll_routing,&p.logout_routing]{assert!(!fields.iter().any(|p|p.key==b"id"));}
+    assert!(p.bootstrap.is_none());assert!(p.common_bootstrap.is_some());assert!(p.domain_name.is_empty()&&p.domain_id.is_empty()&&p.application_id.is_empty());
+    // An already-known entry, identity, offset or destination field contradicts
+    // "derived from the matched reply" and is refused before any network work.
+    assert!(RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),common(&cert.root,12345),bootstrap_route()).is_err());
+    assert!(RuntimeProfile::supplied_common_bootstrap(inputs(),bootstrap_common(&cert.root,12345),bootstrap_route()).is_err());
+    assert!(RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),bootstrap_common(&cert.root,12345),
+        RuntimeCommonBootstrapInputs{routing:&[RpcProperty{key:b"id",value:b"DestEntry"}],..bootstrap_route()}).is_err());
+    assert!(RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),RuntimeCommonInputs{endpoint_index:1,..bootstrap_common(&cert.root,12345)},bootstrap_route()).is_err());
+    assert!(RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),RuntimeCommonInputs{resolved_host_index:1,..bootstrap_common(&cert.root,12345)},bootstrap_route()).is_err());
+    for handoff in [Duration::ZERO,Duration::from_secs(121)]{assert!(RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),bootstrap_common(&cert.root,12345),
+        RuntimeCommonBootstrapInputs{handoff_timeout:handoff,..bootstrap_route()}).is_err());}
+    let text=format!("{p:?}");for value in ["BootEntry","DestEntry","12345","fixture"]{assert!(!text.contains(value));}
+}
+#[test]
+fn common_bootstrap_login_capture_keeps_the_sdk_reference_as_untrusted_data_only(){
+    let cert=Certificates::generate("IP:127.0.0.1");
+    let p=RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),bootstrap_common(&cert.root,12345),bootstrap_route()).unwrap();
+    let captured=LoginCapture::capture(SdkLoginRequest{server_address:BOOTSTRAP_SDK,..request(&cert.root)},&p).unwrap();
+    assert_eq!(captured.reference.as_str(),BOOTSTRAP_SDK);assert_eq!(captured.password.as_str(),"fixture-phone-token");
+    assert!(LoginCapture::capture(SdkLoginRequest{tls_only:false,..request(&cert.root)},&p).is_err());
+    assert!(LoginCapture::capture(SdkLoginRequest{account_identity:"fixture:user",..request(&cert.root)},&p).is_err());
+}
+#[tokio::test]
+async fn common_bootstrap_dials_only_the_returned_entry_after_releasing_its_own_source_actor(){
+    let cert=Certificates::generate("IP:127.0.0.1");
+    let front=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
+    let bootstrap_listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
+    let destination_listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
+    let port=front.local_addr().unwrap().port();
+    let bootstrap_port=bootstrap_listener.local_addr().unwrap().port();let destination_port=destination_listener.local_addr().unwrap().port();
+    let config=cert.server_config(&TLS13);
+    // Transparent byte relay: each dial is a REAL separate Router/Common
+    // connection, but both can share the single supplied policy port.
+    let relay=async move{for target in [bootstrap_port,destination_port]{
+        let(mut inbound,_)=front.accept().await.unwrap();
+        let mut outbound=tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST,target)).await.unwrap();
+        tokio::spawn(async move{let _=tokio::io::copy_bidirectional(&mut inbound,&mut outbound).await;});
+    }};
+    let server=async move{
+        let bootstrap=async move{let mut peer=CommonPeer::open(bootstrap_listener,config.clone()).await;
+            let packet=peer.next().await.unwrap();assert_eq!(packet[0],0);let call=decode_request(&packet[1..]).unwrap();
+            assert_eq!(call.method,b"getAppConfigs.AccountEntry.Account");assert_eq!(call.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"BootEntry");
+            peer.send(&[reply(call.call_id,&bootstrap_result())]).await;while peer.next().await.is_some(){}
+        };
+        let destination=async move{let mut peer=CommonPeer::open(destination_listener,config).await;
+            let packet=peer.next().await.unwrap();assert_eq!(packet[0],0);let call=decode_request(&packet[1..]).unwrap();
+            assert_eq!(call.method,b"loginSession.AccountEntry.Account");
+            assert_eq!(call.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"DestEntry");
+            assert_eq!(call.metadata.iter().find(|p|p.key==b"pwd").unwrap().value,b"fixture-phone-token");
+            let mut reader=Reader::versioned(call.arguments).unwrap();assert_eq!(reader.bytes().unwrap(),b"[username:fixture-user@account-domain.invalid]");
+            let fields=reader.properties().unwrap();assert_eq!(fields.iter().find(|p|p.key==b"__domain").unwrap().value,b"fixture-domain");
+            assert_eq!(fields.iter().find(|p|p.key==b"__app").unwrap().value,b"fixture-app");
+            assert_eq!(fields.iter().find(|p|p.key==b"DeviceInfo.CC").unwrap().value,b"fixture-cc");
+            assert_eq!(fields.iter().find(|p|p.key==b"__appKey").unwrap().value,b"fixture-app-key");
+            peer.send(&[reply(call.call_id,&login_result())]).await;
+            let packet=peer.next().await.unwrap();let call=decode_request(&packet[1..]).unwrap();
+            assert_eq!(call.method,b"logoutSession.AccountEntry.Account");assert_eq!(call.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"DestEntry");
+            peer.send(&[reply(call.call_id,b"\0\x01\0\0\0\0")]).await;while peer.next().await.is_some(){}
+        };
+        let _=tokio::join!(bootstrap,destination);
+    };
+    let client=async move{
+        let p=RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),bootstrap_common(&cert.root,port),bootstrap_route()).unwrap();
+        let connector=Arc::new(LegacyDenied{calls:AtomicUsize::new(0)});let(backend,mut events)=NativeHostingBackend::new(p,connector.clone());let original=owner();
+        backend.login(original.clone(),SdkLoginRequest{server_address:BOOTSTRAP_SDK,..request(&cert.root)}).await.unwrap();
+        let scope=backend.original_scope(&original).unwrap();backend.pause_original_polls_for_test(&original,&scope,true).unwrap();
+        assert!(backend.original(&original).unwrap().bootstrap_handle.lock().await.is_none());
+        let event=tokio::time::timeout(Duration::from_secs(4),events.recv()).await.unwrap().unwrap();
+        assert!(event.matches(&original,&scope));
+        assert!(matches!(event.payload,BackendEventPayload::Callback(c) if c.callback==(Callback::SdkLogin{success:true})));
+        assert_eq!(connector.calls.load(Ordering::Acquire),0);
+        backend.logout(original.clone()).await.unwrap();assert!(!scope.is_open());
+        assert!(lock(&backend.original(&original).unwrap().state).released);
+    };
+    let _=tokio::join!(server,client,relay);
+}
+
 fn inputs()->RuntimeProfileInputs<'static>{RuntimeProfileInputs{
     route:PacketRoute::NativeCommon,authority:"",enable_sni:false,identity_type:"username",domain_name:"fixture.invalid",domain_id:"fixture-domain",application_id:"fixture-app",device_info_cc:"fixture-cc",
     client_properties:&[RpcProperty{key:b"ClientId",value:b"fixture-client-id"}],include_device_id:false,login_routing:&[],gateway_uri:"fixture-uri",gateway_metadata:&[],poll_routing:&[],logout_routing:&[],incoming:None,
@@ -26,8 +120,8 @@ fn login_result()->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.by
 
 #[test]
 fn native_profile_captures_physical_and_logical_namespaces_and_fills_only_absent_ids(){
-    let cert=Certificates::generate("IP:127.0.0.1");let p=profile(&cert.root,12345);assert!(p.authority.is_empty());let route=p.common.as_ref().unwrap();assert_eq!(route.reference.as_str(),ENTRY);
-    assert_eq!(route.entry.identity(),b"AccountEntry");for fields in [&p.login_routing,&p.poll_routing,&p.logout_routing]{assert_eq!(fields.iter().find(|p|p.key==b"id").unwrap().value,b"AccountEntry");}
+    let cert=Certificates::generate("IP:127.0.0.1");let p=profile(&cert.root,12345);assert!(p.authority.is_empty());let route=p.common.as_ref().unwrap();assert_eq!(route.reference.as_ref().unwrap().as_str(),ENTRY);
+    assert_eq!(route.entry.as_ref().unwrap().identity(),b"AccountEntry");for fields in [&p.login_routing,&p.poll_routing,&p.logout_routing]{assert_eq!(fields.iter().find(|p|p.key==b"id").unwrap().value,b"AccountEntry");}
     assert!(p.gateway_metadata.is_empty());assert_eq!(p.domain_name.as_str(),"fixture.invalid");assert_eq!(p.domain_id.as_str(),"fixture-domain");assert!(p.bootstrap.is_none());
 }
 #[test]

@@ -97,6 +97,7 @@ impl OfflineBackend {
         Ok(events)
     }
     pub(super) fn claim_common_transport(&mut self)->Result<(),ProtocolError>{self.protocol.claim_common_transport()}
+    pub(super) fn bind_common_identity(&mut self,identity:&[u8])->Result<(),ProtocolError>{self.protocol.bind_common_identity(identity)}
     /// Only original CommonPath-produced groups enter this bridge. Normalising
     ///a completed logical message to the existing protocol parser does not
     ///forge VerifiedPlaintextPackets, an innerTLS handshake, or a new scope.
