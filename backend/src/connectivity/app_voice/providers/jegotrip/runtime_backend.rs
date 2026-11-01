@@ -508,13 +508,14 @@ impl NativeHostingBackend {
     async fn login_common_original(&self,owner:AttemptOwner,request:SdkLoginRequest<'_>)->Result<(),BackendFailure>{
         let captured=LoginCapture::capture(request,&self.profile)?;let common=self.profile.common.as_ref().ok_or(BackendFailure::Unavailable)?;
         let begin=Instant::now();let end=begin.checked_add(common.attempt_timeout).ok_or(BackendFailure::Unavailable)?;
-        let policy=RuntimePolicy{io_timeout:self.profile.io_timeout,rpc_timeout:self.profile.rpc_timeout};
-        let destination=transport_actor::native::prepare_common(owner.clone(),policy,end).map_err(|_|BackendFailure::Unavailable)?;
+        // The policy is a plain value: build one per prepared Common runtime.
+        let runtime_policy=||RuntimePolicy{io_timeout:self.profile.io_timeout,rpc_timeout:self.profile.rpc_timeout};
+        let destination=transport_actor::native::prepare_common(owner.clone(),runtime_policy(),end).map_err(|_|BackendFailure::Unavailable)?;
         // A matched bootstrap always uses its OWN Common incarnation. That
         //actor is released before the destination dials; its returned data
         //cannot replace Router hosts/SNI/roots/access or the destination scope.
         let bootstrap=match self.profile.common_bootstrap.is_some(){
-            true=>Some(transport_actor::native::prepare_common(owner.clone(),policy,end).map_err(|_|BackendFailure::Unavailable)?),false=>None};
+            true=>Some(transport_actor::native::prepare_common(owner.clone(),runtime_policy(),end).map_err(|_|BackendFailure::Unavailable)?),false=>None};
         if bootstrap.as_ref().is_some_and(|bootstrap|bootstrap.connection_scope().matches(&destination.connection_scope())){return Err(BackendFailure::Unavailable);}
         let bootstrap_scope=bootstrap.as_ref().map(|bootstrap|bootstrap.connection_scope());
         let attempt={

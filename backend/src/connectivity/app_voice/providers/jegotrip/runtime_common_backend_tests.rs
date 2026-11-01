@@ -54,7 +54,7 @@ async fn common_bootstrap_dials_only_the_returned_entry_after_releasing_its_own_
     let destination_listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
     let port=front.local_addr().unwrap().port();
     let bootstrap_port=bootstrap_listener.local_addr().unwrap().port();let destination_port=destination_listener.local_addr().unwrap().port();
-    let config=cert.server_config(&TLS13);
+    let config=cert.server_config(&TLS13);let bootstrap_config=config.clone();
     // Transparent byte relay: each dial is a REAL separate Router/Common
     // connection, but both can share the single supplied policy port.
     let relay=async move{for target in [bootstrap_port,destination_port]{
@@ -63,7 +63,7 @@ async fn common_bootstrap_dials_only_the_returned_entry_after_releasing_its_own_
         tokio::spawn(async move{let _=tokio::io::copy_bidirectional(&mut inbound,&mut outbound).await;});
     }};
     let server=async move{
-        let bootstrap=async move{let mut peer=CommonPeer::open(bootstrap_listener,config.clone()).await;
+        let bootstrap=async move{let mut peer=CommonPeer::open(bootstrap_listener,bootstrap_config).await;
             let packet=peer.next().await.unwrap();assert_eq!(packet[0],0);let call=decode_request(&packet[1..]).unwrap();
             assert_eq!(call.method,b"getAppConfigs.AccountEntry.Account");assert_eq!(call.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"BootEntry");
             peer.send(&[reply(call.call_id,&bootstrap_result())]).await;while peer.next().await.is_some(){}
