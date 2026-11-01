@@ -278,8 +278,24 @@ async fn native_bootstrap_account_hosts_and_persists_received_sip_message_end_to
                 peer.send(&[reply(call.call_id,&super::tests::swap_result(None,true,payload.fields))]).await;
             }
             let(_uri,flag)=hosting_call(&mut peer).await;assert_eq!(flag.as_slice(),b"3");
-            let packet=peer.next().await.unwrap();let call=decode_request(&packet[1..]).unwrap();
-            assert_eq!(call.method,b"logoutSession.AccountEntry.Account");
+            // The unregister request stays retained until its ACK, so polls or a
+            // retransmission may still arrive before the SDK logout.
+            let call=loop{
+                let packet=peer.next().await.unwrap();assert_eq!(packet[0],0);
+                let call=decode_request(&packet[1..]).unwrap();
+                if call.method==b"logoutSession.AccountEntry.Account"{break call;}
+                assert_eq!(call.method,super::super::rpc_batch::SWAP_CALLS_METHOD.as_bytes());
+                let mut args=Reader::versioned(call.arguments).unwrap();args.bytes().unwrap();args.bytes().unwrap();
+                let payload=super::super::rpc_batch::read_payload(&mut args).unwrap();
+                let mut sequence=None;
+                for(key,nested) in payload.requests.iter(){
+                    assert!(nested.metadata.iter().any(|p|p.key==b"id"&&p.value==super::super::rpc_arguments::DEFAULT_GATEWAY_OBJECT.as_bytes()));
+                    let mut fields=Reader::versioned(nested.arguments).unwrap();fields.bytes().unwrap();
+                    let flag=fields.properties().unwrap().iter().find(|p|p.key==b"SipFlag").unwrap().value.to_vec();
+                    assert_eq!(flag.as_slice(),b"3");sequence=Some(*key);
+                }
+                peer.send(&[reply(call.call_id,&super::tests::swap_result(sequence,true,payload.fields))]).await;
+            };
             peer.send(&[reply(call.call_id,b"\0\x01\0\0\0\0")]).await;while peer.next().await.is_some(){}
         };
         let _=tokio::join!(bootstrap,destination);
