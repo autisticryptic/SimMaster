@@ -280,10 +280,10 @@ async fn native_bootstrap_account_hosts_and_persists_received_sip_message_end_to
             let(_uri,flag)=hosting_call(&mut peer).await;assert_eq!(flag.as_slice(),b"3");
             // The unregister request stays retained until its ACK, so polls or a
             // retransmission may still arrive before the SDK logout.
-            let call=loop{
+            let logout_id=loop{
                 let packet=peer.next().await.unwrap();assert_eq!(packet[0],0);
                 let call=decode_request(&packet[1..]).unwrap();
-                if call.method==b"logoutSession.AccountEntry.Account"{break call;}
+                if call.method==b"logoutSession.AccountEntry.Account"{break call.call_id;}
                 assert_eq!(call.method,super::super::rpc_batch::SWAP_CALLS_METHOD.as_bytes());
                 let mut args=Reader::versioned(call.arguments).unwrap();args.bytes().unwrap();args.bytes().unwrap();
                 let payload=super::super::rpc_batch::read_payload(&mut args).unwrap();
@@ -296,7 +296,7 @@ async fn native_bootstrap_account_hosts_and_persists_received_sip_message_end_to
                 }
                 peer.send(&[reply(call.call_id,&super::tests::swap_result(sequence,true,payload.fields))]).await;
             };
-            peer.send(&[reply(call.call_id,b"\0\x01\0\0\0\0")]).await;while peer.next().await.is_some(){}
+            peer.send(&[reply(logout_id,b"\0\x01\0\0\0\0")]).await;while peer.next().await.is_some(){}
         };
         let _=tokio::join!(bootstrap,destination);
     };
