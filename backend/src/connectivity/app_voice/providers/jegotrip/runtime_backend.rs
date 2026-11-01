@@ -200,7 +200,7 @@ pub struct RuntimeProfile {
     authority: Zeroizing<String>, enable_sni: bool, identity_type: Zeroizing<String>,
     domain_name: Zeroizing<String>, domain_id: Zeroizing<String>, application_id: Zeroizing<String>,
     device_info_cc: Zeroizing<String>, client_properties: Vec<Property>, include_device_id: bool,
-    login_routing: Vec<Property>, gateway_uri: Zeroizing<String>, gateway_metadata: Vec<Property>,
+    login_routing: Vec<Property>, gateway_uri: Option<Zeroizing<String>>, gateway_metadata: Vec<Property>,
     poll_routing: Vec<Property>, logout_routing: Vec<Property>, incoming: Option<Binding>,
     reference_decode_key: Option<ConfigDecodeKey>, handshake_timeout: Duration, partial_timeout: Duration,
     io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>, byte_length:usize,
@@ -309,14 +309,29 @@ impl RuntimeProfile {
             }}}Ok(result)
         };
         let login_routing=account_routing(input.login_routing,&mut total)?;let poll_routing=account_routing(input.poll_routing,&mut total)?;let logout_routing=account_routing(input.logout_routing,&mut total)?;
+        // Real `current_user_uri` (Mtc_UeGetUri) is the normalized loginSession
+        //identity. An empty supplied URI therefore means "derive it from the
+        //matched session" instead of requiring the user to retype it; only the
+        //native bootstrap route may request that derivation.
+        let derived_uri=native&&common_bootstrap.is_some()&&input.gateway_uri.is_empty();
+        // Hosting registers against the SipGateway object. When the native
+        //profile does not name it, use the original default object id instead of
+        //sending the Account object or a placeholder.
+        let mut gateway_metadata=routing(input.gateway_metadata, &mut total)?;
+        if native&&!gateway_metadata.iter().any(|p|p.key==b"id"){
+            if gateway_metadata.len()>=MAX_MAP_ENTRIES{return Err(ProfileError::ResourceLimit);}
+            let gateway:&[u8]=super::rpc_arguments::DEFAULT_GATEWAY_OBJECT.as_bytes();
+            add_bytes(&mut total,2+gateway.len())?;
+            gateway_metadata.push(Property{key:b"id".to_vec(),value:gateway.to_vec()});
+        }
         Ok(Self {
             authority: text(input.authority, native, &mut total)?, enable_sni: input.enable_sni,
             identity_type: text(input.identity_type, false, &mut total)?,
             domain_name: text(input.domain_name, from_bootstrap, &mut total)?, domain_id: text(input.domain_id, from_bootstrap, &mut total)?,
             application_id: text(input.application_id, from_bootstrap, &mut total)?, device_info_cc: text(input.device_info_cc, true, &mut total)?,
             client_properties: properties(input.client_properties, &mut total)?, include_device_id: input.include_device_id,
-            login_routing, gateway_uri: text(input.gateway_uri, false, &mut total)?,
-            gateway_metadata: routing(input.gateway_metadata, &mut total)?,
+            login_routing, gateway_uri: if derived_uri{None}else{Some(text(input.gateway_uri, false, &mut total)?)},
+            gateway_metadata,
             poll_routing, logout_routing, incoming, reference_decode_key: input.reference_decode_key,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
             io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,byte_length:total,
@@ -372,6 +387,16 @@ impl LoginCapture {
     }
 }
 
+/// Normalized loginSession identity of the submitted attempt, i.e. the SDK's
+/// `Mtc_UeGetUri` handed to `updateStatus`. Built with the SAME helper the
+/// login arguments use, so the URI cannot drift from the session it names.
+fn session_uri(captured:&LoginCapture,domain:&[u8])->Result<Zeroizing<String>,BackendFailure>{
+    let normalized=super::rpc_login::normalize_session_identity(captured.identity.as_bytes(),domain)
+        .map_err(|_|BackendFailure::Unavailable)?;
+    let text=std::str::from_utf8(normalized.expose_to_backend()).map_err(|_|BackendFailure::Unavailable)?;
+    Ok(Zeroizing::new(text.to_owned()))
+}
+
 /// Owned events retain ORIGINAL correlation even after terminal retirement.
 /// A copied callback/message is not a channel or an open-scope lease.
 pub struct BackendEvent { owner: AttemptOwner, scope: RpcConnectionScope, pub payload: BackendEventPayload }
@@ -410,6 +435,10 @@ struct Attempt {
     // Commands do not own IO. The owning handle is NEVER moved into a cleanup
     // future: cancellation of close retains its original Join in this slot.
     handle: AsyncMutex<Option<RuntimeHandle>>,
+    // Normalized loginSession identity of THIS attempt, i.e. the SDK's
+    // current_user_uri (Mtc_UeGetUri) used by updateStatus. Captured at login
+    // submission, never inferred from DomainName/host strings later.
+    session_uri: Mutex<Option<Zeroizing<String>>>,
     bootstrap_scope: Option<RpcConnectionScope>,
     bootstrap_handle: AsyncMutex<Option<RuntimeHandle>>,
     // Serializes login/attach and controller commands with resource cleanup.
@@ -424,6 +453,7 @@ impl Attempt {
     fn retire(&self) {
         lock(&self.state).retired = true; self.scope.close();
         if let Some(scope)=&self.bootstrap_scope{scope.close();}
+        *lock(&self.session_uri)=None;
     }
     fn commands(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Result<RuntimeCommands, RuntimeError> {
         if &self.owner != owner || !self.scope.matches(scope) || !self.scope.is_open() || lock(&self.state).retired {
@@ -529,7 +559,7 @@ impl NativeHostingBackend {
                 if value!=0&&!state.incarnations.contains(&value){incarnation=Some(value);break;}}
             let incarnation=incarnation.ok_or(BackendFailure::Unavailable)?;
             let attempt=Arc::new(Attempt{owner:owner.clone(),scope:destination.connection_scope(),incarnation,state:Mutex::new(AttemptState::default()),commands:Mutex::new(None),
-                handle:AsyncMutex::new(None),bootstrap_scope,bootstrap_handle:AsyncMutex::new(None),work:AsyncMutex::new(()),poll_work:AsyncMutex::new(())});
+                handle:AsyncMutex::new(None),session_uri:Mutex::new(None),bootstrap_scope,bootstrap_handle:AsyncMutex::new(None),work:AsyncMutex::new(()),poll_work:AsyncMutex::new(())});
             state.owners.push(owner);state.incarnations.push(incarnation);state.slot=Some(attempt.clone());attempt
         };
         let mut retirement=Retirement::new(attempt.clone());let _work=attempt.work.lock().await;
@@ -561,6 +591,10 @@ impl NativeHostingBackend {
             if self.profile.include_device_id{if let Some(device)=&captured.device{client.push(RpcProperty{key:b"DeviceId",value:device.as_bytes()});}}
             let routing=borrowed(&self.profile.login_routing);
             let derived=plan.as_ref().map(|plan|plan.fields_for(&attempt.owner,&attempt.scope,&common.router)).transpose().map_err(|_|BackendFailure::Unavailable)?;
+            if self.profile.gateway_uri.is_none(){
+                let domain=match &derived{Some(fields)=>fields.domain_name,None=>self.profile.domain_name.as_bytes()};
+                *lock(&attempt.session_uri)=Some(session_uri(&captured,domain)?);
+            }
             let login=||match &derived{
                 Some(fields)=>ArcLoginInputs{typed_identity:captured.identity.as_bytes(),domain_name:fields.domain_name,
                     selected_session_id:captured.selector.as_bytes(),phone_login_token:captured.password.as_bytes(),application_key:captured.appkey.as_bytes(),
@@ -672,7 +706,7 @@ impl NativeHostingBackend {
                     handshake_timeout:self.profile.handshake_timeout,partial_timeout:self.profile.partial_timeout},
                 RuntimePolicy{io_timeout:self.profile.io_timeout,rpc_timeout:self.profile.rpc_timeout},None).map_err(|_|BackendFailure::Unavailable)?)}else{None};
             attempt = Arc::new(Attempt { owner: owner.clone(), scope: prepared.connection_scope(), incarnation,
-                state: Mutex::new(AttemptState::default()), commands: Mutex::new(None), handle: AsyncMutex::new(None),
+                state: Mutex::new(AttemptState::default()), commands: Mutex::new(None), handle: AsyncMutex::new(None),session_uri:Mutex::new(None),
                 bootstrap_scope:bootstrap_prepared.as_ref().map(|prepared|prepared.connection_scope()),bootstrap_handle:AsyncMutex::new(None),
                 work: AsyncMutex::new(()), poll_work: AsyncMutex::new(()) });
             state.owners.push(owner); state.incarnations.push(incarnation); state.slot = Some(attempt.clone());
@@ -713,6 +747,10 @@ impl NativeHostingBackend {
         // Only NotReady is retryable: actor has submitted NO login at that
         // point. Once any receipt/error other than NotReady arrives, no replay.
         let derived=provisioned.as_ref().map(|plan|plan.fields_for(&attempt.owner,&attempt.scope)).transpose().map_err(|_|BackendFailure::Unavailable)?;
+        if self.profile.gateway_uri.is_none(){
+            let domain=match &derived{Some(fields)=>fields.domain_name,None=>self.profile.domain_name.as_bytes()};
+            *lock(&attempt.session_uri)=Some(session_uri(&captured,domain)?);
+        }
         let login=||match &derived {
             Some(fields)=>ArcLoginInputs{typed_identity:captured.identity.as_bytes(),domain_name:fields.domain_name,
                 selected_session_id:captured.selector.as_bytes(),phone_login_token:captured.password.as_bytes(),application_key:captured.appkey.as_bytes(),
@@ -808,7 +846,13 @@ impl NativeHostingBackend {
         let routing = borrowed(&self.profile.poll_routing); let metadata = borrowed(&self.profile.gateway_metadata);
         let mut retirement = Retirement::new(attempt.clone());
         if status == STATUS_UNREGISTER { lock(&attempt.state).unregister_started = true; }
-        let result = commands.hosting(&owner, &attempt.scope, &self.profile.gateway_uri, status, registration, &metadata, &routing).await
+        let uri=match &self.profile.gateway_uri{
+            Some(uri)=>uri.clone(),
+            // No derived session URI may be fabricated: hosting needs the URI of
+            //THIS authenticated attempt, never a DomainName/host inference.
+            None=>lock(&attempt.session_uri).clone().ok_or(BackendFailure::Unavailable)?,
+        };
+        let result = commands.hosting(&owner, &attempt.scope, uri.as_str(), status, registration, &metadata, &routing).await
             .and_then(|receipt| if receipt.matches(&owner, &attempt.scope) { Ok(()) } else { Err(RuntimeError::Scope) })
             .map_err(|error| if error == RuntimeError::UnregistrationRejected { BackendFailure::HostingRejected } else { BackendFailure::Disconnected });
         if status == STATUS_UNREGISTER { lock(&attempt.state).unregister_result = Some(result); }

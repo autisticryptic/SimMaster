@@ -85,6 +85,7 @@ fn fixture(root: &str) -> AccountConfig {
         logout_routing: vec![ProfileProperty { key: vec![0xfc], value: vec![0, 0xff] }],
         incoming: Some(IncomingBinding { object_id: b"#fixture-client".to_vec(), domain: b"fixture-domain".to_vec(),
             receiver_kind: b"fixture.kind".to_vec() }),
+        bootstrap_via_router: None,
         call_incoming:None,call_control:None,
         connect_timeout_ms: 1000, handshake_timeout_ms: 3000, partial_timeout_ms: 300,
         io_timeout_ms: 2000, rpc_timeout_ms: 2000,
@@ -476,6 +477,34 @@ fn native_private_route_roundtrip_preserves_router_identity_roots_and_logical_en
     let bytes=config.encode_private().unwrap();let loaded=AccountConfig::decode_private(&bytes).unwrap();assert_eq!(loaded.validate(100),Ok(()));assert_eq!(bytes.as_slice(),loaded.encode_private().unwrap().as_slice());
     let ProfileRoute::RouterCommon(route)=&loaded.profile.route else{panic!("native route")};assert!(route.reference.expose_to_backend().contains("-ri 12001"));assert_eq!(route.anchors[0].root_der_base64.expose_to_backend(),cert.root);
     assert_eq!(loaded.credentials.sdk.server_address.expose_to_backend(),"AccountEntry:sarc -h 42.7 -p 98;");assert!(loaded.runtime_profile().is_ok());
+}
+#[test]
+fn native_router_bootstrap_derives_destination_and_uri_only_from_the_matched_reply(){
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    let mut config=native_fixture(&cert.root,"fixture.invalid",443);
+    config.profile.domain_name=None;config.profile.domain_id=None;config.profile.application_id=None;config.profile.device_info_cc=None;
+    config.profile.gateway_uri=Secret::from_owned(String::new());
+    config.profile.bootstrap_via_router=Some(RouterBootstrapConfig{routing:vec![ProfileProperty{key:b"domain".to_vec(),value:b"fixture-domain".to_vec()}],handoff_timeout_ms:10_000});
+    assert_eq!(config.validate(100),Ok(()));
+    assert!(config.runtime_profile().is_ok());
+    let bytes=config.encode_private().unwrap();let loaded=AccountConfig::decode_private(&bytes).unwrap();assert_eq!(loaded.validate(100),Ok(()));
+    assert_eq!(bytes.as_slice(),loaded.encode_private().unwrap().as_slice());
+    assert_eq!(loaded.profile.bootstrap_via_router.as_ref().unwrap().handoff_timeout_ms,10_000);
+    assert_eq!(loaded.profile.gateway_uri.expose_to_backend(),"");
+    // Needing an explicit URI, a non-router route or a pre-filled destination
+    // must not silently fall back to the direct carrier or guess values.
+    let mut no_bootstrap=native_fixture(&cert.root,"fixture.invalid",443);no_bootstrap.profile.gateway_uri=Secret::from_owned(String::new());
+    assert_eq!(no_bootstrap.validate(100),Err(INVALID));
+    let mut wrong_route=fixture(&cert.root);wrong_route.profile.bootstrap_via_router=Some(RouterBootstrapConfig{routing:vec![],handoff_timeout_ms:10_000});
+    assert_eq!(wrong_route.validate(100),Err(INVALID));
+    let mut pre_known=native_fixture(&cert.root,"fixture.invalid",443);
+    pre_known.profile.gateway_uri=Secret::from_owned(String::new());
+    pre_known.profile.bootstrap_via_router=Some(RouterBootstrapConfig{routing:vec![],handoff_timeout_ms:10_000});
+    assert_eq!(pre_known.validate(100),Err(INVALID));
+    let mut unbounded=pre_known;unbounded.profile.domain_name=None;unbounded.profile.domain_id=None;
+    unbounded.profile.application_id=None;unbounded.profile.device_info_cc=None;
+    unbounded.profile.bootstrap_via_router=Some(RouterBootstrapConfig{routing:vec![],handoff_timeout_ms:120_001});
+    assert_eq!(unbounded.validate(100),Err(INVALID));
 }
 #[test]
 fn native_capture_does_not_modify_stored_binary_routing_or_turn_it_into_a_direct_tls_profile(){

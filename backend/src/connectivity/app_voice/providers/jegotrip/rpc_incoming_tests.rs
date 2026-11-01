@@ -64,6 +64,52 @@ fn exact_configured_receiver_and_original_object_domain_are_mandatory() {
 }
 
 #[test]
+fn gateway_oid_is_cached_only_inside_the_original_receiver_scope() {
+    let original = owner(); let scope = RpcConnectionScope::fresh(); let d = dispatcher(original.clone(), scope.clone());
+    assert!(d.latest_gateway_oid().is_none());
+    // Native 523EC0 stores Sip.MessageGw.Oid in a module-global; this subset
+    // keeps the same value bound to the ORIGINAL receiver scope instead.
+    let first_bytes = arguments(b"fixture.registered.message-kind",
+        &[RpcProperty { key: b"Sip.MessageGw.Oid", value: b"fixture-gw-1" }], b"one");
+    let first = RpcRequest { call_id: 1, metadata: vec![RpcProperty { key: b"id", value: b"#fixture-incoming" },
+        RpcProperty { key: b"domain", value: b"fixture-domain" }], method: ONLINE_MESSAGE_METHOD.as_bytes(),
+        arguments: first_bytes.expose_to_transport() };
+    assert!(d.on_direct_request(&original, &scope, &first).unwrap().is_some());
+    assert_eq!(d.latest_gateway_oid().as_deref(), Some(b"fixture-gw-1".as_slice()));
+    let second_bytes = arguments(b"fixture.registered.message-kind",
+        &[RpcProperty { key: b"Sip.MessageGw.Oid", value: b"fixture-gw-2" }], b"two");
+    let second = RpcRequest { call_id: 1, metadata: vec![RpcProperty { key: b"id", value: b"#fixture-incoming" },
+        RpcProperty { key: b"domain", value: b"fixture-domain" }], method: ONLINE_MESSAGE_METHOD.as_bytes(),
+        arguments: second_bytes.expose_to_transport() };
+    assert!(d.on_direct_request(&original, &scope, &second).unwrap().is_some());
+    assert_eq!(d.latest_gateway_oid().as_deref(), Some(b"fixture-gw-2".as_slice()));
+    // Unsupported values are not silently stored: an unclassifiable oid clears
+    // the cache rather than keeping the previous value.
+    for bad in [b"".as_slice(), b"has\0nul", &[0xff, 0xfe], b"ENC(sealed)"] {
+        let bytes = arguments(b"fixture.registered.message-kind",
+            &[RpcProperty { key: b"Sip.MessageGw.Oid", value: bad }], b"body");
+        let bad_request = RpcRequest { call_id: 1, metadata: vec![RpcProperty { key: b"id", value: b"#fixture-incoming" },
+            RpcProperty { key: b"domain", value: b"fixture-domain" }], method: ONLINE_MESSAGE_METHOD.as_bytes(),
+            arguments: bytes.expose_to_transport() };
+        assert!(d.on_direct_request(&original, &scope, &bad_request).unwrap().is_some());
+        assert!(d.latest_gateway_oid().is_none(), "unsupported oid must not be stored");
+    }
+    // A message without the property does not reuse a previous gateway oid.
+    let plain_bytes = arguments(b"fixture.registered.message-kind", &[], b"three");
+    let plain = RpcRequest { call_id: 1, metadata: vec![RpcProperty { key: b"id", value: b"#fixture-incoming" },
+        RpcProperty { key: b"domain", value: b"fixture-domain" }], method: ONLINE_MESSAGE_METHOD.as_bytes(),
+        arguments: plain_bytes.expose_to_transport() };
+    assert!(d.on_direct_request(&original, &scope, &plain).unwrap().is_some());
+    assert!(d.latest_gateway_oid().is_none());
+    // The cache never leaves the original scope: a foreign owner/scope sees
+    // nothing and stores nothing.
+    assert!(d.on_direct_request(&owner(), &scope, &first).unwrap().is_none());
+    assert!(d.on_direct_request(&original, &RpcConnectionScope::fresh(), &first).unwrap().is_none());
+    assert!(d.latest_gateway_oid().is_none());
+    assert!(!format!("{d:?}").contains("fixture"));
+}
+
+#[test]
 fn missing_receiver_configuration_or_wildcard_is_not_guessed_from_gateway_name() {
     for kind in [b"".as_slice(), b"fixture.*", b"ENC(unresolved)"] {
         assert!(IncomingDispatcher::for_arc_session(owner(), RpcConnectionScope::fresh(), IncomingBinding {

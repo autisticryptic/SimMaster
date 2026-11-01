@@ -2,8 +2,12 @@
 //!
 //! The Android receiver kind is NOT inferred from SipGateway or an outbound
 //! method name. Bind the original registered kind/object/domain explicitly.
-//! No new message channel readiness, SMS classification, gateway mutation,
-//! persistence ACK, public endpoint or socket is granted by this decoder.
+//! No new message channel readiness, SMS classification, public endpoint or
+//! socket is granted by this decoder.
+//!
+//! `Sip.MessageGw.Oid` is captured into a bounded cache owned by this original
+//! receiver binding (native 523EC0 writes it to a module-global). It is scope
+//! state only, never an identity, credential, routing override or ack proof.
 use super::{
     batch_scheduler::IncomingBatchRequest,
     native_events::IncomingMessage,
@@ -60,12 +64,31 @@ impl fmt::Debug for IncomingBinding<'_> {
 /// Captured when the original authenticated ARC incarnation installs receivers,
 /// not assigned while processing a packet. Exact kind only: native wildcard
 /// registry and generic receivers are intentionally NOT accepted by this subset.
+///
+/// `Sip.MessageGw.Oid` from a received Sip.Request is written to a cache that
+/// lives INSIDE this original receiver binding scope. Native 523EC0 writes the
+/// same property into a module-global; this subset deliberately keeps it
+/// scope-bound, bounded and zeroized instead of process-global state. The value
+/// is never an identity, sender, credential or delivery-readiness proof.
 pub struct IncomingDispatcher {
     owner: AttemptOwner,
     connection: RpcConnectionScope,
     object_id: Vec<u8>,
     domain: Vec<u8>,
     receiver_kind: Vec<u8>,
+    latest_gateway_oid: std::sync::Mutex<Option<zeroize::Zeroizing<Vec<u8>>>>,
+}
+
+const MAX_GATEWAY_OID_BYTES: usize = 256;
+
+/// Strict subset for the gateway reference: bounded printable bytes only.
+/// Unsupported values stay unclassified instead of being stored as-is.
+fn gateway_oid(value: &[u8]) -> Option<Vec<u8>> {
+    if value.is_empty() || value.len() > MAX_GATEWAY_OID_BYTES
+        || value.iter().any(u8::is_ascii_control) || value.windows(4).any(|bytes| bytes == b"ENC(") {
+        return None;
+    }
+    Some(value.to_vec())
 }
 
 impl fmt::Debug for IncomingDispatcher {
@@ -82,7 +105,20 @@ impl IncomingDispatcher {
         }
         if binding.receiver_kind.contains(&b'*') || !connection.is_open() { return Err(CodecError::InvalidField); }
         Ok(Self { owner, connection, object_id: binding.object_id.to_vec(), domain: binding.domain.to_vec(),
-            receiver_kind: binding.receiver_kind.to_vec() })
+            receiver_kind: binding.receiver_kind.to_vec(), latest_gateway_oid: std::sync::Mutex::new(None) })
+    }
+
+    /// Latest in-scope `Sip.MessageGw.Oid` observed on an accepted Sip.Request.
+    /// Scope closure retires the value with the binding; it is never global.
+    pub fn latest_gateway_oid(&self) -> Option<Vec<u8>> {
+        self.latest_gateway_oid.lock().unwrap_or_else(|poison| poison.into_inner())
+            .as_ref().map(|oid| oid.to_vec())
+    }
+
+    fn record_gateway_oid(&self, properties: &[RpcProperty<'_>]) {
+        let Some(value) = properties.iter().find(|p| p.key == b"Sip.MessageGw.Oid").map(|p| p.value) else { return; };
+        let mut cache = self.latest_gateway_oid.lock().unwrap_or_else(|poison| poison.into_inner());
+        match gateway_oid(value) { Some(oid) => *cache = Some(zeroize::Zeroizing::new(oid)), None => *cache = None }
     }
 
     pub(super) fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
@@ -117,6 +153,7 @@ impl IncomingDispatcher {
         // credentials, text, a line id or a delivery-readiness assertion.
         let message = decode_online_message(request.arguments)?;
         if message.receiver_kind != self.receiver_kind { return Ok(None); }
+        self.record_gateway_oid(&message.properties);
         let find = |key: &[u8]| message.properties.iter().find(|p| p.key == key).map(|p| p.value.to_vec());
         Ok(Some(IncomingMessage { body: message.body.to_vec(), from: find(b"Sip.Message.From"), time: find(b"Sip.Message.Time") }))
     }

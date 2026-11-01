@@ -12,7 +12,22 @@ pub struct LoginSessionResult<'a> {
     pub user_id: &'a [u8],
     pub session_token: &'a [u8],
     pub properties: Vec<RpcProperty<'a>>,
+    /// Native `__adjustOutParams` reads these from the SAME reply: the
+    /// `mainAccountServer` names the loginSessionAgent the reply belongs to and
+    /// `mainAccount` is stored on the original account object. They are data
+    /// only, never a new agent, URI, trust anchor or account grant.
+    pub main_account_server: Option<&'a [u8]>,
+    pub main_account: Option<&'a [u8]>,
     pub footer: RpcFooter<'a>,
+}
+
+fn optional_property<'a>(properties: &[RpcProperty<'a>], name: &[u8]) -> Result<Option<&'a [u8]>, CodecError> {
+    let Some(value) = properties.iter().find(|p| p.key == name).map(|p| p.value) else { return Ok(None); };
+    if value.is_empty() || value.len() > MAX_FIELD_BYTES || value.iter().any(u8::is_ascii_control)
+        || value.windows(4).any(|bytes| bytes == b"ENC(") {
+        return Err(CodecError::InvalidField);
+    }
+    Ok(Some(value))
 }
 
 impl fmt::Debug for LoginSessionResult<'_> {
@@ -88,7 +103,9 @@ pub fn decode_login_session_result(result_code: u32, bytes: &[u8])
     reader.finish()?;
     if !success || !footer.reason.is_empty() { return Err(CodecError::RemoteFailure); }
     if user_id.is_empty() || session_token.is_empty() { return Err(CodecError::InvalidField); }
-    Ok(LoginSessionResult { user_id, session_token, properties, footer })
+    let main_account_server = optional_property(&properties, b"mainAccountServer")?;
+    let main_account = optional_property(&properties, b"mainAccount")?;
+    Ok(LoginSessionResult { user_id, session_token, properties, main_account_server, main_account, footer })
 }
 
 #[cfg(test)]

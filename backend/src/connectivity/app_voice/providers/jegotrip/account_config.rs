@@ -128,6 +128,16 @@ impl fmt::Debug for BootstrapConfig {
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RouterBootstrapConfig {
+    pub routing: Vec<ProfileProperty>,
+    pub handoff_timeout_ms: u64,
+}
+impl fmt::Debug for RouterBootstrapConfig {
+    fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RouterBootstrapConfig(<redacted>)")}
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
     pub route: ProfileRoute,
     pub authority: Secret,
@@ -145,6 +155,12 @@ pub struct ProfileConfig {
     pub poll_routing: Vec<ProfileProperty>,
     pub logout_routing: Vec<ProfileProperty>,
     pub incoming: Option<IncomingBinding>,
+    /// Native Common bootstrap over the SAME explicit physical Router: the
+    /// logical AccountEntry destination and DomainName/DomainId/AppId/CC come
+    /// only from the matched getAppConfigs reply. Only valid with RouterCommon;
+    /// `credentials.sdk.server_address` then names the bootstrap entry.
+    #[serde(default)]
+    pub bootstrap_via_router: Option<RouterBootstrapConfig>,
     pub call_incoming:Option<CallIncomingConfig>,
     pub call_control:Option<Vec<ProfileProperty>>,
     pub connect_timeout_ms: u64,
@@ -205,14 +221,19 @@ impl AccountConfig {
     pub fn runtime_profile(&self) -> Result<RuntimeProfile, &'static str> {
         let p = &self.profile;
         p.validate_timeouts()?;
-        for required in [&p.identity_type, &p.gateway_uri] {
-            if required.expose_to_backend().trim().is_empty() { return Err(INVALID); }
-        }
+        if p.identity_type.expose_to_backend().trim().is_empty() { return Err(INVALID); }
+        let router_bootstrap=p.bootstrap_via_router.is_some();
+        if router_bootstrap && !matches!(&p.route,ProfileRoute::RouterCommon(_)) { return Err(INVALID); }
+        // An empty gateway URI means "derive current_user_uri from the matched
+        // loginSession identity" and is only supported by the native bootstrap
+        // route; every other route still requires the exact URI up front.
+        let derived_uri=p.gateway_uri.expose_to_backend().is_empty();
+        if derived_uri && !router_bootstrap { return Err(INVALID); }
         match &p.route{
             ProfileRoute::DirectTlsCarrier=>if p.authority.expose_to_backend().trim().is_empty(){return Err(INVALID);},
             ProfileRoute::RouterCommon(_)=>if !p.authority.expose_to_backend().is_empty()||p.enable_sni||self.bootstrap.is_some(){return Err(INVALID);},
         }
-        let (domain_name,domain_id,application_id,cc)=if self.bootstrap.is_some(){
+        let (domain_name,domain_id,application_id,cc)=if self.bootstrap.is_some()||router_bootstrap{
             if [&p.domain_name,&p.domain_id,&p.application_id,&p.device_info_cc].iter().any(|value|value.is_some()){return Err(INVALID);}
             ("","","","")
         }else{(required_secret(&p.domain_name)?,required_secret(&p.domain_id)?,required_secret(&p.application_id)?,
@@ -246,9 +267,19 @@ impl AccountConfig {
                 authority:a.authority.expose_to_backend(),root:a.root_der_base64.expose_to_backend(),enable_sni:a.enable_sni}).collect();
             let router=super::router_connector::RouterPolicy::supplied(native.reference.expose_to_backend(),&anchors).map_err(|_|INVALID)?;
             let access=borrowed(&native.access)?;
-            RuntimeProfile::supplied_common(inputs,RuntimeCommonInputs{router,account_reference:self.credentials.sdk.server_address.expose_to_backend(),access:&access,
-                endpoint_index:native.endpoint_index,resolved_host_index:native.resolved_host_index,connect_timeout:Duration::from_millis(p.connect_timeout_ms),
-                startup_timeout:Duration::from_millis(native.startup_timeout_ms),attempt_timeout:Duration::from_millis(native.attempt_timeout_ms),compress_above:native.compress_above}).map_err(|_|INVALID)?
+            if let Some(bootstrap)=&p.bootstrap_via_router{
+                if bootstrap.handoff_timeout_ms==0||bootstrap.handoff_timeout_ms>120_000{return Err(INVALID);}
+                let routing=borrowed(&bootstrap.routing)?;
+                let client_key=self.credentials.sdk.client_config_decode_key.as_ref().map(|key|ConfigDecodeKey::supplied(key.expose_to_backend().as_bytes()).map_err(|_|INVALID)).transpose()?;
+                RuntimeProfile::supplied_common_bootstrap(inputs,RuntimeCommonInputs{router,account_reference:"",access:&access,
+                    endpoint_index:native.endpoint_index,resolved_host_index:native.resolved_host_index,connect_timeout:Duration::from_millis(p.connect_timeout_ms),
+                    startup_timeout:Duration::from_millis(native.startup_timeout_ms),attempt_timeout:Duration::from_millis(native.attempt_timeout_ms),compress_above:native.compress_above},
+                    RuntimeCommonBootstrapInputs{routing:&routing,client_config_decode_key:client_key,handoff_timeout:Duration::from_millis(bootstrap.handoff_timeout_ms)}).map_err(|_|INVALID)?
+            }else{
+                RuntimeProfile::supplied_common(inputs,RuntimeCommonInputs{router,account_reference:self.credentials.sdk.server_address.expose_to_backend(),access:&access,
+                    endpoint_index:native.endpoint_index,resolved_host_index:native.resolved_host_index,connect_timeout:Duration::from_millis(p.connect_timeout_ms),
+                    startup_timeout:Duration::from_millis(native.startup_timeout_ms),attempt_timeout:Duration::from_millis(native.attempt_timeout_ms),compress_above:native.compress_above}).map_err(|_|INVALID)?
+            }
         }else if let Some(bootstrap)=&self.bootstrap{
             if bootstrap.handoff_timeout_ms==0||bootstrap.handoff_timeout_ms>30_000
                 ||bootstrap.account_root_der_base64.expose_to_backend().len()>16_384{return Err(INVALID);}
@@ -442,13 +473,20 @@ fn private_route(route:&ProfileRoute)->PrivateProfileRoute<'_>{match route{
         endpoint_index:route.endpoint_index,resolved_host_index:route.resolved_host_index,startup_timeout_ms:route.startup_timeout_ms,attempt_timeout_ms:route.attempt_timeout_ms,compress_above:route.compress_above}),
 }}
 #[derive(Serialize)]
+struct PrivateRouterBootstrapRef<'a>{routing:PrivateProperties<'a>,handoff_timeout_ms:u64}
+fn private_router_bootstrap(b:&Option<RouterBootstrapConfig>)->Option<PrivateRouterBootstrapRef<'_>>{
+    b.as_ref().map(|b|PrivateRouterBootstrapRef{routing:PrivateProperties(&b.routing),handoff_timeout_ms:b.handoff_timeout_ms})
+}
+#[derive(Serialize)]
 pub(super) struct PrivateProfileRef<'a> {
     route: PrivateProfileRoute<'a>, authority: &'a str, enable_sni: bool, identity_type: &'a str,
     domain_name: Option<&'a str>, domain_id: Option<&'a str>, application_id: Option<&'a str>, device_info_cc: Option<&'a str>,
     client_properties: PrivateProperties<'a>, include_device_id: bool,
     login_routing: PrivateProperties<'a>, gateway_uri: &'a str,
     gateway_metadata: PrivateProperties<'a>, poll_routing: PrivateProperties<'a>,
-    logout_routing: PrivateProperties<'a>, incoming: Option<PrivateIncomingRef<'a>>,call_incoming:Option<PrivateCallIncomingRef<'a>>,call_control:Option<PrivateProperties<'a>>,
+    logout_routing: PrivateProperties<'a>, incoming: Option<PrivateIncomingRef<'a>>,
+    bootstrap_via_router: Option<PrivateRouterBootstrapRef<'a>>,
+    call_incoming:Option<PrivateCallIncomingRef<'a>>,call_control:Option<PrivateProperties<'a>>,
     connect_timeout_ms: u64, handshake_timeout_ms: u64, partial_timeout_ms: u64,
     io_timeout_ms: u64, rpc_timeout_ms: u64,
 }
@@ -487,6 +525,7 @@ impl<'a> PrivateConfigRef<'a> {
                 gateway_uri: p.gateway_uri.expose_to_backend(), gateway_metadata: private_properties(&p.gateway_metadata),
                 poll_routing: private_properties(&p.poll_routing), logout_routing: private_properties(&p.logout_routing),
                 incoming: p.incoming.as_ref().map(|b| PrivateIncomingRef { object_id: &b.object_id, domain: &b.domain, receiver_kind: &b.receiver_kind }),
+                bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
                 call_incoming:p.call_incoming.as_ref().map(|binding|PrivateCallIncomingRef{object_id:&binding.object_id,domain:&binding.domain}),
                 call_control:p.call_control.as_ref().map(|properties|PrivateProperties(properties)),
                 connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
@@ -520,6 +559,7 @@ pub(super) fn private_profile_ref(p: &ProfileConfig) -> PrivateProfileRef<'_> {
         gateway_uri: p.gateway_uri.expose_to_backend(), gateway_metadata: private_properties(&p.gateway_metadata),
         poll_routing: private_properties(&p.poll_routing), logout_routing: private_properties(&p.logout_routing),
         incoming: p.incoming.as_ref().map(|b| PrivateIncomingRef { object_id: &b.object_id, domain: &b.domain, receiver_kind: &b.receiver_kind }),
+        bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
         call_incoming: p.call_incoming.as_ref().map(|b| PrivateCallIncomingRef { object_id: &b.object_id, domain: &b.domain }),
         call_control: p.call_control.as_deref().map(private_properties),
         connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,

@@ -214,6 +214,13 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('property(b"domain") != Some(self.domain.as_slice())', source)
         self.assertIn('message.receiver_kind != self.receiver_kind', source)
         self.assertIn('binding.receiver_kind.contains(&b\'*\')', source)
+        # Native 523EC0 caches Sip.MessageGw.Oid globally; this subset keeps it
+        # bounded and owned by the ORIGINAL receiver binding scope.
+        self.assertIn('Sip.MessageGw.Oid', source)
+        self.assertIn('fn record_gateway_oid', source)
+        self.assertIn('fn latest_gateway_oid', source)
+        self.assertIn('latest_gateway_oid: std::sync::Mutex', source)
+        self.assertNotIn('static mut', source)
         self.assertNotIn('from_utf8_lossy', source)
         engine = (MOD / 'offline_backend.rs').read_text(encoding='utf-8')
         self.assertIn('scheduler.on_reply(&reply, now_ms)', engine)
@@ -734,6 +741,21 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('reference_decode_key:None', provision)
         for shortcut in ['Callback::', 'TcpStream', 'default_root', 'from_utf8_lossy', 'derive(Serialize)']:
             self.assertNotIn(shortcut, provision)
+
+    def test_auto_assembled_common_bootstrap_derives_uri_and_gateway_object(self):
+        backend = (MOD / 'runtime_backend.rs').read_text(encoding='utf-8')
+        self.assertIn('let derived_uri=native&&common_bootstrap.is_some()&&input.gateway_uri.is_empty()', backend)
+        self.assertIn('super::rpc_arguments::DEFAULT_GATEWAY_OBJECT.as_bytes()', backend)
+        self.assertIn('fn session_uri(captured:&LoginCapture,domain:&[u8])', backend)
+        self.assertIn('session_uri: Mutex<Option<Zeroizing<String>>>', backend)
+        self.assertIn('normalize_session_identity(captured.identity.as_bytes(),domain)', backend)
+        self.assertIn('None=>lock(&attempt.session_uri).clone().ok_or(BackendFailure::Unavailable)?', backend)
+        config = (MOD / 'account_config.rs').read_text(encoding='utf-8')
+        self.assertIn('pub struct RouterBootstrapConfig', config)
+        self.assertIn('pub bootstrap_via_router: Option<RouterBootstrapConfig>', config)
+        self.assertIn('RuntimeProfile::supplied_common_bootstrap(inputs,RuntimeCommonInputs{router,account_reference:"",access:&access,', config)
+        self.assertIn('let derived_uri=p.gateway_uri.expose_to_backend().is_empty()', config)
+        self.assertIn('if derived_uri && !router_bootstrap { return Err(INVALID); }', config)
 
     def test_bootstrap_deadline_and_real_two_connection_regressions_are_selected(self):
         backend = (MOD / 'runtime_backend.rs').read_text(encoding='utf-8')

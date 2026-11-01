@@ -23,7 +23,7 @@ use super::{
     transport_packets::TransportError,
 };
 use std::{collections::BTreeMap, fmt, sync::Arc};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArcPhase { Initial, LoginPending, Authenticated, LogoutPending, LoggedOut, Closed }
@@ -75,7 +75,7 @@ pub struct ArcRpcSession {
     hosting_tracker_taken: bool,
     batch_scheduler_taken: bool,
     packet_transport_taken: bool,
-    common_transport_claimed:bool,common_identity:Option<Vec<u8>>,
+    common_transport_claimed:bool,common_identity:Option<Vec<u8>>,main_account:Option<Zeroizing<Vec<u8>>>,
     call_book:CallBook,
 }
 
@@ -183,7 +183,7 @@ impl ArcRpcSession {
         let connection=RpcConnectionScope::fresh();let call_book=CallBook::new(owner.clone(),connection.clone());
         Self { owner, connection, phase: ArcPhase::Initial,
             next_id: Some(1), pending: BTreeMap::new(), authentication: None, hosting_tracker_taken: false,
-            batch_scheduler_taken: false, packet_transport_taken: false,common_transport_claimed:false,common_identity:None,call_book }
+            batch_scheduler_taken: false, packet_transport_taken: false,common_transport_claimed:false,common_identity:None,main_account:None,call_book }
     }
 
     pub fn connection_scope(&self) -> RpcConnectionScope { self.connection.clone() }
@@ -227,6 +227,9 @@ impl ArcRpcSession {
         if !self.common_transport_claimed||self.phase()!=ArcPhase::Initial||!self.pending.is_empty()||self.common_identity.is_some(){return Err(CodecError::InvalidField);}
         validate_bytes(identity,true)?;self.common_identity=Some(identity.to_vec());Ok(())
     }
+    /// Original account-level `mainAccount` captured from a matched login reply.
+    /// Not a credential and not a routing override.
+    pub(super) fn main_account(&self)->Option<&[u8]>{self.main_account.as_deref().map(|value|value.as_slice())}
     /// Account metadata on a Common incarnation must carry the SAME entry
     ///identity that was bound before the physical connection. A caller-supplied
     ///conflicting id is refused instead of being rewritten or duplicated.
@@ -421,6 +424,7 @@ impl ArcRpcSession {
         self.connection.close();
         self.authentication = None;
         if let Some(identity)=&mut self.common_identity{identity.zeroize();}self.common_identity=None;
+        if let Some(account)=&mut self.main_account{account.zeroize();}self.main_account=None;
         self.pending.clear();self.call_book.close();
     }
 
@@ -466,6 +470,16 @@ impl ArcRpcSession {
             },
             PendingKind::Login => match decode_login_session_result(reply.result_code, reply.result_stream) {
                 Ok(result) if self.phase == ArcPhase::LoginPending => {
+                    // Native __adjustOutParams treats mainAccountServer as the
+                    // loginSessionAgent identity: a changed value makes the
+                    // original client CREATE A NEW agent. This single-incarnation
+                    // session can only continue on the identity bound before the
+                    // transport existed, so anything else is refused here rather
+                    // than silently ignored or rewritten.
+                    if let Some(server) = result.main_account_server {
+                        if self.common_identity.as_deref() != Some(server) { return Ok(Some(self.failure())); }
+                    }
+                    if let Some(account) = result.main_account { self.main_account = Some(Zeroizing::new(account.to_vec())); }
                     let Some(selected_session_id) = pending.selected_session_id.take() else { return Ok(Some(self.failure())); };
                     self.authentication = Some(ArcAuthentication { user_id: result.user_id.to_vec(),
                         selected_session_id, token: result.session_token.to_vec() });

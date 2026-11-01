@@ -1,6 +1,6 @@
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip::{
-    rpc_batch::read_payload, rpc_envelope::decode_request, rpc_stream::Reader,
+    rpc_batch::read_payload, rpc_envelope::decode_request, rpc_stream::{Reader, Writer},
     session::{HostingSession, Phase}, tests::imported,
 };
 
@@ -268,4 +268,43 @@ fn selected_session_id_is_bounded_before_submission_and_failure_does_not_consume
     assert_eq!(rpc.phase(), ArcPhase::Initial);
     let mut login = inputs(&[]); login.selected_session_id = &accepted;
     assert_eq!(rpc.prepare_login(login, &[]).unwrap().0, 1);
+}
+
+fn login_with_server(id: i32, server: &[u8]) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer.boolean(true).unwrap();
+    writer.bytes(b"fixture-returned-user").unwrap();
+    writer.bytes(b"fixture-returned-token").unwrap();
+    writer.properties(&[RpcProperty { key: b"mainAccountServer", value: server },
+        RpcProperty { key: b"mainAccount", value: b"fixture-main-account" }]).unwrap();
+    writer.bytes(b"").unwrap();
+    reply(id, writer.finish().expose_to_transport())
+}
+
+#[test]
+fn login_reply_main_account_server_cannot_retarget_the_bound_common_identity() {
+    // Native __adjustOutParams would create a NEW loginSessionAgent when
+    // mainAccountServer changed. This incarnation only continues on the identity
+    // bound before the transport existed.
+    let owner = owner(); let mut rpc = ArcRpcSession::new(owner.clone()); let scope = rpc.connection_scope();
+    rpc.claim_common_transport().unwrap(); rpc.bind_common_identity(b"AccountEntry").unwrap();
+    let (id, _) = rpc.prepare_login(inputs(&[]), &[]).unwrap();
+    let answer = login_with_server(id, b"AccountEntry");
+    assert!(matches!(rpc.on_reply(&owner, &scope, &answer).unwrap(), Some(ArcReply::Login(_))));
+    assert_eq!(rpc.main_account(), Some(b"fixture-main-account".as_slice()));
+
+    let owner = owner(); let mut rpc = ArcRpcSession::new(owner.clone()); let scope = rpc.connection_scope();
+    rpc.claim_common_transport().unwrap(); rpc.bind_common_identity(b"AccountEntry").unwrap();
+    let (id, _) = rpc.prepare_login(inputs(&[]), &[]).unwrap();
+    let answer = login_with_server(id, b"OtherEntry");
+    assert!(matches!(rpc.on_reply(&owner, &scope, &answer).unwrap(), Some(ArcReply::Failure(_))));
+    assert!(!scope.is_open()); assert!(rpc.main_account().is_none());
+
+    // An unbound (non-Common) incarnation cannot prove which agent a returned
+    // mainAccountServer names, so it refuses instead of ignoring it.
+    let owner = owner(); let mut rpc = ArcRpcSession::new(owner.clone()); let scope = rpc.connection_scope();
+    let (id, _) = rpc.prepare_login(inputs(&[]), &[]).unwrap();
+    let answer = login_with_server(id, b"AccountEntry");
+    assert!(matches!(rpc.on_reply(&owner, &scope, &answer).unwrap(), Some(ArcReply::Failure(_))));
+    assert!(!scope.is_open());
 }

@@ -23,6 +23,33 @@ fn login_arguments_preserve_two_native_strings_and_deployment_property_map() {
 }
 
 #[test]
+fn login_reply_main_account_fields_are_captured_only_as_validated_data() {
+    let properties = [RpcProperty { key: b"mainAccountServer", value: b"AccountEntry" },
+        RpcProperty { key: b"mainAccount", value: b"fixture-main-account" }];
+    let mut writer = Writer::new(); writer.boolean(true).unwrap();
+    writer.bytes(b"fixture-user").unwrap(); writer.bytes(b"fixture-token").unwrap();
+    writer.properties(&properties).unwrap(); writer.bytes(b"").unwrap();
+    let bytes = writer.finish().expose_to_transport().to_vec();
+    let result = decode_login_session_result(0, &bytes).unwrap();
+    assert_eq!(result.main_account_server, Some(b"AccountEntry".as_slice()));
+    assert_eq!(result.main_account, Some(b"fixture-main-account".as_slice()));
+    assert!(!format!("{result:?}").contains("fixture"));
+    // Absent fields stay unknown instead of being filled from the identity.
+    let absent = login_result(true, b"id", b"token");
+    let result = decode_login_session_result(0, &absent).unwrap();
+    assert!(result.main_account_server.is_none() && result.main_account.is_none());
+    // Malformed identifiers are rejected at the codec boundary rather than
+    // being stored or matched approximately.
+    for value in [b"".as_slice(), b"has\0nul", b"ENC(sealed)"] {
+        let mut writer = Writer::new(); writer.boolean(true).unwrap();
+        writer.bytes(b"fixture-user").unwrap(); writer.bytes(b"fixture-token").unwrap();
+        writer.properties(&[RpcProperty { key: b"mainAccountServer", value }]).unwrap(); writer.bytes(b"").unwrap();
+        let bytes = writer.finish().expose_to_transport().to_vec();
+        assert_eq!(decode_login_session_result(0, &bytes).err(), Some(CodecError::InvalidField));
+    }
+}
+
+#[test]
 fn login_result_requires_zero_code_true_boolean_and_nonempty_returned_id_and_token() {
     let bytes = login_result(true, b"actual-id", b"actual-session-token");
     let result = decode_login_session_result(0, &bytes).unwrap();

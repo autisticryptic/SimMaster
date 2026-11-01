@@ -9,7 +9,7 @@ use tokio_rustls::rustls::version::TLS13;
 const ENTRY:&str="AccountEntry:sarc -h 42.7 -p 98;";
 const BOOTSTRAP_SDK:&str="BootEntry:sarc -h 42.7 -p 98;";
 const DESTINATION:&str="DestEntry:sarc -h 42.7 -p 98;";
-fn bootstrap_inputs()->RuntimeProfileInputs<'static>{RuntimeProfileInputs{domain_name:"",domain_id:"",application_id:"",device_info_cc:"",..inputs()}}
+fn bootstrap_inputs()->RuntimeProfileInputs<'static>{RuntimeProfileInputs{domain_name:"",domain_id:"",application_id:"",device_info_cc:"",gateway_uri:"",..inputs()}}
 fn bootstrap_common(root:&str,port:u16)->RuntimeCommonInputs<'static>{RuntimeCommonInputs{account_reference:"",..common(root,port)}}
 fn bootstrap_route()->RuntimeCommonBootstrapInputs<'static>{RuntimeCommonBootstrapInputs{routing:&[],client_config_decode_key:None,handoff_timeout:Duration::from_secs(10)}}
 fn bootstrap_result()->Vec<u8>{
@@ -18,6 +18,25 @@ fn bootstrap_result()->Vec<u8>{
     let mut w=Writer::new();w.boolean(true).unwrap();w.properties(&properties).unwrap();w.bytes(DESTINATION.as_bytes()).unwrap();
     w.bytes(b"").unwrap();w.bytes(b"").unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()
 }
+fn gateway()->GatewayRegistration<'static>{GatewayRegistration{authname_prefix:"fixture-prefix",channel_id:"fixture-channel",
+    delete_int_code:"1",sip_number:"fixture-number",sip_password:"fixture-SipPwd"}}
+/// Hosting is ONE nested updateStatus request inside swapCalls. Returns the
+/// `current_user_uri` argument and the `SipFlag` value actually sent.
+async fn hosting_call(peer:&mut CommonPeer)->(Vec<u8>,Vec<u8>){
+    loop{
+        let packet=peer.next().await.unwrap();assert_eq!(packet[0],0);let call=decode_request(&packet[1..]).unwrap();
+        assert_eq!(call.method,super::super::rpc_batch::SWAP_CALLS_METHOD.as_bytes());
+        let mut args=Reader::versioned(call.arguments).unwrap();args.bytes().unwrap();args.bytes().unwrap();
+        let payload=super::super::rpc_batch::read_payload(&mut args).unwrap();
+        if payload.requests.is_empty(){peer.send(&[reply(call.call_id,&super::tests::swap_result(None,true,payload.fields))]).await;continue;}
+        assert_eq!(payload.requests.len(),1);let sequence=*payload.requests.keys().next().unwrap();let nested=&payload.requests[&sequence];
+        assert_eq!(nested.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"#SipGateway");
+        let mut fields=Reader::versioned(nested.arguments).unwrap();let uri=fields.bytes().unwrap().to_vec();
+        let flag=fields.properties().unwrap().iter().find(|p|p.key==b"SipFlag").unwrap().value.to_vec();
+        peer.send(&[reply(call.call_id,&super::tests::swap_result(Some(sequence),true,payload.fields))]).await;
+        return (uri,flag);
+    }
+}
 #[test]
 fn common_bootstrap_profile_never_preknows_identity_destination_or_offsets(){
     let cert=Certificates::generate("IP:127.0.0.1");
@@ -25,6 +44,10 @@ fn common_bootstrap_profile_never_preknows_identity_destination_or_offsets(){
     let route=p.common.as_ref().unwrap();assert!(route.entry.is_none());assert!(route.reference.is_none());assert!(route.access.is_empty());
     for fields in [&p.login_routing,&p.poll_routing,&p.logout_routing]{assert!(!fields.iter().any(|p|p.key==b"id"));}
     assert!(p.bootstrap.is_none());assert!(p.common_bootstrap.is_some());assert!(p.domain_name.is_empty()&&p.domain_id.is_empty()&&p.application_id.is_empty());
+    // The real current_user_uri is derived from the matched session identity,
+    // and hosting defaults to the original SipGateway object.
+    assert!(p.gateway_uri.is_none());assert_eq!(p.gateway_metadata.len(),1);
+    assert_eq!(p.gateway_metadata[0].key,b"id");assert_eq!(p.gateway_metadata[0].value,b"#SipGateway");
     // An already-known entry, identity, offset or destination field contradicts
     // "derived from the matched reply" and is refused before any network work.
     assert!(RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),common(&cert.root,12345),bootstrap_route()).is_err());
@@ -33,6 +56,12 @@ fn common_bootstrap_profile_never_preknows_identity_destination_or_offsets(){
         RuntimeCommonBootstrapInputs{routing:&[RpcProperty{key:b"id",value:b"DestEntry"}],..bootstrap_route()}).is_err());
     assert!(RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),RuntimeCommonInputs{endpoint_index:1,..bootstrap_common(&cert.root,12345)},bootstrap_route()).is_err());
     assert!(RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),RuntimeCommonInputs{resolved_host_index:1,..bootstrap_common(&cert.root,12345)},bootstrap_route()).is_err());
+    // A supplied URI stays supported; only an empty one requests derivation.
+    let explicit=RuntimeProfile::supplied_common_bootstrap(RuntimeProfileInputs{gateway_uri:"fixture-supplied-uri",..bootstrap_inputs()},bootstrap_common(&cert.root,12345),bootstrap_route()).unwrap();
+    assert_eq!(explicit.gateway_uri.as_ref().map(|uri|uri.as_str()),Some("fixture-supplied-uri"));
+    // Explicitness of the SipGateway object is preserved, never duplicated.
+    let custom=RuntimeProfile::supplied_common_bootstrap(RuntimeProfileInputs{gateway_metadata:&[RpcProperty{key:b"id",value:b"#CustomGateway"}],..bootstrap_inputs()},bootstrap_common(&cert.root,12345),bootstrap_route()).unwrap();
+    assert_eq!(custom.gateway_metadata.len(),1);assert_eq!(custom.gateway_metadata[0].value,b"#CustomGateway");
     for handoff in [Duration::ZERO,Duration::from_secs(121)]{assert!(RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),bootstrap_common(&cert.root,12345),
         RuntimeCommonBootstrapInputs{handoff_timeout:handoff,..bootstrap_route()}).is_err());}
     let text=format!("{p:?}");for value in ["BootEntry","DestEntry","12345","fixture"]{assert!(!text.contains(value));}
@@ -80,6 +109,12 @@ async fn common_bootstrap_dials_only_the_returned_entry_after_releasing_its_own_
             assert_eq!(fields.iter().find(|p|p.key==b"DeviceInfo.CC").unwrap().value,b"fixture-cc");
             assert_eq!(fields.iter().find(|p|p.key==b"__appKey").unwrap().value,b"fixture-app-key");
             peer.send(&[reply(call.call_id,&login_result())]).await;
+            // Auto-assembled hosting: the URI is the matched session identity and
+            // the batch targets the original default SipGateway object.
+            let(uri,flag)=hosting_call(&mut peer).await;
+            assert_eq!(uri.as_slice(),b"[username:fixture-user@account-domain.invalid]");assert_eq!(flag.as_slice(),b"4");
+            let(uri,flag)=hosting_call(&mut peer).await;
+            assert_eq!(uri.as_slice(),b"[username:fixture-user@account-domain.invalid]");assert_eq!(flag.as_slice(),b"3");
             let packet=peer.next().await.unwrap();let call=decode_request(&packet[1..]).unwrap();
             assert_eq!(call.method,b"logoutSession.AccountEntry.Account");assert_eq!(call.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"DestEntry");
             peer.send(&[reply(call.call_id,b"\0\x01\0\0\0\0")]).await;while peer.next().await.is_some(){}
@@ -96,6 +131,8 @@ async fn common_bootstrap_dials_only_the_returned_entry_after_releasing_its_own_
         assert!(event.matches(&original,&scope));
         assert!(matches!(event.payload,BackendEventPayload::Callback(c) if c.callback==(Callback::SdkLogin{success:true})));
         assert_eq!(connector.calls.load(Ordering::Acquire),0);
+        backend.update_status(original.clone(),STATUS_REGISTER,gateway()).await.unwrap();
+        backend.update_status(original.clone(),STATUS_UNREGISTER,gateway()).await.unwrap();
         backend.logout(original.clone()).await.unwrap();assert!(!scope.is_open());
         assert!(lock(&backend.original(&original).unwrap().state).released);
     };
