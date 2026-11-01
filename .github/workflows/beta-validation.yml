@@ -300,6 +300,7 @@ jobs:
             connectivity::app_voice::providers::jegotrip::router_timing::tests \
             connectivity::app_voice::providers::jegotrip::native_channel::tests \
             connectivity::app_voice::providers::jegotrip::netstream_records::tests \
+            connectivity::app_voice::providers::jegotrip::reliable_channel::tests \
             connectivity::core::tls_identity::tests \
             connectivity::app_voice::registry::tests \
             connectivity::modems::ims::cellular_ims::live::refresh_tests \

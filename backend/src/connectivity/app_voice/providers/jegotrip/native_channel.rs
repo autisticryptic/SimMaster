@@ -97,21 +97,27 @@ pub fn previous_data<'a>(packet: &ChannelPacket<'a>) -> Result<(u16, &'a [u8]), 
 /// This reconstructs DATA ONLY; the caller must retain original live ownership
 /// and must never use it to replay cancelled work on a replacement connection.
 pub fn original_packet<'a>(packet: &ChannelPacket<'a>) -> Result<ChannelPacket<'a>, TransportError> {
+    Ok(original_packet_distance(packet)?.0)
+}
+/// Retain the NON-wrapping aggregate distance for a scoped reliable receiver.
+/// The legacy wire-only API above still returns its original u16 header.
+pub(super) fn original_packet_distance<'a>(packet: &ChannelPacket<'a>) -> Result<(ChannelPacket<'a>, usize), TransportError> {
     let mut kind = packet.kind; let mut sequence = packet.sequence; let mut body = packet.body;
-    let mut descriptors = 0;
+    let mut descriptors = 0; let mut distance = 0usize;
     while kind == PacketKind::Skip {
         descriptors += 1;
         if descriptors > 100 { return Err(TransportError::TooLarge); } // local retention/cpu bound
         let word = body.get(..2).ok_or(TransportError::Truncated)?;
         let value = u16::from_be_bytes([word[0],word[1]]); let delta = value & 0x3fff;
         if delta == 0 { return Err(TransportError::InvalidPacket); }
+        distance = distance.checked_add(delta as usize).ok_or(TransportError::TooLarge)?;
         sequence = sequence.wrapping_sub(delta); body = &body[2..];
         kind = match value >> 14 { 0 => PacketKind::Start, 1 => PacketKind::Data, 2 => PacketKind::Skip,
             _ => return Err(TransportError::UnsupportedKind) };
     }
-    Ok(ChannelPacket { timestamp: packet.timestamp, sequence, kind, data_gap: packet.data_gap,
+    Ok((ChannelPacket { timestamp: packet.timestamp, sequence, kind, data_gap: packet.data_gap,
         ack_sequence: packet.ack_sequence, delivered_sequence: packet.delivered_sequence,
-        inclusive_ack: packet.inclusive_ack, ack_mask: packet.ack_mask, body })
+        inclusive_ack: packet.inclusive_ack, ack_mask: packet.ack_mask, body }, distance))
 }
 
 /// Add precisely one native retransmission descriptor to original Start/Data/
@@ -140,6 +146,7 @@ impl fmt::Debug for Records { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::
     .field("closed", &self.closed).field("partial", &!self.partial.is_empty()).field("data", &"<redacted>").finish() } }
 impl Records {
     pub fn has_partial(&self) -> bool { !self.partial.is_empty() }
+    pub fn retained_bytes(&self) -> usize { self.partial.len() }
     pub fn close(&mut self) { self.partial.zeroize(); self.closed = true; }
     /// Input is one complete ordered channel DATA body AFTER channel ACK/gap
     /// fields, not an arbitrary TCP/TLS read. Caller establishes original scope.
