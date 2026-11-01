@@ -81,7 +81,12 @@ impl RouterPath {
             if let Some(assignment)=assignment {path.assignment=Some(assignment);return Ok(path);}
         }
     }
+    pub(super) fn owner(&self)->AttemptOwner{self.owner.clone()}
     pub(super) fn scope(&self)->RpcConnectionScope{self.scope.clone()}
+    pub(super) fn channel_clock(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,lease:&PortLease,
+        peer:&super::router_peer::PeerBinding)->Option<super::router_ports::PortClock>{
+        if !self.original(owner,scope){return None;}self.tracker.channel_clock(owner,scope,lease,peer)
+    }
     pub(super) fn ids(&self)->Option<(u32,u32)>{self.assignment.as_ref()?.ids_for(&self.owner,&self.scope)}
     pub(super) fn path_metrics(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->Option<super::router_timing::PathMetrics>{
         if !self.original(owner,scope){return None;}self.tracker.metrics_for(owner,scope)
@@ -190,12 +195,26 @@ impl RouterPath {
         let result=self.drive_until(deadline).await;
         if result.is_ok(){cancelled.armed=false;}else{self.close();}result
     }
+    /// A Channel retransmission/partial timer may wake only the READ side.
+    /// TLS output still uses the original hard operation deadline; no failed
+    /// write/flush or consumed input is reclassified as a successful idle tick.
+    pub(super) async fn drive_routing_tick(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,
+        wake:Instant,deadline:Instant)->Result<bool,RouterIoError>{
+        if !self.original(owner,scope){return Ok(false);}
+        let mut cancelled=CancelGuard{scope:self.scope.clone(),armed:true};
+        let result=self.drive_step_until(deadline,Some(wake)).await;
+        if result.is_ok(){cancelled.armed=false;}else{self.close();}result
+    }
     async fn drive_until(&mut self,deadline:Instant)->Result<bool,RouterIoError>{
+        self.drive_step_until(deadline,None).await
+    }
+    async fn drive_step_until(&mut self,deadline:Instant,wake:Option<Instant>)->Result<bool,RouterIoError>{
         loop {
             let now=Instant::now();if now>=deadline{return Err(RouterIoError::Timeout);}
             self.engine.tick(&self.owner,&self.scope,now)?;
             self.tracker.tick(&self.owner,&self.scope,now)?;self.ports.tick(&self.owner,&self.scope,now)?;
             if self.dispatch_pending(deadline).await? {return Ok(true);}
+            if wake.is_some_and(|end|now>=end){return Ok(false);}
             if self.last_node_probe.is_none_or(|last|now.duration_since(last)>=NODE_PROBE_INTERVAL){
                 let timing=self.timing(now)?;
                 let request=self.tracker.prepare_node_probe(&self.owner,&self.scope,timing,now)?.ok_or(RouterIoError::Scope)?;
@@ -203,6 +222,7 @@ impl RouterPath {
             }
             let pulse=self.last_node_probe.and_then(|last|last.checked_add(NODE_PROBE_INTERVAL)).ok_or(RouterIoError::Configuration)?;
             let mut read_end=deadline.min(pulse);
+            if let Some(end)=wake{read_end=read_end.min(end);}
             if let Some(end)=self.tracker.next_deadline(){read_end=read_end.min(end);}
             let input=match self.receive_step(read_end,deadline).await? {
                 Some(input)=>input,
@@ -212,7 +232,11 @@ impl RouterPath {
                     // output. Real IO failures cannot discard admitted input.
                     self.engine.tick(&self.owner,&self.scope,now)?;
                     self.tracker.tick(&self.owner,&self.scope,now)?;
-                    if self.scope.is_open()&&now<deadline&&now>=pulse{continue;}
+                    self.ports.tick(&self.owner,&self.scope,now)?;
+                    if !self.scope.is_open(){return Err(RouterIoError::Scope);}
+                    if now>=deadline{return Err(RouterIoError::Timeout);}
+                    if wake.is_some_and(|end|now>=end){return Ok(false);}
+                    if now>=pulse{continue;}
                     return Err(RouterIoError::Timeout);
                 }
             };

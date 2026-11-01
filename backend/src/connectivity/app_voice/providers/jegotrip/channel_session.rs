@@ -73,6 +73,7 @@ impl ChannelSession {
             permit: self.claim.permit(&self.owner, &self.scope, &self.clock).ok_or(SessionError::Scope)? })
     }
     pub fn ready_for(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool { self.original(owner, scope) && self.core.ready() }
+    pub fn has_queued(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool { self.original(owner, scope) && self.core.has_queued() }
     pub fn peer(&self) -> &PeerBinding { &self.peer }
     pub fn lease(&self) -> &PortLease { self.claim.lease() }
     pub fn next_wake(&self) -> Option<Instant> { self.original(&self.owner, &self.scope).then(|| self.core.next_wake()).flatten() }

@@ -82,6 +82,7 @@ impl ChannelCore {
             rto: Duration::from_millis(200), closed: false })
     }
     pub fn ready(&self) -> bool { !self.closed && self.start_acked && self.start_rx.is_some() }
+    pub fn has_queued(&self) -> bool { !self.closed && !self.queued.is_empty() }
     pub fn close(&mut self) {
         self.closed = true; self.sent.clear(); self.roots.clear(); self.queued.clear(); self.received.clear();
         self.seen.clear(); self.wire_hashes.clear(); self.root_hashes.clear(); self.records.close();
