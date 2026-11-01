@@ -35,7 +35,7 @@ impl Drop for CancelGuard {fn drop(&mut self){if self.armed {self.scope.close();
 
 pub struct RouterPath {owner:AttemptOwner,scope:RpcConnectionScope,io:Option<BoxRuntimeIo>,engine:EndpointTlsEngine,
     tracker:RouterConnectTracker,assignment:Option<RouterAssignment>,ports:RouterPorts,
-    deliveries:Vec<PortDelivery>,delivery_bytes:usize,last_node_probe:Option<Instant>,io_timeout:Duration,start:Instant}
+    deliveries:Vec<PortDelivery>,delivery_bytes:usize,last_node_probe:Option<Instant>,io_timeout:Duration}
 impl fmt::Debug for RouterPath {fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RouterPath(<redacted>)")}}
 impl RouterPath {
     pub(super) async fn open(owner:AttemptOwner,scope:RpcConnectionScope,policy:&RouterPolicy,access:&[RpcProperty<'_>],
@@ -61,7 +61,7 @@ impl RouterPath {
             1460,sequence,timeouts.startup,start)?;
         let ports=tracker.create_ports(&owner,&scope,10000,start)?.ok_or(RouterIoError::Scope)?;
         let mut path=Self{owner,scope,io:Some(io),engine,tracker,assignment:None,ports,
-            deliveries:Vec::new(),delivery_bytes:0,last_node_probe:None,io_timeout:timeouts.io,start};
+            deliveries:Vec::new(),delivery_bytes:0,last_node_probe:None,io_timeout:timeouts.io};
         let wire=path.engine.take_wire_output(&path.owner,&path.scope,Instant::now())?;
         path.write_wire(&wire,deadline).await?;
         while path.engine.phase()!=TlsPhase::Verified {
@@ -83,15 +83,15 @@ impl RouterPath {
     }
     pub(super) fn scope(&self)->RpcConnectionScope{self.scope.clone()}
     pub(super) fn ids(&self)->Option<(u32,u32)>{self.assignment.as_ref()?.ids_for(&self.owner,&self.scope)}
+    pub(super) fn path_metrics(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->Option<super::router_timing::PathMetrics>{
+        if !self.original(owner,scope){return None;}self.tracker.metrics_for(owner,scope)
+    }
     pub(super) fn close(&mut self){
         self.scope.close();self.engine.close();self.tracker.close();self.ports.close();
         self.deliveries.clear();self.delivery_bytes=0;self.io=None;self.assignment=None;
     }
-    fn timing(&self)->RouterTiming{
-        // No fabricated RTT/loss estimate: unknown word2/loss retain native0.
-        // The later path estimator can supply measured values without changing
-        // the original wire sequence, assignment or physical connection.
-        RouterTiming{word1:Instant::now().duration_since(self.start).as_millis() as u16,word2:0,byte6:0}
+    fn timing(&mut self,now:Instant)->Result<RouterTiming,RouterIoError>{
+        self.tracker.timing_for(&self.owner,&self.scope,now)?.ok_or(RouterIoError::Scope)
     }
     async fn send_control(&mut self,request:&PreparedRouterControl,deadline:Instant)->Result<(),RouterIoError>{
         let wire=self.engine.encrypt_packets(&self.owner,&self.scope,
@@ -100,8 +100,8 @@ impl RouterPath {
     }
     async fn flush_feedback(&mut self,deadline:Instant)->Result<(),RouterIoError>{
         loop {
-            let timing=self.timing();
-            let Some(response)=self.tracker.prepare_feedback(&self.owner,&self.scope,timing,Instant::now())? else{break;};
+            let now=Instant::now();let timing=self.timing(now)?;
+            let Some(response)=self.tracker.prepare_feedback(&self.owner,&self.scope,timing,now)? else{break;};
             self.send_control(&response,deadline).await?;
         } Ok(())
     }
@@ -118,8 +118,8 @@ impl RouterPath {
         let mut cancelled=CancelGuard{scope:self.scope.clone(),armed:true};
         let result=async {
             if query {
-                let timing=self.timing();
-                let request=self.tracker.prepare_resolve(owner,scope,endpoint,timing,deadline,Instant::now())?.ok_or(RouterIoError::Scope)?;
+                let now=Instant::now();let timing=self.timing(now)?;
+                let request=self.tracker.prepare_resolve(owner,scope,endpoint,timing,deadline,now)?.ok_or(RouterIoError::Scope)?;
                 if !self.send(owner,scope,request.packets_for(owner,scope).ok_or(RouterIoError::Scope)?,deadline).await?{return Err(RouterIoError::Scope);}
             }
             let target=loop {
@@ -130,8 +130,8 @@ impl RouterPath {
                     Err(error)=>return Err(error.into()),
                 }
             };
-            let timing=self.timing();
-            let request=self.tracker.prepare_peer(owner,scope,&target,timing,deadline,Instant::now())?.ok_or(RouterIoError::Scope)?;
+            let now=Instant::now();let timing=self.timing(now)?;
+            let request=self.tracker.prepare_peer(owner,scope,&target,timing,deadline,now)?.ok_or(RouterIoError::Scope)?;
             if !self.send(owner,scope,request.packets_for(owner,scope).ok_or(RouterIoError::Scope)?,deadline).await?{return Err(RouterIoError::Scope);}
             loop {
                 if let Some(binding)=self.tracker.take_peer_binding(owner,scope,&target){return Ok(Some(binding));}
@@ -151,7 +151,7 @@ impl RouterPath {
         let result=async {
             loop {
                 let now=Instant::now();if now>=deadline{return Err(RouterIoError::Timeout);}
-                let timing=self.timing();
+                let timing=self.timing(now)?;
                 match self.tracker.prepare_datagram(owner,scope,lease,peer,tag,priority,payload,timing,now) {
                     Ok(Some(data))=>return self.send(owner,scope,data.packets_for(owner,scope).ok_or(RouterIoError::Scope)?,deadline).await,
                     Ok(None)=>return Err(RouterIoError::Scope),
@@ -197,7 +197,7 @@ impl RouterPath {
             self.tracker.tick(&self.owner,&self.scope,now)?;self.ports.tick(&self.owner,&self.scope,now)?;
             if self.dispatch_pending(deadline).await? {return Ok(true);}
             if self.last_node_probe.is_none_or(|last|now.duration_since(last)>=NODE_PROBE_INTERVAL){
-                let timing=self.timing();
+                let timing=self.timing(now)?;
                 let request=self.tracker.prepare_node_probe(&self.owner,&self.scope,timing,now)?.ok_or(RouterIoError::Scope)?;
                 self.send_control(&request,deadline).await?;self.last_node_probe=Some(now);
             }
@@ -232,8 +232,8 @@ impl RouterPath {
                 if self.deliveries.len()==64||bytes>MAX_DELIVERY_BYTES-self.delivery_bytes{return Err(RouterIoError::Configuration);}
                 self.delivery_bytes+=bytes;self.deliveries.push(delivery);
             }
-            let timing=self.timing();
-            if let Some(response)=self.tracker.prepare_node_reply(&self.owner,&self.scope,&data,timing,Instant::now())?{
+            let now=Instant::now();let timing=self.timing(now)?;
+            if let Some(response)=self.tracker.prepare_node_reply(&self.owner,&self.scope,&data,timing,now)?{
                 self.send_control(&response,deadline).await?;
             }
         }

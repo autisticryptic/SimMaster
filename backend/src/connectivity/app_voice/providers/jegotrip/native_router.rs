@@ -131,6 +131,12 @@ impl Default for PathReceiver { fn default() -> Self { Self { bookkeeping: Seque
 impl fmt::Debug for PathReceiver { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.debug_struct("PathReceiver")
     .field("closed", &self.closed).field("cached_halves", &self.halves.len()).field("data", &"<redacted>").finish() } }
 impl PathReceiver {
+    pub(super) fn reset_for_peer_clock(&mut self) {
+        if self.closed { return; }
+        self.bookkeeping = SequenceBookkeeping::default(); self.halves.clear(); self.cached_bytes = 0; self.highest = None;
+        // Keep the ORIGINAL local monotonic guard; peer clock reset is not a
+        // new owner/epoch and must not renew any caller's partial deadline.
+    }
     pub fn has_partial(&self) -> bool { !self.halves.is_empty() }
     pub fn close(&mut self) { self.halves.clear(); self.cached_bytes = 0; self.closed = true; }
     pub fn on_packet(&mut self, bytes: &[u8], now: Instant) -> Result<PathInput, TransportError> {
@@ -202,6 +208,9 @@ impl PathReceiver {
 pub enum RouterConnectError { Configuration, Pending, Timeout, ClockRollback, Rejected, Protocol }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouterConnectPhase { Initial, Pending, Connected, Closed }
+fn timing_error(error: super::router_timing::TimingError) -> RouterConnectError {
+    match error { super::router_timing::TimingError::ClockRollback => RouterConnectError::ClockRollback, _ => RouterConnectError::Protocol }
+}
 
 pub struct PreparedRouterConnect {
     owner: super::session::AttemptOwner,
@@ -349,6 +358,7 @@ pub struct RouterConnectTracker {
     deadline: Instant,
     last_now: Instant,
     phase: RouterConnectPhase,
+    path_timing: super::router_timing::PathTiming,
     receiver: PathReceiver,
     common: super::transport_packets::CallAssembler,
 }
@@ -377,7 +387,7 @@ impl RouterConnectTracker {
         Ok(Self { owner, scope, router_id, nonce, access, mtu, sequence, port_clock, assigned_ids: None, node_levels: [0; 4], node_report: None, pending_feedback: 0,
             next_control_id: Some(2), pending_resolve: None, pending_peer: None, peer_binding: None, resolution: None, data: Vec::new(), data_bytes: 0,
             deadline: now.checked_add(timeout).ok_or(RouterConnectError::Configuration)?, last_now: now,
-            phase: RouterConnectPhase::Initial, receiver: PathReceiver::default(), common: super::transport_packets::CallAssembler::default() })
+            phase: RouterConnectPhase::Initial, path_timing: super::router_timing::PathTiming::new(now), receiver: PathReceiver::default(), common: super::transport_packets::CallAssembler::default() })
     }
     /// Exactly one logical port book shares this original tracker's ingress
     /// order. A new tracker/book cannot borrow already received data simply by
@@ -389,7 +399,7 @@ impl RouterConnectTracker {
     }
     pub fn phase(&self) -> RouterConnectPhase { if self.scope.is_open() { self.phase } else { RouterConnectPhase::Closed } }
     pub fn close(&mut self) {
-        self.phase = RouterConnectPhase::Closed; self.scope.close(); self.receiver.close(); self.common.close(); self.access.clear();
+        self.phase = RouterConnectPhase::Closed; self.scope.close(); self.receiver.close(); self.path_timing.close(); self.common.close(); self.access.clear();
         self.pending_resolve = None; self.pending_peer = None; self.peer_binding = None; self.resolution = None; self.data.clear(); self.data_bytes = 0;
         self.assigned_ids = None; self.node_levels.fill(0); self.node_report = None; self.pending_feedback = 0;
     }
@@ -408,6 +418,19 @@ impl RouterConnectTracker {
         now: Instant) -> Result<bool, RouterConnectError> {
         if !self.accepts(owner, scope) { return Ok(false); }
         self.check_time(now)?; Ok(true)
+    }
+    pub(super) fn timing_for(&mut self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope,
+        now: Instant) -> Result<Option<super::packet_transport::RouterTiming>, RouterConnectError> {
+        if !self.accepts(owner, scope) { return Ok(None); }
+        self.check_time(now)?;
+        match self.path_timing.timing(now) {
+            Ok(timing) => Ok(Some(timing)),
+            Err(error) => { self.close(); Err(timing_error(error)) },
+        }
+    }
+    pub(super) fn metrics_for(&self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope)
+        -> Option<super::router_timing::PathMetrics> {
+        if !self.accepts(owner, scope) { return None; } self.path_timing.metrics().ok()
     }
     pub fn next_deadline(&self) -> Option<Instant> {
         if !self.scope.is_open() { return None; }
@@ -453,7 +476,7 @@ impl RouterConnectTracker {
                 .map_err(|_| RouterConnectError::Configuration)?;
             sequence = sequence.wrapping_add(framed.len() as u16); packets.append(&mut framed);
         }
-        self.sequence = sequence; Ok(packets)
+        self.sequence = sequence; self.path_timing.note_transmission(); Ok(packets)
     }
     /// E33008: version1/0 followed by the query WITHOUT its initial arc@.
     /// Only one outstanding resolution per original path. The caller supplies
@@ -533,7 +556,7 @@ impl RouterConnectTracker {
         let body = super::native_routing::encode_routing_body(&route, payload).map_err(|_| RouterConnectError::Configuration)?;
         let packets = encode_path_packets(RouterHeader { sequence: self.sequence, word1: timing.word1, word2: timing.word2,
             byte6: timing.byte6, packet_kind: 0, fragment_part: 1 }, body.expose_to_transport(), self.mtu).map_err(|_| RouterConnectError::Configuration)?;
-        self.sequence = self.sequence.wrapping_add(packets.len() as u16);
+        self.sequence = self.sequence.wrapping_add(packets.len() as u16); self.path_timing.note_transmission();
         Ok(Some(PreparedRouterDatagram { owner: self.owner.clone(), scope: self.scope.clone(), permit, packets }))
     }
     pub(super) fn report_for(&self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope)
@@ -551,7 +574,7 @@ impl RouterConnectTracker {
         if self.pending_feedback == 0 { return Ok(None); }
         let frame = encode_feedback(RouterHeader { sequence: self.sequence, word1: timing.word1, word2: timing.word2,
             byte6: timing.byte6, packet_kind: 3, fragment_part: 1 }).map_err(|_| RouterConnectError::Protocol)?;
-        self.sequence = self.sequence.wrapping_add(1); self.pending_feedback -= 1;
+        self.sequence = self.sequence.wrapping_add(1); self.pending_feedback -= 1; self.path_timing.note_transmission();
         Ok(Some(PreparedRouterControl { owner: self.owner.clone(), scope: self.scope.clone(), packets: vec![frame] }))
     }
     /// D47FF8: original allocated node, port0, kind0/type0 and ONE byte0.
@@ -607,7 +630,7 @@ impl RouterConnectTracker {
         if body.expose_to_transport().len() + HEADER_BYTES >= self.mtu { return Err(RouterConnectError::Configuration); }
         let frame = packet(RouterHeader { sequence: self.sequence, word1: timing.word1, word2: timing.word2,
             byte6: timing.byte6, packet_kind: 0, fragment_part: 0 }, body.expose_to_transport()).map_err(|_| RouterConnectError::Configuration)?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.sequence = self.sequence.wrapping_add(1); self.path_timing.note_transmission();
         Ok(PreparedRouterControl { owner: self.owner.clone(), scope: self.scope.clone(), packets: vec![frame] })
     }
     pub fn take_resolution(&mut self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope) -> Option<RouterResolution> {
@@ -631,6 +654,13 @@ impl RouterConnectTracker {
         let mut node_report: Option<super::router_control::RouterReport> = None;
         let mut peer_reply: Option<super::router_peer::PeerReply> = None;
         for raw in packets {
+            let (header, _) = decode_path_header(raw.expose_to_transport()).map_err(|_| RouterConnectError::Protocol)?;
+            let observed = self.path_timing.observe(header, now).map_err(timing_error)?;
+            if observed.reset_receiver { self.receiver.reset_for_peer_clock(); }
+            if observed.feedback_due {
+                if self.pending_feedback == 64 { return Err(RouterConnectError::Protocol); }
+                self.pending_feedback += 1;
+            }
             let path = self.receiver.on_packet(raw.expose_to_transport(), now).map_err(|_| RouterConnectError::Protocol)?;
             let message = match path {
                 PathInput::Probe { .. } => {

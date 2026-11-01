@@ -224,3 +224,22 @@ async fn original_tcp_tls_numeric_peer_negotiation_and_owned_data_keep_same_sock
 
 #[tokio::test]
 async fn original_tcp_tls_logical_resolution_peer_negotiation_and_owned_data_keep_same_socket(){original_peer_flow(true).await;}
+
+#[tokio::test]
+async fn production_router_echo_and_delay_measurements_come_from_original_tls_headers(){
+ let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
+ let p=policy(&cert.root,listener.local_addr().unwrap().port());let server=cert.server_config(&tokio_rustls::rustls::version::TLS13);
+ let worker=tokio::spawn(async move{tokio::time::timeout(Duration::from_secs(8),async move{
+  let(tcp,_)=listener.accept().await.unwrap();let mut tls=tokio_rustls::TlsAcceptor::from(server).accept(tcp).await.unwrap();let _connect=packet(&mut tls).await;
+  let mut connected=reply();connected[6..8].copy_from_slice(&1000u16.to_be_bytes());tls.write_all(&connected).await.unwrap();tls.flush().await.unwrap();
+  let probe=packet(&mut tls).await;assert_node_packet(&probe,0);
+  let echoed=u16::from_be_bytes([probe[4],probe[5]]);assert!((1000..16000).contains(&echoed));assert_eq!(probe[6],0);
+  let local=u16::from_be_bytes([probe[2],probe[3]]).max(1);let mut alive=node_wire(41,1);alive[8..10].copy_from_slice(&local.to_be_bytes());alive[10]=17;
+  tls.write_all(&alive).await.unwrap();tls.flush().await.unwrap();let mut end=[0;1];assert!(matches!(tls.read(&mut end).await,Ok(0)|Err(_)));
+ }).await.unwrap()});
+ let original=owner();let scope=RpcConnectionScope::fresh();let mut path=RouterPath::open(original.clone(),scope.clone(),&p,&[],timeouts()).await.unwrap();
+ assert_eq!(path.path_metrics(&original,&scope).unwrap().echoed_delay_ms,None);
+ let _lease=path.listen(&original,&scope,ListenProtocol::Arc,None,false,Instant::now()+Duration::from_secs(3)).await.unwrap().unwrap();
+ let measured=path.path_metrics(&original,&scope).unwrap();assert!(measured.echoed_delay_ms.is_some());assert_eq!(measured.peer_loss,Some(17));
+ assert!(path.path_metrics(&owner(),&scope).is_none());drop(path);assert!(!scope.is_open());worker.await.unwrap();
+}

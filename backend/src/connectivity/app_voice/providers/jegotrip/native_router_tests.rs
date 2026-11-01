@@ -955,3 +955,53 @@ fn prepared_channel_datagram_needs_original_live_port_peer_and_generation(){
     assert!(prepared.packets_for(&owner,&scope).is_none());assert!(tracker.prepare_datagram(&owner,&scope,&replacement,&peer,77,0,b"new",timing(),now).unwrap().is_some());
     assert_eq!(protocol.phase(),super::super::arc_session::ArcPhase::Initial);
 }
+
+#[test]
+fn original_tls_header_measurements_feed_scoped_timing_and_not_node_or_sdk_grants(){
+    use super::super::tls_engine::tests::{Certificates,endpoint_setup};
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    let (protocol,owner,scope,mut engine,mut server,now)=endpoint_setup(&cert,&tokio_rustls::rustls::version::TLS13);
+    let mut tracker=tracker(&owner,&scope,12001,now);tracker.prepare(&owner,&scope,timing(),now).unwrap();
+    let mut initial=control_reply(1,0,true,None,0x55667788,b"");initial[4..6].fill(0);
+    let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&initial],now);tracker.on_packets(&owner,&scope,input,now).unwrap();
+    let mut probe=wire(5000,2,1,&[]);probe[2..4].copy_from_slice(&1000u16.to_be_bytes());probe[4..6].copy_from_slice(&80u16.to_be_bytes());
+    let at=now+Duration::from_millis(100);let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&probe],at);tracker.on_packets(&owner,&scope,input,at).unwrap();
+    assert_eq!(tracker.metrics_for(&owner,&scope).unwrap().echoed_delay_ms,Some(20));assert!(tracker.take_data(&owner,&scope).unwrap().is_empty());
+    let send=now+Duration::from_millis(125);let measured=tracker.timing_for(&owner,&scope,send).unwrap().unwrap();
+    assert_eq!((measured.word1,measured.word2,measured.byte6),(125,1025,0));
+    let feedback=tracker.prepare_feedback(&owner,&scope,measured,send).unwrap().unwrap();let bytes=feedback.packets_for(&owner,&scope).unwrap()[0].expose_to_transport();
+    assert_eq!(&bytes[2..6],&[0,125,4,1]);assert_eq!(bytes[7],0x13);
+    assert!(tracker.timing_for(&control_owner(),&scope,now-Duration::from_secs(1)).unwrap().is_none());
+    assert_eq!(protocol.phase(),super::super::arc_session::ArcPhase::Initial);
+}
+
+#[test]
+fn peer_clock_reset_clears_old_router_halves_without_renewing_original_query_deadline(){
+    use super::super::tls_engine::tests::{Certificates,endpoint_setup};
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    let (_protocol,owner,scope,mut engine,mut server,now)=endpoint_setup(&cert,&tokio_rustls::rustls::version::TLS13);
+    let mut tracker=tracker(&owner,&scope,12001,now);finish_fixture_connect(&mut tracker,&owner,&scope,&mut engine,&mut server,now);
+    let r=resolution_reference("arc@AccountEntry",98);let deadline=now+Duration::from_secs(4);
+    tracker.prepare_resolve(&owner,&scope,resolution_endpoint(&r),timing(),deadline,now).unwrap();
+    let half=wire(41,0,2,b"old-prefix");let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&half],now);
+    tracker.on_packets(&owner,&scope,input,now).unwrap();assert!(tracker.receiver.has_partial());
+    let mut reset=wire(42,2,1,&[]);reset[2..4].copy_from_slice(&20000u16.to_be_bytes());
+    let at=now+Duration::from_millis(1);let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&reset],at);
+    tracker.on_packets(&owner,&scope,input,at).unwrap();assert!(!tracker.receiver.has_partial());assert!(scope.is_open());
+    assert_eq!(tracker.next_deadline(),Some(deadline));assert_eq!(tracker.next_control_id,Some(3));
+    let mut late=wire(42,0,3,b"late-tail");late[2..4].copy_from_slice(&20000u16.to_be_bytes());
+    let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&late],at);tracker.on_packets(&owner,&scope,input,at).unwrap();
+    assert!(tracker.take_data(&owner,&scope).unwrap().is_empty());assert_eq!(tracker.tick(&owner,&scope,deadline).err(),Some(RouterConnectError::Timeout));
+}
+
+#[test]
+fn malformed_later_packet_retires_original_timing_observation_and_prepared_output(){
+    use super::super::tls_engine::tests::{Certificates,endpoint_setup};
+    let cert=Certificates::generate("DNS:fixture.invalid");
+    let (_protocol,owner,scope,mut engine,mut server,now)=endpoint_setup(&cert,&tokio_rustls::rustls::version::TLS13);
+    let mut tracker=tracker(&owner,&scope,12001,now);finish_fixture_connect(&mut tracker,&owner,&scope,&mut engine,&mut server,now);
+    let measured=tracker.timing_for(&owner,&scope,now).unwrap().unwrap();let prepared=tracker.prepare_node_probe(&owner,&scope,measured,now).unwrap().unwrap();
+    let probe=wire(41,2,1,&[]);let input=endpoint_peer_group(&owner,&scope,&mut engine,&mut server,&[&probe,&[0xff]],now);
+    assert!(tracker.on_packets(&owner,&scope,input,now).is_err());assert!(tracker.metrics_for(&owner,&scope).is_none());
+    assert!(prepared.packets_for(&owner,&scope).is_none());assert!(tracker.timing_for(&owner,&scope,now).unwrap().is_none());
+}

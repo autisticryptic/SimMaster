@@ -76,6 +76,7 @@ pub(crate) mod native_routing;
 pub(crate) mod router_ports;
 pub(crate) mod router_control;
 pub(crate) mod router_peer;
+pub(crate) mod router_timing;
 pub mod native_channel;
 
 // Keep the existing API/provider id stable while moving the implementation.
