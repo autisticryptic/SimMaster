@@ -245,7 +245,7 @@ DeepLinkUtil.getPhoneLoginToken(Context)
 | TLS | 原 NetSsl 使用 memory BIO；TLS plaintext read 不保证一读一包 | SimAdmin 要求显式 root/authority、证书验证与固定预算，不采用宽松 verifier |
 | Common | 已支持模式的请求/结果流可由长度/计数自定界；mode 3 有原分片规则 | 不能凭 TLS read 边界分包，也不能擅加内层 BE32 长度 |
 
-**`8bd0439`已移植当前App的endpoint TLS与Router控制组件，但主启动链还未完成。** 原`ClientPathI::connect 0xD2E034`把tls交给tlsp；`0xE1000C`先创建真实TLS TCP对象，`0xE10064`再包PacketSender；`0xDFF2A8→0xE712DC`先加BE32长度再交TLS。所以此分支为**packet→BE32 PacketSender→endpoint TLS→raw socket**，不能套用密文外的FF FF06/PacketSender。新端点包品牌不能投成Common/ARC plaintext，root/authority/SNI/原scope/固定deadline及校验保持；原生明文缓冲退休清除，不推断所有传输等价。
+**`8bd0439`已移植当前App的endpoint TLS与Router控制组件，主启动链随后在原生方向接通。** 截至`d814176`，原生Router/SARC/Common actor 已被默认ARC运行时选中，`getAppConfigs` bootstrap handoff、存储配置自动装配（`router_common`+`bootstrap_via_router`）、真实`current_user_uri`派生与默认`#SipGateway`托管对象均已实现，并由账号级端到端测试与两套Actions/官方制品核验；配置形状与运行步骤见[原生托管交付说明](JEGOTRIP_NATIVE_HOSTING_DELIVERY.md)。仍未完成的是真实设备部署与真实账号验收（需单独授权）。原`ClientPathI::connect 0xD2E034`把tls交给tlsp；`0xE1000C`先创建真实TLS TCP对象，`0xE10064`再包PacketSender；`0xDFF2A8→0xE712DC`先加BE32长度再交TLS。所以此分支为**packet→BE32 PacketSender→endpoint TLS→raw socket**，不能套用密文外的FF FF06/PacketSender。新端点包品牌不能投成Common/ARC plaintext，root/authority/SNI/原scope/固定deadline及校验保持；原生明文缓冲退休清除，不推断所有传输等价。
 
 `-ri`保留端点原Router关联。新原控制状态机编码正ID三个BE32词或负ID两个词、原版本和`id=Router/arcVer`，只接受原endpoint TLS品牌、匹配call-id/bool/非零逻辑ID/footer和完整有效组，不把后续坏包藏在早期赋值后。控制fresh路由12个零字节来自`D619A0/D614F8/D61FB8`原构造，不是猜OS地址；分配ID不是SDK/媒体权限。ConnectionI factory返回base+328 API子对象，其createAgent在`D89880→D894AC`；primary槽+24却是setSecurity，不能混用。ObjectAgent直接调用`DCC42C→DA88B8`把原渲染对象写入id，正向证实Router目标。
 
@@ -436,7 +436,7 @@ App 显式设置 server address，**不等于证明 native 内部永远不会解
 | --- | --- | --- |
 | 自动 token 续期 | 自有账号的授权请求/响应、TTL/轮换/撤销错误、设备绑定、活动会话交接 | 手工重新导入；重连不冒充续期 |
 | 额外安全验证/迁移、原地重新认证 | 原服务挑战续接、认证材料/撤销与旧运行交接证据 | 已实现正常密码登录/开通；挑战只报告，暂不自动完成或覆盖旧line |
-| 默认部署上下文自动装配 | 实际匹配的HTTP/native完整配置和原始选择证据 | 仍需安装侧私有上下文；partial共享HTTP提取物不是完整配置 |
+| 默认部署上下文自动装配 | 实际匹配的HTTP/native完整配置和原始选择证据 | 原生路由已实现并验证：`router_common`+`bootstrap_via_router`自动装配，目的地只来自匹配回复，空`gateway_uri`按loginSession身份派生，未指定托管对象时用`#SipGateway`；HTTP侧私有部署上下文与真实服务选择仍需安装侧提供 |
 | 实际部署参数与长期在线 | 原账号完整参数、服务选择的模式、断线/到期/长时间接收观察 | 不从静态常量或缓存状态猜 readiness |
 | 压缩 wire 的完整互通 | 实际邀请/应答样本与原 SDK 上下文，必要时核对预置字典或流状态 | 当前支持有界普通 zlib＋Base64 子集 |
 | Locator / NetStream / 全部 Router-Channel | 原调用者、wire schema、路由/缓存/重传与释放状态机 | 局部结构/codec 不扩充为完整 runtime |
