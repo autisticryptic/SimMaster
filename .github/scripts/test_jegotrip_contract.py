@@ -762,6 +762,12 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('RuntimeProfile::supplied_common_bootstrap(inputs,RuntimeCommonInputs{router,account_reference:"",access:&access,', config)
         self.assertIn('let derived_uri=p.gateway_uri.expose_to_backend().is_empty()', config)
         self.assertIn('if derived_uri && !router_bootstrap { return Err(INVALID); }', config)
+        # The account-level closed loop must run through the NEW route with the
+        # PRODUCTION factory, not only through the synthetic connector.
+        tests = (MOD / 'runtime_common_backend_tests.rs').read_text(encoding='utf-8')
+        self.assertIn('native_bootstrap_account_hosts_and_persists_received_sip_message_end_to_end', tests)
+        self.assertIn('AccountManager::new(temp.database.clone())', tests)
+        self.assertIn('"bootstrap_via_router"]=serde_json::json!({"routing":[],"handoff_timeout_ms":10000})', tests)
 
     def test_bootstrap_deadline_and_real_two_connection_regressions_are_selected(self):
         backend = (MOD / 'runtime_backend.rs').read_text(encoding='utf-8')

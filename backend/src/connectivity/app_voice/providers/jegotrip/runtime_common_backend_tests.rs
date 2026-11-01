@@ -1,7 +1,7 @@
 //! Actions-only native profile -> shared HostingBackend/actor integration.
 use super::*;
 use super::super::{common_runtime::tests::CommonPeer,netstream_runtime::tests::{owner,policy},
-    tls_engine::tests::Certificates,rpc_envelope::{encode_reply,decode_request},rpc_stream::{Writer,Reader},
+    tls_engine::tests::Certificates,rpc_envelope::{encode_reply,encode_request,decode_reply,decode_request},rpc_stream::{Writer,Reader},
     runtime_connector::{ConnectFuture,ConnectError}};
 use std::sync::atomic::{AtomicUsize,Ordering};
 use tokio::{net::TcpListener,io::AsyncReadExt};
@@ -226,6 +226,115 @@ async fn changed_native_sdk_reference_is_rejected_before_any_tcp_or_backend_slot
     let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=profile(&cert.root,listener.local_addr().unwrap().port());let connector=Arc::new(LegacyDenied{calls:AtomicUsize::new(0)});let(backend,_events)=NativeHostingBackend::new(p,connector.clone());
     assert_eq!(backend.login(owner(),SdkLoginRequest{server_address:"AccountEntry:sarc -h 42.8 -p 98;",..request(&cert.root)}).await,Err(BackendFailure::Unavailable));assert!(lock(&backend.state).slot.is_none());assert_eq!(connector.calls.load(Ordering::Acquire),0);
     assert!(tokio::time::timeout(Duration::from_millis(20),listener.accept()).await.is_err());
+}
+#[tokio::test]
+async fn native_bootstrap_account_hosts_and_persists_received_sip_message_end_to_end(){
+    let cert=Certificates::generate("IP:127.0.0.1");
+    let front=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
+    let bootstrap_listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
+    let destination_listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
+    let port=front.local_addr().unwrap().port();
+    let bootstrap_port=bootstrap_listener.local_addr().unwrap().port();let destination_port=destination_listener.local_addr().unwrap().port();
+    let config=cert.server_config(&TLS13);let bootstrap_config=config.clone();
+    let relay=async move{for target in [bootstrap_port,destination_port]{
+        let(mut inbound,_)=front.accept().await.unwrap();
+        let mut outbound=tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST,target)).await.unwrap();
+        tokio::spawn(async move{let _=tokio::io::copy_bidirectional(&mut inbound,&mut outbound).await;});
+    }};
+    let server=async move{
+        let bootstrap=async move{let mut peer=CommonPeer::open(bootstrap_listener,bootstrap_config).await;
+            let packet=peer.next().await.unwrap();assert_eq!(packet[0],0);let call=decode_request(&packet[1..]).unwrap();
+            assert_eq!(call.method,b"getAppConfigs.AccountEntry.Account");
+            assert_eq!(call.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"BootEntry");
+            peer.send(&[reply(call.call_id,&bootstrap_result())]).await;while peer.next().await.is_some(){}
+        };
+        let destination=async move{let mut peer=CommonPeer::open(destination_listener,config).await;
+            let packet=peer.next().await.unwrap();assert_eq!(packet[0],0);let call=decode_request(&packet[1..]).unwrap();
+            assert_eq!(call.method,b"loginSession.AccountEntry.Account");
+            assert_eq!(call.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"DestEntry");
+            peer.send(&[reply(call.call_id,&login_result_for_account())]).await;
+            // The account runtime registers hosting by itself once authenticated.
+            let(uri,flag)=hosting_call(&mut peer).await;
+            assert_eq!(uri.as_slice(),b"[username:fixture-user@account-domain.invalid]");
+            assert_eq!(flag.as_slice(),b"4");
+            // One original Sip.Request text message on the configured receiver.
+            let mut args=Writer::versioned().unwrap();args.bytes(b"Sip.Request").unwrap();
+            args.properties(&[RpcProperty{key:b"Sip.Message.From",value:b"fixture-sender"},
+                RpcProperty{key:b"Sip.Message.Time",value:b"1700000000123"},
+                RpcProperty{key:b"Sip.MessageGw.Oid",value:b"fixture-gateway-oid"}]).unwrap();
+            args.bytes("fixture-original-sms 🥘".as_bytes()).unwrap();
+            let envelope=encode_request(91,&[RpcProperty{key:b"id",value:b"#fixture-client"},
+                RpcProperty{key:b"domain",value:b"fixture-domain"},RpcProperty{key:b"__magic",value:&[0,0xff]}],
+                super::super::rpc_incoming::ONLINE_MESSAGE_METHOD.as_bytes(),args.finish().expose_to_transport()).unwrap();
+            let mut incoming=vec![0];incoming.extend_from_slice(envelope.expose_to_transport());peer.send(&[incoming]).await;
+            // Polls may arrive first; only the original DIRECT reply proves delivery.
+            loop{
+                let packet=peer.next().await.unwrap();
+                if packet[0]==1{let reply=decode_reply(&packet[1..]).unwrap();assert_eq!(reply.call_id,91);
+                    assert_eq!(reply.result_stream,b"\0\x01\0\0\0\0");break;}
+                let call=decode_request(&packet[1..]).unwrap();
+                let mut args=Reader::versioned(call.arguments).unwrap();args.bytes().unwrap();args.bytes().unwrap();
+                let payload=super::super::rpc_batch::read_payload(&mut args).unwrap();
+                peer.send(&[reply(call.call_id,&super::tests::swap_result(None,true,payload.fields))]).await;
+            }
+            let(_uri,flag)=hosting_call(&mut peer).await;assert_eq!(flag.as_slice(),b"3");
+            let packet=peer.next().await.unwrap();let call=decode_request(&packet[1..]).unwrap();
+            assert_eq!(call.method,b"logoutSession.AccountEntry.Account");
+            peer.send(&[reply(call.call_id,b"\0\x01\0\0\0\0")]).await;while peer.next().await.is_some(){}
+        };
+        let _=tokio::join!(bootstrap,destination);
+    };
+    let client=async move{
+        let temp=super::super::account_test_support::TempDatabase::new();
+        let manager=super::super::account_runtime::AccountManager::new(temp.database.clone());
+        let created=manager.create(bootstrap_account_config(&cert.root,port),100).await.unwrap();
+        let line=created.account.line_id.clone();
+        manager.start(&line,1,100).await.unwrap();
+        let hosted=tokio::time::timeout(Duration::from_secs(10),async{loop{
+            let state=manager.get(&line,100).await.unwrap();
+            if state.phase=="hosted"{return state;}
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }}).await.unwrap();
+        assert!(hosted.incoming_message_ready);assert!(!hosted.incoming_call_ready);
+        assert_eq!(hosted.provider_availability,"available");
+        let inbox=tokio::time::timeout(Duration::from_secs(6),async{loop{
+            let rows=manager.inbox(&line,50).unwrap();
+            if rows.first().is_some_and(|row|row.reply_state=="direct_submitted"){return rows;}
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }}).await.unwrap();
+        assert_eq!(inbox.len(),1);assert_eq!(inbox[0].classification,"sms");
+        let messages=manager.messages(&line,50).unwrap();assert_eq!(messages.len(),1);
+        assert_eq!(messages[0].classification,"sms");
+        assert_eq!(messages[0].message.content,"fixture-original-sms 🥘");
+        assert_eq!(messages[0].message.phone_number,"fixture-sender");
+        manager.stop(&line,1,100).await.unwrap();
+        assert_eq!(manager.get(&line,100).await.unwrap().phase,"stopped");
+    };
+    let _=tokio::join!(server,client,relay);
+}
+fn login_result_for_account()->Vec<u8>{
+    let mut w=Writer::new();w.boolean(true).unwrap();w.bytes(b"fixture-user").unwrap();w.bytes(b"fixture-auth").unwrap();
+    w.properties(&[RpcProperty{key:b"mainAccountServer",value:b"DestEntry"},
+        RpcProperty{key:b"mainAccount",value:b"fixture-main-account"}]).unwrap();
+    w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()
+}
+/// Stored config for the SAME native bootstrap route, expressed only as private JSON:
+/// the account manager must assemble it without any hand-typed URI or destination.
+fn bootstrap_account_config(root:&str,port:u16)->super::super::account_config::AccountConfig{
+    let mut json=super::super::account_test_support::config_json(root);
+    json["credentials"]["sdk"]["server_address"]=serde_json::json!(BOOTSTRAP_SDK);
+    json["credentials"]["sdk"]["root_der_base64"]=serde_json::json!(root);
+    json["profile"]["route"]=serde_json::json!({"router_common":{
+        "reference":format!("Router:tls -h 127.0.0.1 -p {port} -ri 12001;"),
+        "anchors":[{"router_id":12001,"host":"127.0.0.1","port":port,"authority":"127.0.0.1","root_der_base64":root,"enable_sni":false}],
+        "access":[],"endpoint_index":0,"resolved_host_index":0,"startup_timeout_ms":5000,"attempt_timeout_ms":8000,"compress_above":null}});
+    json["profile"]["authority"]=serde_json::json!("");json["profile"]["enable_sni"]=serde_json::json!(false);
+    for key in ["domain_name","domain_id","application_id","device_info_cc"]{json["profile"][key]=serde_json::Value::Null;}
+    json["profile"]["gateway_uri"]=serde_json::json!("");
+    json["profile"]["gateway_metadata"]=serde_json::json!([]);
+    json["profile"]["bootstrap_via_router"]=serde_json::json!({"routing":[],"handoff_timeout_ms":10000});
+    json["profile"]["incoming"]["receiver_kind"]=serde_json::json!(b"Sip.Request");
+    serde_json::from_value(json).unwrap()
 }
 #[tokio::test]
 async fn cancelled_native_backend_connect_retires_original_slot_and_releases_unattached_tcp(){
