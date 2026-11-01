@@ -255,7 +255,7 @@ async fn native_bootstrap_account_hosts_and_persists_received_sip_message_end_to
             peer.send(&[reply(call.call_id,&login_result_for_account())]).await;
             // The account runtime registers hosting by itself once authenticated.
             let(uri,flag)=hosting_call(&mut peer).await;
-            assert_eq!(uri.as_slice(),b"[username:fixture-user@account-domain.invalid]");
+            assert_eq!(uri.as_slice(),b"[username:fixture-account@account-domain.invalid]");
             assert_eq!(flag.as_slice(),b"4");
             // One original Sip.Request text message on the configured receiver.
             let mut args=Writer::versioned().unwrap();args.bytes(b"Sip.Request").unwrap();
