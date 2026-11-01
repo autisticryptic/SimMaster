@@ -197,6 +197,9 @@ fn deployment_json(root:&str,encrypted:bool)->Value {
     for key in ["account_identity","phone_login_token","tls_only","expires_at_unix_seconds"] { sdk.as_object_mut().unwrap().remove(key); }
     for key in ["sip_number","sip_password","enrollment_confirmed"] { hosting.as_object_mut().unwrap().remove(key); }
     let mut profile=native["profile"].clone();profile["incoming"]["receiver_kind"]=json!(b"Sip.Request");
+    // The private mirror always carries the native bootstrap route selector;
+    // the direct-carrier fixture leaves it absent.
+    profile["bootstrap_via_router"]=Value::Null;
     json!({"version":1,"http":{
         "base_url":"https://app-fixture.invalid/","anonymous_token":"fixture-anonymous","signature_salt":"fixture-signing-salt",
         "password_salt":"fixture-password-salt:","sip_password_key":"0123456789abcdefABCDEFGH","device_id":"fixture-http-device",
