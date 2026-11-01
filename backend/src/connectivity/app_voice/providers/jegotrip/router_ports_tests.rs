@@ -275,3 +275,49 @@ fn admission_order_exhaustion_fails_without_reusing_an_old_receipt_or_port_birth
     assert_eq!(ports.reserve(&owner,&scope,ListenProtocol::Arc,None,false,now+Duration::from_secs(5),now).err(),Some(PortError::Exhausted));
     assert!(ports.state.lock().unwrap().ports.is_empty()); assert_eq!(ports.clock.inner.next.load(Ordering::Acquire),u64::MAX);
 }
+
+#[test]
+fn channel_claim_requires_registered_original_port_and_excludes_retained_pre_claim_input(){
+ let (owner,scope,ports,now)=setup(10000);let lease=reserve(&ports,Some(12000),now);
+ assert!(lease.claim_channel(&owner,&scope,&ports.clock).unwrap().is_none());observe_host(&ports,now);
+ let before=incoming(&ports,12000,now).unwrap();let claim=lease.claim_channel(&owner,&scope,&ports.clock).unwrap().unwrap();
+ assert!(before.for_channel(&owner,&scope,&claim).is_none());let after=incoming(&ports,12000,now).unwrap();
+ let (_,bytes,received)=after.for_channel(&owner,&scope,&claim).unwrap();assert_eq!(bytes,b"unaccepted-channel");assert_eq!(received,now);
+ assert!(after.for_channel(&fixture_owner(),&scope,&claim).is_none());
+}
+
+#[test]
+fn a_shared_listen_generation_cannot_create_a_second_or_restarted_channel(){
+ let (owner,scope,ports,now)=setup(10000);observe_host(&ports,now);let lease=reserve(&ports,Some(12000),now);let shared=lease.clone();
+ let claim=lease.claim_channel(&owner,&scope,&ports.clock).unwrap().unwrap();
+ assert_eq!(shared.claim_channel(&owner,&scope,&ports.clock).err(),Some(PortError::InUse));drop(claim);
+ assert!(lease.address_for(&owner,&scope).is_none());assert!(shared.claim_channel(&owner,&scope,&ports.clock).unwrap().is_none());
+ assert!(scope.is_open());
+}
+
+#[test]
+fn foreign_clock_owner_or_scope_cannot_consume_original_channel_claim(){
+ let (owner,scope,ports,now)=setup(10000);observe_host(&ports,now);let lease=reserve(&ports,Some(12000),now);
+ let clock=PortClock::for_original(owner.clone(),scope.clone());let other=fixture_owner();let other_scope=RpcConnectionScope::fresh();
+ assert!(lease.claim_channel(&owner,&scope,&clock).unwrap().is_none());assert!(lease.claim_channel(&other,&scope,&ports.clock).unwrap().is_none());
+ assert!(lease.claim_channel(&owner,&other_scope,&ports.clock).unwrap().is_none());assert!(!lease.inner.channel_claimed.load(Ordering::Acquire));
+ assert!(lease.claim_channel(&owner,&scope,&ports.clock).unwrap().is_some());
+}
+
+#[test]
+fn old_channel_claim_and_transmit_permit_cannot_release_or_enter_a_reused_port(){
+ let (owner,scope,ports,now)=setup(10000);observe_host(&ports,now);let lease=reserve(&ports,Some(12000),now);
+ let claim=lease.claim_channel(&owner,&scope,&ports.clock).unwrap().unwrap();let permit=claim.permit(&owner,&scope,&ports.clock).unwrap();
+ let old=incoming(&ports,12000,now).unwrap();claim.release();let new=reserve(&ports,Some(12000),now);let fresh=new.claim_channel(&owner,&scope,&ports.clock).unwrap().unwrap();
+ assert!(old.for_channel(&owner,&scope,&fresh).is_none());assert!(permit.address_for(&owner,&scope).is_none());drop(claim);drop(lease);
+ assert!(fresh.address_for(&owner,&scope).is_some());assert!(incoming(&ports,12000,now).unwrap().for_channel(&owner,&scope,&fresh).is_some());
+}
+
+#[test]
+fn channel_claim_order_exhaustion_burns_generation_without_reusing_old_admission(){
+ let (owner,scope,ports,now)=setup(10000);observe_host(&ports,now);let lease=reserve(&ports,Some(12000),now);
+ ports.clock.inner.next.store(u64::MAX,Ordering::Release);
+ assert_eq!(lease.claim_channel(&owner,&scope,&ports.clock).err(),Some(PortError::Exhausted));
+ assert_eq!(lease.claim_channel(&owner,&scope,&ports.clock).err(),Some(PortError::InUse));
+ assert_eq!(ports.clock.inner.next.load(Ordering::Acquire),u64::MAX);
+}

@@ -351,9 +351,15 @@ fn extended_transmit_reference_bounds_precede_narrowing_and_ack_only_emission(){
 
 #[test]
 fn receive_retention_budget_includes_existing_ordered_partial_and_future_gap_bodies(){
- let now=Instant::now();let mut c=ready(now,0x9000);let mut body=vec![0xfe];body.extend_from_slice(&vec![b'x';MAX_BYTES/2+4096]);
- c.on_packet(data(0x9001,0,&body).expose_to_transport(),now).unwrap();assert!(c.records.retained_bytes()>MAX_BYTES/2);
- assert_eq!(c.on_packet(data(0x9003,0,&body).expose_to_transport(),now).err(),Some(ChannelError::Window));
+ let now=Instant::now();let mut c=ready(now,0x9000);let mut body=vec![0xfe];body.extend_from_slice(&vec![b'x';MAX_BYTES/16]);
+ // Accumulate through legal (<128KiB) lower-layer packets rather than an
+ //oversized fixture that would fail before reaching aggregate accounting.
+ for index in 1..=9{c.on_packet(data(0x9000+index,0,&body).expose_to_transport(),now).unwrap();}
+ assert!(c.records.retained_bytes()>MAX_BYTES/2);
+ // DATA10 is missing. Six later legal packets fit; the seventh crosses the
+ //aggregate partial+pending bound even though each component still fits.
+ for index in 11..=16{c.on_packet(data(0x9000+index,0,&body).expose_to_transport(),now).unwrap();}
+ assert_eq!(c.on_packet(data(0x9011,0,&body).expose_to_transport(),now).err(),Some(ChannelError::Window));
  assert_eq!(c.records.retained_bytes(),0);assert!(c.received.is_empty());
 }
 
@@ -373,4 +379,18 @@ fn uninitialised_ack_zero_halfway_from_pre_send_reset_is_ignored_not_fatal(){
  assert_eq!(native_channel::decode_packet(HeaderMode::Basic,start.expose_to_transport()).unwrap().sequence,0x8000);
  assert!(c.on_packet(wire(0x9000,PacketKind::Start,0,0,0,&[],false,&[]).expose_to_transport(),now).unwrap().is_empty());
  assert!(!c.closed);assert!(!c.start_acked);assert!(!c.ready());
+}
+
+#[test]
+fn delayed_channel_admission_uses_original_receipt_for_partial_and_gap_expiry(){
+ let now=Instant::now();for sequence in [0x9001,0x9002]{
+  let mut c=ready(now,0x9000);let packet=data(sequence,0,&[0xfe,b'x']);
+  assert_eq!(c.on_packet_admitted(packet.expose_to_transport(),now,now+Duration::from_secs(2)).err(),Some(ChannelError::Timeout));assert!(c.closed);
+ }
+}
+
+#[test]
+fn future_receipt_timestamp_is_rejected_without_delivering_a_complete_record(){
+ let now=Instant::now();let mut c=ready(now,0x9000);let packet=data(0x9001,0,&[0xff,b'x']);
+ assert_eq!(c.on_packet_admitted(packet.expose_to_transport(),now+Duration::from_millis(1),now).err(),Some(ChannelError::ClockRollback));assert!(c.closed);
 }

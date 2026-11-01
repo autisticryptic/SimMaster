@@ -284,10 +284,14 @@ impl ChannelCore {
         Ok(())
     }
     pub fn on_packet(&mut self, bytes: &[u8], now: Instant) -> Result<Vec<TransportBytes>, ChannelError> {
-        let result = self.receive(bytes, now); if result.is_err() { self.close(); } result
+        self.on_packet_admitted(bytes, now, now)
     }
-    fn receive(&mut self, bytes: &[u8], now: Instant) -> Result<Vec<TransportBytes>, ChannelError> {
+    pub fn on_packet_admitted(&mut self, bytes: &[u8], admitted: Instant, now: Instant) -> Result<Vec<TransportBytes>, ChannelError> {
+        let result = self.receive(bytes, admitted, now); if result.is_err() { self.close(); } result
+    }
+    fn receive(&mut self, bytes: &[u8], admitted: Instant, now: Instant) -> Result<Vec<TransportBytes>, ChannelError> {
         self.check(now)?;
+        if admitted > now { return Err(ChannelError::ClockRollback); }
         // Peer segmentation has its own MTU. The local transmit budget is not
         //a guessed inbound MTU negotiation; receive allocation stays bounded.
         if bytes.len() > MAX_BYTES { return Err(ChannelError::Window); }
@@ -356,7 +360,7 @@ impl ChannelCore {
                 }
                 let retained = self.records.retained_bytes() + self.received.values().map(|old| old.body.expose_to_transport().len()).sum::<usize>();
                 if self.received.len() >= MAX_PENDING || body.len() > MAX_BYTES.saturating_sub(retained) { return Err(ChannelError::Window); }
-                self.received.insert(root, ReceivedRoot { previous, fingerprint, body: TransportBytes::from_bytes(body.to_vec()), admitted: now });
+                self.received.insert(root, ReceivedRoot { previous, fingerprint, body: TransportBytes::from_bytes(body.to_vec()), admitted });
             }
         }
         let carried_gap = self.gap_end;
@@ -393,6 +397,9 @@ impl ChannelCore {
         if output_bytes + self.records.retained_bytes() + self.received.values().map(|item| item.body.expose_to_transport().len()).sum::<usize>() > MAX_BYTES {
             return Err(ChannelError::Window);
         }
+        // A delayed, already-expired first partial/gap cannot be published or
+        //ACKed just because its protocol parsing happened later than receipt.
+        self.check(now)?;
         Ok(output)
     }
 }

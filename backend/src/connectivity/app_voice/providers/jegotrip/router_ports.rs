@@ -14,6 +14,7 @@ struct ClockState { next: AtomicU64, claimed: AtomicBool }
 /// This is local admission ordering, never a wire sequence, nonce or RPC ID.
 #[derive(Clone)]
 pub(super) struct PortClock { owner: AttemptOwner, scope: RpcConnectionScope, inner: Arc<ClockState> }
+#[derive(Clone)]
 pub(super) struct PortOrder { inner: Arc<ClockState>, value: u64 }
 impl PortClock {
     pub fn for_original(owner: AttemptOwner, scope: RpcConnectionScope) -> Self {
@@ -104,7 +105,7 @@ impl State {
 
 struct LeaseInner {
     state: Weak<Mutex<State>>, owner: AttemptOwner, scope: RpcConnectionScope,
-    port: u16, generation: u64, birth: PortOrder,
+    port: u16, generation: u64, birth: PortOrder, channel_claimed: AtomicBool,
 }
 impl Drop for LeaseInner {
     fn drop(&mut self) {
@@ -139,12 +140,41 @@ impl PortLease {
         let address = self.address_for_clock(owner, scope, clock)?;
         Some(PortTransmitPermit { lease: Arc::downgrade(&self.inner), address })
     }
+    /// One non-resumable Channel may claim a listen generation. Even after the
+    ///claim is dropped, this generation cannot initialise a replacement cipher.
+    pub fn claim_channel(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, clock: &PortClock)
+        -> Result<Option<ChannelLease>, PortError> {
+        if self.address_for_clock(owner, scope, clock).is_none() { return Ok(None); }
+        if self.inner.channel_claimed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() { return Err(PortError::InUse); }
+        // Exhaustion burns this generation's claim rather than reopening it.
+        let birth = clock.stamp()?;
+        Ok(Some(ChannelLease { lease: self.clone(), birth }))
+    }
     pub fn release(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
         if !self.original(owner, scope) { return false; }
         let Some(state) = self.inner.state.upgrade() else { return false; };
         let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
         state.release(self.inner.port, self.inner.generation)
     }
+}
+
+/// A linear Channel claim, separate from cloneable same-protocol listen leases.
+/// Its admission order excludes already retained traffic from a later session.
+pub(super) struct ChannelLease { lease: PortLease, birth: PortOrder }
+impl ChannelLease {
+    pub fn lease(&self) -> &PortLease { &self.lease }
+    pub fn address_for(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Option<LogicalAddress> {
+        self.lease.address_for(owner, scope)
+    }
+    pub fn permit(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, clock: &PortClock) -> Option<PortTransmitPermit> {
+        if !clock.owns(&self.birth) { return None; }
+        self.lease.transmit_permit(owner, scope, clock)
+    }
+    pub fn release(&self) { self.lease.release(&self.lease.inner.owner, &self.lease.inner.scope); }
+}
+impl Drop for ChannelLease { fn drop(&mut self) { self.release(); } }
+impl fmt::Debug for ChannelLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("ChannelLease(<redacted>)") }
 }
 
 pub(super) struct PortTransmitPermit { lease: Weak<LeaseInner>, address: LogicalAddress }
@@ -159,13 +189,19 @@ impl fmt::Debug for PortTransmitPermit {
 }
 
 pub(super) struct PortDelivery {
-    lease: Weak<LeaseInner>, routing: Routing, payload: TransportBytes,
+    lease: Weak<LeaseInner>, routing: Routing, payload: TransportBytes, order: PortOrder, received: Instant,
 }
 impl fmt::Debug for PortDelivery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("PortDelivery(<redacted>)") }
 }
 impl PortDelivery {
     pub fn retained_bytes(&self) -> usize { self.payload.expose_to_transport().len() }
+    pub fn for_channel(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, claim: &ChannelLease)
+        -> Option<(&Routing, &[u8], Instant)> {
+        if !Arc::ptr_eq(&self.order.inner, &claim.birth.inner) || self.order.value <= claim.birth.value { return None; }
+        let (routing, bytes) = self.for_lease(owner, scope, claim.lease())?;
+        Some((routing, bytes, self.received))
+    }
     /// Admission to one logical listen only. The payload is still unaccepted
     /// Channel/NetStream data, never VerifiedRpcPlaintext. In particular, the
     /// on-wire Router address carries NO local allocation generation; delayed
@@ -245,7 +281,8 @@ impl RouterPorts {
         let address = state.fresh_host(now).map(|(network, node)| LogicalAddress { network, node, port });
         if address.is_some_and(|address| state.addresses.contains_key(&address)) { return Err(PortError::InUse); }
         let birth = self.clock.stamp()?; let birth_order = birth.value;
-        let inner = Arc::new(LeaseInner { state: Arc::downgrade(&self.state), owner: self.owner.clone(), scope: self.scope.clone(), port, generation, birth });
+        let inner = Arc::new(LeaseInner { state: Arc::downgrade(&self.state), owner: self.owner.clone(), scope: self.scope.clone(),
+            port, generation, birth, channel_claimed: AtomicBool::new(false) });
         state.next_generation = generation.checked_add(1);
         state.ports.insert(port, Entry { generation, birth_order, protocol, deadline: address.is_none().then_some(deadline), address, lease: Arc::downgrade(&inner) });
         if let Some(address) = address { state.addresses.insert(address, generation); }
@@ -287,7 +324,7 @@ impl RouterPorts {
         let Some(&generation) = state.addresses.get(&address) else { return Ok(None); };
         let Some(entry) = state.ports.get(&address.port).filter(|entry| entry.generation == generation) else { return Err(PortError::Protocol); };
         if entry.birth_order >= input_order || entry.lease.strong_count() == 0 { return Ok(None); }
-        Ok(Some(PortDelivery { lease: entry.lease.clone(), routing, payload: TransportBytes::from_bytes(payload.to_vec()) }))
+        Ok(Some(PortDelivery { lease: entry.lease.clone(), routing, payload: TransportBytes::from_bytes(payload.to_vec()), order: order.clone(), received }))
     }
 }
 impl Drop for RouterPorts { fn drop(&mut self) { self.close(); } }

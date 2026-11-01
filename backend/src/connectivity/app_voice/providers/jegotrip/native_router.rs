@@ -541,6 +541,17 @@ impl RouterConnectTracker {
         self.peer_binding.as_ref()?.reply_for(owner, scope, &self.port_clock, target)?;
         self.peer_binding.take()
     }
+    /// Return only this tracker's original clock after peer/port/local-ID
+    ///checks. A Channel claim cannot be bootstrapped with an equal new tracker.
+    pub(super) fn channel_clock(&self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope,
+        lease: &super::router_ports::PortLease, peer: &super::router_peer::PeerBinding) -> Option<super::router_ports::PortClock> {
+        if !self.accepts(owner, scope) { return None; }
+        peer.target().ids_for(owner, scope, &self.port_clock)?;
+        peer.reply_for(owner, scope, &self.port_clock, peer.target())?;
+        let local = lease.address_for_clock(owner, scope, &self.port_clock)?;
+        if self.local_node().ok()? != (local.network, local.node) { return None; }
+        Some(self.port_clock.clone())
+    }
     pub(super) fn prepare_datagram(&mut self, owner: &super::session::AttemptOwner, scope: &super::rpc_pending::RpcConnectionScope,
         lease: &super::router_ports::PortLease, peer: &super::router_peer::PeerBinding, tag: u32, priority: u8,
         payload: &[u8], timing: super::packet_transport::RouterTiming, now: Instant) -> Result<Option<PreparedRouterDatagram>, RouterConnectError> {
