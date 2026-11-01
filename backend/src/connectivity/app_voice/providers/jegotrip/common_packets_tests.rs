@@ -166,3 +166,11 @@ fn retained_group_receipt_time_bounds_new_common_partial_not_later_processing_ti
  assert_eq!(state.on_packet_budgeted(&[0x20,0,0,0,4,b'x'],now+Duration::from_secs(10),now,now+Duration::from_secs(2),MAX_GROUP_BYTES).err(),Some(CommonError::Timeout));
  let mut state=assembler(now);assert_eq!(state.on_packet_budgeted(&[2],now+Duration::from_secs(10),now+Duration::from_millis(1),now,MAX_GROUP_BYTES).err(),Some(CommonError::ClockRollback));
 }
+#[test]
+fn compressed_partial_and_new_plain_output_are_both_charged_at_completion(){
+ let now=Instant::now();let plain=[b'x';128];let container=reference_container(&plain,1);let packets=fragment(&container,0x11,7);
+ for spare in [0,1]{let mut state=assembler(now);state.on_packet(packets[0].expose_to_transport(),now+Duration::from_secs(1),now).unwrap();let charged=state.retained_bytes();
+  let result=state.on_packet_budgeted(packets[1].expose_to_transport(),now+Duration::from_secs(1),now,now,charged+plain.len()-spare);
+  if spare==0{assert_eq!(result.unwrap().unwrap().payload.expose_to_transport(),plain);}else{assert_eq!(result.err(),Some(CommonError::Bound));assert_eq!(state.retained_bytes(),0);}
+ }
+}

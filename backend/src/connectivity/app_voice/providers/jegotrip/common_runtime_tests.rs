@@ -118,6 +118,46 @@ async fn foreign_owner_or_scope_cannot_send_ping_or_read_original_calls(){
 async fn common_receive_scope_close_drops_original_owner_without_detached_task(){
  let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);let(tx,rx)=oneshot::channel();
  let server=async move{tokio::time::timeout(Duration::from_secs(12),async move{let peer=CommonPeer::open(listener,config).await;peer.no_more_common().await;}).await.unwrap()};
- let client=async move{let(mut path,original,scope)=open_client(p,Duration::from_secs(2)).await;tx.send(scope.clone()).unwrap();assert!(path.receive_calls(&original,&scope,Instant::now()+Duration::from_secs(4)).await.is_err());drop(path);};
+ let client=async move{let(mut path,original,scope)=open_client(p,Duration::from_secs(2)).await;assert!(tx.send(scope.clone()).is_ok());assert!(path.receive_calls(&original,&scope,Instant::now()+Duration::from_secs(4)).await.is_err());drop(path);};
  let cancel=async move{let scope:RpcConnectionScope=rx.await.unwrap();tokio::task::yield_now().await;scope.close();};tokio::join!(server,client,cancel);
+}
+
+async fn blocked_common_output(operation:u8){
+ let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);let(tx,rx)=oneshot::channel();
+ let server=async move{tokio::time::timeout(Duration::from_secs(12),async move{let mut peer=CommonPeer::open(listener,config).await;rx.await.unwrap();
+  if operation==2{peer.send(&[vec![2]]).await;}
+  peer.no_more_common().await;}).await.unwrap()};
+ let client=async move{
+  let(mut path,original,scope)=open_client(p,Duration::from_secs(2)).await;
+  // For required Pong, the first write is only its Channel receipt ACK.
+  //Delay the SECOND write to prove the Common-response branch is exercised.
+  let pauses=super::super::netstream_runtime::tests::delay_original_stream_write(&mut path.stream,Duration::from_millis(300),usize::from(operation==2));
+  tx.send(()).unwrap();let now=Instant::now();let end=now+Duration::from_millis(100);
+  if operation==3{
+   let result={let mut pending=Box::pin(path.send_ping(&original,&scope,now+Duration::from_secs(3)));
+    tokio::select!{result=&mut pending=>Some(result),_=tokio::time::sleep(Duration::from_millis(35))=>None}
+   };assert!(result.is_none());assert!(!scope.is_open());
+  }else{
+   let failed=match operation{0=>path.send_ping(&original,&scope,end).await.is_err(),1=>path.send_call(&original,&scope,CallKind::Request,b"original-call",end).await.is_err(),
+    2=>path.receive_calls(&original,&scope,end).await.is_err(),_=>unreachable!()};assert!(failed);assert!(!scope.is_open());
+  }
+  assert!(pauses.load(std::sync::atomic::Ordering::Acquire)>0);assert!(now.elapsed()<Duration::from_secs(2));path.close();assert_eq!(path.controls.deadline(),None);drop(path);
+ };tokio::join!(server,client);
+}
+#[tokio::test]
+async fn common_ping_write_obeys_original_deadline_and_clears_pending_state(){blocked_common_output(0).await;}
+#[tokio::test]
+async fn common_call_write_cannot_cross_its_original_operation_deadline(){blocked_common_output(1).await;}
+#[tokio::test]
+async fn required_common_pong_write_expires_without_sending_after_original_deadline(){blocked_common_output(2).await;}
+#[tokio::test]
+async fn cancelling_borrowed_common_ping_revokes_scope_then_explicit_owner_drop_releases_tcp(){blocked_common_output(3).await;}
+#[tokio::test]
+async fn same_scope_wrong_live_path_brand_and_expired_group_cannot_expose_calls(){
+ let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
+ let server=async move{tokio::time::timeout(Duration::from_secs(12),async move{let mut peer=CommonPeer::open(listener,config).await;peer.send(&[reply_packet(b"brand-bound",false)]).await;peer.no_more_common().await;}).await.unwrap()};
+ let client=async move{let(mut path,original,scope)=open_client(p,Duration::from_secs(2)).await;let mut group=path.receive_calls(&original,&scope,Instant::now()+Duration::from_secs(3)).await.unwrap().unwrap();
+  assert!(path.calls_for(&original,&scope,&group).is_some());let another=Arc::new(AtomicBool::new(true));let old=std::mem::replace(&mut group.live,Arc::downgrade(&another));
+  assert!(path.calls_for(&original,&scope,&group).is_none());group.live=old;group.calls[0].deadline=Instant::now();assert!(path.calls_for(&original,&scope,&group).is_none());drop(path);
+ };tokio::join!(server,client);
 }

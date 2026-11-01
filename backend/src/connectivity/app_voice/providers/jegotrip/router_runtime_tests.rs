@@ -248,11 +248,13 @@ async fn production_router_echo_and_delay_measurements_come_from_original_tls_he
 //creates a socket nor changes its scope/trust; exercised only in Actions.
 #[derive(Clone,Copy,PartialEq,Eq)]
 pub(crate) enum DelayPoint{Write,Flush}
-struct SlowOriginalIo{inner:BoxRuntimeIo,point:DelayPoint,delay:Duration,sleep:Option<std::pin::Pin<Box<tokio::time::Sleep>>>,waited:bool}
+struct SlowOriginalIo{inner:BoxRuntimeIo,point:DelayPoint,delay:Duration,sleep:Option<std::pin::Pin<Box<tokio::time::Sleep>>>,waited:bool,
+ skip:usize,pauses:std::sync::Arc<std::sync::atomic::AtomicUsize>}
 impl SlowOriginalIo{
  fn pause(&mut self,cx:&mut std::task::Context<'_>)->std::task::Poll<()>{
   use std::future::Future;
   if self.waited{return std::task::Poll::Ready(());}
+  if self.sleep.is_none(){self.pauses.fetch_add(1,std::sync::atomic::Ordering::AcqRel);}
   let delay=self.delay;let sleep=self.sleep.get_or_insert_with(||Box::pin(tokio::time::sleep(delay)));
   if sleep.as_mut().poll(cx).is_pending(){return std::task::Poll::Pending;}
   self.waited=true;self.sleep=None;std::task::Poll::Ready(())
@@ -265,17 +267,21 @@ impl tokio::io::AsyncRead for SlowOriginalIo{
 }
 impl tokio::io::AsyncWrite for SlowOriginalIo{
  fn poll_write(self:std::pin::Pin<&mut Self>,cx:&mut std::task::Context<'_>,bytes:&[u8])->std::task::Poll<std::io::Result<usize>>{
-  let this=self.get_mut();if this.point==DelayPoint::Write&&this.pause(cx).is_pending(){return std::task::Poll::Pending;}
-  let result=tokio::io::AsyncWrite::poll_write(std::pin::Pin::new(&mut *this.inner),cx,bytes);if this.point==DelayPoint::Write&&result.is_ready(){this.waited=false;}result
+  let this=self.get_mut();if this.point==DelayPoint::Write&&this.skip==0&&this.pause(cx).is_pending(){return std::task::Poll::Pending;}
+  let result=tokio::io::AsyncWrite::poll_write(std::pin::Pin::new(&mut *this.inner),cx,bytes);
+  if this.point==DelayPoint::Write&&result.is_ready(){this.waited=false;this.skip=this.skip.saturating_sub(1);}result
  }
  fn poll_flush(self:std::pin::Pin<&mut Self>,cx:&mut std::task::Context<'_>)->std::task::Poll<std::io::Result<()>>{
-  let this=self.get_mut();if this.point==DelayPoint::Flush&&this.pause(cx).is_pending(){return std::task::Poll::Pending;}
-  let result=tokio::io::AsyncWrite::poll_flush(std::pin::Pin::new(&mut *this.inner),cx);if this.point==DelayPoint::Flush&&result.is_ready(){this.waited=false;}result
+  let this=self.get_mut();if this.point==DelayPoint::Flush&&this.skip==0&&this.pause(cx).is_pending(){return std::task::Poll::Pending;}
+  let result=tokio::io::AsyncWrite::poll_flush(std::pin::Pin::new(&mut *this.inner),cx);
+  if this.point==DelayPoint::Flush&&result.is_ready(){this.waited=false;this.skip=this.skip.saturating_sub(1);}result
  }
  fn poll_shutdown(self:std::pin::Pin<&mut Self>,cx:&mut std::task::Context<'_>)->std::task::Poll<std::io::Result<()>>{
   tokio::io::AsyncWrite::poll_shutdown(std::pin::Pin::new(&mut *self.get_mut().inner),cx)
  }
 }
-pub(crate) fn delay_original_io(path:&mut RouterPath,point:DelayPoint,delay:Duration){
- let inner=path.io.take().expect("original fixture socket");path.io=Some(Box::new(SlowOriginalIo{inner,point,delay,sleep:None,waited:false}));
+pub(crate) fn delay_original_io(path:&mut RouterPath,point:DelayPoint,delay:Duration){let _=delay_original_io_after(path,point,delay,0);}
+pub(crate) fn delay_original_io_after(path:&mut RouterPath,point:DelayPoint,delay:Duration,skip:usize)->std::sync::Arc<std::sync::atomic::AtomicUsize>{
+ let inner=path.io.take().expect("original fixture socket");let pauses=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+ path.io=Some(Box::new(SlowOriginalIo{inner,point,delay,sleep:None,waited:false,skip,pauses:pauses.clone()}));pauses
 }
