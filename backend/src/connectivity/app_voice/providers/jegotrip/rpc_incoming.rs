@@ -81,15 +81,10 @@ pub struct IncomingDispatcher {
 
 const MAX_GATEWAY_OID_BYTES: usize = 256;
 
-/// Strict subset for the gateway reference: bounded printable bytes only.
-/// Unsupported values stay unclassified instead of being stored as-is.
-fn gateway_oid(value: &[u8]) -> Option<Vec<u8>> {
-    if value.is_empty() || value.len() > MAX_GATEWAY_OID_BYTES
-        || value.iter().any(u8::is_ascii_control) || value.windows(4).any(|bytes| bytes == b"ENC(") {
-        return None;
-    }
-    Some(value.to_vec())
-}
+/// Native stores `Sip.MessageGw.Oid` as an opaque object reference and never
+/// decodes it. Keep the same opacity: only a bounded non-empty value replaces
+/// the cache, and its bytes are preserved verbatim.
+fn usable_gateway_oid(value: &[u8]) -> bool { !value.is_empty() && value.len() <= MAX_GATEWAY_OID_BYTES }
 
 impl fmt::Debug for IncomingDispatcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("IncomingDispatcher(<redacted>)") }
@@ -117,8 +112,11 @@ impl IncomingDispatcher {
 
     fn record_gateway_oid(&self, properties: &[RpcProperty<'_>]) {
         let Some(value) = properties.iter().find(|p| p.key == b"Sip.MessageGw.Oid").map(|p| p.value) else { return; };
-        let mut cache = self.latest_gateway_oid.lock().unwrap_or_else(|poison| poison.into_inner());
-        match gateway_oid(value) { Some(oid) => *cache = Some(zeroize::Zeroizing::new(oid)), None => *cache = None }
+        // An empty/oversized value carries no usable oid: it does not replace a
+        // previous reference and is never truncated into one.
+        if !usable_gateway_oid(value) { return; }
+        *self.latest_gateway_oid.lock().unwrap_or_else(|poison| poison.into_inner()) =
+            Some(zeroize::Zeroizing::new(value.to_vec()));
     }
 
     pub(super) fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {

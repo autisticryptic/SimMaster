@@ -83,29 +83,40 @@ fn gateway_oid_is_cached_only_inside_the_original_receiver_scope() {
         arguments: second_bytes.expose_to_transport() };
     assert!(d.on_direct_request(&original, &scope, &second).unwrap().is_some());
     assert_eq!(d.latest_gateway_oid().as_deref(), Some(b"fixture-gw-2".as_slice()));
-    // Unsupported values are not silently stored: an unclassifiable oid clears
-    // the cache rather than keeping the previous value.
-    for bad in [b"".as_slice(), b"has\0nul", &[0xff, 0xfe], b"ENC(sealed)"] {
+    // The reference stays opaque: arbitrary bytes are preserved verbatim and are
+    // never decoded as text, routed, or treated as a sender/credential.
+    let binary_bytes = arguments(b"fixture.registered.message-kind",
+        &[RpcProperty { key: b"Sip.MessageGw.Oid", value: &[0xff, 0xfe] }], b"body");
+    let binary = RpcRequest { call_id: 1, metadata: vec![RpcProperty { key: b"id", value: b"#fixture-incoming" },
+        RpcProperty { key: b"domain", value: b"fixture-domain" }], method: ONLINE_MESSAGE_METHOD.as_bytes(),
+        arguments: binary_bytes.expose_to_transport() };
+    assert!(d.on_direct_request(&original, &scope, &binary).unwrap().is_some());
+    assert_eq!(d.latest_gateway_oid().as_deref(), Some(&[0xff, 0xfe][..]));
+    // An empty or oversized value is not truncated or substituted, and it does
+    // not silently replace the reference already in scope.
+    for bad in [b"".as_slice(), &[0x41u8; MAX_GATEWAY_OID_BYTES + 1][..]] {
         let bytes = arguments(b"fixture.registered.message-kind",
             &[RpcProperty { key: b"Sip.MessageGw.Oid", value: bad }], b"body");
         let bad_request = RpcRequest { call_id: 1, metadata: vec![RpcProperty { key: b"id", value: b"#fixture-incoming" },
             RpcProperty { key: b"domain", value: b"fixture-domain" }], method: ONLINE_MESSAGE_METHOD.as_bytes(),
             arguments: bytes.expose_to_transport() };
         assert!(d.on_direct_request(&original, &scope, &bad_request).unwrap().is_some());
-        assert!(d.latest_gateway_oid().is_none(), "unsupported oid must not be stored");
+        assert_eq!(d.latest_gateway_oid().as_deref(), Some(&[0xff, 0xfe][..]),
+            "an unusable oid must not replace or clear the in-scope reference");
     }
-    // A message without the property does not reuse a previous gateway oid.
+    // A message without the property does not reuse or disturb it either.
     let plain_bytes = arguments(b"fixture.registered.message-kind", &[], b"three");
     let plain = RpcRequest { call_id: 1, metadata: vec![RpcProperty { key: b"id", value: b"#fixture-incoming" },
         RpcProperty { key: b"domain", value: b"fixture-domain" }], method: ONLINE_MESSAGE_METHOD.as_bytes(),
         arguments: plain_bytes.expose_to_transport() };
     assert!(d.on_direct_request(&original, &scope, &plain).unwrap().is_some());
-    assert!(d.latest_gateway_oid().is_none());
+    assert_eq!(d.latest_gateway_oid().as_deref(), Some(&[0xff, 0xfe][..]));
     // The cache never leaves the original scope: a foreign owner/scope sees
     // nothing and stores nothing.
+    let observed = d.latest_gateway_oid();
     assert!(d.on_direct_request(&owner(), &scope, &first).unwrap().is_none());
     assert!(d.on_direct_request(&original, &RpcConnectionScope::fresh(), &first).unwrap().is_none());
-    assert!(d.latest_gateway_oid().is_none());
+    assert_eq!(d.latest_gateway_oid(), observed);
     assert!(!format!("{d:?}").contains("fixture"));
 }
 
