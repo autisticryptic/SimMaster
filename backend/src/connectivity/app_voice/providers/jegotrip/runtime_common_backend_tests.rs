@@ -29,10 +29,19 @@ async fn hosting_call(peer:&mut CommonPeer)->(Vec<u8>,Vec<u8>){
         let mut args=Reader::versioned(call.arguments).unwrap();args.bytes().unwrap();args.bytes().unwrap();
         let payload=super::super::rpc_batch::read_payload(&mut args).unwrap();
         if payload.requests.is_empty(){peer.send(&[reply(call.call_id,&super::tests::swap_result(None,true,payload.fields))]).await;continue;}
-        assert_eq!(payload.requests.len(),1);let sequence=*payload.requests.keys().next().unwrap();let nested=&payload.requests[&sequence];
-        assert_eq!(nested.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"#SipGateway");
-        let mut fields=Reader::versioned(nested.arguments).unwrap();let uri=fields.bytes().unwrap().to_vec();
-        let flag=fields.properties().unwrap().iter().find(|p|p.key==b"SipFlag").unwrap().value.to_vec();
+        // An un-acknowledged hosting request stays retained and is retransmitted
+        // with the next one, so a batch may carry the previous registration plus
+        // the new request. Every nested request must still target SipGateway; the
+        // newest sequence is the one this call is waiting for.
+        let mut chosen=None;
+        for(sequence,nested) in payload.requests.iter(){
+            assert_eq!(nested.metadata.iter().find(|p|p.key==b"id").unwrap().value,
+                super::super::rpc_arguments::DEFAULT_GATEWAY_OBJECT.as_bytes());
+            let mut fields=Reader::versioned(nested.arguments).unwrap();let uri=fields.bytes().unwrap().to_vec();
+            let flag=fields.properties().unwrap().iter().find(|p|p.key==b"SipFlag").unwrap().value.to_vec();
+            chosen=Some((*sequence,uri,flag));
+        }
+        let(sequence,uri,flag)=chosen.unwrap();
         peer.send(&[reply(call.call_id,&super::tests::swap_result(Some(sequence),true,payload.fields))]).await;
         return (uri,flag);
     }
@@ -160,7 +169,11 @@ fn login_result()->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.by
 fn native_profile_captures_physical_and_logical_namespaces_and_fills_only_absent_ids(){
     let cert=Certificates::generate("IP:127.0.0.1");let p=profile(&cert.root,12345);assert!(p.authority.is_empty());let route=p.common.as_ref().unwrap();assert_eq!(route.reference.as_ref().unwrap().as_str(),ENTRY);
     assert_eq!(route.entry.as_ref().unwrap().identity(),b"AccountEntry");for fields in [&p.login_routing,&p.poll_routing,&p.logout_routing]{assert_eq!(fields.iter().find(|p|p.key==b"id").unwrap().value,b"AccountEntry");}
-    assert!(p.gateway_metadata.is_empty());assert_eq!(p.domain_name.as_str(),"fixture.invalid");assert_eq!(p.domain_id.as_str(),"fixture-domain");assert!(p.bootstrap.is_none());
+    // Native hosting targets the original default SipGateway object, not the
+    // Account object and not a placeholder.
+    assert_eq!(p.gateway_metadata.len(),1);assert_eq!(p.gateway_metadata[0].key,b"id");
+    assert_eq!(p.gateway_metadata[0].value,super::super::rpc_arguments::DEFAULT_GATEWAY_OBJECT.as_bytes());
+    assert_eq!(p.domain_name.as_str(),"fixture.invalid");assert_eq!(p.domain_id.as_str(),"fixture-domain");assert!(p.bootstrap.is_none());
 }
 #[test]
 fn native_selector_cannot_be_consumed_by_old_inner_tls_carrier_adapter(){
