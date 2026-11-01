@@ -167,6 +167,9 @@ impl CommonProfile{
         if (!bootstrap&&input.account_reference.is_empty())||input.account_reference.len()>MAX_FIELD_BYTES||input.account_reference.chars().any(char::is_control)
             ||input.resolved_host_index>=32||input.compress_above.is_some_and(|limit|limit==0||limit>MAX_PROFILE_BYTES){return Err(ProfileError::InvalidConfiguration);}
         if bootstrap&&(input.endpoint_index!=0||input.resolved_host_index!=0){return Err(ProfileError::InvalidConfiguration);}
+        // In bootstrap mode the logical entry is unknown by design. A supplied
+        //reference is refused rather than silently ignored as if it were used.
+        if bootstrap&&!input.account_reference.is_empty(){return Err(ProfileError::InvalidConfiguration);}
         for(timeout,max)in[(input.connect_timeout,10),(input.startup_timeout,30),(input.attempt_timeout,120)]{
             if timeout.is_zero()||timeout>Duration::from_secs(max){return Err(ProfileError::InvalidConfiguration);}
         }

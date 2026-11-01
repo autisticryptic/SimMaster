@@ -74,6 +74,7 @@ async fn common_bootstrap_dials_only_the_returned_entry_after_releasing_its_own_
             assert_eq!(call.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"DestEntry");
             assert_eq!(call.metadata.iter().find(|p|p.key==b"pwd").unwrap().value,b"fixture-phone-token");
             let mut reader=Reader::versioned(call.arguments).unwrap();assert_eq!(reader.bytes().unwrap(),b"[username:fixture-user@account-domain.invalid]");
+            assert_eq!(reader.bytes().unwrap(),b"fixture-selected-session");
             let fields=reader.properties().unwrap();assert_eq!(fields.iter().find(|p|p.key==b"__domain").unwrap().value,b"fixture-domain");
             assert_eq!(fields.iter().find(|p|p.key==b"__app").unwrap().value,b"fixture-app");
             assert_eq!(fields.iter().find(|p|p.key==b"DeviceInfo.CC").unwrap().value,b"fixture-cc");
