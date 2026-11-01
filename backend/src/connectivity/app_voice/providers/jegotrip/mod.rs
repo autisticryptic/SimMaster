@@ -78,6 +78,7 @@ pub(crate) mod router_control;
 pub(crate) mod router_peer;
 pub(crate) mod router_timing;
 pub mod native_channel;
+pub(crate) mod netstream_records;
 
 // Keep the existing API/provider id stable while moving the implementation.
 pub const PROVIDER_ID: &str = "app_voice";
