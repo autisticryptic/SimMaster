@@ -166,6 +166,43 @@ fn explicit_authenticate_cannot_inherit_default_receiver_start_or_fallback_from_
     assert!(f.script.paths().is_empty()); assert!(f.manager.app_accounts().unwrap().is_empty());
 }
 #[test]
+fn native_bootstrap_runtime_template_binds_the_auto_assembled_account_config(){
+    // The App-login entry must be able to carry the SAME native Common bootstrap
+    // route as a stored account: the deployment template is a full ProfileConfig,
+    // so nothing here may silently downgrade to the direct TLS carrier.
+    let cert=Certificates::generate("IP:127.0.0.1");
+    let mut value=deployment_json(&cert.root,false);
+    // The SDK server address becomes the bootstrap LOGICAL entry; the
+    // destination still comes only from the matched reply.
+    value["runtime"]["sdk"]["server_address"]=json!("BootEntry:sarc -h 42.7 -p 98;");
+    {
+        let profile=&mut value["runtime"]["profile"];
+        profile["route"]=json!({"router_common":{
+            "reference":"Router:tls -h 127.0.0.1 -p 443 -ri 12001;",
+            "anchors":[{"router_id":12001,"host":"127.0.0.1","port":443,"authority":"127.0.0.1","root_der_base64":cert.root.clone(),"enable_sni":false}],
+            "access":[],"endpoint_index":0,"resolved_host_index":0,"startup_timeout_ms":5000,"attempt_timeout_ms":8000,"compress_above":null}});
+        profile["authority"]=json!("");profile["enable_sni"]=json!(false);
+        for key in ["domain_name","domain_id","application_id","device_info_cc"]{profile[key]=Value::Null;}
+        profile["gateway_uri"]=json!("");
+        profile["gateway_metadata"]=json!([]);
+        profile["bootstrap_via_router"]=json!({"routing":[],"handoff_timeout_ms":10000});
+    }
+    let configuration: config::DatabaseConfiguration=serde_json::from_value(value).unwrap();
+    let bound=configuration.runtime.unwrap().bind("fixture-bound-account",super::crypto::PhoneMaterial{
+        token:super::super::credentials::Secret::from_owned("fixture-phone-token".to_owned()),
+        sip_password:super::super::credentials::Secret::from_owned("fixture-SipPwd".to_owned())}).unwrap();
+    assert_eq!(bound.validate(100),Ok(()));
+    assert!(bound.runtime_profile().is_ok());
+    // An empty URI without the native bootstrap route stays inadmissible.
+    let mut direct=deployment_json(&cert.root,false);
+    direct["runtime"]["profile"]["gateway_uri"]=json!("");
+    let direct:config::DatabaseConfiguration=serde_json::from_value(direct).unwrap();
+    let direct=direct.runtime.unwrap().bind("fixture-bound-account",super::crypto::PhoneMaterial{
+        token:super::super::credentials::Secret::from_owned("fixture-phone-token".to_owned()),
+        sip_password:super::super::credentials::Secret::from_owned("fixture-SipPwd".to_owned())}).unwrap();
+    assert_eq!(direct.validate(100),Err("app_account_configuration_invalid"));
+}
+#[test]
 fn full_database_private_mirror_roundtrip_retains_runtime_without_personal_login_fields() {
     let f = Fixture::new(vec![], true);
     let configuration = database_configuration(&f, true);
