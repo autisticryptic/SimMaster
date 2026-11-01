@@ -24,22 +24,27 @@ pub(super) fn try_compress(payload:&[u8])->Result<Option<TransportBytes>,Compres
     out.truncate(4+written);Ok(Some(TransportBytes::from_bytes(std::mem::take(&mut *out))))
 }
 
-pub(super) fn decompress(container:&[u8])->Result<TransportBytes,CompressionError>{
+pub(super) fn uncompressed_length(container:&[u8])->Result<usize,CompressionError>{
     if container.len()>MAX_STREAM_BYTES{return Err(CompressionError::TooLarge);}
     let prefix=container.get(..4).ok_or(CompressionError::Length)?;
     let expected=u32::from_be_bytes(prefix.try_into().map_err(|_|CompressionError::Length)?) as usize;
     if expected==0{return Err(CompressionError::Length);}
     if expected>MAX_STREAM_BYTES{return Err(CompressionError::TooLarge);}
+    Ok(expected)
+}
+pub(super) fn decompress(container:&[u8])->Result<TransportBytes,CompressionError>{
+    let expected=uncompressed_length(container)?;
     let input=&container[4..];
     if input.get(..3)!=Some(b"BZh".as_slice())||!input.get(3).is_some_and(|level|(b'1'..=b'9').contains(level)){return Err(CompressionError::Stream);}
-    // One extra output byte detects a lying size while leaving room to consume
-    //the stream terminator/CRC when exactly 'expected' bytes have been emitted.
-    let mut out=Zeroizing::new(vec![0u8;expected+1]);
+    // Exactly the bounded declared output is allocated. One separate stack
+    //byte detects excess output while consuming the final terminator/CRC.
+    let mut out=Zeroizing::new(vec![0u8;expected]);let mut overflow=Zeroizing::new([0u8;1]);
     let mut decoder=Decompress::new(true); // bounded small-memory native algorithm
     let mut consumed=0usize;let mut produced=0usize;
     for _ in 0..4{
         let old=(consumed,produced);
-        let status=decoder.decompress(&input[consumed..],&mut out[produced..]).map_err(|_|CompressionError::Stream)?;
+        let destination=if produced==expected{overflow.as_mut_slice()}else{&mut out[produced..]};
+        let status=decoder.decompress(&input[consumed..],destination).map_err(|_|CompressionError::Stream)?;
         consumed=usize::try_from(decoder.total_in()).map_err(|_|CompressionError::TooLarge)?;
         produced=usize::try_from(decoder.total_out()).map_err(|_|CompressionError::TooLarge)?;
         if consumed>input.len()||produced>expected{return Err(CompressionError::Length);}

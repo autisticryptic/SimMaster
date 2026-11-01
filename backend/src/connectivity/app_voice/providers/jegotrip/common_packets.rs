@@ -49,7 +49,7 @@ pub(super) fn encode(kind:CallKind,payload:&[u8],threshold:usize,compress_above:
         packets.push(TransportBytes::from_bytes(packet));rest=&rest[count..];first=false;
     }Ok(packets)
 }
-struct Partial{kind:CallKind,compressed:bool,expected:usize,bytes:Vec<u8>,deadline:Instant}
+struct Partial{kind:CallKind,compressed:bool,expected:usize,bytes:Vec<u8>,deadline:Instant,fragments:usize}
 impl Drop for Partial{fn drop(&mut self){self.bytes.zeroize();}}
 pub(super) struct CommonAssembler{partial:Option<Partial>,timeout:Duration,last_now:Instant,closed:bool}
 impl fmt::Debug for CommonAssembler{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.debug_struct("CommonAssembler").field("closed",&self.closed).field("partial",&self.partial.is_some()).field("data",&"<redacted>").finish()}}
@@ -61,21 +61,29 @@ impl CommonAssembler{
     }
     pub fn close(&mut self){self.closed=true;self.partial=None;}
     pub fn deadline(&self)->Option<Instant>{self.partial.as_ref().map(|part|part.deadline)}
-    pub fn retained_bytes(&self)->usize{self.partial.as_ref().map_or(0,|part|part.bytes.len())}
+    /// Charge reserved storage, not merely bytes filled so far. The decoder's
+    ///bounded bzip2 workspace is separate from this retained-payload budget.
+    pub fn retained_bytes(&self)->usize{self.partial.as_ref().map_or(0,|part|part.bytes.capacity())}
     pub fn tick(&mut self,now:Instant)->Result<(),CommonError>{
         let result=if self.closed{Err(CommonError::Closed)}else if now<self.last_now{Err(CommonError::ClockRollback)}
             else if self.deadline().is_some_and(|end|now>=end){Err(CommonError::Timeout)}else{self.last_now=now;Ok(())};
         if result.is_err(){self.close();}result
     }
-    fn complete(kind:CallKind,compressed:bool,bytes:TransportBytes,deadline:Instant)->Result<CommonMessage,CommonError>{
-        let payload=if compressed{common_compression::decompress(bytes.expose_to_transport())?}else{bytes};
+    fn complete(kind:CallKind,compressed:bool,body:&[u8],deadline:Instant,budget:usize)->Result<CommonMessage,CommonError>{
+        let expected=if compressed{common_compression::uncompressed_length(body)?}else{body.len()};
+        if expected>budget{return Err(CommonError::Bound);}
+        let payload=if compressed{common_compression::decompress(body)?}else{TransportBytes::from_bytes(body.to_vec())};
         validate_payload(kind,payload.expose_to_transport())?;Ok(CommonMessage{kind,payload,deadline})
     }
     pub fn on_packet(&mut self,packet:&[u8],caller_end:Instant,now:Instant)->Result<Option<CommonMessage>,CommonError>{
-        let result=self.consume(packet,caller_end,now);if result.is_err(){self.close();}result
+        self.on_packet_budgeted(packet,caller_end,now,now,MAX_GROUP_BYTES)
     }
-    fn consume(&mut self,packet:&[u8],caller_end:Instant,now:Instant)->Result<Option<CommonMessage>,CommonError>{
-        self.tick(now)?;if now>=caller_end{return Err(CommonError::Timeout);}
+    pub fn on_packet_budgeted(&mut self,packet:&[u8],caller_end:Instant,admitted:Instant,now:Instant,budget:usize)->Result<Option<CommonMessage>,CommonError>{
+        let result=self.consume(packet,caller_end,admitted,now,budget.min(MAX_GROUP_BYTES));if result.is_err(){self.close();}result
+    }
+    fn consume(&mut self,packet:&[u8],caller_end:Instant,admitted:Instant,now:Instant,budget:usize)->Result<Option<CommonMessage>,CommonError>{
+        self.tick(now)?;if admitted>now{return Err(CommonError::ClockRollback);}if now>=caller_end{return Err(CommonError::Timeout);}
+        if self.retained_bytes()>budget{return Err(CommonError::Bound);}
         if packet.len()>MAX_STREAM_BYTES+1{return Err(CommonError::Bound);}
         let(&header,body)=packet.split_first().ok_or(CommonError::Packet)?;
         if header&0xc0!=0{return Err(CommonError::Packet);}
@@ -84,11 +92,18 @@ impl CommonAssembler{
             // A shorter current caller budget may tighten, never lengthen,
             //the original captured fragment lifetime.
             part.deadline=part.deadline.min(caller_end);
+            if part.fragments>=MAX_PACKETS{return Err(CommonError::Bound);}part.fragments+=1;
             if body.is_empty()||body.len()>part.expected-part.bytes.len(){return Err(CommonError::Fragment);}
             part.bytes.extend_from_slice(body);
             if part.bytes.len()!=part.expected{return Ok(None);}
             let mut part=self.partial.take().ok_or(CommonError::Fragment)?;
-            return Self::complete(part.kind,part.compressed,TransportBytes::from_bytes(std::mem::take(&mut part.bytes)),part.deadline).map(Some);
+            if part.compressed{
+                // The compressed reassembly allocation remains live while the
+                //plain output is built, so charge both before decompression.
+                return Self::complete(part.kind,true,&part.bytes,part.deadline,budget.saturating_sub(part.bytes.capacity())).map(Some);
+            }
+            validate_payload(part.kind,&part.bytes)?;
+            return Ok(Some(CommonMessage{kind:part.kind,payload:TransportBytes::from_bytes(std::mem::take(&mut part.bytes)),deadline:part.deadline}));
         }
         // Never silently discard/replace an original partial when a new call
         //or control interrupts it. Only the encoder's exact continuation3 is
@@ -96,14 +111,15 @@ impl CommonAssembler{
         if self.partial.is_some(){return Err(CommonError::Fragment);}
         let kind=kind(header)?;let compressed=header&COMPRESSED!=0;
         if (compressed||header&FRAGMENTED!=0)&&!matches!(kind,CallKind::Request|CallKind::Reply){return Err(CommonError::Packet);}
-        if header&FRAGMENTED==0{return Self::complete(kind,compressed,TransportBytes::from_bytes(body.to_vec()),caller_end).map(Some);}
+        if header&FRAGMENTED==0{return Self::complete(kind,compressed,body,caller_end,budget).map(Some);}
         let prefix=body.get(..4).ok_or(CommonError::Fragment)?;
         let expected=u32::from_be_bytes(prefix.try_into().map_err(|_|CommonError::Fragment)?) as usize;
-        if expected==0||expected>MAX_STREAM_BYTES{return Err(CommonError::Bound);}
+        if expected==0||expected>MAX_STREAM_BYTES||expected>budget{return Err(CommonError::Bound);}
         let initial=&body[4..];if initial.is_empty()||initial.len()>=expected{return Err(CommonError::Fragment);}
-        let deadline=caller_end.min(now.checked_add(self.timeout).ok_or(CommonError::Configuration)?);
+        let deadline=caller_end.min(admitted.checked_add(self.timeout).ok_or(CommonError::Configuration)?);
+        if now>=deadline{return Err(CommonError::Timeout);}
         let mut bytes=Vec::with_capacity(expected);bytes.extend_from_slice(initial);
-        self.partial=Some(Partial{kind,compressed,expected,bytes,deadline});Ok(None)
+        self.partial=Some(Partial{kind,compressed,expected,bytes,deadline,fragments:1});Ok(None)
     }
     pub fn on_group(&mut self,packets:&[TransportBytes],caller_end:Instant,now:Instant)->Result<Vec<CommonMessage>,CommonError>{
         self.tick(now)?;if now>=caller_end{self.close();return Err(CommonError::Timeout);}
@@ -113,7 +129,7 @@ impl CommonAssembler{
         }
         let mut messages=Vec::new();let mut expanded=0usize;
         for packet in packets{
-            if let Some(message)=self.on_packet(packet.expose_to_transport(),caller_end,now)?{
+            if let Some(message)=self.on_packet_budgeted(packet.expose_to_transport(),caller_end,now,now,MAX_GROUP_BYTES.saturating_sub(expanded))?{
                 let Some(total)=expanded.checked_add(message.payload.expose_to_transport().len()) else{self.close();return Err(CommonError::Bound);};
                 expanded=total;messages.push(message);
             }

@@ -4,7 +4,7 @@ use super::*;
 use std::{io::Write,process::{Command,Stdio}};
 
 fn reference(operation:&str,level:u8,input:&[u8])->Vec<u8>{
- let script="import bz2,sys; d=sys.stdin.buffer.read(); sys.stdout.buffer.write(bz2.compress(d,compresslevel=int(sys.argv[2])) if sys.argv[1]=='compress' else bz2.decompress(d))";
+ let script="import bz2,sys\nd=sys.stdin.buffer.read()\nif sys.argv[1]=='compress':\n out=bz2.compress(d,compresslevel=int(sys.argv[2]))\nelse:\n decoder=bz2.BZ2Decompressor();out=decoder.decompress(d)\n assert decoder.eof and not decoder.unused_data\nsys.stdout.buffer.write(out)";
  let mut child=Command::new("python3").args(["-c",script,operation,&level.to_string()]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
  {let mut stdin=child.stdin.take().unwrap();stdin.write_all(input).unwrap();}
  let output=child.wait_with_output().unwrap();assert!(output.status.success(),"independent bzip2 reference failed");assert!(output.stdout.len()<=MAX_STREAM_BYTES+2048);output.stdout
@@ -84,4 +84,22 @@ fn separate_decoder_instances_do_not_carry_previous_stream_state(){
 #[test]
 fn decompressed_transport_debug_does_not_disclose_private_call_bytes(){
  let bytes=reference_container(b"fixture-private-call-material",1);let result=decompress(&bytes).unwrap();assert!(!format!("{result:?}").contains("private-call-material"));
+}
+#[test]
+fn level_one_multiblock_without_initial_run_length_collapse_matches_independent_decoder(){
+ let plain:Vec<_>=(0..MAX_STREAM_BYTES).map(|index|(index%251) as u8).collect();
+ // No adjacent repeated bytes: the initial bzip2 run-length transform cannot
+ //shrink this >100k input back into one level-one block.
+ assert!(plain.windows(2).all(|pair|pair[0]!=pair[1]));
+ let independent=reference_container(&plain,1);assert_eq!(decompress(&independent).unwrap().expose_to_transport(),plain);
+ let encoded=try_compress(&plain).unwrap().unwrap();assert_eq!(reference("decompress",1,&encoded.expose_to_transport()[4..]),plain);
+}
+#[test]
+fn exactly_full_three_quarter_container_is_rejected_not_mistaken_for_spare_output_space(){
+ // Find a small independent libbzip2 boundary fixture in Actions; the project
+ //compressor is NOT used to select the expected strict-fit case.
+ let script="import bz2,sys\nfor n in range(8,2048):\n d=b'x'*n\n if 4+len(bz2.compress(d,compresslevel=1))==3*n//4:\n  sys.stdout.buffer.write(d);break\nelse: raise RuntimeError('independent exact-fit fixture missing')";
+ let output=Command::new("python3").args(["-c",script]).output().unwrap();assert!(output.status.success());let plain=output.stdout;
+ assert!(!plain.is_empty()&&plain.len()<2048);assert_eq!(reference_container(&plain,1).len(),plain.len()*3/4);
+ assert!(try_compress(&plain).unwrap().is_none());
 }

@@ -9,10 +9,10 @@ use std::{collections::BTreeMap,io,sync::Arc};
 use tokio::{io::{AsyncReadExt,AsyncWriteExt},net::{TcpListener,TcpStream},sync::oneshot};
 use tokio_rustls::{rustls::{ServerConfig,version::TLS13},server::TlsStream};
 
-fn owner()->AttemptOwner{let mut s=HostingSession::new("fixture-native-netstream".into());s.import(imported(),100).unwrap();s.begin_login(100).unwrap()}
-fn policy(root:&str,port:u16)->RouterPolicy{RouterPolicy::supplied(&format!("Router:tls -h 127.0.0.1 -p {port} -ri 12001;"),&[
+pub(crate) fn owner()->AttemptOwner{let mut s=HostingSession::new("fixture-native-netstream".into());s.import(imported(),100).unwrap();s.begin_login(100).unwrap()}
+pub(crate) fn policy(root:&str,port:u16)->RouterPolicy{RouterPolicy::supplied(&format!("Router:tls -h 127.0.0.1 -p {port} -ri 12001;"),&[
  RouterAnchor{router_id:12001,host:"127.0.0.1",port,authority:"127.0.0.1",root,enable_sni:false}]).unwrap()}
-fn timeouts()->RouterTimeouts{RouterTimeouts{connect:Duration::from_secs(2),handshake:Duration::from_secs(3),partial:Duration::from_secs(1),io:Duration::from_secs(2),startup:Duration::from_secs(5)}}
+pub(crate) fn timeouts()->RouterTimeouts{RouterTimeouts{connect:Duration::from_secs(2),handshake:Duration::from_secs(3),partial:Duration::from_secs(1),io:Duration::from_secs(2),startup:Duration::from_secs(5)}}
 async fn read_packet(tls:&mut TlsStream<TcpStream>)->io::Result<Option<Vec<u8>>>{
  let n=match tls.read_u32().await{Ok(n)=>n as usize,Err(e) if matches!(e.kind(),io::ErrorKind::UnexpectedEof|io::ErrorKind::ConnectionReset)=>return Ok(None),Err(e)=>return Err(e)};
  assert!((1..16384).contains(&n));let mut bytes=vec![0;n];tls.read_exact(&mut bytes).await?;Ok(Some(bytes))
@@ -25,19 +25,19 @@ fn control(sequence:u16,id:i32,result:&[u8])->Vec<u8>{
  let rpc=encode_reply(id,0,result).unwrap();let mut body=vec![0;12];body.push(1);body.extend_from_slice(rpc.expose_to_transport());outer(sequence,1,1,&body)
 }
 fn node(sequence:u16)->Vec<u8>{let mut body=vec![0;12];body.push(1);outer(sequence,0,0,&body)}
-fn channel(sequence:u16,kind:PacketKind,gap:u8,ack:u16,delivered:u16,body:&[u8])->Vec<u8>{
+pub(crate) fn channel(sequence:u16,kind:PacketKind,gap:u8,ack:u16,delivered:u16,body:&[u8])->Vec<u8>{
  native_channel::encode_packet(HeaderMode::Basic,&ChannelPacket{timestamp:None,sequence,kind,data_gap:gap,ack_sequence:ack,delivered_sequence:delivered,
   inclusive_ack:false,ack_mask:&[],body}).unwrap().expose_to_transport().to_vec()
 }
-struct Frame{wire:u16,root:u16,kind:PacketKind,previous:Option<u16>,body:Vec<u8>,ack:u16}
+pub(crate) struct Frame{pub wire:u16,pub root:u16,pub kind:PacketKind,pub previous:Option<u16>,pub body:Vec<u8>,pub ack:u16}
 fn frame(bytes:&[u8])->Frame{
  let packet=native_channel::decode_packet(HeaderMode::Basic,netstream_records::unescape_channel(bytes).unwrap()).unwrap();let original=native_channel::original_packet(&packet).unwrap();
  let (previous,body)=if original.kind==PacketKind::Data{let(prev,body)=native_channel::previous_data(&original).unwrap();(Some(prev),body)}else{(None,original.body)};
  Frame{wire:packet.sequence,root:original.sequence,kind:original.kind,previous,body:body.to_vec(),ack:packet.ack_sequence}
 }
-struct Peer{tls:TlsStream<TcpStream>,port:u16,client_start:u16,client_high:u16,client_delivered:u16,next_channel:u16,last_data:u16,router_sequence:u16}
+pub(crate) struct Peer{pub tls:TlsStream<TcpStream>,port:u16,pub client_start:u16,pub client_high:u16,pub client_delivered:u16,pub next_channel:u16,pub last_data:u16,router_sequence:u16}
 impl Peer{
- async fn accept_start(listener:TcpListener,config:Arc<ServerConfig>,drop_first:bool)->Self{
+ pub(crate) async fn accept_start(listener:TcpListener,config:Arc<ServerConfig>,drop_first:bool)->Self{
   let(tcp,_)=listener.accept().await.unwrap();let mut tls=tokio_rustls::TlsAcceptor::from(config).accept(tcp).await.unwrap();
   let first=read_packet(&mut tls).await.unwrap().unwrap();let(_,body)=decode_path_header(&first).unwrap();let route=super::super::router_packets::decode_routed_body(body).unwrap();
   let request=decode_request(&route.payload[1..]).unwrap();assert_eq!(request.call_id,1);assert_eq!(request.method,b"clientConnect1.RouterClient.Common");
@@ -64,24 +64,24 @@ impl Peer{
    }
   }
  }
- fn routed(&mut self,packet:&[u8])->Vec<u8>{
+ pub(crate) fn routed(&mut self,packet:&[u8])->Vec<u8>{
   let payload=netstream_records::escape_channel(packet).unwrap();let route=Routing{source:RouteAddress{mask:3,network:42,node:7,port:98,..Default::default()},
    destination:RouteAddress{port:self.port,..Default::default()},..Default::default()};let body=native_routing::encode_routing_body(&route,payload.expose_to_transport()).unwrap();
   let wire=outer(self.router_sequence,0,1,body.expose_to_transport());self.router_sequence+=1;wire
  }
  async fn write_channel(&mut self,packet:&[u8]){let wire=self.routed(packet);self.tls.write_all(&wire).await.unwrap();self.tls.flush().await.unwrap();}
- async fn read_channel(&mut self)->Option<Frame>{
+ pub(crate) async fn read_channel(&mut self)->Option<Frame>{
   loop{let raw=match read_packet(&mut self.tls).await{Ok(Some(raw))=>raw,Ok(None)|Err(_)=>return None};let(header,body)=decode_path_header(&raw).unwrap();
    if header.packet_kind==3{assert_eq!(header.fragment_part,1);assert!(body.is_empty());continue;}
    if header.packet_kind==0&&header.fragment_part==0{if body.last()==Some(&0){let wire=node(self.router_sequence);self.router_sequence+=1;self.tls.write_all(&wire).await.unwrap();self.tls.flush().await.unwrap();}continue;}
    assert_eq!((header.packet_kind,header.fragment_part),(0,1));let route=native_routing::decode_routing_body(body).unwrap();let packet=frame(route.payload);self.client_high=packet.wire;return Some(packet);
   }
  }
- async fn start(&mut self){
+ pub(crate) async fn start(&mut self){
   self.write_channel(&channel(self.next_channel,PacketKind::Start,0,self.client_high,self.client_start.wrapping_sub(1),&[])).await;self.next_channel+=1;
   let ack=self.read_channel().await.unwrap();assert_eq!(ack.kind,PacketKind::Probe);assert_eq!(ack.ack,0x9000);assert_eq!(ack.body,[0x89,0x87,0x22,0x83]);self.client_delivered=self.client_start;
  }
- async fn ack(&mut self,delivered:u16){
+ pub(crate) async fn ack(&mut self,delivered:u16){
   self.client_delivered=delivered;
   self.write_channel(&channel(self.next_channel,PacketKind::Probe,0,self.client_high,delivered,&[0x89,0x87,0x22,0x83])).await;self.next_channel+=1;
  }
@@ -117,9 +117,9 @@ impl Peer{
   };
   self.last_data=second;self.next_channel=second+1;self.tls.write_all(&group).await.unwrap();self.tls.flush().await.unwrap();
  }
- async fn eof(mut self){while self.read_channel().await.is_some(){}}
+ pub(crate) async fn eof(mut self){while self.read_channel().await.is_some(){}}
 }
-fn reference(query:bool)->super::super::object_reference::ObjectReference{parse_object_reference(if query{b"AccountEntry:sarc -h arc@AccountEntry -p 98;"}else{b"AccountEntry:sarc -h 42.7 -p 98;"}).unwrap()}
+pub(crate) fn reference(query:bool)->super::super::object_reference::ObjectReference{parse_object_reference(if query{b"AccountEntry:sarc -h arc@AccountEntry -p 98;"}else{b"AccountEntry:sarc -h 42.7 -p 98;"}).unwrap()}
 // The only spawned client tasks are retained behind abort-on-drop guards.
 // Peer futures are polled by join!, so assertion unwinding cannot detach them.
 struct OwnedTestTask<T>(Option<tokio::task::JoinHandle<T>>);

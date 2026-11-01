@@ -25,8 +25,11 @@ impl Brand {
 }
 /// Still Common RECORDS, not decoded/accepted RPC, SDK authentication or a
 ///business ACK. A cancelled original session revokes already queued groups.
-pub(super) struct ScopedRecords { brand: Brand, records: Vec<TransportBytes> }
+pub(super) struct ScopedRecords { brand: Brand, records: Vec<TransportBytes>, received: Instant }
 impl ScopedRecords {
+    pub fn received_for(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, session: &ChannelSession) -> Option<Instant> {
+        self.brand.for_session(owner, scope, session).then_some(self.received)
+    }
     pub fn records_for(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, session: &ChannelSession) -> Option<&[TransportBytes]> {
         self.brand.for_session(owner, scope, session).then_some(self.records.as_slice())
     }
@@ -136,12 +139,12 @@ impl ChannelSession {
         -> Result<Option<ScopedRecords>, SessionError> {
         if !self.original(owner, scope) { return Ok(None); }
         let result = (|| {
-            let mut matched = false; let mut records = Vec::new(); let mut total = 0usize;
+            let mut matched = false; let mut records = Vec::new(); let mut total = 0usize; let mut oldest = now;
             for delivery in deliveries {
                 let Some((routing, wire, received)) = delivery.for_channel(owner, scope, &self.claim) else { continue; };
                 if !self.from_original_peer(routing) { continue; }
                 if received > now { return Err(SessionError::Channel(ChannelError::ClockRollback)); }
-                matched = true;
+                matched = true; oldest = oldest.min(received);
                 for encoded in self.core.on_packet_admitted(unescape_channel(wire)?, received, now)? {
                     let plain = self.receiver.decode(encoded.expose_to_transport())?;
                     total = total.checked_add(plain.expose_to_transport().len()).ok_or(SessionError::Configuration)?;
@@ -150,7 +153,7 @@ impl ChannelSession {
                 }
             }
             if !matched { return Ok(None); }
-            Ok(Some(ScopedRecords { brand: self.brand()?, records }))
+            Ok(Some(ScopedRecords { brand: self.brand()?, records, received: oldest }))
         })();
         if result.is_err() { self.close(); } result
     }

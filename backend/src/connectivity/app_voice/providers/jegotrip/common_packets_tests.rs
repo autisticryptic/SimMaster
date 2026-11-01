@@ -142,3 +142,27 @@ fn expanded_output_and_retained_partial_share_the_same_group_budget(){
  let mut packets:Vec<_>=(0..8).map(|_|TransportBytes::from_bytes(packet.clone())).collect();packets.push(TransportBytes::from_bytes(vec![0x20,0,0,0,8,b'a']));
  let mut state=assembler(now);assert_eq!(state.on_group(&packets,now+Duration::from_secs(5),now).err(),Some(CommonError::Bound));assert!(state.closed);assert_eq!(state.retained_bytes(),0);
 }
+#[test]
+fn announced_expansion_is_admitted_before_decoder_even_with_a_broken_crc(){
+ let now=Instant::now();let mut packet=compressed(CallKind::Reply,&[b'x';32]);let last=packet.len()-4;packet[last]^=0x80;
+ let mut state=assembler(now);assert_eq!(state.on_packet_budgeted(&packet,now+Duration::from_secs(1),now,now,31).err(),Some(CommonError::Bound));
+ assert!(state.closed);assert_eq!(state.retained_bytes(),0);
+}
+#[test]
+fn announced_fragment_reservation_not_just_filled_bytes_is_charged_before_allocation(){
+ let now=Instant::now();let mut state=assembler(now);let packet=[0x20,0,2,0,0,b'x'];
+ assert_eq!(state.on_packet_budgeted(&packet,now+Duration::from_secs(1),now,now,1).err(),Some(CommonError::Bound));assert_eq!(state.retained_bytes(),0);
+ let mut state=assembler(now);state.on_packet(&packet,now+Duration::from_secs(1),now).unwrap();assert_eq!(state.retained_bytes(),MAX_STREAM_BYTES);
+}
+#[test]
+fn fragmented_call_count_is_bounded_across_separate_input_groups(){
+ let now=Instant::now();let mut state=assembler(now);state.on_packet(&[0x20,0,0,1,1,b'x'],now+Duration::from_secs(1),now).unwrap();
+ for _ in 0..255{assert!(state.on_packet(&[3,b'x'],now+Duration::from_secs(1),now).unwrap().is_none());}
+ assert_eq!(state.on_packet(&[3,b'x'],now+Duration::from_secs(1),now).err(),Some(CommonError::Bound));assert!(state.closed);
+}
+#[test]
+fn retained_group_receipt_time_bounds_new_common_partial_not_later_processing_time(){
+ let now=Instant::now();let mut state=assembler(now);
+ assert_eq!(state.on_packet_budgeted(&[0x20,0,0,0,4,b'x'],now+Duration::from_secs(10),now,now+Duration::from_secs(2),MAX_GROUP_BYTES).err(),Some(CommonError::Timeout));
+ let mut state=assembler(now);assert_eq!(state.on_packet_budgeted(&[2],now+Duration::from_secs(10),now+Duration::from_millis(1),now,MAX_GROUP_BYTES).err(),Some(CommonError::ClockRollback));
+}

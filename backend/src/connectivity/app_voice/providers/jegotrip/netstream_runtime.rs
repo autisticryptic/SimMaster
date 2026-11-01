@@ -28,7 +28,11 @@ impl Drop for NetstreamPath{fn drop(&mut self){self.close();}}
 impl NetstreamPath{
     /// Consumes the ORIGINAL physical Router owner. No new socket, endpoint,
     ///trust context or relabelled tracker is created to start this Channel.
+    pub fn owner(&self)->AttemptOwner{self.owner.clone()}
     pub fn scope(&self)->RpcConnectionScope{self.scope.clone()}
+    pub fn received_for(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,group:&ScopedRecords)->Option<Instant>{
+        if !self.original(owner,scope){return None;}group.received_for(owner,scope,&self.session)
+    }
     pub async fn open(mut router:RouterPath,endpoint:&ReferenceEndpoint,index:usize,deadline:Instant,
         partial_timeout:Duration)->Result<Self,NetstreamError>{
         let owner=router.owner();let scope=router.scope();
@@ -150,4 +154,4 @@ impl NetstreamPath{
 
 #[cfg(test)]
 #[path="netstream_runtime_tests.rs"]
-mod tests;
+pub(super) mod tests;

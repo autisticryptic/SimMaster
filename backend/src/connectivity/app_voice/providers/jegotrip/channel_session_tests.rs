@@ -190,3 +190,12 @@ fn prepared_io_carries_original_hard_deadline_not_a_new_caller_or_soft_retry_tim
  assert_eq!(output.for_io(&f.owner,&f.scope,&s,end,f.now+Duration::from_secs(20)).err(),Some(SessionError::Channel(ChannelError::Timeout)));
  assert!(output.for_io(&f.owner,&RpcConnectionScope::fresh(),&s,end,f.now+Duration::from_secs(20)).unwrap().is_none());
 }
+
+#[test]
+fn scoped_record_group_retains_original_receive_time_after_processing_delay(){
+ let mut f=Fixture::new();let mut s=f.session();f.start(&mut s);
+ let input=f.deliveries(peer_source(),&[data(0x9001,&[0xff,7,0,0,0,1,0x53,0x2b,0xc1])]);
+ let records=s.on_deliveries(&f.owner,&f.scope,&input,f.now+Duration::from_secs(1)).unwrap().unwrap();
+ assert_eq!(records.received_for(&f.owner,&f.scope,&s),Some(f.now));assert!(records.received_for(&f.owner,&RpcConnectionScope::fresh(),&s).is_none());
+ s.close();assert!(records.received_for(&f.owner,&f.scope,&s).is_none());
+}

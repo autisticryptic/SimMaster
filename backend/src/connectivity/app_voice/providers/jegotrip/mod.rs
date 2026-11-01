@@ -84,6 +84,8 @@ pub(crate) mod channel_session;
 pub(crate) mod netstream_runtime;
 pub(crate) mod common_compression;
 pub(crate) mod common_packets;
+pub(crate) mod common_control;
+pub(crate) mod common_runtime;
 
 // Keep the existing API/provider id stable while moving the implementation.
 pub const PROVIDER_ID: &str = "app_voice";
