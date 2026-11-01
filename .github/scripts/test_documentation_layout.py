@@ -34,6 +34,10 @@ class DocumentationLayoutTests(unittest.TestCase):
             # User-requested consolidated reverse-engineering result, not a
             # dated handoff page or a private APK/credential dump.
             'JEGOTRIP_REVERSE_ENGINEERING_SUMMARY.md',
+            # Maintained delivery status + runbook for the native hosting subset:
+            # current behaviour, verified evidence and the remaining authorised
+            # device steps. It is not a dated handoff page.
+            'JEGOTRIP_NATIVE_HOSTING_DELIVERY.md',
         }
         # This private, untracked report belongs to the user and is not part of
         # the maintained public documentation set.
