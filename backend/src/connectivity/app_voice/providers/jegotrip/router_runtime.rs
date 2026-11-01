@@ -289,8 +289,13 @@ impl RouterPath {
         &self.owner==owner && self.scope.matches(scope) && self.scope.is_open() && self.io.is_some()
     }
     async fn write_wire(&mut self,wire:&[OwnedWireFrames],deadline:Instant)->Result<(),RouterIoError> {
+        let now=Instant::now();self.engine.tick(&self.owner,&self.scope,now)?;
+        let mut end=deadline.min(now.checked_add(self.io_timeout).ok_or(RouterIoError::Configuration)?);
+        for original in self.engine.next_deadline().into_iter().chain(self.tracker.next_deadline()).chain(self.ports.next_deadline()){
+            end=end.min(original);
+        }
+        if now>=end{return Err(RouterIoError::Timeout);}
         let scope=self.scope.clone();let owner=&self.owner;let io=self.io.as_mut().ok_or(RouterIoError::Scope)?;
-        let end=deadline.min(Instant::now().checked_add(self.io_timeout).ok_or(RouterIoError::Configuration)?);
         let write=async {
             for output in wire {for frame in output.frames_for(owner,&scope).ok_or(RouterIoError::Scope)? {
                 let bytes=frame.expose_to_transport();let mut offset=0;

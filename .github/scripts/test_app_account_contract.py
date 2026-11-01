@@ -557,8 +557,15 @@ class AppAccountContractTests(unittest.TestCase):
 
     def test_direct_compaction_requires_original_written_response_and_durable_watermark(self):
         actor = (PROVIDER / 'transport_actor.rs').read_text(encoding='utf-8')
-        command = actor.split('async fn command(', 1)[1].split('async fn send_wire', 1)[0]
-        self.assertLess(command.index('self.send_wire(&wire'), command.index('if is_response { receipt.direct'))
+        command = actor.split('async fn command(', 1)[1].split('async fn send_packets', 1)[0]
+        self.assertLess(command.index('self.send_packets(&packets.packets'), command.index('if is_response { receipt.direct'))
+        sending = actor.split('async fn send_packets(', 1)[1].split('async fn send_wire', 1)[0]
+        self.assertIn('self.send_common_packets(packets,completion,native_deadline).await', sending)
+        self.assertLess(sending.index('encrypt_packets('), sending.index('self.send_wire(&wire,completion).await'))
+        native = (PROVIDER / 'arc_native_actor.rs').read_text(encoding='utf-8')
+        self.assertIn('common.send_prepared_packets(&owner,&scope,packets,end)', native)
+        self.assertIn('_=completion.closed()=>Err(RuntimeError::Cancelled)', native)
+        self.assertIn('match outcome{Ok(true)=>Ok(())', native)
         self.assertIn('direct: None', actor)
         inbox = (PROVIDER / 'account_inbox.rs').read_text(encoding='utf-8')
         self.assertIn('receipt.direct_replay_frontier()', inbox)

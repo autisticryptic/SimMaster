@@ -108,6 +108,15 @@ impl<I:AsyncRead+AsyncWrite+Unpin+Send+'static> Actor<I>{
         let mut timer=tokio::time::interval(Duration::from_millis(20));timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop{
             if let Err(error)=self.common_tick(){return error;}
+            if self.events.is_closed(){return RuntimeError::Closed;}
+            // One queued command gets service even when control IO made every
+            //timer pulse overdue. We still service a read/timer step afterward,
+            //so neither a command flood nor continuous Pongs can starve peers.
+            match self.commands.try_recv(){
+                Ok(command)=>if !command.completion.is_closed(){if let Err(error)=self.command(command).await{return error;}},
+                Err(mpsc::error::TryRecvError::Disconnected)=>return RuntimeError::Closed,
+                Err(mpsc::error::TryRecvError::Empty)=>{},
+            }
             tokio::select!{biased;
                 _=self.scope.closed()=>return RuntimeError::Closed,
                 _=self.events.closed()=>return RuntimeError::Closed,

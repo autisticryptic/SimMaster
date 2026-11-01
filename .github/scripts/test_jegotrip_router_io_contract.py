@@ -29,6 +29,8 @@ class RouterIoContract(unittest.TestCase):
         self.assertIn('poll_before(&scope,io.write(&bytes[offset..]),end)', runtime)
         self.assertIn('poll_before(&scope,io.flush(),end)', runtime)
         self.assertIn('poll_before(&self.scope,io.read(&mut buffer),end)', runtime)
+        self.assertIn('self.engine.next_deadline().into_iter().chain(self.tracker.next_deadline()).chain(self.ports.next_deadline())', runtime)
+        self.assertIn('end=end.min(original)', runtime)
 
     def test_tls_router_runtime_has_original_drop_cleanup_and_no_detached_tasks_or_sdk_grants(self):
         source = (NATIVE / 'router_runtime.rs').read_text()

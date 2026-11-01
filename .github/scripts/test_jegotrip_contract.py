@@ -452,6 +452,8 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('self.backend.on_common_calls', source)
         self.assertIn('common.send_prepared_packets', source)
         self.assertIn('self.pending.values().copied().chain(extra)', source)
+        self.assertIn('match self.commands.try_recv()', source)
+        self.assertIn('self.native_attempt_end=None', source)
         for forbidden in ['TlsEngine::for_', 'VerifiedPlaintextPackets::', 'RpcConnectionScope::fresh', 'Callback::SdkLogin { success: true }']:
             self.assertNotIn(forbidden, source)
         actor = (MOD / 'transport_actor.rs').read_text(encoding='utf-8')

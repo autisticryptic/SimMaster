@@ -93,9 +93,10 @@ async fn malformed_later_rpc_in_common_group_suppresses_earlier_positive_login()
 #[tokio::test]
 async fn foreign_commands_cannot_consume_native_rpc_ids_or_send_on_original_io(){
     let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=router_policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
-    let server=async move{tokio::time::timeout(Duration::from_secs(10),async move{CommonPeer::open(listener,config).await.no_more_common().await;}).await.unwrap()};
-    let client=async move{let original=owner();let connection=connected(&p,original.clone(),Instant::now()+Duration::from_secs(6)).await;let scope=connection.connection_scope();let(mut handle,_events)=connection.attach().unwrap();
-        assert_eq!(handle.login(&owner(),&scope,login(),&[]).await.err(),Some(RuntimeError::Scope));assert_eq!(handle.bootstrap(&original,&RpcConnectionScope::fresh(),b"fixture-app-key",&[]).await.err(),Some(RuntimeError::Scope));assert!(scope.is_open());assert!(handle.close().await.io_released());};tokio::join!(server,client);
+    let server=async move{tokio::time::timeout(Duration::from_secs(10),async move{let mut peer=CommonPeer::open(listener,config).await;let packet=peer.next().await.unwrap();let request=decode_request(&packet[1..]).unwrap();assert_eq!(request.call_id,1);peer.send(&[reply(1,&login_result(true))]).await;peer.no_more_common().await;}).await.unwrap()};
+    let client=async move{let original=owner();let connection=connected(&p,original.clone(),Instant::now()+Duration::from_secs(6)).await;let scope=connection.connection_scope();let(mut handle,mut events)=connection.attach().unwrap();
+        assert_eq!(handle.login(&owner(),&scope,login(),&[]).await.err(),Some(RuntimeError::Scope));assert_eq!(handle.bootstrap(&original,&RpcConnectionScope::fresh(),b"fixture-app-key",&[]).await.err(),Some(RuntimeError::Scope));assert!(scope.is_open());
+        authenticated(&handle,&mut events,&original,&scope).await;assert!(handle.close().await.io_released());};tokio::join!(server,client);
 }
 #[tokio::test]
 async fn dropping_connected_unattached_native_owner_closes_tcp_without_spawning_actor(){
@@ -139,4 +140,52 @@ async fn real_native_batch_hosting_and_direct_message_keep_original_nested_ticke
             OfflineEvent::Callback(c)=>{assert_eq!(c.callback,Callback::HostingAck{success:true});hosted=true;},OfflineEvent::DirectMessage(m)=>{assert_eq!(m.message().body,[0xff,0,3]);ticket=Some(m.into_parts().2);},_=>panic!("unexpected event")
         }}}
         handle.complete_direct(&original,&scope,&ticket.unwrap(),true).await.unwrap();assert!(handle.close().await.io_released());};tokio::join!(server,client);
+}
+
+#[tokio::test]
+async fn explicit_plain_arc_uses_outer_endpoint_tls_without_guessing_seeded_record_security(){
+    let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=router_policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
+    let server=async move{tokio::time::timeout(Duration::from_secs(10),async move{let mut peer=CommonPeer::open_mode(listener,config,super::super::super::netstream_records::RecordSecurity::Plain).await;
+        let packet=peer.next().await.unwrap();assert_eq!(packet[0],0);let request=decode_request(&packet[1..]).unwrap();assert_eq!(request.call_id,1);peer.send(&[reply(1,&login_result(true))]).await;peer.no_more_common().await;}).await.unwrap()};
+    let client=async move{let original=owner();let prepared=prepare_common(original.clone(),rpc_policy(),Instant::now()+Duration::from_secs(6)).unwrap();let scope=prepared.connection_scope();
+        let r=super::super::super::object_reference::parse_object_reference(b"AccountEntry:arc -h 42.7 -p 98;").unwrap();let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
+        let connected=prepared.connect(&p,&[],&endpoints[0],0,timeouts(),None).await.unwrap();let(mut handle,mut events)=connected.attach().unwrap();authenticated(&handle,&mut events,&original,&scope).await;assert!(handle.close().await.io_released());};tokio::join!(server,client);
+}
+#[tokio::test]
+async fn continuous_slow_control_replies_cannot_starve_a_really_queued_native_login(){
+    let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=router_policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);let(tx,rx)=oneshot::channel();
+    let server=async move{tokio::time::timeout(Duration::from_secs(12),async move{let mut peer=CommonPeer::open(listener,config).await;peer.send(&[vec![2],vec![2],vec![2],vec![2]]).await;tx.send(()).unwrap();
+        let(mut pongs,mut batches,mut logged)=(0usize,1usize,false);
+        while let Some(packet)=peer.next().await{
+            if packet==[14]{pongs+=1;if !logged&&pongs%4==1&&batches<16{peer.send(&[vec![2],vec![2],vec![2],vec![2]]).await;batches+=1;}}
+            else{assert!(!logged);assert_eq!(packet[0],0);let request=decode_request(&packet[1..]).unwrap();assert_eq!(request.call_id,1);peer.send(&[reply(1,&login_result(true))]).await;logged=true;}
+        }assert!(logged);
+    }).await.unwrap()};
+    let client=async move{let original=owner();let mut connection=connected(&p,original.clone(),Instant::now()+Duration::from_secs(6)).await;let scope=connection.connection_scope();
+        let pauses=super::super::super::common_runtime::tests::delay_common_write(connection.common.as_mut().unwrap(),Duration::from_millis(50));
+        let(mut handle,mut events)=connection.attach().unwrap();rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2),authenticated(&handle,&mut events,&original,&scope)).await.unwrap();assert!(pauses.load(std::sync::atomic::Ordering::Acquire)>0);
+        assert!(handle.close().await.io_released());};tokio::join!(server,client);
+}
+#[tokio::test]
+async fn native_handle_drop_revokes_surviving_commands_and_retained_join_observes_io_release(){
+    let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=router_policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
+    let server=async move{tokio::time::timeout(Duration::from_secs(10),async move{CommonPeer::open(listener,config).await.no_more_common().await;}).await.unwrap()};
+    let client=async move{let original=owner();let connection=connected(&p,original.clone(),Instant::now()+Duration::from_secs(6)).await;let scope=connection.connection_scope();let(mut handle,_events)=connection.attach().unwrap();let commands=handle.command_handle();
+        // Test owns the very same Join while dropping the public handle; this
+        //does not fabricate a RuntimeCloseReceipt or release an account lease.
+        let mut task=handle.task.take().unwrap();drop(handle);assert!(!scope.is_open());assert_eq!(commands.bootstrap(&original,&scope,b"fixture-key",&[]).await.err(),Some(RuntimeError::Scope));
+        match tokio::time::timeout(Duration::from_secs(2),&mut task).await{Ok(result)=>assert_eq!(result.unwrap(),RuntimeError::Closed),Err(_)=>{task.abort();let _=task.await;panic!("native task did not retire");}}
+    };tokio::join!(server,client);
+}
+#[tokio::test]
+async fn cancelling_actual_native_submission_stops_blocked_write_and_preserves_owning_join(){
+    let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=router_policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
+    let server=async move{tokio::time::timeout(Duration::from_secs(10),async move{CommonPeer::open(listener,config).await.no_more_common().await;}).await.unwrap()};
+    let client=async move{let original=owner();let mut connection=connected(&p,original.clone(),Instant::now()+Duration::from_secs(6)).await;let scope=connection.connection_scope();
+        let pauses=super::super::super::common_runtime::tests::delay_common_write(connection.common.as_mut().unwrap(),Duration::from_millis(300));let(mut handle,_events)=connection.attach().unwrap();let commands=handle.command_handle();
+        assert!(tokio::time::timeout(Duration::from_millis(35),commands.bootstrap(&original,&scope,b"fixture-key",&[])).await.is_err());
+        tokio::time::timeout(Duration::from_secs(2),scope.closed()).await.unwrap();assert!(pauses.load(std::sync::atomic::Ordering::Acquire)>0);
+        let closed=handle.close().await;assert!(closed.io_released());assert_eq!(closed.reason,RuntimeError::Cancelled);
+    };tokio::join!(server,client);
 }

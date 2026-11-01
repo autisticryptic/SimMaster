@@ -285,3 +285,32 @@ pub(crate) fn delay_original_io_after(path:&mut RouterPath,point:DelayPoint,dela
  let inner=path.io.take().expect("original fixture socket");let pauses=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
  path.io=Some(Box::new(SlowOriginalIo{inner,point,delay,sleep:None,waited:false,skip,pauses:pauses.clone()}));pauses
 }
+
+#[tokio::test]
+async fn original_tls_handshake_deadline_bounds_blocked_first_clienthello_write(){
+ let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let port=listener.local_addr().unwrap().port();let p=policy(&cert.root,port);
+ let server=async move{let(mut tcp,_)=listener.accept().await.unwrap();let mut bytes=[0u8;1];assert!(matches!(tokio::time::timeout(Duration::from_secs(2),tcp.read(&mut bytes)).await.unwrap(),Ok(0)|Err(_)));};
+ let client=async move{
+  let original=owner();let scope=RpcConnectionScope::fresh();let tcp=tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST,port)).await.unwrap();let pauses=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+  let io=SlowOriginalIo{inner:Box::new(tcp),point:DelayPoint::Write,delay:Duration::from_millis(300),sleep:None,waited:false,skip:0,pauses:pauses.clone()};
+  let connected=ConnectedRouterIo::original(&original,&scope,&p,0,io).unwrap();let now=Instant::now();let mut bounds=timeouts();bounds.handshake=Duration::from_millis(80);
+  assert!(RouterPath::attach(original,scope.clone(),&p,connected,&[],bounds,now,now+Duration::from_secs(2)).await.is_err());
+  assert!(now.elapsed()<Duration::from_secs(1));assert!(!scope.is_open());assert!(pauses.load(std::sync::atomic::Ordering::Acquire)>0);
+ };tokio::join!(server,client);
+}
+
+#[tokio::test]
+async fn retained_endpoint_tls_partial_deadline_bounds_control_write_and_flush(){
+ for point in [DelayPoint::Write,DelayPoint::Flush]{
+  let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=policy(&cert.root,listener.local_addr().unwrap().port());let server_config=cert.server_config(&tokio_rustls::rustls::version::TLS13);
+  let server=async move{tokio::time::timeout(Duration::from_secs(5),async move{let(tcp,_)=listener.accept().await.unwrap();let mut tls=tokio_rustls::TlsAcceptor::from(server_config).accept(tcp).await.unwrap();let _=packet(&mut tls).await;
+   let mut group=reply();group.extend_from_slice(&[0,0]);tls.write_all(&group).await.unwrap();tls.flush().await.unwrap();
+   if point==DelayPoint::Flush{assert_node_packet(&packet(&mut tls).await,0);}
+   let mut bytes=[0u8;1];assert!(matches!(tls.read(&mut bytes).await,Ok(0)|Err(_)));}).await.unwrap()};
+  let client=async move{let original=owner();let scope=RpcConnectionScope::fresh();let mut bounds=timeouts();bounds.partial=Duration::from_millis(80);
+   let mut path=RouterPath::open(original.clone(),scope.clone(),&p,&[],bounds).await.unwrap();assert!(path.engine.next_deadline().is_some());
+   let pauses=delay_original_io_after(&mut path,point,Duration::from_millis(300),0);let now=Instant::now();let timing=path.timing(now).unwrap();let control=path.tracker.prepare_node_probe(&original,&scope,timing,now).unwrap().unwrap();
+   assert!(path.send_control(&control,now+Duration::from_secs(2)).await.is_err());assert!(now.elapsed()<Duration::from_secs(1));assert!(pauses.load(std::sync::atomic::Ordering::Acquire)>0);path.close();assert!(!scope.is_open());
+  };tokio::join!(server,client);
+ }
+}

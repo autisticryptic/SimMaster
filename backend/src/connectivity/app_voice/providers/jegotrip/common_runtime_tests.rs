@@ -9,9 +9,10 @@ use tokio_rustls::rustls::{ServerConfig,version::TLS13};
 
 pub(crate) struct CommonPeer{peer:Peer,sender:RecordSender,receiver:RecordReceiver,records:Records,last_client:u16,pending:VecDeque<Vec<u8>>}
 impl CommonPeer{
- pub(crate) async fn open(listener:TcpListener,config:Arc<ServerConfig>)->Self{
+ pub(crate) async fn open(listener:TcpListener,config:Arc<ServerConfig>)->Self{Self::open_mode(listener,config,RecordSecurity::SeededXor).await}
+ pub(crate) async fn open_mode(listener:TcpListener,config:Arc<ServerConfig>,mode:RecordSecurity)->Self{
   let mut peer=Peer::accept_start(listener,config,false).await;peer.start().await;let last_client=peer.client_start;
-  Self{peer,sender:RecordSender::new(RecordSecurity::SeededXor,Some(0x12345678)).unwrap(),receiver:RecordReceiver::new(RecordSecurity::SeededXor),records:Records::default(),last_client,pending:VecDeque::new()}
+  Self{peer,sender:RecordSender::new(mode,(mode==RecordSecurity::SeededXor).then_some(0x12345678)).unwrap(),receiver:RecordReceiver::new(mode),records:Records::default(),last_client,pending:VecDeque::new()}
  }
  pub(crate) async fn send(&mut self,packets:&[Vec<u8>]){
   let mut wire=Vec::new();
@@ -120,6 +121,10 @@ async fn common_receive_scope_close_drops_original_owner_without_detached_task()
  let server=async move{tokio::time::timeout(Duration::from_secs(12),async move{let peer=CommonPeer::open(listener,config).await;peer.no_more_common().await;}).await.unwrap()};
  let client=async move{let(mut path,original,scope)=open_client(p,Duration::from_secs(2)).await;assert!(tx.send(scope.clone()).is_ok());assert!(path.receive_calls(&original,&scope,Instant::now()+Duration::from_secs(4)).await.is_err());drop(path);};
  let cancel=async move{let scope:RpcConnectionScope=rx.await.unwrap();tokio::task::yield_now().await;scope.close();};tokio::join!(server,client,cancel);
+}
+
+pub(crate) fn delay_common_write(path:&mut CommonPath,delay:Duration)->Arc<std::sync::atomic::AtomicUsize>{
+ super::super::netstream_runtime::tests::delay_original_stream_write(&mut path.stream,delay,0)
 }
 
 async fn blocked_common_output(operation:u8){
