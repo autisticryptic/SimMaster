@@ -110,21 +110,30 @@ impl ChannelCore {
     pub fn tick(&mut self, now: Instant) -> Result<(), ChannelError> {
         let result = self.check(now); if result.is_err() { self.close(); } result
     }
-    pub fn next_wake(&self) -> Option<Instant> {
+    /// Earliest absolute Channel expiration. Unlike next_wake, this excludes
+    ///soft retransmission pulses and is safe to constrain awaited physical IO.
+    pub fn hard_deadline(&self) -> Option<Instant> {
         if self.closed { return None; }
         let mut end = (!self.ready()).then_some(self.startup_end);
-        for value in [self.partial_end, self.gap_end].into_iter().flatten() { end = Some(end.map_or(value, |old| old.min(value))); }
+        for value in [self.partial_end, self.gap_end].into_iter().flatten()
+            .chain(self.queued.iter().map(|item| item.deadline))
+            .chain(self.roots.values().filter(|item| item.kind != PacketKind::Start || !self.start_acked).map(|item| item.deadline)) {
+            end = Some(end.map_or(value, |old| old.min(value)));
+        }
+        end
+    }
+    pub fn next_wake(&self) -> Option<Instant> {
+        if self.closed { return None; }
+        let mut end = self.hard_deadline();
         if self.ack_pending || self.reset_reply.is_some() || self.ready() && !self.queued.is_empty() && self.roots.len() < MAX_PENDING {
             return Some(self.last_now);
         }
         for item in self.roots.values() {
-            if item.kind != PacketKind::Start || !self.start_acked { end = Some(end.map_or(item.deadline, |old| old.min(item.deadline))); }
             if !item.acknowledged {
                 let retry = item.sent.and_then(|time| time.checked_add(self.rto)).unwrap_or(self.last_now);
                 end = Some(end.map_or(retry, |old| old.min(retry)));
             }
         }
-        for item in &self.queued { end = Some(end.map_or(item.deadline, |old| old.min(item.deadline))); }
         end
     }
     fn retained_send_bytes(&self) -> usize {

@@ -195,6 +195,22 @@ impl RouterPath {
         let result=self.drive_until(deadline).await;
         if result.is_ok(){cancelled.armed=false;}else{self.close();}result
     }
+    /// Offer the original socket one cancellation-safe read poll, even while
+    ///Channel output is queued. Pending means no bytes consumed, not a deadline
+    ///failure. Any resulting TLS/control writes retain the HARD deadline.
+    pub(super) async fn try_drive_routing(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,deadline:Instant)->Result<bool,RouterIoError>{
+        if !self.original(owner,scope){return Ok(false);}
+        let mut cancelled=CancelGuard{scope:self.scope.clone(),armed:true};
+        let result=async{
+            let now=Instant::now();if now>=deadline{return Err(RouterIoError::Timeout);}
+            self.engine.tick(&self.owner,&self.scope,now)?;self.tracker.tick(&self.owner,&self.scope,now)?;self.ports.tick(&self.owner,&self.scope,now)?;
+            if self.dispatch_pending(deadline).await?{return Ok(true);}
+            let Some(input)=self.receive_available(deadline).await? else{return Ok(false);};
+            if self.tracker.on_packets(&self.owner,&self.scope,input,Instant::now())?.is_some(){return Err(RouterIoError::Configuration);}
+            self.flush_feedback(deadline).await?;self.dispatch_pending(deadline).await?;Ok(true)
+        }.await;
+        if result.is_ok(){cancelled.armed=false;}else{self.close();}result
+    }
     /// A Channel retransmission/partial timer may wake only the READ side.
     /// TLS output still uses the original hard operation deadline; no failed
     /// write/flush or consumed input is reclassified as a successful idle tick.
@@ -283,6 +299,24 @@ impl RouterPath {
         tokio::select!{biased;_=scope.closed()=>Err(RouterIoError::Scope),
             result=tokio::time::timeout_at(end.into(),write)=>result.unwrap_or(Err(RouterIoError::Timeout))}
     }
+    async fn receive_available(&mut self,deadline:Instant)->Result<Option<VerifiedEndpointPackets>,RouterIoError>{
+        use std::{future::{Future,poll_fn},task::Poll};
+        self.engine.tick(&self.owner,&self.scope,Instant::now())?;
+        let mut buffer=[0u8;16384];
+        let count={
+            let io=self.io.as_mut().ok_or(RouterIoError::Scope)?;
+            // AsyncReadExt::read is cancellation-safe (unlike read_exact).
+            // The single Pending poll consumes no prefix/body bytes.
+            let mut read=Box::pin(io.read(&mut buffer));
+            let once=poll_fn(|cx|match read.as_mut().poll(cx){
+                Poll::Pending=>Poll::Ready(Ok(None)),
+                Poll::Ready(result)=>Poll::Ready(result.map(Some)),
+            });
+            poll_before(&self.scope,once,deadline).await?.map_err(|_|RouterIoError::Io)?
+        };
+        let Some(count)=count else{return Ok(None);};
+        Ok(Some(self.process_read(&buffer[..count],deadline).await?))
+    }
     async fn receive_until(&mut self,deadline:Instant)->Result<VerifiedEndpointPackets,RouterIoError> {
         self.receive_step(deadline,deadline).await?.ok_or(RouterIoError::Timeout)
     }
@@ -298,12 +332,15 @@ impl RouterPath {
             Err(_)|Ok(Err(RouterIoError::Connect(ConnectError::Timeout)))=>return Ok(None),
             Ok(result)=>result?,
         };
-        if n==0{let error=self.engine.finish_eof(&self.owner,&self.scope).err().unwrap_or(TlsError::Closed);return Err(error.into());}
-        let progress=self.engine.on_wire_bytes(&self.owner,&self.scope,&buffer[..n],Instant::now())?.ok_or(RouterIoError::Scope)?;
+        Ok(Some(self.process_read(&buffer[..n],write_deadline).await?))
+    }
+    async fn process_read(&mut self,bytes:&[u8],write_deadline:Instant)->Result<VerifiedEndpointPackets,RouterIoError>{
+        if bytes.is_empty(){let error=self.engine.finish_eof(&self.owner,&self.scope).err().unwrap_or(TlsError::Closed);return Err(error.into());}
+        let progress=self.engine.on_wire_bytes(&self.owner,&self.scope,bytes,Instant::now())?.ok_or(RouterIoError::Scope)?;
         // A keepalive read wake must not shorten the write/flush budget or turn
         // an IO error into an idle tick after TLS has consumed this input.
         self.write_wire(&progress.wire,write_deadline).await?;
-        Ok(Some(progress.plaintext))
+        Ok(progress.plaintext)
     }
     /// Original-only raw endpoint packets; the later Router routing layer must
     /// validate their path/control semantics before any Common/SDK delivery.
@@ -329,4 +366,4 @@ impl Drop for RouterPath {fn drop(&mut self){self.close();}}
 
 #[cfg(test)]
 #[path="router_runtime_tests.rs"]
-mod tests;
+pub(super) mod tests;

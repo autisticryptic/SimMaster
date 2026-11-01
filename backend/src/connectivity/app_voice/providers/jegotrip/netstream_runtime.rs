@@ -78,11 +78,16 @@ impl NetstreamPath{
         //while every actual write retains its original hard deadline/gate.
         for _ in 0..32{
             let now=Instant::now();if now>=deadline{return Err(NetstreamError::Timeout);}
-            let Some(packet)=self.session.next_packet(&self.owner,&self.scope,now)? else{return Ok(());};
-            let bytes=packet.bytes_for(&self.owner,&self.scope,&self.session).ok_or(NetstreamError::Scope)?;
-            if !self.router.send_datagram(&self.owner,&self.scope,self.session.lease(),self.session.peer(),0,0,bytes,deadline).await?{
+            let read_end=self.session.bound_io_deadline(&self.owner,&self.scope,deadline).ok_or(NetstreamError::Scope)?;
+            // A ready route does not otherwise read during send_datagram. Give
+            //ACKs an actual read poll BEFORE choosing another due retry.
+            self.router.try_drive_routing(&self.owner,&self.scope,read_end).await?;self.ingest_pending()?;
+            let Some(packet)=self.session.next_packet(&self.owner,&self.scope,Instant::now())? else{return Ok(());};
+            let (bytes,write_end)=packet.for_io(&self.owner,&self.scope,&self.session,Instant::now(),deadline)?.ok_or(NetstreamError::Scope)?;
+            if !self.router.send_datagram(&self.owner,&self.scope,self.session.lease(),self.session.peer(),0,0,bytes,write_end).await?{
                 return Err(NetstreamError::Scope);
             }
+            tokio::task::yield_now().await;
             // Route-report waiting may have admitted a complete TLS group.
             //Do not defer its Channel validation until after another send.
             self.ingest_pending()?;
@@ -96,10 +101,11 @@ impl NetstreamPath{
         if let Some(metrics)=self.router.path_metrics(&self.owner,&self.scope){self.session.path_delay(&self.owner,&self.scope,metrics.echoed_delay_ms);}
         self.flush(deadline).await?;
         if !self.incoming.is_empty()||!was_ready&&self.session.ready_for(&self.owner,&self.scope){return Ok(());}
-        let wake=self.session.next_wake().unwrap_or(deadline).min(deadline);
+        let hard_end=self.session.bound_io_deadline(&self.owner,&self.scope,deadline).ok_or(NetstreamError::Scope)?;
+        let wake=self.session.next_wake().unwrap_or(hard_end).min(hard_end);
         // A successful false result is only a read-side timer wake. Write/flush
         //failures and expired TLS/Router partials remain errors and retire IO.
-        self.router.drive_routing_tick(&self.owner,&self.scope,wake,deadline).await?;
+        self.router.drive_routing_tick(&self.owner,&self.scope,wake,hard_end).await?;
         if !self.session.tick(&self.owner,&self.scope,Instant::now())?{return Err(NetstreamError::Scope);}
         self.ingest_pending()?;Ok(())
     }

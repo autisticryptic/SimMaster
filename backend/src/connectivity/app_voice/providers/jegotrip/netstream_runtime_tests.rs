@@ -72,6 +72,7 @@ impl Peer{
  async fn write_channel(&mut self,packet:&[u8]){let wire=self.routed(packet);self.tls.write_all(&wire).await.unwrap();self.tls.flush().await.unwrap();}
  async fn read_channel(&mut self)->Option<Frame>{
   loop{let raw=match read_packet(&mut self.tls).await{Ok(Some(raw))=>raw,Ok(None)|Err(_)=>return None};let(header,body)=decode_path_header(&raw).unwrap();
+   if header.packet_kind==3{assert_eq!(header.fragment_part,1);assert!(body.is_empty());continue;}
    if header.packet_kind==0&&header.fragment_part==0{if body.last()==Some(&0){let wire=node(self.router_sequence);self.router_sequence+=1;self.tls.write_all(&wire).await.unwrap();self.tls.flush().await.unwrap();}continue;}
    assert_eq!((header.packet_kind,header.fragment_part),(0,1));let route=native_routing::decode_routing_body(body).unwrap();let packet=frame(route.payload);self.client_high=packet.wire;return Some(packet);
   }
@@ -100,15 +101,16 @@ impl Peer{
   }panic!("bounded native request did not complete")
  }
  async fn response(&mut self,malformed:bool){
-  let first=self.next_channel;let second=first+1;let gap=(first-self.last_data-1) as u8;assert!(gap<31);
+  let first=self.next_channel;let second=first+1;let gap=(first-self.last_data-1).min(31) as u8;let previous=self.last_data;
+  let first_body=|body:&[u8]|{let mut bytes=Vec::new();if gap==31{bytes.extend_from_slice(&previous.to_be_bytes());}bytes.extend_from_slice(body);bytes};
   // Independent first-direction seed1 and payload 'OK':4f^32=7d,4b^49=02.
   let encoded=[1,0,0,0,1,0x7d,0x02];let delivered=self.client_delivered;
   let group=if malformed{
    let mut body=vec![0xff];body.extend_from_slice(&encoded);
-   let good=channel(first,PacketKind::Data,gap,self.client_high,delivered,&body);let bad=channel(second,PacketKind::Data,0,self.client_high,delivered,&[0]);
+   let good=channel(first,PacketKind::Data,gap,self.client_high,delivered,&first_body(&body));let bad=channel(second,PacketKind::Data,0,self.client_high,delivered,&[0]);
    [self.routed(&good),self.routed(&bad)].concat()
   }else{
-   let a=channel(first,PacketKind::Data,gap,self.client_high,delivered,&[0xfe,1,0,0]);
+   let a=channel(first,PacketKind::Data,gap,self.client_high,delivered,&first_body(&[0xfe,1,0,0]));
    let b=channel(second,PacketKind::Data,0,self.client_high,delivered,&[0xff,0,1,0x7d,0x02]);
    // Last first, then first and duplicate first, one authenticated TLS group.
    [self.routed(&b),self.routed(&a),self.routed(&a)].concat()
@@ -118,20 +120,40 @@ impl Peer{
  async fn eof(mut self){while self.read_channel().await.is_some(){}}
 }
 fn reference(query:bool)->super::super::object_reference::ObjectReference{parse_object_reference(if query{b"AccountEntry:sarc -h arc@AccountEntry -p 98;"}else{b"AccountEntry:sarc -h 42.7 -p 98;"}).unwrap()}
-async fn echo_case(query:bool,drop_start:bool,drop_data:bool,malformed:bool){
+// The only spawned client tasks are retained behind abort-on-drop guards.
+// Peer futures are polled by join!, so assertion unwinding cannot detach them.
+struct OwnedTestTask<T>(Option<tokio::task::JoinHandle<T>>);
+impl<T> Drop for OwnedTestTask<T>{fn drop(&mut self){if let Some(task)=&self.0{task.abort();}}}
+impl<T> OwnedTestTask<T>{
+ fn new(task:tokio::task::JoinHandle<T>)->Self{Self(Some(task))}
+ fn abort(&self){self.0.as_ref().unwrap().abort();}
+ async fn join(mut self)->Result<T,tokio::task::JoinError>{
+  // Borrow the handle during timeout; timeout never owns/drops/detaches it.
+  let result=match tokio::time::timeout(Duration::from_secs(2),self.0.as_mut().unwrap()).await{
+   Ok(result)=>result,
+   Err(_)=>{self.abort();let _=self.0.as_mut().unwrap().await;self.0.take();panic!("owned task join timed out after abort and cleanup")}
+  };self.0.take();result
+ }
+}
+async fn echo_case(query:bool,drop_start:bool,drop_data:bool,malformed:bool){echo_case_with_delay(query,drop_start,drop_data,malformed,false).await;}
+async fn echo_case_with_delay(query:bool,drop_start:bool,drop_data:bool,malformed:bool,slow:bool){
  let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
- let mut request=vec![0];request.extend_from_slice(&vec![b'x';4096]);let expected=request.clone();
- let worker=tokio::spawn(async move{tokio::time::timeout(Duration::from_secs(15),async move{let mut peer=Peer::accept_start(listener,config,drop_start).await;peer.start().await;
-  assert_eq!(peer.request(drop_data).await,expected);peer.response(malformed).await;peer.eof().await;}).await.unwrap()});
- let original=owner();let scope=RpcConnectionScope::fresh();let router=RouterPath::open(original.clone(),scope.clone(),&p,&[],timeouts()).await.unwrap();let r=reference(query);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
- let mut path=NetstreamPath::open(router,&endpoints[0],0,Instant::now()+Duration::from_secs(6),Duration::from_secs(1)).await.unwrap();assert!(path.ready_for(&original,&scope));
- assert!(!path.send_records(&owner(),&scope,&[],Instant::now()).await.unwrap());assert!(scope.is_open());
- assert!(path.send_records(&original,&scope,&[TransportBytes::from_bytes(request)],Instant::now()+Duration::from_secs(5)).await.unwrap());
- let response=path.receive_records(&original,&scope,Instant::now()+Duration::from_secs(5)).await;
- if malformed{assert!(response.is_err());assert!(!scope.is_open());}
- else{let groups=response.unwrap().unwrap();let records:Vec<_>=groups.iter().flat_map(|group|path.records_for(&original,&scope,group).unwrap()).collect();
-  assert_eq!(records.len(),1);assert_eq!(records[0].expose_to_transport(),[1,b'O',b'K']);path.close();assert!(path.records_for(&original,&scope,&groups[0]).is_none());}
- drop(path);assert!(!scope.is_open());worker.await.unwrap();
+ let mut request=vec![0];request.extend_from_slice(&vec![b'x';if slow{96*1024}else{4096}]);let expected=request.clone();
+ let server=async move{tokio::time::timeout(Duration::from_secs(25),async move{let mut peer=Peer::accept_start(listener,config,drop_start).await;peer.start().await;
+  assert_eq!(peer.request(drop_data).await,expected);peer.response(malformed).await;peer.eof().await;}).await.unwrap()};
+ let client=async move{
+  let original=owner();let scope=RpcConnectionScope::fresh();let router=RouterPath::open(original.clone(),scope.clone(),&p,&[],timeouts()).await.unwrap();let r=reference(query);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
+  let mut path=NetstreamPath::open(router,&endpoints[0],0,Instant::now()+Duration::from_secs(6),Duration::from_secs(1)).await.unwrap();assert!(path.ready_for(&original,&scope));
+  if slow{super::super::router_runtime::tests::delay_original_io(&mut path.router,super::super::router_runtime::tests::DelayPoint::Flush,Duration::from_millis(50));}
+  assert!(!path.send_records(&owner(),&scope,&[],Instant::now()).await.unwrap());assert!(scope.is_open());
+  assert!(path.send_records(&original,&scope,&[TransportBytes::from_bytes(request)],Instant::now()+Duration::from_secs(20)).await.unwrap());
+  let response=path.receive_records(&original,&scope,Instant::now()+Duration::from_secs(5)).await;
+  if malformed{assert!(response.is_err());assert!(!scope.is_open());}
+  else{let groups=response.unwrap().unwrap();let records:Vec<_>=groups.iter().flat_map(|group|path.records_for(&original,&scope,group).unwrap()).collect();
+   assert_eq!(records.len(),1);assert_eq!(records[0].expose_to_transport(),[1,b'O',b'K']);path.close();assert!(path.records_for(&original,&scope,&groups[0]).is_none());}
+  drop(path);assert!(!scope.is_open());
+ };
+ tokio::join!(server,client);
 }
 
 #[tokio::test]
@@ -146,58 +168,87 @@ async fn later_bad_channel_in_same_physical_tls_group_never_returns_earlier_good
 #[tokio::test]
 async fn cancelling_channel_startup_drops_original_socket_before_owning_task_join(){
  let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
- let(ready_tx,ready_rx)=oneshot::channel();let worker=tokio::spawn(async move{tokio::time::timeout(Duration::from_secs(10),async move{let peer=Peer::accept_start(listener,config,false).await;ready_tx.send(()).unwrap();peer.eof().await;}).await.unwrap()});
- let original=owner();let scope=RpcConnectionScope::fresh();let running=scope.clone();let task=tokio::spawn(async move{let router=RouterPath::open(original,running,&p,&[],timeouts()).await.unwrap();
-  let r=reference(false);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};NetstreamPath::open(router,&endpoints[0],0,Instant::now()+Duration::from_secs(6),Duration::from_secs(1)).await});
- ready_rx.await.unwrap();task.abort();assert!(task.await.unwrap_err().is_cancelled());assert!(!scope.is_open());worker.await.unwrap();
+ let(ready_tx,ready_rx)=oneshot::channel();
+ let server=async move{tokio::time::timeout(Duration::from_secs(10),async move{let peer=Peer::accept_start(listener,config,false).await;ready_tx.send(()).unwrap();peer.eof().await;}).await.unwrap()};
+ let controller=async move{
+  let original=owner();let scope=RpcConnectionScope::fresh();let running=scope.clone();let task=OwnedTestTask::new(tokio::spawn(async move{let router=RouterPath::open(original,running,&p,&[],timeouts()).await.unwrap();
+   let r=reference(false);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};NetstreamPath::open(router,&endpoints[0],0,Instant::now()+Duration::from_secs(6),Duration::from_secs(1)).await}));
+  ready_rx.await.unwrap();task.abort();assert!(task.join().await.unwrap_err().is_cancelled());assert!(!scope.is_open());
+ };tokio::join!(server,controller);
 }
 
-#[tokio::test]
-async fn cancelling_active_read_keeps_scope_revocation_and_physical_drop_join_together(){
+async fn cancel_active(abort:bool){
  let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
- let worker=tokio::spawn(async move{tokio::time::timeout(Duration::from_secs(12),async move{let mut peer=Peer::accept_start(listener,config,false).await;peer.start().await;peer.eof().await;}).await.unwrap()});
- let original=owner();let scope=RpcConnectionScope::fresh();let running=scope.clone();let(ready_tx,ready_rx)=oneshot::channel();
- let task=tokio::spawn(async move{let router=RouterPath::open(original.clone(),running.clone(),&p,&[],timeouts()).await.unwrap();let r=reference(false);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
-  let mut path=NetstreamPath::open(router,&endpoints[0],0,Instant::now()+Duration::from_secs(6),Duration::from_secs(1)).await.unwrap();ready_tx.send(()).unwrap();
-  path.receive_records(&original,&running,Instant::now()+Duration::from_secs(5)).await});
- ready_rx.await.unwrap();task.abort();assert!(task.await.unwrap_err().is_cancelled());assert!(!scope.is_open());worker.await.unwrap();
+ let server=async move{tokio::time::timeout(Duration::from_secs(12),async move{let mut peer=Peer::accept_start(listener,config,false).await;peer.start().await;peer.eof().await;}).await.unwrap()};
+ let controller=async move{
+  let original=owner();let scope=RpcConnectionScope::fresh();let running=scope.clone();let(ready_tx,ready_rx)=oneshot::channel();
+  let task=OwnedTestTask::new(tokio::spawn(async move{let router=RouterPath::open(original.clone(),running.clone(),&p,&[],timeouts()).await.unwrap();let r=reference(false);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
+   let mut path=NetstreamPath::open(router,&endpoints[0],0,Instant::now()+Duration::from_secs(6),Duration::from_secs(1)).await.unwrap();ready_tx.send(()).unwrap();
+   path.receive_records(&original,&running,Instant::now()+Duration::from_secs(5)).await}));
+  ready_rx.await.unwrap();if abort{task.abort();assert!(task.join().await.unwrap_err().is_cancelled());}else{scope.close();assert!(task.join().await.unwrap().is_err());}
+  assert!(!scope.is_open());
+ };tokio::join!(server,controller);
 }
+#[tokio::test]
+async fn cancelling_active_read_keeps_scope_revocation_and_physical_drop_join_together(){cancel_active(true).await;}
+#[tokio::test]
+async fn scope_close_wakes_active_receiver_and_join_observes_original_socket_drop(){cancel_active(false).await;}
 
 #[tokio::test]
 async fn partial_channel_record_expires_despite_valid_probe_traffic_and_releases_tcp(){
  let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
- let worker=tokio::spawn(async move{tokio::time::timeout(Duration::from_secs(12),async move{let mut peer=Peer::accept_start(listener,config,false).await;peer.start().await;
+ let server=async move{tokio::time::timeout(Duration::from_secs(12),async move{let mut peer=Peer::accept_start(listener,config,false).await;peer.start().await;
   peer.write_channel(&channel(0x9001,PacketKind::Data,0,peer.client_high,peer.client_start,&[0xfe,1,0])).await;
   for seq in 0x9002..0x9006{tokio::time::sleep(Duration::from_millis(35)).await;let packet=channel(seq,PacketKind::Probe,0,peer.client_high,peer.client_start,&[0x89,0x87,0x22,0x83]);
    let bytes=peer.routed(&packet);if peer.tls.write_all(&bytes).await.is_err()||peer.tls.flush().await.is_err(){break;}}
-  peer.eof().await;}).await.unwrap()});
- let original=owner();let scope=RpcConnectionScope::fresh();let router=RouterPath::open(original.clone(),scope.clone(),&p,&[],timeouts()).await.unwrap();let r=reference(false);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
- let mut path=NetstreamPath::open(router,&endpoints[0],0,Instant::now()+Duration::from_secs(5),Duration::from_millis(100)).await.unwrap();let now=Instant::now();
- assert!(path.receive_records(&original,&scope,now+Duration::from_secs(3)).await.is_err());assert!(now.elapsed()<Duration::from_secs(2));assert!(!scope.is_open());drop(path);worker.await.unwrap();
+  peer.eof().await;}).await.unwrap()};
+ let client=async move{
+  let original=owner();let scope=RpcConnectionScope::fresh();let router=RouterPath::open(original.clone(),scope.clone(),&p,&[],timeouts()).await.unwrap();let r=reference(false);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
+  let mut path=NetstreamPath::open(router,&endpoints[0],0,Instant::now()+Duration::from_secs(5),Duration::from_millis(100)).await.unwrap();let now=Instant::now();
+  assert!(path.receive_records(&original,&scope,now+Duration::from_secs(3)).await.is_err());assert!(now.elapsed()<Duration::from_secs(2));assert!(!scope.is_open());drop(path);
+ };tokio::join!(server,client);
 }
 
 #[tokio::test]
 async fn original_startup_deadline_is_not_renewed_by_router_alive_traffic(){
  let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
- let worker=tokio::spawn(async move{tokio::time::timeout(Duration::from_secs(8),async move{let mut peer=Peer::accept_start(listener,config,false).await;
-  // Deliberately never answer Channel Start, but keep original Router host
-  //fresh. Do not cancel a partially consumed read to implement this fixture.
+ let server=async move{tokio::time::timeout(Duration::from_secs(8),async move{let mut peer=Peer::accept_start(listener,config,false).await;
   for _ in 0..120{let bytes=node(peer.router_sequence);peer.router_sequence+=1;
    if peer.tls.write_all(&bytes).await.is_err()||peer.tls.flush().await.is_err(){break;}
    tokio::time::sleep(Duration::from_millis(25)).await;
-  }peer.eof().await;}).await.unwrap()});
- let original=owner();let scope=RpcConnectionScope::fresh();let router=RouterPath::open(original,scope.clone(),&p,&[],timeouts()).await.unwrap();let r=reference(false);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
- let now=Instant::now();assert!(NetstreamPath::open(router,&endpoints[0],0,now+Duration::from_millis(350),Duration::from_secs(1)).await.is_err());
- assert!(now.elapsed()<Duration::from_secs(2));assert!(!scope.is_open());worker.await.unwrap();
+  }peer.eof().await;}).await.unwrap()};
+ let client=async move{
+  let original=owner();let scope=RpcConnectionScope::fresh();let router=RouterPath::open(original,scope.clone(),&p,&[],timeouts()).await.unwrap();let r=reference(false);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
+  let now=Instant::now();assert!(NetstreamPath::open(router,&endpoints[0],0,now+Duration::from_millis(350),Duration::from_secs(1)).await.is_err());
+  assert!(now.elapsed()<Duration::from_secs(2));assert!(!scope.is_open());
+ };tokio::join!(server,client);
 }
 
 #[tokio::test]
-async fn scope_close_wakes_active_receiver_and_join_observes_original_socket_drop(){
- let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
- let worker=tokio::spawn(async move{tokio::time::timeout(Duration::from_secs(12),async move{let mut peer=Peer::accept_start(listener,config,false).await;peer.start().await;peer.eof().await;}).await.unwrap()});
- let original=owner();let scope=RpcConnectionScope::fresh();let running=scope.clone();let(ready_tx,ready_rx)=oneshot::channel();
- let task=tokio::spawn(async move{let router=RouterPath::open(original.clone(),running.clone(),&p,&[],timeouts()).await.unwrap();let r=reference(false);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
-  let mut path=NetstreamPath::open(router,&endpoints[0],0,Instant::now()+Duration::from_secs(6),Duration::from_secs(1)).await.unwrap();ready_tx.send(()).unwrap();
-  path.receive_records(&original,&running,Instant::now()+Duration::from_secs(5)).await});
- ready_rx.await.unwrap();scope.close();let result=tokio::time::timeout(Duration::from_secs(2),task).await.unwrap().unwrap();assert!(result.is_err());worker.await.unwrap();
+async fn sustained_slow_flush_reads_acknowledgements_before_retrying_and_drains_beyond_one_burst(){
+ echo_case_with_delay(false,false,false,false,true).await;
 }
+
+async fn blocked_write_deadline(retry:bool){
+ let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let p=policy(&cert.root,listener.local_addr().unwrap().port());let config=cert.server_config(&TLS13);
+ let(first_tx,first_rx)=oneshot::channel();
+ let server=async move{tokio::time::timeout(Duration::from_secs(10),async move{let mut peer=Peer::accept_start(listener,config,false).await;peer.start().await;
+  if retry{let first=peer.read_channel().await.unwrap();assert_eq!(first.kind,PacketKind::Data);first_tx.send(()).unwrap();}else{drop(first_tx);}
+  // No delayed first DATA or retry may reach the underlying socket after the
+  //original root deadline, even when the newer receive call has3 seconds.
+  while let Some(packet)=peer.read_channel().await{assert_ne!(packet.kind,PacketKind::Data,"expired original DATA reached physical IO");}
+ }).await.unwrap()};
+ let client=async move{
+  let original=owner();let scope=RpcConnectionScope::fresh();let router=RouterPath::open(original.clone(),scope.clone(),&p,&[],timeouts()).await.unwrap();let r=reference(false);let ReferenceTarget::Direct(endpoints)=r.target()else{panic!("endpoint")};
+  let mut path=NetstreamPath::open(router,&endpoints[0],0,Instant::now()+Duration::from_secs(5),Duration::from_secs(1)).await.unwrap();
+  let now=Instant::now();let end=now+Duration::from_millis(if retry{350}else{80});
+  path.session.queue_record(&original,&scope,&[0,b'x'],end,now).unwrap();
+  if retry{path.flush(now+Duration::from_secs(3)).await.unwrap();first_rx.await.unwrap();}else{drop(first_rx);}
+  super::super::router_runtime::tests::delay_original_io(&mut path.router,super::super::router_runtime::tests::DelayPoint::Write,Duration::from_millis(300));
+  assert!(path.receive_records(&original,&scope,now+Duration::from_secs(3)).await.is_err());assert!(now.elapsed()<Duration::from_secs(2));assert!(!scope.is_open());drop(path);
+ };tokio::join!(server,client);
+}
+#[tokio::test]
+async fn blocked_first_write_cannot_outlive_original_record_deadline(){blocked_write_deadline(false).await;}
+#[tokio::test]
+async fn blocked_retry_cannot_borrow_the_newer_receive_call_deadline(){blocked_write_deadline(true).await;}

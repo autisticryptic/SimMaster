@@ -180,3 +180,13 @@ fn session_and_capability_debug_redact_peer_route_cipher_and_payload(){
  let mut f=Fixture::new();let mut s=f.session();let output=f.start(&mut s);let text=format!("{s:?} {output:?}");
  for value in ["not-authorized","55667788","12000","AccountEntry"]{assert!(!text.contains(value));}assert!(text.contains("<redacted>"));
 }
+
+#[test]
+fn prepared_io_carries_original_hard_deadline_not_a_new_caller_or_soft_retry_time(){
+ let mut f=Fixture::new();let mut s=f.session();f.start(&mut s);let end=f.now+Duration::from_secs(1);
+ s.queue_record(&f.owner,&f.scope,&[1,b'x'],end,f.now).unwrap();let output=s.next_packet(&f.owner,&f.scope,f.now).unwrap().unwrap();
+ let (_,io_end)=output.for_io(&f.owner,&f.scope,&s,f.now,f.now+Duration::from_secs(20)).unwrap().unwrap();assert_eq!(io_end,end);
+ assert_eq!(s.bound_io_deadline(&f.owner,&f.scope,f.now+Duration::from_secs(20)),Some(end));
+ assert_eq!(output.for_io(&f.owner,&f.scope,&s,end,f.now+Duration::from_secs(20)).err(),Some(SessionError::Channel(ChannelError::Timeout)));
+ assert!(output.for_io(&f.owner,&RpcConnectionScope::fresh(),&s,end,f.now+Duration::from_secs(20)).unwrap().is_none());
+}

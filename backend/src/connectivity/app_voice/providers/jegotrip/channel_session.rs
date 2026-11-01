@@ -32,10 +32,21 @@ impl ScopedRecords {
     }
 }
 impl fmt::Debug for ScopedRecords { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("ScopedRecords(<redacted>)") } }
-pub(super) struct PreparedChannel { brand: Brand, wire: TransportBytes }
+pub(super) struct PreparedChannel { brand: Brand, wire: TransportBytes, hard_end: Option<Instant>, prepared_at: Instant }
 impl PreparedChannel {
+    /// Inspection only; production physical IO uses for_io so the original
+    ///hard expiration accompanies the bytes across every await.
+    #[cfg(test)]
     pub fn bytes_for(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, session: &ChannelSession) -> Option<&[u8]> {
         self.brand.for_session(owner, scope, session).then_some(self.wire.expose_to_transport())
+    }
+    pub fn for_io(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, session: &ChannelSession,
+        now: Instant, caller_end: Instant) -> Result<Option<(&[u8], Instant)>, SessionError> {
+        if !self.brand.for_session(owner, scope, session) { return Ok(None); }
+        if now < self.prepared_at { return Err(SessionError::Channel(ChannelError::ClockRollback)); }
+        let end = self.hard_end.map_or(caller_end, |hard| hard.min(caller_end));
+        if now >= end { return Err(SessionError::Channel(ChannelError::Timeout)); }
+        Ok(Some((self.wire.expose_to_transport(), end)))
     }
 }
 impl fmt::Debug for PreparedChannel { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("PreparedChannel(<redacted>)") } }
@@ -77,6 +88,9 @@ impl ChannelSession {
     pub fn peer(&self) -> &PeerBinding { &self.peer }
     pub fn lease(&self) -> &PortLease { self.claim.lease() }
     pub fn next_wake(&self) -> Option<Instant> { self.original(&self.owner, &self.scope).then(|| self.core.next_wake()).flatten() }
+    pub fn bound_io_deadline(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, caller_end: Instant) -> Option<Instant> {
+        self.original(owner, scope).then(|| self.core.hard_deadline().map_or(caller_end, |hard| hard.min(caller_end)))
+    }
     pub fn close(&mut self) {
         self.live.store(false, Ordering::Release); self.scope.close(); self.core.close(); self.sender.close(); self.receiver.close(); self.claim.release();
         // The enclosing RouterPath owner still owes physical socket Drop/Join.
@@ -102,7 +116,8 @@ impl ChannelSession {
         if !self.original(owner, scope) { return Ok(None); }
         let result = (|| {
             let Some(packet) = self.core.next_packet(now)? else { return Ok(None); };
-            Ok(Some(PreparedChannel { brand: self.brand()?, wire: escape_channel(packet.expose_to_transport())? }))
+            Ok(Some(PreparedChannel { brand: self.brand()?, wire: escape_channel(packet.expose_to_transport())?,
+                hard_end: self.core.hard_deadline(), prepared_at: now }))
         })();
         if result.is_err() { self.close(); } result
     }

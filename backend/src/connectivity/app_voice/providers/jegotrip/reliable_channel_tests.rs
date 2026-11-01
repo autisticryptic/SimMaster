@@ -394,3 +394,14 @@ fn future_receipt_timestamp_is_rejected_without_delivering_a_complete_record(){
  let now=Instant::now();let mut c=ready(now,0x9000);let packet=data(0x9001,0,&[0xff,b'x']);
  assert_eq!(c.on_packet_admitted(packet.expose_to_transport(),now+Duration::from_millis(1),now).err(),Some(ChannelError::ClockRollback));assert!(c.closed);
 }
+
+#[test]
+fn hard_expiration_is_separate_from_retry_wake_and_keeps_old_obligations(){
+ let now=Instant::now();let initial=core(now);assert_eq!(initial.hard_deadline(),Some(now+Duration::from_secs(10)));
+ let mut c=ready(now,0x9000);assert_eq!(c.hard_deadline(),None);
+ c.queue_record(b"x",now+Duration::from_secs(5),now).unwrap();c.next_packet(now).unwrap();
+ assert_eq!(c.hard_deadline(),Some(now+Duration::from_secs(5)));assert_eq!(c.next_wake(),Some(now+Duration::from_millis(200)));
+ c.set_echoed_delay(Some(16000));assert_eq!(c.hard_deadline(),Some(now+Duration::from_secs(5)));
+ c.on_packet(data(0x9001,0,&[0xfe,1]).expose_to_transport(),now).unwrap();assert_eq!(c.hard_deadline(),Some(now+Duration::from_secs(2)));
+ c.close();assert_eq!(c.hard_deadline(),None);
+}
