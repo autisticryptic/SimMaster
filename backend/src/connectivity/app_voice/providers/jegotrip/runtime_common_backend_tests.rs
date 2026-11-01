@@ -302,9 +302,9 @@ async fn native_bootstrap_account_hosts_and_persists_received_sip_message_end_to
             if rows.first().is_some_and(|row|row.reply_state=="direct_submitted"){return rows;}
             tokio::time::sleep(Duration::from_millis(5)).await;
         }}).await.unwrap();
-        assert_eq!(inbox.len(),1);assert_eq!(inbox[0].classification,"sms");
+        assert_eq!(inbox.len(),1);assert_eq!(inbox[0].classification,"smgw_text");
         let messages=manager.messages(&line,50).unwrap();assert_eq!(messages.len(),1);
-        assert_eq!(messages[0].classification,"sms");
+        assert_eq!(messages[0].classification,"smgw_text");
         assert_eq!(messages[0].message.content,"fixture-original-sms 🥘");
         assert_eq!(messages[0].message.phone_number,"fixture-sender");
         manager.stop(&line,1,100).await.unwrap();
