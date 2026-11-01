@@ -45,6 +45,9 @@ impl RouterPolicy {
         Ok(Self{reference:Zeroizing::new(reference.to_owned()),targets,identity:Arc::new(())})
     }
     pub(super) fn len(&self)->usize {self.targets.len()}
+    pub(super) fn retained_bytes(&self)->usize {
+        self.reference.len()+self.targets.iter().map(|target|target.host.len()+target.authority.len()+target.root.len()).sum::<usize>()
+    }
     pub(super) fn tls_for(&self,index:usize,handshake:Duration,partial:Duration)->Result<TlsParameters<'_>,ConnectError> {
         let target=self.targets.get(index).ok_or(ConnectError::Scope)?;
         Ok(TlsParameters{authority:&target.authority,root_der_base64:&target.root,tls_only:true,

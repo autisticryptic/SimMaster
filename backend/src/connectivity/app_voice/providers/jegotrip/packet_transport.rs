@@ -20,6 +20,9 @@ pub struct RouterBinding<'a> { pub packet_kind: u8, pub routing: RouterRouting<'
 /// from incoming bytes. A Router path needs independent captured TX/RX bindings.
 pub enum PacketRoute<'a> {
     DirectTlsCarrier,
+    /// Selector for a separately supplied original Router/Common runtime. It
+    ///cannot be consumed by the legacy TLS carrier/PacketSender adapter.
+    NativeCommon,
     Router { transmit: RouterBinding<'a>, receive: RouterBinding<'a>, mtu: usize, first_sequence: u16 },
 }
 
@@ -126,6 +129,7 @@ impl OwnedPacketTransport {
         -> Result<Self, TransportError> {
         if !connection.is_open() { return Err(TransportError::Closed); }
         let route = match route {
+            PacketRoute::NativeCommon => return Err(TransportError::UnsupportedRoute),
             PacketRoute::DirectTlsCarrier => CapturedRoute::Direct,
             PacketRoute::Router { transmit, receive, mtu, first_sequence } => {
                 if !(16..=super::packet_stream::MAX_NETWORK_PACKET_BYTES).contains(&mtu) { return Err(TransportError::InvalidPacket); }

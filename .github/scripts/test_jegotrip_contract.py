@@ -461,6 +461,23 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('if self.common.is_some(){return self.common_loop_run()', actor)
         self.assertIn('if let Some(common)=&mut self.common{common.close();}', actor)
 
+    def test_explicit_common_profile_is_not_a_legacy_carrier_or_mutable_entry_override(self):
+        profile = (MOD / 'runtime_backend.rs').read_text(encoding='utf-8')
+        self.assertIn('pub fn supplied_common(', profile)
+        self.assertIn('if self.profile.common.is_some(){return self.login_common_original(owner,request).await;}', profile)
+        self.assertIn('encoded.expose_to_backend()!=common.reference.as_bytes()', profile)
+        self.assertIn('p.key==b"id"&&p.value!=common.entry.identity()', profile)
+        self.assertIn('connected.connection_scope().matches(&attempt.scope)', profile)
+        self.assertIn('let mut owning=attempt.handle.lock().await', profile)
+        self.assertIn('let(handle,runtime_events)=connected.attach()', profile)
+        self.assertIn('*owning=Some(handle)', profile)
+        self.assertIn('tokio::time::timeout_at(end.into(),operation)', profile)
+        transport = (MOD / 'packet_transport.rs').read_text(encoding='utf-8')
+        self.assertIn('PacketRoute::NativeCommon => return Err(TransportError::UnsupportedRoute)', transport)
+        for name in ['beta-validation.yml', 'build-release.yml']:
+            self.assertIn('connectivity::app_voice::providers::jegotrip::runtime_backend::common_tests',
+                          (ROOT / '.github/workflows' / name).read_text(encoding='utf-8'))
+
     def test_legacy_config_unwrap_requires_explicit_context_and_does_not_weaken_tls(self):
         source = (MOD / 'legacy_config.rs').read_text(encoding='utf-8')
         self.assertIn('pub fn supplied(bytes: &[u8])', source)
