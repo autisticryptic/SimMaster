@@ -7,8 +7,11 @@ fn trust(root:&str)->AccountTrust{AccountTrust::supplied(AccountTrustInputs{auth
 struct Source { scope:RpcConnectionScope, _rpc:ArcRpcSession }
 impl std::ops::Deref for Source { type Target=RpcConnectionScope;fn deref(&self)->&Self::Target{&self.scope} }
 fn owned(original:&AttemptOwner,properties:&[RpcProperty<'_>],reference:&[u8])->(OwnedBootstrapReply,Source){
+    owned_alive(original,properties,reference,b"optional-account-alive")
+}
+fn owned_alive(original:&AttemptOwner,properties:&[RpcProperty<'_>],reference:&[u8],alive:&[u8])->(OwnedBootstrapReply,Source){
     let mut rpc=ArcRpcSession::new(original.clone());let source=rpc.connection_scope();let(id,_)=rpc.prepare_bootstrap(b"fixture-appkey",&[]).unwrap();
-    let mut result=Writer::new();result.boolean(true).unwrap();result.properties(properties).unwrap();result.bytes(reference).unwrap();result.bytes(b"optional-account-alive").unwrap();result.bytes(b"optional-user-entry").unwrap();result.bytes(b"").unwrap();
+    let mut result=Writer::new();result.boolean(true).unwrap();result.properties(properties).unwrap();result.bytes(reference).unwrap();result.bytes(alive).unwrap();result.bytes(b"optional-user-entry").unwrap();result.bytes(b"").unwrap();
     let reply=encode_reply(id,0,result.finish().expose_to_transport()).unwrap();
     let Some(ArcReply::Bootstrap(proof))=rpc.on_reply(original,&source,reply.expose_to_transport()).unwrap()else{panic!("matched bootstrap required")};
     // Keep the original protocol owner in the fixture; Drop closes its scope.
@@ -27,6 +30,20 @@ fn matched_bootstrap_fields_use_original_destination_without_domain_name_host_in
     let fields=plan.fields_for(&original,&destination).unwrap();assert_eq!(fields.domain_name,b"account-domain.invalid");assert_eq!(fields.domain_id,b"fixture-domain");assert_eq!(fields.application_id,b"fixture-app");assert_eq!(fields.device_info_cc,b"fixture-cc");
     let connection=plan.connection_for(&original,&destination,&anchor).unwrap();assert_eq!(connection.authority,"fixture.invalid");assert_eq!(connection.server_reference,std::str::from_utf8(REFERENCE).unwrap());assert_eq!(connection.root_der_base64,cert.root);assert!(connection.enable_sni);
     source.close();destination.close();
+}
+#[test]
+fn matched_account_alive_reference_is_classified_and_never_claimed_as_registered(){
+    let cert=Certificates::generate("DNS:fixture.invalid");let anchor=trust(&cert.root);
+    // Native __doRegisterAlive treats the disable literal as "stop the timer" and
+    // needs registerAlive.AccountAlive.Account for any other value. That schema is
+    // not verified here, so a real reference must not be dropped silently.
+    for (alive,expected) in [(b"".as_slice(),AccountAliveState::Absent),
+        (AccountAliveState::DISABLED_REFERENCE,AccountAliveState::Disabled),
+        (b"AliveEntry:stcp -h 42.7 -p 98;".as_slice(),AccountAliveState::Unsupported)]{
+        let original=owner();let(reply,source)=owned_alive(&original,&properties(),REFERENCE,alive);let destination=RpcConnectionScope::fresh();
+        let plan=ProvisionedLogin::from_reply(&reply,&original,&source,&destination,&anchor,None,None).unwrap();
+        assert_eq!(plan.account_alive(),expected);source.close();destination.close();
+    }
 }
 #[test]
 fn wrong_owner_source_same_scope_and_closed_destination_fail_before_plan_capture(){

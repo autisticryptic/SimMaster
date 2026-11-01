@@ -8,6 +8,23 @@ use super::{arc_session::OwnedBootstrapReply,deployment::BootstrapDeployment,
 use std::{fmt,sync::Arc};
 use zeroize::Zeroizing;
 
+/// Classification of the matched reply's AccountAlive reference, recovered from
+/// `ClientI::__doRegisterAlive` (0x593000): the literal sentinel below means
+/// "disabled" and stops the alive timer; empty means no AccountAlive channel;
+/// any other value would require `registerAlive.AccountAlive.Account`, whose
+/// argument schema/necessity is not verified here and is therefore reported as
+/// unsupported instead of being guessed or silently dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountAliveState { Absent, Disabled, Unsupported }
+impl AccountAliveState {
+    pub(super) const DISABLED_REFERENCE: &'static [u8] = b"AccountAlive:stcp -h disable -p 8888;";
+    pub(super) fn classify(reference: &[u8]) -> Self {
+        if reference.is_empty() { Self::Absent }
+        else if reference == Self::DISABLED_REFERENCE { Self::Disabled }
+        else { Self::Unsupported }
+    }
+}
+
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum ProvisionError {Scope,Configuration,UnsupportedReference,MissingProperty,InvalidProperty,ResourceLimit}
 impl ProvisionError {
@@ -32,7 +49,7 @@ impl AccountTrust{
 }
 
 pub struct ProvisionedLogin {
-    owner:AttemptOwner,source:RpcConnectionScope,destination:RpcConnectionScope,trust:Arc<()>,call_id:i32,
+    owner:AttemptOwner,source:RpcConnectionScope,destination:RpcConnectionScope,trust:Arc<()>,call_id:i32,account_alive:AccountAliveState,
     reference:Zeroizing<String>,domain_name:Zeroizing<Vec<u8>>,domain_id:Zeroizing<Vec<u8>>,app_id:Zeroizing<Vec<u8>>,cc:Zeroizing<Vec<u8>>,
 }
 impl fmt::Debug for ProvisionedLogin{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ProvisionedLogin(<redacted>)")}}
@@ -69,6 +86,7 @@ impl ProvisionedLogin {
         let app_id=field(app.expose_to_backend(),false,&mut total)?;
         let cc=decoded(b"CC")?;let cc=field(cc.as_ref().map_or(b"".as_slice(),|value|value.expose_to_backend()),true,&mut total)?;
         Ok(Self{owner:reply.owner().clone(),source:source.clone(),destination:destination.clone(),trust:trust.identity.clone(),call_id:reply.call_id(),
+            account_alive:deployment.account_alive_state_for(owner,source).map_err(|_|ProvisionError::Configuration)?,
             reference:Zeroizing::new(text.to_owned()),domain_name,domain_id,app_id,cc})
     }
     fn matches(&self,owner:&AttemptOwner,destination:&RpcConnectionScope)->bool{
@@ -84,6 +102,8 @@ impl ProvisionedLogin {
     }
     pub(super) fn original_source_scope(&self)->RpcConnectionScope{self.source.clone()}
     pub fn bootstrap_call_id(&self)->i32{self.call_id}
+    /// Optional AccountAlive channel of the matched reply. Never readiness.
+    pub fn account_alive(&self)->AccountAliveState{self.account_alive}
 }
 
 /// Native Router/SARC handoff. The already selected physical Router policy
@@ -91,7 +111,7 @@ impl ProvisionedLogin {
 ///its OS hosts, SNI, roots or access credentials. Source data survives close,
 ///but use still requires the pre-created ORIGINAL destination scope.
 pub(super) struct ProvisionedCommonLogin{
-    owner:AttemptOwner,source:RpcConnectionScope,destination:RpcConnectionScope,policy:super::router_connector::RouterPolicyIdentity,call_id:i32,
+    owner:AttemptOwner,source:RpcConnectionScope,destination:RpcConnectionScope,policy:super::router_connector::RouterPolicyIdentity,call_id:i32,account_alive:AccountAliveState,
     entry:super::object_reference::ObjectReference,domain_name:Zeroizing<Vec<u8>>,domain_id:Zeroizing<Vec<u8>>,app_id:Zeroizing<Vec<u8>>,cc:Zeroizing<Vec<u8>>,
 }
 impl fmt::Debug for ProvisionedCommonLogin{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ProvisionedCommonLogin(<redacted>)")}}
@@ -115,7 +135,8 @@ impl ProvisionedCommonLogin{
         let domain=decoded(b"DomainId")?.ok_or(ProvisionError::MissingProperty)?;let domain_id=field(domain.expose_to_backend(),false,&mut total)?;
         let app=decoded(b"AppId")?.ok_or(ProvisionError::MissingProperty)?;let app_id=field(app.expose_to_backend(),false,&mut total)?;
         let cc=decoded(b"CC")?;let cc=field(cc.as_ref().map_or(b"".as_slice(),|value|value.expose_to_backend()),true,&mut total)?;
-        Ok(Self{owner:reply.owner().clone(),source:source.clone(),destination:destination.clone(),policy:router.original_identity(),call_id:reply.call_id(),entry,domain_name,domain_id,app_id,cc})
+        Ok(Self{owner:reply.owner().clone(),source:source.clone(),destination:destination.clone(),policy:router.original_identity(),call_id:reply.call_id(),
+            account_alive:deployment.account_alive_state_for(owner,source).map_err(|_|ProvisionError::Configuration)?,entry,domain_name,domain_id,app_id,cc})
     }
     fn matches(&self,owner:&AttemptOwner,destination:&RpcConnectionScope,router:&super::router_connector::RouterPolicy)->bool{
         &self.owner==owner&&self.destination.matches(destination)&&destination.is_open()&&self.policy.matches(router)
@@ -129,6 +150,7 @@ impl ProvisionedCommonLogin{
     }
     pub fn original_source_scope(&self)->RpcConnectionScope{self.source.clone()}
     pub fn bootstrap_call_id(&self)->i32{self.call_id}
+    pub fn account_alive(&self)->AccountAliveState{self.account_alive}
 }
 
 #[cfg(test)]

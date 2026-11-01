@@ -739,6 +739,12 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('Arc::ptr_eq(&self.trust,&trust.identity)', provision)
         self.assertIn('destination.is_open()', provision)
         self.assertIn('reference_decode_key:None', provision)
+        # Native __doRegisterAlive semantics: the optional AccountAlive channel is
+        # classified, never optimistically armed or silently dropped.
+        self.assertIn('pub enum AccountAliveState', provision)
+        self.assertIn('b"AccountAlive:stcp -h disable -p 8888;"', provision)
+        self.assertIn('pub fn account_alive(', provision)
+        self.assertIn('fn account_alive_state_for', (MOD / 'deployment.rs').read_text(encoding='utf-8'))
         for shortcut in ['Callback::', 'TcpStream', 'default_root', 'from_utf8_lossy', 'derive(Serialize)']:
             self.assertNotIn(shortcut, provision)
 

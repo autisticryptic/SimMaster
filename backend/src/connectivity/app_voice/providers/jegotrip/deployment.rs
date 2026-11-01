@@ -87,6 +87,17 @@ impl BootstrapDeployment {
     pub fn auxiliary_references_for(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Option<(&[u8], &[u8])> {
         if self.matches(owner, scope) { Some((&self.account_alive, &self.user_entry)) } else { None }
     }
+
+    /// Native `ClientI::__doRegisterAlive` compares the account's AccountAlive
+    /// reference with THIS literal and stops its timer instead of registering.
+    /// The request schema of `registerAlive.AccountAlive.Account` is not verified
+    /// here, so a real non-empty reference is reported as unsupported rather
+    /// than silently ignored or optimistically armed.
+    pub fn account_alive_state_for(&self, owner: &AttemptOwner, scope: &RpcConnectionScope)
+        -> Result<super::runtime_provision::AccountAliveState, DeploymentError> {
+        if !self.matches(owner, scope) { return Err(DeploymentError::Scope); }
+        Ok(super::runtime_provision::AccountAliveState::classify(&self.account_alive))
+    }
 }
 
 #[cfg(test)]
