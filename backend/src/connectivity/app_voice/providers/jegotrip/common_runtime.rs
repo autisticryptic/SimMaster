@@ -34,6 +34,7 @@ impl CommonPath{
     }
     pub fn scope(&self)->RpcConnectionScope{self.scope.clone()}
     pub fn owner(&self)->AttemptOwner{self.owner.clone()}
+    pub fn is_open_for(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{self.original(owner,scope)}
     fn original(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{
         &self.owner==owner&&self.scope.matches(scope)&&self.scope.is_open()&&self.live.load(Ordering::Acquire)&&self.stream.ready_for(owner,scope)
     }
@@ -71,6 +72,23 @@ impl CommonPath{
         }.await;
         if result.is_ok(){cancelled.armed=false;}else{self.close();}result
     }
+    /// Adapts this actor's already prepared plaintext ARC call packets to the
+    ///native Common fragment/compression policy. No TLS capability is forged;
+    ///RPC IDs and all metadata remain byte-identical in the payload.
+    pub async fn send_prepared_packets(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,packets:&[TransportBytes],deadline:Instant)->Result<bool,CommonIoError>{
+        if !self.original(owner,scope){return Ok(false);}
+        let result=async{
+            self.tick(deadline)?;if packets.is_empty()||packets.len()>MAX_CALLS{return Err(CommonIoError::Configuration);}
+            let mut assembler=super::transport_packets::CallAssembler::default();let mut message=None;
+            for (index,packet) in packets.iter().enumerate(){
+                let decoded=assembler.on_packet(packet.expose_to_transport()).map_err(|_|CommonIoError::Configuration)?;
+                if decoded.is_some(){if index+1!=packets.len(){return Err(CommonIoError::Configuration);}message=decoded;}
+            }
+            let message=message.ok_or(CommonIoError::Configuration)?;
+            self.send_call(owner,scope,message.kind,message.payload.expose_to_transport(),deadline).await
+        }.await;
+        if result.is_err(){self.close();}result
+    }
     pub async fn send_ping(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,deadline:Instant)->Result<bool,CommonIoError>{
         if !self.original(owner,scope){return Ok(false);}
         let mut cancelled=CancelGuard{scope:self.scope.clone(),armed:true};
@@ -98,6 +116,31 @@ impl CommonPath{
         }
         self.tick(deadline)?;Ok(calls)
     }
+    async fn dispatch_groups(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,groups:&[ScopedRecords],deadline:Instant)->Result<Option<ScopedCommonCalls>,CommonIoError>{
+        let messages=self.decode_groups(groups,deadline)?;
+        let plan=self.controls.on_messages(messages,Instant::now())?;
+        if let Some(pong_end)=plan.pong_deadlines.iter().copied().min(){
+            let packets:Vec<_>=plan.pong_deadlines.iter().map(|_|TransportBytes::from_bytes(vec![14])).collect();
+            let end=self.bound(deadline.min(pong_end));
+            if !self.stream.send_records(owner,scope,&packets,end).await?{return Err(CommonIoError::Scope);}
+        }
+        self.tick(deadline)?;
+        if plan.calls.is_empty(){return Ok(None);}
+        let now=Instant::now();if plan.calls.iter().any(|call|now>=call.deadline){return Err(CommonIoError::Timeout);}
+        Ok(Some(ScopedCommonCalls{owner:self.owner.clone(),scope:self.scope.clone(),live:Arc::downgrade(&self.live),calls:plan.calls}))
+    }
+    /// A bounded nonblocking-read step for the original ARC actor. Required
+    ///control writes may await, still bounded by the original hard deadlines.
+    pub async fn try_receive_calls(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,deadline:Instant)->Result<Option<ScopedCommonCalls>,CommonIoError>{
+        if !self.original(owner,scope){return Ok(None);}
+        let mut cancelled=CancelGuard{scope:self.scope.clone(),armed:true};
+        let result=async{
+            self.tick(deadline)?;let end=self.bound(deadline);
+            let Some(groups)=self.stream.try_receive_records(owner,scope,end).await? else{return Ok(None);};
+            self.dispatch_groups(owner,scope,&groups,end).await
+        }.await;
+        if result.is_ok(){cancelled.armed=false;}else{self.close();}result
+    }
     /// Receive a whole original NetStream group before emitting Pongs or calls.
     /// A malformed later packet or Release4 revokes the entire staged result;
     /// Ping/Pong traffic never extends pending call, fragment or ping budgets.
@@ -108,20 +151,7 @@ impl CommonPath{
             loop{
                 self.tick(deadline)?;let end=self.bound(deadline);
                 let groups=self.stream.receive_records(owner,scope,end).await?.ok_or(CommonIoError::Scope)?;
-                let messages=self.decode_groups(&groups,end)?;
-                let plan=self.controls.on_messages(messages,Instant::now())?;
-                if let Some(pong_end)=plan.pong_deadlines.iter().copied().min(){
-                    let packets:Vec<_>=plan.pong_deadlines.iter().map(|_|TransportBytes::from_bytes(vec![14])).collect();
-                    let end=self.bound(deadline.min(pong_end));
-                    if !self.stream.send_records(owner,scope,&packets,end).await?{return Err(CommonIoError::Scope);}
-                }
-                self.tick(deadline)?;
-                if !plan.calls.is_empty(){
-                    // Decompression and required control output consumed time;
-                    //never expose an already expired original message.
-                    let now=Instant::now();if plan.calls.iter().any(|call|now>=call.deadline){return Err(CommonIoError::Timeout);}
-                    return Ok(Some(ScopedCommonCalls{owner:self.owner.clone(),scope:self.scope.clone(),live:Arc::downgrade(&self.live),calls:plan.calls}));
-                }
+                if let Some(calls)=self.dispatch_groups(owner,scope,&groups,end).await?{return Ok(Some(calls));}
             }
         }.await;
         if result.is_ok(){cancelled.armed=false;}else{self.close();}result
@@ -130,4 +160,4 @@ impl CommonPath{
 
 #[cfg(test)]
 #[path="common_runtime_tests.rs"]
-mod tests;
+pub(super) mod tests;

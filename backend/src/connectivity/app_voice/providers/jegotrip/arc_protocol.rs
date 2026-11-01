@@ -126,6 +126,7 @@ impl ArcProtocol {
     }
     pub fn take_tls_engine(&mut self, route: PacketRoute<'_>, parameters: TlsParameters<'_>, now: std::time::Instant)
         -> Result<TlsEngine, TlsError> { self.rpc.take_tls_engine(route, parameters, now) }
+    pub(super) fn claim_common_transport(&mut self)->Result<(),ProtocolError>{Ok(self.rpc.claim_common_transport()?)}
     pub fn take_hosting_tracker(&mut self) -> Result<HostingRpcTracker, ProtocolError> {
         Ok(self.rpc.take_hosting_tracker()?)
     }

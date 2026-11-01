@@ -193,7 +193,7 @@ async fn cancelling_original_command_during_send_terminates_and_releases_actor_i
     let wire = tls.take_wire_output(&original, &scope, None, now).unwrap();
     let (io, bytes, _, _, dropped) = poll_io(true);
     let (_commands, commands) = mpsc::channel(MAX_COMMANDS); let (events, _events) = mpsc::channel(MAX_EVENTS);
-    let mut actor = Actor { io: Some(io), owner: original, scope: scope.clone(), backend, tls, commands, events,
+    let mut actor = Actor { io: Some(io), owner: original, scope: scope.clone(), backend, tls:Some(tls), common:None, native_attempt_end:None, commands, events,
         policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new(), logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new() };
     let (mut completion, receiver) = oneshot::channel();
     {
@@ -248,9 +248,9 @@ async fn bounded_command_queue_returns_backpressure_without_preparing_or_reencry
     let runtime = RuntimeHandle { owner: original, scope, commands, task: None };
     let mut receivers = vec![];
     for _ in 0..MAX_COMMANDS { let (completion, receiver) = oneshot::channel(); receivers.push(receiver);
-        runtime.commands.try_send(Command { operation: Operation::Configure(1, None), completion }).unwrap_or_else(|_| panic!("queue capacity")); }
+        runtime.commands.try_send(Command { operation: Operation::Configure(1, None), completion, admitted:Instant::now() }).unwrap_or_else(|_| panic!("queue capacity")); }
     let (completion, _) = oneshot::channel();
-    assert!(matches!(runtime.commands.try_send(Command { operation: Operation::Configure(1, None), completion }), Err(mpsc::error::TrySendError::Full(_))));
+    assert!(matches!(runtime.commands.try_send(Command { operation: Operation::Configure(1, None), completion, admitted:Instant::now() }), Err(mpsc::error::TrySendError::Full(_))));
     drop(receivers); drop(runtime);
 }
 
@@ -463,7 +463,7 @@ async fn unregistration_and_logout_queue_rejection_do_not_arm_cancellation_guard
     let mut waiting = Vec::new();
     for _ in 0..MAX_COMMANDS {
         let (completion, result) = oneshot::channel(); waiting.push(result);
-        runtime.commands.try_send(Command { operation: Operation::Configure(1, None), completion })
+        runtime.commands.try_send(Command { operation: Operation::Configure(1, None), completion, admitted:Instant::now() })
             .unwrap_or_else(|_| panic!("fixture queue capacity"));
     }
     assert_eq!(runtime.hosting(&original, &scope, "fixture-uri", super::super::session::STATUS_UNREGISTER,
@@ -481,7 +481,7 @@ fn unhosting_actor_fixture(root: &str, original: AttemptOwner, blocked: bool)
     let wire = tls.take_wire_output(&original, &scope, None, now).unwrap();
     let (io, bytes, _, _, _) = poll_io(blocked);
     let (_commands, commands) = mpsc::channel(MAX_COMMANDS); let (events, receive_events) = mpsc::channel(MAX_EVENTS);
-    let actor = Actor { io: Some(io), owner: original, scope, backend, tls, commands, events,
+    let actor = Actor { io: Some(io), owner: original, scope, backend, tls:Some(tls), common:None, native_attempt_end:None, commands, events,
         policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new(),
         logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new() };
     (actor, wire, bytes, receive_events)
@@ -559,7 +559,7 @@ async fn accepted_unregistration_followed_by_same_delivery_io_failure_never_repo
     assert_eq!(tls.phase(), TlsPhase::Verified);
     let (mut io, bytes, _, _, _) = poll_io(false); io.limit = 0;
     let (_commands, commands) = mpsc::channel(MAX_COMMANDS); let (events, _events) = mpsc::channel(MAX_EVENTS);
-    let mut actor = Actor { io: Some(io), owner: original, scope: scope.clone(), backend, tls, commands, events,
+    let mut actor = Actor { io: Some(io), owner: original, scope: scope.clone(), backend, tls:Some(tls), common:None, native_attempt_end:None, commands, events,
         policy: policy(), timing: None, start: now, pending: std::collections::BTreeMap::new(),
         logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new() };
     let (sequence, reply) = original_unhosting_completion(&actor); let (completion, result) = oneshot::channel();

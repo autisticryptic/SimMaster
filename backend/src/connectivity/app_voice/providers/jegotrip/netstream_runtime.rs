@@ -135,6 +135,23 @@ impl NetstreamPath{
         }.await;
         if result.is_ok(){cancelled.armed=false;}else{self.close();}result
     }
+    /// A caller-owned actor may poll commands/timers between these bounded
+    ///steps. No pending receive future is cancelled and no fresh read deadline
+    ///replaces a retained Channel expiration.
+    pub async fn try_receive_records(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,deadline:Instant)
+        ->Result<Option<Vec<ScopedRecords>>,NetstreamError>{
+        if !self.original(owner,scope){return Ok(None);}
+        let mut cancelled=CancelGuard{scope:self.scope.clone(),armed:true};
+        let result=async{
+            if !self.session.tick(owner,scope,Instant::now())?{return Err(NetstreamError::Scope);}
+            self.ingest_pending()?;
+            if let Some(metrics)=self.router.path_metrics(owner,scope){self.session.path_delay(owner,scope,metrics.echoed_delay_ms);}
+            self.flush(deadline).await?;
+            if self.incoming.is_empty(){return Ok(None);}
+            self.incoming_bytes=0;Ok(Some(std::mem::take(&mut self.incoming)))
+        }.await;
+        if result.is_ok(){cancelled.armed=false;}else{self.close();}result
+    }
     pub async fn receive_records(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,deadline:Instant)
         ->Result<Option<Vec<ScopedRecords>>,NetstreamError>{
         if !self.original(owner,scope){return Ok(None);}

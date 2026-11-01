@@ -7,13 +7,13 @@ use std::{collections::VecDeque,sync::Arc};
 use tokio::{io::AsyncWriteExt,net::TcpListener,sync::oneshot};
 use tokio_rustls::rustls::{ServerConfig,version::TLS13};
 
-struct CommonPeer{peer:Peer,sender:RecordSender,receiver:RecordReceiver,records:Records,last_client:u16,pending:VecDeque<Vec<u8>>}
+pub(crate) struct CommonPeer{peer:Peer,sender:RecordSender,receiver:RecordReceiver,records:Records,last_client:u16,pending:VecDeque<Vec<u8>>}
 impl CommonPeer{
- async fn open(listener:TcpListener,config:Arc<ServerConfig>)->Self{
+ pub(crate) async fn open(listener:TcpListener,config:Arc<ServerConfig>)->Self{
   let mut peer=Peer::accept_start(listener,config,false).await;peer.start().await;let last_client=peer.client_start;
   Self{peer,sender:RecordSender::new(RecordSecurity::SeededXor,Some(0x12345678)).unwrap(),receiver:RecordReceiver::new(RecordSecurity::SeededXor),records:Records::default(),last_client,pending:VecDeque::new()}
  }
- async fn send(&mut self,packets:&[Vec<u8>]){
+ pub(crate) async fn send(&mut self,packets:&[Vec<u8>]){
   let mut wire=Vec::new();
   for packet in packets{
    let encoded=self.sender.encode(packet).unwrap();for body in native_channel::encode_record(encoded.expose_to_transport(),900).unwrap(){
@@ -25,7 +25,7 @@ impl CommonPeer{
   }
   self.peer.tls.write_all(&wire).await.unwrap();self.peer.tls.flush().await.unwrap();
  }
- async fn next(&mut self)->Option<Vec<u8>>{
+ pub(crate) async fn next(&mut self)->Option<Vec<u8>>{
   loop{
    if let Some(value)=self.pending.pop_front(){return Some(value);}
    let frame=self.peer.read_channel().await?;if frame.kind==PacketKind::Probe{continue;}
@@ -38,7 +38,7 @@ impl CommonPeer{
    self.peer.ack(self.last_client).await;
   }
  }
- async fn no_more_common(mut self){assert!(self.next().await.is_none(),"unexpected Common control or business replay before EOF");}
+ pub(crate) async fn no_more_common(mut self){assert!(self.next().await.is_none(),"unexpected Common control or business replay before EOF");}
 }
 fn reply_packet(payload:&[u8],compressed:bool)->Vec<u8>{
  let mut packet=vec![if compressed{0x11}else{1}];if compressed{packet.extend_from_slice(&reference_container(payload,1));}else{packet.extend_from_slice(payload);}packet

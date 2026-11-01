@@ -165,7 +165,7 @@ impl Operation {
         }
     }
 }
-struct Command { operation: Operation, completion: oneshot::Sender<Result<RuntimeReceipt, RuntimeError>> }
+struct Command { operation: Operation, completion: oneshot::Sender<Result<RuntimeReceipt, RuntimeError>>, admitted: Instant }
 struct CallPending{ticket:CallControlTicket,operation:CallOperation,deadline:Instant,completion:oneshot::Sender<Result<OwnedCallOperationReply,RuntimeError>>}
 struct CallRetirement{scope:RpcConnectionScope,ticket:CallControlTicket,done:bool}
 impl Drop for CallRetirement{fn drop(&mut self){if !self.done{self.ticket.revoke();self.scope.close();}}}
@@ -264,7 +264,7 @@ impl RuntimeCommands {
         if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
         if operation.byte_length() > MAX_PARAMETER_BYTES { return Err(RuntimeError::InvalidConfiguration); }
         let (completion, result) = oneshot::channel();
-        self.commands.try_send(Command { operation, completion }).map_err(|error| match error {
+        self.commands.try_send(Command { operation, completion, admitted: Instant::now() }).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => RuntimeError::Backpressure,
             mpsc::error::TrySendError::Closed(_) => RuntimeError::Closed,
         })?;
@@ -459,7 +459,7 @@ impl PreparedRuntime {
         let policy = self.policy.take().ok_or(RuntimeError::Closed)?;
         let (commands_tx, commands_rx) = mpsc::channel(MAX_COMMANDS); let (events_tx, events_rx) = mpsc::channel(MAX_EVENTS);
         let owner = self.owner.clone(); let scope = self.scope.clone();
-        let actor = Actor { io: Some(io), owner: owner.clone(), scope: scope.clone(), backend, tls, commands: commands_rx,
+        let actor = Actor { io: Some(io), owner: owner.clone(), scope: scope.clone(), backend, tls:Some(tls), common:None, native_attempt_end:None, commands: commands_rx,
             events: events_tx, policy, timing: self.timing, start: self.start, pending: std::collections::BTreeMap::new(),
             logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new() };
         self.attached = true;
@@ -485,24 +485,30 @@ pub fn start<I>(io: I, owner: AttemptOwner, route: PacketRoute<'_>, tls_paramete
 }
 
 struct Actor<I> {
-    io: Option<I>, owner: AttemptOwner, scope: RpcConnectionScope, backend: OfflineBackend, tls: TlsEngine,
+    io: Option<I>, owner: AttemptOwner, scope: RpcConnectionScope, backend: OfflineBackend, tls: Option<TlsEngine>,
+    common: Option<super::common_runtime::CommonPath>, native_attempt_end:Option<Instant>,
     commands: mpsc::Receiver<Command>, events: mpsc::Sender<RuntimeEvent>, policy: RuntimePolicy,
     timing: Option<RouterTiming>, start: Instant, pending: std::collections::BTreeMap<i32, Instant>, logout_pending: Option<LogoutPending>, unhosting_pending: Option<UnhostingPending>,
     call_pending:std::collections::BTreeMap<i32,CallPending>,
 }
 impl<I> Drop for Actor<I> {
-    fn drop(&mut self) { self.scope.close(); self.backend.close(); self.tls.close(); self.io = None; self.commands.close(); }
+    fn drop(&mut self) {
+        self.scope.close(); self.backend.close(); if let Some(tls)=&mut self.tls{tls.close();}
+        if let Some(common)=&mut self.common{common.close();}self.common=None;self.io = None; self.commands.close();
+    }
 }
 impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     async fn run(mut self) -> RuntimeError {
         let result = self.loop_run().await;
-        self.scope.close(); self.backend.close(); self.tls.close(); self.io = None; self.commands.close();
+        self.scope.close(); self.backend.close(); if let Some(tls)=&mut self.tls{tls.close();}
+        if let Some(common)=&mut self.common{common.close();}self.common=None;self.io = None; self.commands.close();
         while let Ok(command) = self.commands.try_recv() { let _ = command.completion.send(Err(RuntimeError::Closed)); }
         result
     }
     fn elapsed_ms(&self, now: Instant) -> u64 { now.saturating_duration_since(self.start).as_millis().min(u64::MAX as u128) as u64 }
     async fn loop_run(&mut self) -> RuntimeError {
-        let initial = match self.tls.take_wire_output(&self.owner, &self.scope, self.timing, Instant::now()) {
+        if self.common.is_some(){return self.common_loop_run().await;}
+        let initial = match self.tls.as_mut().expect("original TLS mode").take_wire_output(&self.owner, &self.scope, self.timing, Instant::now()) {
             Ok(initial) => initial, Err(error) => return error.into(),
         };
         if let Err(error) = self.send_wire(&initial, None).await { return error; }
@@ -516,7 +522,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 _ = self.events.closed() => return RuntimeError::Closed,
                 _ = timer.tick() => {
                     let now = Instant::now();
-                    if let Err(error) = self.tls.tick(&self.owner, &self.scope, now) { return error.into(); }
+                    if let Err(error) = self.tls.as_mut().expect("original TLS mode").tick(&self.owner, &self.scope, now) { return error.into(); }
                     self.pending.retain(|id, _| self.backend.is_pending(*id));
                     if self.logout_pending.as_ref().is_some_and(|pending| pending.completion.is_closed()) { return RuntimeError::Cancelled; }
                     if let Some(pending) = &self.unhosting_pending {
@@ -527,10 +533,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                     if self.pending.values().any(|deadline| now >= *deadline) { return RuntimeError::Timeout; }
                 }
                 received = self.io.as_mut().expect("owned IO").read(&mut read) => {
-                    let count = match received { Ok(0) => { let _ = self.tls.finish_eof(&self.owner, &self.scope); return RuntimeError::Io; },
+                    let count = match received { Ok(0) => { let _ = self.tls.as_mut().expect("original TLS mode").finish_eof(&self.owner, &self.scope); return RuntimeError::Io; },
                         Ok(count) => count, Err(_) => return RuntimeError::Io };
                     let now = Instant::now();
-                    let progress = match self.tls.on_wire_bytes(&self.owner, &self.scope, &read[..count], self.timing, now) {
+                    let progress = match self.tls.as_mut().expect("original TLS mode").on_wire_bytes(&self.owner, &self.scope, &read[..count], self.timing, now) {
                         Ok(Some(progress)) => progress, Ok(None) => return RuntimeError::Closed, Err(error) => return error.into(),
                     };
                     if let Err(error) = self.send_wire(&progress.wire, None).await { return error; }
@@ -605,10 +611,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                     if pending.completion.send(result).is_err() { return Err(RuntimeError::Cancelled); }
                     return Err(if accepted { RuntimeError::LoggedOut } else { RuntimeError::Protocol });
                 }
-                OfflineEvent::Outgoing(packets) => {
-                    let wire = self.tls.encrypt_packets(&self.owner, &self.scope, &packets.packets, self.timing, Instant::now())?.ok_or(RuntimeError::Closed)?;
-                    self.send_wire(&wire, None).await?;
-                }
+                OfflineEvent::Outgoing(packets) => { self.send_packets(&packets.packets,None,None).await?; }
                 event => visible.push(event),
             }
         }
@@ -628,9 +631,15 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_)) {
             let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
         }
-        if self.tls.phase() != TlsPhase::Verified {
+        if self.common.is_none() && self.tls.as_ref().is_none_or(|tls|tls.phase()!=TlsPhase::Verified) {
             let _ = command.completion.send(Err(RuntimeError::Tls(TlsError::NotReady))); return Ok(());
         }
+        let native_deadline=if self.common.is_some(){
+            let wait=if matches!(&command.operation,Operation::Login(..)){Duration::from_secs(90)}else{self.policy.rpc_timeout};
+            let mut end=command.admitted.checked_add(wait).ok_or(RuntimeError::Timeout)?;
+            if self.backend.phase()!=ArcPhase::Authenticated{if let Some(attempt)=self.native_attempt_end{end=end.min(attempt);}}
+            if now>=end{let _=command.completion.send(Err(RuntimeError::Timeout));return Err(RuntimeError::Timeout);}Some(end)
+        }else{None};
         if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
@@ -712,24 +721,17 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             Err(_) => { let _ = command.completion.send(Err(RuntimeError::Protocol)); return Ok(()); }
         };
         if is_logout { self.pending.retain(|id, _| self.backend.is_pending(*id)); }
-        let wire = match self.tls.encrypt_packets(&self.owner, &self.scope, &packets.packets, self.timing, now) {
-            Ok(Some(wire)) => wire,
-            Ok(None) => { let _ = command.completion.send(Err(RuntimeError::Closed)); return Err(RuntimeError::Closed); }
-            Err(error) => { let _ = command.completion.send(Err(error.into())); return Err(error.into()); }
-        };
-        if let Err(error) = self.send_wire(&wire, Some(&mut command.completion)).await {
+        if let Err(error) = self.send_packets(&packets.packets,Some(&mut command.completion),native_deadline).await {
             self.backend.retire_request(packets.call_id); let _ = command.completion.send(Err(error)); return Err(error);
         }
-        if !is_response {
-            self.pending.insert(packets.call_id, Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?);
-        }
+        let rpc_deadline=native_deadline.unwrap_or(Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?);
+        if !is_response { self.pending.insert(packets.call_id,rpc_deadline); }
         if let Some((ticket,operation,completion))=call_wait{
-            let deadline=Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?;
-            self.call_pending.insert(packets.call_id,CallPending{ticket,operation,deadline,completion});
+            self.call_pending.insert(packets.call_id,CallPending{ticket,operation,deadline:rpc_deadline,completion});
         }
         if let Some(sequence) = unhosting_sequence {
             self.unhosting_pending = Some(UnhostingPending { sequence, outer_id: packets.call_id,
-                deadline: Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?, completion: command.completion });
+                deadline:rpc_deadline, completion: command.completion });
             return Ok(());
         }
         if is_logout { self.logout_pending = Some(LogoutPending { id: packets.call_id, completion: command.completion }); return Ok(()); }
@@ -742,6 +744,11 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         }
         Ok(())
     }
+    async fn send_packets(&mut self,packets:&[super::transport_packets::TransportBytes],completion:Option<&mut oneshot::Sender<Result<RuntimeReceipt,RuntimeError>>>,native_deadline:Option<Instant>)->Result<(),RuntimeError>{
+        if self.common.is_some(){return self.send_common_packets(packets,completion,native_deadline).await;}
+        let wire=self.tls.as_mut().ok_or(RuntimeError::Closed)?.encrypt_packets(&self.owner,&self.scope,packets,self.timing,Instant::now())?.ok_or(RuntimeError::Closed)?;
+        self.send_wire(&wire,completion).await
+    }
     async fn send_wire(&mut self, wire: &[OwnedWireFrames], completion: Option<&mut oneshot::Sender<Result<RuntimeReceipt, RuntimeError>>>)
         -> Result<(), RuntimeError> {
         let mut frames = Vec::new(); let mut total = 0usize;
@@ -752,7 +759,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 frames.push(bytes);
             }
         }
-        let step_deadline = self.pending.values().copied().chain(self.tls.next_deadline())
+        let step_deadline = self.pending.values().copied().chain(self.tls.as_ref().and_then(TlsEngine::next_deadline))
             .chain(self.unhosting_pending.as_ref().map(|pending| pending.deadline)).chain(self.call_pending.values().map(|pending|pending.deadline)).min();
         let deadline = Instant::now().checked_add(self.policy.io_timeout).ok_or(RuntimeError::Timeout)?;
         let deadline = step_deadline.map_or(deadline, |rpc| deadline.min(rpc));
@@ -760,7 +767,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if now >= deadline { self.scope.close(); return Err(RuntimeError::Timeout); }
         let timeout = deadline.saturating_duration_since(now);
         let scope = self.scope.clone();
-        if self.tls.tick(&self.owner, &self.scope, Instant::now()).is_err() { return Err(RuntimeError::Timeout); }
+        if self.tls.as_mut().ok_or(RuntimeError::Closed)?.tick(&self.owner, &self.scope, Instant::now()).is_err() { return Err(RuntimeError::Timeout); }
         let io = self.io.as_mut().ok_or(RuntimeError::Closed)?;
         let sending = write_frames(io, &scope, &frames);
         let result = if let Some(completion) = completion {
@@ -803,6 +810,9 @@ async fn write_frames<I: AsyncWrite + Unpin>(io: &mut I, scope: &RpcConnectionSc
         None => Poll::Ready(Err(io::Error::other("closed original scope"))), Some(result) => result,
     }).await.map_err(|_| RuntimeError::Io)
 }
+
+#[path="arc_native_actor.rs"]
+pub(super) mod native;
 
 #[cfg(test)]
 #[path = "transport_actor_tests.rs"]

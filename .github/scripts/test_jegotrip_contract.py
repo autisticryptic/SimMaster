@@ -433,9 +433,31 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('if !self.is_open() { return; }', source)
         actor = (MOD / 'transport_actor.rs').read_text(encoding='utf-8')
         self.assertIn('tokio::time::MissedTickBehavior::Skip', actor)
-        self.assertIn('self.tls.next_deadline()', actor)
+        self.assertIn('self.tls.as_ref().and_then(TlsEngine::next_deadline)', actor)
         self.assertIn('count > frame.len() - offset', actor)
         self.assertIn('RuntimeError::Cancelled', actor)
+
+    def test_common_actor_keeps_original_pre_network_scope_without_inner_tls_emulation(self):
+        source = (MOD / 'arc_native_actor.rs').read_text(encoding='utf-8')
+        prepare = source.split('fn prepare_common(', 1)[1].split('impl PreparedCommonRuntime', 1)[0]
+        self.assertIn('OfflineBackend::new(owner.clone())', prepare)
+        self.assertIn('backend.claim_common_transport()', prepare)
+        self.assertIn('backend.connection_scope()', prepare)
+        self.assertIn('RouterPath::open(self.owner.clone(),self.scope.clone(),router_policy', source)
+        self.assertIn('common.scope().matches(&self.scope)', source)
+        self.assertIn('common.is_open_for(&owner,&scope)', source)
+        self.assertIn('io:None', source)
+        self.assertIn('tls:None', source)
+        self.assertIn('common.try_receive_calls', source)
+        self.assertIn('self.backend.on_common_calls', source)
+        self.assertIn('common.send_prepared_packets', source)
+        self.assertIn('self.pending.values().copied().chain(extra)', source)
+        for forbidden in ['TlsEngine::for_', 'VerifiedPlaintextPackets::', 'RpcConnectionScope::fresh', 'Callback::SdkLogin { success: true }']:
+            self.assertNotIn(forbidden, source)
+        actor = (MOD / 'transport_actor.rs').read_text(encoding='utf-8')
+        self.assertIn('command.admitted.checked_add(wait)', actor)
+        self.assertIn('if self.common.is_some(){return self.common_loop_run()', actor)
+        self.assertIn('if let Some(common)=&mut self.common{common.close();}', actor)
 
     def test_legacy_config_unwrap_requires_explicit_context_and_does_not_weaken_tls(self):
         source = (MOD / 'legacy_config.rs').read_text(encoding='utf-8')

@@ -205,6 +205,12 @@ impl RouterPath {
             let now=Instant::now();if now>=deadline{return Err(RouterIoError::Timeout);}
             self.engine.tick(&self.owner,&self.scope,now)?;self.tracker.tick(&self.owner,&self.scope,now)?;self.ports.tick(&self.owner,&self.scope,now)?;
             if self.dispatch_pending(deadline).await?{return Ok(true);}
+            let now=Instant::now();
+            if self.last_node_probe.is_none_or(|last|now.duration_since(last)>=NODE_PROBE_INTERVAL){
+                let timing=self.timing(now)?;
+                let request=self.tracker.prepare_node_probe(&self.owner,&self.scope,timing,now)?.ok_or(RouterIoError::Scope)?;
+                self.send_control(&request,deadline).await?;self.last_node_probe=Some(now);
+            }
             let Some(input)=self.receive_available(deadline).await? else{return Ok(false);};
             if self.tracker.on_packets(&self.owner,&self.scope,input,Instant::now())?.is_some(){return Err(RouterIoError::Configuration);}
             self.flush_feedback(deadline).await?;self.dispatch_pending(deadline).await?;Ok(true)

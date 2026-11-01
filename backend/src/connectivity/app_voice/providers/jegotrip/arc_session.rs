@@ -215,6 +215,13 @@ impl ArcRpcSession {
         Ok(engine)
     }
 
+    /// Claims the one original lower-layer slot BEFORE any Router DNS/IO.
+    ///This is not a TLS engine or authentication grant; the prepared native
+    ///actor must build its physical CommonPath with this same owned scope.
+    pub(super) fn claim_common_transport(&mut self)->Result<(),TransportError>{
+        if self.phase()!=ArcPhase::Initial||!self.pending.is_empty()||self.packet_transport_taken{return Err(TransportError::InvalidPacket);}
+        self.packet_transport_taken=true;Ok(())
+    }
     /// One tracker per ARC incarnation keeps nested sequences unique and binds
     /// owner/connection at construction, never when a batch arrives.
     pub fn take_hosting_tracker(&mut self) -> Result<HostingRpcTracker, CodecError> {

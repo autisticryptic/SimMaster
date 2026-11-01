@@ -96,6 +96,23 @@ impl OfflineBackend {
         for packet in packets { events.extend(self.on_plaintext_packet(owner, scope, packet.expose_to_transport(), now_ms)?); }
         Ok(events)
     }
+    pub(super) fn claim_common_transport(&mut self)->Result<(),ProtocolError>{self.protocol.claim_common_transport()}
+    /// Only original CommonPath-produced groups enter this bridge. Normalising
+    ///a completed logical message to the existing protocol parser does not
+    ///forge VerifiedPlaintextPackets, an innerTLS handshake, or a new scope.
+    pub(super) fn on_common_calls(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,
+        path:&super::common_runtime::CommonPath,group:&super::common_runtime::ScopedCommonCalls,now_ms:u64)->Result<Vec<OfflineEvent>,ProtocolError>{
+        if !self.connection_scope().matches(scope){return Ok(Vec::new());}
+        let Some(calls)=path.calls_for(owner,scope,group) else{return Ok(Vec::new());};
+        let mut events=Vec::new();
+        for call in calls{
+            if !matches!(call.kind,super::transport_packets::CallKind::Request|super::transport_packets::CallKind::Reply){self.close();return Err(super::transport_packets::TransportError::UnsupportedKind.into());}
+            let mut packet=zeroize::Zeroizing::new(Vec::with_capacity(call.payload.expose_to_transport().len()+1));
+            packet.push(call.kind as u8);packet.extend_from_slice(call.payload.expose_to_transport());
+            events.extend(self.on_plaintext_packet(owner,scope,&packet,now_ms)?);
+        }
+        Ok(events)
+    }
     pub fn close(&mut self) {
         self.protocol.close(); if let Some(s) = &mut self.scheduler { s.close(); }
         self.tracker.retire_all();
