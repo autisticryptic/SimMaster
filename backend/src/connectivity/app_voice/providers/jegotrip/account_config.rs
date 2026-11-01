@@ -6,7 +6,7 @@ use super::{
     legacy_config::ConfigDecodeKey,
     packet_transport::PacketRoute,
     rpc_stream::{RpcProperty, MAX_FIELD_BYTES, MAX_MAP_ENTRIES},
-    runtime_backend::{RuntimeBootstrapInputs, RuntimeCommonInputs, RuntimeProfile, RuntimeProfileInputs},
+    runtime_backend::{RuntimeBootstrapInputs, RuntimeCommonBootstrapInputs, RuntimeCommonInputs, RuntimeProfile, RuntimeProfileInputs},
     runtime_provision::{AccountTrust, AccountTrustInputs},
     runtime_connector::{validate_explicit_profile, ConnectionInput},
 };
