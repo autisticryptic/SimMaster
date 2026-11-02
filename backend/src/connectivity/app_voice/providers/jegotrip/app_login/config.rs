@@ -4,7 +4,7 @@ use super::super::{
     credentials::{Secret, SdkCredentials, HostingCredentials, ImportedCredentials},
     account_config::{AccountConfig, ProfileConfig, BootstrapConfig, CallMediaConfig, ReconnectPolicy},
 };
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{fmt, io::Read, path::Path};
 use zeroize::Zeroizing;
@@ -227,8 +227,8 @@ struct PrivateHttpPairs<'a>(&'a [HttpPair]);
 impl Serialize for PrivateHttpPairs<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-        for pair in self.0 { seq.serialize_element(&PrivateHttpPairRef { name: pair.name.expose_to_backend(), value: pair.value.expose_to_backend() })?; }
-        seq.end()
+        for pair in self.0 { SerializeSeq::serialize_element(&mut seq, &PrivateHttpPairRef { name: pair.name.expose_to_backend(), value: pair.value.expose_to_backend() })?; }
+        SerializeSeq::end(seq)
     }
 }
 #[derive(Serialize)]
