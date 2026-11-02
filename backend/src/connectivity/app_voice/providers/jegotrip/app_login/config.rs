@@ -180,7 +180,9 @@ struct PrivateBodyProtectionRef<'a> { secret_id: &'a str, secret_value: &'a str 
 struct PrivateHttpRef<'a> {
     base_url: &'a str, anonymous_token: &'a str, signature_salt: &'a str, password_salt: &'a str,
     sip_password_key: &'a str, device_id: &'a str, endpoints: &'a Endpoints,
-    body_protection: Option<PrivateBodyProtectionRef<'a>>, root_der_base64: Option<&'a str>, user_agent: Option<&'a str>, enroll_id: Option<&'a str>,
+    body_protection: Option<PrivateBodyProtectionRef<'a>>, root_der_base64: Option<&'a str>,
+    pinned_server_certificate_der_base64: Option<&'a str>,
+    user_agent: Option<&'a str>, enroll_id: Option<&'a str>,
 }
 impl<'a> PrivateHttpRef<'a> {
     fn new(h: &'a HttpDeployment) -> Self {
@@ -188,7 +190,9 @@ impl<'a> PrivateHttpRef<'a> {
             signature_salt: h.signature_salt.expose_to_backend(), password_salt: h.password_salt.expose_to_backend(),
             sip_password_key: h.sip_password_key.expose_to_backend(), device_id: h.device_id.expose_to_backend(), endpoints: &h.endpoints,
             body_protection: h.body_protection.as_ref().map(|b| PrivateBodyProtectionRef { secret_id: b.secret_id.expose_to_backend(), secret_value: b.secret_value.expose_to_backend() }),
-            root_der_base64: h.root_der_base64.as_ref().map(Secret::expose_to_backend), user_agent: h.user_agent.as_ref().map(Secret::expose_to_backend),
+            root_der_base64: h.root_der_base64.as_ref().map(Secret::expose_to_backend),
+            pinned_server_certificate_der_base64: h.pinned_server_certificate_der_base64.as_ref().map(Secret::expose_to_backend),
+            user_agent: h.user_agent.as_ref().map(Secret::expose_to_backend),
             enroll_id: h.enroll_id.as_ref().map(Secret::expose_to_backend) }
     }
 }

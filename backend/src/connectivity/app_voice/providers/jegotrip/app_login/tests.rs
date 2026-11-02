@@ -616,6 +616,40 @@ async fn live_https_transport_posts_signed_json_with_pinned_root_and_no_redirect
     cfg.base_url=Secret::from_owned(format!("https://127.0.0.1:{port}/"));let mut client=LiveFactory.build(&cfg).unwrap();assert_eq!(client.login(&login_request(&id())).await.unwrap_err().code,"app_login_transport_failed");assert!(task.await.unwrap().is_some());
 }
 #[tokio::test]
+async fn pinned_server_certificate_accepts_only_the_configured_leaf() {
+    // The App bundles one concrete leaf (assets/app2.cer) instead of a CA, so an
+    // explicit pin is the faithful transport trust decision here.
+    let cert=Certificates::generate("IP:127.0.0.1");let other=Certificates::generate("IP:127.0.0.1");
+    let body=r#"{"code":0,"body":{"token":"fixture-live-App-session"}}"#;
+    let (port,task)=https_once(cert.server_config(&rustls::version::TLS13),
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len())).await;
+    let mut cfg=http_config(false);cfg.base_url=Secret::from_owned(format!("https://127.0.0.1:{port}/"));
+    cfg.root_der_base64=None;cfg.pinned_server_certificate_der_base64=Some(Secret::from_owned(cert.root.clone()));
+    let mut client=LiveFactory.build(&cfg).unwrap();client.login(&login_request(&id())).await.unwrap();
+    assert!(task.await.unwrap().is_some());
+    // Any other presented certificate is refused before a login body is delivered.
+    let (port,task)=https_once(cert.server_config(&rustls::version::TLS13),String::new()).await;
+    let mut cfg=http_config(false);cfg.base_url=Secret::from_owned(format!("https://127.0.0.1:{port}/"));
+    cfg.root_der_base64=None;cfg.pinned_server_certificate_der_base64=Some(Secret::from_owned(other.root.clone()));
+    let mut client=LiveFactory.build(&cfg).unwrap();
+    assert_eq!(client.login(&login_request(&id())).await.unwrap_err().code,"app_login_transport_failed");
+    assert!(task.await.unwrap().is_none());
+}
+#[test]
+fn pinned_server_certificate_is_exclusive_with_root_and_must_be_der() {
+    let cert=Certificates::generate("IP:127.0.0.1");
+    let mut value=deployment_json(&cert.root,false);
+    value["http"]["pinned_server_certificate_der_base64"]=json!(cert.root.clone());
+    let config:config::Deployment=serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(config.http.validate(),Ok(()));
+    let mut both=value.clone();both["http"]["root_der_base64"]=json!(cert.root.clone());
+    assert!(serde_json::from_value::<config::Deployment>(both).unwrap().http.validate().is_err());
+    let mut bad=value.clone();bad["http"]["pinned_server_certificate_der_base64"]=json!("not-base64");
+    assert!(serde_json::from_value::<config::Deployment>(bad).unwrap().http.validate().is_err());
+    let mut short=value;short["http"]["pinned_server_certificate_der_base64"]=json!(STANDARD.encode(b"0"));
+    assert!(serde_json::from_value::<config::Deployment>(short).unwrap().http.validate().is_err());
+}
+#[tokio::test]
 async fn wrong_https_root_refuses_before_any_login_body_is_delivered() {
     let cert=Certificates::generate("IP:127.0.0.1");let other=Certificates::generate("IP:127.0.0.1");
     let (port,task)=https_once(cert.server_config(&rustls::version::TLS13),String::new()).await;

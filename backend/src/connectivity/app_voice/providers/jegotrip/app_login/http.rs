@@ -15,6 +15,48 @@ pub(super) type Exchange<'a> = Pin<Box<dyn Future<Output=Result<WireResponse,Err
 pub(super) trait Transport: Send+Sync { fn exchange(&self, request:WireRequest)->Exchange<'_>; }
 pub(super) trait TransportFactory: Send+Sync { fn build(&self, config:&HttpDeployment)->Result<AppClient,Error>; }
 pub(super) struct LiveFactory;
+
+/// Exact end-entity certificate pin, mirroring the App's bundled `assets/app2.cer`.
+/// The operator supplies one concrete server certificate; no system root and no
+/// CA path is consulted, and any other certificate fails the handshake.
+#[derive(Debug)]
+struct PinnedLeaf {
+    leaf: Vec<u8>,
+    provider: Arc<tokio_rustls::rustls::crypto::CryptoProvider>,
+}
+impl tokio_rustls::rustls::client::danger::ServerCertVerifier for PinnedLeaf {
+    fn verify_server_cert(&self, end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+        _server_name: &tokio_rustls::rustls::pki_types::ServerName<'_>, _ocsp: &[u8],
+        _now: tokio_rustls::rustls::pki_types::UnixTime)
+        -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error> {
+        if end_entity.as_ref() != self.leaf.as_slice() {
+            return Err(tokio_rustls::rustls::Error::InvalidCertificate(
+                tokio_rustls::rustls::CertificateError::UnknownIssuer));
+        }
+        Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, message: &[u8], cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        dss: &tokio_rustls::rustls::DigitallySignedStruct)
+        -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        tokio_rustls::rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, message: &[u8], cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        dss: &tokio_rustls::rustls::DigitallySignedStruct)
+        -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        tokio_rustls::rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+fn pinned_tls(der: Vec<u8>) -> Result<tokio_rustls::rustls::ClientConfig, Error> {
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions().map_err(|_| Error::new("app_login_deployment_invalid"))?
+        .dangerous().with_custom_certificate_verifier(Arc::new(PinnedLeaf { leaf: der, provider })).with_no_client_auth();
+    Ok(config)
+}
 struct LiveTransport(reqwest::Client);
 impl TransportFactory for LiveFactory {
     fn build(&self, config:&HttpDeployment)->Result<AppClient,Error> {
@@ -26,6 +68,10 @@ impl TransportFactory for LiveFactory {
             if bytes.len()>65_536 { return Err(Error::new("app_login_deployment_invalid")); }
             let cert=reqwest::Certificate::from_der(&bytes).map_err(|_|Error::new("app_login_deployment_invalid"))?;
             builder=builder.tls_built_in_root_certs(false).add_root_certificate(cert);
+        }
+        if let Some(pin)=&config.pinned_server_certificate_der_base64 {
+            let der=STANDARD.decode(pin.expose_to_backend()).map_err(|_|Error::new("app_login_deployment_invalid"))?;
+            builder=builder.tls_built_in_root_certs(false).use_preconfigured_tls(pinned_tls(der)?);
         }
         if let Some(agent)=&config.user_agent { builder=builder.user_agent(agent.expose_to_backend()); }
         let client=builder.build().map_err(|_|Error::new("app_login_deployment_invalid"))?;
