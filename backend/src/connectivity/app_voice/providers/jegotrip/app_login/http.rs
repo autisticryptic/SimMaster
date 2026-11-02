@@ -55,6 +55,9 @@ fn pinned_tls(der: Vec<u8>) -> Result<tokio_rustls::rustls::ClientConfig, Error>
     let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions().map_err(|_| Error::new("app_login_deployment_invalid"))?
         .dangerous().with_custom_certificate_verifier(Arc::new(PinnedLeaf { leaf: der, provider })).with_no_client_auth();
+    // reqwest drives HTTP/1.1 here; advertise only what this client speaks.
+    let mut config = config;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }
 struct LiveTransport(reqwest::Client);

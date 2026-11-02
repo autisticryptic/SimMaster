@@ -646,7 +646,7 @@ fn pinned_server_certificate_is_exclusive_with_root_and_must_be_der() {
     assert!(serde_json::from_value::<config::Deployment>(both).unwrap().http.validate().is_err());
     let mut bad=value.clone();bad["http"]["pinned_server_certificate_der_base64"]=json!("not-base64");
     assert!(serde_json::from_value::<config::Deployment>(bad).unwrap().http.validate().is_err());
-    let mut short=value;short["http"]["pinned_server_certificate_der_base64"]=json!(STANDARD.encode(b"0"));
+    let mut short=value;short["http"]["pinned_server_certificate_der_base64"]=json!("MA==");
     assert!(serde_json::from_value::<config::Deployment>(short).unwrap().http.validate().is_err());
 }
 #[tokio::test]

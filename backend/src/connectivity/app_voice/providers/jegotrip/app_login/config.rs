@@ -5,6 +5,7 @@ use super::super::{
     account_config::{AccountConfig, ProfileConfig, BootstrapConfig, CallMediaConfig, ReconnectPolicy},
 };
 use serde::{Deserialize, Serialize};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{fmt, io::Read, path::Path};
 use zeroize::Zeroizing;
 use url::Url;
@@ -74,6 +75,12 @@ pub(super) struct HttpDeployment {
     /// None is the original non-encrypted AppConfig branch, not a TLS downgrade.
     pub body_protection: Option<BodyProtection>,
     pub root_der_base64: Option<Secret>,
+    /// Exact end-entity certificate pin (the App bundles one such leaf in
+    /// `assets/app2.cer`). Mutually exclusive with `root_der_base64`; when set,
+    /// only this exact server certificate is accepted and no system root is
+    /// consulted. It is an explicit installation value, never a fallback.
+    #[serde(default)]
+    pub pinned_server_certificate_der_base64: Option<Secret>,
     pub user_agent: Option<Secret>,
     pub enroll_id: Option<Secret>,
 }
@@ -95,6 +102,13 @@ impl HttpDeployment {
         }
         for s in [&self.user_agent,&self.enroll_id].into_iter().flatten() {
             if s.expose_to_backend().len()>1024 || s.expose_to_backend().chars().any(char::is_control) { return Err(invalid()); }
+        }
+        if self.root_der_base64.is_some() && self.pinned_server_certificate_der_base64.is_some() { return Err(invalid()); }
+        if let Some(pin)=&self.pinned_server_certificate_der_base64 {
+            let text=pin.expose_to_backend();
+            if text.is_empty() || text.len()>87_400 || text.chars().any(char::is_control) { return Err(invalid()); }
+            let der=STANDARD.decode(text).map_err(|_|invalid())?;
+            if der.len()<200 || der.len()>65_536 || der.first()!=Some(&0x30) { return Err(invalid()); }
         }
         for p in [&self.endpoints.login,&self.endpoints.user_info,&self.endpoints.phone_token,&self.endpoints.voip_status,&self.endpoints.call_status,&self.endpoints.enable_hosting] { self.endpoint(p)?; }
         Ok(())
