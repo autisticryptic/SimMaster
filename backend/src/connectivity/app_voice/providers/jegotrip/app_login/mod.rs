@@ -3,12 +3,14 @@
 mod config;
 mod crypto;
 mod http;
+mod app_version;
 mod store;
 mod settings;
 mod accounts;
 #[cfg(test)] mod tests;
 
 pub(crate) use config::DatabaseConfiguration;
+pub(crate) use app_version::AppVersionView;
 pub use accounts::JegotripAccountView;
 use super::{account_runtime::AccountManager, account_config::AccountConfig};
 use futures_util::FutureExt;
@@ -27,6 +29,7 @@ const ERRORS: &[&str] = &[
     "app_login_busy", "app_login_unavailable", "app_login_shutting_down", "app_login_interrupted",
     "app_login_timeout", "app_login_entropy_failed", "app_login_transport_failed",
     "app_login_response_invalid", "app_login_rate_limited", "app_login_server_rejected",
+    "app_login_version_discovery_failed",
     "app_login_verification_required", "app_login_migration_required", "app_login_existing_business_action_required",
     "app_login_session_revoked", "app_login_service_maintenance", "app_login_phone_binding_required",
     "app_login_identity_mismatch", "app_login_native_configuration_invalid", "app_login_business_unconfirmed",
@@ -99,6 +102,11 @@ impl fmt::Debug for JegotripLoginRequest {fn fmt(&self,f:&mut fmt::Formatter<'_>
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigurationWriteRequest { pub expected_revision:u64, pub configuration:DatabaseConfiguration }
+/// Operator override carried to the shared version store; the value is
+/// re-validated there (digits and dots only, bounded length).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AppVersionWriteRequest { pub version:String }
 impl fmt::Debug for ConfigurationWriteRequest {fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {f.write_str("JegotripConfigurationWrite(<redacted>)")}}
 #[derive(Clone,Debug,Serialize)]
 pub struct ConfigurationView {
@@ -199,6 +207,36 @@ impl AppLoginManager {
         if lock(&self.owner).is_none() {return Ok(Vec::new());}
         self.database.with_conn(accounts::list)
     }
+    /// Shared-state view of the App client version. Only the value and its
+    /// provenance are exported; no deployment secret is reachable from here.
+    pub(crate) fn app_version_view(&self)->Result<AppVersionView,Error> {
+        let (_,_,configuration)=self.selected_configuration().map_err(Error::new)?;
+        let http=configuration.as_ref().map(|c|&c.http);
+        let stored=self.database.with_conn(|conn|Ok::<_,&'static str>(app_version::load(conn))).ok().flatten();
+        Ok(app_version::view(stored,now(),
+            http.is_some_and(|h|h.app_version_file.is_some()),
+            http.is_some_and(|h|h.app_version_web_url.is_some()),
+            http.is_some_and(|h|h.app_version_ios_app_id.is_some()),
+            http.is_some_and(|h|h.app_version.is_some()),
+            http.is_some_and(|h|h.app_version_store)))
+    }
+    /// Force one remote lookup now (App Store, then the official page) and
+    /// persist the result. Never guesses: a failed lookup is an explicit error.
+    pub(crate) async fn refresh_app_version(&self)->Result<AppVersionView,Error> {
+        let (_,_,configuration)=self.selected_configuration().map_err(Error::new)?;
+        let configuration=configuration.ok_or(Error::new("app_login_deployment_missing"))?;
+        let factory=self.factory.build(&configuration.http)?;
+        let client=factory.with_version_store(Arc::new(app_version::DatabaseVersionStore::new(self.database.clone())));
+        if client.refresh_app_version().await.is_none() { return Err(Error::new("app_login_version_discovery_failed")); }
+        self.app_version_view()
+    }
+    /// Operator override. Stored with source=manual so the provenance stays
+    /// honest and a later automatic re-check can replace it.
+    pub(crate) fn set_app_version(&self,version:&str)->Result<AppVersionView,Error> {
+        let stored=app_version::manual(version.trim(),now())?;
+        self.database.with_conn(|conn|app_version::save(conn,&stored)).map_err(Error::new)?;
+        self.app_version_view()
+    }
     pub fn list(&self) -> Result<Vec<AttemptView>, &'static str> {
         if lock(&self.owner).is_none() { return Ok(Vec::new()); }
         let mut views = self.database.with_conn(store::list)?;
@@ -231,6 +269,7 @@ impl AppLoginManager {
         let configuration=configuration.ok_or(Error::new("app_login_deployment_missing"))?;
         if intent==LoginIntent::EnableHosting && configuration.runtime.is_none() {return Err(Error::new("app_login_native_configuration_missing"));}
         let client=self.factory.build(&configuration.http)?;
+        let client=client.with_version_store(Arc::new(app_version::DatabaseVersionStore::new(self.database.clone())));
         let accounts=self.accounts.upgrade().ok_or(Error::new("app_login_unavailable"))?;
         if intent==LoginIntent::EnableHosting {accounts.login_preflight_create().map_err(|_|Error::new("app_login_account_creation_failed"))?;}
         let permit=self.active.clone().try_acquire_owned().map_err(|_|Error::new("app_login_busy"))?;
@@ -265,13 +304,41 @@ impl AppLoginManager {
         self.database.with_conn(|c|store::step(c,id,owner,phase,business,now())).map_err(Error::new)
     }
     async fn run(&self,owner:&str,mut request:LoginRequest,intent:LoginIntent,revision:u64,configuration:DatabaseConfiguration,mut client:AppClient)->Result<(),Error> {
+        // First run of a fresh installation: learn a real App version from the
+        // configured source and persist it BEFORE any login call, so the very
+        // first request already carries a value the server accepts.
+        client.ensure_app_version().await;
+        eprintln!("app_login_version_in_use {}",client.version_provenance().await);
+        let outcome=self.run_with_version_gate(owner,&request,intent,revision,&configuration,&mut client).await;
+        request.password = Secret::from_owned(String::new());
+        request.username = Secret::from_owned(String::new());
+        outcome
+    }
+    /// The server refuses an outdated client with a single business code. When
+    /// that happens the version is re-learned once (App Store / official page),
+    /// persisted, and the WHOLE flow is replayed so every body, query and header
+    /// is rebuilt with the new value. One retry only: a repeated gate is final.
+    async fn run_with_version_gate(&self,owner:&str,request:&LoginRequest,intent:LoginIntent,revision:u64,configuration:&DatabaseConfiguration,client:&mut AppClient)->Result<(),Error> {
+        let error=match self.run_flow(owner,request,intent,revision,configuration,client).await { Ok(())=>return Ok(()), Err(error)=>error };
+        if error.server_code!=Some(http::VERSION_GATE_CODE) { return Err(error); }
+        let before=client.version_value().await;
+        let Some((value,source))=client.refresh_app_version().await else {
+            eprintln!("app_login_version_refresh_unavailable"); return Err(error);
+        };
+        if before.as_deref()==Some(value.as_str()) {
+            eprintln!("app_login_version_gate_unchanged source={source}"); return Err(error);
+        }
+        eprintln!("app_login_version_gate_retry source={source}");
+        client.reset_session();
+        self.step(owner,&request.attempt_id,"authenticating",None)?;
+        self.run_flow(owner,request,intent,revision,configuration,client).await
+    }
+    async fn run_flow(&self,owner:&str,request:&LoginRequest,intent:LoginIntent,revision:u64,configuration:&DatabaseConfiguration,client:&mut AppClient)->Result<(),Error> {
         let id=request.attempt_id.clone();let id=id.as_str();let hint=request.masked_login_name();
         self.step(owner,id,"authenticating",None)?;
         client.login(&request).await?;
-        request.password = Secret::from_owned(String::new());
         self.step(owner,id,"reading_bound_number",None)?;
         let bound=client.bound_number(&request).await?;
-        request.username=Secret::from_owned(String::new());
         self.database.with_conn(|c|store::set_mask(c,id,owner,&bound.masked(),now())).map_err(Error::new)?;
         self.step(owner,id,"saving_app_account",None)?;
         let key=client.account_key(&bound)?;
@@ -282,7 +349,7 @@ impl AppLoginManager {
         if intent==LoginIntent::Authenticate {return Ok(());}
         self.step(owner,id,"fetching_credentials",None)?;
         let material=client.phone_credentials(&bound).await?;
-        let runtime=configuration.runtime.ok_or(Error::new("app_login_native_configuration_missing"))?;
+        let runtime=configuration.runtime.clone().ok_or(Error::new("app_login_native_configuration_missing"))?;
         let config:AccountConfig=runtime.bind(&bound.identity(),material)?;
         config.validate(now() as u64).map_err(|_|Error::new("app_login_native_configuration_invalid"))?;
         let accounts=self.accounts.upgrade().ok_or(Error::new("app_login_unavailable"))?;

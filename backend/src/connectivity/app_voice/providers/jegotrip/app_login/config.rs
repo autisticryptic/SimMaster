@@ -71,6 +71,10 @@ pub(super) fn valid_version_page(url:&str)->bool {
     !host.is_empty() && (host=="jegotrip.cn" || host.ends_with(".jegotrip.cn"))
 }
 
+pub(super) fn valid_ios_app_id(value:&str)->bool {
+    !value.is_empty() && value.len()<=12 && value.bytes().all(|b|b.is_ascii_digit()) && !value.starts_with('0')
+}
+
 pub(super) fn valid_app_version(value:&str)->bool {
     !value.is_empty() && value.len()<=24 && value.bytes().all(|b|b.is_ascii_digit()||b==b'.')
         && value.split('.').all(|part|!part.is_empty())
@@ -128,6 +132,16 @@ pub(super) struct HttpDeployment {
     /// the file or stored value so a page redesign can never block a login.
     #[serde(default)]
     pub app_version_web_url: Option<Secret>,
+    /// Numeric App Store id of the official iOS App. The lookup URL is built by
+    /// SimAdmin (`https://itunes.apple.com/lookup?id=…`), so no arbitrary URL
+    /// can be configured here, and only the returned `version` literal is kept.
+    #[serde(default)]
+    pub app_version_ios_app_id: Option<Secret>,
+    /// Persist a discovered version into the shared installation state so the
+    /// next start does not depend on the network. Off by default: without it the
+    /// value only lives in memory for this process/client.
+    #[serde(default)]
+    pub app_version_store: bool,
     pub user_agent: Option<Secret>,
     pub enroll_id: Option<Secret>,
 }
@@ -184,6 +198,9 @@ impl HttpDeployment {
             let text=path.expose_to_backend();
             if text.is_empty() || text.len()>512 || text.chars().any(char::is_control) || !text.starts_with('/')
                 || text.split('/').any(|part|part==".."||part==".") { return Err(invalid()); }
+        }
+        if let Some(id)=&self.app_version_ios_app_id {
+            if !valid_ios_app_id(id.expose_to_backend()) { return Err(invalid()); }
         }
         Ok(())
     }
@@ -283,6 +300,7 @@ struct PrivateHttpRef<'a> {
     pinned_server_public_key_der_base64: Option<&'a str>,
     extra_query: PrivateHttpPairs<'a>, extra_headers: PrivateHttpPairs<'a>, extra_body: PrivateHttpPairs<'a>,
     app_version: Option<&'a str>, app_version_file: Option<&'a str>, app_version_web_url: Option<&'a str>,
+    app_version_ios_app_id: Option<&'a str>, app_version_store: bool,
     user_agent: Option<&'a str>, enroll_id: Option<&'a str>,
 }
 impl<'a> PrivateHttpRef<'a> {
@@ -298,6 +316,8 @@ impl<'a> PrivateHttpRef<'a> {
             app_version: h.app_version.as_ref().map(Secret::expose_to_backend),
             app_version_file: h.app_version_file.as_ref().map(Secret::expose_to_backend),
             app_version_web_url: h.app_version_web_url.as_ref().map(Secret::expose_to_backend),
+    app_version_ios_app_id: h.app_version_ios_app_id.as_ref().map(Secret::expose_to_backend),
+    app_version_store: h.app_version_store,
             user_agent: h.user_agent.as_ref().map(Secret::expose_to_backend),
             enroll_id: h.enroll_id.as_ref().map(Secret::expose_to_backend) }
     }

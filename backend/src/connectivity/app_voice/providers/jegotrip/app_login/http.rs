@@ -164,7 +164,18 @@ impl BoundNumber {
     pub fn masked(&self)->String { let s=self.mobile.expose_to_backend();format!("***{}",&s[s.len().saturating_sub(4)..]) }
 }
 pub(super) struct AppClient { config:HttpDeployment, transport:Arc<dyn Transport>, session:Option<Secret>,
-    version_cache:std::sync::Mutex<Option<(String,std::time::Instant)>> }
+    version_store:Option<Arc<dyn super::app_version::VersionStore>>,
+    version_cache:std::sync::Mutex<Option<(String,&'static str,std::time::Instant)>> }
+/// The server's explicit "your App is too old" business code. It is the ONLY
+/// trigger for re-learning the version and replaying a request.
+pub(super) const VERSION_GATE_CODE:u32=524;
+/// Parse the iOS lookup payload (`{"resultCount":1,"results":[{"version":"8.9.8"}]}`).
+/// Only a validated `8.x[.y[.z]]` literal is accepted; nothing is inferred.
+pub(super) fn pick_ios_version(text:&str)->Option<String> {
+    let value:serde_json::Value=serde_json::from_str(text).ok()?;
+    let version=value.get("results")?.as_array()?.first()?.get("version")?.as_str()?.trim();
+    (super::config::valid_app_version(version) && version.split('.').next()==Some("8")).then(||version.to_owned())
+}
 /// Pick the newest `8.x.y[.z]` literal out of an official page. Pure and
 /// deterministic so a page redesign degrades to "no value" instead of a guess.
 pub(super) fn pick_version(text:&str)->Option<String> {
@@ -196,42 +207,106 @@ impl AppClient {
         hash.update(realm.as_str().as_bytes());hash.update(&[0]);hash.update(identity.as_bytes());
         Ok(hash.finish().as_ref().to_vec())
     }
-    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_cache:std::sync::Mutex::new(None)}) }
-    /// Resolve `$APP_VERSION` for the CURRENT request. A configured file is
-    /// re-read every time and the official page is re-read at most every 30
-    /// minutes, so an App upgrade never needs a SimAdmin rebuild: change the
-    /// file, the stored configuration, or let the page be discovered.
-    async fn app_version(&self)->Option<String> {
+    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_store:None,version_cache:std::sync::Mutex::new(None)}) }
+    /// Attach the durable shared-state store. Without it the version still
+    /// resolves from file/page/static, but nothing is persisted.
+    pub fn with_version_store(mut self,store:Arc<dyn super::app_version::VersionStore>)->Self { self.version_store=Some(store); self }
+    fn store_load(&self)->Option<super::app_version::StoredVersion> { self.version_store.as_ref().and_then(|store|store.load()) }
+    fn store_save(&self,version:&str,source:&str) {
+        if !self.config.app_version_store { return; }
+        let Some(store)=&self.version_store else { return; };
+        let now=chrono::Utc::now().timestamp().max(0);
+        store.save(&super::app_version::StoredVersion {version:version.to_owned(),source:source.to_owned(),observed_at:now});
+    }
+    /// Resolve `$APP_VERSION` for the CURRENT request. Order: explicit file
+    /// (re-read every call), shared stored value, iOS App Store, official page,
+    /// static configuration. A stored value older than the store TTL is
+    /// re-checked but still used when the re-check fails, so an official App
+    /// upgrade needs no SimAdmin rebuild and an offline start still works.
+    async fn app_version(&self)->Option<(String,&'static str)> {
+        use super::app_version::{SOURCE_FILE,SOURCE_STATIC,SOURCE_STORE,STORE_TTL_SECONDS};
         if let Some(path)=&self.config.app_version_file {
-            let Ok(bytes)=std::fs::read(path.expose_to_backend()) else { return None; };
-            if bytes.len()>64 { return None; }
-            let value=String::from_utf8(bytes).ok()?.trim().to_owned();
-            return super::config::valid_app_version(&value).then_some(value);
+            if let Ok(bytes)=std::fs::read(path.expose_to_backend()) {
+                if bytes.len()<=64 {
+                    let value=String::from_utf8(bytes).ok().map(|text|text.trim().to_owned());
+                    if let Some(value)=value.filter(|v|super::config::valid_app_version(v)) { return Some((value,SOURCE_FILE)); }
+                }
+            }
+            return None;
+        }
+        let cached=self.version_cache.lock().ok().and_then(|slot|slot.clone());
+        if let Some((value,source,at))=cached {
+            if at.elapsed()<std::time::Duration::from_secs(super::app_version::MEMORY_TTL_SECONDS) { return Some((value,source)); }
+        }
+        if let Some(stored)=self.store_load() {
+            let age=chrono::Utc::now().timestamp().max(0)-stored.observed_at;
+            if age<STORE_TTL_SECONDS { self.remember_version(&stored.version,SOURCE_STORE); return Some((stored.version,SOURCE_STORE)); }
+            if let Some((value,source))=self.discover_remote().await {
+                self.remember_version(&value,source); return Some((value,source));
+            }
+            eprintln!("app_login_version_keeping_stale age={age}");
+            self.remember_version(&stored.version,SOURCE_STORE); return Some((stored.version,SOURCE_STORE));
+        }
+        if let Some((value,source))=self.discover_remote().await { self.remember_version(&value,source); return Some((value,source)); }
+        let value=self.config.app_version.as_ref()?.expose_to_backend().to_owned();
+        super::config::valid_app_version(&value).then(||(value,SOURCE_STATIC))
+    }
+    /// Force a fresh remote lookup, bypassing both caches. Used before the first
+    /// hosted login (so a brand-new installation starts with a stored value) and
+    /// when the server answers the version gate.
+    pub(super) async fn refresh_app_version(&self)->Option<(String,&'static str)> {
+        let found=self.discover_remote().await;
+        match found { Some((value,source))=>{ self.remember_version(&value,source); Some((value,source)) }, None=>None }
+    }
+    /// First-run pre-flight: a brand-new installation has no stored value yet.
+    /// Learning it here means the login itself already carries a real version.
+    pub(super) async fn ensure_app_version(&self) {
+        if self.config.app_version_file.is_some() || self.config.app_version.is_some() { return; }
+        if !self.config.app_version_store && self.config.app_version_ios_app_id.is_none() && self.config.app_version_web_url.is_none() { return; }
+        if self.store_load().is_some() { return; }
+        let (value,source)=self.app_version().await.unwrap_or_else(||(String::new(),"none"));
+        eprintln!("app_login_version_preflight len={} source={source}",value.len());
+    }
+    /// iOS App Store first (a stable, machine-readable literal), then the
+    /// official page. Only a validated literal is persisted; no guess, and a
+    /// failure keeps whatever the store already had.
+    async fn discover_remote(&self)->Option<(String,&'static str)> {
+        use super::app_version::{SOURCE_IOS,SOURCE_PAGE};
+        if let Some(id)=&self.config.app_version_ios_app_id {
+            let url=format!("https://itunes.apple.com/lookup?id={}&country=cn",id.expose_to_backend());
+            if let Some(bytes)=self.fetch_text(&url).await {
+                match pick_ios_version(&String::from_utf8_lossy(&bytes)) {
+                    Some(value)=>{ self.store_save(&value,SOURCE_IOS); return Some((value,SOURCE_IOS)); },
+                    None=>eprintln!("app_login_version_discovery_failed stage=ios_parse bytes={}",bytes.len()),
+                }
+            }
         }
         if let Some(url)=&self.config.app_version_web_url {
-            let cached=self.version_cache.lock().ok().and_then(|slot|slot.clone());
-            if let Some((value,at))=cached {
-                if at.elapsed()<std::time::Duration::from_secs(1800) { return Some(value); }
-                if let Some(found)=self.discover_version(url.expose_to_backend()).await {
-                    self.remember_version(&found); return Some(found);
+            if let Some(bytes)=self.fetch_text(url.expose_to_backend()).await {
+                match pick_version(&String::from_utf8_lossy(&bytes)) {
+                    Some(value)=>{ self.store_save(&value,SOURCE_PAGE); return Some((value,SOURCE_PAGE)); },
+                    None=>eprintln!("app_login_version_discovery_failed stage=page_parse bytes={}",bytes.len()),
                 }
-                eprintln!("app_login_version_discovery_failed keeping_stale=true");
-                return Some(value);
             }
-            if let Some(found)=self.discover_version(url.expose_to_backend()).await {
-                self.remember_version(&found); return Some(found);
-            }
-            eprintln!("app_login_version_discovery_failed keeping_stale=false");
         }
-        let value=self.config.app_version.as_ref()?.expose_to_backend().to_owned();
-        super::config::valid_app_version(&value).then_some(value)
+        None
     }
-    fn remember_version(&self,value:&str) {
-        if let Ok(mut slot)=self.version_cache.lock() { *slot=Some((value.to_owned(),std::time::Instant::now())); }
+    fn remember_version(&self,value:&str,source:&'static str) {
+        if let Ok(mut slot)=self.version_cache.lock() { *slot=Some((value.to_owned(),source,std::time::Instant::now())); }
     }
-    /// Fetch the official page with public roots (not the pinned App leaf),
+    /// Value-only view used by the per-call placeholders.
+    pub(super) async fn version_value(&self)->Option<String> { self.app_version().await.map(|(value,_)|value) }
+    /// A replay of the same login attempt must not reuse a previous App session
+    /// token; each flow starts from the anonymous login again.
+    pub(super) fn reset_session(&mut self) { self.session=None; }
+    /// Provenance of the value that will be placed in the next request, for the
+    /// bounded operator log line (never a secret).
+    pub(super) async fn version_provenance(&self)->String {
+        match self.app_version().await { Some((value,source))=>format!("{source}:{value}"), None=>"none".to_owned() }
+    }
+    /// Fetch a discovery URL with public roots (not the pinned App leaf),
     /// bounded body/time, no redirects; only the version literal is kept.
-    async fn discover_version(&self,url:&str)->Option<String> {
+    async fn fetch_text(&self,url:&str)->Option<Vec<u8>> {
         // Shared factory keeps the project's DNS boundary (no ad-hoc clients).
         let builder=crate::platform::dns::http_client_builder()
             .timeout(std::time::Duration::from_secs(8))
@@ -248,10 +323,7 @@ impl AppClient {
         if response.content_length().unwrap_or(0)>524_288 { eprintln!("app_login_version_discovery_failed stage=size"); return None; }
         let bytes=match response.bytes().await { Ok(bytes)=>bytes, Err(_)=>{ eprintln!("app_login_version_discovery_failed stage=body"); return None; } };
         if bytes.len()>524_288 { eprintln!("app_login_version_discovery_failed stage=size"); return None; }
-        let text=String::from_utf8_lossy(&bytes);
-        let Some(found)=pick_version(&text) else { eprintln!("app_login_version_discovery_failed stage=parse bytes={}",bytes.len()); return None; };
-        eprintln!("app_login_version_discovered len={}",found.len());
-        Some(found)
+        Some(bytes.to_vec())
     }
     fn expand(value:&str,version:Option<&str>)->Option<String> {
         if value=="$APP_VERSION" { return version.map(str::to_owned); }
@@ -287,7 +359,7 @@ impl AppClient {
         let mut url=self.config.endpoint(path)?;
         let millis=chrono::Utc::now().timestamp_millis().max(0) as u64;
         let signature=crypto::url_signature(&self.config.signature_salt,millis);
-        let version=self.app_version().await;
+        let version=self.version_value().await;
         {
             let mut query=url.query_pairs_mut();
             match auth {
@@ -339,7 +411,7 @@ impl AppClient {
     pub async fn login(&mut self,request:&LoginRequest)->Result<(),Error> {
         let hash=crypto::password_hash(&self.config.password_salt,&request.password);
         let mut payload=self.payload(serde_json::json!({"loginName":request.username.expose_to_backend().trim(),
-            "password":hash.expose_to_backend(),"userType":"0","site":1}),self.app_version().await.as_deref());
+            "password":hash.expose_to_backend(),"userType":"0","site":1}),self.version_value().await.as_deref());
         if let Some(country)=&request.country_code { payload.0["countryCode"]=serde_json::Value::String(country.clone()); }
         if let Some(id)=&self.config.enroll_id { payload.0["enrollId"]=serde_json::Value::String(id.expose_to_backend().to_owned()); }
         // No campaign context is invented; null Gson fields are omitted.
@@ -363,7 +435,7 @@ impl AppClient {
         Ok(BoundNumber {country:country.to_owned(),mobile:Secret::from_owned(mobile.to_owned())})
     }
     pub async fn phone_credentials(&self,bound:&BoundNumber)->Result<PhoneMaterial,Error> {
-        let identity=bound.identity();let payload=self.payload(serde_json::json!({"accountId":&**identity}),self.app_version().await.as_deref());
+        let identity=bound.identity();let payload=self.payload(serde_json::json!({"accountId":&**identity}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let token_doc=self.post(&self.config.endpoints.phone_token,&bytes,Authentication::Session,true).await?;
         let token=crypto::secret_field(crypto::body(&token_doc)?,"token")?;
@@ -373,7 +445,7 @@ impl AppClient {
         Ok(PhoneMaterial {token,sip_password})
     }
     pub async fn business_enabled(&self)->Result<bool,Error> {
-        let payload=self.payload(serde_json::json!({"device_id":self.config.device_id.expose_to_backend()}),self.app_version().await.as_deref());
+        let payload=self.payload(serde_json::json!({"device_id":self.config.device_id.expose_to_backend()}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let doc=self.post(&self.config.endpoints.call_status,&bytes,Authentication::Session,false).await?;
         let value=crypto::body(&doc)?.get("cs_forward").ok_or(Error::new("app_login_response_invalid"))?;
@@ -382,7 +454,7 @@ impl AppClient {
         }
     }
     pub async fn enable_business(&self)->Result<(),Error> {
-        let payload=self.payload(serde_json::json!({"cs_forward":"2","device_id":self.config.device_id.expose_to_backend()}),self.app_version().await.as_deref());
+        let payload=self.payload(serde_json::json!({"cs_forward":"2","device_id":self.config.device_id.expose_to_backend()}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         self.post(&self.config.endpoints.enable_hosting,&bytes,Authentication::Session,true).await?;Ok(())
     }

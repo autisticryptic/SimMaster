@@ -16,6 +16,7 @@ fn columns(conn:&Connection)->Result<Vec<String>,&'static str> {
     rows.collect::<Result<Vec<_>,_>>().map_err(|_|STORAGE)
 }
 pub(super) fn initialize(conn:&Connection,owner:&str,now:i64)->Result<(),&'static str> {
+    super::app_version::initialize(conn)?;
     let tx=rusqlite::Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
     let old=exists(&tx,"app_voice_login_attempts")?;
     let new=exists(&tx,"jegotrip_login_attempts")?;

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Alert, Button, Checkbox, CircularProgress, FormControlLabel, MenuItem, Stack, TextField, Typography } from '@mui/material'
-import { api, type AppLoginAttempt, type AppLoginSetup } from '../../api/current'
+import { api, type AppLoginAttempt, type AppLoginSetup, type JegotripAppVersionView } from '../../api/current'
 import { appBusinessLabel, appLoginError, jegotripLoginInput, appLoginNeedsPolling, appLoginPhase, canSubmitJegotripLogin, emptyAppLoginDraft, type AppLoginDraft } from '../../policies/appLogin'
 
 const emptyDraft = emptyAppLoginDraft
@@ -8,6 +8,10 @@ const emptyDraft = emptyAppLoginDraft
 export default function AppAccountLoginPane({ open, onCreated }: { open: boolean; onCreated?: () => void }) {
   const [draft, setDraft] = useState<AppLoginDraft>(emptyDraft)
   const [setup, setSetup] = useState<AppLoginSetup | null>(null)
+  const [appVersion, setAppVersion] = useState<JegotripAppVersionView | null>(null)
+  const [versionInput, setVersionInput] = useState('')
+  const [versionBusy, setVersionBusy] = useState(false)
+  const [versionNote, setVersionNote] = useState<string | null>(null)
   const [attempt, setAttempt] = useState<AppLoginAttempt | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -18,9 +22,14 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
     const scope = { active: open }
     generation.current = scope
     setDraft(emptyDraft()); setAttempt(null); setSubmitting(false); setError(null); setSetup(null)
+    setAppVersion(null); setVersionInput(''); setVersionNote(null)
     if (open) void api.getJegotripLoginSetup().then((response) => {
       if (scope.active) setSetup(response.data ?? null)
     }).catch(() => { if (scope.active) setError('无法读取数据库账号登录配置。') })
+    if (open) void api.getJegotripAppVersion().then((response) => {
+      if (!scope.active) return
+      setAppVersion(response.data ?? null); setVersionInput(response.data?.stored?.version ?? '')
+    }).catch(() => { if (scope.active) setVersionNote('无法读取 App 版本状态。') })
     return () => { scope.active = false }
   }, [open])
 
@@ -77,11 +86,47 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
   }
 
   const pending = submitting || (attempt !== null && appLoginNeedsPolling(attempt))
+  const versionValid = /^\d+(\.\d+)*$/.test(versionInput.trim()) && versionInput.trim().length <= 24
+  const storeVersion = async () => {
+    if (versionBusy || !versionValid) return
+    setVersionBusy(true); setVersionNote(null)
+    try {
+      const response = await api.saveJegotripAppVersion(versionInput.trim())
+      setAppVersion(response.data ?? null); setVersionNote('已写入共享状态表，下次登录立即生效。')
+    } catch (failure) { setVersionNote(appLoginError(failure)) } finally { setVersionBusy(false) }
+  }
+  const refreshVersion = async () => {
+    if (versionBusy) return
+    setVersionBusy(true); setVersionNote(null)
+    try {
+      const response = await api.refreshJegotripAppVersion()
+      setAppVersion(response.data ?? null); setVersionInput(response.data?.stored?.version ?? versionInput)
+      setVersionNote('已按 App Store/官方页面重新拉取并写入。')
+    } catch (failure) { setVersionNote(appLoginError(failure)) } finally { setVersionBusy(false) }
+  }
+  const sourceLabel: Record<string, string> = { manual: '手工设置', ios: 'iOS App Store', page: '官方页面', store: '共享状态表', file: '版本文件', static: '静态配置' }
   return <Stack spacing={2}>
     <Alert severity="info">登录已绑定号码的无忧行账号，后台自动取得电话 token/SIP 密码、确认托管业务并启动无忧行接收器。不是仅保存 App 认证摘要；业务开启、SDK 在线、电话/短信和媒体就绪分别核验，无需手填个人 SDK 凭据。</Alert>
     {setup && !setup.accepting_authenticate && <Alert severity="warning">App HTTP 安装配置或运行锁尚未准备好，完整登录启动流程不可用。配置使用专用数据库；不再要求单独的 jegotrip-login.json 文件。</Alert>}
     {setup?.accepting_authenticate && !setup.native_configured && <Alert severity="warning">完整原生启动配置尚未就绪，暂不能登录并启动无忧行。程序不会降级为仅认证、使用占位值启动或显示接收就绪。</Alert>}
     {setup && <Typography variant="caption" color="text.secondary">配置来源：{setup.configuration_source} · 数据库版本：{setup.configuration_revision}</Typography>}
+    <Stack spacing={1}>
+      <Typography variant="subtitle2">App 客户端版本</Typography>
+      <Typography variant="caption" color="text.secondary">
+        {appVersion?.stored
+          ? `共享状态表：${appVersion.stored.version}（${sourceLabel[appVersion.stored.source] ?? appVersion.stored.source}）`
+          : '共享状态表暂无版本号；首次登录会先按已配置来源拉取并写入。'}
+        {appVersion && ` · 来源：${[appVersion.configured_ios_lookup ? 'App Store' : '', appVersion.configured_mobile_page ? '官方页面' : '',
+          appVersion.configured_file ? '版本文件' : '', appVersion.configured_static ? '静态值' : ''].filter(Boolean).join('/') || '未配置'}`}
+      </Typography>
+      <Stack direction="row" spacing={1}>
+        <TextField size="small" label="App 版本（如 8.9.8.0）" value={versionInput} disabled={versionBusy}
+          onChange={(event) => setVersionInput(event.target.value)} error={versionInput.length > 0 && !versionValid} />
+        <Button variant="outlined" disabled={versionBusy || !versionValid} onClick={() => { void storeVersion() }}>保存</Button>
+        <Button variant="outlined" disabled={versionBusy} onClick={() => { void refreshVersion() }}>拉取最新</Button>
+      </Stack>
+      {versionNote && <Alert severity="info">{versionNote}</Alert>}
+    </Stack>
     <TextField select size="small" label="登录方式" value={draft.mode} disabled={pending}
       onChange={(event) => setDraft({ ...draft, mode: event.target.value === 'phone' ? 'phone' : 'account' })}>
       <MenuItem value="phone">手机号和密码</MenuItem><MenuItem value="account">无忧行账号和密码</MenuItem>

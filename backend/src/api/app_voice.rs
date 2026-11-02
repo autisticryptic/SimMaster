@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use crate::{
     api::models::ApiResponse,
-    connectivity::app_voice::providers::jegotrip::{account_config::AccountConfig, account_runtime::AccountManager, app_login::{AppLoginManager, LoginRequest, JegotripLoginRequest, ConfigurationWriteRequest}, PROVIDER_ID},
+    connectivity::app_voice::providers::jegotrip::{account_config::AccountConfig, account_runtime::AccountManager, app_login::{AppLoginManager, LoginRequest, JegotripLoginRequest, ConfigurationWriteRequest, AppVersionWriteRequest}, PROVIDER_ID},
     state::AppState,
 };
 
@@ -46,6 +46,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/jegotrip/config", get(jegotrip_configuration).put(jegotrip_configure).delete(jegotrip_clear_configuration))
         .route("/api/jegotrip/accounts", get(jegotrip_accounts))
         .route("/api/jegotrip/login/setup", get(app_login_setup))
+        .route("/api/jegotrip/app-version", get(jegotrip_app_version).put(jegotrip_set_app_version))
+        .route("/api/jegotrip/app-version/refresh", post(jegotrip_refresh_app_version))
         .route("/api/jegotrip/login/attempts", get(app_login_attempts).post(jegotrip_login_submit))
         .route("/api/jegotrip/login/attempts/{attempt_id}", get(app_login_attempt))
         .route("/api/non-3gpp/app-login/setup", get(app_login_setup))
@@ -122,6 +124,20 @@ pub async fn jegotrip_clear_configuration(State(manager):State<Arc<AppLoginManag
 }
 pub async fn jegotrip_accounts(State(manager):State<Arc<AppLoginManager>>)->Response {
     success(StatusCode::OK,manager.app_accounts())
+}
+/// Shared App-version state: value, provenance, age and which sources are
+/// configured. No secret from the deployment is exported.
+pub async fn jegotrip_app_version(State(manager):State<Arc<AppLoginManager>>)->Response {
+    success(StatusCode::OK,manager.app_version_view())
+}
+/// Force one remote lookup (App Store, then the official page) and persist it.
+pub async fn jegotrip_refresh_app_version(State(manager):State<Arc<AppLoginManager>>)->Response {
+    match manager.refresh_app_version().await {Ok(view)=>success(StatusCode::OK,Ok(view)),Err(e)=>failure(e.code)}
+}
+/// Explicit operator override, stored as source=manual.
+pub async fn jegotrip_set_app_version(State(manager):State<Arc<AppLoginManager>>,request:Result<Json<AppVersionWriteRequest>,JsonRejection>)->Response {
+    let Ok(Json(request))=request else{return failure("app_login_request_invalid");};
+    match manager.set_app_version(&request.version) {Ok(view)=>success(StatusCode::OK,Ok(view)),Err(e)=>failure(e.code)}
 }
 pub async fn jegotrip_login_submit(State(manager):State<Arc<AppLoginManager>>,request:Result<Json<JegotripLoginRequest>,JsonRejection>)->Response {
     let Ok(Json(request))=request else{return failure("app_login_request_invalid");};

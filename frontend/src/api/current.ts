@@ -209,6 +209,16 @@ export interface JegotripConfigurationView {
   accepting_authenticate: boolean
   accepting_enable_hosting: boolean
 }
+export interface JegotripAppVersionView {
+  stored: { version: string; source: string; observed_at: number } | null
+  stored_age_seconds: number | null
+  store_ttl_seconds: number
+  configured_file: boolean
+  configured_mobile_page: boolean
+  configured_ios_lookup: boolean
+  configured_static: boolean
+  store_enabled: boolean
+}
 export interface JegotripLoginInput {
   attempt_id: string
   username: string
@@ -917,6 +927,22 @@ class SimAdminCurrentAPI {
 
   async getJegotripAccounts() {
     return request<ApiResponse<JegotripAccountView[]>>('/jegotrip/accounts')
+  }
+
+  async getJegotripAppVersion() {
+    return request<ApiResponse<JegotripAppVersionView>>('/jegotrip/app-version')
+  }
+
+  async saveJegotripAppVersion(version: string) {
+    return request<ApiResponse<JegotripAppVersionView>>('/jegotrip/app-version', {
+      method: 'PUT', body: JSON.stringify({ version }), timeoutMs: 15000,
+    })
+  }
+
+  async refreshJegotripAppVersion() {
+    return request<ApiResponse<JegotripAppVersionView>>('/jegotrip/app-version/refresh', {
+      method: 'POST', timeoutMs: 20000,
+    })
   }
 
   async getJegotripLoginSetup() {

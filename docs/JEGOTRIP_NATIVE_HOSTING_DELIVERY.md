@@ -45,26 +45,63 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 真实服务在 `setVoip`（开启托管）会校验客户端 APP 版本：实测返回 `524`
 （`msg` 提示升级到 8.9.8 及以上；当前 APK 字节为 `8.9.7.0`）。版本不在原 App 的 URL/
 `setVoip` 请求体里（已核对 DEX 的 `HttpRequestUitls.main/withToken` 与 `setVoipCsState`），
-所以部署侧提供三个**显式且可变**的插槽，取值为 `$APP_VERSION` 占位符：
+所以部署侧提供**显式且可变**的插槽，取值为 `$APP_VERSION` 占位符。
+
+### 2.2.1 版本值存在哪里（共享状态表）
+
+版本号不是编译期常量，也不靠猜：它保存在数据库的共享状态表里（与其它共用信息同一张
+key/value 表，`jegotrip_shared_state`，`name='app_version'`），一行记录 `value` / `source` /
+`observed_at`：
+
+- `source` 记录来源（`manual` 手工覆盖、`ios` App Store、`page` 官方页面、`store` 读自该表），
+  便于运维判断这个值是谁写的；
+- 首次运行时表为空 → 先按配置的来源拉取一次 → 写入该表 → **再**开始登录流程，因此第一次
+  请求就带上真实版本；
+- 数据库里已存在未过期（6 小时）的值时直接用，**不依赖网络**也能启动；过期后会尝试刷新，
+  刷新失败仍沿用旧值（旧值好过没有值）。
+
+### 2.2.2 来源与解析顺序
 
 ```jsonc
-"app_version": "8.9.8.0",                                   // 静态/存储值（与 file 互斥）
+"app_version": "8.9.8.0",                                    // 静态/兜底值
 "app_version_file": "/opt/simadmin/jegotrip-app-version.txt", // 每次请求重读
-"app_version_web_url": "https://www.jegotrip.cn/m/mobileIndex.html", // 官方页面自动发现，30分钟缓存
+"app_version_web_url": "https://www.jegotrip.cn/m/mobileIndex.html", // 官方页面
+"app_version_ios_app_id": "1037589370",                      // iOS App Store 数字 id
+"app_version_store": true,                                    // 允许写入共享状态表
 "extra_query":   [ { "name": "version",   "value": "$APP_VERSION" } ],
 "extra_headers": [ { "name": "version",   "value": "$APP_VERSION" } ],
 "extra_body":    [ { "name": "app_version","value": "$APP_VERSION" } ]
 ```
 
-解析顺序：`app_version_file` → `app_version_web_url`（30 分钟缓存，失败保留旧值）→ `app_version`。
+解析顺序：`app_version_file`（每次重读）→ 共享状态表 → iOS App Store → 官方页面 → `app_version`。
 
-- **不需要重新编译/重启**：改文件（`echo 8.9.9.0 > /opt/simadmin/jegotrip-app-version.txt`）
-  或改存储配置（`PUT /api/jegotrip/config`）后，下一次登录立刻生效；
-- 网页发现受限：仅 `https://*.jegotrip.cn/`、8 秒超时、不跟随重定向、响应≤512KB，
-  只提取页面中最大的 `8.x.y[.z]` 字面量（例：`8.9.10`）；页面改版时**不猜值**，退回到旧值；
+- **iOS 来源**：由 SimAdmin 自己拼 `https://itunes.apple.com/lookup?id=<数字id>&country=cn`，
+  配置项只接受纯数字 id，不能填任意 URL；只取 `results[0].version` 且必须是 `8.x[.y[.z]]`
+  的字面量，其它值（9.x、乱码、空结果）一律视为“没有值”；
+- **官方页面**：仅 `https://*.jegotrip.cn/`、8 秒超时、不跟重定向、响应≤512KB，只提取页面中
+  最大的 `8.x.y[.z]` 字面量；
+- **不需要重新编译/重启**：改文件或 `PUT /api/jegotrip/config` 后，下一次登录立刻生效；
 - 版本值与路径都受校验：版本仅数字与点且≤24字符，文件≤64字节；文件路径必须绝对、无 `.`/`..`；
   `app_version` 与 `app_version_file` 同时提供视为配置错误；
 - 占位符解析不出来时该字段**不发送**，不会发出空版本号或默认值。
+
+### 2.2.3 服务端说“版本过低”时怎么办
+
+登录链路任一调用返回业务码 `524` 时：重新拉取一次版本（App Store → 官方页面）→ 写入共享
+状态表 → 用新值**重放整个登录流程一次**（body/query/header 全部重新构造，签名/时间戳/nonce
+也都是新的）→ 若仍为 `524` 则如实失败，不再重试。只重试一次，且只在拿到**不同**版本号时才
+重放，避免对同一份配置反复打服务端。
+
+### 2.2.4 运维接口（不导出任何密钥）
+
+```
+GET  /api/jegotrip/app-version          # 当前存储值 + 来源 + 年龄 + 各来源是否已配置
+PUT  /api/jegotrip/app-version          # {"version":"8.9.8.0"} 手工写入（source=manual）
+POST /api/jegotrip/app-version/refresh  # 立即强制拉取一次并落库
+```
+
+返回体只有 `version` / `source` / `observed_at` / `stored_age_seconds` / `store_ttl_seconds`
+与四个 `configured_*` 布尔值，不包含任何部署凭据。
 
 `extra_query`/`extra_headers`/`extra_body` 仍受之前的限制：每个≤16项，name 仅字母数字/`-`/`_`，
 value ≤256 且不含控制字符；`n_token`/`lang`/`timestamp`/`sign`/`token` 不可被覆盖。

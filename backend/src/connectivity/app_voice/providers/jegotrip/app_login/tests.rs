@@ -219,6 +219,8 @@ fn full_database_private_mirror_roundtrip_retains_runtime_without_personal_login
     expected["http"]["app_version"] = Value::Null;
     expected["http"]["app_version_file"] = Value::Null;
     expected["http"]["app_version_web_url"] = Value::Null;
+    expected["http"]["app_version_ios_app_id"] = Value::Null;
+    expected["http"]["app_version_store"] = json!(false);
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
     let restored = DatabaseConfiguration::decode_private(&bytes).unwrap();
     assert!(restored.runtime.is_some());
@@ -733,4 +735,63 @@ async fn wrong_https_root_refuses_before_any_login_body_is_delivered() {
     let (port,task)=https_once(cert.server_config(&rustls::version::TLS13),String::new()).await;
     let mut cfg=http_config(false);cfg.base_url=Secret::from_owned(format!("https://127.0.0.1:{port}/"));cfg.root_der_base64=Some(Secret::from_owned(other.root.clone()));
     let mut client=LiveFactory.build(&cfg).unwrap();assert_eq!(client.login(&login_request(&id())).await.unwrap_err().code,"app_login_transport_failed");assert!(task.await.unwrap().is_none());
+}
+
+#[test]
+fn ios_lookup_reports_only_a_validated_8x_version_and_never_guesses() {
+    assert_eq!(http::pick_ios_version(r#"{"resultCount":1,"results":[{"version":"8.9.8"}]}"#).as_deref(),Some("8.9.8"));
+    assert_eq!(http::pick_ios_version(r#"{"resultCount":1,"results":[{"version":"8.9.8.0"}]}"#).as_deref(),Some("8.9.8.0"));
+    // A different major, a missing/empty result set, a malformed literal and a
+    // non-JSON body all resolve to "no value" instead of a guess.
+    for text in [r#"{"resultCount":1,"results":[{"version":"9.0.0"}]}"#,r#"{"resultCount":0,"results":[]}"#,
+                 r#"{"results":[{"version":"8.x"}]}"#,r#"{"results":[]}"#,"not json",""] {
+        assert_eq!(http::pick_ios_version(text),None,"{text}");
+    }
+}
+#[test]
+fn ios_lookup_source_is_limited_to_a_numeric_app_store_id_and_explicit_store_optin() {
+    let cert=Certificates::generate("IP:127.0.0.1");
+    let mut value=deployment_json(&cert.root,false);
+    value["http"]["app_version_ios_app_id"]=json!("1037589370");
+    value["http"]["app_version_store"]=json!(true);
+    let ok:config::Deployment=serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(ok.http.validate(),Ok(()));
+    for bad in ["","0","1037589370a","../../../etc/passwd","1037589370123","https://itunes.apple.com/lookup?id=1"] {
+        let mut bad_value=value.clone();bad_value["http"]["app_version_ios_app_id"]=json!(bad);
+        assert!(serde_json::from_value::<config::Deployment>(bad_value).unwrap().http.validate().is_err(),"{bad}");
+    }
+}
+#[test]
+fn shared_state_stores_the_app_version_with_provenance_and_rejects_garbage() {
+    let conn=rusqlite::Connection::open_in_memory().unwrap();
+    super::app_version::initialize(&conn).unwrap();
+    // A fresh installation starts empty: no invented default version.
+    assert!(super::app_version::load(&conn).is_none());
+    let stored=super::app_version::manual("8.9.8.0",7).unwrap();
+    assert_eq!(stored.source,super::app_version::SOURCE_MANUAL);
+    super::app_version::save(&conn,&stored).unwrap();
+    assert_eq!(super::app_version::load(&conn),Some(stored));
+    // Overrides go through the same validation as discovered values.
+    for bad in ["","8.x","8..9","v8.9.8","a".repeat(25).as_str()] {
+        assert!(super::app_version::manual(bad,1).is_err(),"{bad}");
+    }
+    // A row that no longer holds a valid version is ignored, never trusted.
+    conn.execute("UPDATE jegotrip_shared_state SET value='' WHERE name=?1",
+        rusqlite::params![super::app_version::APP_VERSION_KEY]).unwrap();
+    assert!(super::app_version::load(&conn).is_none());
+}
+#[test]
+fn version_view_exposes_only_the_value_provenance_and_sources() {
+    let stored=super::app_version::StoredVersion{version:"8.9.8.0".into(),source:"ios".into(),observed_at:1_000};
+    let view=super::app_version::view(Some(stored),1_500,false,true,true,false,true);
+    let text=serde_json::to_string(&view).unwrap();
+    assert!(text.contains("\"version\":\"8.9.8.0\""),"{text}");
+    assert!(text.contains("\"source\":\"ios\""),"{text}");
+    assert!(text.contains("\"stored_age_seconds\":500"),"{text}");
+    assert!(text.contains("\"configured_ios_lookup\":true"),"{text}");
+    assert!(text.contains("\"store_enabled\":true"),"{text}");
+    // Empty state stays explicit rather than fabricating a version.
+    let empty=serde_json::to_string(&super::app_version::view(None,1_500,true,false,false,true,false)).unwrap();
+    assert!(empty.contains("\"stored\":null"),"{empty}");
+    assert!(empty.contains("\"stored_age_seconds\":null"),"{empty}");
 }
