@@ -221,6 +221,7 @@ fn full_database_private_mirror_roundtrip_retains_runtime_without_personal_login
     expected["http"]["app_version_web_url"] = Value::Null;
     expected["http"]["app_version_ios_app_id"] = Value::Null;
     expected["http"]["app_version_store"] = json!(false);
+    expected["http"]["endpoints"]["verification_trustful_device"] = Value::Null;
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
     let restored = DatabaseConfiguration::decode_private(&bytes).unwrap();
     assert!(restored.runtime.is_some());
