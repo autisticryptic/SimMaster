@@ -190,6 +190,19 @@ business_state=not_requested   （证明没有任何写业务开关的请求）
 手机 App 完成”（服务端安全设备认证要求绑定号码的 SIM）。开启后本机用 `attach_hosting` 即可接管：
 取 phone token/SIP 密码 → 建本地账号 → 启动原生接收器。
 
+### 2.2.7 已验收的真机结果（2026-11-03，`4ad682b9`）
+
+| 能力 | 真实服务结果 |
+| --- | --- |
+| App 登录 + 绑定号码 + 账号记录（`intent=authenticate`） | **通过**：`completed=true`、`masked_number=***7634`、生成本地账号 `f70bc6cd…` |
+| 版本门槛（`app-version` 头） | 通过（`524` 消失） |
+| 设备注册 `device/sec/v1/enroll` | 通过：返回 `enrollId`(32) + `expireTime`(19)，已随登录上报 |
+| 安全设备校验 `securityVerify` / `verificationTrustfulDevice` | 已调用，服务端回答 `authentication_code=2` |
+| 开启托管 `setVoip` | 仍 `506 未授信设备`（需手机侧一键认证） |
+| 接管 `intent=attach_hosting` | 正确拒绝：`app_login_business_not_enabled`，`business_state=not_requested`（零写入） |
+
+也就是说：**只要账号已在手机上开启了托管，本机就能完整接管后续接收**；开启这一步必须由手机完成。
+
 ## 2. 受支持的配置形状（不含真实值）
 
 存储的账号配置里，原生路由需要**同时**给出：
