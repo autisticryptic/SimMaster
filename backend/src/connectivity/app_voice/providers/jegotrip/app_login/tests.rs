@@ -216,6 +216,8 @@ fn full_database_private_mirror_roundtrip_retains_runtime_without_personal_login
     expected["http"]["extra_query"] = json!([]);
     expected["http"]["extra_headers"] = json!([]);
     expected["http"]["extra_body"] = json!([]);
+    expected["http"]["app_version"] = Value::Null;
+    expected["http"]["app_version_file"] = Value::Null;
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
     let restored = DatabaseConfiguration::decode_private(&bytes).unwrap();
     assert!(restored.runtime.is_some());
@@ -642,6 +644,28 @@ async fn pinned_server_certificate_accepts_only_the_configured_leaf() {
     let mut client=LiveFactory.build(&cfg).unwrap();
     assert_eq!(client.login(&login_request(&id())).await.unwrap_err().code,"app_login_transport_failed");
     assert!(task.await.unwrap().is_none());
+}
+#[test]
+fn app_version_can_be_static_or_reread_from_a_bounded_file_without_a_rebuild() {
+    let cert=Certificates::generate("IP:127.0.0.1");
+    let mut value=deployment_json(&cert.root,false);
+    value["http"]["app_version"]=json!("8.9.8.0");
+    assert_eq!(serde_json::from_value::<config::Deployment>(value.clone()).unwrap().http.validate(),Ok(()));
+    // Both sources at once is ambiguous; malformed values and relative or
+    // traversing paths are refused before any request is built.
+    let mut both=value.clone();both["http"]["app_version_file"]=json!("/opt/simadmin/jegotrip-app-version.txt");
+    assert!(serde_json::from_value::<config::Deployment>(both).unwrap().http.validate().is_err());
+    for bad in ["","8.9.","8..9","v8.9.8","8.9.8.0 ","a".repeat(25).as_str()] {
+        let mut bad_value=value.clone();bad_value["http"]["app_version"]=json!(bad);
+        assert!(serde_json::from_value::<config::Deployment>(bad_value).unwrap().http.validate().is_err(),"{bad}");
+    }
+    let mut file=value.clone();file["http"]["app_version"]=Value::Null;
+    for path in ["","relative/version.txt","/opt/simadmin/../etc/passwd","/opt/simadmin/./v"] {
+        file["http"]["app_version_file"]=json!(path);
+        assert!(serde_json::from_value::<config::Deployment>(file.clone()).unwrap().http.validate().is_err(),"{path}");
+    }
+    file["http"]["app_version_file"]=json!("/opt/simadmin/jegotrip-app-version.txt");
+    assert_eq!(serde_json::from_value::<config::Deployment>(file).unwrap().http.validate(),Ok(()));
 }
 #[test]
 fn extra_query_and_headers_are_bounded_and_never_replace_reserved_parameters() {

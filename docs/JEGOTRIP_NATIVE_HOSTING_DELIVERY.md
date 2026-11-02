@@ -40,20 +40,29 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 设备上该证书需随部署私有配置提供；校验失败会在登录 attempt 上以
 `app_login_transport_failed` 结束，不会伪造成功。
 
-## 2.2 App 请求的版本门槛与显式附加参数
+## 2.2 App 请求的版本门槛与**动态**版本值
 
 真实服务在 `setVoip`（开启托管）会校验客户端 APP 版本：实测返回 `524`
-（`msg` 提示升级到 8.9.8 及以上；APK 自身字符串为 `8.9.7.0`）。原 App 的请求 URL 只拼接
-token/lang/timestamp/sign，版本不在 URL 和 `setVoip` 请求体里，因此部署侧新增两个**显式**字段：
+（`msg` 提示升级到 8.9.8 及以上；当前 APK 字节为 `8.9.7.0`）。版本不在原 App 的 URL/
+`setVoip` 请求体里（已核对 DEX 的 `HttpRequestUitls.main/withToken` 与 `setVoipCsState`），
+所以部署侧提供三个**显式且可变**的插槽，取值为 `$APP_VERSION` 占位符：
 
 ```jsonc
-"extra_query":   [ { "name": "version", "value": "<安装侧确定值>" } ],
-"extra_headers": [ { "name": "X-Client-Version", "value": "<安装侧确定值>" } ]
+"app_version": "8.9.8.0",                                   // 静态（二选一）
+"app_version_file": "/opt/simadmin/jegotrip-app-version.txt", // 每次请求重读（二选一）
+"extra_query":   [ { "name": "version",   "value": "$APP_VERSION" } ],
+"extra_headers": [ { "name": "version",   "value": "$APP_VERSION" } ],
+"extra_body":    [ { "name": "app_version","value": "$APP_VERSION" } ]
 ```
 
-- 两列表默认空，最多 16 项；name 仅为字母数字/`-`/`_` 且 ≤64；value 非空、≤256、不得含控制字符；
-- `n_token`/`lang`/`timestamp`/`sign`/`token` 不允许被覆盖（配置校验拒绝）；
-- 不做从 APK 或服务端响应推断的默认值：具体名称/取值必须由安装侧给定。
+- **不需要重新编译**：改文件（`echo 8.9.9.0 > /opt/simadmin/jegotrip-app-version.txt`）
+  或改存储配置（`PUT /api/jegotrip/config`）后，下一次登录立刻生效，不需重启；
+- 版本值与路径都受校验：版本仅数字与点且≤24字符，文件≤64字节；路径必须绝对、无 `.`/`..`；
+  两项同时提供视为配置错误；
+- 占位符解析不出来时该字段**不发送**，不会发出空版本号或默认值。
+
+`extra_query`/`extra_headers`/`extra_body` 仍受之前的限制：每个≤16项，name 仅字母数字/`-`/`_`，
+value ≤256 且不含控制字符；`n_token`/`lang`/`timestamp`/`sign`/`token` 不可被覆盖。
 
 ## 2. 受支持的配置形状（不含真实值）
 

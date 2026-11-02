@@ -62,6 +62,11 @@ pub(super) struct Endpoints {
     pub login: String, pub user_info: String, pub phone_token: String,
     pub voip_status: String, pub call_status: String, pub enable_hosting: String,
 }
+fn valid_app_version(value:&str)->bool {
+    !value.is_empty() && value.len()<=24 && value.bytes().all(|b|b.is_ascii_digit()||b==b'.')
+        && value.split('.').all(|part|!part.is_empty())
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct HttpPair { pub name: Secret, pub value: Secret }
@@ -101,6 +106,14 @@ pub(super) struct HttpDeployment {
     /// Extra fields merged into every App JSON body before encryption.
     #[serde(default)]
     pub extra_body: Vec<HttpPair>,
+    /// Client version used to replace the `$APP_VERSION` placeholder inside the
+    /// extra query/header/body pairs. Either a static value or a file that is
+    /// re-read on EVERY request, so an official App upgrade only needs the file
+    /// (or stored configuration) to change - never a SimAdmin rebuild.
+    #[serde(default)]
+    pub app_version: Option<Secret>,
+    #[serde(default)]
+    pub app_version_file: Option<Secret>,
     pub user_agent: Option<Secret>,
     pub enroll_id: Option<Secret>,
 }
@@ -145,6 +158,15 @@ impl HttpDeployment {
                 || value.is_empty() || value.len()>256 || value.chars().any(|c|c.is_control()) { return Err(invalid()); }
         }
         if self.extra_query.iter().any(|pair|reserved.contains(&pair.name.expose_to_backend())) { return Err(invalid()); }
+        if self.app_version.is_some() && self.app_version_file.is_some() { return Err(invalid()); }
+        if let Some(value)=&self.app_version {
+            if !valid_app_version(value.expose_to_backend()) { return Err(invalid()); }
+        }
+        if let Some(path)=&self.app_version_file {
+            let text=path.expose_to_backend();
+            if text.is_empty() || text.len()>512 || text.chars().any(char::is_control) || !text.starts_with('/')
+                || text.split('/').any(|part|part==".."||part==".") { return Err(invalid()); }
+        }
         Ok(())
     }
     pub fn base(&self) -> Result<Url,Error> {
@@ -242,6 +264,7 @@ struct PrivateHttpRef<'a> {
     pinned_server_certificate_der_base64: Option<&'a str>,
     pinned_server_public_key_der_base64: Option<&'a str>,
     extra_query: PrivateHttpPairs<'a>, extra_headers: PrivateHttpPairs<'a>, extra_body: PrivateHttpPairs<'a>,
+    app_version: Option<&'a str>, app_version_file: Option<&'a str>,
     user_agent: Option<&'a str>, enroll_id: Option<&'a str>,
 }
 impl<'a> PrivateHttpRef<'a> {
@@ -254,6 +277,8 @@ impl<'a> PrivateHttpRef<'a> {
             pinned_server_certificate_der_base64: h.pinned_server_certificate_der_base64.as_ref().map(Secret::expose_to_backend),
             pinned_server_public_key_der_base64: h.pinned_server_public_key_der_base64.as_ref().map(Secret::expose_to_backend),
             extra_query: PrivateHttpPairs(&h.extra_query), extra_headers: PrivateHttpPairs(&h.extra_headers), extra_body: PrivateHttpPairs(&h.extra_body),
+            app_version: h.app_version.as_ref().map(Secret::expose_to_backend),
+            app_version_file: h.app_version_file.as_ref().map(Secret::expose_to_backend),
             user_agent: h.user_agent.as_ref().map(Secret::expose_to_backend),
             enroll_id: h.enroll_id.as_ref().map(Secret::expose_to_backend) }
     }

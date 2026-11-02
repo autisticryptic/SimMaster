@@ -175,15 +175,37 @@ impl AppClient {
         Ok(hash.finish().as_ref().to_vec())
     }
     pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None}) }
+    /// Resolve `$APP_VERSION` for the CURRENT request. A configured file is
+    /// re-read every time (bounded, validated), so upgrading the official App
+    /// only requires updating that file or the stored configuration.
+    fn app_version(&self)->Option<String> {
+        let value=if let Some(path)=&self.config.app_version_file {
+            let path=path.expose_to_backend();
+            let Ok(bytes)=std::fs::read(path) else { return None; };
+            if bytes.len()>64 { return None; }
+            String::from_utf8(bytes).ok()?.trim().to_owned()
+        } else {
+            self.config.app_version.as_ref()?.expose_to_backend().to_owned()
+        };
+        super::config::valid_app_version(&value).then_some(value)
+    }
+    fn expand(value:&str,version:Option<&str>)->Option<String> {
+        if value=="$APP_VERSION" { return version.map(str::to_owned); }
+        Some(value.replace("$APP_VERSION",version.unwrap_or_default()))
+    }
     /// Every App JSON body passes through here so the installation's explicit
     /// extra fields (for example a client-version gate) are merged once, before
     /// encryption. Extras never overwrite fields the caller produced.
     fn payload(&self,value:serde_json::Value)->JsonDoc {
         let mut value=value;
         if let Some(map)=value.as_object_mut() {
+            let version=self.app_version();
             for pair in &self.config.extra_body {
                 let key=pair.name.expose_to_backend();
-                if !map.contains_key(key) { map.insert(key.to_owned(),serde_json::Value::String(pair.value.expose_to_backend().to_owned())); }
+                if map.contains_key(key) { continue; }
+                if let Some(expanded)=Self::expand(pair.value.expose_to_backend(),version.as_deref()) {
+                    map.insert(key.to_owned(),serde_json::Value::String(expanded));
+                }
             }
         }
         JsonDoc(value)
@@ -212,10 +234,15 @@ impl AppClient {
                 },
             }
             query.append_pair("timestamp",&millis.to_string()).append_pair("sign",&signature);
-            for pair in &self.config.extra_query { query.append_pair(pair.name.expose_to_backend(),pair.value.expose_to_backend()); }
+            for pair in &self.config.extra_query {
+                if let Some(expanded)=Self::expand(pair.value.expose_to_backend(),self.app_version().as_deref()) {
+                    query.append_pair(pair.name.expose_to_backend(),&expanded);
+                }
+            }
         }
-        let headers=self.config.extra_headers.iter()
-            .map(|pair|(pair.name.expose_to_backend().to_owned(),pair.value.expose_to_backend().to_owned())).collect();
+        let headers={let version=self.app_version();self.config.extra_headers.iter()
+            .filter_map(|pair|Self::expand(pair.value.expose_to_backend(),version.as_deref())
+                .map(|value|(pair.name.expose_to_backend().to_owned(),value))).collect()};
         let response=self.transport.exchange(WireRequest {url,body:request_body,headers}).await?;
         if response.status==429 { return Err(Error::new("app_login_rate_limited")); }
         if response.status!=200 { return Err(Error::new("app_login_transport_failed")); }
