@@ -61,7 +61,7 @@ fn transport_failure(error:&reqwest::Error)->Error {
     while let Some(item)=source {
         if depth>=8 { break; }
         if let Some(tls)=item.downcast_ref::<tokio_rustls::rustls::Error>() { chain.push(format!("rustls:{tls:?}")); }
-        else { chain.push(short_type(item)); }
+        else { chain.push(format!("{}: {}", short_type(item), item)); }
         source=item.source(); depth+=1;
     }
     eprintln!("app_login_transport_failed connect={} timeout={} request={} body={} chain={chain:?}",
