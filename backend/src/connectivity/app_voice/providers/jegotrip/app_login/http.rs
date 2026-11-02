@@ -18,11 +18,41 @@ pub(super) struct LiveFactory;
 
 /// Exact end-entity certificate pin, mirroring the App's bundled `assets/app2.cer`.
 /// The operator supplies one concrete server certificate; no system root and no
-/// CA path is consulted, and any other certificate fails the handshake.
+/// CA path is consulted, and any other certificate fails the handshake. The
+/// bundled leaf is X.509 v1, which webpki cannot parse, so the handshake
+/// signature is verified with ring against the pinned certificate's own RSA key
+/// (also supplied explicitly). That keeps real signature verification instead of
+/// accepting any signature.
 #[derive(Debug)]
 struct PinnedLeaf {
     leaf: Vec<u8>,
-    provider: Arc<tokio_rustls::rustls::crypto::CryptoProvider>,
+    public_key: Vec<u8>,
+}
+fn rsa_algorithm(scheme: tokio_rustls::rustls::SignatureScheme)
+    -> Option<&'static dyn ring::signature::VerificationAlgorithm> {
+    use tokio_rustls::rustls::SignatureScheme as S;
+    Some(match scheme {
+        S::RSA_PSS_SHA256 => &ring::signature::RSA_PSS_2048_8192_SHA256,
+        S::RSA_PSS_SHA384 => &ring::signature::RSA_PSS_2048_8192_SHA384,
+        S::RSA_PSS_SHA512 => &ring::signature::RSA_PSS_2048_8192_SHA512,
+        S::RSA_PKCS1_SHA256 => &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+        S::RSA_PKCS1_SHA384 => &ring::signature::RSA_PKCS1_2048_8192_SHA384,
+        S::RSA_PKCS1_SHA512 => &ring::signature::RSA_PKCS1_2048_8192_SHA512,
+        _ => return None,
+    })
+}
+impl PinnedLeaf {
+    fn verify(&self, message: &[u8], dss: &tokio_rustls::rustls::DigitallySignedStruct)
+        -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        let Some(algorithm) = rsa_algorithm(dss.scheme) else {
+            return Err(tokio_rustls::rustls::Error::PeerIncompatible(
+                tokio_rustls::rustls::PeerIncompatible::NoSignatureSchemesInCommon));
+        };
+        match ring::signature::UnparsedPublicKey::new(algorithm, &self.public_key).verify(message, dss.signature()) {            Ok(()) => Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion()),
+            Err(_) => Err(tokio_rustls::rustls::Error::InvalidCertificate(
+                tokio_rustls::rustls::CertificateError::BadSignature)),
+        }
+    }
 }
 impl tokio_rustls::rustls::client::danger::ServerCertVerifier for PinnedLeaf {
     fn verify_server_cert(&self, end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
@@ -38,18 +68,20 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for PinnedLeaf {
         eprintln!("app_login_pinned_verify matched len={}", self.leaf.len());
         Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
     }
-    fn verify_tls12_signature(&self, message: &[u8], cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+    fn verify_tls12_signature(&self, message: &[u8], _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
         dss: &tokio_rustls::rustls::DigitallySignedStruct)
         -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        tokio_rustls::rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        self.verify(message, dss)
     }
-    fn verify_tls13_signature(&self, message: &[u8], cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+    fn verify_tls13_signature(&self, message: &[u8], _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
         dss: &tokio_rustls::rustls::DigitallySignedStruct)
         -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        tokio_rustls::rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        self.verify(message, dss)
     }
     fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        use tokio_rustls::rustls::SignatureScheme as S;
+        vec![S::RSA_PSS_SHA256, S::RSA_PSS_SHA384, S::RSA_PSS_SHA512,
+             S::RSA_PKCS1_SHA256, S::RSA_PKCS1_SHA384, S::RSA_PKCS1_SHA512]
     }
 }
 fn transport_failure(error:&reqwest::Error)->Error {
@@ -72,12 +104,11 @@ pub(super) fn short_type(value:&(dyn std::error::Error+'static))->String {
     std::any::type_name_of_val(value).rsplit("::").next().unwrap_or("error").to_owned()
 }
 
-fn pinned_tls(der: Vec<u8>) -> Result<tokio_rustls::rustls::ClientConfig, Error> {
-    eprintln!("app_login_pinned_tls installing pinned_len={}", der.len());
-    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-    let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider.clone())
+fn pinned_tls(der: Vec<u8>, public_key: Vec<u8>) -> Result<tokio_rustls::rustls::ClientConfig, Error> {
+    eprintln!("app_login_pinned_tls installing pinned_len={} key_len={}", der.len(), public_key.len());
+    let config = tokio_rustls::rustls::ClientConfig::builder()
         .with_safe_default_protocol_versions().map_err(|_| Error::new("app_login_deployment_invalid"))?
-        .dangerous().with_custom_certificate_verifier(Arc::new(PinnedLeaf { leaf: der, provider })).with_no_client_auth();
+        .dangerous().with_custom_certificate_verifier(Arc::new(PinnedLeaf { leaf: der, public_key })).with_no_client_auth();
     // reqwest drives HTTP/1.1 here; advertise only what this client speaks.
     let mut config = config;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -97,7 +128,9 @@ impl TransportFactory for LiveFactory {
         }
         if let Some(pin)=&config.pinned_server_certificate_der_base64 {
             let der=STANDARD.decode(pin.expose_to_backend()).map_err(|_|Error::new("app_login_deployment_invalid"))?;
-            builder=builder.tls_built_in_root_certs(false).use_preconfigured_tls(pinned_tls(der)?);
+            let key=config.pinned_server_public_key_der_base64.as_ref().ok_or_else(||Error::new("app_login_deployment_invalid"))?;
+            let key=STANDARD.decode(key.expose_to_backend()).map_err(|_|Error::new("app_login_deployment_invalid"))?;
+            builder=builder.tls_built_in_root_certs(false).use_preconfigured_tls(pinned_tls(der,key)?);
         }
         if let Some(agent)=&config.user_agent { builder=builder.user_agent(agent.expose_to_backend()); }
         let client=builder.build().map_err(|_|Error::new("app_login_deployment_invalid"))?;

@@ -31,7 +31,10 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 - 与 `http.root_der_base64` **互斥**；提供后不再使用任何系统根证书；
 - 只接受与该 DER **逐字节相同**的服务端证书，否则握手失败（`app_login_transport_failed`）；
-- 握手签名仍用 ring 的算法集校验，不做 "接受任意证书" 的降级；
+- 该叶子是 **X.509 v1**（无扩展字段），现代 webpki 无法解析，因此还需同时提供
+  `http.pinned_server_public_key_der_base64`（该证书的 PKCS#1 RSAPublicKey DER）；
+  握手签名用 ring 按 RSA-PSS/PKCS#1 方案**真实验签**，不是“接受任意证书”；
+- 缺少其中任意一项、两项同时给、或给根证书与 pin 同时给，均被配置校验拒绝；
 - 这是安装侧显式给定的一张证书，不是默认值、不是 CA 推断。
 
 设备上该证书需随部署私有配置提供；校验失败会在登录 attempt 上以

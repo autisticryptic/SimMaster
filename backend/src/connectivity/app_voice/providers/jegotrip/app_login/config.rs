@@ -81,6 +81,11 @@ pub(super) struct HttpDeployment {
     /// consulted. It is an explicit installation value, never a fallback.
     #[serde(default)]
     pub pinned_server_certificate_der_base64: Option<Secret>,
+    /// PKCS#1 RSAPublicKey DER of the pinned leaf. Required with the pin because
+    /// the bundled v1 certificate cannot be parsed by webpki, so handshake
+    /// signatures are verified with ring against this key.
+    #[serde(default)]
+    pub pinned_server_public_key_der_base64: Option<Secret>,
     pub user_agent: Option<Secret>,
     pub enroll_id: Option<Secret>,
 }
@@ -104,11 +109,17 @@ impl HttpDeployment {
             if s.expose_to_backend().len()>1024 || s.expose_to_backend().chars().any(char::is_control) { return Err(invalid()); }
         }
         if self.root_der_base64.is_some() && self.pinned_server_certificate_der_base64.is_some() { return Err(invalid()); }
+        if self.pinned_server_certificate_der_base64.is_some() != self.pinned_server_public_key_der_base64.is_some() { return Err(invalid()); }
         if let Some(pin)=&self.pinned_server_certificate_der_base64 {
             let text=pin.expose_to_backend();
             if text.is_empty() || text.len()>87_400 || text.chars().any(char::is_control) { return Err(invalid()); }
             let der=STANDARD.decode(text).map_err(|_|invalid())?;
             if der.len()<200 || der.len()>65_536 || der.first()!=Some(&0x30) { return Err(invalid()); }
+            let key=self.pinned_server_public_key_der_base64.as_ref().ok_or_else(invalid)?;
+            let key_text=key.expose_to_backend();
+            if key_text.is_empty() || key_text.len()>16_384 || key_text.chars().any(char::is_control) { return Err(invalid()); }
+            let key_der=STANDARD.decode(key_text).map_err(|_|invalid())?;
+            if key_der.len()<100 || key_der.len()>8_192 || key_der.first()!=Some(&0x30) { return Err(invalid()); }
         }
         for p in [&self.endpoints.login,&self.endpoints.user_info,&self.endpoints.phone_token,&self.endpoints.voip_status,&self.endpoints.call_status,&self.endpoints.enable_hosting] { self.endpoint(p)?; }
         Ok(())
@@ -196,6 +207,7 @@ struct PrivateHttpRef<'a> {
     sip_password_key: &'a str, device_id: &'a str, endpoints: &'a Endpoints,
     body_protection: Option<PrivateBodyProtectionRef<'a>>, root_der_base64: Option<&'a str>,
     pinned_server_certificate_der_base64: Option<&'a str>,
+    pinned_server_public_key_der_base64: Option<&'a str>,
     user_agent: Option<&'a str>, enroll_id: Option<&'a str>,
 }
 impl<'a> PrivateHttpRef<'a> {
@@ -206,6 +218,7 @@ impl<'a> PrivateHttpRef<'a> {
             body_protection: h.body_protection.as_ref().map(|b| PrivateBodyProtectionRef { secret_id: b.secret_id.expose_to_backend(), secret_value: b.secret_value.expose_to_backend() }),
             root_der_base64: h.root_der_base64.as_ref().map(Secret::expose_to_backend),
             pinned_server_certificate_der_base64: h.pinned_server_certificate_der_base64.as_ref().map(Secret::expose_to_backend),
+            pinned_server_public_key_der_base64: h.pinned_server_public_key_der_base64.as_ref().map(Secret::expose_to_backend),
             user_agent: h.user_agent.as_ref().map(Secret::expose_to_backend),
             enroll_id: h.enroll_id.as_ref().map(Secret::expose_to_backend) }
     }

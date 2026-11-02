@@ -210,8 +210,9 @@ fn full_database_private_mirror_roundtrip_retains_runtime_without_personal_login
     let mut expected = deployment_json(&f.cert.root, true);
     for key in ["client_config_decode_key", "reference_decode_key"] { expected["runtime"]["sdk"][key] = Value::Null; }
     for key in ["call_incoming", "call_control"] { expected["runtime"]["profile"][key] = Value::Null; }
-    // The private mirror always carries the optional pinned-certificate slot.
+    // The private mirror always carries the optional pinned-certificate slots.
     expected["http"]["pinned_server_certificate_der_base64"] = Value::Null;
+    expected["http"]["pinned_server_public_key_der_base64"] = Value::Null;
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
     let restored = DatabaseConfiguration::decode_private(&bytes).unwrap();
     assert!(restored.runtime.is_some());
@@ -642,8 +643,12 @@ fn pinned_server_certificate_is_exclusive_with_root_and_must_be_der() {
     let cert=Certificates::generate("IP:127.0.0.1");
     let mut value=deployment_json(&cert.root,false);
     value["http"]["pinned_server_certificate_der_base64"]=json!(cert.root.clone());
+    value["http"]["pinned_server_public_key_der_base64"]=json!(cert.public_key.clone());
     let config:config::Deployment=serde_json::from_value(value.clone()).unwrap();
     assert_eq!(config.http.validate(),Ok(()));
+    // A pin without its public key (needed for the v1 certificate) is invalid.
+    let mut no_key=value.clone();no_key["http"]["pinned_server_public_key_der_base64"]=Value::Null;
+    assert!(serde_json::from_value::<config::Deployment>(no_key).unwrap().http.validate().is_err());
     let mut both=value.clone();both["http"]["root_der_base64"]=json!(cert.root.clone());
     assert!(serde_json::from_value::<config::Deployment>(both).unwrap().http.validate().is_err());
     let mut bad=value.clone();bad["http"]["pinned_server_certificate_der_base64"]=json!("not-base64");

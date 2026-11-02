@@ -25,8 +25,10 @@ impl Certificates {
             "-addext", &format!("subjectAltName={san}"), "-addext", "basicConstraints=critical,CA:FALSE", "-addext", "keyUsage=critical,digitalSignature,keyEncipherment", "-addext", "extendedKeyUsage=serverAuth"]);
         run(&["x509", "-in", "cert.pem", "-outform", "DER", "-out", "cert.der"]);
         run(&["pkcs8", "-topk8", "-nocrypt", "-in", "key.pem", "-outform", "DER", "-out", "key.der"]);
+        run(&["rsa", "-in", "key.pem", "-RSAPublicKey_out", "-outform", "DER", "-out", "pub.der"]);
         let der = std::fs::read(directory.join("cert.der")).unwrap(); let root = STANDARD.encode(&der);
-        Self { certificate: CertificateDer::from(der), key: std::fs::read(directory.join("key.der")).unwrap(), root, directory }
+        let public_key = STANDARD.encode(std::fs::read(directory.join("pub.der")).unwrap());
+        Self { certificate: CertificateDer::from(der), key: std::fs::read(directory.join("key.der")).unwrap(), root, public_key, directory }
     }
     pub(crate) fn server_config(&self, version: &'static rustls::SupportedProtocolVersion) -> Arc<rustls::ServerConfig> {
         Arc::new(rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
