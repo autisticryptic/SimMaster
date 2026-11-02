@@ -62,7 +62,16 @@ pub(super) struct Endpoints {
     pub login: String, pub user_info: String, pub phone_token: String,
     pub voip_status: String, pub call_status: String, pub enable_hosting: String,
 }
-fn valid_app_version(value:&str)->bool {
+pub(super) fn valid_version_page(url:&str)->bool {
+    if url.len()>512 || url.chars().any(char::is_control) { return false; }
+    let Some(rest)=url.strip_prefix("https://") else { return false; };
+    let host=rest.split(['/','?','#']).next().unwrap_or_default().to_ascii_lowercase();
+    let host=host.split('@').next_back().unwrap_or_default();
+    let host=host.split(':').next().unwrap_or_default();
+    !host.is_empty() && (host=="jegotrip.cn" || host.ends_with(".jegotrip.cn"))
+}
+
+pub(super) fn valid_app_version(value:&str)->bool {
     !value.is_empty() && value.len()<=24 && value.bytes().all(|b|b.is_ascii_digit()||b==b'.')
         && value.split('.').all(|part|!part.is_empty())
 }
@@ -114,6 +123,11 @@ pub(super) struct HttpDeployment {
     pub app_version: Option<Secret>,
     #[serde(default)]
     pub app_version_file: Option<Secret>,
+    /// Optional official page used to discover the current App version. The URL
+    /// is restricted to `https://…jegotrip.cn/…`, and any failure falls back to
+    /// the file or stored value so a page redesign can never block a login.
+    #[serde(default)]
+    pub app_version_web_url: Option<Secret>,
     pub user_agent: Option<Secret>,
     pub enroll_id: Option<Secret>,
 }
@@ -159,6 +173,10 @@ impl HttpDeployment {
         }
         if self.extra_query.iter().any(|pair|reserved.contains(&pair.name.expose_to_backend())) { return Err(invalid()); }
         if self.app_version.is_some() && self.app_version_file.is_some() { return Err(invalid()); }
+        if let Some(url)=&self.app_version_web_url {
+            let text=url.expose_to_backend();
+            if !valid_version_page(text) { return Err(invalid()); }
+        }
         if let Some(value)=&self.app_version {
             if !valid_app_version(value.expose_to_backend()) { return Err(invalid()); }
         }
@@ -264,7 +282,7 @@ struct PrivateHttpRef<'a> {
     pinned_server_certificate_der_base64: Option<&'a str>,
     pinned_server_public_key_der_base64: Option<&'a str>,
     extra_query: PrivateHttpPairs<'a>, extra_headers: PrivateHttpPairs<'a>, extra_body: PrivateHttpPairs<'a>,
-    app_version: Option<&'a str>, app_version_file: Option<&'a str>,
+    app_version: Option<&'a str>, app_version_file: Option<&'a str>, app_version_web_url: Option<&'a str>,
     user_agent: Option<&'a str>, enroll_id: Option<&'a str>,
 }
 impl<'a> PrivateHttpRef<'a> {
@@ -279,6 +297,7 @@ impl<'a> PrivateHttpRef<'a> {
             extra_query: PrivateHttpPairs(&h.extra_query), extra_headers: PrivateHttpPairs(&h.extra_headers), extra_body: PrivateHttpPairs(&h.extra_body),
             app_version: h.app_version.as_ref().map(Secret::expose_to_backend),
             app_version_file: h.app_version_file.as_ref().map(Secret::expose_to_backend),
+            app_version_web_url: h.app_version_web_url.as_ref().map(Secret::expose_to_backend),
             user_agent: h.user_agent.as_ref().map(Secret::expose_to_backend),
             enroll_id: h.enroll_id.as_ref().map(Secret::expose_to_backend) }
     }

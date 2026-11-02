@@ -48,17 +48,22 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 所以部署侧提供三个**显式且可变**的插槽，取值为 `$APP_VERSION` 占位符：
 
 ```jsonc
-"app_version": "8.9.8.0",                                   // 静态（二选一）
-"app_version_file": "/opt/simadmin/jegotrip-app-version.txt", // 每次请求重读（二选一）
+"app_version": "8.9.8.0",                                   // 静态/存储值（与 file 互斥）
+"app_version_file": "/opt/simadmin/jegotrip-app-version.txt", // 每次请求重读
+"app_version_web_url": "https://www.jegotrip.cn/m/mobileIndex.html", // 官方页面自动发现，30分钟缓存
 "extra_query":   [ { "name": "version",   "value": "$APP_VERSION" } ],
 "extra_headers": [ { "name": "version",   "value": "$APP_VERSION" } ],
 "extra_body":    [ { "name": "app_version","value": "$APP_VERSION" } ]
 ```
 
-- **不需要重新编译**：改文件（`echo 8.9.9.0 > /opt/simadmin/jegotrip-app-version.txt`）
-  或改存储配置（`PUT /api/jegotrip/config`）后，下一次登录立刻生效，不需重启；
-- 版本值与路径都受校验：版本仅数字与点且≤24字符，文件≤64字节；路径必须绝对、无 `.`/`..`；
-  两项同时提供视为配置错误；
+解析顺序：`app_version_file` → `app_version_web_url`（30 分钟缓存，失败保留旧值）→ `app_version`。
+
+- **不需要重新编译/重启**：改文件（`echo 8.9.9.0 > /opt/simadmin/jegotrip-app-version.txt`）
+  或改存储配置（`PUT /api/jegotrip/config`）后，下一次登录立刻生效；
+- 网页发现受限：仅 `https://*.jegotrip.cn/`、8 秒超时、不跟随重定向、响应≤512KB，
+  只提取页面中最大的 `8.x.y[.z]` 字面量（例：`8.9.10`）；页面改版时**不猜值**，退回到旧值；
+- 版本值与路径都受校验：版本仅数字与点且≤24字符，文件≤64字节；文件路径必须绝对、无 `.`/`..`；
+  `app_version` 与 `app_version_file` 同时提供视为配置错误；
 - 占位符解析不出来时该字段**不发送**，不会发出空版本号或默认值。
 
 `extra_query`/`extra_headers`/`extra_body` 仍受之前的限制：每个≤16项，name 仅字母数字/`-`/`_`，

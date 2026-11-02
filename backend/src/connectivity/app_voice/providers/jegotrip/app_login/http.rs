@@ -163,7 +163,29 @@ impl BoundNumber {
     pub fn identity(&self)->Zeroizing<String> { Zeroizing::new(format!("+{}{}",self.country,self.mobile.expose_to_backend())) }
     pub fn masked(&self)->String { let s=self.mobile.expose_to_backend();format!("***{}",&s[s.len().saturating_sub(4)..]) }
 }
-pub(super) struct AppClient { config:HttpDeployment, transport:Arc<dyn Transport>, session:Option<Secret> }
+pub(super) struct AppClient { config:HttpDeployment, transport:Arc<dyn Transport>, session:Option<Secret>,
+    version_cache:std::sync::Mutex<Option<(String,std::time::Instant)>> }
+/// Pick the newest `8.x.y[.z]` literal out of an official page. Pure and
+/// deterministic so a page redesign degrades to "no value" instead of a guess.
+pub(super) fn pick_version(text:&str)->Option<String> {
+    let bytes=text.as_bytes();
+    let mut best:Option<(Vec<u32>,String)>=None;
+    let mut index=0usize;
+    while index<bytes.len() {
+        if !bytes[index].is_ascii_digit() { index+=1; continue; }
+        let start=index;
+        while index<bytes.len() && (bytes[index].is_ascii_digit() || bytes[index]==b'.') { index+=1; }
+        let candidate=text[start..index].trim_end_matches('.');
+        if super::config::valid_app_version(candidate) {
+            let parts:Vec<u32>=candidate.split('.').filter_map(|part|part.parse().ok()).collect();
+            if parts.len()>=3 && parts[0]==8 && parts.iter().all(|part|*part<10_000) {
+                let newer=best.as_ref().map_or(true,|(key,_)|parts> *key);
+                if newer { best=Some((parts,candidate.to_owned())); }
+            }
+        }
+    }
+    best.map(|(_,value)|value)
+}
 impl AppClient {
     /// Private stable identity key for this App realm and the server-returned
     /// bound number. Neither this key nor the full number is a public DTO.
@@ -174,20 +196,52 @@ impl AppClient {
         hash.update(realm.as_str().as_bytes());hash.update(&[0]);hash.update(identity.as_bytes());
         Ok(hash.finish().as_ref().to_vec())
     }
-    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None}) }
+    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_cache:std::sync::Mutex::new(None)}) }
     /// Resolve `$APP_VERSION` for the CURRENT request. A configured file is
-    /// re-read every time (bounded, validated), so upgrading the official App
-    /// only requires updating that file or the stored configuration.
-    fn app_version(&self)->Option<String> {
-        let value=if let Some(path)=&self.config.app_version_file {
-            let path=path.expose_to_backend();
-            let Ok(bytes)=std::fs::read(path) else { return None; };
+    /// re-read every time and the official page is re-read at most every 30
+    /// minutes, so an App upgrade never needs a SimAdmin rebuild: change the
+    /// file, the stored configuration, or let the page be discovered.
+    async fn app_version(&self)->Option<String> {
+        if let Some(path)=&self.config.app_version_file {
+            let Ok(bytes)=std::fs::read(path.expose_to_backend()) else { return None; };
             if bytes.len()>64 { return None; }
-            String::from_utf8(bytes).ok()?.trim().to_owned()
-        } else {
-            self.config.app_version.as_ref()?.expose_to_backend().to_owned()
-        };
+            let value=String::from_utf8(bytes).ok()?.trim().to_owned();
+            return super::config::valid_app_version(&value).then_some(value);
+        }
+        if let Some(url)=&self.config.app_version_web_url {
+            let cached=self.version_cache.lock().ok().and_then(|slot|slot.clone());
+            if let Some((value,at))=cached {
+                if at.elapsed()<std::time::Duration::from_secs(1800) { return Some(value); }
+                if let Some(found)=self.discover_version(url.expose_to_backend()).await {
+                    self.remember_version(&found); return Some(found);
+                }
+                eprintln!("app_login_version_discovery_failed keeping_stale=true");
+                return Some(value);
+            }
+            if let Some(found)=self.discover_version(url.expose_to_backend()).await {
+                self.remember_version(&found); return Some(found);
+            }
+            eprintln!("app_login_version_discovery_failed keeping_stale=false");
+        }
+        let value=self.config.app_version.as_ref()?.expose_to_backend().to_owned();
         super::config::valid_app_version(&value).then_some(value)
+    }
+    fn remember_version(&self,value:&str) {
+        if let Ok(mut slot)=self.version_cache.lock() { *slot=Some((value.to_owned(),std::time::Instant::now())); }
+    }
+    /// Fetch the official page with public roots (not the pinned App leaf),
+    /// bounded body/time, no redirects; only the version literal is kept.
+    async fn discover_version(&self,url:&str)->Option<String> {
+        let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(8))
+            .redirect(reqwest::redirect::Policy::none()).build().ok()?;
+        let response=client.get(url).send().await.ok()?.error_for_status().ok()?;
+        if response.content_length().unwrap_or(0)>524_288 { return None; }
+        let bytes=response.bytes().await.ok()?;
+        if bytes.len()>524_288 { return None; }
+        let text=String::from_utf8_lossy(&bytes);
+        let found=pick_version(&text)?;
+        eprintln!("app_login_version_discovered len={}",found.len());
+        Some(found)
     }
     fn expand(value:&str,version:Option<&str>)->Option<String> {
         if value=="$APP_VERSION" { return version.map(str::to_owned); }
@@ -196,10 +250,9 @@ impl AppClient {
     /// Every App JSON body passes through here so the installation's explicit
     /// extra fields (for example a client-version gate) are merged once, before
     /// encryption. Extras never overwrite fields the caller produced.
-    fn payload(&self,value:serde_json::Value)->JsonDoc {
+    fn payload(&self,value:serde_json::Value,version:Option<&str>)->JsonDoc {
         let mut value=value;
         if let Some(map)=value.as_object_mut() {
-            let version=self.app_version();
             for pair in &self.config.extra_body {
                 let key=pair.name.expose_to_backend();
                 if map.contains_key(key) { continue; }
@@ -224,6 +277,7 @@ impl AppClient {
         let mut url=self.config.endpoint(path)?;
         let millis=chrono::Utc::now().timestamp_millis().max(0) as u64;
         let signature=crypto::url_signature(&self.config.signature_salt,millis);
+        let version=self.app_version().await;
         {
             let mut query=url.query_pairs_mut();
             match auth {
@@ -235,12 +289,12 @@ impl AppClient {
             }
             query.append_pair("timestamp",&millis.to_string()).append_pair("sign",&signature);
             for pair in &self.config.extra_query {
-                if let Some(expanded)=Self::expand(pair.value.expose_to_backend(),self.app_version().as_deref()) {
+                if let Some(expanded)=Self::expand(pair.value.expose_to_backend(),version.as_deref()) {
                     query.append_pair(pair.name.expose_to_backend(),&expanded);
                 }
             }
         }
-        let headers={let version=self.app_version();self.config.extra_headers.iter()
+        let headers={self.config.extra_headers.iter()
             .filter_map(|pair|Self::expand(pair.value.expose_to_backend(),version.as_deref())
                 .map(|value|(pair.name.expose_to_backend().to_owned(),value))).collect()};
         let response=self.transport.exchange(WireRequest {url,body:request_body,headers}).await?;
@@ -271,8 +325,8 @@ impl AppClient {
     }
     pub async fn login(&mut self,request:&LoginRequest)->Result<(),Error> {
         let hash=crypto::password_hash(&self.config.password_salt,&request.password);
-        let mut payload=self.payload(serde_json::json!({"loginName":request.username.expose_to_backend().trim(),
-            "password":hash.expose_to_backend(),"userType":"0","site":1}));
+        let payload=self.payload(serde_json::json!({"loginName":request.username.expose_to_backend().trim(),
+            "password":hash.expose_to_backend(),"userType":"0","site":1}),self.app_version().await.as_deref());
         if let Some(country)=&request.country_code { payload.0["countryCode"]=serde_json::Value::String(country.clone()); }
         if let Some(id)=&self.config.enroll_id { payload.0["enrollId"]=serde_json::Value::String(id.expose_to_backend().to_owned()); }
         // No campaign context is invented; null Gson fields are omitted.
@@ -296,7 +350,7 @@ impl AppClient {
         Ok(BoundNumber {country:country.to_owned(),mobile:Secret::from_owned(mobile.to_owned())})
     }
     pub async fn phone_credentials(&self,bound:&BoundNumber)->Result<PhoneMaterial,Error> {
-        let identity=bound.identity();let payload=self.payload(serde_json::json!({"accountId":&**identity}));
+        let identity=bound.identity();let payload=self.payload(serde_json::json!({"accountId":&**identity}),self.app_version().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let token_doc=self.post(&self.config.endpoints.phone_token,&bytes,Authentication::Session,true).await?;
         let token=crypto::secret_field(crypto::body(&token_doc)?,"token")?;
@@ -306,7 +360,7 @@ impl AppClient {
         Ok(PhoneMaterial {token,sip_password})
     }
     pub async fn business_enabled(&self)->Result<bool,Error> {
-        let payload=self.payload(serde_json::json!({"device_id":self.config.device_id.expose_to_backend()}));
+        let payload=self.payload(serde_json::json!({"device_id":self.config.device_id.expose_to_backend()}),self.app_version().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let doc=self.post(&self.config.endpoints.call_status,&bytes,Authentication::Session,false).await?;
         let value=crypto::body(&doc)?.get("cs_forward").ok_or(Error::new("app_login_response_invalid"))?;
@@ -315,7 +369,7 @@ impl AppClient {
         }
     }
     pub async fn enable_business(&self)->Result<(),Error> {
-        let payload=self.payload(serde_json::json!({"cs_forward":"2","device_id":self.config.device_id.expose_to_backend()}));
+        let payload=self.payload(serde_json::json!({"cs_forward":"2","device_id":self.config.device_id.expose_to_backend()}),self.app_version().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         self.post(&self.config.endpoints.enable_hosting,&bytes,Authentication::Session,true).await?;Ok(())
     }

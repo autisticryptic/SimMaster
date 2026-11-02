@@ -218,6 +218,7 @@ fn full_database_private_mirror_roundtrip_retains_runtime_without_personal_login
     expected["http"]["extra_body"] = json!([]);
     expected["http"]["app_version"] = Value::Null;
     expected["http"]["app_version_file"] = Value::Null;
+    expected["http"]["app_version_web_url"] = Value::Null;
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
     let restored = DatabaseConfiguration::decode_private(&bytes).unwrap();
     assert!(restored.runtime.is_some());
@@ -666,6 +667,23 @@ fn app_version_can_be_static_or_reread_from_a_bounded_file_without_a_rebuild() {
     }
     file["http"]["app_version_file"]=json!("/opt/simadmin/jegotrip-app-version.txt");
     assert_eq!(serde_json::from_value::<config::Deployment>(file).unwrap().http.validate(),Ok(()));
+}
+#[test]
+fn official_page_version_discovery_picks_the_newest_8x_literal_and_never_guesses() {
+    let page="<html><head><title>8.9.8</title></head><body>\n    <p>安卓版 8.9.10 发布</p>\n    <a href=\"/dl/8.9.9.apk\">download</a>\n    <span>20.1.3</span><em>1.2</em></body></html>";
+    assert_eq!(http::pick_version(page).as_deref(),Some("8.9.10"));
+    assert_eq!(http::pick_version("no version here").as_deref(),None);
+    assert_eq!(http::pick_version("v8.x.1 and 8..9 and 8.9.").as_deref(),None);
+    assert_eq!(http::pick_version("version: 8.9.8.0").as_deref(),Some("8.9.8.0"));
+}
+#[test]
+fn official_page_url_is_restricted_to_the_official_https_host() {
+    assert!(config::valid_version_page("https://www.jegotrip.cn/m/mobileIndex.html"));
+    assert!(config::valid_version_page("https://jegotrip.cn/m/mobileIndex.html"));
+    for bad in ["http://www.jegotrip.cn/m/mobileIndex.html","https://evil.example/m","https://jegotrip.cn.evil.example/m",
+                "https://user@evil.example/m","ftp://www.jegotrip.cn/m","https://www.jegotrip.cn\n/m"] {
+        assert!(!config::valid_version_page(bad),"{bad}");
+    }
 }
 #[test]
 fn extra_query_and_headers_are_bounded_and_never_replace_reserved_parameters() {
