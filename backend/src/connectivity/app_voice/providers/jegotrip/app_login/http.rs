@@ -232,7 +232,9 @@ impl AppClient {
     /// Fetch the official page with public roots (not the pinned App leaf),
     /// bounded body/time, no redirects; only the version literal is kept.
     async fn discover_version(&self,url:&str)->Option<String> {
-        let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(8))
+        // Shared factory keeps the project's DNS boundary (no ad-hoc clients).
+        let client=crate::platform::dns::http_client_builder()
+            .timeout(std::time::Duration::from_secs(8))
             .redirect(reqwest::redirect::Policy::none()).build().ok()?;
         let response=client.get(url).send().await.ok()?.error_for_status().ok()?;
         if response.content_length().unwrap_or(0)>524_288 { return None; }
