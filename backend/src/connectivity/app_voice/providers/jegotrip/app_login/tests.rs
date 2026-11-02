@@ -210,6 +210,8 @@ fn full_database_private_mirror_roundtrip_retains_runtime_without_personal_login
     let mut expected = deployment_json(&f.cert.root, true);
     for key in ["client_config_decode_key", "reference_decode_key"] { expected["runtime"]["sdk"][key] = Value::Null; }
     for key in ["call_incoming", "call_control"] { expected["runtime"]["profile"][key] = Value::Null; }
+    // The private mirror always carries the optional pinned-certificate slot.
+    expected["http"]["pinned_server_certificate_der_base64"] = Value::Null;
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
     let restored = DatabaseConfiguration::decode_private(&bytes).unwrap();
     assert!(restored.runtime.is_some());
