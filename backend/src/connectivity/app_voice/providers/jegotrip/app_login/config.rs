@@ -225,7 +225,7 @@ struct PrivateBodyProtectionRef<'a> { secret_id: &'a str, secret_value: &'a str 
 struct PrivateHttpPairRef<'a> { name: &'a str, value: &'a str }
 struct PrivateHttpPairs<'a>(&'a [HttpPair]);
 impl Serialize for PrivateHttpPairs<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
         for pair in self.0 { seq.serialize_element(&PrivateHttpPairRef { name: pair.name.expose_to_backend(), value: pair.value.expose_to_backend() })?; }
         seq.end()
