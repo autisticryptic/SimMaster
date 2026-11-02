@@ -106,7 +106,7 @@ POST /api/jegotrip/app-version/refresh  # 立即强制拉取一次并落库
 `extra_query`/`extra_headers`/`extra_body` 仍受之前的限制：每个≤16项，name 仅字母数字/`-`/`_`，
 value ≤256 且不含控制字符；`n_token`/`lang`/`timestamp`/`sign`/`token` 不可被覆盖。
 
-## 2.2.5 可信设备校验（业务码 506）
+## 2.2.5 可信设备校验（业务码 506）与两种托管模式
 
 过了版本门槛后，`setVoip` 仍可能返回 `506 未授信设备,开启失败!`。这不是版本问题：原 App 在
 调用业务开关之前会先向服务端查询“本机是否已授信”，即 `CallLogic.querySafeDevice`，请求体恰好三个
@@ -144,6 +144,51 @@ SimAdmin 的实现方式：
 变成授信设备取决于服务端策略，**未验证前不声称可用**。
 `enrollId` 只与登录侧一键登录有关（`AccoutLogic.oneKeyLogin/ssoLogin/thirdOneKeyLogin`），
 不是 `setVoip` 的授信凭证。静态证据见 `.local/jegotrip/device-trust-20261103/FINDINGS.md`。
+
+### 2.2.6 已实测的授信结论（2026-11-03，410 + 真实服务）
+
+按原 App 顺序完整复现后，实测链路是：
+
+```
+ensure_app_version → device/sec/v1/enroll（匿名 n_token）→ 拿到 enrollId(32位)+expireTime
+→ 登录 body 携带 enrollId → csb/token → securityVerify → verificationTrustfulDevice
+→ getCallStatus → setVoip
+```
+
+日志证据（有界，不含凭据）：
+
+```
+app_login_device_trust_shape step=enroll enrollId=str:32 expireTime=str:19
+app_login_device_enroll id_len=32
+app_login_device_trust_shape step=security_verify authentication_code=num:2
+app_login_trust_decision authentication_code=Some(2)
+app_login_reject_fields endpoint=api/service/voip/v1/setVoip code=506 msg="未授信设备,开启失败!"
+```
+
+即：**`enrollId` 已拿到并已随登录上报，但本设备仍未通过安全设备认证（`authentication_code=2`）**。
+APK 里承担这一步的是中国移动一键认证 SDK（`com.cmic.sso.sdk.auth.AuthnHelper`，封装在
+`com.cmi.mobile.auth.MobileAuthUtil`），`TrusteeShipVerActivitiy.getToken()` 的
+`receiveToken resultCode=` 就是它的回调。这一步需要**账号绑定号码的 SIM 在现场**（运营商网络侧校验），
+纯软件无法复制；本客户端不会伪造 token 或把 `authentication_code=2` 当成已授信。
+
+因此 SimAdmin 提供**两种托管模式**（`intent`）：
+
+| intent | 行为 | 适用场景 |
+| --- | --- | --- |
+| `enable_hosting`（默认） | 完整序列，必要时调用 `setVoip` 开启托管；若服务端以 506 拒绝，任务以 `app_login_device_untrusted` 结束 | 设备已授信（或服务端不要求）的环境 |
+| `attach_hosting` | **绝不写业务开关**：先读 `getCallStatus`，只有服务端确认 `cs_forward=2`（已开启）才继续建账号并启动接收器；否则以 `app_login_business_not_enabled` 结束 | 已在手机 App 开启托管的账号，本机只接管接收 |
+
+实测（真实服务，账号当前托管未开启）：
+
+```
+POST /api/jegotrip/login/attempts  {intent:"attach_hosting"} → 202
+phase: queued → checking_business → failed  error=app_login_business_not_enabled
+business_state=not_requested   （证明没有任何写业务开关的请求）
+```
+
+**结论**：代码侧已把原 App 的业务开通/接管链路补齐；剩下的唯一外部条件是“首次开启托管必须在
+手机 App 完成”（服务端安全设备认证要求绑定号码的 SIM）。开启后本机用 `attach_hosting` 即可接管：
+取 phone token/SIP 密码 → 建本地账号 → 启动原生接收器。
 
 ## 2. 受支持的配置形状（不含真实值）
 
