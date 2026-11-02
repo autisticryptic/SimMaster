@@ -222,6 +222,8 @@ fn full_database_private_mirror_roundtrip_retains_runtime_without_personal_login
     expected["http"]["app_version_ios_app_id"] = Value::Null;
     expected["http"]["app_version_store"] = json!(false);
     expected["http"]["endpoints"]["verification_trustful_device"] = Value::Null;
+    expected["http"]["endpoints"]["device_enroll"] = Value::Null;
+    expected["http"]["endpoints"]["security_verify"] = Value::Null;
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
     let restored = DatabaseConfiguration::decode_private(&bytes).unwrap();
     assert!(restored.runtime.is_some());
@@ -844,5 +846,40 @@ async fn trusted_device_verification_is_optional_and_sends_nothing_when_unconfig
     let mut client=Factory(script.clone()).build(&http_config(false)).unwrap();
     client.login(&login_request(&id())).await.unwrap();
     assert_eq!(client.verify_trusted_device().await.unwrap(),None);
+    assert_eq!(script.paths(),vec!["/login".to_owned()]);
+}
+#[tokio::test]
+async fn security_device_enrolment_and_verification_send_only_the_app_device_field() {
+    let mut value=deployment_json("AA==",false);
+    value["http"]["endpoints"]["device_enroll"]=json!("enroll");
+    value["http"]["endpoints"]["security_verify"]=json!("security");
+    let cfg:HttpDeployment=serde_json::from_value(value["http"].clone()).unwrap();
+    let script=Arc::new(Script::new(vec![
+        reply("/login",json!({"code":"0","body":{"token":"fixture-app-session","expiredAt":0}})),
+        reply("/enroll",json!({"code":0,"body":{"authentication_code":2}})),
+        reply("/security",json!({"code":0,"body":{"authentication_code":"1"}})),
+    ],false));
+    let mut client=Factory(script.clone()).build(&cfg).unwrap();
+    client.login(&login_request(&id())).await.unwrap();
+    assert_eq!(client.enroll_device().await.unwrap(),Some(http::TrustDecision {authentication_code:Some(2)}));
+    assert_eq!(client.security_verify_device().await.unwrap(),Some(http::TrustDecision {authentication_code:Some(1)}));
+    let seen=lock(&script.seen);
+    assert_eq!(seen[1].path,"/enroll");
+    assert_eq!(seen[2].path,"/security");
+    for recorded in [&seen[1],&seen[2]] {
+        // The App posts exactly one field for both calls; nothing else is invented.
+        assert_eq!(recorded.body,json!({"deviceId":"fixture-http-device"}));
+        assert!(recorded.query.contains_key("token"));
+    }
+}
+#[tokio::test]
+async fn security_device_calls_are_optional_and_send_nothing_when_unconfigured() {
+    let script=Arc::new(Script::new(vec![
+        reply("/login",json!({"code":"0","body":{"token":"fixture-app-session","expiredAt":0}})),
+    ],false));
+    let mut client=Factory(script.clone()).build(&http_config(false)).unwrap();
+    client.login(&login_request(&id())).await.unwrap();
+    assert_eq!(client.enroll_device().await.unwrap(),None);
+    assert_eq!(client.security_verify_device().await.unwrap(),None);
     assert_eq!(script.paths(),vec!["/login".to_owned()]);
 }

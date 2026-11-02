@@ -352,7 +352,20 @@ impl AppLoginManager {
         // The App asks the server whether THIS device is trusted before it
         // touches the business switch. The answer is reported verbatim; a
         // missing configuration or a transport error is never read as trust,
-        // and the business call below remains the only decider.
+        // and the business call below remains the only decider. When the
+        // installation also configured the App's own enrolment/verification
+        // endpoints, those run first, exactly as the original client does, and
+        // each answer is logged instead of being treated as a grant.
+        for (label,outcome) in [
+            ("enroll",client.enroll_device().await),
+            ("security_verify",client.security_verify_device().await),
+        ] {
+            match outcome {
+                Ok(Some(decision))=>eprintln!("app_login_device_trust step={label} authentication_code={:?}",decision.authentication_code),
+                Ok(None)=>eprintln!("app_login_device_trust step={label} not_configured"),
+                Err(error)=>eprintln!("app_login_device_trust step={label} failed code={} server_code={:?}",error.code,error.server_code),
+            }
+        }
         match client.verify_trusted_device().await {
             Ok(Some(decision))=>eprintln!("app_login_trust_decision authentication_code={:?}",decision.authentication_code),
             Ok(None)=>eprintln!("app_login_trust_decision not_configured"),

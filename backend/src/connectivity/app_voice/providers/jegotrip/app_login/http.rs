@@ -472,6 +472,33 @@ impl AppClient {
         };
         Ok(Some(TrustDecision { authentication_code }))
     }
+    /// Security-device enrolment (`CmiLogic.enroll`): the App posts exactly
+    /// `{"deviceId": …}`. Optional; a missing path sends nothing.
+    pub async fn enroll_device(&self)->Result<Option<TrustDecision>,Error> {
+        let Some(decision)=self.device_only_call(self.config.endpoints.device_enroll.clone()).await? else { return Ok(None); };
+        Ok(Some(decision))
+    }
+    /// Device security verification (`CmiLogic.sendSecurityVerify`): same
+    /// `{"deviceId": …}` body. Optional; never inferred from a previous call.
+    pub async fn security_verify_device(&self)->Result<Option<TrustDecision>,Error> {
+        let Some(decision)=self.device_only_call(self.config.endpoints.security_verify.clone()).await? else { return Ok(None); };
+        Ok(Some(decision))
+    }
+    /// Both App calls above send one field only; sharing the body keeps them
+    /// provably identical to the reviewed DEX shape.
+    async fn device_only_call(&self,path:Option<String>)->Result<Option<TrustDecision>,Error> {
+        let Some(path)=path else { return Ok(None); };
+        let payload=self.payload(serde_json::json!({
+            "deviceId":self.config.device_id.expose_to_backend()}),self.version_value().await.as_deref());
+        let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
+        let doc=self.post(&path,&bytes,Authentication::Session,true).await?;
+        let authentication_code=match crypto::body(&doc)?.get("authentication_code") {
+            Some(serde_json::Value::Number(number))=>number.as_i64(),
+            Some(serde_json::Value::String(text))=>text.trim().parse::<i64>().ok(),
+            _=>None,
+        };
+        Ok(Some(TrustDecision { authentication_code }))
+    }
     pub async fn business_enabled(&self)->Result<bool,Error> {        let payload=self.payload(serde_json::json!({"device_id":self.config.device_id.expose_to_backend()}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let doc=self.post(&self.config.endpoints.call_status,&bytes,Authentication::Session,false).await?;

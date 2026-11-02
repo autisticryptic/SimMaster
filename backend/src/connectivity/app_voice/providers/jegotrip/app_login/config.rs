@@ -66,6 +66,13 @@ pub(super) struct Endpoints {
     /// installation that knows the path can reproduce the same order.
     #[serde(default)]
     pub verification_trustful_device: Option<String>,
+    /// Optional security-device enrolment (`device/sec/v1/enroll`) and its
+    /// verification (`service/voip/v1/securityVerify`). Both are the App's own
+    /// `{deviceId}` calls; when unset the client never sends them.
+    #[serde(default)]
+    pub device_enroll: Option<String>,
+    #[serde(default)]
+    pub security_verify: Option<String>,
 }
 pub(super) fn valid_version_page(url:&str)->bool {
     if url.len()>512 || url.chars().any(char::is_control) { return false; }
@@ -184,6 +191,7 @@ impl HttpDeployment {
         }
         for p in [&self.endpoints.login,&self.endpoints.user_info,&self.endpoints.phone_token,&self.endpoints.voip_status,&self.endpoints.call_status,&self.endpoints.enable_hosting] { self.endpoint(p)?; }
         if let Some(p)=&self.endpoints.verification_trustful_device { self.endpoint(p)?; }
+        for optional in [&self.endpoints.device_enroll,&self.endpoints.security_verify].into_iter().flatten() { self.endpoint(optional)?; }
         if self.extra_query.len()>16 || self.extra_headers.len()>16 || self.extra_body.len()>16 { return Err(invalid()); }
         let reserved=["n_token","lang","timestamp","sign","token"];
         for pair in self.extra_query.iter().chain(self.extra_headers.iter()).chain(self.extra_body.iter()) {

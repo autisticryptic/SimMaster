@@ -121,19 +121,29 @@ value ≤256 且不含控制字符；`n_token`/`lang`/`timestamp`/`sign`/`token`
 
 SimAdmin 的实现方式：
 
-- 部署配置新增**可选**端点 `endpoints.verification_trustful_device`；未配置时行为与以前完全一致
-  （不发这个请求，也不假设任何授信结果）；
-- 配置后，流程在 `csb/token` 之后、业务开关之前调用一次，并把服务端字段原样写成有界日志：
-  `app_login_trust_decision authentication_code=<0|1|unknown>`；
-- 这个返回值**只是报告**，不是授权凭据：程序不会把它当成“已授信”去跳过任何校验，
+- 部署配置新增**可选**端点（三者都缺省时行为与以前完全一致）：
+  ```jsonc
+  "endpoints": {
+    "device_enroll": "device/sec/v1/enroll",                          // 安全设备注册，body 只有 {"deviceId":…}
+    "security_verify": "service/voip/v1/securityVerify",               // 设备安全校验，body 只有 {"deviceId":…}
+    "verification_trustful_device": "service/voip/v1/verificationTrustfulDevice"
+  }
+  ```
+- 流程在 `csb/token` 之后、业务开关之前依次调用它们，并把服务端返回原样写成有界日志：
+  `app_login_device_trust step=enroll|security_verify authentication_code=<…>`、
+  `app_login_trust_decision authentication_code=<…>`；
+- 这些返回值**只是报告**，不是授权凭据：程序不会把它们当成“已授信”去跳过任何校验，
   业务是否真正开启仍由 `setVoip` + 读回确认决定；
 - `setVoip` 返回 `506` 时，任务以专用错误码 `app_login_device_untrusted` 结束（前端有对应中文提示），
   不会退化成“通用拒绝”或伪造成功。
 
-**边界**：原 App 在 `authentication_code != 1` 时还有 `getToken()` 与 `service/voip/v1/securityVerify`
-两步（静态确认存在），它们依赖设备/运营商侧能力，当前**未实现**，也不会用假值绕过。
-`device/sec/v1/enroll` 与 `enrollId` 只与登录侧一键登录有关（`AccoutLogic.oneKeyLogin/ssoLogin/
-thirdOneKeyLogin`），不是 `setVoip` 的授信凭证。静态证据见 `.local/jegotrip/device-trust-20261103/FINDINGS.md`。
+**边界**：原 App 在 `authentication_code != 1` 时还有 `getToken()` 与运营商侧能力参与（静态确认存在），
+这部分**未实现**，也不会用假值绕过。410 实测：`verificationTrustfulDevice` 返回
+`authentication_code=2`（表示该 `device_id` 未被本账号授信），随后 `setVoip` 仍为 `506`；
+`device/sec/v1/enroll` 与 `securityVerify` 的 `{deviceId}` 调用已接入并可观测，但它们能否把设备
+变成授信设备取决于服务端策略，**未验证前不声称可用**。
+`enrollId` 只与登录侧一键登录有关（`AccoutLogic.oneKeyLogin/ssoLogin/thirdOneKeyLogin`），
+不是 `setVoip` 的授信凭证。静态证据见 `.local/jegotrip/device-trust-20261103/FINDINGS.md`。
 
 ## 2. 受支持的配置形状（不含真实值）
 
