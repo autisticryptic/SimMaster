@@ -11,7 +11,7 @@ use std::{path::PathBuf, process::{Command, Stdio}, sync::atomic::{AtomicU64, Or
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
-pub(crate) struct Certificates { directory: PathBuf, pub(crate) root: String, certificate: CertificateDer<'static>, key: Vec<u8> }
+pub(crate) struct Certificates { directory: PathBuf, pub(crate) root: String, pub(crate) public_key: String, certificate: CertificateDer<'static>, key: Vec<u8> }
 impl Drop for Certificates { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.directory); } }
 impl Certificates {
     pub(crate) fn generate(san: &str) -> Self {

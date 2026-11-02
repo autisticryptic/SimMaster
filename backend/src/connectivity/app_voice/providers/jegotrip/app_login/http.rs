@@ -107,7 +107,6 @@ pub(super) fn short_type(value:&(dyn std::error::Error+'static))->String {
 fn pinned_tls(der: Vec<u8>, public_key: Vec<u8>) -> Result<tokio_rustls::rustls::ClientConfig, Error> {
     eprintln!("app_login_pinned_tls installing pinned_len={} key_len={}", der.len(), public_key.len());
     let config = tokio_rustls::rustls::ClientConfig::builder()
-        .with_safe_default_protocol_versions().map_err(|_| Error::new("app_login_deployment_invalid"))?
         .dangerous().with_custom_certificate_verifier(Arc::new(PinnedLeaf { leaf: der, public_key })).with_no_client_auth();
     // reqwest drives HTTP/1.1 here; advertise only what this client speaks.
     let mut config = config;
