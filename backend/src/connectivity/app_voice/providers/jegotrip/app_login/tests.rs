@@ -628,12 +628,14 @@ async fn pinned_server_certificate_accepts_only_the_configured_leaf() {
         format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len())).await;
     let mut cfg=http_config(false);cfg.base_url=Secret::from_owned(format!("https://127.0.0.1:{port}/"));
     cfg.root_der_base64=None;cfg.pinned_server_certificate_der_base64=Some(Secret::from_owned(cert.root.clone()));
+    cfg.pinned_server_public_key_der_base64=Some(Secret::from_owned(cert.public_key.clone()));
     let mut client=LiveFactory.build(&cfg).unwrap();client.login(&login_request(&id())).await.unwrap();
     assert!(task.await.unwrap().is_some());
     // Any other presented certificate is refused before a login body is delivered.
     let (port,task)=https_once(cert.server_config(&rustls::version::TLS13),String::new()).await;
     let mut cfg=http_config(false);cfg.base_url=Secret::from_owned(format!("https://127.0.0.1:{port}/"));
     cfg.root_der_base64=None;cfg.pinned_server_certificate_der_base64=Some(Secret::from_owned(other.root.clone()));
+    cfg.pinned_server_public_key_der_base64=Some(Secret::from_owned(other.public_key.clone()));
     let mut client=LiveFactory.build(&cfg).unwrap();
     assert_eq!(client.login(&login_request(&id())).await.unwrap_err().code,"app_login_transport_failed");
     assert!(task.await.unwrap().is_none());
