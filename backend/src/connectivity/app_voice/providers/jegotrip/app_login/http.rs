@@ -233,15 +233,23 @@ impl AppClient {
     /// bounded body/time, no redirects; only the version literal is kept.
     async fn discover_version(&self,url:&str)->Option<String> {
         // Shared factory keeps the project's DNS boundary (no ad-hoc clients).
-        let client=crate::platform::dns::http_client_builder()
+        let builder=crate::platform::dns::http_client_builder()
             .timeout(std::time::Duration::from_secs(8))
-            .redirect(reqwest::redirect::Policy::none()).build().ok()?;
-        let response=client.get(url).send().await.ok()?.error_for_status().ok()?;
-        if response.content_length().unwrap_or(0)>524_288 { return None; }
-        let bytes=response.bytes().await.ok()?;
-        if bytes.len()>524_288 { return None; }
+            .redirect(reqwest::redirect::Policy::none());
+        let client=match builder.build() { Ok(client)=>client, Err(error)=>{ eprintln!("app_login_version_discovery_failed stage=client reason={}",short_type(&error)); return None; } };
+        let response=match client.get(url).send().await {
+            Ok(response)=>match response.error_for_status() {
+                Ok(response)=>response,
+                Err(error)=>{ eprintln!("app_login_version_discovery_failed stage=status code={:?}",error.status()); return None; }
+            },
+            Err(error)=>{ eprintln!("app_login_version_discovery_failed stage=request connect={} timeout={} reason={}",
+                error.is_connect(),error.is_timeout(),short_type(&error)); return None; }
+        };
+        if response.content_length().unwrap_or(0)>524_288 { eprintln!("app_login_version_discovery_failed stage=size"); return None; }
+        let bytes=match response.bytes().await { Ok(bytes)=>bytes, Err(_)=>{ eprintln!("app_login_version_discovery_failed stage=body"); return None; } };
+        if bytes.len()>524_288 { eprintln!("app_login_version_discovery_failed stage=size"); return None; }
         let text=String::from_utf8_lossy(&bytes);
-        let found=pick_version(&text)?;
+        let Some(found)=pick_version(&text) else { eprintln!("app_login_version_discovery_failed stage=parse bytes={}",bytes.len()); return None; };
         eprintln!("app_login_version_discovered len={}",found.len());
         Some(found)
     }
@@ -301,8 +309,11 @@ impl AppClient {
                 .map(|value|(pair.name.expose_to_backend().to_owned(),value))).collect()};
         let response=self.transport.exchange(WireRequest {url,body:request_body,headers}).await?;
         if response.status==429 { return Err(Error::new("app_login_rate_limited")); }
-        if response.status!=200 { return Err(Error::new("app_login_transport_failed")); }
-        let mut doc=crypto::parse(&response.body)?;
+        if response.status!=200 { eprintln!("app_login_http_status endpoint={path} status={} bytes={}",response.status,response.body.len()); return Err(Error::new("app_login_transport_failed")); }
+        let mut doc=match crypto::parse(&response.body) {
+            Ok(doc)=>doc,
+            Err(error)=>{ eprintln!("app_login_body_invalid endpoint={path} bytes={} reason={}",response.body.len(),error.code); return Err(error); }
+        };
         // Bounded, sanitized field dump for rejected business calls: the operator
         // needs the server's own reason fields (message/msg/detail) to calibrate
         // deployment values, and they never contain our credentials.
@@ -318,7 +329,7 @@ impl AppClient {
                         fields.push(format!("{key}={text:?}"));
                     }
                 }
-                eprintln!("app_login_reject_fields code={code} {}",fields.join(" "));
+                eprintln!("app_login_reject_fields endpoint={path} code={code} {}",fields.join(" "));
             }
         }
         // Outer App codes are inspected independently from body decryption. In
