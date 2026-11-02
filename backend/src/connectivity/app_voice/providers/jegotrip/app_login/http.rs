@@ -50,8 +50,27 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for PinnedLeaf {
         self.provider.signature_verification_algorithms.supported_schemes()
     }
 }
-fn pinned_tls(der: Vec<u8>) -> Result<tokio_rustls::rustls::ClientConfig, Error> {
-    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+fn transport_failure(error:&reqwest::Error)->Error {
+    // Sanitized diagnostics only: the URL/query (n_token/sign) is never printed.
+    // Source type names and the rustls variant identify TLS/DNS/connect causes.
+    let mut chain:Vec<String>=Vec::new();
+    let mut source:Option<&(dyn std::error::Error+'static)>=std::error::Error::source(error);
+    let mut depth=0;
+    while let Some(item)=source {
+        if depth>=8 { break; }
+        if let Some(tls)=item.downcast_ref::<tokio_rustls::rustls::Error>() { chain.push(format!("rustls:{tls:?}")); }
+        else { chain.push(short_type(item)); }
+        source=item.source(); depth+=1;
+    }
+    eprintln!("app_login_transport_failed connect={} timeout={} request={} body={} chain={chain:?}",
+        error.is_connect(),error.is_timeout(),error.is_request(),error.is_body());
+    Error::new("app_login_transport_failed")
+}
+pub(super) fn short_type(value:&(dyn std::error::Error+'static))->String {
+    std::any::type_name_of_val(value).rsplit("::").next().unwrap_or("error").to_owned()
+}
+
+fn pinned_tls(der: Vec<u8>) -> Result<tokio_rustls::rustls::ClientConfig, Error> {    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
     let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions().map_err(|_| Error::new("app_login_deployment_invalid"))?
         .dangerous().with_custom_certificate_verifier(Arc::new(PinnedLeaf { leaf: der, provider })).with_no_client_auth();
@@ -84,7 +103,7 @@ impl TransportFactory for LiveFactory {
 impl Transport for LiveTransport {
     fn exchange(&self, request:WireRequest)->Exchange<'_> { Box::pin(async move {
         let response=self.0.post(request.url).header(reqwest::header::CONTENT_TYPE,"application/json; charset=utf-8")
-            .body(request.body.to_vec()).send().await.map_err(|_|Error::new("app_login_transport_failed"))?;
+            .body(request.body.to_vec()).send().await.map_err(|error| transport_failure(&error))?;
         let status=response.status().as_u16();
         if response.content_length().is_some_and(|n|n>crypto::MAX_BODY as u64) { return Err(Error::new("app_login_response_invalid")); }
         let mut stream=response.bytes_stream();let mut bytes=Zeroizing::new(Vec::new());
