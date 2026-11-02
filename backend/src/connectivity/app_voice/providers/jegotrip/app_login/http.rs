@@ -475,29 +475,48 @@ impl AppClient {
     /// Security-device enrolment (`CmiLogic.enroll`): the App posts exactly
     /// `{"deviceId": …}`. Optional; a missing path sends nothing.
     pub async fn enroll_device(&self)->Result<Option<TrustDecision>,Error> {
-        let Some(decision)=self.device_only_call(self.config.endpoints.device_enroll.clone()).await? else { return Ok(None); };
-        Ok(Some(decision))
+        self.device_only_call("enroll",self.config.endpoints.device_enroll.clone()).await
     }
     /// Device security verification (`CmiLogic.sendSecurityVerify`): same
     /// `{"deviceId": …}` body. Optional; never inferred from a previous call.
     pub async fn security_verify_device(&self)->Result<Option<TrustDecision>,Error> {
-        let Some(decision)=self.device_only_call(self.config.endpoints.security_verify.clone()).await? else { return Ok(None); };
-        Ok(Some(decision))
+        self.device_only_call("security_verify",self.config.endpoints.security_verify.clone()).await
     }
     /// Both App calls above send one field only; sharing the body keeps them
-    /// provably identical to the reviewed DEX shape.
-    async fn device_only_call(&self,path:Option<String>)->Result<Option<TrustDecision>,Error> {
+    /// provably identical to the reviewed DEX shape. Only field NAMES (and
+    /// value lengths) of the answer are logged: the operator learns the shape
+    /// without any token or device material reaching the journal.
+    async fn device_only_call(&self,label:&str,path:Option<String>)->Result<Option<TrustDecision>,Error> {
         let Some(path)=path else { return Ok(None); };
         let payload=self.payload(serde_json::json!({
             "deviceId":self.config.device_id.expose_to_backend()}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let doc=self.post(&path,&bytes,Authentication::Session,true).await?;
-        let authentication_code=match crypto::body(&doc)?.get("authentication_code") {
+        let body=crypto::body(&doc)?;
+        Self::log_body_shape(label,body);
+        let authentication_code=match body.get("authentication_code") {
             Some(serde_json::Value::Number(number))=>number.as_i64(),
             Some(serde_json::Value::String(text))=>text.trim().parse::<i64>().ok(),
             _=>None,
         };
         Ok(Some(TrustDecision { authentication_code }))
+    }
+    fn log_body_shape(label:&str,body:&serde_json::Value) {
+        let mut fields=Vec::new();
+        if let Some(map)=body.as_object() {
+            for (key,value) in map.iter().take(12) {
+                let shape=match value {
+                    serde_json::Value::String(text)=>format!("str:{}",text.len()),
+                    serde_json::Value::Number(number)=>format!("num:{number}"),
+                    serde_json::Value::Bool(flag)=>format!("bool:{flag}"),
+                    serde_json::Value::Null=>"null".to_owned(),
+                    serde_json::Value::Array(items)=>format!("arr:{}",items.len()),
+                    serde_json::Value::Object(map)=>format!("obj:{}",map.len()),
+                };
+                fields.push(format!("{key}={shape}"));
+            }
+        }
+        eprintln!("app_login_device_trust_shape step={label} {}",fields.join(" "));
     }
     pub async fn business_enabled(&self)->Result<bool,Error> {        let payload=self.payload(serde_json::json!({"device_id":self.config.device_id.expose_to_backend()}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);

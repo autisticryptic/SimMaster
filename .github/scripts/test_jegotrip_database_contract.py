@@ -102,7 +102,12 @@ class JegotripDatabaseContractTests(unittest.TestCase):
 
     def test_primary_api_defaults_to_full_hosting_but_still_requires_consent(self):
         source = (P / 'mod.rs').read_text()
-        self.assertIn('pub enum LoginIntent { Authenticate, #[default] EnableHosting }', source)
+        self.assertIn('pub enum LoginIntent { Authenticate, #[default] EnableHosting, AttachHosting }', source)
+        # The default API intent still means "log in and enable hosting"; the
+        # attach intent only takes over an already-enabled service and never
+        # writes the business switch.
+        self.assertIn('intent==LoginIntent::AttachHosting', source)
+        self.assertLess(source.index('intent==LoginIntent::AttachHosting'), source.index('client.enable_business().await'))
         self.assertIn('fn default_start_receiver() -> bool { true }', source)
         self.assertIn('#[serde(default="default_start_receiver")]', source)
         self.assertIn('if !request.consent', source)

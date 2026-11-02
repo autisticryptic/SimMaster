@@ -38,7 +38,8 @@ export function appLoginInput(attemptId: string, draft: AppLoginDraft): AppLogin
 
 export function canSubmitJegotripLogin(draft: AppLoginDraft): boolean {
   const intent = draft.intent ?? 'enable_hosting'
-  return canSubmitAppLogin(draft) && (intent === 'enable_hosting' || (intent === 'authenticate' && !draft.startReceiver))
+  return canSubmitAppLogin(draft)
+    && (intent === 'enable_hosting' || intent === 'attach_hosting' || (intent === 'authenticate' && !draft.startReceiver))
 }
 
 export function jegotripLoginInput(attemptId: string, draft: AppLoginDraft): JegotripLoginInput {
@@ -74,6 +75,7 @@ const errors: Record<string, string> = {
   app_login_receiver_start_failed: '账号已保存，但接收器启动失败；请查看独立账号状态。',
   app_login_version_discovery_failed: '未能从 App Store 或官方页面取得版本号；请手工填写后保存。',
   app_login_device_untrusted: '服务端判定本机不是已授信设备（506）；需要在服务端完成设备授信后才能开启托管。',
+  app_login_business_not_enabled: '该账号的托管业务尚未开启；无法从本机开启（服务端要求安全设备认证），请先在手机 App 开启托管，或在手机 App 上完成开通后再重试。',
   app_login_business_unconfirmed: '开通请求已被接受，但未确认业务状态；未启动接收器。',
   app_login_rate_limited: '服务请求过于频繁，请勿自动重复登录。',
   app_login_server_rejected: '无忧行服务拒绝了本次请求。',

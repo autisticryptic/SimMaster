@@ -29,7 +29,7 @@ const ERRORS: &[&str] = &[
     "app_login_busy", "app_login_unavailable", "app_login_shutting_down", "app_login_interrupted",
     "app_login_timeout", "app_login_entropy_failed", "app_login_transport_failed",
     "app_login_response_invalid", "app_login_rate_limited", "app_login_server_rejected",
-    "app_login_version_discovery_failed", "app_login_device_untrusted",
+    "app_login_version_discovery_failed", "app_login_device_untrusted", "app_login_business_not_enabled",
     "app_login_verification_required", "app_login_migration_required", "app_login_existing_business_action_required",
     "app_login_session_revoked", "app_login_service_maintenance", "app_login_phone_binding_required",
     "app_login_identity_mismatch", "app_login_native_configuration_invalid", "app_login_business_unconfirmed",
@@ -45,10 +45,10 @@ pub(crate) fn valid_attempt_id(s: &str) -> bool { s.len() == 32 && s.bytes().all
 
 #[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
 #[serde(rename_all="snake_case")]
-pub enum LoginIntent { Authenticate, #[default] EnableHosting }
+pub enum LoginIntent { Authenticate, #[default] EnableHosting, AttachHosting }
 impl LoginIntent {
-    fn as_str(self)->&'static str {match self {Self::Authenticate=>"authenticate",Self::EnableHosting=>"enable_hosting"}}
-    fn parse(value:&str)->Option<Self> {match value {"authenticate"=>Some(Self::Authenticate),"enable_hosting"=>Some(Self::EnableHosting),_=>None}}
+    fn as_str(self)->&'static str {match self {Self::Authenticate=>"authenticate",Self::EnableHosting=>"enable_hosting",Self::AttachHosting=>"attach_hosting"}}
+    fn parse(value:&str)->Option<Self> {match value {"authenticate"=>Some(Self::Authenticate),"enable_hosting"=>Some(Self::EnableHosting),"attach_hosting"=>Some(Self::AttachHosting),_=>None}}
 }
 
 /// Historical API contract: explicit consent to the complete hosting operation.
@@ -377,7 +377,17 @@ impl AppLoginManager {
         let accounts=self.accounts.upgrade().ok_or(Error::new("app_login_unavailable"))?;
         accounts.login_preflight_create().map_err(|_|Error::new("app_login_account_creation_failed"))?;
         self.step(owner,id,"checking_business",None)?;
-        if client.business_enabled().await? {
+        let enabled=client.business_enabled().await?;
+        if intent==LoginIntent::AttachHosting {
+            // Taking over an EXISTING hosting service. The server only lets the
+            // account's verified device enable it (506 otherwise, verified on
+            // the real service), so this intent never writes the business
+            // switch: it requires the operator to have enabled hosting in the
+            // official App first, and fails closed when the server says it is
+            // still off.
+            if !enabled { return Err(Error::new("app_login_business_not_enabled")); }
+            self.step(owner,id,"creating_account",Some("already_enabled"))?;
+        } else if enabled {
             self.step(owner,id,"creating_account",Some("already_enabled"))?;
         } else {
             self.step(owner,id,"enabling_business",Some("request_uncertain"))?;

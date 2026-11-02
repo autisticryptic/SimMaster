@@ -199,7 +199,7 @@ export interface AppLoginSetup {
   configuration_error?: string | null
 }
 
-export type JegotripLoginIntent = 'authenticate' | 'enable_hosting'
+export type JegotripLoginIntent = 'authenticate' | 'enable_hosting' | 'attach_hosting'
 export interface JegotripConfigurationView {
   configuration_source: string
   revision: number

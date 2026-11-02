@@ -131,6 +131,12 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
       onChange={(event) => setDraft({ ...draft, mode: event.target.value === 'phone' ? 'phone' : 'account' })}>
       <MenuItem value="phone">手机号和密码</MenuItem><MenuItem value="account">无忧行账号和密码</MenuItem>
     </TextField>
+    <TextField select size="small" label="托管操作" value={draft.intent ?? 'enable_hosting'} disabled={pending}
+      onChange={(event) => setDraft({ ...draft, intent: event.target.value as AppLoginDraft['intent'] })}>
+      <MenuItem value="enable_hosting">登录并开启托管（需要服务端允许本机开启）</MenuItem>
+      <MenuItem value="attach_hosting">接管已开启的托管（先在手机 App 开启）</MenuItem>
+    </TextField>
+    {(draft.intent ?? 'enable_hosting') === 'attach_hosting' && <Alert severity="info">本机不会修改服务端托管开关：只有服务端已确认托管处于开启状态时才继续创建本地账号并启动接收器；否则以「托管未开启」结束。</Alert>}
     {draft.mode === 'phone' && <TextField size="small" label="国家/地区区号" value={draft.country} disabled={pending} onChange={(event) => setDraft({ ...draft, country: event.target.value })} />}
     <TextField size="small" label={draft.mode === 'phone' ? '已绑定手机号' : '无忧行账号'} value={draft.username} disabled={pending} autoComplete="username" onChange={(event) => setDraft({ ...draft, username: event.target.value })} />
     <TextField size="small" label="无忧行密码" type="password" value={draft.password} disabled={pending} autoComplete="current-password" onChange={(event) => setDraft({ ...draft, password: event.target.value })} />
