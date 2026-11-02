@@ -22,6 +22,21 @@
 `.local/jegotrip/verified-native-*.json`（本地私有证据目录）。每次提交的 run id、
 artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`。
 
+## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
+
+原 App 并未依赖公共 CA：`assets/app2.cer` 就是服务端叶子证书
+（`CN=*.jegotrip.com.cn`，issuer `CN=Jegotrip`，序列号 `ba770f6aa86973eb`），
+而服务端只下发这一张证书、不下发中间/根证书。因此部署配置可使用新可选项
+`http.pinned_server_certificate_der_base64`：
+
+- 与 `http.root_der_base64` **互斥**；提供后不再使用任何系统根证书；
+- 只接受与该 DER **逐字节相同**的服务端证书，否则握手失败（`app_login_transport_failed`）；
+- 握手签名仍用 ring 的算法集校验，不做 "接受任意证书" 的降级；
+- 这是安装侧显式给定的一张证书，不是默认值、不是 CA 推断。
+
+设备上该证书需随部署私有配置提供；校验失败会在登录 attempt 上以
+`app_login_transport_failed` 结束，不会伪造成功。
+
 ## 2. 受支持的配置形状（不含真实值）
 
 存储的账号配置里，原生路由需要**同时**给出：
