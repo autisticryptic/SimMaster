@@ -494,7 +494,7 @@ impl AppClient {
         let payload=self.payload(serde_json::json!({
             "deviceId":self.config.device_id.expose_to_backend()}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
-        let doc=self.post(&path,&bytes,Authentication::Session,true).await?;
+        let doc=self.post(&path,&bytes,Authentication::Anonymous,true).await?;
         let body=crypto::body(&doc)?;
         Self::log_body_shape("enroll",body);
         // The App stores the returned enrolment id and sends it in the next

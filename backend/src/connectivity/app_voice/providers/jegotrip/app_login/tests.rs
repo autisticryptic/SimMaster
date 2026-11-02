@@ -898,6 +898,10 @@ async fn device_enrolment_id_is_kept_for_the_next_login_body_only() {
     let seen=lock(&script.seen);
     assert_eq!(seen[0].path,"/enroll");
     assert_eq!(seen[0].body,json!({"deviceId":"fixture-http-device"}));
+    // Enrolment happens at login time, before any App session exists, so it is
+    // the anonymous token - exactly like the original LoginActivity call.
+    assert!(seen[0].query.contains_key("n_token"));
+    assert!(!seen[0].query.contains_key("token"));
     // The App enrols first and then sends the received id in the login body.
     assert_eq!(seen[1].path,"/login");
     assert_eq!(seen[1].body["enrollId"],"fixture-enroll-0001");
