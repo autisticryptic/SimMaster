@@ -327,7 +327,7 @@ impl AppClient {
     }
     pub async fn login(&mut self,request:&LoginRequest)->Result<(),Error> {
         let hash=crypto::password_hash(&self.config.password_salt,&request.password);
-        let payload=self.payload(serde_json::json!({"loginName":request.username.expose_to_backend().trim(),
+        let mut payload=self.payload(serde_json::json!({"loginName":request.username.expose_to_backend().trim(),
             "password":hash.expose_to_backend(),"userType":"0","site":1}),self.app_version().await.as_deref());
         if let Some(country)=&request.country_code { payload.0["countryCode"]=serde_json::Value::String(country.clone()); }
         if let Some(id)=&self.config.enroll_id { payload.0["enrollId"]=serde_json::Value::String(id.expose_to_backend().to_owned()); }
