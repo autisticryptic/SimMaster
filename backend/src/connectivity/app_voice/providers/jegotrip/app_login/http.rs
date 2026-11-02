@@ -175,6 +175,19 @@ impl AppClient {
         Ok(hash.finish().as_ref().to_vec())
     }
     pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None}) }
+    /// Every App JSON body passes through here so the installation's explicit
+    /// extra fields (for example a client-version gate) are merged once, before
+    /// encryption. Extras never overwrite fields the caller produced.
+    fn payload(&self,value:serde_json::Value)->JsonDoc {
+        let mut value=value;
+        if let Some(map)=value.as_object_mut() {
+            for pair in &self.config.extra_body {
+                let key=pair.name.expose_to_backend();
+                if !map.contains_key(key) { map.insert(key.to_owned(),serde_json::Value::String(pair.value.expose_to_backend().to_owned())); }
+            }
+        }
+        JsonDoc(value)
+    }
     fn nonce(&self)->Result<String,Error> {
         let mut byte=[0];
         for _ in 0..16 {
@@ -231,7 +244,7 @@ impl AppClient {
     }
     pub async fn login(&mut self,request:&LoginRequest)->Result<(),Error> {
         let hash=crypto::password_hash(&self.config.password_salt,&request.password);
-        let mut payload=JsonDoc(serde_json::json!({"loginName":request.username.expose_to_backend().trim(),
+        let mut payload=self.payload(serde_json::json!({"loginName":request.username.expose_to_backend().trim(),
             "password":hash.expose_to_backend(),"userType":"0","site":1}));
         if let Some(country)=&request.country_code { payload.0["countryCode"]=serde_json::Value::String(country.clone()); }
         if let Some(id)=&self.config.enroll_id { payload.0["enrollId"]=serde_json::Value::String(id.expose_to_backend().to_owned()); }
@@ -256,7 +269,7 @@ impl AppClient {
         Ok(BoundNumber {country:country.to_owned(),mobile:Secret::from_owned(mobile.to_owned())})
     }
     pub async fn phone_credentials(&self,bound:&BoundNumber)->Result<PhoneMaterial,Error> {
-        let identity=bound.identity();let payload=JsonDoc(serde_json::json!({"accountId":&**identity}));
+        let identity=bound.identity();let payload=self.payload(serde_json::json!({"accountId":&**identity}));
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let token_doc=self.post(&self.config.endpoints.phone_token,&bytes,Authentication::Session,true).await?;
         let token=crypto::secret_field(crypto::body(&token_doc)?,"token")?;
@@ -266,7 +279,7 @@ impl AppClient {
         Ok(PhoneMaterial {token,sip_password})
     }
     pub async fn business_enabled(&self)->Result<bool,Error> {
-        let payload=JsonDoc(serde_json::json!({"device_id":self.config.device_id.expose_to_backend()}));
+        let payload=self.payload(serde_json::json!({"device_id":self.config.device_id.expose_to_backend()}));
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let doc=self.post(&self.config.endpoints.call_status,&bytes,Authentication::Session,false).await?;
         let value=crypto::body(&doc)?.get("cs_forward").ok_or(Error::new("app_login_response_invalid"))?;
@@ -275,7 +288,7 @@ impl AppClient {
         }
     }
     pub async fn enable_business(&self)->Result<(),Error> {
-        let payload=JsonDoc(serde_json::json!({"cs_forward":"2","device_id":self.config.device_id.expose_to_backend()}));
+        let payload=self.payload(serde_json::json!({"cs_forward":"2","device_id":self.config.device_id.expose_to_backend()}));
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         self.post(&self.config.endpoints.enable_hosting,&bytes,Authentication::Session,true).await?;Ok(())
     }

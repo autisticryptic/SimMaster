@@ -215,6 +215,7 @@ fn full_database_private_mirror_roundtrip_retains_runtime_without_personal_login
     expected["http"]["pinned_server_public_key_der_base64"] = Value::Null;
     expected["http"]["extra_query"] = json!([]);
     expected["http"]["extra_headers"] = json!([]);
+    expected["http"]["extra_body"] = json!([]);
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
     let restored = DatabaseConfiguration::decode_private(&bytes).unwrap();
     assert!(restored.runtime.is_some());

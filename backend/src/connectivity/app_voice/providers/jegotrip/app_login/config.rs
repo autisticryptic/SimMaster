@@ -98,6 +98,9 @@ pub(super) struct HttpDeployment {
     pub extra_query: Vec<HttpPair>,
     #[serde(default)]
     pub extra_headers: Vec<HttpPair>,
+    /// Extra fields merged into every App JSON body before encryption.
+    #[serde(default)]
+    pub extra_body: Vec<HttpPair>,
     pub user_agent: Option<Secret>,
     pub enroll_id: Option<Secret>,
 }
@@ -134,9 +137,9 @@ impl HttpDeployment {
             if key_der.len()<100 || key_der.len()>8_192 || key_der.first()!=Some(&0x30) { return Err(invalid()); }
         }
         for p in [&self.endpoints.login,&self.endpoints.user_info,&self.endpoints.phone_token,&self.endpoints.voip_status,&self.endpoints.call_status,&self.endpoints.enable_hosting] { self.endpoint(p)?; }
-        if self.extra_query.len()>16 || self.extra_headers.len()>16 { return Err(invalid()); }
+        if self.extra_query.len()>16 || self.extra_headers.len()>16 || self.extra_body.len()>16 { return Err(invalid()); }
         let reserved=["n_token","lang","timestamp","sign","token"];
-        for pair in self.extra_query.iter().chain(self.extra_headers.iter()) {
+        for pair in self.extra_query.iter().chain(self.extra_headers.iter()).chain(self.extra_body.iter()) {
             let name=pair.name.expose_to_backend();let value=pair.value.expose_to_backend();
             if name.is_empty() || name.len()>64 || !name.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'-'|b'_'))
                 || value.is_empty() || value.len()>256 || value.chars().any(|c|c.is_control()) { return Err(invalid()); }
@@ -238,7 +241,7 @@ struct PrivateHttpRef<'a> {
     body_protection: Option<PrivateBodyProtectionRef<'a>>, root_der_base64: Option<&'a str>,
     pinned_server_certificate_der_base64: Option<&'a str>,
     pinned_server_public_key_der_base64: Option<&'a str>,
-    extra_query: PrivateHttpPairs<'a>, extra_headers: PrivateHttpPairs<'a>,
+    extra_query: PrivateHttpPairs<'a>, extra_headers: PrivateHttpPairs<'a>, extra_body: PrivateHttpPairs<'a>,
     user_agent: Option<&'a str>, enroll_id: Option<&'a str>,
 }
 impl<'a> PrivateHttpRef<'a> {
@@ -250,7 +253,7 @@ impl<'a> PrivateHttpRef<'a> {
             root_der_base64: h.root_der_base64.as_ref().map(Secret::expose_to_backend),
             pinned_server_certificate_der_base64: h.pinned_server_certificate_der_base64.as_ref().map(Secret::expose_to_backend),
             pinned_server_public_key_der_base64: h.pinned_server_public_key_der_base64.as_ref().map(Secret::expose_to_backend),
-            extra_query: PrivateHttpPairs(&h.extra_query), extra_headers: PrivateHttpPairs(&h.extra_headers),
+            extra_query: PrivateHttpPairs(&h.extra_query), extra_headers: PrivateHttpPairs(&h.extra_headers), extra_body: PrivateHttpPairs(&h.extra_body),
             user_agent: h.user_agent.as_ref().map(Secret::expose_to_backend),
             enroll_id: h.enroll_id.as_ref().map(Secret::expose_to_backend) }
     }
