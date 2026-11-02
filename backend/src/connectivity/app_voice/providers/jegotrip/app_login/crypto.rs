@@ -21,14 +21,17 @@ pub(super) fn parse(bytes: &[u8]) -> Result<JsonDoc, Error> {
     let value:Value=serde_json::from_slice(bytes).map_err(|_|bad())?;
     if !value.is_object() { return Err(bad()); } Ok(JsonDoc(value))
 }
-pub(super) fn success(doc: &JsonDoc) -> Result<(),Error> {
-    let code=doc.0.get("code").and_then(|v| {
+pub(super) fn outer_code(doc: &JsonDoc) -> Option<u32> {
+    doc.0.get("code").and_then(|v| {
         if let Some(text)=v.as_str() {
             if text.is_empty() || text.len()>6 || !text.bytes().all(|b|b.is_ascii_digit()) { return None; }
             let value:u32=text.parse().ok()?;
             (value.to_string()==text).then_some(value)
         } else { v.as_u64().filter(|n|*n<=999999).map(|n|n as u32) }
-    });
+    })
+}
+pub(super) fn success(doc: &JsonDoc) -> Result<(),Error> {
+    let code=outer_code(doc);
     if code==Some(0) { return Ok(()); }
     if let Some(found)=code {
         // Sanitized server reason for the operator: bounded text only, never the

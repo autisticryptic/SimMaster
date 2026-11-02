@@ -200,6 +200,24 @@ impl AppClient {
         if response.status==429 { return Err(Error::new("app_login_rate_limited")); }
         if response.status!=200 { return Err(Error::new("app_login_transport_failed")); }
         let mut doc=crypto::parse(&response.body)?;
+        // Bounded, sanitized field dump for rejected business calls: the operator
+        // needs the server's own reason fields (message/msg/detail) to calibrate
+        // deployment values, and they never contain our credentials.
+        if let Some(code)=crypto::outer_code(&doc) {
+            if code!=0 {
+                let mut fields=Vec::new();
+                if let Some(map)=doc.0.as_object() {
+                    for (key,value) in map.iter().take(12) {
+                        let text=match value {
+                            serde_json::Value::String(text)=>text.chars().filter(|c|!c.is_control()).take(120).collect::<String>(),
+                            other=>other.to_string().chars().take(60).collect(),
+                        };
+                        fields.push(format!("{key}={text:?}"));
+                    }
+                }
+                eprintln!("app_login_reject_fields code={code} {}",fields.join(" "));
+            }
+        }
         // Outer App codes are inspected independently from body decryption. In
         // particular 2006 must NOT trigger the APK's implicit closeVoipForward.
         crypto::success(&doc)?; crypto::decrypt_body(&mut doc,protection)?; Ok(doc)
