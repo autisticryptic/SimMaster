@@ -73,6 +73,7 @@ const errors: Record<string, string> = {
   app_login_account_creation_failed: '本地账号保存失败；请先核对任务中的远端业务结果。',
   app_login_receiver_start_failed: '账号已保存，但接收器启动失败；请查看独立账号状态。',
   app_login_version_discovery_failed: '未能从 App Store 或官方页面取得版本号；请手工填写后保存。',
+  app_login_device_untrusted: '服务端判定本机不是已授信设备（506）；需要在服务端完成设备授信后才能开启托管。',
   app_login_business_unconfirmed: '开通请求已被接受，但未确认业务状态；未启动接收器。',
   app_login_rate_limited: '服务请求过于频繁，请勿自动重复登录。',
   app_login_server_rejected: '无忧行服务拒绝了本次请求。',

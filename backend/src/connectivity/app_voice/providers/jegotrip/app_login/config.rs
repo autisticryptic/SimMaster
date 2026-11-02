@@ -61,6 +61,11 @@ pub(super) struct BodyProtection { pub secret_id: Secret, pub secret_value: Secr
 pub(super) struct Endpoints {
     pub login: String, pub user_info: String, pub phone_token: String,
     pub voip_status: String, pub call_status: String, pub enable_hosting: String,
+    /// Optional trusted-device verification (`verificationTrustfulDevice`). The
+    /// original App queries this before touching the business switch, so an
+    /// installation that knows the path can reproduce the same order.
+    #[serde(default)]
+    pub verification_trustful_device: Option<String>,
 }
 pub(super) fn valid_version_page(url:&str)->bool {
     if url.len()>512 || url.chars().any(char::is_control) { return false; }
@@ -178,6 +183,7 @@ impl HttpDeployment {
             if key_der.len()<100 || key_der.len()>8_192 || key_der.first()!=Some(&0x30) { return Err(invalid()); }
         }
         for p in [&self.endpoints.login,&self.endpoints.user_info,&self.endpoints.phone_token,&self.endpoints.voip_status,&self.endpoints.call_status,&self.endpoints.enable_hosting] { self.endpoint(p)?; }
+        if let Some(p)=&self.endpoints.verification_trustful_device { self.endpoint(p)?; }
         if self.extra_query.len()>16 || self.extra_headers.len()>16 || self.extra_body.len()>16 { return Err(invalid()); }
         let reserved=["n_token","lang","timestamp","sign","token"];
         for pair in self.extra_query.iter().chain(self.extra_headers.iter()).chain(self.extra_body.iter()) {

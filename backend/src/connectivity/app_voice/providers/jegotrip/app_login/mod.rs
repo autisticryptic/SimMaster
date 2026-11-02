@@ -29,7 +29,7 @@ const ERRORS: &[&str] = &[
     "app_login_busy", "app_login_unavailable", "app_login_shutting_down", "app_login_interrupted",
     "app_login_timeout", "app_login_entropy_failed", "app_login_transport_failed",
     "app_login_response_invalid", "app_login_rate_limited", "app_login_server_rejected",
-    "app_login_version_discovery_failed",
+    "app_login_version_discovery_failed", "app_login_device_untrusted",
     "app_login_verification_required", "app_login_migration_required", "app_login_existing_business_action_required",
     "app_login_session_revoked", "app_login_service_maintenance", "app_login_phone_binding_required",
     "app_login_identity_mismatch", "app_login_native_configuration_invalid", "app_login_business_unconfirmed",
@@ -349,6 +349,15 @@ impl AppLoginManager {
         if intent==LoginIntent::Authenticate {return Ok(());}
         self.step(owner,id,"fetching_credentials",None)?;
         let material=client.phone_credentials(&bound).await?;
+        // The App asks the server whether THIS device is trusted before it
+        // touches the business switch. The answer is reported verbatim; a
+        // missing configuration or a transport error is never read as trust,
+        // and the business call below remains the only decider.
+        match client.verify_trusted_device().await {
+            Ok(Some(decision))=>eprintln!("app_login_trust_decision authentication_code={:?}",decision.authentication_code),
+            Ok(None)=>eprintln!("app_login_trust_decision not_configured"),
+            Err(error)=>eprintln!("app_login_trust_decision_failed code={} server_code={:?}",error.code,error.server_code),
+        }
         let runtime=configuration.runtime.clone().ok_or(Error::new("app_login_native_configuration_missing"))?;
         let config:AccountConfig=runtime.bind(&bound.identity(),material)?;
         config.validate(now() as u64).map_err(|_|Error::new("app_login_native_configuration_invalid"))?;
@@ -360,7 +369,11 @@ impl AppLoginManager {
         } else {
             self.step(owner,id,"enabling_business",Some("request_uncertain"))?;
             if let Err(error)=client.enable_business().await {
-                if error.server_code.is_some() {self.step(owner,id,"enabling_business",Some("rejected"))?;}return Err(error);
+                if error.server_code.is_some() {self.step(owner,id,"enabling_business",Some("rejected"))?;}
+                // 506 is the server's own "untrusted device" refusal; keep it a
+                // distinct, actionable code instead of a generic rejection.
+                if error.server_code==Some(506) {return Err(Error::new("app_login_device_untrusted"));}
+                return Err(error);
             }
             self.step(owner,id,"confirming_business",Some("accepted_unconfirmed"))?;
             if !client.business_enabled().await? {return Err(Error::new("app_login_business_unconfirmed"));}

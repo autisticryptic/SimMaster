@@ -795,3 +795,53 @@ fn version_view_exposes_only_the_value_provenance_and_sources() {
     assert!(empty.contains("\"stored\":null"),"{empty}");
     assert!(empty.contains("\"stored_age_seconds\":null"),"{empty}");
 }
+#[tokio::test]
+async fn trusted_device_verification_posts_the_app_fields_and_never_invents_a_grant() {
+    let mut value=deployment_json("AA==",false);
+    value["http"]["endpoints"]["verification_trustful_device"]=json!("trust");
+    let cfg:HttpDeployment=serde_json::from_value(value["http"].clone()).unwrap();
+    let script=Arc::new(Script::new(vec![
+        reply("/login",json!({"code":"0","body":{"token":"fixture-app-session","expiredAt":0}})),
+        reply("/trust",json!({"code":0,"body":{"code":0,"authentication_code":1}})),
+    ],false));
+    let mut client=Factory(script.clone()).build(&cfg).unwrap();
+    client.login(&login_request(&id())).await.unwrap();
+    // The App's own request shape: sso_token + equipment_type=1 + device_id.
+    assert_eq!(client.verify_trusted_device().await.unwrap(),
+        Some(http::TrustDecision {authentication_code:Some(1)}));
+    let seen=lock(&script.seen);
+    assert_eq!(seen[1].path,"/trust");
+    assert_eq!(seen[1].body["sso_token"],"fixture-app-session");
+    assert_eq!(seen[1].body["equipment_type"],1);
+    assert_eq!(seen[1].body["device_id"],"fixture-http-device");
+    assert!(seen[1].query.contains_key("token"),"the App session token is query-authenticated");
+}
+#[tokio::test]
+async fn trusted_device_verification_reports_unknown_instead_of_trust_when_the_field_is_absent() {
+    let mut value=deployment_json("AA==",false);
+    value["http"]["endpoints"]["verification_trustful_device"]=json!("trust");
+    let cfg:HttpDeployment=serde_json::from_value(value["http"].clone()).unwrap();
+    let script=Arc::new(Script::new(vec![
+        reply("/login",json!({"code":"0","body":{"token":"fixture-app-session","expiredAt":0}})),
+        reply("/trust",json!({"code":0,"body":{"code":0}})),
+        reply("/trust",json!({"code":0,"body":{"authentication_code":"1"}})),
+    ],false));
+    let mut client=Factory(script.clone()).build(&cfg).unwrap();
+    client.login(&login_request(&id())).await.unwrap();
+    // A body without the field stays unknown; it is never promoted to a grant.
+    assert_eq!(client.verify_trusted_device().await.unwrap(),
+        Some(http::TrustDecision {authentication_code:None}));
+    // A numeric string is accepted exactly like the original App's parser.
+    assert_eq!(client.verify_trusted_device().await.unwrap(),
+        Some(http::TrustDecision {authentication_code:Some(1)}));
+}
+#[tokio::test]
+async fn trusted_device_verification_is_optional_and_sends_nothing_when_unconfigured() {
+    let script=Arc::new(Script::new(vec![
+        reply("/login",json!({"code":"0","body":{"token":"fixture-app-session","expiredAt":0}})),
+    ],false));
+    let mut client=Factory(script.clone()).build(&http_config(false)).unwrap();
+    client.login(&login_request(&id())).await.unwrap();
+    assert_eq!(client.verify_trusted_device().await.unwrap(),None);
+    assert_eq!(script.paths(),vec!["/login".to_owned()]);
+}

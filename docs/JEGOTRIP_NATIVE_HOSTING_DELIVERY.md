@@ -106,6 +106,35 @@ POST /api/jegotrip/app-version/refresh  # 立即强制拉取一次并落库
 `extra_query`/`extra_headers`/`extra_body` 仍受之前的限制：每个≤16项，name 仅字母数字/`-`/`_`，
 value ≤256 且不含控制字符；`n_token`/`lang`/`timestamp`/`sign`/`token` 不可被覆盖。
 
+## 2.2.5 可信设备校验（业务码 506）
+
+过了版本门槛后，`setVoip` 仍可能返回 `506 未授信设备,开启失败!`。这不是版本问题：原 App 在
+调用业务开关之前会先向服务端查询“本机是否已授信”，即 `CallLogic.querySafeDevice`，请求体恰好三个
+字段：
+
+```json
+{ "sso_token": "<登录后拿到的 App token>", "equipment_type": 1, "device_id": "<设备标识>" }
+```
+
+对应的服务端路径（APK 内端点目录 `JegoTripApi.<clinit>`）是
+`service/voip/v1/verificationTrustfulDevice`；调用方读回 `body.code` 与 `body.authentication_code`。
+
+SimAdmin 的实现方式：
+
+- 部署配置新增**可选**端点 `endpoints.verification_trustful_device`；未配置时行为与以前完全一致
+  （不发这个请求，也不假设任何授信结果）；
+- 配置后，流程在 `csb/token` 之后、业务开关之前调用一次，并把服务端字段原样写成有界日志：
+  `app_login_trust_decision authentication_code=<0|1|unknown>`；
+- 这个返回值**只是报告**，不是授权凭据：程序不会把它当成“已授信”去跳过任何校验，
+  业务是否真正开启仍由 `setVoip` + 读回确认决定；
+- `setVoip` 返回 `506` 时，任务以专用错误码 `app_login_device_untrusted` 结束（前端有对应中文提示），
+  不会退化成“通用拒绝”或伪造成功。
+
+**边界**：原 App 在 `authentication_code != 1` 时还有 `getToken()` 与 `service/voip/v1/securityVerify`
+两步（静态确认存在），它们依赖设备/运营商侧能力，当前**未实现**，也不会用假值绕过。
+`device/sec/v1/enroll` 与 `enrollId` 只与登录侧一键登录有关（`AccoutLogic.oneKeyLogin/ssoLogin/
+thirdOneKeyLogin`），不是 `setVoip` 的授信凭证。静态证据见 `.local/jegotrip/device-trust-20261103/FINDINGS.md`。
+
 ## 2. 受支持的配置形状（不含真实值）
 
 存储的账号配置里，原生路由需要**同时**给出：

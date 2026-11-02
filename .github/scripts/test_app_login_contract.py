@@ -24,7 +24,16 @@ class AppLoginContractTests(unittest.TestCase):
         self.assertLess(source.index('if !client.business_enabled().await?'), source.index('accounts.create(config'))
         self.assertIn('app_login_attempt_exists', source)
         http = (P / 'http.rs').read_text()
-        self.assertNotIn('querySafeDevice', http)
+        # The original App asks the server about its own trusted-device state, so
+        # the client may reproduce that single App HTTP call - but only as a
+        # report of the server's field. Local telephony / carrier fallbacks stay
+        # outside this module and no trust grant is ever synthesized here.
+        self.assertIn('verification_trustful_device', http)
+        self.assertIn('"equipment_type":1', http)
+        self.assertIn('authentication_code', http)
+        self.assertNotIn('MobileAuthUtil', http)
+        self.assertNotIn('AuthnHelper', http)
+        self.assertNotIn('trust_granted', http)
         self.assertNotIn('PHONE_MESSAGE_SAVE_CHECK', http)
         self.assertNotIn('"cs_forward":"1"', http)
         self.assertIn('"cs_forward":"2"', http)

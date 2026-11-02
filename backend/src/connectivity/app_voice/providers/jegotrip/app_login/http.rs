@@ -159,6 +159,10 @@ impl Transport for LiveTransport {
 #[derive(Clone, Copy)]
 enum Authentication { Anonymous, Session }
 pub(super) struct BoundNumber { country:String, mobile:Secret }
+/// Server answer of the App's trusted-device verification. Nothing here is a
+/// grant: `authentication_code` is only what the server reported.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(super) struct TrustDecision { pub authentication_code:Option<i64> }
 impl BoundNumber {
     pub fn identity(&self)->Zeroizing<String> { Zeroizing::new(format!("+{}{}",self.country,self.mobile.expose_to_backend())) }
     pub fn masked(&self)->String { let s=self.mobile.expose_to_backend();format!("***{}",&s[s.len().saturating_sub(4)..]) }
@@ -444,8 +448,31 @@ impl AppClient {
         let sip_password=crypto::sip_password(&encrypted,&self.config)?;
         Ok(PhoneMaterial {token,sip_password})
     }
-    pub async fn business_enabled(&self)->Result<bool,Error> {
-        let payload=self.payload(serde_json::json!({"device_id":self.config.device_id.expose_to_backend()}),self.version_value().await.as_deref());
+    /// The original App verifies that THIS device is already trusted before it
+    /// touches the business switch (`CallLogic.querySafeDevice` sends exactly
+    /// `sso_token`, `equipment_type=1` and `device_id`). `Ok(None)` means the
+    /// installation did not configure the optional endpoint; the caller then
+    /// keeps its previous behaviour instead of inventing a trust result.
+    pub async fn verify_trusted_device(&self)->Result<Option<TrustDecision>,Error> {
+        let Some(path)=self.config.endpoints.verification_trustful_device.clone() else { return Ok(None); };
+        let token=self.session.as_ref().ok_or(Error::new("app_login_unavailable"))?;
+        let payload=self.payload(serde_json::json!({
+            "sso_token":token.expose_to_backend(),
+            "equipment_type":1,
+            "device_id":self.config.device_id.expose_to_backend()}),self.version_value().await.as_deref());
+        let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
+        let doc=self.post(&path,&bytes,Authentication::Session,true).await?;
+        let body=crypto::body(&doc)?;
+        // The App accepts either a JSON number or a numeric string; anything
+        // else stays unknown rather than becoming an implicit grant.
+        let authentication_code=match body.get("authentication_code") {
+            Some(serde_json::Value::Number(number))=>number.as_i64(),
+            Some(serde_json::Value::String(text))=>text.trim().parse::<i64>().ok(),
+            _=>None,
+        };
+        Ok(Some(TrustDecision { authentication_code }))
+    }
+    pub async fn business_enabled(&self)->Result<bool,Error> {        let payload=self.payload(serde_json::json!({"device_id":self.config.device_id.expose_to_backend()}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let doc=self.post(&self.config.endpoints.call_status,&bytes,Authentication::Session,false).await?;
         let value=crypto::body(&doc)?.get("cs_forward").ok_or(Error::new("app_login_response_invalid"))?;
