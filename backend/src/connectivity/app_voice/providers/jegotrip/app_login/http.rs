@@ -501,20 +501,18 @@ impl AppClient {
         };
         Ok(Some(TrustDecision { authentication_code }))
     }
-    fn log_body_shape(label:&str,body:&serde_json::Value) {
+    fn log_body_shape(label:&str,body:&serde_json::Map<String,serde_json::Value>) {
         let mut fields=Vec::new();
-        if let Some(map)=body.as_object() {
-            for (key,value) in map.iter().take(12) {
-                let shape=match value {
-                    serde_json::Value::String(text)=>format!("str:{}",text.len()),
-                    serde_json::Value::Number(number)=>format!("num:{number}"),
-                    serde_json::Value::Bool(flag)=>format!("bool:{flag}"),
-                    serde_json::Value::Null=>"null".to_owned(),
-                    serde_json::Value::Array(items)=>format!("arr:{}",items.len()),
-                    serde_json::Value::Object(map)=>format!("obj:{}",map.len()),
-                };
-                fields.push(format!("{key}={shape}"));
-            }
+        for (key,value) in body.iter().take(12) {
+            let shape=match value {
+                serde_json::Value::String(text)=>format!("str:{}",text.len()),
+                serde_json::Value::Number(number)=>format!("num:{number}"),
+                serde_json::Value::Bool(flag)=>format!("bool:{flag}"),
+                serde_json::Value::Null=>"null".to_owned(),
+                serde_json::Value::Array(items)=>format!("arr:{}",items.len()),
+                serde_json::Value::Object(map)=>format!("obj:{}",map.len()),
+            };
+            fields.push(format!("{key}={shape}"));
         }
         eprintln!("app_login_device_trust_shape step={label} {}",fields.join(" "));
     }
