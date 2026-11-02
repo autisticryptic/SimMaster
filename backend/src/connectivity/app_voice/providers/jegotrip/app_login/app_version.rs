@@ -52,7 +52,7 @@ pub(super) fn load(conn:&Connection)->Option<StoredVersion> {
     let row:Option<(String,String,i64)>=conn.query_row(
         "SELECT value,source,observed_at FROM jegotrip_shared_state WHERE name=?1",
         params![APP_VERSION_KEY],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().ok()?;
-    let (version,source,observed_at)=row;
+    let (version,source,observed_at)=match row { Some(row)=>row, None=>return None };
     if source.len()>16 || observed_at<0 || !super::config::valid_app_version(&version) { return None; }
     Some(StoredVersion { version, source, observed_at })
 }

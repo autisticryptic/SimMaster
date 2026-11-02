@@ -128,7 +128,7 @@ pub async fn jegotrip_accounts(State(manager):State<Arc<AppLoginManager>>)->Resp
 /// Shared App-version state: value, provenance, age and which sources are
 /// configured. No secret from the deployment is exported.
 pub async fn jegotrip_app_version(State(manager):State<Arc<AppLoginManager>>)->Response {
-    success(StatusCode::OK,manager.app_version_view())
+    success(StatusCode::OK,manager.app_version_view().map_err(|e|e.code))
 }
 /// Force one remote lookup (App Store, then the official page) and persist it.
 pub async fn jegotrip_refresh_app_version(State(manager):State<Arc<AppLoginManager>>)->Response {
