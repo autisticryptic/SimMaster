@@ -308,6 +308,9 @@ impl AppLoginManager {
         // configured source and persist it BEFORE any login call, so the very
         // first request already carries a value the server accepts.
         client.ensure_app_version().await;
+        // The original LoginActivity enrols this device before signing in; the
+        // login body then carries the returned enrollId. Best effort only.
+        client.ensure_device_enrollment().await;
         eprintln!("app_login_version_in_use {}",client.version_provenance().await);
         let outcome=self.run_with_version_gate(owner,&request,intent,revision,&configuration,&mut client).await;
         request.password = Secret::from_owned(String::new());

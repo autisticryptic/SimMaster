@@ -883,3 +883,22 @@ async fn security_device_calls_are_optional_and_send_nothing_when_unconfigured()
     assert_eq!(client.security_verify_device().await.unwrap(),None);
     assert_eq!(script.paths(),vec!["/login".to_owned()]);
 }
+#[tokio::test]
+async fn device_enrolment_id_is_kept_for_the_next_login_body_only() {
+    let mut value=deployment_json("AA==",false);
+    value["http"]["endpoints"]["device_enroll"]=json!("enroll");
+    let cfg:HttpDeployment=serde_json::from_value(value["http"].clone()).unwrap();
+    let script=Arc::new(Script::new(vec![
+        reply("/enroll",json!({"code":0,"body":{"enrollId":"fixture-enroll-0001","expireTime":"2030-01-01 00:00:00"}})),
+        reply("/login",json!({"code":"0","body":{"token":"fixture-app-session","expiredAt":0}})),
+    ],false));
+    let mut client=Factory(script.clone()).build(&cfg).unwrap();
+    client.ensure_device_enrollment().await;
+    client.login(&login_request(&id())).await.unwrap();
+    let seen=lock(&script.seen);
+    assert_eq!(seen[0].path,"/enroll");
+    assert_eq!(seen[0].body,json!({"deviceId":"fixture-http-device"}));
+    // The App enrols first and then sends the received id in the login body.
+    assert_eq!(seen[1].path,"/login");
+    assert_eq!(seen[1].body["enrollId"],"fixture-enroll-0001");
+}

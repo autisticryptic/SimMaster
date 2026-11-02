@@ -169,6 +169,10 @@ impl BoundNumber {
 }
 pub(super) struct AppClient { config:HttpDeployment, transport:Arc<dyn Transport>, session:Option<Secret>,
     version_store:Option<Arc<dyn super::app_version::VersionStore>>,
+    /// `enrollId` returned by the App's own `device/sec/v1/enroll`. The original
+    /// LoginActivity enrols before signing in and then sends this value in the
+    /// login body, so it lives with the client for this flow only.
+    enroll_id:std::sync::Mutex<Option<Secret>>,
     version_cache:std::sync::Mutex<Option<(String,&'static str,std::time::Instant)>> }
 /// The server's explicit "your App is too old" business code. It is the ONLY
 /// trigger for re-learning the version and replaying a request.
@@ -211,7 +215,7 @@ impl AppClient {
         hash.update(realm.as_str().as_bytes());hash.update(&[0]);hash.update(identity.as_bytes());
         Ok(hash.finish().as_ref().to_vec())
     }
-    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_store:None,version_cache:std::sync::Mutex::new(None)}) }
+    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_store:None,enroll_id:std::sync::Mutex::new(None),version_cache:std::sync::Mutex::new(None)}) }
     /// Attach the durable shared-state store. Without it the version still
     /// resolves from file/page/static, but nothing is persisted.
     pub fn with_version_store(mut self,store:Arc<dyn super::app_version::VersionStore>)->Self { self.version_store=Some(store); self }
@@ -300,6 +304,13 @@ impl AppClient {
     }
     /// Value-only view used by the per-call placeholders.
     pub(super) async fn version_value(&self)->Option<String> { self.app_version().await.map(|(value,_)|value) }
+    /// Enrolment identifier learned from `device/sec/v1/enroll` in this flow.
+    fn remembered_enroll_id(&self)->Option<String> {
+        self.enroll_id.lock().ok().and_then(|slot|slot.clone()).map(|value|value.expose_to_backend().to_owned())
+    }
+    fn remember_enroll_id(&self,value:&str) {
+        if let Ok(mut slot)=self.enroll_id.lock() { *slot=Some(Secret::from_owned(value.to_owned())); }
+    }
     /// A replay of the same login attempt must not reuse a previous App session
     /// token; each flow starts from the anonymous login again.
     pub(super) fn reset_session(&mut self) { self.session=None; }
@@ -418,6 +429,9 @@ impl AppClient {
             "password":hash.expose_to_backend(),"userType":"0","site":1}),self.version_value().await.as_deref());
         if let Some(country)=&request.country_code { payload.0["countryCode"]=serde_json::Value::String(country.clone()); }
         if let Some(id)=&self.config.enroll_id { payload.0["enrollId"]=serde_json::Value::String(id.expose_to_backend().to_owned()); }
+        // A freshly enrolled device id wins over the static configuration: the
+        // App sends the value it just received from device/sec/v1/enroll.
+        if let Some(id)=self.remembered_enroll_id() { payload.0["enrollId"]=serde_json::Value::String(id); }
         // No campaign context is invented; null Gson fields are omitted.
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let doc=self.post(&self.config.endpoints.login,&bytes,Authentication::Anonymous,true).await?;
@@ -475,7 +489,40 @@ impl AppClient {
     /// Security-device enrolment (`CmiLogic.enroll`): the App posts exactly
     /// `{"deviceId": …}`. Optional; a missing path sends nothing.
     pub async fn enroll_device(&self)->Result<Option<TrustDecision>,Error> {
-        self.device_only_call("enroll",self.config.endpoints.device_enroll.clone()).await
+        let path=self.config.endpoints.device_enroll.clone();
+        let Some(path)=path else { return Ok(None); };
+        let payload=self.payload(serde_json::json!({
+            "deviceId":self.config.device_id.expose_to_backend()}),self.version_value().await.as_deref());
+        let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
+        let doc=self.post(&path,&bytes,Authentication::Session,true).await?;
+        let body=crypto::body(&doc)?;
+        Self::log_body_shape("enroll",body);
+        // The App stores the returned enrolment id and sends it in the next
+        // login body; only a bounded, control-free value is kept.
+        if let Some(serde_json::Value::String(value))=body.get("enrollId") {
+            let trimmed=value.trim();
+            if !trimmed.is_empty() && trimmed.len()<=256 && !trimmed.chars().any(char::is_control) {
+                self.remember_enroll_id(trimmed);
+                eprintln!("app_login_device_enroll id_len={}",trimmed.len());
+            }
+        }
+        let authentication_code=match body.get("authentication_code") {
+            Some(serde_json::Value::Number(number))=>number.as_i64(),
+            Some(serde_json::Value::String(text))=>text.trim().parse::<i64>().ok(),
+            _=>None,
+        };
+        Ok(Some(TrustDecision { authentication_code }))
+    }
+    /// The original LoginActivity enrols first, so the login body carries the
+    /// fresh `enrollId`. Best-effort: a failed enrolment never blocks the login,
+    /// it just leaves the configured/static value in place.
+    pub(super) async fn ensure_device_enrollment(&self) {
+        if self.config.endpoints.device_enroll.is_none() || self.remembered_enroll_id().is_some() { return; }
+        match self.enroll_device().await {
+            Ok(Some(_))=>eprintln!("app_login_device_enroll ok={}",self.remembered_enroll_id().is_some()),
+            Ok(None)=>eprintln!("app_login_device_enroll not_configured"),
+            Err(error)=>eprintln!("app_login_device_enroll_failed code={} server_code={:?}",error.code,error.server_code),
+        }
     }
     /// Device security verification (`CmiLogic.sendSecurityVerify`): same
     /// `{"deviceId": …}` body. Optional; never inferred from a previous call.
