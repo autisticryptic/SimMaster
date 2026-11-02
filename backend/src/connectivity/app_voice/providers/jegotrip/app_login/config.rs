@@ -64,6 +64,11 @@ pub(super) struct Endpoints {
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct HttpPair { pub name: Secret, pub value: Secret }
+impl fmt::Debug for HttpPair { fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result { f.write_str("HttpPair(<redacted>)") } }
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct HttpDeployment {
     pub base_url: Secret,
     pub anonymous_token: Secret,
@@ -86,6 +91,13 @@ pub(super) struct HttpDeployment {
     /// signatures are verified with ring against this key.
     #[serde(default)]
     pub pinned_server_public_key_der_base64: Option<Secret>,
+    /// Explicit installation values the reviewed service requires on every App
+    /// call (for example a client-version gate). Bounded names/values only; both
+    /// lists are opt-in and never inferred from the APK or a provider response.
+    #[serde(default)]
+    pub extra_query: Vec<HttpPair>,
+    #[serde(default)]
+    pub extra_headers: Vec<HttpPair>,
     pub user_agent: Option<Secret>,
     pub enroll_id: Option<Secret>,
 }
@@ -122,6 +134,14 @@ impl HttpDeployment {
             if key_der.len()<100 || key_der.len()>8_192 || key_der.first()!=Some(&0x30) { return Err(invalid()); }
         }
         for p in [&self.endpoints.login,&self.endpoints.user_info,&self.endpoints.phone_token,&self.endpoints.voip_status,&self.endpoints.call_status,&self.endpoints.enable_hosting] { self.endpoint(p)?; }
+        if self.extra_query.len()>16 || self.extra_headers.len()>16 { return Err(invalid()); }
+        let reserved=["n_token","lang","timestamp","sign","token"];
+        for pair in self.extra_query.iter().chain(self.extra_headers.iter()) {
+            let name=pair.name.expose_to_backend();let value=pair.value.expose_to_backend();
+            if name.is_empty() || name.len()>64 || !name.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'-'|b'_'))
+                || value.is_empty() || value.len()>256 || value.chars().any(|c|c.is_control()) { return Err(invalid()); }
+        }
+        if self.extra_query.iter().any(|pair|reserved.contains(&pair.name.expose_to_backend())) { return Err(invalid()); }
         Ok(())
     }
     pub fn base(&self) -> Result<Url,Error> {
@@ -202,12 +222,23 @@ struct PrivateDatabaseRef<'a, R: Serialize> { version: u32, http: PrivateHttpRef
 #[derive(Serialize)]
 struct PrivateBodyProtectionRef<'a> { secret_id: &'a str, secret_value: &'a str }
 #[derive(Serialize)]
+struct PrivateHttpPairRef<'a> { name: &'a str, value: &'a str }
+struct PrivateHttpPairs<'a>(&'a [HttpPair]);
+impl Serialize for PrivateHttpPairs<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for pair in self.0 { seq.serialize_element(&PrivateHttpPairRef { name: pair.name.expose_to_backend(), value: pair.value.expose_to_backend() })?; }
+        seq.end()
+    }
+}
+#[derive(Serialize)]
 struct PrivateHttpRef<'a> {
     base_url: &'a str, anonymous_token: &'a str, signature_salt: &'a str, password_salt: &'a str,
     sip_password_key: &'a str, device_id: &'a str, endpoints: &'a Endpoints,
     body_protection: Option<PrivateBodyProtectionRef<'a>>, root_der_base64: Option<&'a str>,
     pinned_server_certificate_der_base64: Option<&'a str>,
     pinned_server_public_key_der_base64: Option<&'a str>,
+    extra_query: PrivateHttpPairs<'a>, extra_headers: PrivateHttpPairs<'a>,
     user_agent: Option<&'a str>, enroll_id: Option<&'a str>,
 }
 impl<'a> PrivateHttpRef<'a> {
@@ -219,6 +250,7 @@ impl<'a> PrivateHttpRef<'a> {
             root_der_base64: h.root_der_base64.as_ref().map(Secret::expose_to_backend),
             pinned_server_certificate_der_base64: h.pinned_server_certificate_der_base64.as_ref().map(Secret::expose_to_backend),
             pinned_server_public_key_der_base64: h.pinned_server_public_key_der_base64.as_ref().map(Secret::expose_to_backend),
+            extra_query: PrivateHttpPairs(&h.extra_query), extra_headers: PrivateHttpPairs(&h.extra_headers),
             user_agent: h.user_agent.as_ref().map(Secret::expose_to_backend),
             enroll_id: h.enroll_id.as_ref().map(Secret::expose_to_backend) }
     }

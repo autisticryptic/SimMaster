@@ -213,6 +213,8 @@ fn full_database_private_mirror_roundtrip_retains_runtime_without_personal_login
     // The private mirror always carries the optional pinned-certificate slots.
     expected["http"]["pinned_server_certificate_der_base64"] = Value::Null;
     expected["http"]["pinned_server_public_key_der_base64"] = Value::Null;
+    expected["http"]["extra_query"] = json!([]);
+    expected["http"]["extra_headers"] = json!([]);
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
     let restored = DatabaseConfiguration::decode_private(&bytes).unwrap();
     assert!(restored.runtime.is_some());
@@ -639,6 +641,30 @@ async fn pinned_server_certificate_accepts_only_the_configured_leaf() {
     let mut client=LiveFactory.build(&cfg).unwrap();
     assert_eq!(client.login(&login_request(&id())).await.unwrap_err().code,"app_login_transport_failed");
     assert!(task.await.unwrap().is_none());
+}
+#[test]
+fn extra_query_and_headers_are_bounded_and_never_replace_reserved_parameters() {
+    let cert=Certificates::generate("IP:127.0.0.1");
+    let mut value=deployment_json(&cert.root,false);
+    value["http"]["extra_query"]=json!([{"name":"version","value":"8.9.8.0"}]);
+    value["http"]["extra_headers"]=json!([{"name":"X-Client-Version","value":"8.9.8.0"}]);
+    let ok:config::Deployment=serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(ok.http.validate(),Ok(()));
+    // Reserved query names are transport-critical and cannot be overridden.
+    for reserved in ["token","timestamp","sign","lang","n_token"] {
+        let mut bad=value.clone();bad["http"]["extra_query"]=json!([{"name":reserved,"value":"x"}]);
+        assert!(serde_json::from_value::<config::Deployment>(bad).unwrap().http.validate().is_err(),"{reserved}");
+    }
+    // Header/query names stay a bounded token; values stay printable single-line.
+    let long_name="a".repeat(65);let long_value="a".repeat(257);
+    for bad_name in ["bad name","bad:name","",long_name.as_str()] {
+        let mut bad=value.clone();bad["http"]["extra_headers"]=json!([{"name":bad_name,"value":"x"}]);
+        assert!(serde_json::from_value::<config::Deployment>(bad).unwrap().http.validate().is_err(),"{bad_name}");
+    }
+    for bad_value in ["","line\nbreak",long_value.as_str()] {
+        let mut bad=value.clone();bad["http"]["extra_headers"]=json!([{"name":"X","value":bad_value}]);
+        assert!(serde_json::from_value::<config::Deployment>(bad).unwrap().http.validate().is_err(),"{bad_value}");
+    }
 }
 #[test]
 fn pinned_server_certificate_is_exclusive_with_root_and_must_be_der() {

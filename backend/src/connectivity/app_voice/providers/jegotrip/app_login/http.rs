@@ -9,7 +9,7 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use url::Url;
 use zeroize::Zeroizing;
 
-pub(super) struct WireRequest { pub url: Url, pub body: Zeroizing<Vec<u8>> }
+pub(super) struct WireRequest { pub url: Url, pub body: Zeroizing<Vec<u8>>, pub headers: Vec<(String, String)> }
 pub(super) struct WireResponse { pub status: u16, pub body: Zeroizing<Vec<u8>> }
 pub(super) type Exchange<'a> = Pin<Box<dyn Future<Output=Result<WireResponse,Error>>+Send+'a>>;
 pub(super) trait Transport: Send+Sync { fn exchange(&self, request:WireRequest)->Exchange<'_>; }
@@ -140,6 +140,10 @@ impl TransportFactory for LiveFactory {
 impl Transport for LiveTransport {
     fn exchange(&self, request:WireRequest)->Exchange<'_> { Box::pin(async move {
         let response=self.0.post(request.url).header(reqwest::header::CONTENT_TYPE,"application/json; charset=utf-8")
+            .headers({let mut map=reqwest::header::HeaderMap::new();
+                for (name,value) in &request.headers {
+                    if let (Ok(name),Ok(value))=(reqwest::header::HeaderName::from_bytes(name.as_bytes()),reqwest::header::HeaderValue::from_str(value)){map.insert(name,value);}
+                }map})
             .body(request.body.to_vec()).send().await.map_err(|error| transport_failure(&error))?;
         let status=response.status().as_u16();
         if response.content_length().is_some_and(|n|n>crypto::MAX_BODY as u64) { return Err(Error::new("app_login_response_invalid")); }
@@ -195,8 +199,11 @@ impl AppClient {
                 },
             }
             query.append_pair("timestamp",&millis.to_string()).append_pair("sign",&signature);
+            for pair in &self.config.extra_query { query.append_pair(pair.name.expose_to_backend(),pair.value.expose_to_backend()); }
         }
-        let response=self.transport.exchange(WireRequest {url,body:request_body}).await?;
+        let headers=self.config.extra_headers.iter()
+            .map(|pair|(pair.name.expose_to_backend().to_owned(),pair.value.expose_to_backend().to_owned())).collect();
+        let response=self.transport.exchange(WireRequest {url,body:request_body,headers}).await?;
         if response.status==429 { return Err(Error::new("app_login_rate_limited")); }
         if response.status!=200 { return Err(Error::new("app_login_transport_failed")); }
         let mut doc=crypto::parse(&response.body)?;
