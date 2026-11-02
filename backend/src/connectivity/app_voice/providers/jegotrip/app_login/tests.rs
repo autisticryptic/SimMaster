@@ -869,8 +869,10 @@ async fn security_device_enrolment_and_verification_send_only_the_app_device_fie
     for recorded in [&seen[1],&seen[2]] {
         // The App posts exactly one field for both calls; nothing else is invented.
         assert_eq!(recorded.body,json!({"deviceId":"fixture-http-device"}));
-        assert!(recorded.query.contains_key("token"));
     }
+    // Enrolment precedes the App session, verification follows it.
+    assert!(seen[1].query.contains_key("n_token"));
+    assert!(seen[2].query.contains_key("token"));
 }
 #[tokio::test]
 async fn security_device_calls_are_optional_and_send_nothing_when_unconfigured() {
