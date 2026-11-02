@@ -31,9 +31,11 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for PinnedLeaf {
         _now: tokio_rustls::rustls::pki_types::UnixTime)
         -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error> {
         if end_entity.as_ref() != self.leaf.as_slice() {
+            eprintln!("app_login_pinned_verify mismatch presented_len={} pinned_len={}", end_entity.as_ref().len(), self.leaf.len());
             return Err(tokio_rustls::rustls::Error::InvalidCertificate(
                 tokio_rustls::rustls::CertificateError::UnknownIssuer));
         }
+        eprintln!("app_login_pinned_verify matched len={}", self.leaf.len());
         Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
     }
     fn verify_tls12_signature(&self, message: &[u8], cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
@@ -70,7 +72,9 @@ pub(super) fn short_type(value:&(dyn std::error::Error+'static))->String {
     std::any::type_name_of_val(value).rsplit("::").next().unwrap_or("error").to_owned()
 }
 
-fn pinned_tls(der: Vec<u8>) -> Result<tokio_rustls::rustls::ClientConfig, Error> {    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+fn pinned_tls(der: Vec<u8>) -> Result<tokio_rustls::rustls::ClientConfig, Error> {
+    eprintln!("app_login_pinned_tls installing pinned_len={}", der.len());
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
     let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions().map_err(|_| Error::new("app_login_deployment_invalid"))?
         .dangerous().with_custom_certificate_verifier(Arc::new(PinnedLeaf { leaf: der, provider })).with_no_client_auth();
