@@ -219,6 +219,30 @@ export interface JegotripAppVersionView {
   configured_static: boolean
   store_enabled: boolean
 }
+export interface JegotripDeviceIdentityView {
+  id: string
+  device_id: string
+  source: 'generated' | 'manual' | 'legacy'
+  revision: number
+  bound_account_id: string | null
+  masked_number: string | null
+  reserved: boolean
+  in_use: boolean
+  created_at: number
+  updated_at: number
+}
+export interface JegotripDeviceIdentityState {
+  initialized: boolean
+  configured_mode: 'store' | 'static'
+  max_identities: number
+  identities: JegotripDeviceIdentityView[]
+}
+export interface JegotripDeviceIdentityInput {
+  id: string | null
+  expected_revision: number
+  account_id: string | null
+  device_id: string | null
+}
 export interface JegotripLoginInput {
   attempt_id: string
   username: string
@@ -227,6 +251,7 @@ export interface JegotripLoginInput {
   intent: JegotripLoginIntent
   consent: boolean
   start_receiver: boolean
+  device_id?: string
 }
 export interface JegotripAccountView {
   account_id: string
@@ -942,6 +967,22 @@ class SimAdminCurrentAPI {
   async refreshJegotripAppVersion() {
     return request<ApiResponse<JegotripAppVersionView>>('/jegotrip/app-version/refresh', {
       method: 'POST', timeoutMs: 20000,
+    })
+  }
+
+  async getJegotripDeviceIdentities() {
+    return request<ApiResponse<JegotripDeviceIdentityState>>('/jegotrip/device-identities')
+  }
+
+  async saveJegotripDeviceIdentity(input: JegotripDeviceIdentityInput) {
+    return request<ApiResponse<JegotripDeviceIdentityState>>('/jegotrip/device-identities', {
+      method: 'PUT', body: JSON.stringify(input), timeoutMs: 15000,
+    })
+  }
+
+  async deleteJegotripDeviceIdentity(id: string, revision: number) {
+    return request<ApiResponse<JegotripDeviceIdentityState>>(`/jegotrip/device-identities/${encodeURIComponent(id)}?expected_revision=${revision}`, {
+      method: 'DELETE', timeoutMs: 15000,
     })
   }
 

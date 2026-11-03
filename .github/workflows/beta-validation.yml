@@ -281,6 +281,7 @@ jobs:
             connectivity::app_voice::providers::jegotrip::runtime_backend::common_tests \
             connectivity::app_voice::providers::jegotrip::account_config::tests \
             connectivity::app_voice::providers::jegotrip::app_login::tests \
+            connectivity::app_voice::providers::jegotrip::app_login::device_identity_tests \
             connectivity::app_voice::providers::jegotrip::account_store::tests \
             connectivity::app_voice::providers::jegotrip::account_inbox::tests \
             connectivity::app_voice::providers::jegotrip::smgw_text::tests \
@@ -384,3 +385,16 @@ jobs:
           pnpm run build
           pnpm run type-check
           pnpm run test:unit
+      - name: Check Jegotrip device-identity UI (mock APIs only)
+        working-directory: frontend
+        run: |
+          pnpm exec playwright install --with-deps chromium
+          pnpm exec playwright test --config playwright.jegotrip.config.ts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jegotrip-device-ui-beta
+          path: |
+            frontend/test-results/jegotrip-device-ui/
+            frontend/test-results/jegotrip-ui-results.json
+          retention-days: 7

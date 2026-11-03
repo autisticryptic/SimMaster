@@ -111,7 +111,7 @@ class JegotripDatabaseContractTests(unittest.TestCase):
         self.assertIn('fn default_start_receiver() -> bool { true }', source)
         self.assertIn('#[serde(default="default_start_receiver")]', source)
         self.assertIn('if !request.consent', source)
-        self.assertLess(source.index('configuration.runtime.is_none()'), source.index('let client=self.factory.build(&configuration.http)?'))
+        self.assertLess(source.index('configuration.runtime.is_none()'), source.index('let mut client=self.factory.build(&configuration.http)?'))
 
 
 if __name__ == '__main__':

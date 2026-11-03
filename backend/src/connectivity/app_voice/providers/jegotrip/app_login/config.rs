@@ -92,6 +92,18 @@ pub(super) fn valid_app_version(value:&str)->bool {
         && value.split('.').all(|part|!part.is_empty())
 }
 
+#[derive(Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq, Debug)]
+#[serde(rename_all="snake_case")]
+pub(crate) enum DeviceIdentityMode {
+    /// One persisted identity per account, generated on first use.
+    #[default]
+    Store,
+    /// The static `device_id` of this deployment.
+    Static,
+}
+
+fn empty_device_id() -> Secret { Secret::from_owned(String::new()) }
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct HttpPair { pub name: Secret, pub value: Secret }
@@ -105,6 +117,9 @@ pub(super) struct HttpDeployment {
     pub signature_salt: Secret,
     pub password_salt: Secret,
     pub sip_password_key: Secret,
+    /// Legacy fixed identity is optional in store mode; fresh installations
+    /// generate a UUID and persist it before enrolment. Static mode requires it.
+    #[serde(default="empty_device_id")]
     pub device_id: Secret,
     pub endpoints: Endpoints,
     /// None is the original non-encrypted AppConfig branch, not a TLS downgrade.
@@ -154,6 +169,12 @@ pub(super) struct HttpDeployment {
     /// value only lives in memory for this process/client.
     #[serde(default)]
     pub app_version_store: bool,
+    /// Where the App device identity comes from. `store` (default) keeps one
+    /// persisted identity per account in the installation database, so several
+    /// accounts never share a value the server binds to a single number;
+    /// `static` uses `device_id` from this configuration.
+    #[serde(default)]
+    pub device_identity_mode: DeviceIdentityMode,
     pub user_agent: Option<Secret>,
     pub enroll_id: Option<Secret>,
 }
@@ -163,10 +184,13 @@ impl HttpDeployment {
         let invalid = || Error::new("app_login_deployment_invalid");
         let base = self.base()?;
         if !base.path().ends_with('/') { return Err(invalid()); }
-        for value in [&self.anonymous_token, &self.signature_salt, &self.password_salt, &self.sip_password_key, &self.device_id] {
+        for value in [&self.anonymous_token, &self.signature_salt, &self.password_salt, &self.sip_password_key] {
             let text=value.expose_to_backend();
             if text.is_empty() || text.len()>16_384 || text.chars().any(char::is_control) { return Err(invalid()); }
         }
+        let device_id=self.device_id.expose_to_backend();
+        if (!device_id.is_empty() || self.device_identity_mode==DeviceIdentityMode::Static)
+            && !super::device_identity::valid_device_id(device_id) { return Err(invalid()); }
         if self.signature_salt.expose_to_backend().len()<8 || self.sip_password_key.expose_to_backend().len()!=24 { return Err(invalid()); }
         if let Some(p)=&self.body_protection {
             for v in [&p.secret_id,&p.secret_value] {
@@ -314,7 +338,7 @@ struct PrivateHttpRef<'a> {
     pinned_server_public_key_der_base64: Option<&'a str>,
     extra_query: PrivateHttpPairs<'a>, extra_headers: PrivateHttpPairs<'a>, extra_body: PrivateHttpPairs<'a>,
     app_version: Option<&'a str>, app_version_file: Option<&'a str>, app_version_web_url: Option<&'a str>,
-    app_version_ios_app_id: Option<&'a str>, app_version_store: bool,
+    app_version_ios_app_id: Option<&'a str>, app_version_store: bool, device_identity_mode: DeviceIdentityMode,
     user_agent: Option<&'a str>, enroll_id: Option<&'a str>,
 }
 impl<'a> PrivateHttpRef<'a> {
@@ -330,8 +354,8 @@ impl<'a> PrivateHttpRef<'a> {
             app_version: h.app_version.as_ref().map(Secret::expose_to_backend),
             app_version_file: h.app_version_file.as_ref().map(Secret::expose_to_backend),
             app_version_web_url: h.app_version_web_url.as_ref().map(Secret::expose_to_backend),
-    app_version_ios_app_id: h.app_version_ios_app_id.as_ref().map(Secret::expose_to_backend),
-    app_version_store: h.app_version_store,
+            app_version_ios_app_id: h.app_version_ios_app_id.as_ref().map(Secret::expose_to_backend),
+            app_version_store: h.app_version_store, device_identity_mode: h.device_identity_mode,
             user_agent: h.user_agent.as_ref().map(Secret::expose_to_backend),
             enroll_id: h.enroll_id.as_ref().map(Secret::expose_to_backend) }
     }

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Checkbox, CircularProgress, FormControlLabel, MenuItem, Stack, TextField, Typography } from '@mui/material'
+import { Alert, Button, Checkbox, CircularProgress, Divider, FormControlLabel, MenuItem, Stack, TextField, Typography } from '@mui/material'
 import { api, type AppLoginAttempt, type AppLoginSetup, type JegotripAppVersionView } from '../../api/current'
-import { appBusinessLabel, appLoginError, jegotripLoginInput, appLoginNeedsPolling, appLoginPhase, canSubmitJegotripLogin, emptyAppLoginDraft, type AppLoginDraft } from '../../policies/appLogin'
+import { appBusinessLabel, appLoginError, jegotripLoginInput, appLoginNeedsPolling, appLoginPhase, canSubmitJegotripLogin, emptyAppLoginDraft, validJegotripDeviceId, type AppLoginDraft } from '../../policies/appLogin'
+import JegotripDeviceIdentityPane from './JegotripDeviceIdentityPane'
 
 const emptyDraft = emptyAppLoginDraft
 
@@ -13,6 +14,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
   const [versionBusy, setVersionBusy] = useState(false)
   const [versionNote, setVersionNote] = useState<string | null>(null)
   const [attempt, setAttempt] = useState<AppLoginAttempt | null>(null)
+  const [deviceRefresh, setDeviceRefresh] = useState(0)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const generation = useRef({ active: false })
@@ -22,7 +24,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
     const scope = { active: open }
     generation.current = scope
     setDraft(emptyDraft()); setAttempt(null); setSubmitting(false); setError(null); setSetup(null)
-    setAppVersion(null); setVersionInput(''); setVersionNote(null)
+    setAppVersion(null); setVersionInput(''); setVersionNote(null); setDeviceRefresh(0)
     if (open) void api.getJegotripLoginSetup().then((response) => {
       if (scope.active) setSetup(response.data ?? null)
     }).catch(() => { if (scope.active) setError('无法读取数据库账号登录配置。') })
@@ -48,6 +50,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
         setAttempt(value)
         if (value.error) setError(appLoginError(value.error))
         if (!appLoginNeedsPolling(value)) {
+          setDeviceRefresh((current) => current + 1)
           if (value.account_id || value.line_id) onCreated?.()
           return
         }
@@ -119,7 +122,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
         {appVersion && ` · 来源：${[appVersion.configured_ios_lookup ? 'App Store' : '', appVersion.configured_mobile_page ? '官方页面' : '',
           appVersion.configured_file ? '版本文件' : '', appVersion.configured_static ? '静态值' : ''].filter(Boolean).join('/') || '未配置'}`}
       </Typography>
-      <Stack direction="row" spacing={1}>
+      <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
         <TextField size="small" label="App 版本（如 8.9.8.0）" value={versionInput} disabled={versionBusy}
           onChange={(event) => setVersionInput(event.target.value)} error={versionInput.length > 0 && !versionValid} />
         <Button variant="outlined" disabled={versionBusy || !versionValid} onClick={() => { void storeVersion() }}>保存</Button>
@@ -131,6 +134,15 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
       onChange={(event) => setDraft({ ...draft, mode: event.target.value === 'phone' ? 'phone' : 'account' })}>
       <MenuItem value="phone">手机号和密码</MenuItem><MenuItem value="account">无忧行账号和密码</MenuItem>
     </TextField>
+    <TextField select size="small" label="本次登录的设备标识" value={draft.deviceMode ?? 'auto'} disabled={pending}
+      onChange={(event) => setDraft({ ...draft, deviceMode: event.target.value === 'manual' ? 'manual' : 'auto' })}>
+      <MenuItem value="auto">自动生成 / 复用已保存标识（默认）</MenuItem><MenuItem value="manual">手工指定自己的标识</MenuItem>
+    </TextField>
+    {(draft.deviceMode ?? 'auto') === 'manual' && <TextField size="small" label="首次登录使用的设备标识" value={draft.deviceId ?? ''} disabled={pending}
+      onChange={(event) => setDraft({ ...draft, deviceId: event.target.value })} inputProps={{ maxLength: 64 }}
+      error={!!draft.deviceId && !validJegotripDeviceId(draft.deviceId)}
+      helperText="8–64 位，仅字母、数字、下划线与连字符；现有账号更换标识请用下方管理，不会自动覆盖旧绑定。" />}
+    <Typography variant="caption" color="text.secondary">标识保存在独立数据库中，重试/重启不反复随机。不同号码不共用；标识不是认证 token，也不保证通过服务端一键验证。</Typography>
     <TextField select size="small" label="托管操作" value={draft.intent ?? 'enable_hosting'} disabled={pending}
       onChange={(event) => setDraft({ ...draft, intent: event.target.value as AppLoginDraft['intent'] })}>
       <MenuItem value="enable_hosting">登录并开启托管（需要服务端允许本机开启）</MenuItem>
@@ -152,5 +164,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
       {attempt.line_id && <Typography variant="caption" display="block">接收账号已保存，电话/短信是否就绪以原运行时为准。</Typography>}
     </Alert>}
     {error && <Alert severity="error">{error}</Alert>}
+    <Divider />
+    <JegotripDeviceIdentityPane open={open} disabled={pending} refreshKey={deviceRefresh} />
   </Stack>
 }

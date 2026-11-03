@@ -9,10 +9,12 @@ export interface AppLoginDraft {
   consent: boolean
   startReceiver: boolean
   intent?: JegotripLoginIntent
+  deviceMode?: 'auto' | 'manual'
+  deviceId?: string
 }
 
 export function emptyAppLoginDraft(): AppLoginDraft {
-  return { mode: 'phone', username: '', password: '', country: '86', consent: false, startReceiver: true, intent: 'enable_hosting' }
+  return { mode: 'phone', username: '', password: '', country: '86', consent: false, startReceiver: true, intent: 'enable_hosting', deviceMode: 'auto', deviceId: '' }
 }
 
 export function canSubmitAppLogin(draft: AppLoginDraft): boolean {
@@ -36,9 +38,15 @@ export function appLoginInput(attemptId: string, draft: AppLoginDraft): AppLogin
   }
 }
 
+export function validJegotripDeviceId(value: string): boolean {
+  return /^[A-Za-z0-9_-]{8,64}$/.test(value.trim())
+}
+
 export function canSubmitJegotripLogin(draft: AppLoginDraft): boolean {
   const intent = draft.intent ?? 'enable_hosting'
+  const deviceMode = draft.deviceMode ?? 'auto'
   return canSubmitAppLogin(draft)
+    && (deviceMode === 'auto' || (deviceMode === 'manual' && validJegotripDeviceId(draft.deviceId ?? '')))
     && (intent === 'enable_hosting' || intent === 'attach_hosting' || (intent === 'authenticate' && !draft.startReceiver))
 }
 
@@ -48,6 +56,7 @@ export function jegotripLoginInput(attemptId: string, draft: AppLoginDraft): Jeg
     attempt_id: attemptId, username: draft.username.trim(), password: draft.password,
     country_code: draft.mode === 'phone' ? draft.country.trim().replace(/^\+/, '') : null,
     intent: draft.intent ?? 'enable_hosting', consent: draft.consent, start_receiver: draft.startReceiver,
+    ...(draft.deviceMode === 'manual' ? { device_id: (draft.deviceId ?? '').trim() } : {}),
   }
 }
 
@@ -69,12 +78,17 @@ const errors: Record<string, string> = {
   app_login_session_revoked: 'App 会话已被服务撤销，请确认其他设备登录情况。',
   app_login_service_maintenance: '无忧行服务当前维护中。',
   app_login_phone_binding_required: '账号没有返回可用的已绑定手机号码。',
-  app_login_identity_mismatch: '返回的绑定号码与本次手机号登录输入不一致，已停止。',
+  app_login_identity_mismatch: '返回的绑定号码与本次输入或该设备标识原绑定的号码不一致，已停止，未修改托管业务。',
   app_login_native_configuration_invalid: '原生接收配置不完整或不受支持，未提交业务开通。',
   app_login_account_creation_failed: '本地账号保存失败；请先核对任务中的远端业务结果。',
   app_login_receiver_start_failed: '账号已保存，但接收器启动失败；请查看独立账号状态。',
   app_login_version_discovery_failed: '未能从 App Store 或官方页面取得版本号；请手工填写后保存。',
-  app_login_device_untrusted: '服务端判定本机不是已授信设备（506）；需要在服务端完成设备授信后才能开启托管。',
+  app_login_device_identity_conflict: '该标识已分配或保留给另一身份，或与本账号现有标识不一致。请勿复用他人标识；更换现有标识请使用下方设备标识管理。',
+  app_login_device_identity_revision_conflict: '设备标识已被其他操作修改，请刷新后再保存。',
+  app_login_device_identity_not_found: '设备标识已不存在，请刷新列表。',
+  app_login_device_identity_limit: '设备标识或历史保留记录已达上限，请管理员核对；不会覆盖旧绑定。',
+  app_login_device_identity_in_use: '有登录任务、接收器或未完成的清理正在使用该标识，请等待任务结束并停止接收器后再修改。',
+  app_login_device_untrusted: '服务端判定本机不是已授信设备（506）；生成或更换设备标识不等于通过一键验证，需要服务端完成设备授信。',
   app_login_business_not_enabled: '该账号的托管业务尚未开启；无法从本机开启（服务端要求安全设备认证），请先在手机 App 开启托管，或在手机 App 上完成开通后再重试。',
   app_login_business_unconfirmed: '开通请求已被接受，但未确认业务状态；未启动接收器。',
   app_login_rate_limited: '服务请求过于频繁，请勿自动重复登录。',

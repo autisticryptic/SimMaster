@@ -221,6 +221,7 @@ fn full_database_private_mirror_roundtrip_retains_runtime_without_personal_login
     expected["http"]["app_version_web_url"] = Value::Null;
     expected["http"]["app_version_ios_app_id"] = Value::Null;
     expected["http"]["app_version_store"] = json!(false);
+    expected["http"]["device_identity_mode"] = json!("store");
     expected["http"]["endpoints"]["verification_trustful_device"] = Value::Null;
     expected["http"]["endpoints"]["device_enroll"] = Value::Null;
     expected["http"]["endpoints"]["security_verify"] = Value::Null;
@@ -931,4 +932,196 @@ async fn attach_hosting_never_writes_the_business_switch_and_fails_closed_when_i
     assert_eq!(accounts.len(),1);
     assert_eq!(accounts[0].voice_line_id,None);
     assert_redacted(&view);
+}
+#[test]
+fn device_identity_is_generated_once_per_account_and_never_shared() {
+    use super::device_identity as device;
+    let conn=rusqlite::Connection::open_in_memory().unwrap();
+    accounts::initialize(&conn).unwrap();device::initialize(&conn).unwrap();
+    let key=|value:&str|ring::digest::digest(&ring::digest::SHA256,value.as_bytes()).as_ref().to_vec();
+    let reserve=|alias:&[u8],preferred:Option<&str>| {
+        let tx=rusqlite::Transaction::new_unchecked(&conn,rusqlite::TransactionBehavior::Immediate).unwrap();
+        let value=device::resolve(&tx,alias,preferred,None,100).unwrap();tx.commit().unwrap();value
+    };
+    let first=reserve(&key("account-a"),None);let second=reserve(&key("account-b"),None);
+    assert_ne!(first.device_id.expose_to_backend(),second.device_id.expose_to_backend());
+    assert_eq!(reserve(&key("account-a"),None).id,first.id);
+    let value=first.device_id.expose_to_backend();assert_eq!(value.len(),36);
+    assert!(value.chars().all(|c|c.is_ascii_digit()||c=='-'||('A'..='F').contains(&c)));
+    device::set(&conn,None,0,Some(&key("number-c")),Some("PHONE-DEVICE-0001"),103).unwrap();
+    let provisional=reserve(&key("account-c"),None);
+    let tx=rusqlite::Transaction::new_unchecked(&conn,rusqlite::TransactionBehavior::Immediate).unwrap();
+    let manual=device::confirm(&tx,&key("account-c"),&provisional,&key("number-c"),104).unwrap();tx.commit().unwrap();
+    assert_eq!(manual.device_id.expose_to_backend(),"PHONE-DEVICE-0001");
+    assert_eq!(reserve(&key("account-c"),None).id,manual.id);
+    assert_eq!(device::set(&conn,None,0,Some(&key("number-a")),Some("PHONE-DEVICE-0001"),105).unwrap_err().code,"app_login_device_identity_conflict");
+    device::set(&conn,None,0,None,Some("POOL-VALUE-0001"),106).unwrap();
+    // A prepared value is used only when explicitly selected, not handed to a
+    // random unrelated login from a global free pool.
+    let selected=reserve(&key("account-d"),Some("POOL-VALUE-0001"));
+    assert_eq!(selected.device_id.expose_to_backend(),"POOL-VALUE-0001");
+    let rows=device::list(&conn).unwrap();assert!(rows.iter().any(|r|r.device_id=="PHONE-DEVICE-0001" && r.source=="manual"));
+    device::remove(&conn,&selected.id,selected.revision,107).unwrap();
+    assert_eq!(device::remove(&conn,&selected.id,selected.revision,108).unwrap_err().code,"app_login_device_identity_revision_conflict");
+}
+#[test]
+fn device_identity_values_and_modes_are_validated() {
+    let conn=rusqlite::Connection::open_in_memory().unwrap();
+    super::device_identity::initialize(&conn).unwrap();
+    for bad in ["","short","has space","bad:colon","x".repeat(65).as_str()] {
+        assert!(super::device_identity::set(&conn,None,0,None,Some(bad),1).is_err(),"{bad}");
+    }
+    for good in ["PHONE-DEVICE-0001","0123456789abcdef","A_B-C_09"] {
+        assert!(super::device_identity::valid_device_id(good),"{good}");
+    }
+    let mut value=deployment_json("AA==",false);
+    value["http"].as_object_mut().unwrap().remove("device_id");
+    let default:config::HttpDeployment=serde_json::from_value(value["http"].clone()).unwrap();
+    assert_eq!(default.device_identity_mode,config::DeviceIdentityMode::Store);assert_eq!(default.validate(),Ok(()));
+    value["http"]["device_identity_mode"]=json!("static");
+    let missing:config::HttpDeployment=serde_json::from_value(value["http"].clone()).unwrap();assert!(missing.validate().is_err());
+    value["http"]["device_id"]=json!("fixture-device-id");
+    let strict:config::HttpDeployment=serde_json::from_value(value["http"].clone()).unwrap();
+    assert_eq!(strict.device_identity_mode,config::DeviceIdentityMode::Static);assert_eq!(strict.validate(),Ok(()));
+    value["http"]["device_identity_mode"]=json!("sometimes");
+    assert!(serde_json::from_value::<config::HttpDeployment>(value["http"].clone()).is_err());
+}
+#[tokio::test]
+async fn resolved_device_identity_overrides_the_static_value_for_every_app_call() {
+    let mut value=deployment_json("AA==",false);
+    value["http"]["endpoints"]["device_enroll"]=json!("enroll");
+    value["http"]["endpoints"]["security_verify"]=json!("security");
+    value["http"]["endpoints"]["verification_trustful_device"]=json!("trust");
+    let cfg:HttpDeployment=serde_json::from_value(value["http"].clone()).unwrap();
+    let script=Arc::new(Script::new(vec![
+        reply("/enroll",json!({"code":0,"body":{"enrollId":"fixture-enroll-0009","expireTime":"2030-01-01 00:00:00"}})),
+        reply("/login",json!({"code":"0","body":{"token":"fixture-app-session","expiredAt":0}})),
+        reply("/security",json!({"code":0,"body":{"authentication_code":2}})),
+        reply("/trust",json!({"code":0,"body":{"authentication_code":2}})),
+        reply("/state",json!({"code":0,"body":{"cs_forward":"1"}})),
+        reply("/enable",json!({"code":506,"body":{}})),
+    ],false));
+    let mut client=Factory(script.clone()).build(&cfg).unwrap().with_device_id("PHONE-DEVICE-0001");
+    client.ensure_device_enrollment().await;client.login(&login_request(&id())).await.unwrap();
+    assert_eq!(client.security_verify_device().await.unwrap().unwrap().authentication_code,Some(2));
+    assert_eq!(client.verify_trusted_device().await.unwrap().unwrap().authentication_code,Some(2));
+    assert!(!client.business_enabled().await.unwrap());assert_eq!(client.enable_business().await.unwrap_err().server_code,Some(506));
+    let seen=lock(&script.seen);
+    for index in [0,2] {assert_eq!(seen[index].body["deviceId"],"PHONE-DEVICE-0001");}
+    for index in [3,4,5] {assert_eq!(seen[index].body["device_id"],"PHONE-DEVICE-0001");}
+}
+
+fn device_write(id:Option<&str>,revision:u64,account:Option<&str>,value:Option<&str>)->DeviceIdentityWriteRequest {
+    DeviceIdentityWriteRequest {id:id.map(str::to_owned),expected_revision:revision,account_id:account.map(str::to_owned),
+        device_id:value.map(|v|Secret::from_owned(v.to_owned()))}
+}
+fn device_fixture_configuration(f:&Fixture,enroll:bool)->DatabaseConfiguration {
+    let mut configuration=database_configuration(f,false);
+    configuration.http.device_id=Secret::from_owned(String::new());
+    if enroll {configuration.http.endpoints.device_enroll=Some("enroll".to_owned());}
+    configuration
+}
+fn enrolled_auth_steps()->Vec<Step> {
+    let mut steps=vec![reply("/enroll",json!({"code":0,"body":{"enrollId":"fixture-enrolled-id"}}))];
+    steps.extend(app_only_steps());steps
+}
+fn device_rows(f:&Fixture,table:&str)->i64 {
+    f.temp.database.with_conn(|c|c.query_row(&format!("SELECT COUNT(*) FROM {table}"),[],|r|r.get(0)).map_err(|_|"fixture_query_failed")).unwrap()
+}
+#[test]
+fn device_mode_is_kept_in_the_private_configuration_roundtrip_without_changing_sdk_identity() {
+    let f=Fixture::new(vec![],false);let mut configuration=database_configuration(&f,true);
+    configuration.http.device_identity_mode=config::DeviceIdentityMode::Static;
+    let restored=DatabaseConfiguration::decode_private(&configuration.encode_private().unwrap()).unwrap();
+    assert_eq!(restored.http.device_identity_mode,config::DeviceIdentityMode::Static);
+    assert_eq!(restored.runtime.unwrap().sdk.device_id.unwrap().expose_to_backend(),"fixture-original-device");
+}
+#[test]
+fn device_login_alias_keys_are_realm_scoped_and_normalize_only_the_existing_login_identity() {
+    let script=Arc::new(Script::new(vec![],false));let cfg=http_config(false);
+    let client=Factory(script.clone()).build(&cfg).unwrap();let request=login_request(&id());
+    let first=client.login_alias_key(&request).unwrap();
+    let mut same=login_request(&id());same.username=Secret::from_owned("USER@example.invalid".into());
+    assert_eq!(first,client.login_alias_key(&same).unwrap());
+    let mut other=cfg;other.base_url=Secret::from_owned("https://other-realm.invalid/".into());
+    assert_ne!(first,Factory(script).build(&other).unwrap().login_alias_key(&request).unwrap());
+}
+#[tokio::test]
+async fn account_level_manual_device_update_is_reused_by_the_next_login_not_a_different_lookup_key() {
+    let mut steps=enrolled_auth_steps();steps.extend(enrolled_auth_steps());
+    let f=Fixture::new(steps,false);f.manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration:device_fixture_configuration(&f,true)}).unwrap();
+    let first=id();let mut request=app_only_request(&first);request.device_id=Some(Secret::from_owned("OWN-MANUAL-0001".into()));
+    f.manager.submit_jegotrip(request).unwrap();let view=terminal(&f.manager,&first).await;assert_eq!(view.phase,"completed");assert_redacted(&view);
+    let stored=f.manager.device_identities().unwrap().identities.remove(0);assert_eq!(stored.device_id,"OWN-MANUAL-0001");
+    assert_eq!(stored.bound_account_id,view.account_id);assert_eq!(stored.masked_number.as_deref(),Some("***0123"));
+    let updated=f.manager.set_device_identity(device_write(Some(&stored.id),stored.revision,view.account_id.as_deref(),Some("OWN-MANUAL-0002"))).unwrap();
+    assert_eq!(updated.identities[0].revision,stored.revision+1);
+    let second=id();f.manager.submit_jegotrip(app_only_request(&second)).unwrap();assert_eq!(terminal(&f.manager,&second).await.phase,"completed");
+    let seen=lock(&f.script.seen);assert_eq!(seen[0].body["deviceId"],"OWN-MANUAL-0001");assert_eq!(seen[3].body["deviceId"],"OWN-MANUAL-0002");
+    assert_eq!(f.manager.app_accounts().unwrap().len(),1);assert_eq!(f.factory.build_count(),0);
+}
+#[tokio::test]
+async fn another_login_alias_reauthenticates_once_with_the_confirmed_numbers_existing_device() {
+    let mut steps=enrolled_auth_steps();steps.extend(enrolled_auth_steps());steps.extend(enrolled_auth_steps());
+    let f=Fixture::new(steps,false);f.manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration:device_fixture_configuration(&f,true)}).unwrap();
+    let first=id();f.manager.submit_jegotrip(app_only_request(&first)).unwrap();assert_eq!(terminal(&f.manager,&first).await.phase,"completed");
+    let original=f.manager.device_identities().unwrap().identities.remove(0);
+    let second=id();let mut request=app_only_request(&second);request.username=Secret::from_owned("second-alias@example.invalid".into());
+    f.manager.submit_jegotrip(request).unwrap();let result=terminal(&f.manager,&second).await;assert_eq!(result.phase,"completed");assert_redacted(&result);
+    let seen=lock(&f.script.seen);assert_ne!(seen[3].body["deviceId"],original.device_id);assert_eq!(seen[6].body["deviceId"],original.device_id);
+    drop(seen);
+    assert_eq!(f.script.paths(),["/enroll","/login","/user","/enroll","/login","/user","/enroll","/login","/user"]);
+    assert_eq!(f.manager.app_accounts().unwrap().len(),1);assert_eq!(f.manager.device_identities().unwrap().identities.len(),1);
+    assert_eq!(device_rows(&f,"jegotrip_device_aliases"),2);assert_eq!(f.factory.build_count(),0);
+}
+#[tokio::test]
+async fn a_changed_server_number_does_not_rebind_a_used_device_or_reach_credentials_and_business() {
+    let mut steps=app_only_steps();let mut changed=app_only_steps();
+    changed[1]=reply("/user",json!({"code":0,"body":{"mobile":"7700900999","country_code":"44"}}));steps.extend(changed);
+    let f=Fixture::new(steps,false);f.manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration:device_fixture_configuration(&f,false)}).unwrap();
+    let first=id();f.manager.submit_jegotrip(app_only_request(&first)).unwrap();let old=terminal(&f.manager,&first).await;assert_eq!(old.phase,"completed");
+    let stored=f.manager.device_identities().unwrap().identities.remove(0);
+    let next=id();f.manager.submit_jegotrip(app_only_request(&next)).unwrap();let failed=terminal(&f.manager,&next).await;
+    assert_eq!(failed.error,Some("app_login_identity_mismatch"));assert_eq!(failed.business_state,"not_requested");assert_redacted(&failed);
+    assert_eq!(f.script.paths(),["/login","/user","/login","/user"]);let still=f.manager.device_identities().unwrap().identities.remove(0);
+    assert_eq!(still.device_id,stored.device_id);assert_eq!(still.bound_account_id,old.account_id);assert_eq!(still.revision,stored.revision);
+}
+#[tokio::test]
+async fn device_mutations_are_blocked_during_login_and_busy_admission_does_not_allocate_more_ids() {
+    let f=Fixture::new(vec![Step::Park("/login".into())],false);
+    f.manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration:device_fixture_configuration(&f,false)}).unwrap();
+    let original=id();f.manager.submit_jegotrip(app_only_request(&original)).unwrap();
+    tokio::time::timeout(Duration::from_secs(3),async {while f.script.paths().is_empty(){tokio::task::yield_now().await;}}).await.unwrap();
+    let row=f.manager.device_identities().unwrap().identities.remove(0);assert!(row.in_use);
+    assert_eq!(f.manager.set_device_identity(device_write(Some(&row.id),row.revision,None,Some("OWN-CHANGED-0001"))).err().unwrap().code,"app_login_device_identity_in_use");
+    assert_eq!(f.manager.delete_device_identity(&row.id,row.revision).err().unwrap().code,"app_login_device_identity_in_use");
+    assert_eq!(f.manager.submit_jegotrip(app_only_request(&id())).unwrap_err().code,"app_login_busy");
+    assert_eq!(device_rows(&f,"jegotrip_device_identities"),1);assert_eq!(device_rows(&f,"jegotrip_device_aliases"),1);
+    f.manager.shutdown().await;assert_eq!(f.manager.get(&original).unwrap().error,Some("app_login_interrupted"));
+    assert!(!f.manager.device_identities().unwrap().identities[0].in_use);
+    assert_eq!(f.manager.set_device_identity(device_write(None,0,None,None)).err().unwrap().code,"app_login_shutting_down");
+}
+#[tokio::test]
+async fn failed_durable_attempt_admission_rolls_back_device_alias_and_history_allocation() {
+    let f=Fixture::new(vec![],false);
+    f.manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration:device_fixture_configuration(&f,false)}).unwrap();
+    f.temp.database.with_conn(|c|c.execute_batch("CREATE TRIGGER fixture_reject_device_attempt BEFORE INSERT ON jegotrip_login_attempts BEGIN SELECT RAISE(ABORT,'fixture'); END;")
+        .map_err(|_|"fixture_setup_failed")).unwrap();
+    assert_eq!(f.manager.submit_jegotrip(app_only_request(&id())).unwrap_err().code,"app_login_storage_failed");
+    for table in ["jegotrip_device_identities","jegotrip_device_aliases","jegotrip_device_identity_history"] {assert_eq!(device_rows(&f,table),0);}
+    assert!(f.script.paths().is_empty());assert!(f.manager.list().unwrap().is_empty());
+}
+#[tokio::test]
+async fn concurrent_aliases_cannot_borrow_the_same_canonical_device_before_the_original_attempt_finishes() {
+    let mut steps=app_only_steps();steps.push(Step::Park("/csb/token".into()));steps.extend(app_only_steps());
+    let f=Fixture::new(steps,false);let mut configuration=database_configuration(&f,true);configuration.http.device_id=Secret::from_owned(String::new());
+    f.manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration}).unwrap();
+    let first=id();let mut request=app_only_request(&first);request.intent=LoginIntent::AttachHosting;request.start_receiver=false;
+    f.manager.submit_jegotrip(request).unwrap();
+    tokio::time::timeout(Duration::from_secs(3),async {while !f.script.paths().contains(&"/csb/token".to_owned()){tokio::task::yield_now().await;}}).await.unwrap();
+    let next=id();let mut request=app_only_request(&next);request.username=Secret::from_owned("other-alias@example.invalid".into());
+    f.manager.submit_jegotrip(request).unwrap();let result=terminal(&f.manager,&next).await;
+    assert_eq!(result.error,Some("app_login_busy"));assert_eq!(result.business_state,"not_requested");assert_redacted(&result);
+    assert_eq!(f.script.paths(),["/login","/user","/csb/token","/login","/user"]);
+    assert_eq!(f.manager.app_accounts().unwrap().len(),1);f.manager.shutdown().await;
 }

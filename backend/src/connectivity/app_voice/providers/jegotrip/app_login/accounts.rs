@@ -23,25 +23,32 @@ pub(super) fn initialize(conn:&Connection)->Result<(),&'static str> {
         voice_line_id TEXT
     );").map_err(|_|STORAGE)
 }
-fn valid_mask(mask:&str)->bool {
+pub(super) fn valid_mask(mask:&str)->bool {
     mask.starts_with("***") && mask.len()<=7 && mask[3..].bytes().all(|b|b.is_ascii_digit())
+}
+fn valid_hint(hint:&str)->bool {
+    hint.strip_suffix("***").is_some_and(|prefix|prefix.chars().count()==1 && !prefix.chars().any(char::is_control))
 }
 fn decode(row:&rusqlite::Row<'_>)->rusqlite::Result<JegotripAccountView> {
     let id:String=row.get(0)?;let hint:String=row.get(1)?;let number:String=row.get(2)?;
-    let revision:i64=row.get(4)?;
-    if !valid_attempt_id(&id) || hint.is_empty() || hint.len()>64 || hint.chars().any(char::is_control)
-        || !valid_mask(&number) || revision<0 {return Err(rusqlite::Error::InvalidQuery);}
+    let revision:i64=row.get(4)?;let line:Option<String>=row.get(5)?;
+    if !valid_attempt_id(&id) || !valid_hint(&hint) || !valid_mask(&number) || revision<0
+        || line.as_ref().is_some_and(|v|!super::super::account_store::valid_line_id(v)) {return Err(rusqlite::Error::InvalidQuery);}
     Ok(JegotripAccountView {account_id:id,masked_login_name:hint,masked_number:number,
-        last_authenticated_at:row.get(3)?,configuration_revision:revision as u64,voice_line_id:row.get(5)?})
+        last_authenticated_at:row.get(3)?,configuration_revision:revision as u64,voice_line_id:line})
 }
-const COLUMNS:&str="account_id,masked_login_name,masked_number,last_authenticated_at,configuration_revision,voice_line_id";
+const COLUMNS:&str="CASE WHEN typeof(account_id)='text' AND length(CAST(account_id AS BLOB))=32 THEN account_id END,
+    CASE WHEN typeof(masked_login_name)='text' AND length(CAST(masked_login_name AS BLOB)) BETWEEN 4 AND 7 THEN masked_login_name END,
+    CASE WHEN typeof(masked_number)='text' AND length(CAST(masked_number AS BLOB)) BETWEEN 3 AND 7 THEN masked_number END,
+    last_authenticated_at,configuration_revision,
+    CASE WHEN voice_line_id IS NULL THEN NULL WHEN typeof(voice_line_id)='text' AND length(CAST(voice_line_id AS BLOB))=44 THEN voice_line_id ELSE '' END";
 pub(super) fn list(conn:&Connection)->Result<Vec<JegotripAccountView>,&'static str> {
     let mut stmt=conn.prepare(&format!("SELECT {COLUMNS} FROM jegotrip_accounts ORDER BY last_authenticated_at DESC,rowid DESC LIMIT 64")).map_err(|_|STORAGE)?;
     let rows=stmt.query_map([],decode).map_err(|_|STORAGE)?;
     rows.collect::<Result<Vec<_>,_>>().map_err(|_|STORAGE)
 }
 pub(super) fn record(conn:&Connection,key:&[u8],hint:&str,mask:&str,revision:u64,now:i64)->Result<String,Error> {
-    if key.len()!=32 || hint.is_empty() || hint.len()>64 || hint.chars().any(char::is_control)
+    if key.len()!=32 || !valid_hint(hint)
         || !valid_mask(mask) || revision>i64::MAX as u64 {return Err(Error::new(STORAGE));}
     let tx=rusqlite::Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(|_|Error::new(STORAGE))?;
     let old:Option<String>=tx.query_row("SELECT account_id FROM jegotrip_accounts WHERE identity_key=?1",[key],|r|r.get(0)).optional().map_err(|_|Error::new(STORAGE))?;
@@ -63,4 +70,13 @@ pub(super) fn record(conn:&Connection,key:&[u8],hint:&str,mask:&str,revision:u64
 pub(super) fn link_voice_line(conn:&Connection,id:&str,line:&str)->Result<(),&'static str> {
     let changed=conn.execute("UPDATE jegotrip_accounts SET voice_line_id=?1 WHERE account_id=?2",params![line,id]).map_err(|_|STORAGE)?;
     if changed==1 {Ok(())}else{Err(STORAGE)}
+}
+/// Only the stored identity key, used to bind a durable device identity to an
+/// existing account without exposing the key through any API.
+pub(super) fn identity_key(conn:&Connection,account_id:&str)->Result<Option<Vec<u8>>,&'static str> {
+    if !valid_attempt_id(account_id) { return Err("app_login_request_invalid"); }
+    let key: Option<Vec<u8>>=conn.query_row("SELECT CASE WHEN typeof(identity_key)='blob' AND length(identity_key)=32 THEN identity_key END FROM jegotrip_accounts WHERE account_id=?1",[account_id],|row|row.get(0))
+        .optional().map_err(|_|STORAGE)?;
+    if key.as_ref().is_some_and(|k| k.len()!=32) { return Err(STORAGE); }
+    Ok(key)
 }

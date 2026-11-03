@@ -23,5 +23,5 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["e2e", "tests", "playwright.config.ts", "playwright.esim.config.ts"]
+  "include": ["e2e", "tests", "playwright.config.ts", "playwright.esim.config.ts", "playwright.jegotrip.config.ts"]
 }

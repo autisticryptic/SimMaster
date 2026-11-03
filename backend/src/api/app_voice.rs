@@ -6,13 +6,13 @@ use axum::{
     extract::{rejection::{JsonRejection, QueryRejection}, DefaultBodyLimit, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post}, Json, Router,
+    routing::{delete, get, post}, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use crate::{
     api::models::ApiResponse,
-    connectivity::app_voice::providers::jegotrip::{account_config::AccountConfig, account_runtime::AccountManager, app_login::{AppLoginManager, LoginRequest, JegotripLoginRequest, ConfigurationWriteRequest, AppVersionWriteRequest}, PROVIDER_ID},
+    connectivity::app_voice::providers::jegotrip::{account_config::AccountConfig, account_runtime::AccountManager, app_login::{AppLoginManager, LoginRequest, JegotripLoginRequest, ConfigurationWriteRequest, AppVersionWriteRequest, DeviceIdentityWriteRequest}, PROVIDER_ID},
     state::AppState,
 };
 
@@ -48,6 +48,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/jegotrip/login/setup", get(app_login_setup))
         .route("/api/jegotrip/app-version", get(jegotrip_app_version).put(jegotrip_set_app_version))
         .route("/api/jegotrip/app-version/refresh", post(jegotrip_refresh_app_version))
+        .route("/api/jegotrip/device-identities", get(jegotrip_device_identities).put(jegotrip_set_device_identity))
+        .route("/api/jegotrip/device-identities/{id}", delete(jegotrip_delete_device_identity))
         .route("/api/jegotrip/login/attempts", get(app_login_attempts).post(jegotrip_login_submit))
         .route("/api/jegotrip/login/attempts/{attempt_id}", get(app_login_attempt))
         .route("/api/non-3gpp/app-login/setup", get(app_login_setup))
@@ -76,12 +78,13 @@ fn no_store(mut response: Response) -> Response {
 }
 fn error_status(code: &str) -> StatusCode {
     match code {
-        "app_login_attempt_exists" | "app_login_configuration_revision_conflict" | "app_login_migration_conflict" => StatusCode::CONFLICT,
-        "app_login_busy" | "app_login_attempt_limit" | "app_login_account_limit" | "app_login_rate_limited" => StatusCode::TOO_MANY_REQUESTS,
+        "app_login_attempt_exists" | "app_login_configuration_revision_conflict" | "app_login_migration_conflict"
+            | "app_login_device_identity_conflict" | "app_login_device_identity_revision_conflict" | "app_login_device_identity_in_use" => StatusCode::CONFLICT,
+        "app_login_busy" | "app_login_attempt_limit" | "app_login_account_limit" | "app_login_rate_limited" | "app_login_device_identity_limit" => StatusCode::TOO_MANY_REQUESTS,
         "app_login_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_login_unavailable" | "app_login_deployment_missing" | "app_login_deployment_invalid"
-            | "app_login_native_configuration_missing" | "app_login_shutting_down" => StatusCode::SERVICE_UNAVAILABLE,
-        "app_account_not_found" | "app_account_call_not_found" => StatusCode::NOT_FOUND,
+            | "app_login_native_configuration_missing" | "app_login_shutting_down" | "app_login_entropy_failed" => StatusCode::SERVICE_UNAVAILABLE,
+        "app_account_not_found" | "app_account_call_not_found" | "app_login_device_identity_not_found" => StatusCode::NOT_FOUND,
         "app_account_revision_conflict" | "app_account_stop_before_replace" | "app_account_call_operation_pending" => StatusCode::CONFLICT,
         "app_account_provider_unsupported" | "app_account_outbound_unsupported" => StatusCode::NOT_IMPLEMENTED,
         "app_account_storage_failed" | "app_account_inbox_storage_failed" | "app_account_sms_storage_failed"
@@ -138,6 +141,19 @@ pub async fn jegotrip_refresh_app_version(State(manager):State<Arc<AppLoginManag
 pub async fn jegotrip_set_app_version(State(manager):State<Arc<AppLoginManager>>,request:Result<Json<AppVersionWriteRequest>,JsonRejection>)->Response {
     let Ok(Json(request))=request else{return failure("app_login_request_invalid");};
     match manager.set_app_version(&request.version) {Ok(view)=>success(StatusCode::OK,Ok(view)),Err(e)=>failure(e.code)}
+}
+/// Persisted App identities and honest number bindings, not trust credentials.
+pub async fn jegotrip_device_identities(State(manager):State<Arc<AppLoginManager>>)->Response {
+    success(StatusCode::OK,manager.device_identities().map_err(|e|e.code))
+}
+pub async fn jegotrip_set_device_identity(State(manager):State<Arc<AppLoginManager>>,request:Result<Json<DeviceIdentityWriteRequest>,JsonRejection>)->Response {
+    let Ok(Json(request))=request else{return failure("app_login_request_invalid");};
+    match manager.set_device_identity(request) {Ok(views)=>success(StatusCode::OK,Ok(views)),Err(e)=>failure(e.code)}
+}
+pub async fn jegotrip_delete_device_identity(State(manager):State<Arc<AppLoginManager>>,Path(id):Path<String>,
+    request:Result<Query<RevisionRequest>,QueryRejection>)->Response {
+    let Ok(Query(request))=request else{return failure("app_login_request_invalid");};
+    match manager.delete_device_identity(&id,request.expected_revision) {Ok(views)=>success(StatusCode::OK,Ok(views)),Err(e)=>failure(e.code)}
 }
 pub async fn jegotrip_login_submit(State(manager):State<Arc<AppLoginManager>>,request:Result<Json<JegotripLoginRequest>,JsonRejection>)->Response {
     let Ok(Json(request))=request else{return failure("app_login_request_invalid");};

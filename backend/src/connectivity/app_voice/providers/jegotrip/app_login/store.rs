@@ -52,6 +52,7 @@ pub(super) fn initialize(conn:&Connection,owner:&str,now:i64)->Result<(),&'stati
     }
     super::settings::initialize(&tx)?;
     super::accounts::initialize(&tx)?;
+    super::device_identity::initialize(&tx)?;
     // Caller holds the original database OS lock; no PID/age guessing, replay
     // or schema-level manipulation of SIM/IMS/history/application run tables.
     tx.execute("UPDATE jegotrip_login_attempts SET phase='interrupted',completed=1,error='app_login_interrupted',updated_at=?1
@@ -62,16 +63,25 @@ fn decode(row:&rusqlite::Row<'_>)->rusqlite::Result<AttemptView> {
     let id:String=row.get(0)?;let phase:String=row.get(1)?;let business:String=row.get(2)?;
     let error:Option<String>=row.get(6)?;let masked:Option<String>=row.get(5)?;
     let intent:String=row.get(10)?;let account_id:Option<String>=row.get(11)?;
-    let intent=LoginIntent::parse(&intent).ok_or(rusqlite::Error::InvalidQuery)?;
+    let intent=LoginIntent::parse(&intent).ok_or(rusqlite::Error::InvalidQuery)?;let line:Option<String>=row.get(4)?;
     if !valid_attempt_id(&id) || !PHASES.contains(&phase.as_str()) || !BUSINESS.contains(&business.as_str())
+        || line.as_ref().is_some_and(|v|!super::super::account_store::valid_line_id(v))
         || account_id.as_ref().is_some_and(|s|!valid_attempt_id(s))
         || masked.as_ref().is_some_and(|s|!s.starts_with("***") || s.len()>7 || !s[3..].bytes().all(|b|b.is_ascii_digit())) {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    Ok(AttemptView {attempt_id:id,phase,business_state:business,completed:row.get::<_,i64>(3)?!=0,line_id:row.get(4)?,masked_number:masked,
+    Ok(AttemptView {attempt_id:id,phase,business_state:business,completed:row.get::<_,i64>(3)?!=0,line_id:line,masked_number:masked,
         error:error.as_deref().map(|s|stored_code(s).unwrap_or(STORAGE)),server_code:row.get(7)?,created_at:row.get(8)?,updated_at:row.get(9)?,intent,account_id})
 }
-const COLUMNS:&str="attempt_id,phase,business_state,completed,line_id,masked_number,error,server_code,created_at,updated_at,intent,account_id";
+const COLUMNS:&str="CASE WHEN typeof(attempt_id)='text' AND length(CAST(attempt_id AS BLOB))=32 THEN attempt_id END,
+    CASE WHEN typeof(phase)='text' AND length(CAST(phase AS BLOB)) BETWEEN 1 AND 32 THEN phase END,
+    CASE WHEN typeof(business_state)='text' AND length(CAST(business_state AS BLOB)) BETWEEN 1 AND 32 THEN business_state END,completed,
+    CASE WHEN line_id IS NULL THEN NULL WHEN typeof(line_id)='text' AND length(CAST(line_id AS BLOB))=44 THEN line_id ELSE '' END,
+    CASE WHEN masked_number IS NULL THEN NULL WHEN typeof(masked_number)='text' AND length(CAST(masked_number AS BLOB)) BETWEEN 3 AND 7 THEN masked_number ELSE '' END,
+    CASE WHEN error IS NULL THEN NULL WHEN typeof(error)='text' AND length(CAST(error AS BLOB)) BETWEEN 1 AND 64 THEN error ELSE 'app_login_storage_failed' END,
+    server_code,created_at,updated_at,
+    CASE WHEN typeof(intent)='text' AND length(CAST(intent AS BLOB)) BETWEEN 1 AND 32 THEN intent END,
+    CASE WHEN account_id IS NULL THEN NULL WHEN typeof(account_id)='text' AND length(CAST(account_id AS BLOB))=32 THEN account_id ELSE '' END";
 pub(super) fn get(conn:&Connection,id:&str)->Result<Option<AttemptView>,&'static str> {
     conn.query_row(&format!("SELECT {COLUMNS} FROM jegotrip_login_attempts WHERE attempt_id=?1"),[id],decode).optional().map_err(|_|STORAGE)
 }
@@ -86,12 +96,17 @@ pub(super) fn insert(conn:&Connection,id:&str,owner:&str,now:i64)->Result<Attemp
 }
 pub(super) fn insert_with_intent(conn:&Connection,id:&str,owner:&str,intent:LoginIntent,now:i64)->Result<AttemptView,&'static str> {
     let tx=rusqlite::Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
-    if get(&tx,id)?.is_some() {return Err("app_login_attempt_exists");}
-    let count:i64=tx.query_row("SELECT COUNT(*) FROM jegotrip_login_attempts",[],|r|r.get(0)).map_err(|_|STORAGE)?;
+    let view=insert_admitted(&tx,id,owner,intent,now)?;
+    tx.commit().map_err(|_|STORAGE)?;Ok(view)
+}
+/// Caller owns the admission transaction, including any new device identity.
+pub(super) fn insert_admitted(conn:&Connection,id:&str,owner:&str,intent:LoginIntent,now:i64)->Result<AttemptView,&'static str> {
+    if get(conn,id)?.is_some() {return Err("app_login_attempt_exists");}
+    let count:i64=conn.query_row("SELECT COUNT(*) FROM jegotrip_login_attempts",[],|r|r.get(0)).map_err(|_|STORAGE)?;
     if count>=MAX_ATTEMPTS {return Err("app_login_attempt_limit");}
-    tx.execute("INSERT INTO jegotrip_login_attempts(attempt_id,owner,phase,intent,created_at,updated_at) VALUES(?1,?2,'queued',?3,?4,?4)",
+    conn.execute("INSERT INTO jegotrip_login_attempts(attempt_id,owner,phase,intent,created_at,updated_at) VALUES(?1,?2,'queued',?3,?4,?4)",
         params![id,owner,intent.as_str(),now]).map_err(|_|STORAGE)?;
-    let view=get(&tx,id)?.ok_or(STORAGE)?;tx.commit().map_err(|_|STORAGE)?;Ok(view)
+    get(conn,id)?.ok_or(STORAGE)
 }
 fn changed(n:usize)->Result<(),&'static str> {if n==1 {Ok(())}else{Err(STORAGE)}}
 pub(super) fn step(conn:&Connection,id:&str,owner:&str,phase:&str,business:Option<&str>,now:i64)->Result<(),&'static str> {

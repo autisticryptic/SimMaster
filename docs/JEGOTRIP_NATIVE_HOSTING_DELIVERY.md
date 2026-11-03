@@ -64,7 +64,7 @@ key/value 表，`jegotrip_shared_state`，`name='app_version'`），一行记录
 
 ```jsonc
 "app_version": "8.9.8.0",                                    // 静态/兜底值
-"app_version_file": "/opt/simadmin/jegotrip-app-version.txt", // 每次请求重读
+"app_version_file": null, // 若改为绝对路径，须同时将 app_version 置为 null
 "app_version_web_url": "https://www.jegotrip.cn/m/mobileIndex.html", // 官方页面
 "app_version_ios_app_id": "1037589370",                      // iOS App Store 数字 id
 "app_version_store": true,                                    // 允许写入共享状态表
@@ -114,7 +114,7 @@ value ≤256 且不含控制字符；`n_token`/`lang`/`timestamp`/`sign`/`token`
 字段：
 
 ```json
-{ "sso_token": "<登录后拿到的 App token>", "equipment_type": 1, "device_id": "<设备标识>" }
+{ "sso_token": "<原 App 回调提供的认证 token，来源仍须核对>", "equipment_type": 1, "device_id": "<设备标识>" }
 ```
 
 对应的服务端路径（APK 内端点目录 `JegoTripApi.<clinit>`）是
@@ -125,9 +125,9 @@ SimAdmin 的实现方式：
 - 部署配置新增**可选**端点（三者都缺省时行为与以前完全一致）：
   ```jsonc
   "endpoints": {
-    "device_enroll": "device/sec/v1/enroll",                          // 安全设备注册，body 只有 {"deviceId":…}
-    "security_verify": "service/voip/v1/securityVerify",               // 设备安全校验，body 只有 {"deviceId":…}
-    "verification_trustful_device": "service/voip/v1/verificationTrustfulDevice"
+    "device_enroll": "api/device/sec/v1/enroll", // 匿名调用，body 只有 {"deviceId":…}
+    "security_verify": "api/service/voip/v1/securityVerify", // body 只有 {"deviceId":…}
+    "verification_trustful_device": "api/service/voip/v1/verificationTrustfulDevice"
   }
   ```
 - 流程在 `csb/token` 之后、业务开关之前依次调用它们，并把服务端返回原样写成有界日志：
@@ -138,17 +138,15 @@ SimAdmin 的实现方式：
 - `setVoip` 返回 `506` 时，任务以专用错误码 `app_login_device_untrusted` 结束（前端有对应中文提示），
   不会退化成“通用拒绝”或伪造成功。
 
-**边界**：原 App 在 `authentication_code != 1` 时还有 `getToken()` 与运营商侧能力参与（静态确认存在），
-这部分**未实现**，也不会用假值绕过。410 实测：`verificationTrustfulDevice` 返回
-`authentication_code=2`（表示该 `device_id` 未被本账号授信），随后 `setVoip` 仍为 `506`；
-`device/sec/v1/enroll` 与 `securityVerify` 的 `{deviceId}` 调用已接入并可观测，但它们能否把设备
-变成授信设备取决于服务端策略，**未验证前不声称可用**。
-`enrollId` 只与登录侧一键登录有关（`AccoutLogic.oneKeyLogin/ssoLogin/thirdOneKeyLogin`），
-不是 `setVoip` 的授信凭证。静态证据见 `.local/jegotrip/device-trust-20261103/FINDINGS.md`。
+**边界**：HTTP 探针的存在不等于原 App 认证流程已完成。`querySafeDevice` 的 `sso_token` 从原 App
+`getToken` 回调传入，不能仅凭字段名认定为 App 登录会话。当前客户端以 App 会话做诊断性查询，
+尚未提供运营商号码认证凭证；服务端实测 `authentication_code=2`、`setVoip=506`。
+`enrollId` 已取得并用于登录，但不能把它当成设备授信凭证。静态证据见
+`.local/jegotrip/device-trust-20261103/`；任何合法替代验证路径也必须单独核验，不能伪造 token/验证通过。
 
 ### 2.2.6 已实测的授信结论（2026-11-03，410 + 真实服务）
 
-按原 App 顺序完整复现后，实测链路是：
+当前客户端已实际尝试的链路是（不等同于原 App 所有认证分支均已复刻）：
 
 ```
 ensure_app_version → device/sec/v1/enroll（匿名 n_token）→ 拿到 enrollId(32位)+expireTime
@@ -169,8 +167,9 @@ app_login_reject_fields endpoint=api/service/voip/v1/setVoip code=506 msg="未�
 即：**`enrollId` 已拿到并已随登录上报，但本设备仍未通过安全设备认证（`authentication_code=2`）**。
 APK 里承担这一步的是中国移动一键认证 SDK（`com.cmic.sso.sdk.auth.AuthnHelper`，封装在
 `com.cmi.mobile.auth.MobileAuthUtil`），`TrusteeShipVerActivitiy.getToken()` 的
-`receiveToken resultCode=` 就是它的回调。这一步需要**账号绑定号码的 SIM 在现场**（运营商网络侧校验），
-纯软件无法复制；本客户端不会伪造 token 或把 `authentication_code=2` 当成已授信。
+`receiveToken resultCode=` 是相关回调。认证 token、SIM/运营商通道和设备标识是不同材料；
+当前证据仅证明本客户端尚未通过授信，不能由字符串扫描推出所有账号/版本都只能用同一种验证方法。
+本客户端不会伪造 token，或把 `authentication_code=2` 当成已授信。
 
 因此 SimAdmin 提供**两种托管模式**（`intent`）：
 
@@ -187,9 +186,9 @@ phase: queued → checking_business → failed  error=app_login_business_not_ena
 business_state=not_requested   （证明没有任何写业务开关的请求）
 ```
 
-**结论**：代码侧已把原 App 的业务开通/接管链路补齐；剩下的唯一外部条件是“首次开启托管必须在
-手机 App 完成”（服务端安全设备认证要求绑定号码的 SIM）。开启后本机用 `attach_hosting` 即可接管：
-取 phone token/SIP 密码 → 建本地账号 → 启动原生接收器。
+**结论**：已实现并测试 HTTP 登录、授信查询和接管入口，但尚未通过真实服务的设备授信，
+也尚未完成真实账号的完整原生接收验收。手机 App 的合法开通可作为后续接管的前置条件；
+不能据此宣称“只差开通、后续必然成功”。开通后仍须逐项验证原生会话、短信、通话/媒体和停止清理。
 
 ### 2.2.7 已验收的真机结果（2026-11-03，`4ad682b9`）
 
@@ -202,7 +201,7 @@ business_state=not_requested   （证明没有任何写业务开关的请求）
 | 开启托管 `setVoip` | 仍 `506 未授信设备`（需手机侧一键认证） |
 | 接管 `intent=attach_hosting` | 正确拒绝：`app_login_business_not_enabled`，`business_state=not_requested`（零写入） |
 
-也就是说：**只要账号已在手机上开启了托管，本机就能完整接管后续接收**；开启这一步必须由手机完成。
+接管未开启业务的拒绝路径已通过实测；已开启业务的真实接收路径仍待验收，不能视为已经可用。
 
 ### 2.2.8 APK 能力 → SimAdmin 对照表（托管相关）
 
@@ -213,11 +212,11 @@ business_state=not_requested   （证明没有任何写业务开关的请求）
 | 电话 token | `service/voip/v1/csb/token` | ✅ 已实现 |
 | SIP 凭据 | `service/voip/v1/openVoipStatus` | ✅ 已实现（内存内 AES/MD5 解密） |
 | 托管状态 | `service/voip/v1/getCallStatus` | ✅ 已实现 |
-| 开启/关闭托管 | `service/voip/v1/setVoip` | ✅ 已实现；服务端 `506` 需设备授信 |
-| 安全设备注册 | `device/sec/v1/enroll` | ✅ 已实现（匿名调用，`enrollId` 随登录上报） |
-| 安全设备校验 | `service/voip/v1/securityVerify` | ✅ 已实现（上报 `authentication_code`） |
-| 可信设备查询 | `service/voip/v1/verificationTrustfulDevice` | ✅ 已实现 |
-| 一键认证（号码/SIM） | `com.cmic.sso.sdk.auth.AuthnHelper` / `MobileAuthUtil` | ⛔ 需绑定号码 SIM，纯软件不可替代 |
+| 开启托管（不自动关闭） | `service/voip/v1/setVoip` | 已实现请求/读回确认；真实服务仍 `506`，关闭业务未实现 |
+| 安全设备注册 | `device/sec/v1/enroll` | 已实现（匿名调用，`enrollId` 随登录上报） |
+| 安全设备校验 | `service/voip/v1/securityVerify` | 已实现 HTTP 查询，实测返回未授信 |
+| 可信设备查询 | `service/voip/v1/verificationTrustfulDevice` | 已实现诊断查询，原 App 认证 token 来源/授信尚未闭合 |
+| 一键认证（号码/SIM） | `com.cmic.sso.sdk.auth.AuthnHelper` / `MobileAuthUtil` | 未实现；不能由设备标识替代真实认证材料 |
 | 在线状态上报 | `api/service/voip/v1/setJegoMStatus` | ⛔ 未实现（UI 层在线上报，语义未确认） |
 | 号码服务开关 | `service/voip/v1/phoneService` | ⛔ 未实现（语义未确认，不是托管开关） |
 | App 退出 | `service/user/v1/logout` | ⛔ 未实现（本机不持久化 App 会话） |
@@ -230,7 +229,70 @@ business_state=not_requested   （证明没有任何写业务开关的请求）
 2. **SimAdmin**：登录方式选“接管已开启的托管（先在手机 App 开启）”，提交同一账号；此时服务端 `cs_forward=2`，程序会
    取 phone token / SIP 密码 → 建本地账号 → 启动原生接收器。
 3. 向托管号码发一条短信，在 SimAdmin 的短信列表确认入库（分类 `smgw_text`）。
-4. 在账号上执行 `stop`，确认注销 → App 退出 → 会话 stopped，且服务端托管开关保持开启（本机不关闭业务）。
+4. 在账号上执行 `stop`，确认原生注销 → SDK `logoutSession` → 会话 stopped，且服务端托管开关保持开启。
+   `stop` 不调用 App HTTP logout，也不关闭业务；这些 API 与原生会话清理是不同层。
+
+## 2.3 设备标识：默认随机、持久复用、手工指定
+
+这是**客户端标识管理**，不是绕过认证。一个标识不借给不同号码是本项目的隔离策略；朋友描述的
+服务端全局限制仍须实测，不能把此策略当作已证明的全部服务端规则。
+
+- **默认 `store`**：新安装不必填写 `http.device_id`。首次明确提交登录前生成大写 UUID v4 并落库；
+  同一登录身份在重试、密码更改和重启后复用。旧配置已有固定值时，仅首次保留原值，避免擅自旋转；
+  其他新账号仍独立生成，不共用旧值。
+- **按认证号码绑定**：预登录只记服务域 + 登录身份的哈希；登录成功并取得绑定号码后，才与规范账号 key
+  关联。一个号码的手机号/邮箱等别名收敛到同一标识。新别名若发现已有标识，会在任何电话 token、
+  授信或业务开关请求之前，以该标识重新认证一次；号码发生不一致则失败，不转移旧所有权。
+- **手工指定**：首次登录可选“手工指定自己的标识”，填写 8–64 位字母、数字、`_`、`-`。
+  已有标识更换必须用下方“设备标识管理”的版本守卫操作，不能用普通登录请求默默覆盖。
+- **配置兼容**：`http.device_identity_mode` 可为 `store`（默认）或 `static`。后者要求显式 `device_id`，
+  仍遵守同样的唯一性/号码隔离；不能把一个固定值交给多个号码使用。
+- **分层**：这里只管理 App HTTPS 的 `deviceId` / `device_id`。SDK 的显式设备参数、物理 IMEI、SIM、
+  IMS/NV 均不修改，不能假定它们与这个 UUID 相同。
+
+### 2.3.1 专用表和保护规则
+
+| 表 | 内容 |
+| --- | --- |
+| `jegotrip_device_identities` | 本地行 id、当前标识、生成来源、规范账号哈希、版本、弃用标记及时间 |
+| `jegotrip_device_aliases` | 登录域/登录别名的哈希 → 设备标识行（不保存明文账号、密码） |
+| `jegotrip_device_identity_history` | 旧标识的保留所有权，阻止改名/删除后被另一号码复用 |
+
+有效行≤64、别名≤256、历史值≤512；达到上限明确拒绝，不覆盖旧记录。列表及字段复制均有界，
+坏的持久化行会返回存储错误而非隐藏/反射秘密。设备值仅在鉴权后的页面/API 显示，Debug/错误不回显。
+
+同一事务完成标识预留和登录任务入库；繁忙/无效/存储失败的提交不会留下半份新标识。
+登录期间禁止修改标识；接收器的任何旧运行租约/未清理收件 fence 都会阻止旋转和弃用，
+不只检查最新 `voice_line_id`。改写使用 `expected_revision`；省略 `account_id` 不清空原号码绑定。
+删除是弃用记录，旧值不释放给别人，也不擅自停止接收器或关闭远端业务。
+
+### 2.3.2 鉴权 API / 中文 UI
+
+```text
+GET    /api/jegotrip/device-identities
+PUT    /api/jegotrip/device-identities
+DELETE /api/jegotrip/device-identities/{本地行id}?expected_revision=<版本>
+```
+
+PUT 示例（全新标识）：
+
+```jsonc
+{"id":null,"expected_revision":0,"account_id":null,"device_id":null} // 后端随机生成
+{"id":null,"expected_revision":0,"account_id":null,"device_id":"OWN-DEVICE-0001"} // 指定自己的值
+```
+
+修改已有行时提供页面返回的 `id` 和 `revision`，可选绑定已有账号 id；重复/跨号码占用、过期版本、
+使用中的修改分别返回明确冲突，绝不自动重试生成。返回只含标识、来源、脱敏号码及使用/版本元数据，
+不含账号 key、别名 key、密码、App/SIP token 或 SDK 配置。URL 使用本地行 id，不放真实设备值。
+
+登录页新增“自动生成/复用”和“手工指定”，下方可生成、指定、绑定、更新、弃用和刷新。
+已绑定账号下次自动复用；预先生成的未分配值只有在首次登录明确选择其值时才会使用，
+不会从全局空闲池随机借给另一个账号。页面关闭清空输入，不写浏览器存储。
+
+新增回归覆盖 SQLite 重开/并发、别名归并、换号拒绝、CAS/旧值保留、旧接收器 fence、坏行有界拒绝、
+真实鉴权管理路由和全部 App 设备字段一致性。两个工作流另外执行仅模拟 API 的桌面/手机 UI 测试；
+截图和报告保存在官方 `jegotrip-device-ui-*` 制品。它们与 410 的真实业务验收分开记录。
+相关本地收据/失败证据：`.local/jegotrip/device-identity-20261103/` 与 `verified-native-*.json`。
 
 ## 2. 受支持的配置形状（不含真实值）
 
@@ -300,9 +362,10 @@ business_state=not_requested   （证明没有任何写业务开关的请求）
 
 ## 4. 明确未完成 / 需单独授权的部分
 
-- **410 设备部署**：需要先核对 pinned host key、机器身份、架构、路径与当前状态，再部署
-  同 SHA 的 ARM64 后端/前端与私有配置；本文件不代表已部署。
-- **真实账号登录与托管验收**：需要用户自有有效凭据与自有号码，属于单独授权范围。
+- **410 设备部署**：使用用户授权的既有安全通道，核对 pinned host key、机器身份、架构及同 SHA 官方制品；
+  实际安装提交/运行哈希以 `.local/jegotrip/deploy-410-*/` 的守卫与复验收据为准，部署成功不等于业务可用。
+- **真实账号与托管验收**：App 登录/绑定号码已有实测；服务端授信/业务开启、原生接收短信/通话/媒体及
+  停止清理仍须分别验证。手机号认证材料不能由 UUID、enrollId、HTTP 200 或本地布尔值代替。
 - **真实服务语义未闭合项**：服务端是否强制要求 `registerAlive.AccountAlive.Account`
   （当前只做分类，不乐观注册）、`Mtc_UeSetStatus` 的状态取值、以及任何服务端并发/设备
   绑定规则。没有实测证据前不实现猜测行为。

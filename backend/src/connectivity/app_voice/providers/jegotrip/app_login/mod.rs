@@ -4,13 +4,16 @@ mod config;
 mod crypto;
 mod http;
 mod app_version;
+mod device_identity;
 mod store;
 mod settings;
 mod accounts;
 #[cfg(test)] mod tests;
+#[cfg(test)] mod device_identity_tests;
 
 pub(crate) use config::DatabaseConfiguration;
 pub(crate) use app_version::AppVersionView;
+pub(crate) use device_identity::DeviceIdentityState;
 pub use accounts::JegotripAccountView;
 use super::{account_runtime::AccountManager, account_config::AccountConfig};
 use futures_util::FutureExt;
@@ -30,6 +33,8 @@ const ERRORS: &[&str] = &[
     "app_login_timeout", "app_login_entropy_failed", "app_login_transport_failed",
     "app_login_response_invalid", "app_login_rate_limited", "app_login_server_rejected",
     "app_login_version_discovery_failed", "app_login_device_untrusted", "app_login_business_not_enabled",
+    "app_login_device_identity_conflict", "app_login_device_identity_revision_conflict", "app_login_device_identity_not_found",
+    "app_login_device_identity_limit", "app_login_device_identity_in_use",
     "app_login_verification_required", "app_login_migration_required", "app_login_existing_business_action_required",
     "app_login_session_revoked", "app_login_service_maintenance", "app_login_phone_binding_required",
     "app_login_identity_mismatch", "app_login_native_configuration_invalid", "app_login_business_unconfirmed",
@@ -97,6 +102,9 @@ pub struct JegotripLoginRequest {
     pub attempt_id:String, pub username:Secret, pub password:Secret,
     pub country_code:Option<String>, #[serde(default)] pub intent:LoginIntent,
     pub consent:bool, #[serde(default="default_start_receiver")] pub start_receiver:bool,
+    /// Optional explicit App identity for a new login alias; not a trust token.
+    /// Existing identities can only be changed through the revision-guarded API.
+    #[serde(default)] pub device_id:Option<Secret>,
 }
 impl fmt::Debug for JegotripLoginRequest {fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {f.write_str("JegotripLoginRequest(<redacted>)")}}
 #[derive(Deserialize)]
@@ -107,6 +115,16 @@ pub(crate) struct ConfigurationWriteRequest { pub expected_revision:u64, pub con
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AppVersionWriteRequest { pub version:String }
+/// Administrative CAS. A null device_id generates a random UUID. Omitting an
+/// account_id never clears/reassigns an existing canonical number binding.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeviceIdentityWriteRequest {
+    pub id:Option<String>, pub expected_revision:u64, pub account_id:Option<String>, pub device_id:Option<Secret>,
+}
+impl fmt::Debug for DeviceIdentityWriteRequest {
+    fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {f.write_str("DeviceIdentityWrite(<redacted>)")}
+}
 impl fmt::Debug for ConfigurationWriteRequest {fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {f.write_str("JegotripConfigurationWrite(<redacted>)")}}
 #[derive(Clone,Debug,Serialize)]
 pub struct ConfigurationView {
@@ -131,13 +149,26 @@ pub struct LoginSetup {
     pub configuration_source:&'static str, pub configuration_revision:u64,
     pub configuration_error:Option<&'static str>,
 }
-struct ActiveGuard { manager: Weak<AppLoginManager>, identity: Vec<u8>, _permit: OwnedSemaphorePermit }
-impl Drop for ActiveGuard { fn drop(&mut self) { if let Some(m) = self.manager.upgrade() { lock(&m.identities).remove(&self.identity); } } }
+#[derive(Default)]
+struct Admissions { aliases:BTreeSet<Vec<u8>>, devices:BTreeSet<String> }
+struct ActiveGuard {
+    manager:Weak<AppLoginManager>, alias:Vec<u8>, devices:BTreeSet<String>,
+    snapshot:device_identity::Snapshot, _permit:OwnedSemaphorePermit,
+}
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        if let Some(m)=self.manager.upgrade() {
+            let mut admissions=lock(&m.admissions);
+            admissions.aliases.remove(&self.alias);
+            for id in &self.devices {admissions.devices.remove(id);}
+        }
+    }
+}
 
 pub struct AppLoginManager {
     database: Arc<Database>, accounts: Weak<AccountManager>, owner: Mutex<Option<String>>,
     deployment_path: Mutex<Option<PathBuf>>, factory: Arc<dyn TransportFactory>,
-    active: Arc<Semaphore>, identities: Mutex<BTreeSet<Vec<u8>>>,
+    active: Arc<Semaphore>, admissions:Mutex<Admissions>,
     tasks: Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>,
     finalization_errors: Mutex<BTreeSet<String>>, closed: AtomicBool, changed: Notify,
 }
@@ -145,7 +176,7 @@ impl fmt::Debug for AppLoginManager { fn fmt(&self, f: &mut fmt::Formatter<'_>) 
 impl AppLoginManager {
     pub(crate) fn new(database: Arc<Database>, accounts: Weak<AccountManager>) -> Self {
         Self { database, accounts, owner: Mutex::new(None), deployment_path: Mutex::new(None), factory: Arc::new(LiveFactory),
-            active: Arc::new(Semaphore::new(2)), identities: Mutex::new(BTreeSet::new()), tasks: Mutex::new(BTreeMap::new()),
+            active: Arc::new(Semaphore::new(2)), admissions:Mutex::new(Admissions::default()), tasks: Mutex::new(BTreeMap::new()),
             finalization_errors: Mutex::new(BTreeSet::new()), closed: AtomicBool::new(false), changed: Notify::new() }
     }
     /// Only after the original manager acquired the database OS lock. Migration
@@ -207,8 +238,47 @@ impl AppLoginManager {
         if lock(&self.owner).is_none() {return Ok(Vec::new());}
         self.database.with_conn(accounts::list)
     }
-    /// Shared-state view of the App client version. Only the value and its
-    /// provenance are exported; no deployment secret is reachable from here.
+    /// Authenticated metadata only. No alias hash, username, password, App token
+    /// or native SDK material is reachable from this view.
+    pub(crate) fn device_identities(&self)->Result<DeviceIdentityState,Error> {
+        let initialized=lock(&self.owner).is_some();
+        let configuration=self.selected_configuration().map_err(Error::new)?.2;
+        let mode=configuration.as_ref().map(|c|c.http.device_identity_mode).unwrap_or_default();
+        let admissions=lock(&self.admissions);
+        let mut identities=if initialized {self.database.with_conn(device_identity::list).map_err(Error::new)?} else {Vec::new()};
+        for view in &mut identities {view.in_use|=admissions.devices.contains(&view.id);}
+        Ok(DeviceIdentityState {initialized,configured_mode:mode,max_identities:device_identity::MAX_IDENTITIES,identities})
+    }
+    fn device_admin_preflight(&self)->Result<(),Error> {
+        if lock(&self.owner).is_none() {return Err(Error::new("app_login_unavailable"));}
+        if self.closed.load(Ordering::SeqCst) {return Err(Error::new("app_login_shutting_down"));}
+        Ok(())
+    }
+    pub(crate) fn set_device_identity(&self,request:DeviceIdentityWriteRequest)->Result<DeviceIdentityState,Error> {
+        self.device_admin_preflight()?;
+        let admissions=lock(&self.admissions);
+        if !admissions.aliases.is_empty() {return Err(Error::new("app_login_device_identity_in_use"));}
+        if self.closed.load(Ordering::SeqCst) {return Err(Error::new("app_login_shutting_down"));}
+        let value=request.device_id.as_ref().map(|v|v.expose_to_backend().trim());
+        self.database.with_conn(|conn| {
+            let key=match request.account_id.as_deref() {
+                Some(account)=>Some(accounts::identity_key(conn,account)?.ok_or("app_account_not_found")?),None=>None,
+            };
+            device_identity::set(conn,request.id.as_deref(),request.expected_revision,key.as_deref(),value,now()).map_err(|e|e.code)
+        }).map_err(Error::new)?;
+        drop(admissions);
+        self.device_identities()
+    }
+    pub(crate) fn delete_device_identity(&self,id:&str,expected:u64)->Result<DeviceIdentityState,Error> {
+        self.device_admin_preflight()?;
+        let admissions=lock(&self.admissions);
+        if !admissions.aliases.is_empty() {return Err(Error::new("app_login_device_identity_in_use"));}
+        if self.closed.load(Ordering::SeqCst) {return Err(Error::new("app_login_shutting_down"));}
+        self.database.with_conn(|conn|device_identity::remove(conn,id,expected,now()).map_err(|e|e.code)).map_err(Error::new)?;
+        drop(admissions);
+        self.device_identities()
+    }
+    /// Shared-state version view, separate from private deployment context.
     pub(crate) fn app_version_view(&self)->Result<AppVersionView,Error> {
         let (_,_,configuration)=self.selected_configuration().map_err(Error::new)?;
         let http=configuration.as_ref().map(|c|&c.http);
@@ -252,36 +322,51 @@ impl AppLoginManager {
         self.observe_finalization_error(&mut view); Ok(view)
     }
     pub(crate) fn submit(self: &Arc<Self>, request: LoginRequest) -> Result<AttemptView, Error> {
-        request.validate()?;self.submit_internal(request,LoginIntent::EnableHosting)
+        request.validate()?;self.submit_internal(request,LoginIntent::EnableHosting,None)
     }
     pub(crate) fn submit_jegotrip(self:&Arc<Self>,request:JegotripLoginRequest)->Result<AttemptView,Error> {
         if !request.consent || (request.intent==LoginIntent::Authenticate && request.start_receiver) {return Err(Error::new("app_login_request_invalid"));}
         let intent=request.intent;
         let common=LoginRequest {attempt_id:request.attempt_id,username:request.username,password:request.password,country_code:request.country_code,
             enable_hosting:intent==LoginIntent::EnableHosting,start_receiver:request.start_receiver};
-        common.validate_identity()?;self.submit_internal(common,intent)
+        let preferred=request.device_id;
+        if preferred.as_ref().is_some_and(|v| !device_identity::valid_device_id(v.expose_to_backend().trim())) {return Err(Error::new("app_login_request_invalid"));}
+        common.validate_identity()?;self.submit_internal(common,intent,preferred)
     }
-    fn submit_internal(self:&Arc<Self>,request:LoginRequest,intent:LoginIntent)->Result<AttemptView,Error> {
+    fn submit_internal(self:&Arc<Self>,request:LoginRequest,intent:LoginIntent,preferred:Option<Secret>)->Result<AttemptView,Error> {
         if self.closed.load(Ordering::SeqCst) { return Err(Error::new("app_login_shutting_down")); }
         let owner=lock(&self.owner).clone().ok_or(Error::new("app_login_unavailable"))?;
         if self.database.with_conn(|c|store::get(c,&request.attempt_id)).map_err(Error::new)?.is_some() {return Err(Error::new("app_login_attempt_exists"));}
         let (_,revision,configuration)=self.selected_configuration().map_err(Error::new)?;
         let configuration=configuration.ok_or(Error::new("app_login_deployment_missing"))?;
-        if intent==LoginIntent::EnableHosting && configuration.runtime.is_none() {return Err(Error::new("app_login_native_configuration_missing"));}
-        let client=self.factory.build(&configuration.http)?;
-        let client=client.with_version_store(Arc::new(app_version::DatabaseVersionStore::new(self.database.clone())));
+        if intent!=LoginIntent::Authenticate && configuration.runtime.is_none() {return Err(Error::new("app_login_native_configuration_missing"));}
+        let mut client=self.factory.build(&configuration.http)?;
         let accounts=self.accounts.upgrade().ok_or(Error::new("app_login_unavailable"))?;
-        if intent==LoginIntent::EnableHosting {accounts.login_preflight_create().map_err(|_|Error::new("app_login_account_creation_failed"))?;}
+        if intent!=LoginIntent::Authenticate {accounts.login_preflight_create().map_err(|_|Error::new("app_login_account_creation_failed"))?;}
         let permit=self.active.clone().try_acquire_owned().map_err(|_|Error::new("app_login_busy"))?;
-        let identity=request.identity_key();
-        if !lock(&self.identities).insert(identity.clone()) {return Err(Error::new("app_login_busy"));}
-        let guard=ActiveGuard {manager:Arc::downgrade(self),identity,_permit:permit};
-        let view=self.database.with_conn(|c|store::insert_with_intent(c,&request.attempt_id,&owner,intent,now())).map_err(Error::new)?;
+        let alias=client.login_alias_key(&request)?;
+        let mut admissions=lock(&self.admissions);
+        if self.closed.load(Ordering::SeqCst) {return Err(Error::new("app_login_shutting_down"));}
+        if admissions.aliases.contains(&alias) {return Err(Error::new("app_login_busy"));}
+        let explicit=preferred.as_ref().map(|v|v.expose_to_backend().trim()).or_else(||
+            (configuration.http.device_identity_mode==config::DeviceIdentityMode::Static).then(||configuration.http.device_id.expose_to_backend()));
+        let (view,snapshot)=self.database.with_conn(|conn| {
+            let tx=rusqlite::Transaction::new_unchecked(conn,rusqlite::TransactionBehavior::Immediate).map_err(|_|"app_login_storage_failed")?;
+            let snapshot=device_identity::resolve(&tx,&alias,explicit,Some(configuration.http.device_id.expose_to_backend()),now()).map_err(|e|e.code)?;
+            if admissions.devices.contains(&snapshot.id) {return Err("app_login_busy");}
+            let view=store::insert_admitted(&tx,&request.attempt_id,&owner,intent,now())?;
+            tx.commit().map_err(|_|"app_login_storage_failed")?;
+            Ok((view,snapshot))
+        }).map_err(Error::new)?;
+        client=client.with_device_id(snapshot.device_id.expose_to_backend());
+        let client=client.with_version_store(Arc::new(app_version::DatabaseVersionStore::new(self.database.clone())));
+        admissions.aliases.insert(alias.clone());admissions.devices.insert(snapshot.id.clone());
+        let guard=ActiveGuard {manager:Arc::downgrade(self),alias,devices:BTreeSet::from([snapshot.id.clone()]),snapshot,_permit:permit};
         let id=request.attempt_id.clone();let manager=self.clone();
         // No await/cancellation gap between durable admission and spawn.
         let task=tokio::spawn(async move {
-            let _guard=guard;
-            let work=std::panic::AssertUnwindSafe(manager.run(&owner,request,intent,revision,configuration,client)).catch_unwind();
+            let mut guard=guard;
+            let work=std::panic::AssertUnwindSafe(manager.run(&owner,request,intent,revision,configuration,client,&mut guard)).catch_unwind();
             let result=tokio::select! {
                 biased;
                 _=manager.wait_closed()=>Err(Error::new("app_login_interrupted")),
@@ -291,7 +376,8 @@ impl AppLoginManager {
             };
             if manager.database.with_conn(|c|store::finish(c,&id,&owner,result.err(),now())).is_err() {lock(&manager.finalization_errors).insert(id.clone());}
         });
-        let mut tasks=lock(&self.tasks);tasks.retain(|_,t|!t.is_finished());tasks.insert(view.attempt_id.clone(),task);Ok(view)
+        let mut tasks=lock(&self.tasks);tasks.retain(|_,t|!t.is_finished());tasks.insert(view.attempt_id.clone(),task);
+        drop(tasks);drop(admissions);Ok(view)
     }
     async fn wait_closed(&self) {
         loop {
@@ -303,7 +389,19 @@ impl AppLoginManager {
         if self.closed.load(Ordering::SeqCst) {return Err(Error::new("app_login_interrupted"));}
         self.database.with_conn(|c|store::step(c,id,owner,phase,business,now())).map_err(Error::new)
     }
-    async fn run(&self,owner:&str,mut request:LoginRequest,intent:LoginIntent,revision:u64,configuration:DatabaseConfiguration,mut client:AppClient)->Result<(),Error> {
+    fn confirm_device_identity(&self,guard:&mut ActiveGuard,key:&[u8])->Result<bool,Error> {
+        let mut admissions=lock(&self.admissions);
+        let selected=self.database.with_conn(|conn| {
+            let tx=rusqlite::Transaction::new_unchecked(conn,rusqlite::TransactionBehavior::Immediate).map_err(|_|"app_login_storage_failed")?;
+            let selected=device_identity::confirm(&tx,&guard.alias,&guard.snapshot,key,now()).map_err(|e|e.code)?;
+            if selected.id!=guard.snapshot.id && admissions.devices.contains(&selected.id) {return Err("app_login_busy");}
+            tx.commit().map_err(|_|"app_login_storage_failed")?;Ok(selected)
+        }).map_err(Error::new)?;
+        let changed=guard.snapshot.id!=selected.id;
+        admissions.devices.insert(selected.id.clone());guard.devices.insert(selected.id.clone());guard.snapshot=selected;
+        Ok(changed)
+    }
+    async fn run(&self,owner:&str,mut request:LoginRequest,intent:LoginIntent,revision:u64,configuration:DatabaseConfiguration,mut client:AppClient,guard:&mut ActiveGuard)->Result<(),Error> {
         // First run of a fresh installation: learn a real App version from the
         // configured source and persist it BEFORE any login call, so the very
         // first request already carries a value the server accepts.
@@ -312,7 +410,7 @@ impl AppLoginManager {
         // login body then carries the returned enrollId. Best effort only.
         client.ensure_device_enrollment().await;
         eprintln!("app_login_version_in_use {}",client.version_provenance().await);
-        let outcome=self.run_with_version_gate(owner,&request,intent,revision,&configuration,&mut client).await;
+        let outcome=self.run_with_version_gate(owner,&request,intent,revision,&configuration,&mut client,guard).await;
         request.password = Secret::from_owned(String::new());
         request.username = Secret::from_owned(String::new());
         outcome
@@ -321,8 +419,8 @@ impl AppLoginManager {
     /// that happens the version is re-learned once (App Store / official page),
     /// persisted, and the WHOLE flow is replayed so every body, query and header
     /// is rebuilt with the new value. One retry only: a repeated gate is final.
-    async fn run_with_version_gate(&self,owner:&str,request:&LoginRequest,intent:LoginIntent,revision:u64,configuration:&DatabaseConfiguration,client:&mut AppClient)->Result<(),Error> {
-        let error=match self.run_flow(owner,request,intent,revision,configuration,client).await { Ok(())=>return Ok(()), Err(error)=>error };
+    async fn run_with_version_gate(&self,owner:&str,request:&LoginRequest,intent:LoginIntent,revision:u64,configuration:&DatabaseConfiguration,client:&mut AppClient,guard:&mut ActiveGuard)->Result<(),Error> {
+        let error=match self.run_flow(owner,request,intent,revision,configuration,client,guard).await { Ok(())=>return Ok(()), Err(error)=>error };
         if error.server_code!=Some(http::VERSION_GATE_CODE) { return Err(error); }
         let before=client.version_value().await;
         let Some((value,source))=client.refresh_app_version().await else {
@@ -334,22 +432,37 @@ impl AppLoginManager {
         eprintln!("app_login_version_gate_retry source={source}");
         client.reset_session();
         self.step(owner,&request.attempt_id,"authenticating",None)?;
-        self.run_flow(owner,request,intent,revision,configuration,client).await
+        self.run_flow(owner,request,intent,revision,configuration,client,guard).await
     }
-    async fn run_flow(&self,owner:&str,request:&LoginRequest,intent:LoginIntent,revision:u64,configuration:&DatabaseConfiguration,client:&mut AppClient)->Result<(),Error> {
+    async fn run_flow(&self,owner:&str,request:&LoginRequest,intent:LoginIntent,revision:u64,configuration:&DatabaseConfiguration,client:&mut AppClient,guard:&mut ActiveGuard)->Result<(),Error> {
         let id=request.attempt_id.clone();let id=id.as_str();let hint=request.masked_login_name();
         self.step(owner,id,"authenticating",None)?;
         client.login(&request).await?;
         self.step(owner,id,"reading_bound_number",None)?;
-        let bound=client.bound_number(&request).await?;
+        let mut bound=client.bound_number(&request).await?;
+        let key=client.account_key(&bound)?;
+        if self.confirm_device_identity(guard,&key)? {
+            // A newly seen alias discovered an existing number's identity.
+            // Re-authenticate ONCE with it, before any token/trust/business call;
+            // never switch a device beneath an existing App session.
+            client.use_device_identity(guard.snapshot.device_id.expose_to_backend());
+            client.ensure_device_enrollment().await;
+            client.login(&request).await?;
+            let confirmed=client.bound_number(&request).await?;
+            if client.account_key(&confirmed)?!=key {return Err(Error::new("app_login_identity_mismatch"));}
+            self.confirm_device_identity(guard,&key)?;
+            bound=confirmed;
+        }
         self.database.with_conn(|c|store::set_mask(c,id,owner,&bound.masked(),now())).map_err(Error::new)?;
         self.step(owner,id,"saving_app_account",None)?;
-        let key=client.account_key(&bound)?;
         let account_id=self.database.with_conn(|c|accounts::record(c,&key,&hint,&bound.masked(),revision,now()).map_err(|e|e.code)).map_err(Error::new)?;
         self.database.with_conn(|c|store::set_account(c,id,owner,&account_id,now())).map_err(Error::new)?;
         // An App-only login does not consume SDK materials, enable a service,
         // retain the App token or fabricate a native account/configuration.
         if intent==LoginIntent::Authenticate {return Ok(());}
+        if self.database.with_conn(|c|device_identity::native_ownership_pending(c,&key)).map_err(Error::new)? {
+            return Err(Error::new("app_login_device_identity_in_use"));
+        }
         self.step(owner,id,"fetching_credentials",None)?;
         let material=client.phone_credentials(&bound).await?;
         // The App asks the server whether THIS device is trusted before it
@@ -398,7 +511,7 @@ impl AppLoginManager {
                 if error.server_code.is_some() {self.step(owner,id,"enabling_business",Some("rejected"))?;}
                 // 506 is the server's own "untrusted device" refusal; keep it a
                 // distinct, actionable code instead of a generic rejection.
-                if error.server_code==Some(506) {return Err(Error::new("app_login_device_untrusted"));}
+                if error.server_code==Some(506) {return Err(Error {code:"app_login_device_untrusted",server_code:error.server_code});}
                 return Err(error);
             }
             self.step(owner,id,"confirming_business",Some("accepted_unconfirmed"))?;
@@ -416,7 +529,13 @@ impl AppLoginManager {
         Ok(())
     }
     pub(crate) async fn shutdown(&self) {
-        self.closed.store(true,Ordering::SeqCst);self.active.close();self.changed.notify_waiters();
-        let tasks=std::mem::take(&mut *lock(&self.tasks));for(_,task)in tasks {let _=task.await;}
+        let tasks={
+            // The same admission lock covers spawn + handle registration. A
+            // concurrent shutdown cannot miss a newly admitted provisioning task.
+            let _admissions=lock(&self.admissions);
+            self.closed.store(true,Ordering::SeqCst);self.active.close();self.changed.notify_waiters();
+            std::mem::take(&mut *lock(&self.tasks))
+        };
+        for(_,task)in tasks {let _=task.await;}
     }
 }

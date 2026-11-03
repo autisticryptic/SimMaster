@@ -34,11 +34,9 @@ pub(super) fn success(doc: &JsonDoc) -> Result<(),Error> {
     let code=outer_code(doc);
     if code==Some(0) { return Ok(()); }
     if let Some(found)=code {
-        // Sanitized server reason for the operator: bounded text only, never the
-        // request URL/token or any credential material.
-        let message=doc.0.get("message").and_then(|v|v.as_str()).unwrap_or("");
-        let cleaned:String=message.chars().filter(|c|!c.is_control()).take(160).collect();
-        eprintln!("app_login_server_code={found} message={cleaned:?}");
+        // Untrusted reason text may reflect a token, password or device value;
+        // keep only the canonical business code in diagnostics.
+        eprintln!("app_login_server_code={found}");
     }
     let text=match code { Some(88001)=>"app_login_verification_required",Some(2044)=>"app_login_migration_required",
         Some(2006)=>"app_login_existing_business_action_required",Some(429)=>"app_login_session_revoked",

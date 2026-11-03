@@ -49,7 +49,7 @@ export default function JegotripConfigurationDialog({ open, onClose, onSaved }: 
     <DialogContent><Stack spacing={2} sx={{ pt: 1 }}>
       <Alert severity="info">配置写入 jegotrip_login_settings，不再必须放置 JSON 文件。旧秘密值不会回显；保存或关闭后清空输入。安装参数不是个人 SDK 凭据。</Alert>
       {view && <Typography variant="body2">来源：{view.configuration_source} · 版本：{view.revision} · App HTTP：{view.http_configured ? '已录入' : '未录入'} · 原生接收：{view.native_configured ? '已录入，运行时另核验' : '未配置，不能登录启动'}</Typography>}
-      <Typography variant="caption" color="text.secondary">格式为 version: 1、http 和 runtime。主入口必须使用完整接收上下文登录并启动；runtime 为 null 仅保留安装配置兼容，不会让主入口退回仅认证。原 App 共享默认参数的自动装配仍待原生启动链核实；不要用占位值或个人 phone token/SipPwd 补齐。</Typography>
+      <Typography variant="caption" color="text.secondary">格式为 version: 1、http 和 runtime。主入口必须使用完整接收上下文登录并启动；runtime 为 null 仅保留认证兼容，不会让主入口假装托管成功。http.device_identity_mode 默认为 store：为每个认证号码生成并复用数据库标识，device_id 可省略；static 仅保留旧固定值兼容，不能跨号码复用。手工指定/重新生成也可在登录页的设备标识管理中设置。SDK 的设备参数仍是独立原生配置，不会被 App 标识擅自替换。</Typography>
       <Button component="label" variant="outlined" disabled={busy}>选择私有安装 JSON
         <input hidden type="file" accept=".json,application/json" onChange={(event) => {
           const file = event.target.files?.[0]

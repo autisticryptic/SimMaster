@@ -32,6 +32,75 @@ mod app_voice_accounts {
     }
 
     #[tokio::test]
+    async fn device_identity_routes_require_auth_and_uninitialized_writes_do_not_create_state() {
+        let state=build_test_router().await.expect("Actions private D-Bus required; no skip");let served=serve(state.router.clone()).await;
+        let id="0123456789abcdef0123456789abcdef";
+        for (method,path) in [(reqwest::Method::GET,"/api/jegotrip/device-identities".to_owned()),
+            (reqwest::Method::PUT,"/api/jegotrip/device-identities".to_owned()),
+            (reqwest::Method::DELETE,format!("/api/jegotrip/device-identities/{id}?expected_revision=1"))] {
+            let (status,_,body)=account_request(&served,method,&path,Some(serde_json::json!({"expected_revision":0,"device_id":"OWN-DEVICE-0001"})),None).await;
+            assert_eq!(status,StatusCode::UNAUTHORIZED);no_secrets(&body);
+        }
+        let cookie=authenticate(&served).await;
+        let (status,headers,body)=account_request(&served,reqwest::Method::GET,"/api/jegotrip/device-identities",None,Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
+        let value:serde_json::Value=serde_json::from_str(&body).unwrap();assert_eq!(value["data"]["initialized"],false);
+        assert_eq!(value["data"]["identities"],serde_json::json!([]));
+        let (status,headers,body)=account_request(&served,reqwest::Method::PUT,"/api/jegotrip/device-identities",
+            Some(serde_json::json!({"expected_revision":0,"device_id":null})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::SERVICE_UNAVAILABLE);no_store(&headers);no_secrets(&body);assert!(body.contains("app_login_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_device_identity_crud_is_cas_bound_and_retains_deleted_ownership() {
+        let state=build_test_router().await.expect("Actions private D-Bus required; no skip");
+        let mut bytes=[0u8;16];ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(),&mut bytes).unwrap();
+        let nonce=bytes.iter().map(|byte|format!("{byte:02x}")).collect::<String>();
+        let lock_path=std::env::temp_dir().join(format!("jegotrip-device-api-{nonce}.lock"));
+        state.app.app_accounts.claim_process_ownership(&lock_path).unwrap();
+        state.app.app_logins.initialize(std::env::temp_dir().join(format!("missing-jegotrip-device-{nonce}.json"))).unwrap();
+        let served=serve(build_router(state.app.clone(),CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))).await;
+        let cookie=authenticate(&served).await;let path="/api/jegotrip/device-identities";
+        let create=serde_json::json!({"id":null,"expected_revision":0,"account_id":null,"device_id":"OWN-DEVICE-0001"});
+        let (status,headers,body)=account_request(&served,reqwest::Method::PUT,path,Some(create.clone()),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
+        let value:serde_json::Value=serde_json::from_str(&body).unwrap();let row=&value["data"]["identities"][0];
+        let id=row["id"].as_str().unwrap().to_owned();assert_eq!(row["device_id"],"OWN-DEVICE-0001");assert_eq!(row["source"],"manual");assert_eq!(row["revision"],1);
+        assert_eq!(value["data"]["configured_mode"],"store");assert_eq!(row["bound_account_id"],serde_json::Value::Null);
+        for hidden in ["alias_key","identity_key","account_key","password","token","trust_granted"] {assert!(!body.contains(hidden));}
+        for bad in [serde_json::json!({"expected_revision":0,"device_id":"fixture-private value"}),
+            serde_json::json!({"expected_revision":0,"device_id":42}),
+            serde_json::json!({"expected_revision":0,"password":"fixture-must-not-echo"}),
+            serde_json::json!({"expected_revision":0,"account_id":"bad-account","device_id":null})] {
+            let (status,headers,body)=account_request(&served,reqwest::Method::PUT,path,Some(bad),Some(&cookie)).await;
+            assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);
+        }
+        let update=serde_json::json!({"id":id,"expected_revision":1,"account_id":null,"device_id":"OWN-DEVICE-0002"});
+        let (status,headers,body)=account_request(&served,reqwest::Method::PUT,path,Some(update.clone()),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
+        let value:serde_json::Value=serde_json::from_str(&body).unwrap();assert_eq!(value["data"]["identities"][0]["revision"],2);
+        let (status,headers,body)=account_request(&served,reqwest::Method::PUT,path,Some(update),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::CONFLICT);no_store(&headers);no_secrets(&body);
+        for (suffix,wanted) in [("".to_owned(),StatusCode::BAD_REQUEST),("?expected_revision=1".to_owned(),StatusCode::CONFLICT),
+            ("?expected_revision=2&device_id=fixture-must-not-echo".to_owned(),StatusCode::BAD_REQUEST)] {
+            let (status,headers,body)=account_request(&served,reqwest::Method::DELETE,&format!("{path}/{id}{suffix}"),None,Some(&cookie)).await;
+            assert_eq!(status,wanted);no_store(&headers);no_secrets(&body);
+        }
+        let (status,headers,body)=account_request(&served,reqwest::Method::DELETE,&format!("{path}/{id}?expected_revision=2"),None,Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["identities"],serde_json::json!([]));
+        let mut old=create;old["device_id"]=serde_json::json!("own-device-0002");
+        let (status,headers,body)=account_request(&served,reqwest::Method::PUT,path,Some(old),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::CONFLICT);no_store(&headers);no_secrets(&body);
+        let (status,headers,body)=account_request(&served,reqwest::Method::PUT,path,Some(serde_json::json!({"expected_revision":0,"device_id":null})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);let value:serde_json::Value=serde_json::from_str(&body).unwrap();
+        let generated=&value["data"]["identities"][0];assert_eq!(generated["source"],"generated");assert_eq!(generated["device_id"].as_str().unwrap().len(),36);
+        assert_eq!(state.app.database.with_conn(|c|c.query_row("SELECT COUNT(*) FROM jegotrip_device_identities WHERE retired=1",[],|r|r.get::<_,i64>(0)).map_err(|_|"fixture_query_failed")).unwrap(),1);
+        assert!(state.app.app_logins.list().unwrap().is_empty());assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+        let _=std::fs::remove_file(lock_path);
+    }
+
+    #[tokio::test]
     async fn jegotrip_database_routes_require_auth_and_never_export_private_configuration() {
         let state=build_test_router().await.expect("Actions private D-Bus required; no skip");let served=serve(state.router.clone()).await;
         for (method,path) in [

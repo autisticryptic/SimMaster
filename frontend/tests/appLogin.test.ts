@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { appLoginInput, canSubmitAppLogin, jegotripLoginInput, canSubmitJegotripLogin, emptyAppLoginDraft, appLoginError, appBusinessLabel, appLoginPhase, appLoginNeedsPolling, type AppLoginDraft } from '../src/policies/appLogin.ts'
+import { appLoginInput, canSubmitAppLogin, jegotripLoginInput, canSubmitJegotripLogin, emptyAppLoginDraft, validJegotripDeviceId, appLoginError, appBusinessLabel, appLoginPhase, appLoginNeedsPolling, type AppLoginDraft } from '../src/policies/appLogin.ts'
 import type { AppLoginAttempt } from '../src/api/current.ts'
 
 const id = '0123456789abcdef0123456789abcdef'
@@ -85,4 +85,39 @@ void test('database configuration and App-only summary labels do not claim phone
   assert.match(appLoginError('app_login_native_configuration_missing'), /未开启托管/)
   assert.match(appLoginPhase('saving_app_account'), /最近 App 认证/)
   assert.equal(appLoginPhase('saving_app_account').includes('就绪'), false)
+})
+
+void test('device selection defaults to persisted automatic reuse and does not submit an accidental override', () => {
+  assert.equal(emptyAppLoginDraft().deviceMode, 'auto')
+  assert.equal('device_id' in jegotripLoginInput(id, draft), false)
+  assert.equal('device_id' in jegotripLoginInput(id, { ...draft, deviceMode: 'auto', deviceId: 'STALE-DEVICE-01' }), false)
+})
+void test('manual App device identity is bounded and sent only through the dedicated Jegotrip form', () => {
+  const manual: AppLoginDraft = { ...draft, deviceMode: 'manual', deviceId: ' OWN-DEVICE-0001 ' }
+  assert.equal(canSubmitJegotripLogin(manual), true)
+  assert.equal(jegotripLoginInput(id, manual).device_id, 'OWN-DEVICE-0001')
+  assert.equal('device_id' in appLoginInput(id, manual), false)
+  for (const value of ['', 'short', 'has space', 'not:a:device', 'https://other.invalid/', 'x'.repeat(65), 'OWN-\n-DEVICE']) {
+    assert.equal(validJegotripDeviceId(value), false)
+    assert.equal(canSubmitJegotripLogin({ ...manual, deviceId: value }), false)
+    assert.throws(() => jegotripLoginInput(id, { ...manual, deviceId: value }))
+  }
+  assert.equal(canSubmitJegotripLogin({ ...manual, consent: false }), false)
+  assert.equal(canSubmitJegotripLogin({ ...manual, deviceMode: 'unknown' as AppLoginDraft['deviceMode'] }), false)
+})
+void test('device conflicts, stale revisions and active leases have Chinese messages without secret reflection', () => {
+  assert.match(appLoginError('app_login_device_identity_conflict'), /另一身份/)
+  assert.match(appLoginError('app_login_device_identity_revision_conflict'), /刷新/)
+  assert.match(appLoginError('app_login_device_identity_in_use'), /停止接收器/)
+  const message = appLoginError(new Error('app_login_device_identity_conflict OWN-PRIVATE-DEVICE https://other.invalid/?token=secret'))
+  assert.equal(message.includes('OWN-PRIVATE-DEVICE'), false)
+  assert.equal(message.includes('secret'), false)
+  assert.match(appLoginError('app_login_device_untrusted'), /不等于通过一键验证/)
+})
+void test('manual device selection cannot change the explicit attach-hosting or authentication intent', () => {
+  const attach = jegotripLoginInput(id, { ...draft, intent: 'attach_hosting', deviceMode: 'manual', deviceId: 'OWN-DEVICE-01' })
+  assert.equal(attach.intent, 'attach_hosting')
+  assert.equal(attach.device_id, 'OWN-DEVICE-01')
+  assert.equal('enable_hosting' in attach, false)
+  assert.equal(jegotripLoginInput(id, { ...draft, intent: 'authenticate', startReceiver: false, deviceMode: 'manual', deviceId: 'OWN-DEVICE-01' }).intent, 'authenticate')
 })
