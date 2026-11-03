@@ -925,6 +925,10 @@ async fn attach_hosting_never_writes_the_business_switch_and_fails_closed_when_i
     assert_eq!(view.error.as_deref(),Some("app_login_business_not_enabled"));
     assert_eq!(view.business_state,"not_requested");
     assert_eq!(f.script.paths(),vec!["/login".to_owned(),"/user".to_owned(),"/csb/token".to_owned(),"/voip".to_owned(),"/state".to_owned()]);
-    assert!(f.manager.app_accounts().unwrap().is_empty());
+    // Only the App authentication summary exists; no hosting line is created and
+    // no business switch was written.
+    let accounts=f.manager.app_accounts().unwrap();
+    assert_eq!(accounts.len(),1);
+    assert_eq!(accounts[0].voice_line_id,None);
     assert_redacted(&view);
 }
