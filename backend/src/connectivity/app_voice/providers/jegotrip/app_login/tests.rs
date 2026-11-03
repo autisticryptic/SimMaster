@@ -908,3 +908,23 @@ async fn device_enrolment_id_is_kept_for_the_next_login_body_only() {
     assert_eq!(seen[1].path,"/login");
     assert_eq!(seen[1].body["enrollId"],"fixture-enroll-0001");
 }
+#[tokio::test]
+async fn attach_hosting_never_writes_the_business_switch_and_fails_closed_when_it_is_off() {
+    // login, user, csb/token, voip, then the read-only business state.
+    let mut steps=prefix();
+    steps.push(reply("/state",json!({"code":0,"body":{"cs_forward":"1","authentication_code":"0"}})));
+    let f=Fixture::new(steps,false);
+    let configuration=database_configuration(&f,true);
+    f.manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration}).unwrap();
+    let id=id();
+    let request:JegotripLoginRequest=serde_json::from_value(json!({"attempt_id":id,"username":" user@example.invalid ",
+        "password":" p@ss ","country_code":null,"intent":"attach_hosting","consent":true,"start_receiver":true})).unwrap();
+    f.manager.submit_jegotrip(request).unwrap();
+    let view=terminal(&f.manager,&id).await;
+    // Taking over is allowed to fail, but it must never touch the switch.
+    assert_eq!(view.error.as_deref(),Some("app_login_business_not_enabled"));
+    assert_eq!(view.business_state,"not_requested");
+    assert_eq!(f.script.paths(),vec!["/login".to_owned(),"/user".to_owned(),"/csb/token".to_owned(),"/voip".to_owned(),"/state".to_owned()]);
+    assert!(f.manager.app_accounts().unwrap().is_empty());
+    assert_redacted(&view);
+}
