@@ -68,9 +68,10 @@ key/value 表，`jegotrip_shared_state`，`name='app_version'`），一行记录
 "app_version_web_url": "https://www.jegotrip.cn/m/mobileIndex.html", // 官方页面
 "app_version_ios_app_id": "1037589370",                      // iOS App Store 数字 id
 "app_version_store": true,                                    // 允许写入共享状态表
-"extra_query":   [ { "name": "version",   "value": "$APP_VERSION" } ],
-"extra_headers": [ { "name": "version",   "value": "$APP_VERSION" } ],
-"extra_body":    [ { "name": "app_version","value": "$APP_VERSION" } ]
+// 实测结论：版本只通过请求头生效，query/body 都是错的（body 额外字段会让 csb/token 直接 400）
+"extra_headers": [ { "name": "app-version", "value": "$APP_VERSION" } ],
+"extra_query":   [],
+"extra_body":    []
 ```
 
 解析顺序：`app_version_file`（每次重读）→ 共享状态表 → iOS App Store → 官方页面 → `app_version`。
