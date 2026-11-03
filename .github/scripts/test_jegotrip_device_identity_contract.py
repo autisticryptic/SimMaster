@@ -92,6 +92,9 @@ class JegotripDeviceIdentityContractTests(unittest.TestCase):
             self.assertNotIn('sessionStorage', text)
         config = (ROOT / 'frontend/playwright.jegotrip.config.ts').read_text()
         self.assertIn("VITE_API_PROXY_TARGET: 'http://127.0.0.1:1'", config)
+        browser = (ROOT / 'frontend/e2e/jegotrip-device-identity.spec.ts').read_text()
+        self.assertIn("url.pathname.startsWith('/api/')", browser)
+        self.assertNotIn("page.route('**/api/**'", browser)
 
     def test_both_workflows_run_the_new_nonzero_test_module_and_mock_ui_suite(self):
         for name in ['beta-validation.yml', 'build-release.yml']:

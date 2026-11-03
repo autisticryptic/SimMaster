@@ -5,7 +5,8 @@ async function mockApis(page: Page) {
   const state: JegotripDeviceIdentityState = { initialized: true, configured_mode: 'store', max_identities: 64, identities: [] }
   const writes: JegotripDeviceIdentityInput[] = []
   const logins: string[] = []
-  await page.route('**/api/**', async (route) => {
+  // Match root API paths only; /src/api/current.ts is a JavaScript module.
+  await page.route((url) => url.pathname.startsWith('/api/'), async (route) => {
     const request = route.request()
     const path = new URL(request.url()).pathname
     if (path === '/api/jegotrip/login/setup') {
