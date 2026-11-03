@@ -204,6 +204,34 @@ business_state=not_requested   （证明没有任何写业务开关的请求）
 
 也就是说：**只要账号已在手机上开启了托管，本机就能完整接管后续接收**；开启这一步必须由手机完成。
 
+### 2.2.8 APK 能力 → SimAdmin 对照表（托管相关）
+
+| 能力 | APK 端点 / 组件 | SimAdmin 状态 |
+| --- | --- | --- |
+| App 登录 | `userCenter/v3/signIn` | ✅ 已实现，真实服务通过 |
+| 绑定号码 | `service/user/v1/getUser` | ✅ 已实现 |
+| 电话 token | `service/voip/v1/csb/token` | ✅ 已实现 |
+| SIP 凭据 | `service/voip/v1/openVoipStatus` | ✅ 已实现（内存内 AES/MD5 解密） |
+| 托管状态 | `service/voip/v1/getCallStatus` | ✅ 已实现 |
+| 开启/关闭托管 | `service/voip/v1/setVoip` | ✅ 已实现；服务端 `506` 需设备授信 |
+| 安全设备注册 | `device/sec/v1/enroll` | ✅ 已实现（匿名调用，`enrollId` 随登录上报） |
+| 安全设备校验 | `service/voip/v1/securityVerify` | ✅ 已实现（上报 `authentication_code`） |
+| 可信设备查询 | `service/voip/v1/verificationTrustfulDevice` | ✅ 已实现 |
+| 一键认证（号码/SIM） | `com.cmic.sso.sdk.auth.AuthnHelper` / `MobileAuthUtil` | ⛔ 需绑定号码 SIM，纯软件不可替代 |
+| 在线状态上报 | `api/service/voip/v1/setJegoMStatus` | ⛔ 未实现（UI 层在线上报，语义未确认） |
+| 号码服务开关 | `service/voip/v1/phoneService` | ⛔ 未实现（语义未确认，不是托管开关） |
+| App 退出 | `service/user/v1/logout` | ⛔ 未实现（本机不持久化 App 会话） |
+| 托管资料 | `service/voip/v1/getProfile` | ⛔ 未实现（当前用安装侧静态运行模板） |
+| 原生托管会话（ARC/SARC/Router/TLS） | `libmtc` / SDK 层 | ✅ 已实现（离线端到端测试覆盖） |
+
+### 2.2.9 完成一次完整托管的操作步骤
+
+1. **手机 App**（绑定号码所在手机）：登录账号 → 号码托管 → 开启（该步走中国移动一键认证，由运营商校验 SIM）。
+2. **SimAdmin**：登录方式选“接管已开启的托管（先在手机 App 开启）”，提交同一账号；此时服务端 `cs_forward=2`，程序会
+   取 phone token / SIP 密码 → 建本地账号 → 启动原生接收器。
+3. 向托管号码发一条短信，在 SimAdmin 的短信列表确认入库（分类 `smgw_text`）。
+4. 在账号上执行 `stop`，确认注销 → App 退出 → 会话 stopped，且服务端托管开关保持开启（本机不关闭业务）。
+
 ## 2. 受支持的配置形状（不含真实值）
 
 存储的账号配置里，原生路由需要**同时**给出：
