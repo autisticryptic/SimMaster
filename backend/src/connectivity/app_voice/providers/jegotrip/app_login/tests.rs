@@ -269,7 +269,7 @@ fn id()->String { super::super::account_runtime::local_nonce().unwrap() }
 fn reply(path:&str,body:Value)->Step { Step::Reply(path.to_owned(),200,body) }
 enum Step { Reply(String,u16,Value), Fail(String), Park(String) }
 #[derive(Clone)]
-struct Recorded { path:String, query:BTreeMap<String,String>, body:Value }
+struct Recorded { path:String, query:BTreeMap<String,String>, body:Value, wire:Value }
 struct Script { steps:Mutex<VecDeque<Step>>, seen:Mutex<Vec<Recorded>>, protection:Option<config::BodyProtection> }
 impl Script {
     fn new(steps:Vec<Step>,encrypted:bool)->Self { Self {steps:Mutex::new(steps.into()),seen:Mutex::new(vec![]),protection:http_config(encrypted).body_protection} }
@@ -277,12 +277,13 @@ impl Script {
 }
 impl Transport for Script {
     fn exchange(&self,request:WireRequest)->Exchange<'_> {Box::pin(async move {
-        let path=request.url.path().to_owned();let encrypted=!matches!(path.as_str(),"/voip"|"/state") && self.protection.is_some();
+        let path=request.url.path().to_owned();let encrypted=!matches!(path.as_str(),"/voip"|"/state"|"/trust") && self.protection.is_some();
+        let wire=if request.body.is_empty() {Value::Null} else {serde_json::from_slice(&request.body).unwrap()};
         let payload=if request.body.is_empty() {Value::Null} else {
             let mut doc=crypto::parse(&request.body).unwrap();
             if encrypted {crypto::decrypt_body(&mut doc,self.protection.as_ref()).unwrap();doc.0["body"].clone()} else {doc.0.clone()}
         };
-        lock(&self.seen).push(Recorded {path:path.clone(),query:request.url.query_pairs().map(|(k,v)|(k.into_owned(),v.into_owned())).collect(),body:payload});
+        lock(&self.seen).push(Recorded {path:path.clone(),query:request.url.query_pairs().map(|(k,v)|(k.into_owned(),v.into_owned())).collect(),body:payload,wire});
         let step=lock(&self.steps).pop_front().expect("unexpected extra App request");
         match step {
             Step::Fail(expected)=>{assert_eq!(path,expected);Err(Error::new("app_login_transport_failed"))},
@@ -810,13 +811,14 @@ async fn trusted_device_verification_posts_the_app_fields_and_never_invents_a_gr
     ],false));
     let mut client=Factory(script.clone()).build(&cfg).unwrap();
     client.login(&login_request(&id())).await.unwrap();
-    // The App's own request shape: sso_token + equipment_type=1 + device_id.
+    // Existing-device fallback has no genuine MobileAuth credential; the App
+    // session is query authentication only, never substituted into sso_token.
     assert_eq!(client.verify_trusted_device().await.unwrap(),
         Some(http::TrustDecision {authentication_code:Some(1)}));
     let seen=lock(&script.seen);
     assert_eq!(seen[1].path,"/trust");
-    assert_eq!(seen[1].body["sso_token"],"fixture-app-session");
-    assert_eq!(seen[1].body["equipment_type"],1);
+    assert_eq!(seen[1].body["sso_token"],"");
+    assert_eq!(seen[1].body["equipment_type"],"1");
     assert_eq!(seen[1].body["device_id"],"fixture-http-device");
     assert!(seen[1].query.contains_key("token"),"the App session token is query-authenticated");
 }
@@ -1009,6 +1011,76 @@ async fn resolved_device_identity_overrides_the_static_value_for_every_app_call(
     let seen=lock(&script.seen);
     for index in [0,2] {assert_eq!(seen[index].body["deviceId"],"PHONE-DEVICE-0001");}
     for index in [3,4,5] {assert_eq!(seen[index].body["device_id"],"PHONE-DEVICE-0001");}
+}
+
+#[tokio::test]
+async fn existing_device_fallback_is_plain_json_and_never_substitutes_the_app_token() {
+    let mut value=deployment_json("AA==",true);
+    value["http"]["endpoints"]["verification_trustful_device"]=json!("trust");
+    let cfg:HttpDeployment=serde_json::from_value(value["http"].clone()).unwrap();
+    let script=Arc::new(Script::new(vec![
+        reply("/login",json!({"code":0,"body":{"token":"fixture-app-session"}})),
+        reply("/trust",json!({"code":0,"body":{"authentication_code":2}})),
+    ],true));
+    let mut client=Factory(script.clone()).build(&cfg).unwrap();client.login(&login_request(&id())).await.unwrap();
+    assert_eq!(client.verify_trusted_device().await.unwrap().unwrap().authentication_code,Some(2));
+    let seen=lock(&script.seen);
+    assert!(seen[0].wire.get("sec").is_some(),"the original login remains encrypted");
+    assert_eq!(seen[1].wire,json!({"sso_token":"","equipment_type":"1","device_id":"fixture-http-device"}));
+    assert_eq!(seen[1].query.get("token").map(String::as_str),Some("fixture-app-session"));
+    assert!(seen[1].wire.get("sec").is_none());
+    assert!(!serde_json::to_string(&seen[1].wire).unwrap().contains("fixture-app-session"));
+}
+#[tokio::test]
+async fn existing_device_fallback_still_requires_the_owned_app_session_and_sends_nothing_without_it() {
+    let mut cfg=http_config(false);cfg.endpoints.verification_trustful_device=Some("trust".into());
+    let script=Arc::new(Script::new(vec![],false));let client=Factory(script.clone()).build(&cfg).unwrap();
+    assert_eq!(client.verify_trusted_device().await.unwrap_err().code,"app_login_unavailable");
+    assert!(script.paths().is_empty());
+}
+#[test]
+fn push_diagnostics_do_not_promote_retained_history_or_configuration_to_live_delivery_proof() {
+    let observations=push_status::PushStoredObservations {app_sms_records:Some(300),app_call_records:Some(4),
+        retained_inbox_records:Some(20),pending_sms_notifications:Some(2)};
+    let template=push_status::PushTemplateStatus {runtime_template_present:true,sms_receiver_present:true,sip_request_receiver_selected:true,
+        call_receiver_present:true,call_control_present:true,call_media_present:true,reconnect_configured:true};
+    let report=PushStatusView::assembled(true,100,template,Vec::new(),observations);
+    assert!(report.warnings.contains(&"no_armed_sms_receiver"));assert!(report.warnings.contains(&"no_armed_call_receiver"));
+    assert!(report.warnings.contains(&"native_accounts_absent"));
+    assert_eq!(report.external_delivery_verification,"requires_external_sms_call_test");
+    assert_eq!(report.receiver_namespace_verification,"requires_original_binding_evidence");
+    assert!(!report.implementation.platform_offline_wakeup&&!report.implementation.call_notification_forwarding);
+    assert!(report.implementation.online_native_sms&&report.implementation.online_native_calls&&report.implementation.sms_notification_forwarding);
+}
+#[test]
+fn push_diagnostics_retain_unknown_schema_and_read_counts_without_exposing_content() {
+    let conn=rusqlite::Connection::open_in_memory().unwrap();
+    let unknown=push_status::stored_observations(&conn).unwrap();assert_eq!(unknown.app_sms_records,None);assert_eq!(unknown.app_call_records,None);
+    conn.execute_batch("CREATE TABLE sms_messages(transport TEXT,content TEXT);
+        INSERT INTO sms_messages VALUES('app_voice','PRIVATE-SMS'),('cs','PRIVATE-PHYSICAL-SMS');
+        CREATE TABLE call_history(app_call_token TEXT,phone_number TEXT);
+        INSERT INTO call_history VALUES('PRIVATE-TICKET','PRIVATE-CALLER'),(NULL,'PHYSICAL-CALLER');
+        CREATE TABLE app_voice_inbox(id INTEGER);INSERT INTO app_voice_inbox VALUES(1);
+        CREATE TABLE app_voice_notification_jobs(state TEXT);INSERT INTO app_voice_notification_jobs VALUES('pending'),('delivered');").unwrap();
+    let observations=push_status::stored_observations(&conn).unwrap();assert_eq!(observations.app_sms_records,Some(1));
+    assert_eq!(observations.app_call_records,Some(1));assert_eq!(observations.pending_sms_notifications,Some(1));
+    let text=serde_json::to_string(&observations).unwrap();assert!(!text.contains("PRIVATE")&&!text.contains("PHYSICAL"));
+    conn.execute_batch("DROP TABLE call_history;CREATE TABLE call_history(private_unrelated_column TEXT);").unwrap();
+    assert_eq!(push_status::stored_observations(&conn).err(),Some("app_login_storage_failed"));
+}
+#[tokio::test]
+async fn reading_push_status_never_authenticates_creates_accounts_starts_or_writes_business() {
+    let f=Fixture::new(vec![],false);let mut configuration=database_configuration(&f,true);
+    configuration.runtime.as_mut().unwrap().profile.incoming=None;
+    f.manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration}).unwrap();
+    let report=f.manager.push_status().await.unwrap();assert!(report.initialized&&report.configuration.runtime_template_present);
+    assert!(!report.configuration.sms_receiver_present&&!report.configuration.sip_request_receiver_selected);
+    assert!(!report.configuration.call_receiver_present&&!report.configuration.call_control_present&&!report.configuration.call_media_present);
+    assert!(report.warnings.contains(&"sms_receiver_missing_or_unsupported"));assert!(report.warnings.contains(&"call_media_missing"));
+    assert!(report.native_accounts.is_empty());assert_eq!(report.stored_observations.app_sms_records,Some(0));
+    assert!(f.script.paths().is_empty());assert!(f.manager.list().unwrap().is_empty());assert!(f.manager.app_accounts().unwrap().is_empty());
+    assert_eq!(f.factory.build_count(),0);let text=serde_json::to_string(&report).unwrap();
+    for private in ["fixture-","secret_id","salt","ClientId","SipPwd","phone_login_token","device_id"] {assert!(!text.contains(private));}
 }
 
 fn device_write(id:Option<&str>,revision:u64,account:Option<&str>,value:Option<&str>)->DeviceIdentityWriteRequest {

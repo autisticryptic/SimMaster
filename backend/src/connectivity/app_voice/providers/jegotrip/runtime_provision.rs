@@ -18,6 +18,11 @@ use zeroize::Zeroizing;
 pub enum AccountAliveState { Absent, Disabled, Unsupported }
 impl AccountAliveState {
     pub(super) const DISABLED_REFERENCE: &'static [u8] = b"AccountAlive:stcp -h disable -p 8888;";
+    /// Only the classification is exposed; never the server reference or a
+    /// claim that registration/polling/receiver readiness was granted.
+    pub(super) fn label(self)->&'static str {
+        match self { Self::Absent=>"absent", Self::Disabled=>"disabled", Self::Unsupported=>"unsupported" }
+    }
     pub(super) fn classify(reference: &[u8]) -> Self {
         if reference.is_empty() { Self::Absent }
         else if reference == Self::DISABLED_REFERENCE { Self::Disabled }

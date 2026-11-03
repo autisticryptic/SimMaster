@@ -67,6 +67,10 @@ pub struct AccountView {
     pub reconnect_state: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reconnect_error: Option<&'static str>,
+    /// Last matched bootstrap observation of this run, not an active alive
+    /// registration. None means no observation; never silently assume disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_alive_state:Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<&'static str>,
 }
@@ -76,7 +80,7 @@ fn view(metadata: AccountMetadata, phase: Phase, cleanup: bool, error: Option<&'
         // A hosted SDK acknowledgement is not verified SMS/call/media support.
         incoming_call_ready: false, incoming_message_ready: false, outbound_authorized: false,
         provider_availability: "unsupported", manual_start_required: true, cleanup_on_disconnect: None, cleanup_error: None,
-        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, last_error: error }
+        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, account_alive_state:None, last_error: error }
 }
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
@@ -354,6 +358,7 @@ impl AccountManager {
         let mut snapshot = view(metadata, observed_phase, !controller.resources_released() || !run.finalized.load(Ordering::SeqCst), error);
         snapshot.cleanup_on_disconnect = Some(run.cleanup_on_disconnect);
         snapshot.cleanup_error = *lock(&run.cleanup_error);
+        if let Some(owner)=controller.resource_owner() {snapshot.account_alive_state=run.backend.account_alive_observation(&owner);}
         if run.reconnect.is_some() {
             snapshot.reconnect_attempt = Some(run.reconnect_attempt);
             snapshot.reconnect_state = *lock(&run.reconnect_state);

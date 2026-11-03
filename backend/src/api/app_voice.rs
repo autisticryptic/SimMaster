@@ -46,6 +46,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/jegotrip/config", get(jegotrip_configuration).put(jegotrip_configure).delete(jegotrip_clear_configuration))
         .route("/api/jegotrip/accounts", get(jegotrip_accounts))
         .route("/api/jegotrip/login/setup", get(app_login_setup))
+        .route("/api/jegotrip/push/status",get(jegotrip_push_status))
         .route("/api/jegotrip/app-version", get(jegotrip_app_version).put(jegotrip_set_app_version))
         .route("/api/jegotrip/app-version/refresh", post(jegotrip_refresh_app_version))
         .route("/api/jegotrip/device-identities", get(jegotrip_device_identities).put(jegotrip_set_device_identity))
@@ -160,6 +161,9 @@ pub async fn jegotrip_login_submit(State(manager):State<Arc<AppLoginManager>>,re
     match manager.submit_jegotrip(request) {Ok(view)=>success(StatusCode::ACCEPTED,Ok(view)),Err(e)=>failure(e.code)}
 }
 
+pub async fn jegotrip_push_status(State(manager):State<Arc<AppLoginManager>>)->Response {
+    success(StatusCode::OK,manager.push_status().await.map_err(|e|e.code))
+}
 pub async fn app_login_setup(State(manager): State<Arc<AppLoginManager>>) -> Response {
     success(StatusCode::OK, Ok(manager.setup()))
 }

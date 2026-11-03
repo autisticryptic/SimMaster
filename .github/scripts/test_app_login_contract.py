@@ -29,7 +29,9 @@ class AppLoginContractTests(unittest.TestCase):
         # report of the server's field. Local telephony / carrier fallbacks stay
         # outside this module and no trust grant is ever synthesized here.
         self.assertIn('verification_trustful_device', http)
-        self.assertIn('"equipment_type":1', http)
+        self.assertIn('"equipment_type":"1"', http)
+        self.assertIn('"sso_token":""', http)
+        self.assertNotIn('"sso_token":token.expose_to_backend()', http)
         self.assertIn('authentication_code', http)
         self.assertNotIn('MobileAuthUtil', http)
         self.assertNotIn('AuthnHelper', http)

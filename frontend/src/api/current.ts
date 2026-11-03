@@ -219,6 +219,37 @@ export interface JegotripAppVersionView {
   configured_static: boolean
   store_enabled: boolean
 }
+export interface JegotripPushStatus {
+  initialized: boolean
+  observed_at_unix_seconds: number
+  configuration: {
+    runtime_template_present: boolean
+    sms_receiver_present: boolean
+    sip_request_receiver_selected: boolean
+    call_receiver_present: boolean
+    call_control_present: boolean
+    call_media_present: boolean
+    reconnect_configured: boolean
+  }
+  implementation: {
+    online_native_sms: boolean
+    online_native_calls: boolean
+    browser_event_stream: boolean
+    platform_offline_wakeup: boolean
+    sms_notification_forwarding: boolean
+    call_notification_forwarding: boolean
+  }
+  native_accounts: AppAccountView[]
+  stored_observations: {
+    app_sms_records: number | null
+    app_call_records: number | null
+    retained_inbox_records: number | null
+    pending_sms_notifications: number | null
+  }
+  warnings: string[]
+  receiver_namespace_verification: string
+  external_delivery_verification: string
+}
 export interface JegotripDeviceIdentityView {
   id: string
   device_id: string
@@ -296,6 +327,7 @@ export interface AppAccountView {
   incoming_message_ready: boolean
   outbound_authorized: boolean
   last_error?: string
+  account_alive_state?: 'absent' | 'disabled' | 'unsupported'
 }
 
 async function request<T>(
@@ -968,6 +1000,10 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<JegotripAppVersionView>>('/jegotrip/app-version/refresh', {
       method: 'POST', timeoutMs: 20000,
     })
+  }
+
+  async getJegotripPushStatus() {
+    return request<ApiResponse<JegotripPushStatus>>('/jegotrip/push/status')
   }
 
   async getJegotripDeviceIdentities() {

@@ -495,20 +495,19 @@ impl AppClient {
         let sip_password=crypto::sip_password(&encrypted,&self.config)?;
         Ok(PhoneMaterial {token,sip_password})
     }
-    /// The original App verifies that THIS device is already trusted before it
-    /// touches the business switch (`CallLogic.querySafeDevice` sends exactly
-    /// `sso_token`, `equipment_type=1` and `device_id`). `Ok(None)` means the
-    /// installation did not configure the optional endpoint; the caller then
-    /// keeps its previous behaviour instead of inventing a trust result.
+    /// Original receiveFail fallback: query whether the server already trusts
+    /// THIS device, with an empty MobileAuth token. The App login session is
+    /// only the HTTPS authentication query; it is never a MobileAuth credential.
+    /// Original CallLogic uses ordinary JSON here, and equipment_type is "1".
     pub async fn verify_trusted_device(&self)->Result<Option<TrustDecision>,Error> {
         let Some(path)=self.config.endpoints.verification_trustful_device.clone() else { return Ok(None); };
-        let token=self.session.as_ref().ok_or(Error::new("app_login_unavailable"))?;
+        if self.session.is_none() {return Err(Error::new("app_login_unavailable"));}
         let payload=self.payload(serde_json::json!({
-            "sso_token":token.expose_to_backend(),
-            "equipment_type":1,
+            "sso_token":"",
+            "equipment_type":"1",
             "device_id":self.device_id()?}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
-        let doc=self.post(&path,&bytes,Authentication::Session,true).await?;
+        let doc=self.post(&path,&bytes,Authentication::Session,false).await?;
         let body=crypto::body(&doc)?;
         // Only a small public code is reported; reflected numeric identifiers
         // or arbitrary strings stay unknown, never a fabricated grant.

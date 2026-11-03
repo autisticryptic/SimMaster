@@ -12,11 +12,12 @@ const DESTINATION:&str="DestEntry:sarc -h 42.7 -p 98;";
 fn bootstrap_inputs()->RuntimeProfileInputs<'static>{RuntimeProfileInputs{domain_name:"",domain_id:"",application_id:"",device_info_cc:"",gateway_uri:"",..inputs()}}
 fn bootstrap_common(root:&str,port:u16)->RuntimeCommonInputs<'static>{RuntimeCommonInputs{account_reference:"",..common(root,port)}}
 fn bootstrap_route()->RuntimeCommonBootstrapInputs<'static>{RuntimeCommonBootstrapInputs{routing:&[],client_config_decode_key:None,handoff_timeout:Duration::from_secs(10)}}
-fn bootstrap_result()->Vec<u8>{
+fn bootstrap_result()->Vec<u8>{bootstrap_result_alive(b"")}
+fn bootstrap_result_alive(alive:&[u8])->Vec<u8>{
     let properties=[RpcProperty{key:b"DomainName",value:b"account-domain.invalid"},RpcProperty{key:b"DomainId",value:b"fixture-domain"},
         RpcProperty{key:b"AppId",value:b"fixture-app"},RpcProperty{key:b"CC",value:b"fixture-cc"}];
     let mut w=Writer::new();w.boolean(true).unwrap();w.properties(&properties).unwrap();w.bytes(DESTINATION.as_bytes()).unwrap();
-    w.bytes(b"").unwrap();w.bytes(b"").unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()
+    w.bytes(alive).unwrap();w.bytes(b"").unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()
 }
 fn gateway()->GatewayRegistration<'static>{GatewayRegistration{authname_prefix:"fixture-prefix",channel_id:"fixture-channel",
     delete_int_code:"1",sip_number:"fixture-number",sip_password:"fixture-SipPwd"}}
@@ -44,6 +45,46 @@ async fn hosting_call(peer:&mut CommonPeer)->(Vec<u8>,Vec<u8>){
         let(sequence,uri,flag)=chosen.unwrap();
         peer.send(&[reply(call.call_id,&super::tests::swap_result(Some(sequence),true,payload.fields))]).await;
         return (uri,flag);
+    }
+}
+#[tokio::test]
+async fn matched_common_bootstrap_alive_state_is_preserved_without_inventing_registration_or_receivers(){
+    for (alive,label) in [(b"".as_slice(),"absent"),(super::super::runtime_provision::AccountAliveState::DISABLED_REFERENCE,"disabled"),
+        (b"AccountAlive:stcp -h private.fixture.invalid -p 8888;".as_slice(),"unsupported")] {
+        let cert=Certificates::generate("IP:127.0.0.1");
+        let front=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let port=front.local_addr().unwrap().port();
+        let source_listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let source_port=source_listener.local_addr().unwrap().port();
+        let destination_listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let destination_port=destination_listener.local_addr().unwrap().port();
+        let server=cert.server_config(&TLS13);let source_server=server.clone();
+        let relay=tokio::spawn(async move {
+            let mut tasks=Vec::new();
+            for target in [source_port,destination_port] {
+                let(mut inbound,_)=front.accept().await.unwrap();let mut outbound=tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST,target)).await.unwrap();
+                tasks.push(tokio::spawn(async move {let _=tokio::io::copy_bidirectional(&mut inbound,&mut outbound).await;}));
+            }
+            for task in tasks {task.await.unwrap();}
+        });
+        let source_task=tokio::spawn(async move {
+            let mut source=CommonPeer::open(source_listener,source_server).await;let packet=source.next().await.unwrap();
+            let call=decode_request(&packet[1..]).unwrap();assert_eq!(call.method,b"getAppConfigs.AccountEntry.Account");
+            source.send(&[reply(call.call_id,&bootstrap_result_alive(alive))]).await;while source.next().await.is_some(){}
+        });
+        let destination_task=tokio::spawn(async move {
+            let mut peer=CommonPeer::open(destination_listener,server).await;let packet=peer.next().await.unwrap();
+            let call=decode_request(&packet[1..]).unwrap();assert_eq!(call.method,b"loginSession.AccountEntry.Account");
+            peer.send(&[reply(call.call_id,&login_result())]).await;while peer.next().await.is_some(){}
+        });
+        let p=RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),bootstrap_common(&cert.root,port),bootstrap_route()).unwrap();
+        let connector=Arc::new(LegacyDenied{calls:AtomicUsize::new(0)});let(backend,mut events)=NativeHostingBackend::new(p,connector.clone());let original=owner();
+        backend.login(original.clone(),SdkLoginRequest{server_address:BOOTSTRAP_SDK,..request(&cert.root)}).await.unwrap();
+        assert_eq!(backend.account_alive_observation(&original),Some(label));
+        let event=tokio::time::timeout(Duration::from_secs(4),events.recv()).await.unwrap().unwrap();
+        assert!(matches!(event.payload,BackendEventPayload::Callback(OwnedRpcCallback{callback:Callback::SdkLogin{success:true},..})));
+        assert!(events.try_recv().is_err(),"observing Alive does not create a HostingAck");
+        assert_eq!(connector.calls.load(Ordering::SeqCst),0);
+        assert_eq!(backend.account_alive_observation(&owner()),None);
+        backend.retire(&original);backend.logout(original).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(4),async {source_task.await.unwrap();destination_task.await.unwrap();relay.await.unwrap();}).await.unwrap();
     }
 }
 #[test]

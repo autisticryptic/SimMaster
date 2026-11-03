@@ -5,6 +5,7 @@ mod crypto;
 mod http;
 mod app_version;
 mod device_identity;
+mod push_status;
 mod store;
 mod settings;
 mod accounts;
@@ -14,6 +15,7 @@ mod accounts;
 pub(crate) use config::DatabaseConfiguration;
 pub(crate) use app_version::AppVersionView;
 pub(crate) use device_identity::DeviceIdentityState;
+pub(crate) use push_status::PushStatusView;
 pub use accounts::JegotripAccountView;
 use super::{account_runtime::AccountManager, account_config::AccountConfig};
 use futures_util::FutureExt;
@@ -237,6 +239,17 @@ impl AppLoginManager {
     pub fn app_accounts(&self)->Result<Vec<JegotripAccountView>,&'static str> {
         if lock(&self.owner).is_none() {return Ok(Vec::new());}
         self.database.with_conn(accounts::list)
+    }
+    /// Pure inspection: no provider login, enrolment, start, callback or business
+    /// operation. Historical records never make an idle receiver look ready.
+    pub(crate) async fn push_status(&self)->Result<PushStatusView,Error> {
+        let initialized=lock(&self.owner).is_some();
+        let configuration=self.selected_configuration().map_err(Error::new)?.2;
+        let template=push_status::PushTemplateStatus::inspect(configuration.as_ref().and_then(|c|c.runtime.as_ref()));
+        let accounts=self.accounts.upgrade().ok_or(Error::new("app_login_unavailable"))?;
+        let native_accounts=accounts.list(now() as u64).await.map_err(Error::new)?;
+        let stored=self.database.with_conn(push_status::stored_observations).map_err(Error::new)?;
+        Ok(PushStatusView::assembled(initialized,now(),template,native_accounts,stored))
     }
     /// Authenticated metadata only. No alias hash, username, password, App token
     /// or native SDK material is reachable from this view.

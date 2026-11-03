@@ -17,6 +17,19 @@ async function mockApis(page: Page) {
       await route.fulfill({ json: { status: 'ok', data: { stored: { version: '8.9.8.0', source: 'manual', observed_at: 1000 }, stored_age_seconds: 0,
         store_ttl_seconds: 21600, configured_file: false, configured_mobile_page: false, configured_ios_lookup: true, configured_static: false, store_enabled: true } } }); return
     }
+    if (path === '/api/jegotrip/push/status') {
+      await route.fulfill({ json: { status: 'ok', data: {
+        initialized: true, observed_at_unix_seconds: 1000,
+        configuration: { runtime_template_present: true, sms_receiver_present: false, sip_request_receiver_selected: false,
+          call_receiver_present: false, call_control_present: false, call_media_present: false, reconnect_configured: false },
+        implementation: { online_native_sms: true, online_native_calls: true, browser_event_stream: true,
+          platform_offline_wakeup: false, sms_notification_forwarding: true, call_notification_forwarding: false },
+        native_accounts: [], stored_observations: { app_sms_records: 0, app_call_records: 0, retained_inbox_records: 0, pending_sms_notifications: 0 },
+        warnings: ['sms_receiver_missing_or_unsupported', 'call_receiver_missing', 'call_control_missing', 'call_media_missing',
+          'native_accounts_absent', 'no_armed_sms_receiver', 'no_armed_call_receiver', 'platform_offline_wakeup_unimplemented', 'call_notifications_unimplemented'],
+        receiver_namespace_verification: 'requires_original_binding_evidence', external_delivery_verification: 'requires_external_sms_call_test',
+      } } }); return
+    }
     if (path === '/api/jegotrip/accounts') { await route.fulfill({ json: { status: 'ok', data: [] } }); return }
     if (path === '/api/jegotrip/device-identities' && request.method() === 'GET') {
       await route.fulfill({ json: { status: 'ok', data: state } }); return
@@ -62,6 +75,9 @@ test('device UI persists the automatic identity and supports a manual CAS update
   await page.reload()
   await expect(page.getByText('OWN-MANUAL-DEVICE-01', { exact: true })).toBeVisible()
   await expect(page.getByText(/手工指定 · 版本 2/)).toBeVisible()
+  await expect(page.getByText('短信 / 来电推送诊断', { exact: true })).toBeVisible()
+  await expect(page.getByText(/原生接收账号：0 · 在线短信接收器：0 · 在线来电接收器：0/)).toBeVisible()
+  await expect(page.getByText(/来电的第三方通知转发尚未接线/)).toBeVisible()
   await page.screenshot({ path: 'test-results/jegotrip-device-ui/desktop.png', fullPage: true })
   expect(model.logins).toEqual([]) // Rendering/CRUD is not a provider login or a trust grant.
 })
@@ -79,6 +95,11 @@ test('mobile device UI validates a manual value and never claims verification or
   await expect(input).toHaveAttribute('aria-invalid', 'false')
   await expect(page.getByText(/生成或更换标识不代表绕过一键验证/)).toBeVisible()
   await expect(page.getByRole('button', { name: '登录并启动无忧行', exact: true })).toBeDisabled()
+  await expect(page.getByText(/未配置受支持的 Sip.Request 短信接收绑定/)).toBeVisible()
+  const read = page.waitForRequest((request) => new URL(request.url()).pathname === '/api/jegotrip/push/status' && request.method() === 'GET')
+  await page.getByRole('button', { name: '刷新推送状态', exact: true }).click()
+  await read
+  await expect(page.getByText(/尚无原生接收账号/)).toBeVisible()
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
   await page.screenshot({ path: 'test-results/jegotrip-device-ui/mobile.png', fullPage: true })
   expect(model.writes).toEqual([]); expect(model.logins).toEqual([])

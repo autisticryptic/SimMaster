@@ -32,6 +32,39 @@ mod app_voice_accounts {
     }
 
     #[tokio::test]
+    async fn push_status_is_authenticated_read_only_and_reports_unconfigured_receivers_without_secret_export() {
+        let state=build_test_router().await.expect("Actions private D-Bus required; no skip");let served=serve(state.router.clone()).await;
+        let (status,_,body)=account_request(&served,reqwest::Method::GET,"/api/jegotrip/push/status",None,None).await;
+        assert_eq!(status,StatusCode::UNAUTHORIZED);no_secrets(&body);
+        let cookie=authenticate(&served).await;
+        let (status,headers,body)=account_request(&served,reqwest::Method::GET,"/api/jegotrip/push/status",None,Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
+        let value:serde_json::Value=serde_json::from_str(&body).unwrap();let data=&value["data"];
+        assert_eq!(data["initialized"],false);assert_eq!(data["native_accounts"],serde_json::json!([]));
+        assert_eq!(data["configuration"]["runtime_template_present"],false);assert_eq!(data["configuration"]["sms_receiver_present"],false);
+        assert_eq!(data["implementation"]["platform_offline_wakeup"],false);assert_eq!(data["implementation"]["call_notification_forwarding"],false);
+        assert_eq!(data["external_delivery_verification"],"requires_external_sms_call_test");
+        assert!(state.app.app_logins.list().unwrap().is_empty());assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+        for private in ["ClientId","account_key","token","password","salt","domain_id"] {assert!(!body.contains(private));}
+    }
+    #[tokio::test]
+    async fn a_stored_native_account_does_not_make_read_only_push_diagnostics_claim_an_online_or_verified_receiver() {
+        let state=build_test_router().await.expect("Actions private D-Bus required; no skip");let served=serve(state.router.clone()).await;
+        let cookie=authenticate(&served).await;let cert=Certificates::generate("DNS:fixture.invalid");
+        let (status,_,body)=account_request(&served,reqwest::Method::POST,"/api/non-3gpp/accounts",
+            Some(serde_json::json!({"provider_id":"app_voice","config":config_json(&cert.root)})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::CREATED);let line=created_line(&body);
+        let (status,headers,body)=account_request(&served,reqwest::Method::GET,"/api/jegotrip/push/status",None,Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);let value:serde_json::Value=serde_json::from_str(&body).unwrap();
+        let account=&value["data"]["native_accounts"][0];assert_eq!(account["line_id"],line);assert_eq!(account["phase"],"stopped");
+        assert_eq!(account["incoming_message_ready"],false);assert_eq!(account["incoming_call_ready"],false);assert!(account.get("account_alive_state").is_none());
+        assert_eq!(value["data"]["external_delivery_verification"],"requires_external_sms_call_test");
+        assert!(value["data"]["warnings"].as_array().unwrap().iter().any(|v|v=="no_armed_sms_receiver"));
+        assert!(state.app.app_logins.list().unwrap().is_empty());
+        assert_eq!(state.app.database.with_conn(|conn|conn.query_row("SELECT COUNT(*) FROM app_voice_runtime_leases",[],|r|r.get::<_,i64>(0)).map_err(|_|"test_query_failed")).unwrap(),0);
+    }
+
+    #[tokio::test]
     async fn device_identity_routes_require_auth_and_uninitialized_writes_do_not_create_state() {
         let state=build_test_router().await.expect("Actions private D-Bus required; no skip");let served=serve(state.router.clone()).await;
         let id="0123456789abcdef0123456789abcdef";

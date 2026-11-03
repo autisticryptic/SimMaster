@@ -110,8 +110,11 @@ fn properties(include_cc: bool) -> Vec<RpcProperty<'static>> {
     values
 }
 fn bootstrap_result(properties: &[RpcProperty<'_>], reference: &[u8], success: bool) -> Vec<u8> {
+    bootstrap_result_alive(properties,reference,b"unclaimed-alive-reference",success)
+}
+fn bootstrap_result_alive(properties:&[RpcProperty<'_>],reference:&[u8],alive:&[u8],success:bool)->Vec<u8>{
     let mut result = Writer::new(); result.boolean(success).unwrap(); result.properties(properties).unwrap();
-    result.bytes(reference).unwrap(); result.bytes(b"unclaimed-alive-reference").unwrap();
+    result.bytes(reference).unwrap(); result.bytes(alive).unwrap();
     result.bytes(b"unclaimed-user-reference").unwrap(); result.bytes(b"").unwrap();
     result.finish().expose_to_transport().to_vec()
 }
@@ -149,6 +152,24 @@ fn login_result() -> Vec<u8> {
     let mut result = Writer::new(); result.boolean(true).unwrap(); result.bytes(b"fixture-user").unwrap();
     result.bytes(b"fixture-auth").unwrap(); result.properties(&[]).unwrap(); result.bytes(b"").unwrap();
     result.finish().expose_to_transport().to_vec()
+}
+
+#[tokio::test]
+async fn matched_tls_bootstrap_alive_state_is_visible_without_registering_an_alive_channel(){
+    for (alive,label) in [(b"".as_slice(),"absent"),(native::runtime_provision::AccountAliveState::DISABLED_REFERENCE,"disabled"),
+        (b"AliveEntry:stcp -h private.fixture.invalid -p 8888;".as_slice(),"unsupported")] {
+        let source_cert=Certificates::generate("DNS:bootstrap.fixture.invalid");let account_cert=Certificates::generate("DNS:account.fixture.invalid");
+        let Fixture{backend,mut events,mut source,mut account,connector,..}=two_fixture(&source_cert,&account_cert,Duration::from_secs(4),false,false);
+        let source_task=tokio::spawn(async move {let id=bootstrap_call(&mut source).await;
+            source.reply(id,&bootstrap_result_alive(&properties(true),ACCOUNT_REFERENCE,alive,true)).await;source.drain_until_eof().await;});
+        let account_task=tokio::spawn(async move {let id=account_login(&mut account,true).await;account.reply(id,&login_result()).await;account.drain_until_eof().await;});
+        let original=owner(&source_cert.root);backend.login(original.clone(),bootstrap_request(&source_cert.root)).await.unwrap();
+        assert_eq!(backend.account_alive_observation(&original),Some(label));
+        let sdk=callback(&mut events).await;assert!(matches!(sdk.payload,BackendEventPayload::Callback(OwnedRpcCallback{callback:Callback::SdkLogin{success:true},..})));
+        assert_eq!(lock(&connector.records).len(),2,"no guessed Alive connection is created");
+        assert_eq!(backend.account_alive_observation(&owner(&source_cert.root)),None);
+        backend.retire(&original);backend.logout(original).await.unwrap();source_task.await.unwrap();account_task.await.unwrap();
+    }
 }
 
 #[tokio::test]

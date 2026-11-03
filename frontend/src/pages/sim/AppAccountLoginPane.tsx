@@ -3,6 +3,7 @@ import { Alert, Button, Checkbox, CircularProgress, Divider, FormControlLabel, M
 import { api, type AppLoginAttempt, type AppLoginSetup, type JegotripAppVersionView } from '../../api/current'
 import { appBusinessLabel, appLoginError, jegotripLoginInput, appLoginNeedsPolling, appLoginPhase, canSubmitJegotripLogin, emptyAppLoginDraft, validJegotripDeviceId, type AppLoginDraft } from '../../policies/appLogin'
 import JegotripDeviceIdentityPane from './JegotripDeviceIdentityPane'
+import JegotripPushStatusPane from './JegotripPushStatusPane'
 
 const emptyDraft = emptyAppLoginDraft
 
@@ -164,6 +165,8 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
       {attempt.line_id && <Typography variant="caption" display="block">接收账号已保存，电话/短信是否就绪以原运行时为准。</Typography>}
     </Alert>}
     {error && <Alert severity="error">{error}</Alert>}
+    <Divider />
+    {open && <JegotripPushStatusPane open refreshKey={deviceRefresh} />}
     <Divider />
     <JegotripDeviceIdentityPane open={open} disabled={pending} refreshKey={deviceRefresh} />
   </Stack>

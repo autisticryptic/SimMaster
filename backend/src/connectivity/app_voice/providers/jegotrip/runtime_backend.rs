@@ -426,6 +426,8 @@ impl fmt::Debug for BackendEventPayload {
 struct AttemptState {
     retired: bool, configured: bool, unregister_started: bool, unregister_result: Option<Result<(), BackendFailure>>,
     logout_started: bool, logout_result: Option<Result<(), BackendFailure>>, released: bool,
+    /// Matched bootstrap observation only; never an armed keepalive or grant.
+    account_alive:Option<super::runtime_provision::AccountAliveState>,
     #[cfg(test)]
     polls_paused: bool,
 }
@@ -494,6 +496,13 @@ impl NativeHostingBackend {
     }
     pub(super) fn original_scope(&self, owner: &AttemptOwner) -> Option<RpcConnectionScope> {
         self.original(owner).ok().map(|attempt| attempt.scope.clone())
+    }
+    /// Classification survives the original matched handoff; no references or
+    /// tokens are exported and this never means alive registration succeeded.
+    pub(super) fn account_alive_observation(&self,owner:&AttemptOwner)->Option<&'static str> {
+        let attempt=self.original(owner).ok()?;
+        let observation=lock(&attempt.state).account_alive;
+        observation.map(super::runtime_provision::AccountAliveState::label)
     }
     pub(super) fn original_incoming_binding(&self, owner: &AttemptOwner, scope: &RpcConnectionScope)
         -> Option<super::rpc_incoming::IncomingBinding<'_>> {
@@ -566,6 +575,7 @@ impl NativeHostingBackend {
         let operation=async{
             if !attempt.scope.is_open()||lock(&attempt.state).retired{return Err(BackendFailure::Disconnected);}
             let plan=match bootstrap{Some(bootstrap)=>Some(self.bootstrap_common_original(&attempt,&captured,bootstrap).await?),None=>None};
+            if let Some(plan)=&plan {lock(&attempt.state).account_alive=Some(plan.account_alive());}
             // Only a matched bootstrap may supply the logical entry. Directly
             //supplied Common profiles keep their own single captured entry.
             let(resolved,entry,endpoint)=match &plan{
@@ -718,6 +728,7 @@ impl NativeHostingBackend {
         let provisioned=match bootstrap_prepared {
             Some(bootstrap)=>Some(self.bootstrap_original(&attempt,&captured,bootstrap).await?),None=>None,
         };
+        if let Some(plan)=&provisioned {lock(&attempt.state).account_alive=Some(plan.account_alive());}
         let input=match (&provisioned,&self.profile.bootstrap){
             (Some(plan),Some(bootstrap))=>plan.connection_for(&attempt.owner,&attempt.scope,&bootstrap.account_trust).map_err(|_|BackendFailure::Unavailable)?,
             (None,None)=>captured.connection(&self.profile),_=>return Err(BackendFailure::Unavailable),

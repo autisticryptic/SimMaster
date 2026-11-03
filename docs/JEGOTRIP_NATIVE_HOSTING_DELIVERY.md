@@ -114,7 +114,7 @@ value ≤256 且不含控制字符；`n_token`/`lang`/`timestamp`/`sign`/`token`
 字段：
 
 ```json
-{ "sso_token": "<原 App 回调提供的认证 token，来源仍须核对>", "equipment_type": 1, "device_id": "<设备标识>" }
+{ "sso_token": "<真实 MobileAuth token；失败后备查询为空字符串>", "equipment_type": "1", "device_id": "<设备标识>" }
 ```
 
 对应的服务端路径（APK 内端点目录 `JegoTripApi.<clinit>`）是
@@ -138,11 +138,21 @@ SimAdmin 的实现方式：
 - `setVoip` 返回 `506` 时，任务以专用错误码 `app_login_device_untrusted` 结束（前端有对应中文提示），
   不会退化成“通用拒绝”或伪造成功。
 
-**边界**：HTTP 探针的存在不等于原 App 认证流程已完成。`querySafeDevice` 的 `sso_token` 从原 App
-`getToken` 回调传入，不能仅凭字段名认定为 App 登录会话。当前客户端以 App 会话做诊断性查询，
-尚未提供运营商号码认证凭证；服务端实测 `authentication_code=2`、`setVoip=506`。
-`enrollId` 已取得并用于登录，但不能把它当成设备授信凭证。静态证据见
-`.local/jegotrip/device-trust-20261103/`；任何合法替代验证路径也必须单独核验，不能伪造 token/验证通过。
+**边界与原字节校准**：`querySafeDevice` 的 `sso_token` 来自 MobileAuth 的 receiveToken 第二个参数，
+不是 App 登录会话；原 receiveFail 后备分支传空字符串，`equipment_type` 为字符串 `"1"`，
+调用普通 `HttpRequest.request`，正文不加密。SimAdmin 没有真实 MobileAuth token 时，只复现此已有设备
+后备查询，仍用 App 会话在 query 做 HTTPS 身份认证；不会把会话 token 填成运营商 token。
+`enroll` / `securityVerify` / `setVoip` 仍保持原加密请求，TLS 校验不变。
+
+授信**两端都有状态，但服务器是授权依据**：原 App 在服务器外层 code0 / authentication_code1 后，
+把区号+号码的 MD5 放到本地 `phone_safe_num`；收到 setVoip506 会删除该缓存。稳定 UUID 位于
+`setting_power / phone_uuid` 和 `device.dat`，并随设备报告/业务请求发给服务器。本地标记可减少页面提示，
+不创造授信或服务权益。UUID、enrollId、HTTP200 或账号注册年份均不能替代合法号码认证。
+服务器内部表、授信有效期、撤销策略和不同账号的规则尚未知，不能猜成永久有效或普遍强制验证。
+
+此前真实服务已拒绝本账号/该设备组合（setVoip506）；查询校准不代表授信已通过。原始证据和最新只读审查见
+`.local/jegotrip/hosting-prereqs-apk2-20261103/{flows,trust-storage,trust-cache-callers}.txt` 与
+`.local/jegotrip/trust-push-audit-20261104/TRUST_STORAGE.md`。
 
 ### 2.2.6 已实测的授信结论（2026-11-03，410 + 真实服务）
 
@@ -293,6 +303,57 @@ PUT 示例（全新标识）：
 真实鉴权管理路由和全部 App 设备字段一致性。两个工作流另外执行仅模拟 API 的桌面/手机 UI 测试；
 截图和报告保存在官方 `jegotrip-device-ui-*` 制品。它们与 410 的真实业务验收分开记录。
 相关本地收据/失败证据：`.local/jegotrip/device-identity-20261103/` 与 `verified-native-*.json`。
+
+## 2.4 短信 / 来电推送：在线接收、离线唤醒与本地通知
+
+它们不是同一个“推送开关”：
+
+| 层 | 当前能力与边界 |
+| --- | --- |
+| 服务器在线原生收件 | Router/Common/ARC 长连接的 direct 与 swapCalls 批次，精确短信/来电 receiver 和 scope；已实现软件子集，真实服务器收件尚待验收 |
+| Android 厂商离线唤醒 | 原 App 用 JCNewPush.updateToken / MtcEngine.updatePushInfo 注册真实平台 token；Linux 版尚未实现，不会伪造 token 或在进程停止后自动被唤醒 |
+| 本地短信显示与通知 | 落库及 SSE/UI 事件已接线；启用规则/目标、静默时段、频率限制、目标指纹、有限重试会影响后续外部通知送达 |
+| 本地来电显示/操作 | 来电历史/SSE、原 Inform/Accept/Release 和支持的双向媒体已实现；来电 Webhook/Telegram 等第三方通知转发目前未接线，不承诺已正常 |
+
+当前 410 的只读快照（5f7a0e9 基线）表明：原生接收账号/租约/无忧行短信来电记录均为0，
+安装模板的短信 incoming、call_incoming、call_control、call_media 缺省。
+这不是已经确诊的收件解码bug，而是**尚未启动和装配接收链**；合法授信/业务开启后仍要补齐、
+核验真实接收器namespace和媒体，不能声称“只差开通、后续必然成功”。
+
+### 2.4.1 只读推送诊断
+
+```text
+GET /api/jegotrip/push/status
+```
+
+鉴权、`Cache-Control: no-store`，读取安装模板字段是否存在、当前原生账号及逐能力ready、
+历史无忧行短信/来电和保留收件/待处理短信通知数量；不输出密码、token、receiver id/domain或SDK参数。
+诊断不进行 provider 登录/enroll/业务操作，不启动账号或生成接收证明。
+
+- 模板 `*_present` 仅是**配置存在**，不是经服务器验证的 receiver namespace；
+- 当前 `incoming_message_ready` / `incoming_call_ready` 仅是**原运行的收件器已武装**，还须真实短信/来电测试；
+- `stored_observations` 是**历史落库数量**，不从旧记录恢复当前ready；未初始化的表返回null，而非冒充已验0；
+- 外部收件与namespace验证保持 `requires_external_sms_call_test` / `requires_original_binding_evidence`，
+  不因有历史记录/Socket在线/SDK登录就变成已验证；
+- 匹配 bootstrap 中的 AccountAlive 分类现已保留到该原运行的 `account_alive_state`：absent、disabled、unsupported。
+  无匹配观察则无此字段；它不表示registerAlive已经发出/成功，活跃引用的协议和必要性仍未闭合。
+
+登录页新增“短信 / 来电推送诊断”和只读刷新，明确显示缺配置/无原生账号/无已武装接收器、
+离线唤醒和来电通知未实现，不把App认证摘要显示为推送成功。
+新回归覆盖正确普通JSON授信后备、查询仍需合法App会话、历史不能恢复ready、只读HTTP鉴权/无副作用、
+Common/TLS matched Alive分类可见且不创造注册结果；原软件与真实设备证据仍分开记录。
+
+### 2.4.2 完整验收不能省略的步骤
+
+1. 真实业务状态和合法设备/号码认证（不借用他人标识、不伪造token）。
+2. 正确原生模板、真实匹配bootstrap/login及gateway注册回复。
+3. 本人号码的外来短信：原receiver/正文/发送者 → 持久化 → 原回执；UI/SSE及配置的通知通道分别核验。
+4. 本人号码的来电：invitation → 原Inform/振铃 → 明确授权answer → Accept及真实双向媒体；第三方来电通知另查接线。
+5. 断连/显式重启/配置的重连策略，最后status3注销、SDK logout、全部原IO Join清理。
+
+当前没有上述真实收件/通话证据，不能据隔离peer回归判定本设备推送正常。
+审查收据：`.local/jegotrip/trust-push-audit-20261104/PUSH_AUDIT.md`、`push-review-rust-20261104/report.md`，
+设备快照：`.local/jegotrip/deploy-410-5f7a0e9/push-state-readonly.json`。
 
 ## 2. 受支持的配置形状（不含真实值）
 
