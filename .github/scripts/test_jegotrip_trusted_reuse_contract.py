@@ -96,6 +96,9 @@ class JegotripTrustedReuseContracts(unittest.TestCase):
         model=source('device_trust.rs');store=source('store.rs')
         self.assertIn('MAX_OBSERVATION_BYTES: usize = 2048',model)
         self.assertIn('skip_serializing_if="Option::is_none"',model)
+        config=source('config.rs')
+        self.assertIn('#[serde(default,skip_serializing_if="Option::is_none")]\n    pub device_sync: Option<String>',config)
+        self.assertIn('#[serde(skip_serializing_if="Option::is_none")]\n    device_sync_profile:',config)
         self.assertIn('pub call_status:Option<TrustQueryObservation>',model)
         self.assertIn('pub device_sync:Option<DeviceSyncObservation>',model)
         self.assertIn('WHERE attempt_id=?3 AND owner=?4 AND completed=0',store)
@@ -131,6 +134,8 @@ class JegotripTrustedReuseContracts(unittest.TestCase):
         self.assertIn('不申请新授信或开启业务',pane)
         self.assertIn('明确开启托管',pane)
         self.assertIn('SDK 会话冲突',pane)
+        self.assertIn('local_cs_forward !== undefined && attempt.device_trust.local_cs_forward !== null',pane)
+        self.assertNotIn('local_cs_forward != null',pane)
         for forbidden in ['localStorage','sessionStorage','indexedDB','console.log']:
             self.assertNotIn(forbidden,pane)
         browser=text('frontend/e2e/jegotrip-device-identity.spec.ts')

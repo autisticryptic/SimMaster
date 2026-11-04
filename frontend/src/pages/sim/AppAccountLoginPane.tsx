@@ -197,7 +197,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
       <Typography variant="body2">securityVerify：{deviceTrustQueryLabel(attempt.device_trust.security_verify)}</Typography>
       <Typography variant="body2">已有设备查询：{deviceTrustQueryLabel(attempt.device_trust.existing_device)}</Typography>
       {attempt.device_trust.call_status && <Typography variant="body2">getCallStatus 授信读回：{deviceTrustQueryLabel(attempt.device_trust.call_status)}</Typography>}
-      {attempt.device_trust.local_cs_forward != null && <Typography variant="body2">本次 localCsForward：{attempt.device_trust.local_cs_forward}（不是 SDK 或媒体就绪证明）</Typography>}
+      {attempt.device_trust.local_cs_forward !== undefined && attempt.device_trust.local_cs_forward !== null && <Typography variant="body2">本次 localCsForward：{attempt.device_trust.local_cs_forward}（不是 SDK 或媒体就绪证明）</Typography>}
       {attempt.device_trust.device_sync && <Typography variant="body2">设备同步：{deviceSyncLabel(attempt.device_trust.device_sync)}</Typography>}
       <Typography variant="body2">托管业务读回：{attempt.device_trust.hosting_enabled === true ? '该次读回已开启' : attempt.device_trust.hosting_enabled === false ? '该次读回未开启' : '查询失败 / 未确认'}</Typography>
       <Typography variant="caption">只表示上述时间、该标识版本的服务器回答；更换 UUID 或状态变化后需重新核验。不会从记录恢复授信、SDK 或短信/来电 ready。</Typography>

@@ -74,7 +74,7 @@ pub(super) struct Endpoints {
     #[serde(default)]
     pub security_verify: Option<String>,
     /// Original encrypted device report, distinct from VTD authorization.
-    #[serde(default)]
+    #[serde(default,skip_serializing_if="Option::is_none")]
     pub device_sync: Option<String>,
 }
 pub(super) fn valid_version_page(url:&str)->bool {
@@ -351,6 +351,7 @@ struct PrivateHttpRef<'a> {
     app_version: Option<&'a str>, app_version_file: Option<&'a str>, app_version_web_url: Option<&'a str>,
     app_version_ios_app_id: Option<&'a str>, app_version_store: bool, device_identity_mode: DeviceIdentityMode,
     user_agent: Option<&'a str>, enroll_id: Option<&'a str>,
+    #[serde(skip_serializing_if="Option::is_none")]
     device_sync_profile: Option<super::device_sync::PrivateDeviceSyncProfileRef<'a>>,
 }
 impl<'a> PrivateHttpRef<'a> {
