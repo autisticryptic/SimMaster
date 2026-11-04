@@ -381,10 +381,12 @@ jobs:
       - run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
       - working-directory: frontend
         run: |
-          pnpm install --frozen-lockfile
-          pnpm run build
-          pnpm run type-check
-          pnpm run test:unit
+          set -o pipefail
+          mkdir -p test-results
+          pnpm install --frozen-lockfile 2>&1 | tee test-results/jegotrip-frontend-checks.log
+          pnpm run build 2>&1 | tee -a test-results/jegotrip-frontend-checks.log
+          pnpm run type-check 2>&1 | tee -a test-results/jegotrip-frontend-checks.log
+          pnpm run test:unit 2>&1 | tee -a test-results/jegotrip-frontend-checks.log
       - name: Check Jegotrip device-identity UI (mock APIs only)
         working-directory: frontend
         run: |
@@ -397,4 +399,5 @@ jobs:
           path: |
             frontend/test-results/jegotrip-device-ui/
             frontend/test-results/jegotrip-ui-results.json
+            frontend/test-results/jegotrip-frontend-checks.log
           retention-days: 7

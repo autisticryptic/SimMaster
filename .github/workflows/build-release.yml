@@ -120,12 +120,14 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         run: |
+          set -o pipefail
+          mkdir -p test-results
           echo "🎨 构建前端..."
-          pnpm install --frozen-lockfile
-          pnpm run build
-          pnpm run type-check
-          pnpm run lint
-          pnpm run test:unit
+          pnpm install --frozen-lockfile 2>&1 | tee test-results/jegotrip-frontend-checks.log
+          pnpm run build 2>&1 | tee -a test-results/jegotrip-frontend-checks.log
+          pnpm run type-check 2>&1 | tee -a test-results/jegotrip-frontend-checks.log
+          pnpm run lint 2>&1 | tee -a test-results/jegotrip-frontend-checks.log
+          pnpm run test:unit 2>&1 | tee -a test-results/jegotrip-frontend-checks.log
           echo "✅ 前端构建完成！"
           ls -lh dist/
 
@@ -143,6 +145,7 @@ jobs:
           path: |
             frontend/test-results/jegotrip-device-ui/
             frontend/test-results/jegotrip-ui-results.json
+            frontend/test-results/jegotrip-frontend-checks.log
           retention-days: 7
 
       - name: Upload frontend artifact
