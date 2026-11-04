@@ -1,4 +1,4 @@
-import type { AppLoginAttempt, AppLoginInput, JegotripLoginInput, JegotripLoginIntent } from '../api/current'
+import type { AppLoginAttempt, AppLoginInput, JegotripLoginInput, JegotripLoginIntent, JegotripTrustQueryObservation } from '../api/current'
 
 export type AppLoginMode = 'account' | 'phone'
 export interface AppLoginDraft {
@@ -9,7 +9,7 @@ export interface AppLoginDraft {
   consent: boolean
   startReceiver: boolean
   intent?: JegotripLoginIntent
-  deviceMode?: 'auto' | 'manual'
+  deviceMode?: 'auto' | 'manual' | 'phone_app'
   deviceId?: string
 }
 
@@ -42,12 +42,18 @@ export function validJegotripDeviceId(value: string): boolean {
   return /^[A-Za-z0-9_-]{8,64}$/.test(value.trim())
 }
 
+export function validPhoneAppUuid(value: string): boolean {
+  return /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/.test(value.trim())
+}
+
 export function canSubmitJegotripLogin(draft: AppLoginDraft): boolean {
   const intent = draft.intent ?? 'enable_hosting'
   const deviceMode = draft.deviceMode ?? 'auto'
   return canSubmitAppLogin(draft)
-    && (deviceMode === 'auto' || (deviceMode === 'manual' && validJegotripDeviceId(draft.deviceId ?? '')))
-    && (intent === 'enable_hosting' || intent === 'attach_hosting' || (intent === 'authenticate' && !draft.startReceiver))
+    && (deviceMode === 'auto' || (deviceMode === 'manual' && validJegotripDeviceId(draft.deviceId ?? ''))
+      || (deviceMode === 'phone_app' && validPhoneAppUuid(draft.deviceId ?? '')))
+    && (intent === 'enable_hosting' || intent === 'attach_hosting'
+      || ((intent === 'authenticate' || intent === 'check_device_trust') && !draft.startReceiver))
 }
 
 export function jegotripLoginInput(attemptId: string, draft: AppLoginDraft): JegotripLoginInput {
@@ -56,7 +62,7 @@ export function jegotripLoginInput(attemptId: string, draft: AppLoginDraft): Jeg
     attempt_id: attemptId, username: draft.username.trim(), password: draft.password,
     country_code: draft.mode === 'phone' ? draft.country.trim().replace(/^\+/, '') : null,
     intent: draft.intent ?? 'enable_hosting', consent: draft.consent, start_receiver: draft.startReceiver,
-    ...(draft.deviceMode === 'manual' ? { device_id: (draft.deviceId ?? '').trim() } : {}),
+    ...(draft.deviceMode === 'manual' || draft.deviceMode === 'phone_app' ? { device_id: (draft.deviceId ?? '').trim() } : {}),
   }
 }
 
@@ -114,8 +120,17 @@ export function appBusinessLabel(state: string): string {
 }
 export function appLoginPhase(phase: string): string {
   return ({ queued: '已入队', authenticating: '登录 App 账号', reading_bound_number: '核对绑定号码', fetching_credentials: '后台取得通话凭据',
-    saving_app_account: '保存最近 App 认证摘要',
+    saving_app_account: '保存最近 App 认证摘要', checking_device_trust: '查询该 UUID 的服务器授信状态',
     checking_business: '查询托管业务', enabling_business: '提交开通请求', confirming_business: '确认业务状态', creating_account: '保存独立账号',
     starting_receiver: '提交接收器启动', completed: '登录配置任务完成', failed: '任务失败', interrupted: '任务中断' } as Record<string, string>)[phase] ?? '未知任务状态'
 }
 export function appLoginNeedsPolling(attempt: AppLoginAttempt): boolean { return !attempt.completed && !attempt.error }
+
+export function deviceTrustQueryLabel(observation: JegotripTrustQueryObservation): string {
+  if (observation.state === 'not_configured') return '查询端点未配置，状态未知'
+  if (observation.state === 'failed') return `查询失败：${appLoginError(observation.error)}`
+  if (observation.state !== 'observed') return '状态未知'
+  if (observation.authentication_code === 1) return '服务器本次返回 1（认可该设备）'
+  if (observation.authentication_code === 2) return '服务器本次返回 2（未认可该设备）'
+  return '服务器未返回已支持的明确授信结论'
+}

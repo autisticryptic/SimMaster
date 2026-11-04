@@ -35,6 +35,7 @@ fn legacy_attempt_table_rename_preserves_ids_and_uncertain_fields() {
     let value=store::get(&conn,&id).unwrap().unwrap();
     assert_eq!(value.phase,"confirming_business");assert_eq!(value.business_state,"accepted_unconfirmed");assert!(!value.completed);
     assert_eq!((value.created_at,value.updated_at),(10,11));assert_eq!(value.intent,LoginIntent::EnableHosting);assert_eq!(value.account_id,None);
+    assert!(value.device_trust.is_none());
     assert_eq!(conn.query_row("SELECT owner FROM jegotrip_login_attempts",[],|r|r.get::<_,String>(0)).unwrap(),"owner");
     assert_eq!(conn.query_row("SELECT value FROM keep_fixture",[],|r|r.get::<_,String>(0)).unwrap(),"unchanged");
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='app_voice_login_attempts'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
@@ -1196,4 +1197,122 @@ async fn concurrent_aliases_cannot_borrow_the_same_canonical_device_before_the_o
     assert_eq!(result.error,Some("app_login_busy"));assert_eq!(result.business_state,"not_requested");assert_redacted(&result);
     assert_eq!(f.script.paths(),["/login","/user","/csb/token","/login","/user"]);
     assert_eq!(f.manager.app_accounts().unwrap().len(),1);f.manager.shutdown().await;
+}
+
+fn trust_check_configuration(f:&Fixture)->DatabaseConfiguration {
+    let mut configuration=database_configuration(f,false);
+    configuration.http.endpoints.device_enroll=Some("enroll".into());
+    configuration.http.endpoints.security_verify=Some("security".into());
+    configuration.http.endpoints.verification_trustful_device=Some("trust".into());
+    configuration
+}
+fn trust_check_request(attempt:&str)->JegotripLoginRequest {
+    let mut request=app_only_request(attempt);request.intent=LoginIntent::CheckDeviceTrust;
+    request.device_id=Some(Secret::from_owned("D5C0199B-1644-4D33-8912-B8BD5AB49224".into()));request
+}
+fn trust_check_steps(code:i64,enabled:bool)->Vec<Step> {
+    let mut steps=app_only_steps();
+    steps.push(reply("/security",json!({"code":0,"body":{"authentication_code":code}})));
+    steps.push(reply("/trust",json!({"code":0,"body":{"authentication_code":code}})));
+    steps.push(reply("/state",json!({"code":0,"body":{"cs_forward":if enabled {"2"}else{"1"}}})));
+    steps
+}
+#[tokio::test]
+async fn phone_uuid_trust_check_uses_the_owned_identity_without_enrollment_phone_credentials_business_or_native_start() {
+    let f=Fixture::new(trust_check_steps(1,true),true);
+    f.manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration:trust_check_configuration(&f)}).unwrap();
+    let attempt=id();f.manager.submit_jegotrip(trust_check_request(&attempt)).unwrap();
+    let view=terminal(&f.manager,&attempt).await;assert_eq!(view.phase,"completed");assert_eq!(view.intent,LoginIntent::CheckDeviceTrust);
+    assert_eq!(view.business_state,"not_requested");assert!(view.line_id.is_none());assert_redacted(&view);
+    let observation=view.device_trust.as_ref().unwrap();
+    assert_eq!(observation.security_verify.authentication_code,Some(1));assert_eq!(observation.existing_device.authentication_code,Some(1));
+    assert_eq!(observation.hosting_enabled,Some(true));
+    let identity=f.manager.device_identities().unwrap().identities.remove(0);
+    assert_eq!(observation.device_identity_id,identity.id);assert_eq!(observation.device_identity_revision,identity.revision);
+    assert_eq!(identity.bound_account_id,view.account_id);assert_eq!(identity.device_id,"D5C0199B-1644-4D33-8912-B8BD5AB49224");
+    assert_eq!(f.script.paths(),["/login","/user","/security","/trust","/state"]);
+    let seen=lock(&f.script.seen);
+    assert!(seen[0].body.get("enrollId").is_none());
+    assert_eq!(seen[2].body,json!({"deviceId":identity.device_id}));
+    assert_eq!(seen[3].body,json!({"sso_token":"","equipment_type":"1","device_id":identity.device_id}));
+    assert_eq!(seen[3].wire,seen[3].body,"existing-device query remains ordinary JSON");
+    assert_eq!(seen[4].body,json!({"device_id":identity.device_id}));
+    for value in seen.iter().skip(1) {assert_eq!(value.query["token"],"fixture-app-session");}
+    drop(seen);
+    assert_eq!(f.factory.build_count(),0);assert!(f.accounts.list(now() as u64).await.unwrap().is_empty());
+    f.manager.shutdown().await;
+}
+#[tokio::test]
+async fn trust_check_keeps_transport_failure_untrusted_and_unknown_business_as_separate_observations() {
+    let mut steps=app_only_steps();steps.push(Step::Fail("/security".into()));
+    steps.push(reply("/trust",json!({"code":0,"body":{"authentication_code":2,"token":"must-not-export"}})));
+    steps.push(Step::Fail("/state".into()));let f=Fixture::new(steps,false);
+    f.manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration:trust_check_configuration(&f)}).unwrap();
+    let attempt=id();f.manager.submit_jegotrip(trust_check_request(&attempt)).unwrap();let view=terminal(&f.manager,&attempt).await;
+    assert_eq!(view.phase,"completed","query task completion is not successful authorization");
+    let observation=view.device_trust.as_ref().unwrap();
+    assert_eq!(observation.security_verify.state,device_trust::TrustQueryState::Failed);
+    assert_eq!(observation.security_verify.error.as_deref(),Some("app_login_transport_failed"));
+    assert_eq!(observation.existing_device.authentication_code,Some(2));assert_eq!(observation.hosting_enabled,None);
+    assert_eq!(observation.business_query_error.as_deref(),Some("app_login_transport_failed"));
+    assert_eq!(view.business_state,"not_requested");assert!(view.line_id.is_none());assert_eq!(f.factory.build_count(),0);
+    let encoded=serde_json::to_string(&view).unwrap();assert!(!encoded.contains("must-not-export"));assert_redacted(&view);
+    assert_eq!(f.script.paths(),["/login","/user","/security","/trust","/state"]);f.manager.shutdown().await;
+}
+#[test]
+fn trust_check_requires_consent_no_receiver_and_rejects_forged_trust_and_hardware_inputs() {
+    let f=Fixture::new(vec![],false);let mut request=trust_check_request(&id());request.consent=false;
+    assert_eq!(f.manager.submit_jegotrip(request).unwrap_err().code,"app_login_request_invalid");
+    let mut request=trust_check_request(&id());request.start_receiver=true;
+    assert_eq!(f.manager.submit_jegotrip(request).unwrap_err().code,"app_login_request_invalid");
+    for field in ["device_trust","trust_granted","hardware_imei","sso_token","phone_login_token"] {
+        let mut value=json!({"attempt_id":id(),"username":"user@example.invalid","password":" p@ss ","consent":true,
+            "intent":"check_device_trust","start_receiver":false});value[field]=json!("must-not-import");
+        assert!(serde_json::from_value::<JegotripLoginRequest>(value).is_err());
+    }
+    assert_eq!(LoginIntent::default(),LoginIntent::EnableHosting);assert!(f.script.paths().is_empty());
+}
+#[test]
+fn trust_observation_storage_is_bounded_owner_guarded_and_never_exports_reflected_fields() {
+    let conn=rusqlite::Connection::open_in_memory().unwrap();store::initialize(&conn,"owner",10).unwrap();let attempt=id();
+    store::insert_with_intent(&conn,&attempt,"owner",LoginIntent::CheckDeviceTrust,10).unwrap();
+    let snapshot=device_identity::Snapshot {id:id(),device_id:Secret::from_owned("PRIVATE-UUID-0001".into()),revision:1};
+    let observation=DeviceTrustObservation::capture(&snapshot,11,Ok(Some(http::TrustDecision {authentication_code:Some(1)})),Ok(None),Ok(false));
+    let encoded=observation.encode().unwrap();assert!(!encoded.contains("PRIVATE-UUID-0001"));
+    assert!(store::set_device_trust(&conn,&attempt,"another-owner",&observation,11).is_err());
+    store::set_device_trust(&conn,&attempt,"owner",&observation,11).unwrap();
+    assert_eq!(store::get(&conn,&attempt).unwrap().unwrap().device_trust.unwrap().device_identity_id,snapshot.id);
+    let mut reflected:Value=serde_json::from_str(&encoded).unwrap();reflected["token"]=json!("secret");
+    assert!(DeviceTrustObservation::decode(&reflected.to_string()).is_err());
+    assert!(DeviceTrustObservation::decode(&"x".repeat(device_trust::MAX_OBSERVATION_BYTES+1)).is_err());
+    let mut invalid=observation.clone();invalid.existing_device.authentication_code=Some(1);assert!(invalid.encode().is_err());
+    store::finish(&conn,&attempt,"owner",None,12).unwrap();assert!(store::set_device_trust(&conn,&attempt,"owner",&observation,13).is_err());
+    conn.execute("UPDATE jegotrip_login_attempts SET device_trust=?1 WHERE attempt_id=?2",rusqlite::params!["x".repeat(2049),attempt]).unwrap();
+    assert!(store::get(&conn,&attempt).is_err());
+}
+#[tokio::test]
+async fn trust_observation_persistence_failure_prevents_a_later_business_write_or_native_creation() {
+    let f=Fixture::new(normal_steps(false),false);
+    f.temp.database.with_conn(|conn|conn.execute_batch("CREATE TRIGGER fixture_reject_trust BEFORE UPDATE OF device_trust ON jegotrip_login_attempts BEGIN SELECT RAISE(ABORT,'fixture'); END;")
+        .map_err(|_|"fixture")).unwrap();
+    let request=login_request(&id());let attempt=request.attempt_id.clone();f.manager.submit(request).unwrap();let view=terminal(&f.manager,&attempt).await;
+    assert_eq!(view.error,Some("app_login_storage_failed"));assert_eq!(view.business_state,"not_requested");assert!(view.line_id.is_none());
+    assert_eq!(f.script.paths(),["/login","/user","/csb/token","/voip","/state"]);assert_eq!(f.factory.build_count(),0);f.manager.shutdown().await;
+}
+#[tokio::test]
+async fn a_phone_trust_observation_stays_historical_after_uuid_rotation_and_never_restores_a_receiver() {
+    let mut steps=trust_check_steps(1,true);steps.extend(trust_check_steps(2,false));let f=Fixture::new(steps,false);
+    f.manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration:trust_check_configuration(&f)}).unwrap();
+    let first=id();f.manager.submit_jegotrip(trust_check_request(&first)).unwrap();let original=terminal(&f.manager,&first).await;
+    tokio::time::timeout(Duration::from_secs(4),async {while f.manager.active.available_permits()!=2 {tokio::task::yield_now().await;}}).await.unwrap();
+    let identity=f.manager.device_identities().unwrap().identities.remove(0);
+    f.manager.set_device_identity(device_write(Some(&identity.id),identity.revision,original.account_id.as_deref(),Some("F1C0199B-1644-4D33-8912-B8BD5AB49224"))).unwrap();
+    let second=id();let mut request=trust_check_request(&second);request.device_id=None;f.manager.submit_jegotrip(request).unwrap();
+    let next=terminal(&f.manager,&second).await;assert_eq!(original.account_id,next.account_id);
+    assert_eq!(original.device_trust.as_ref().unwrap().security_verify.authentication_code,Some(1));
+    assert_eq!(next.device_trust.as_ref().unwrap().security_verify.authentication_code,Some(2));
+    assert!(next.device_trust.as_ref().unwrap().device_identity_revision>original.device_trust.as_ref().unwrap().device_identity_revision);
+    assert_eq!(f.manager.get(&first).unwrap().device_trust.unwrap().security_verify.authentication_code,Some(1));
+    let diagnostics=f.manager.push_status().await.unwrap();assert!(diagnostics.native_accounts.is_empty());
+    assert_eq!(f.factory.build_count(),0);assert!(next.line_id.is_none());f.manager.shutdown().await;
 }

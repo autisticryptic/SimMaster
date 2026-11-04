@@ -2,6 +2,9 @@
 
 > 本文件只描述**当前受支持的原生子集**及其验证证据。它区分「已在 Actions + 官方制品核验的软件行为」与「仍需真实设备/账号/服务验收的部分」，不把前者当作后者。
 > 私有部署值、账号 token、SipPwd、证书私钥、内置密钥一律不在此文件、不在 Git 中。
+>
+> 普通用户最少需要输入什么、哪些属于共享协议参数，以及为什么 UUID 不能替代所有认证材料，见
+> [最小配置与授信材料](JEGOTRIP_MINIMUM_CONFIGURATION.md)。完整安装 JSON 放在高级入口；界面简化不会删除未核验的 receiver/媒体配置或放宽原生校验。
 
 ## 1. 已验证的软件状态
 
@@ -130,7 +133,8 @@ SimAdmin 的实现方式：
     "verification_trustful_device": "api/service/voip/v1/verificationTrustfulDevice"
   }
   ```
-- 流程在 `csb/token` 之后、业务开关之前依次调用它们，并把服务端返回原样写成有界日志：
+- 流程在登录前先按配置 enroll，取得的 enrollId 仅供当次登录；随后在 `csb/token` 之后、业务开关之前执行已有设备查询，
+  把服务端回答写成有界日志：
   `app_login_device_trust step=enroll|security_verify authentication_code=<…>`、
   `app_login_trust_decision authentication_code=<…>`；
 - 这些返回值**只是报告**，不是授权凭据：程序不会把它们当成“已授信”去跳过任何校验，
@@ -208,7 +212,7 @@ business_state=not_requested   （证明没有任何写业务开关的请求）
 | 版本门槛（`app-version` 头） | 通过（`524` 消失） |
 | 设备注册 `device/sec/v1/enroll` | 通过：返回 `enrollId`(32) + `expireTime`(19)，已随登录上报 |
 | 安全设备校验 `securityVerify` / `verificationTrustfulDevice` | 已调用，服务端回答 `authentication_code=2` |
-| 开启托管 `setVoip` | 仍 `506 未授信设备`（需手机侧一键认证） |
+| 开启托管 `setVoip` | 仍 `506 未授信设备`（需服务端认可的合法验证，不能由该次拒绝推出所有账号只支持一种认证） |
 | 接管 `intent=attach_hosting` | 正确拒绝：`app_login_business_not_enabled`，`business_state=not_requested`（零写入） |
 
 接管未开启业务的拒绝路径已通过实测；已开启业务的真实接收路径仍待验收，不能视为已经可用。
@@ -220,7 +224,7 @@ business_state=not_requested   （证明没有任何写业务开关的请求）
 | App 登录 | `userCenter/v3/signIn` | ✅ 已实现，真实服务通过 |
 | 绑定号码 | `service/user/v1/getUser` | ✅ 已实现 |
 | 电话 token | `service/voip/v1/csb/token` | ✅ 已实现 |
-| SIP 凭据 | `service/voip/v1/openVoipStatus` | ✅ 已实现（内存内 AES/MD5 解密） |
+| SIP 凭据 | `service/voip/v1/openVoipStatus` | ✅ 已实现（SIP 密码独立 Triple-DES 解密，不与 HTTP 正文 AES/口令 MD5 混用） |
 | 托管状态 | `service/voip/v1/getCallStatus` | ✅ 已实现 |
 | 开启托管（不自动关闭） | `service/voip/v1/setVoip` | 已实现请求/读回确认；真实服务仍 `506`，关闭业务未实现 |
 | 安全设备注册 | `device/sec/v1/enroll` | 已实现（匿名调用，`enrollId` 随登录上报） |
@@ -233,14 +237,20 @@ business_state=not_requested   （证明没有任何写业务开关的请求）
 | 托管资料 | `service/voip/v1/getProfile` | ⛔ 未实现（当前用安装侧静态运行模板） |
 | 原生托管会话（ARC/SARC/Router/TLS） | `libmtc` / SDK 层 | ✅ 已实现（离线端到端测试覆盖） |
 
-### 2.2.9 完成一次完整托管的操作步骤
+### 2.2.9 手机授信迁移与完整托管验收的操作步骤
 
-1. **手机 App**（绑定号码所在手机）：登录账号 → 号码托管 → 开启（该步走中国移动一键认证，由运营商校验 SIM）。
-2. **SimAdmin**：登录方式选“接管已开启的托管（先在手机 App 开启）”，提交同一账号；此时服务端 `cs_forward=2`，程序会
-   取 phone token / SIP 密码 → 建本地账号 → 启动原生接收器。
-3. 向托管号码发一条短信，在 SimAdmin 的短信列表确认入库（分类 `smgw_text`）。
-4. 在账号上执行 `stop`，确认原生注销 → SDK `logoutSession` → 会话 stopped，且服务端托管开关保持开启。
-   `stop` 不调用 App HTTP logout，也不关闭业务；这些 API 与原生会话清理是不同层。
+1. 在本人手机 App 完成服务端认可的合法设备授信；保持 App 数据，取得其 **App `phone_uuid` / `device.dat`**，不是硬件 IMEI 或 SDK 的另一个 UUID。
+2. SimAdmin 登录页选“复用手机 App 已授信 UUID”。已有号码先在设备标识管理中做有版本守卫的替换，不能用登录请求静默覆盖旧绑定。
+3. 先选 `intent=check_device_trust`（“只查询设备授信”）：登录、核对绑定号码、查询 securityVerify/已有设备后备和业务读回；不 enroll、不取电话凭据、不建原生账号、不改业务、不启动接收。
+   此模式允许 HTTP-only 安装上下文，但不是将正常主入口退回“仅认证”。端点未配/查询失败/未知状态都分别显示，结果记录只是指定时间和标识版本的历史观察。
+4. 合法条件具备且**原生模板完整**后，明确选择 `attach_hosting` 接管已开启业务，或 `enable_hosting` 请求正常开启。
+   服务器仍可要求额外验证或拒绝；只复制 UUID 的真实迁移成功与否必须实测，不从静态分析保证。
+5. 本人号码真实外来短信、来电和双向媒体分别验收；短信列表应有对应入库、原 ACK 与接收时间证据。
+6. `stop` 后确认原生注销 → SDK logoutSession → 全部 Join → stopped，且没有自动关闭服务端业务。
+
+`device_trust` 观察只包含本地设备行 id/版本、时间、有限认证码/错误码和业务读回；不包含 UUID、账号、密码或 token。
+查询本身仍会正常登录服务，必须明确授权；页面保存 UUID 和配置不会自动触发查询或服务操作。
+完整说明见 [最小配置与授信材料](JEGOTRIP_MINIMUM_CONFIGURATION.md)。
 
 ## 2.3 设备标识：默认随机、持久复用、手工指定
 

@@ -38,6 +38,9 @@ class DocumentationLayoutTests(unittest.TestCase):
             # current behaviour, verified evidence and the remaining authorised
             # device steps. It is not a dated handoff page.
             'JEGOTRIP_NATIVE_HOSTING_DELIVERY.md',
+            # Maintained configuration/data-source guide, not a dated handoff or
+            # an export of the private installation template.
+            'JEGOTRIP_MINIMUM_CONFIGURATION.md',
         }
         # This private, untracked report belongs to the user and is not part of
         # the maintained public documentation set.

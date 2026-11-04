@@ -4,7 +4,7 @@ use super::{AttemptView, Error, LoginIntent, stored_code, valid_attempt_id};
 use rusqlite::{Connection, OptionalExtension, params, TransactionBehavior};
 const STORAGE:&str="app_login_storage_failed";
 const MAX_ATTEMPTS:i64=4096;
-const PHASES:&[&str]=&["queued","authenticating","reading_bound_number","saving_app_account","fetching_credentials","checking_business","enabling_business","confirming_business","creating_account","starting_receiver","completed","failed","interrupted"];
+const PHASES:&[&str]=&["queued","authenticating","reading_bound_number","saving_app_account","fetching_credentials","checking_device_trust","checking_business","enabling_business","confirming_business","creating_account","starting_receiver","completed","failed","interrupted"];
 const BUSINESS:&[&str]=&["not_requested","request_uncertain","accepted_unconfirmed","enabled","already_enabled","rejected"];
 const LEGACY_COLUMNS:&str="attempt_id,owner,phase,business_state,completed,line_id,masked_number,error,server_code,created_at,updated_at";
 fn exists(conn:&Connection,name:&str)->Result<bool,&'static str> {
@@ -50,6 +50,9 @@ pub(super) fn initialize(conn:&Connection,owner:&str,now:i64)->Result<(),&'stati
     if !cols.iter().any(|s|s=="account_id") {
         tx.execute_batch("ALTER TABLE jegotrip_login_attempts ADD COLUMN account_id TEXT;").map_err(|_|STORAGE)?;
     }
+    if !cols.iter().any(|s|s=="device_trust") {
+        tx.execute_batch("ALTER TABLE jegotrip_login_attempts ADD COLUMN device_trust TEXT;").map_err(|_|STORAGE)?;
+    }
     super::settings::initialize(&tx)?;
     super::accounts::initialize(&tx)?;
     super::device_identity::initialize(&tx)?;
@@ -64,6 +67,8 @@ fn decode(row:&rusqlite::Row<'_>)->rusqlite::Result<AttemptView> {
     let error:Option<String>=row.get(6)?;let masked:Option<String>=row.get(5)?;
     let intent:String=row.get(10)?;let account_id:Option<String>=row.get(11)?;
     let intent=LoginIntent::parse(&intent).ok_or(rusqlite::Error::InvalidQuery)?;let line:Option<String>=row.get(4)?;
+    let observation:Option<String>=row.get(12)?;
+    let device_trust=observation.as_deref().map(super::DeviceTrustObservation::decode).transpose().map_err(|_|rusqlite::Error::InvalidQuery)?;
     if !valid_attempt_id(&id) || !PHASES.contains(&phase.as_str()) || !BUSINESS.contains(&business.as_str())
         || line.as_ref().is_some_and(|v|!super::super::account_store::valid_line_id(v))
         || account_id.as_ref().is_some_and(|s|!valid_attempt_id(s))
@@ -71,7 +76,7 @@ fn decode(row:&rusqlite::Row<'_>)->rusqlite::Result<AttemptView> {
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(AttemptView {attempt_id:id,phase,business_state:business,completed:row.get::<_,i64>(3)?!=0,line_id:line,masked_number:masked,
-        error:error.as_deref().map(|s|stored_code(s).unwrap_or(STORAGE)),server_code:row.get(7)?,created_at:row.get(8)?,updated_at:row.get(9)?,intent,account_id})
+        error:error.as_deref().map(|s|stored_code(s).unwrap_or(STORAGE)),server_code:row.get(7)?,created_at:row.get(8)?,updated_at:row.get(9)?,intent,account_id,device_trust})
 }
 const COLUMNS:&str="CASE WHEN typeof(attempt_id)='text' AND length(CAST(attempt_id AS BLOB))=32 THEN attempt_id END,
     CASE WHEN typeof(phase)='text' AND length(CAST(phase AS BLOB)) BETWEEN 1 AND 32 THEN phase END,
@@ -81,7 +86,8 @@ const COLUMNS:&str="CASE WHEN typeof(attempt_id)='text' AND length(CAST(attempt_
     CASE WHEN error IS NULL THEN NULL WHEN typeof(error)='text' AND length(CAST(error AS BLOB)) BETWEEN 1 AND 64 THEN error ELSE 'app_login_storage_failed' END,
     server_code,created_at,updated_at,
     CASE WHEN typeof(intent)='text' AND length(CAST(intent AS BLOB)) BETWEEN 1 AND 32 THEN intent END,
-    CASE WHEN account_id IS NULL THEN NULL WHEN typeof(account_id)='text' AND length(CAST(account_id AS BLOB))=32 THEN account_id ELSE '' END";
+    CASE WHEN account_id IS NULL THEN NULL WHEN typeof(account_id)='text' AND length(CAST(account_id AS BLOB))=32 THEN account_id ELSE '' END,
+    CASE WHEN device_trust IS NULL THEN NULL WHEN typeof(device_trust)='text' AND length(CAST(device_trust AS BLOB)) BETWEEN 1 AND 2048 THEN device_trust ELSE '' END";
 pub(super) fn get(conn:&Connection,id:&str)->Result<Option<AttemptView>,&'static str> {
     conn.query_row(&format!("SELECT {COLUMNS} FROM jegotrip_login_attempts WHERE attempt_id=?1"),[id],decode).optional().map_err(|_|STORAGE)
 }
@@ -130,6 +136,11 @@ pub(super) fn set_line(conn:&Connection,id:&str,owner:&str,line:&str,now:i64)->R
         params![line,now,id,owner]).map_err(|_|STORAGE)?)?;
     if let Some(account)=account {super::accounts::link_voice_line(&tx,&account,line)?;}
     tx.commit().map_err(|_|STORAGE)
+}
+pub(super) fn set_device_trust(conn:&Connection,id:&str,owner:&str,observation:&super::DeviceTrustObservation,now:i64)->Result<(),&'static str> {
+    let value=observation.encode()?;
+    changed(conn.execute("UPDATE jegotrip_login_attempts SET device_trust=?1,updated_at=?2 WHERE attempt_id=?3 AND owner=?4 AND completed=0",
+        params![value,now,id,owner]).map_err(|_|STORAGE)?)
 }
 pub(super) fn finish(conn:&Connection,id:&str,owner:&str,error:Option<Error>,now:i64)->Result<(),&'static str> {
     let phase=match error {None=>"completed",Some(e)if e.code=="app_login_interrupted"=>"interrupted",_=>"failed"};

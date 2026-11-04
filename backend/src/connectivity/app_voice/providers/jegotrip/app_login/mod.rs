@@ -5,6 +5,7 @@ mod crypto;
 mod http;
 mod app_version;
 mod device_identity;
+mod device_trust;
 mod push_status;
 mod store;
 mod settings;
@@ -17,6 +18,7 @@ pub(crate) use app_version::AppVersionView;
 pub(crate) use device_identity::DeviceIdentityState;
 pub(crate) use push_status::PushStatusView;
 pub use accounts::JegotripAccountView;
+pub use device_trust::DeviceTrustObservation;
 use super::{account_runtime::AccountManager, account_config::AccountConfig};
 use futures_util::FutureExt;
 use crate::platform::db::Database;
@@ -52,10 +54,11 @@ pub(crate) fn valid_attempt_id(s: &str) -> bool { s.len() == 32 && s.bytes().all
 
 #[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
 #[serde(rename_all="snake_case")]
-pub enum LoginIntent { Authenticate, #[default] EnableHosting, AttachHosting }
+pub enum LoginIntent { Authenticate, #[default] EnableHosting, AttachHosting, CheckDeviceTrust }
 impl LoginIntent {
-    fn as_str(self)->&'static str {match self {Self::Authenticate=>"authenticate",Self::EnableHosting=>"enable_hosting",Self::AttachHosting=>"attach_hosting"}}
-    fn parse(value:&str)->Option<Self> {match value {"authenticate"=>Some(Self::Authenticate),"enable_hosting"=>Some(Self::EnableHosting),"attach_hosting"=>Some(Self::AttachHosting),_=>None}}
+    fn as_str(self)->&'static str {match self {Self::Authenticate=>"authenticate",Self::EnableHosting=>"enable_hosting",Self::AttachHosting=>"attach_hosting",Self::CheckDeviceTrust=>"check_device_trust"}}
+    fn parse(value:&str)->Option<Self> {match value {"authenticate"=>Some(Self::Authenticate),"enable_hosting"=>Some(Self::EnableHosting),"attach_hosting"=>Some(Self::AttachHosting),"check_device_trust"=>Some(Self::CheckDeviceTrust),_=>None}}
+    fn needs_native(self)->bool {matches!(self,Self::EnableHosting|Self::AttachHosting)}
 }
 
 /// Historical API contract: explicit consent to the complete hosting operation.
@@ -142,6 +145,8 @@ pub struct AttemptView {
     pub error: Option<&'static str>, pub server_code: Option<u32>,
     pub created_at: i64, pub updated_at: i64,
     pub intent:LoginIntent, pub account_id:Option<String>,
+    /// 本次原设备查询的历史状态，不作为托管/接收授权或永久授信缓存。
+    pub device_trust:Option<DeviceTrustObservation>,
 }
 #[derive(Debug, Serialize)]
 pub struct LoginSetup {
@@ -338,7 +343,7 @@ impl AppLoginManager {
         request.validate()?;self.submit_internal(request,LoginIntent::EnableHosting,None)
     }
     pub(crate) fn submit_jegotrip(self:&Arc<Self>,request:JegotripLoginRequest)->Result<AttemptView,Error> {
-        if !request.consent || (request.intent==LoginIntent::Authenticate && request.start_receiver) {return Err(Error::new("app_login_request_invalid"));}
+        if !request.consent || (matches!(request.intent,LoginIntent::Authenticate|LoginIntent::CheckDeviceTrust) && request.start_receiver) {return Err(Error::new("app_login_request_invalid"));}
         let intent=request.intent;
         let common=LoginRequest {attempt_id:request.attempt_id,username:request.username,password:request.password,country_code:request.country_code,
             enable_hosting:intent==LoginIntent::EnableHosting,start_receiver:request.start_receiver};
@@ -352,10 +357,10 @@ impl AppLoginManager {
         if self.database.with_conn(|c|store::get(c,&request.attempt_id)).map_err(Error::new)?.is_some() {return Err(Error::new("app_login_attempt_exists"));}
         let (_,revision,configuration)=self.selected_configuration().map_err(Error::new)?;
         let configuration=configuration.ok_or(Error::new("app_login_deployment_missing"))?;
-        if intent!=LoginIntent::Authenticate && configuration.runtime.is_none() {return Err(Error::new("app_login_native_configuration_missing"));}
+        if intent.needs_native() && configuration.runtime.is_none() {return Err(Error::new("app_login_native_configuration_missing"));}
         let mut client=self.factory.build(&configuration.http)?;
         let accounts=self.accounts.upgrade().ok_or(Error::new("app_login_unavailable"))?;
-        if intent!=LoginIntent::Authenticate {accounts.login_preflight_create().map_err(|_|Error::new("app_login_account_creation_failed"))?;}
+        if intent.needs_native() {accounts.login_preflight_create().map_err(|_|Error::new("app_login_account_creation_failed"))?;}
         let permit=self.active.clone().try_acquire_owned().map_err(|_|Error::new("app_login_busy"))?;
         let alias=client.login_alias_key(&request)?;
         let mut admissions=lock(&self.admissions);
@@ -421,7 +426,7 @@ impl AppLoginManager {
         client.ensure_app_version().await;
         // The original LoginActivity enrols this device before signing in; the
         // login body then carries the returned enrollId. Best effort only.
-        client.ensure_device_enrollment().await;
+        if intent!=LoginIntent::CheckDeviceTrust {client.ensure_device_enrollment().await;}
         eprintln!("app_login_version_in_use {}",client.version_provenance().await);
         let outcome=self.run_with_version_gate(owner,&request,intent,revision,&configuration,&mut client,guard).await;
         request.password = Secret::from_owned(String::new());
@@ -459,7 +464,7 @@ impl AppLoginManager {
             // Re-authenticate ONCE with it, before any token/trust/business call;
             // never switch a device beneath an existing App session.
             client.use_device_identity(guard.snapshot.device_id.expose_to_backend());
-            client.ensure_device_enrollment().await;
+            if intent!=LoginIntent::CheckDeviceTrust {client.ensure_device_enrollment().await;}
             client.login(&request).await?;
             let confirmed=client.bound_number(&request).await?;
             if client.account_key(&confirmed)?!=key {return Err(Error::new("app_login_identity_mismatch"));}
@@ -473,6 +478,17 @@ impl AppLoginManager {
         // An App-only login does not consume SDK materials, enable a service,
         // retain the App token or fabricate a native account/configuration.
         if intent==LoginIntent::Authenticate {return Ok(());}
+        if intent==LoginIntent::CheckDeviceTrust {
+            // 手机授信迁移后的显式只读核验：不 enroll、不取电话凭据、
+            // 不创建原生账号、不写业务、不把历史观察当作授权。
+            self.step(owner,id,"checking_device_trust",None)?;
+            let security=client.security_verify_device().await;
+            let existing=client.verify_trusted_device().await;
+            let business=client.business_enabled().await;
+            let observation=DeviceTrustObservation::capture(&guard.snapshot,now(),security,existing,business);
+            self.database.with_conn(|c|store::set_device_trust(c,id,owner,&observation,now())).map_err(Error::new)?;
+            return Ok(());
+        }
         if self.database.with_conn(|c|device_identity::native_ownership_pending(c,&key)).map_err(Error::new)? {
             return Err(Error::new("app_login_device_identity_in_use"));
         }
@@ -485,17 +501,17 @@ impl AppLoginManager {
         // installation also configured the App's own enrolment/verification
         // endpoints, those run first, exactly as the original client does, and
         // each answer is logged instead of being treated as a grant.
-        for (label,outcome) in [
-            ("enroll",client.enroll_device().await),
-            ("security_verify",client.security_verify_device().await),
-        ] {
+        let enroll=client.enroll_device().await;
+        let security=client.security_verify_device().await;
+        for (label,outcome) in [("enroll",&enroll),("security_verify",&security)] {
             match outcome {
                 Ok(Some(decision))=>eprintln!("app_login_device_trust step={label} authentication_code={:?}",decision.authentication_code),
                 Ok(None)=>eprintln!("app_login_device_trust step={label} not_configured"),
                 Err(error)=>eprintln!("app_login_device_trust step={label} failed code={} server_code={:?}",error.code,error.server_code),
             }
         }
-        match client.verify_trusted_device().await {
+        let existing=client.verify_trusted_device().await;
+        match &existing {
             Ok(Some(decision))=>eprintln!("app_login_trust_decision authentication_code={:?}",decision.authentication_code),
             Ok(None)=>eprintln!("app_login_trust_decision not_configured"),
             Err(error)=>eprintln!("app_login_trust_decision_failed code={} server_code={:?}",error.code,error.server_code),
@@ -506,7 +522,10 @@ impl AppLoginManager {
         let accounts=self.accounts.upgrade().ok_or(Error::new("app_login_unavailable"))?;
         accounts.login_preflight_create().map_err(|_|Error::new("app_login_account_creation_failed"))?;
         self.step(owner,id,"checking_business",None)?;
-        let enabled=client.business_enabled().await?;
+        let business=client.business_enabled().await;
+        let observation=DeviceTrustObservation::capture(&guard.snapshot,now(),security,existing,business);
+        self.database.with_conn(|c|store::set_device_trust(c,id,owner,&observation,now())).map_err(Error::new)?;
+        let enabled=business?;
         if intent==LoginIntent::AttachHosting {
             // Taking over an EXISTING hosting service. The server only lets the
             // account's verified device enable it (506 otherwise, verified on
