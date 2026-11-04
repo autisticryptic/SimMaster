@@ -801,6 +801,21 @@ fn version_view_exposes_only_the_value_provenance_and_sources() {
     assert!(empty.contains("\"stored\":null"),"{empty}");
     assert!(empty.contains("\"stored_age_seconds\":null"),"{empty}");
 }
+#[test]
+fn device_trust_codes_preserve_the_original_exact_success_literal_and_reject_padded_or_reflected_values() {
+    for value in [json!("01"),json!("000001"),json!("+1"),json!(" 1"),json!("1 "),json!(1.0),json!(true),json!(-1),json!(1000000),json!("uuid-1")] {
+        let body=json!({"authentication_code":value});
+        assert_eq!(http::trust_code(body.as_object().unwrap()),None,"noncanonical trust value must remain unknown");
+    }
+    for value in [json!(1),json!("1")] {
+        let body=json!({"authentication_code":value});
+        assert_eq!(http::trust_code(body.as_object().unwrap()),Some(1));
+    }
+    for value in [json!(2),json!("2")] {
+        let body=json!({"authentication_code":value});
+        assert_eq!(http::trust_code(body.as_object().unwrap()),Some(2));
+    }
+}
 #[tokio::test]
 async fn trusted_device_verification_posts_the_app_fields_and_never_invents_a_grant() {
     let mut value=deployment_json("AA==",false);

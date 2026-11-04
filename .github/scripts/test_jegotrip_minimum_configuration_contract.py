@@ -129,6 +129,9 @@ class JegotripMinimumConfigurationContracts(unittest.TestCase):
         self.assertNotIn('pub trusted:bool', model)
         backend = (P / 'app_login/mod.rs').read_text(encoding='utf-8')
         self.assertNotIn('if observation.', backend)
+        http = (P / 'app_login/http.rs').read_text(encoding='utf-8')
+        self.assertIn('if number.to_string()!=text {return None;}', http)
+        self.assertIn('noncanonical trust value must remain unknown', (P / 'app_login/tests.rs').read_text(encoding='utf-8'))
 
     def test_trust_api_and_browser_regressions_preserve_no_store_and_no_business_assertions(self):
         http = source('backend/src/api/app_voice_http_tests.rs')

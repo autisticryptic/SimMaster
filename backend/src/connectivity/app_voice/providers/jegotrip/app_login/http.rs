@@ -160,12 +160,15 @@ pub(super) fn rejected_response_diagnostic(path:&str,doc:&JsonDoc)->Option<Strin
     let code=crypto::outer_code(doc)?;
     (code!=0).then(||format!("app_login_reject_fields endpoint={path} code={code}"))
 }
-fn trust_code(body:&serde_json::Map<String,serde_json::Value>)->Option<i64> {
+pub(super) fn trust_code(body:&serde_json::Map<String,serde_json::Value>)->Option<i64> {
     let value=body.get("authentication_code")?;
     let code=if let Some(number)=value.as_i64() {number} else {
         let text=value.as_str()?;
         if text.is_empty() || text.len()>6 || !text.bytes().all(|b|b.is_ascii_digit()) {return None;}
-        text.parse().ok()?
+        let number:i64=text.parse().ok()?;
+        // 原 App 对 optString 后的 "1" 做精确比较；"01" 不能变成授信成功。
+        if number.to_string()!=text {return None;}
+        number
     };
     (0..=999999).contains(&code).then_some(code)
 }
