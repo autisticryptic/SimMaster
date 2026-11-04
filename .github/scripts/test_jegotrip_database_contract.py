@@ -102,7 +102,8 @@ class JegotripDatabaseContractTests(unittest.TestCase):
 
     def test_primary_api_defaults_to_full_hosting_but_still_requires_consent(self):
         source = (P / 'mod.rs').read_text()
-        self.assertIn('pub enum LoginIntent { Authenticate, #[default] EnableHosting, AttachHosting, CheckDeviceTrust }', source)
+        self.assertIn('pub enum LoginIntent { Authenticate, #[default] EnableHosting, AttachHosting, CheckDeviceTrust, ReuseHosting, EnableTrustedHosting }', source)
+        self.assertIn('fn reuses_trusted_device(self)->bool {matches!(self,Self::ReuseHosting|Self::EnableTrustedHosting)}', source)
         check = source.split('if intent==LoginIntent::CheckDeviceTrust {', 1)[1].split('if self.database.with_conn', 1)[0]
         self.assertIn('client.verify_trusted_device().await', check)
         self.assertIn('client.security_verify_device().await', check)

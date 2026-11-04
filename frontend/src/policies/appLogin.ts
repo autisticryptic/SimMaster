@@ -1,4 +1,4 @@
-import type { AppLoginAttempt, AppLoginInput, JegotripLoginInput, JegotripLoginIntent, JegotripTrustQueryObservation } from '../api/current'
+import type { AppLoginAttempt, AppLoginInput, JegotripLoginInput, JegotripLoginIntent, JegotripTrustQueryObservation, JegotripDeviceSyncObservation } from '../api/current'
 
 export type AppLoginMode = 'account' | 'phone'
 export interface AppLoginDraft {
@@ -49,10 +49,13 @@ export function validPhoneAppUuid(value: string): boolean {
 export function canSubmitJegotripLogin(draft: AppLoginDraft): boolean {
   const intent = draft.intent ?? 'enable_hosting'
   const deviceMode = draft.deviceMode ?? 'auto'
+  const reusing = intent === 'reuse_hosting' || intent === 'enable_trusted_hosting'
   return canSubmitAppLogin(draft)
     && (deviceMode === 'auto' || (deviceMode === 'manual' && validJegotripDeviceId(draft.deviceId ?? ''))
       || (deviceMode === 'phone_app' && validPhoneAppUuid(draft.deviceId ?? '')))
-    && (intent === 'enable_hosting' || intent === 'attach_hosting'
+    && (!reusing || deviceMode === 'phone_app')
+    && (deviceMode !== 'phone_app' || reusing || intent === 'authenticate' || intent === 'check_device_trust')
+    && (reusing || intent === 'enable_hosting' || intent === 'attach_hosting'
       || ((intent === 'authenticate' || intent === 'check_device_trust') && !draft.startReceiver))
 }
 
@@ -94,8 +97,9 @@ const errors: Record<string, string> = {
   app_login_device_identity_not_found: '设备标识已不存在，请刷新列表。',
   app_login_device_identity_limit: '设备标识或历史保留记录已达上限，请管理员核对；不会覆盖旧绑定。',
   app_login_device_identity_in_use: '有登录任务、接收器或未完成的清理正在使用该标识，请等待任务结束并停止接收器后再修改。',
-  app_login_device_untrusted: '服务端判定本机不是已授信设备（506）；生成或更换设备标识不等于通过一键验证，需要服务端完成设备授信。',
-  app_login_business_not_enabled: '该账号的托管业务尚未开启；无法从本机开启（服务端要求安全设备认证），请先在手机 App 开启托管，或在手机 App 上完成开通后再重试。',
+  app_login_device_untrusted: '本次未取得该原 UUID 的明确服务器认可，或服务端拒绝本机（506）；生成或更换设备标识不等于通过一键验证。已停止，未自动申请新授信。',
+  app_login_business_not_enabled: '所选接管操作不写业务开关，但服务器本次读回托管尚未开启。请在本人手机开启，或确认已授信后另选明确开启业务的操作；仍以服务端结果为准。',
+  app_login_device_sync_context_missing: '已配置设备同步，但缺少本次 user-info.accountid 或受支持的本人手机报告资料；未猜测字段或申请新授信，请检查安装配置。',
   app_login_business_unconfirmed: '开通请求已被接受，但未确认业务状态；未启动接收器。',
   app_login_rate_limited: '服务请求过于频繁，请勿自动重复登录。',
   app_login_server_rejected: '无忧行服务拒绝了本次请求。',
@@ -120,7 +124,7 @@ export function appBusinessLabel(state: string): string {
 }
 export function appLoginPhase(phase: string): string {
   return ({ queued: '已入队', authenticating: '登录 App 账号', reading_bound_number: '核对绑定号码', fetching_credentials: '后台取得通话凭据',
-    saving_app_account: '保存最近 App 认证摘要', checking_device_trust: '查询该 UUID 的服务器授信状态',
+    saving_app_account: '保存最近 App 认证摘要', checking_device_trust: '查询该 UUID 的服务器授信状态', syncing_device: '同步已明确配置的本人手机设备资料',
     checking_business: '查询托管业务', enabling_business: '提交开通请求', confirming_business: '确认业务状态', creating_account: '保存独立账号',
     starting_receiver: '提交接收器启动', completed: '登录配置任务完成', failed: '任务失败', interrupted: '任务中断' } as Record<string, string>)[phase] ?? '未知任务状态'
 }
@@ -128,9 +132,18 @@ export function appLoginNeedsPolling(attempt: AppLoginAttempt): boolean { return
 
 export function deviceTrustQueryLabel(observation: JegotripTrustQueryObservation): string {
   if (observation.state === 'not_configured') return '查询端点未配置，状态未知'
+  if (observation.state === 'not_requested') return '本次复用流程未请求此端点'
   if (observation.state === 'failed') return `查询失败：${appLoginError(observation.error)}`
   if (observation.state !== 'observed') return '状态未知'
   if (observation.authentication_code === 1) return '服务器本次返回 1（认可该设备）'
   if (observation.authentication_code === 2) return '服务器本次返回 2（未认可该设备）'
   return '服务器未返回已支持的明确授信结论'
+}
+
+export function deviceSyncLabel(observation: JegotripDeviceSyncObservation): string {
+  if (observation.state === 'not_configured') return '未配置本人手机报告，未发送'
+  if (observation.state === 'not_requested') return '本次未发送设备报告'
+  if (observation.state === 'accepted') return '服务器已接受本次设备报告（不是授信或收件成功）'
+  if (observation.state === 'rejected') return `报告被拒绝：${appLoginError(observation.error)}`
+  return '设备报告结果不确定，不会自动重放'
 }

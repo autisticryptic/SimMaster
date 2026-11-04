@@ -113,7 +113,9 @@ class JegotripMinimumConfigurationContracts(unittest.TestCase):
         self.assertIn('DeviceTrustObservation::capture(&guard.snapshot', check)
         for forbidden in ['accounts.create', 'client.phone_credentials', 'client.enroll_device', 'client.enable_business', 'accounts.start']:
             self.assertNotIn(forbidden, check)
-        self.assertLess(backend.index('self.confirm_device_identity(guard,&key)'), backend.index('if intent==LoginIntent::CheckDeviceTrust {'))
+        self.assertLess(backend.index('self.confirm_device_identity(guard,&key,intent.reuses_trusted_device())'), backend.index('if intent==LoginIntent::CheckDeviceTrust {'))
+        self.assertIn('device_identity::confirm_reuse(&tx,&guard.alias,&guard.snapshot,key,now())', backend)
+        self.assertIn('if !intent.reuses_trusted_device() {', backend)
 
     def test_trust_observations_are_bounded_metadata_not_a_cached_authorization(self):
         model = (P / 'app_login/device_trust.rs').read_text(encoding='utf-8')

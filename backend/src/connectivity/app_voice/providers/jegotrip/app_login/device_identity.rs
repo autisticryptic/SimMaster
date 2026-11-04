@@ -61,6 +61,12 @@ pub(super) fn initialize(conn: &Connection) -> Result<(), &'static str> {
 pub(super) fn valid_device_id(value: &str) -> bool {
     (8..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
+/// Shape of the App's persisted phone_uuid/device.dat, not a trust assertion.
+pub(super) fn valid_phone_app_uuid(value:&str)->bool {
+    value.len()==36 && value.bytes().enumerate().all(|(i,b)| {
+        if matches!(i,8|13|18|23) { b==b'-' } else { b.is_ascii_hexdigit() }
+    })
+}
 /// Matches the App's persisted random uppercase UUID shape, not a fabricated IMEI.
 pub(super) fn generated() -> Result<String, Error> {
     let mut bytes = [0u8; 16];
@@ -175,6 +181,30 @@ pub(super) fn resolve(conn: &Connection, alias_key: &[u8], preferred: Option<&st
     Ok(snapshot)
 }
 
+/// Explicit reuse never generates a device value or silently selects a different
+/// canonical UUID. A known UUID may be inspected through a new login alias, but
+/// that alias is attached ONLY after the returned number confirms its ownership.
+pub(super) fn resolve_reuse(conn:&Connection,alias_key:&[u8],value:&str,now:i64)->Result<Snapshot,Error> {
+    if alias_key.len()!=32 || !valid_phone_app_uuid(value) { return Err(Error::new("app_login_request_invalid")); }
+    let old:Option<String>=conn.query_row("SELECT CASE WHEN typeof(identity_id)='text' AND length(CAST(identity_id AS BLOB))=32 THEN identity_id END
+        FROM jegotrip_device_aliases WHERE alias_key=?1",[alias_key],|r|r.get(0)).optional().map_err(|_|Error::new(STORAGE))?;
+    let owner:Option<String>=conn.query_row("SELECT CASE WHEN typeof(identity_id)='text' AND length(CAST(identity_id AS BLOB))=32 THEN identity_id END
+        FROM jegotrip_device_identity_history WHERE device_id=?1 COLLATE NOCASE",[value],|r|r.get(0)).optional().map_err(|_|Error::new(STORAGE))?;
+    if old.as_ref().is_some_and(|id|owner.as_ref()!=Some(id)) { return Err(Error::new("app_login_device_identity_conflict")); }
+    if let Some(id)=owner {
+        let row=get(conn,&id)?.ok_or(Error::new(STORAGE))?;
+        if row.retired || !value.eq_ignore_ascii_case(row.snapshot.device_id.expose_to_backend()) {
+            return Err(Error::new("app_login_device_identity_conflict"));
+        }
+        if in_use(conn,row.account_key.as_deref())? { return Err(Error::new("app_login_device_identity_in_use")); }
+        Ok(row.snapshot)
+    } else {
+        // Import the explicitly selected EXISTING phone value locally. This
+        // neither enrols it remotely nor changes the server's single-device rule.
+        create(conn,value,"manual",None,now)
+    }
+}
+
 /// Successful App user-info is the ONLY authority for the number binding. A
 /// different login alias may discover a canonical identity here; the caller
 /// must re-authenticate with it BEFORE credentials/trust/business calls.
@@ -199,6 +229,23 @@ pub(super) fn confirm(conn: &Connection, alias_key: &[u8], used: &Snapshot, acco
     alias(conn,alias_key,&used.id)?;
     Ok(Snapshot { revision, ..used.clone() })
 }
+/// The reuse path must never retire the selected phone UUID in favour of an
+/// account's OTHER canonical identity. Check before confirm can mutate aliases.
+pub(super) fn confirm_reuse(conn:&Connection,alias_key:&[u8],used:&Snapshot,account_key:&[u8],now:i64)->Result<Snapshot,Error> {
+    if alias_key.len()!=32 || account_key.len()!=32 { return Err(Error::new(STORAGE)); }
+    let row=current(conn,&used.id,used.revision)?;
+    if row.snapshot.device_id.expose_to_backend()!=used.device_id.expose_to_backend() { return Err(Error::new(STORAGE)); }
+    if row.account_key.as_ref().is_some_and(|key|key.as_slice()!=account_key) { return Err(Error::new("app_login_identity_mismatch")); }
+    if active_account(conn,account_key)?.is_some_and(|canonical|canonical.snapshot.id!=used.id) {
+        return Err(Error::new("app_login_device_identity_conflict"));
+    }
+    if in_use(conn,Some(account_key))? { return Err(Error::new("app_login_device_identity_in_use")); }
+    let selected=confirm(conn,alias_key,used,account_key,now)?;
+    if selected.id!=used.id { return Err(Error::new(STORAGE)); }
+    alias(conn,alias_key,&selected.id)?;
+    Ok(selected)
+}
+
 fn current(conn: &Connection, id: &str, revision: u64) -> Result<Identity, Error> {
     if !valid_attempt_id(id) || revision==0 || revision>i64::MAX as u64 { return Err(Error::new("app_login_request_invalid")); }
     let row = get(conn,id)?.ok_or(Error::new("app_login_device_identity_not_found"))?;

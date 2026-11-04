@@ -160,8 +160,7 @@ pub(super) fn rejected_response_diagnostic(path:&str,doc:&JsonDoc)->Option<Strin
     let code=crypto::outer_code(doc)?;
     (code!=0).then(||format!("app_login_reject_fields endpoint={path} code={code}"))
 }
-pub(super) fn trust_code(body:&serde_json::Map<String,serde_json::Value>)->Option<i64> {
-    let value=body.get("authentication_code")?;
+fn bounded_code(value:&serde_json::Value)->Option<i64> {
     let code=if let Some(number)=value.as_i64() {number} else {
         let text=value.as_str()?;
         if text.is_empty() || text.len()>6 || !text.bytes().all(|b|b.is_ascii_digit()) {return None;}
@@ -171,6 +170,9 @@ pub(super) fn trust_code(body:&serde_json::Map<String,serde_json::Value>)->Optio
         number
     };
     (0..=999999).contains(&code).then_some(code)
+}
+pub(super) fn trust_code(body:&serde_json::Map<String,serde_json::Value>)->Option<i64> {
+    bounded_code(body.get("authentication_code")?)
 }
 pub(super) fn device_trust_shape(label:&str,body:&serde_json::Map<String,serde_json::Value>)->String {
     let mut fields=Vec::new();
@@ -185,7 +187,18 @@ pub(super) fn device_trust_shape(label:&str,body:&serde_json::Map<String,serde_j
 }
 #[derive(Clone, Copy)]
 enum Authentication { Anonymous, Session }
-pub(super) struct BoundNumber { country:String, mobile:Secret }
+pub(super) struct BoundNumber { country:String, mobile:Secret, app_account_id:Option<Secret> }
+/// Finite fields of the SAME getCallStatus response, not SDK readiness.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(super) struct CallStatus { pub authentication_code:Option<i64>, pub hosting_enabled:bool, pub local_cs_forward:Option<i64> }
+pub(super) fn decode_call_status(body:&serde_json::Map<String,serde_json::Value>)->Result<CallStatus,Error> {
+    let value=body.get("cs_forward").ok_or(Error::new("app_login_response_invalid"))?;
+    let enabled=match value.as_str() {
+        Some("2")=>true,Some("1")=>false,_=>match value.as_u64() {Some(2)=>true,Some(1)=>false,_=>return Err(Error::new("app_login_response_invalid"))},
+    };
+    let local=body.get("localCsForward").and_then(bounded_code);
+    Ok(CallStatus {authentication_code:trust_code(body),hosting_enabled:enabled,local_cs_forward:local})
+}
 /// Server answer of the App's trusted-device verification. Nothing here is a
 /// grant: `authentication_code` is only what the server reported.
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -203,6 +216,9 @@ pub(super) struct AppClient { config:HttpDeployment, transport:Arc<dyn Transport
     /// Per-account App device identity resolved from the installation store.
     /// SDK identity remains a separate explicit runtime parameter.
     device_id_override:Option<Secret>,
+    /// Reuse is an operation policy, never a locally granted trust bit.
+    trusted_reuse:bool,
+    trusted_reuse_write_started:std::sync::atomic::AtomicBool,
     version_cache:std::sync::Mutex<Option<(String,&'static str,std::time::Instant)>> }
 /// The server's explicit "your App is too old" business code. It is the ONLY
 /// trigger for re-learning the version and replaying a request.
@@ -254,7 +270,17 @@ impl AppClient {
         hash.update(&[0]);hash.update(&request.identity_key());
         Ok(hash.finish().as_ref().to_vec())
     }
-    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_store:None,enroll_id:std::sync::Mutex::new(None),device_id_override:None,version_cache:std::sync::Mutex::new(None)}) }
+    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_store:None,enroll_id:std::sync::Mutex::new(None),device_id_override:None,trusted_reuse:false,trusted_reuse_write_started:std::sync::atomic::AtomicBool::new(false),version_cache:std::sync::Mutex::new(None)}) }
+    pub(super) fn with_trusted_reuse(mut self)->Result<Self,Error> {
+        // A private extra field must not sneak a stale enrolment, carrier
+        // credential or a different report owner into this explicit policy.
+        if self.config.extra_body.iter().any(|pair|matches!(pair.name.expose_to_backend(),
+            "enrollId"|"sso_token"|"device_id"|"deviceId"|"imei"|"userId"|"accountid"|"authentication_code")) {
+            return Err(Error::new("app_login_deployment_invalid"));
+        }
+        self.trusted_reuse=true;Ok(self)
+    }
+    pub(super) fn trusted_reuse_write_started(&self)->bool { self.trusted_reuse_write_started.load(std::sync::atomic::Ordering::SeqCst) }
     /// Bind a checked installation-store identity before any network request.
     pub fn with_device_id(mut self,device_id:&str)->Self { self.use_device_identity(device_id); self }
     pub fn use_device_identity(&mut self,device_id:&str) {
@@ -464,10 +490,12 @@ impl AppClient {
         let mut payload=self.payload(serde_json::json!({"loginName":request.username.expose_to_backend().trim(),
             "password":hash.expose_to_backend(),"userType":"0","site":1}),self.version_value().await.as_deref());
         if let Some(country)=&request.country_code { payload.0["countryCode"]=serde_json::Value::String(country.clone()); }
-        if let Some(id)=&self.config.enroll_id { payload.0["enrollId"]=serde_json::Value::String(id.expose_to_backend().to_owned()); }
-        // A freshly enrolled device id wins over the static configuration: the
-        // App sends the value it just received from device/sec/v1/enroll.
-        if let Some(id)=self.remembered_enroll_id() { payload.0["enrollId"]=serde_json::Value::String(id); }
+        // Reuse never applies a static/old enrolment to the copied phone UUID.
+        if !self.trusted_reuse {
+            if let Some(id)=&self.config.enroll_id { payload.0["enrollId"]=serde_json::Value::String(id.expose_to_backend().to_owned()); }
+            // Ordinary LoginActivity compatibility retains its fresh enrolment.
+            if let Some(id)=self.remembered_enroll_id() { payload.0["enrollId"]=serde_json::Value::String(id); }
+        }
         // No campaign context is invented; null Gson fields are omitted.
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let doc=self.post(&self.config.endpoints.login,&bytes,Authentication::Anonymous,true).await?;
@@ -486,7 +514,11 @@ impl AppClient {
         if let Some(requested_country)=&request.country_code {
             if country!=requested_country || mobile!=request.username.expose_to_backend().trim() { return Err(Error::new("app_login_identity_mismatch")); }
         }
-        Ok(BoundNumber {country:country.to_owned(),mobile:Secret::from_owned(mobile.to_owned())})
+        // Original SysApplication.getUserId reads User.accountid. No alias to
+        // user_id/phone number/SDK identity is inferred for the device report.
+        let app_account_id=body.get("accountid").and_then(|v|v.as_str()).filter(|s|
+            !s.is_empty() && s.len()<=254 && !s.chars().any(char::is_control)).map(|s|Secret::from_owned(s.to_owned()));
+        Ok(BoundNumber {country:country.to_owned(),mobile:Secret::from_owned(mobile.to_owned()),app_account_id})
     }
     pub async fn phone_credentials(&self,bound:&BoundNumber)->Result<PhoneMaterial,Error> {
         let identity=bound.identity();let payload=self.payload(serde_json::json!({"accountId":&**identity}),self.version_value().await.as_deref());
@@ -503,6 +535,7 @@ impl AppClient {
     /// only the HTTPS authentication query; it is never a MobileAuth credential.
     /// Original CallLogic uses ordinary JSON here, and equipment_type is "1".
     pub async fn verify_trusted_device(&self)->Result<Option<TrustDecision>,Error> {
+        if self.trusted_reuse { return Err(Error::new("app_login_request_invalid")); }
         let Some(path)=self.config.endpoints.verification_trustful_device.clone() else { return Ok(None); };
         if self.session.is_none() {return Err(Error::new("app_login_unavailable"));}
         let payload=self.payload(serde_json::json!({
@@ -519,6 +552,7 @@ impl AppClient {
     /// Security-device enrolment (`CmiLogic.enroll`): the App posts exactly
     /// `{"deviceId": …}`. Optional; a missing path sends nothing.
     pub async fn enroll_device(&self)->Result<Option<TrustDecision>,Error> {
+        if self.trusted_reuse { return Err(Error::new("app_login_request_invalid")); }
         let path=self.config.endpoints.device_enroll.clone();
         let Some(path)=path else { return Ok(None); };
         let payload=self.payload(serde_json::json!({"deviceId":self.device_id()?}),self.version_value().await.as_deref());
@@ -541,7 +575,7 @@ impl AppClient {
     /// fresh `enrollId`. Best-effort: a failed enrolment never blocks the login,
     /// it just leaves the configured/static value in place.
     pub(super) async fn ensure_device_enrollment(&self) {
-        if self.config.endpoints.device_enroll.is_none() || self.remembered_enroll_id().is_some() { return; }
+        if self.trusted_reuse || self.config.endpoints.device_enroll.is_none() || self.remembered_enroll_id().is_some() { return; }
         match self.enroll_device().await {
             Ok(Some(_))=>eprintln!("app_login_device_enroll ok={}",self.remembered_enroll_id().is_some()),
             Ok(None)=>eprintln!("app_login_device_enroll not_configured"),
@@ -570,18 +604,36 @@ impl AppClient {
     fn log_body_shape(label:&str,body:&serde_json::Map<String,serde_json::Value>) {
         eprintln!("{}",device_trust_shape(label,body));
     }
-    pub async fn business_enabled(&self)->Result<bool,Error> {
+    pub async fn call_status(&self)->Result<CallStatus,Error> {
         let payload=self.payload(serde_json::json!({"device_id":self.device_id()?}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let doc=self.post(&self.config.endpoints.call_status,&bytes,Authentication::Session,false).await?;
-        let value=crypto::body(&doc)?.get("cs_forward").ok_or(Error::new("app_login_response_invalid"))?;
-        match value.as_str() {
-            Some("2")=>Ok(true),Some("1")=>Ok(false),_=>match value.as_u64() {Some(2)=>Ok(true),Some(1)=>Ok(false),_=>Err(Error::new("app_login_response_invalid"))},
-        }
+        decode_call_status(crypto::body(&doc)?)
+    }
+    pub async fn business_enabled(&self)->Result<bool,Error> { Ok(self.call_status().await?.hosting_enabled) }
+    pub(super) fn device_sync_configured(&self)->bool { self.config.device_sync_profile.is_some() }
+    pub(super) fn validate_device_sync_context(&self,bound:&BoundNumber)->Result<(),Error> {
+        let Some(profile)=&self.config.device_sync_profile else { return Ok(()); };
+        let account=bound.app_account_id.as_ref().ok_or(Error::new("app_login_device_sync_context_missing"))?;
+        let _=profile.payload(self.device_id()?,account.expose_to_backend())?;Ok(())
+    }
+    pub(super) async fn sync_device(&self,bound:&BoundNumber,status:CallStatus)->Result<(),Error> {
+        if !self.trusted_reuse || status.authentication_code!=Some(1) { return Err(Error::new("app_login_device_untrusted")); }
+        let profile=self.config.device_sync_profile.as_ref().ok_or(Error::new("app_login_device_sync_context_missing"))?;
+        let account=bound.app_account_id.as_ref().ok_or(Error::new("app_login_device_sync_context_missing"))?;
+        let path=self.config.endpoints.device_sync.as_deref().ok_or(Error::new("app_login_device_sync_context_missing"))?;
+        let payload=profile.payload(self.device_id()?,account.expose_to_backend())?;
+        let payload=self.payload(payload.0.clone(),self.version_value().await.as_deref());
+        let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
+        // The ledger must be uncertain BEFORE this method. A later version
+        // gate cannot replay a device report that may already have been applied.
+        self.trusted_reuse_write_started.store(true,std::sync::atomic::Ordering::SeqCst);
+        self.post(path,&bytes,Authentication::Session,true).await?;Ok(())
     }
     pub async fn enable_business(&self)->Result<(),Error> {
         let payload=self.payload(serde_json::json!({"cs_forward":"2","device_id":self.device_id()?}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
+        if self.trusted_reuse { self.trusted_reuse_write_started.store(true,std::sync::atomic::Ordering::SeqCst); }
         self.post(&self.config.endpoints.enable_hosting,&bytes,Authentication::Session,true).await?;Ok(())
     }
 }

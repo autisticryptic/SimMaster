@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Alert, Button, Checkbox, CircularProgress, Divider, FormControlLabel, MenuItem, Stack, TextField, Typography } from '@mui/material'
 import { api, type AppLoginAttempt, type AppLoginSetup, type JegotripAppVersionView } from '../../api/current'
-import { appBusinessLabel, appLoginError, jegotripLoginInput, appLoginNeedsPolling, appLoginPhase, canSubmitJegotripLogin, emptyAppLoginDraft, validJegotripDeviceId, validPhoneAppUuid, deviceTrustQueryLabel, type AppLoginDraft } from '../../policies/appLogin'
+import { appBusinessLabel, appLoginError, jegotripLoginInput, appLoginNeedsPolling, appLoginPhase, canSubmitJegotripLogin, emptyAppLoginDraft, validJegotripDeviceId, validPhoneAppUuid, deviceTrustQueryLabel, deviceSyncLabel, type AppLoginDraft } from '../../policies/appLogin'
 import JegotripDeviceIdentityPane from './JegotripDeviceIdentityPane'
 import JegotripPushStatusPane from './JegotripPushStatusPane'
 
@@ -20,6 +20,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
   const [error, setError] = useState<string | null>(null)
   const generation = useRef({ active: false })
   const checkingTrust = draft.intent === 'check_device_trust'
+  const reusingTrust = draft.intent === 'reuse_hosting' || draft.intent === 'enable_trusted_hosting'
   const accepting = !!setup?.accepting
   const acceptingSelected = checkingTrust ? !!setup?.accepting_authenticate : accepting
 
@@ -112,7 +113,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
   }
   const sourceLabel: Record<string, string> = { manual: '手工设置', ios: 'iOS App Store', page: '官方页面', store: '共享状态表', file: '版本文件', static: '静态配置' }
   return <Stack spacing={2}>
-    <Alert severity="info">登录已绑定号码的无忧行账号，后台自动取得电话 token/SIP 密码、确认托管业务并启动无忧行接收器。不是仅保存 App 认证摘要；业务开启、SDK 在线、电话/短信和媒体就绪分别核验，无需手填个人 SDK 凭据。</Alert>
+    <Alert severity="info">本人账号登录、设备授信读回、托管业务、SDK 在线和短信/来电媒体分别核验。复用手机授信时保持原 App UUID，不申请新授信；复用流程的电话 token/SIP 密码仅在服务器明确认可后由后台取得，接收就绪仍以原运行时为准。</Alert>
     {setup && !setup.accepting_authenticate && <Alert severity="warning">App HTTP 安装配置或运行锁尚未准备好，完整登录启动流程不可用。配置使用专用数据库；不再要求单独的 jegotrip-login.json 文件。</Alert>}
     {setup?.accepting_authenticate && !setup.native_configured && <Alert severity="warning">完整原生启动配置尚未就绪，暂不能登录并启动无忧行。程序不会降级为仅认证、使用占位值启动或显示接收就绪。</Alert>}
     {setup && <Typography variant="caption" color="text.secondary">配置来源：{setup.configuration_source} · 数据库版本：{setup.configuration_revision}</Typography>}
@@ -138,7 +139,12 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
       <MenuItem value="phone">手机号和密码</MenuItem><MenuItem value="account">无忧行账号和密码</MenuItem>
     </TextField>
     <TextField select size="small" label="本次登录的设备标识" value={draft.deviceMode ?? 'auto'} disabled={pending}
-      onChange={(event) => setDraft({ ...draft, deviceMode: event.target.value === 'phone_app' ? 'phone_app' : event.target.value === 'manual' ? 'manual' : 'auto' })}>
+      onChange={(event) => {
+        const mode = event.target.value === 'phone_app' ? 'phone_app' : event.target.value === 'manual' ? 'manual' : 'auto'
+        setDraft({ ...draft, deviceMode: mode, consent: false,
+          intent: mode === 'phone_app' ? 'reuse_hosting' : reusingTrust ? 'attach_hosting' : draft.intent,
+          startReceiver: mode === 'phone_app' ? true : draft.startReceiver })
+      }}>
       <MenuItem value="auto">自动生成 / 复用已保存标识（默认）</MenuItem><MenuItem value="manual">手工指定自己的标识</MenuItem>
       <MenuItem value="phone_app">复用手机 App 已授信 UUID</MenuItem>
     </TextField>
@@ -149,7 +155,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
       helperText={draft.deviceMode === 'phone_app'
         ? '复制本人手机 App 的 phone_uuid / device.dat 中原样的 36 位 UUID（含连字符）；不是硬件 IMEI、phone_safe_num 的 MD5、enrollId 或 SDK UUID。已有账号更换请先用下方标识管理。'
         : '8–64 位，仅字母、数字、下划线与连字符；现有账号更换标识请用下方管理，不会自动覆盖旧绑定。'} />}
-    {draft.deviceMode === 'phone_app' && <Alert severity="info">先在本人手机完成服务端认可的设备授信，再复用同一账号/号码与原 App UUID。这里只导入标识，不导入本地“已验证”缓存，也不会把 UUID 当成授权。请先选择「只查询设备授信」核验；服务器仍可能要求其他材料或重新认证。</Alert>}
+    {draft.deviceMode === 'phone_app' && <Alert severity="info">先在本人手机完成授信，再复用同一账号/号码与原 App UUID。复用接管/开启流程不 enroll、不请求 VTD，也不使用旧 enrollId；不会自动改用另一 UUID。按单设备复用边界，不同时申请新设备授信；手机 App 同时收件还可能发生独立的 SDK 会话冲突。</Alert>}
     <Typography variant="caption" color="text.secondary">标识保存在独立数据库中，重试/重启不反复随机。不同号码不共用；标识不是认证 token，也不保证通过服务端一键验证。</Typography>
     <TextField select size="small" label="托管操作" value={draft.intent ?? 'enable_hosting'} disabled={pending}
       onChange={(event) => {
@@ -157,18 +163,24 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
         setDraft({ ...draft, intent, consent: false,
           startReceiver: intent === 'check_device_trust' ? false : checkingTrust ? true : draft.startReceiver })
       }}>
-      <MenuItem value="enable_hosting">登录并开启托管（需要服务端允许本机开启）</MenuItem>
-      <MenuItem value="attach_hosting">接管已开启的托管（先在手机 App 开启）</MenuItem>
+      <MenuItem value="enable_hosting" disabled={draft.deviceMode === 'phone_app'}>登录并开启托管（需要服务端允许本机开启）</MenuItem>
+      <MenuItem value="attach_hosting" disabled={draft.deviceMode === 'phone_app'}>接管已开启的托管（先在手机 App 开启）</MenuItem>
+      <MenuItem value="reuse_hosting" disabled={draft.deviceMode !== 'phone_app'}>复用已授信 UUID 接管托管（不写业务开关）</MenuItem>
+      <MenuItem value="enable_trusted_hosting" disabled={draft.deviceMode !== 'phone_app'}>复用已授信 UUID 并开启托管（明确业务授权）</MenuItem>
       <MenuItem value="check_device_trust">只查询设备授信（不建接收账号、不改业务、不启动接收）</MenuItem>
     </TextField>
     {checkingTrust && <Alert severity="info">本次仅登录本人账号并查询该 UUID 的设备授信及业务状态。不 enroll、不取电话 token/SIP 密码、不创建原生接收账号、不修改托管开关；查询完成不等于托管或收件成功。</Alert>}
+    {reusingTrust && <Alert severity="info">本次以 getCallStatus 对原 UUID 的实时 authentication_code=1 为门禁，不从历史查询恢复授权。取得电话凭据后、写业务或创建接收账号前会再次读回；未认可或状态变化立即停止。仅当安装侧明确配置本人手机的真实报告资料时才发送设备同步，报告被接受不是授信或收件成功。</Alert>}
     {(draft.intent ?? 'enable_hosting') === 'attach_hosting' && <Alert severity="info">本机不会修改服务端托管开关：只有服务端已确认托管处于开启状态时才继续创建本地账号并启动接收器；否则以「托管未开启」结束。</Alert>}
     {draft.mode === 'phone' && <TextField size="small" label="国家/地区区号" value={draft.country} disabled={pending} onChange={(event) => setDraft({ ...draft, country: event.target.value })} />}
     <TextField size="small" label={draft.mode === 'phone' ? '已绑定手机号' : '无忧行账号'} value={draft.username} disabled={pending} autoComplete="username" onChange={(event) => setDraft({ ...draft, username: event.target.value })} />
     <TextField size="small" label="无忧行密码" type="password" value={draft.password} disabled={pending} autoComplete="current-password" onChange={(event) => setDraft({ ...draft, password: event.target.value })} />
     <FormControlLabel control={<Checkbox checked={draft.startReceiver} disabled={pending || checkingTrust} onChange={(event) => setDraft({ ...draft, startReceiver: event.target.checked })} />} label="业务确认后立即启动无忧行接收器（默认开启）" />
     <FormControlLabel control={<Checkbox checked={draft.consent} disabled={pending} onChange={(event) => setDraft({ ...draft, consent: event.target.checked })} />}
-      label={checkingTrust ? '我拥有此账号及号码，仅授权登录和查询设备授信/业务状态' : '我拥有此账号及绑定号码，并授权登录、开启托管业务和启动所选接收器'} />
+      label={checkingTrust ? '我拥有此账号及号码，仅授权登录和查询设备授信/业务状态'
+        : draft.intent === 'reuse_hosting' ? '我拥有此账号及号码，授权保持原 UUID、同步已明确配置的本人资料并接管已开启业务，不申请新授信或开启业务'
+          : draft.intent === 'enable_trusted_hosting' ? '我拥有此账号及号码，授权保持原 UUID、同步已明确配置的本人资料、明确开启托管并启动所选接收器，不申请新授信'
+            : '我拥有此账号及绑定号码，并授权登录、开启托管业务和启动所选接收器'} />
     <Typography variant="caption" color="text.secondary">请通过 HTTPS 或可信本机输入。密码不保存到数据库或浏览器存储；App 会话只用于本次任务。关闭窗口不撤销已发请求，结果保留在独立账号/任务表中。</Typography>
     <Button variant="contained" disabled={pending || !acceptingSelected || !canSubmitJegotripLogin(draft)} onClick={() => { void submit() }}>
       {pending ? <CircularProgress size={18} color="inherit" /> : checkingTrust ? '查询设备授信' : '登录并启动无忧行'}
@@ -184,6 +196,9 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
       <Typography variant="body2">设备标识版本：{attempt.device_trust.device_identity_revision} · 查询时间：{new Date(attempt.device_trust.observed_at * 1000).toLocaleString()}</Typography>
       <Typography variant="body2">securityVerify：{deviceTrustQueryLabel(attempt.device_trust.security_verify)}</Typography>
       <Typography variant="body2">已有设备查询：{deviceTrustQueryLabel(attempt.device_trust.existing_device)}</Typography>
+      {attempt.device_trust.call_status && <Typography variant="body2">getCallStatus 授信读回：{deviceTrustQueryLabel(attempt.device_trust.call_status)}</Typography>}
+      {attempt.device_trust.local_cs_forward != null && <Typography variant="body2">本次 localCsForward：{attempt.device_trust.local_cs_forward}（不是 SDK 或媒体就绪证明）</Typography>}
+      {attempt.device_trust.device_sync && <Typography variant="body2">设备同步：{deviceSyncLabel(attempt.device_trust.device_sync)}</Typography>}
       <Typography variant="body2">托管业务读回：{attempt.device_trust.hosting_enabled === true ? '该次读回已开启' : attempt.device_trust.hosting_enabled === false ? '该次读回未开启' : '查询失败 / 未确认'}</Typography>
       <Typography variant="caption">只表示上述时间、该标识版本的服务器回答；更换 UUID 或状态变化后需重新核验。不会从记录恢复授信、SDK 或短信/来电 ready。</Typography>
     </Alert>}

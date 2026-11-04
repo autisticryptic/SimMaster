@@ -73,6 +73,9 @@ pub(super) struct Endpoints {
     pub device_enroll: Option<String>,
     #[serde(default)]
     pub security_verify: Option<String>,
+    /// Original encrypted device report, distinct from VTD authorization.
+    #[serde(default)]
+    pub device_sync: Option<String>,
 }
 pub(super) fn valid_version_page(url:&str)->bool {
     if url.len()>512 || url.chars().any(char::is_control) { return false; }
@@ -177,6 +180,10 @@ pub(super) struct HttpDeployment {
     pub device_identity_mode: DeviceIdentityMode,
     pub user_agent: Option<Secret>,
     pub enroll_id: Option<Secret>,
+    /// Optional observed phone App report fields. Only an explicit trusted
+    /// reuse flow sends them; absent context never mints hardware/push data.
+    #[serde(default)]
+    pub device_sync_profile: Option<super::device_sync::DeviceSyncProfile>,
 }
 impl fmt::Debug for HttpDeployment { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("AppHttpDeployment(<redacted>)") } }
 impl HttpDeployment {
@@ -215,7 +222,11 @@ impl HttpDeployment {
         }
         for p in [&self.endpoints.login,&self.endpoints.user_info,&self.endpoints.phone_token,&self.endpoints.voip_status,&self.endpoints.call_status,&self.endpoints.enable_hosting] { self.endpoint(p)?; }
         if let Some(p)=&self.endpoints.verification_trustful_device { self.endpoint(p)?; }
-        for optional in [&self.endpoints.device_enroll,&self.endpoints.security_verify].into_iter().flatten() { self.endpoint(optional)?; }
+        for optional in [&self.endpoints.device_enroll,&self.endpoints.security_verify,&self.endpoints.device_sync].into_iter().flatten() { self.endpoint(optional)?; }
+        if let Some(profile)=&self.device_sync_profile {
+            profile.validate()?;
+            if self.endpoints.device_sync.is_none() { return Err(invalid()); }
+        }
         if self.extra_query.len()>16 || self.extra_headers.len()>16 || self.extra_body.len()>16 { return Err(invalid()); }
         let reserved=["n_token","lang","timestamp","sign","token"];
         for pair in self.extra_query.iter().chain(self.extra_headers.iter()).chain(self.extra_body.iter()) {
@@ -340,6 +351,7 @@ struct PrivateHttpRef<'a> {
     app_version: Option<&'a str>, app_version_file: Option<&'a str>, app_version_web_url: Option<&'a str>,
     app_version_ios_app_id: Option<&'a str>, app_version_store: bool, device_identity_mode: DeviceIdentityMode,
     user_agent: Option<&'a str>, enroll_id: Option<&'a str>,
+    device_sync_profile: Option<super::device_sync::PrivateDeviceSyncProfileRef<'a>>,
 }
 impl<'a> PrivateHttpRef<'a> {
     fn new(h: &'a HttpDeployment) -> Self {
@@ -357,7 +369,8 @@ impl<'a> PrivateHttpRef<'a> {
             app_version_ios_app_id: h.app_version_ios_app_id.as_ref().map(Secret::expose_to_backend),
             app_version_store: h.app_version_store, device_identity_mode: h.device_identity_mode,
             user_agent: h.user_agent.as_ref().map(Secret::expose_to_backend),
-            enroll_id: h.enroll_id.as_ref().map(Secret::expose_to_backend) }
+            enroll_id: h.enroll_id.as_ref().map(Secret::expose_to_backend),
+            device_sync_profile: h.device_sync_profile.as_ref().map(super::device_sync::DeviceSyncProfile::private_mirror) }
     }
 }
 #[derive(Serialize)]

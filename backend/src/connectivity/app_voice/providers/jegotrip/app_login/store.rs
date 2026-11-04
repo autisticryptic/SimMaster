@@ -4,7 +4,7 @@ use super::{AttemptView, Error, LoginIntent, stored_code, valid_attempt_id};
 use rusqlite::{Connection, OptionalExtension, params, TransactionBehavior};
 const STORAGE:&str="app_login_storage_failed";
 const MAX_ATTEMPTS:i64=4096;
-const PHASES:&[&str]=&["queued","authenticating","reading_bound_number","saving_app_account","fetching_credentials","checking_device_trust","checking_business","enabling_business","confirming_business","creating_account","starting_receiver","completed","failed","interrupted"];
+const PHASES:&[&str]=&["queued","authenticating","reading_bound_number","saving_app_account","fetching_credentials","checking_device_trust","syncing_device","checking_business","enabling_business","confirming_business","creating_account","starting_receiver","completed","failed","interrupted"];
 const BUSINESS:&[&str]=&["not_requested","request_uncertain","accepted_unconfirmed","enabled","already_enabled","rejected"];
 const LEGACY_COLUMNS:&str="attempt_id,owner,phase,business_state,completed,line_id,masked_number,error,server_code,created_at,updated_at";
 fn exists(conn:&Connection,name:&str)->Result<bool,&'static str> {

@@ -25,6 +25,18 @@
 `.local/jegotrip/verified-native-*.json`（本地私有证据目录）。每次提交的 run id、
 artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`。
 
+## 1.1 本轮新增：保持原 UUID 的已授信复用（自身 CI 待验证）
+
+新源码不是上表已验证版本的同 SHA 交付；必须等自身两个 Actions、官方 digest/CRC 和精确测试名通过，才能作为新的软件 checkpoint。部署不采用未绿色版本。
+
+- `intent=reuse_hosting`：明确指定本人手机36位App UUID，保持同账号/号码绑定；不 enroll、不请求 VTD、不使用旧 enrollId、不自动更换到另一 canonical UUID。本次 getCallStatus 明确认可且业务已开才继续。
+- `intent=enable_trusted_hosting`：同一已授信复用策略，另有明确的业务开启同意。phone/SIP及原生模板校验后再次查询；开启后认可码和业务读回都必须通过。
+- 不使用历史 DeviceTrustObservation 当许可。授信变化/未知/拒绝在创建或启动接收器前停止，业务或同步不确定请求不重放。
+- 可选原 `device/v1/sync` 报告仅使用安装侧明确配置的本人手机真实资料。设备目标固定为该原App UUID，userId源于本次原accountid字段；未知push/硬件字段不制造。同步接受或localCsForward不是SDK/收件ready。
+- 原SDK设备标识、phone token、TLS、原账号/收件ACK与stop→logoutSession→Join边界不改变。模拟覆盖的是已支持子集，不证明手机授权已实际迁移、原生通信全部实现或收件及时。
+
+用户提供同一时间只有一个设备授信的规则，本轮按此保护，不写新的VTD或取消手机认可。SDK another-device-logined / same-device-login分支属于另一个会话层，不能当VTD服务器唯一键证据。
+
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 
 原 App 并未依赖公共 CA：`assets/app2.cer` 就是服务端叶子证书
@@ -95,6 +107,8 @@ key/value 表，`jegotrip_shared_state`，`name='app_version'`），一行记录
 状态表 → 用新值**重放整个登录流程一次**（body/query/header 全部重新构造，签名/时间戳/nonce
 也都是新的）→ 若仍为 `524` 则如实失败，不再重试。只重试一次，且只在拿到**不同**版本号时才
 重放，避免对同一份配置反复打服务端。
+
+**明确授信复用的额外边界**：如果该流程的设备同步或业务写入已经开始，则不因后来出现524重放整个流程，即使已得到另一版本号也不重发可能已生效的写入。仍保留原不确定结果，要求核对；只有写入之前的版本拒绝才可走上述一次刷新。
 
 ### 2.2.4 运维接口（不导出任何密钥）
 

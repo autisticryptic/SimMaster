@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { appLoginInput, canSubmitAppLogin, jegotripLoginInput, canSubmitJegotripLogin, emptyAppLoginDraft, validJegotripDeviceId, validPhoneAppUuid, deviceTrustQueryLabel, appLoginError, appBusinessLabel, appLoginPhase, appLoginNeedsPolling, type AppLoginDraft } from '../src/policies/appLogin.ts'
+import { appLoginInput, canSubmitAppLogin, jegotripLoginInput, canSubmitJegotripLogin, emptyAppLoginDraft, validJegotripDeviceId, validPhoneAppUuid, deviceTrustQueryLabel, deviceSyncLabel, appLoginError, appBusinessLabel, appLoginPhase, appLoginNeedsPolling, type AppLoginDraft } from '../src/policies/appLogin.ts'
 import type { AppLoginAttempt } from '../src/api/current.ts'
 
 const id = '0123456789abcdef0123456789abcdef'
@@ -122,10 +122,10 @@ void test('manual device selection cannot change the explicit attach-hosting or 
   assert.equal(jegotripLoginInput(id, { ...draft, intent: 'authenticate', startReceiver: false, deviceMode: 'manual', deviceId: 'OWN-DEVICE-01' }).intent, 'authenticate')
 })
 void test('phone trust transfer accepts only the App UUID shape and never turns it into an authorization field', () => {
-  const value: AppLoginDraft = { ...draft, deviceMode: 'phone_app', deviceId: ' D5C0199B-1644-4D33-8912-B8BD5AB49224 ' }
+  const value: AppLoginDraft = { ...draft, intent: 'reuse_hosting', deviceMode: 'phone_app', deviceId: ' D5C0199B-1644-4D33-8912-B8BD5AB49224 ' }
   const input = jegotripLoginInput(id, value)
   assert.equal(input.device_id, 'D5C0199B-1644-4D33-8912-B8BD5AB49224')
-  assert.equal(input.intent, 'enable_hosting')
+  assert.equal(input.intent, 'reuse_hosting')
   for (const field of ['device_trust', 'trust_granted', 'sso_token', 'enroll_id', 'hardware_imei', 'sdk_device_id']) assert.equal(field in input, false)
   for (const invalid of ['0123456789abcdef0123456789abcdef', '123456789012345', 'fixture-enroll-id', 'UNKNOWN_DEVICE', '', 'OWN-MANUAL-01']) {
     assert.equal(validPhoneAppUuid(invalid), false)
@@ -152,4 +152,35 @@ void test('device trust labels describe a server observation and preserve missin
   assert.match(deviceTrustQueryLabel({ ...observed, state: 'not_configured', authentication_code: null }), /状态未知/)
   const failed = deviceTrustQueryLabel({ ...observed, state: 'failed', authentication_code: null, error: 'https://private.invalid/?token=secret' })
   assert.match(failed, /查询失败/); assert.equal(failed.includes('secret'), false); assert.equal(failed.includes('private.invalid'), false)
+})
+
+void test('trusted reuse intents require the explicit phone UUID mode and never silently generate or substitute an identity', () => {
+  for (const intent of ['reuse_hosting', 'enable_trusted_hosting'] as const) {
+    const value: AppLoginDraft = { ...draft, intent, deviceMode: 'phone_app', deviceId: 'D5C0199B-1644-4D33-8912-B8BD5AB49224' }
+    assert.equal(canSubmitJegotripLogin(value), true)
+    const input = jegotripLoginInput(id, value)
+    assert.equal(input.intent, intent); assert.equal(input.device_id, value.deviceId)
+    for (const field of ['trust_granted', 'sso_token', 'enrollId', 'device_sync_profile', 'sdk_device_id']) assert.equal(field in input, false)
+    for (const deviceMode of ['auto', 'manual'] as const) assert.equal(canSubmitJegotripLogin({ ...value, deviceMode }), false)
+    assert.equal(canSubmitJegotripLogin({ ...value, consent: false }), false)
+    assert.equal(canSubmitJegotripLogin({ ...value, deviceId: '' }), false)
+    assert.throws(() => jegotripLoginInput(id, { ...value, deviceId: 'fixture-sdk-device' }))
+  }
+})
+void test('phone UUID selection cannot accidentally keep the ordinary enrolling enable or attach intent', () => {
+  const value: AppLoginDraft = { ...draft, deviceMode: 'phone_app', deviceId: 'D5C0199B-1644-4D33-8912-B8BD5AB49224' }
+  assert.equal(canSubmitJegotripLogin(value), false)
+  assert.equal(canSubmitJegotripLogin({ ...value, intent: 'enable_hosting' }), false)
+  assert.equal(canSubmitJegotripLogin({ ...value, intent: 'attach_hosting' }), false)
+  assert.equal(canSubmitJegotripLogin({ ...value, intent: 'check_device_trust', startReceiver: false }), true)
+})
+void test('device sync and skipped endpoint labels never present report acceptance as a trust or live receiver grant', () => {
+  const skipped = { state: 'not_requested' as const, authentication_code: null, error: null, server_code: null }
+  assert.match(deviceTrustQueryLabel(skipped), /未请求/)
+  assert.match(deviceSyncLabel({ state: 'accepted', error: null, server_code: null }), /不是授信或收件成功/)
+  assert.match(deviceSyncLabel({ state: 'not_configured', error: null, server_code: null }), /未发送/)
+  assert.match(deviceSyncLabel({ state: 'request_uncertain', error: null, server_code: null }), /不会自动重放/)
+  const rejected = deviceSyncLabel({ state: 'rejected', error: 'https://secret.invalid/?token=PRIVATE-TOKEN', server_code: 506 })
+  assert.equal(rejected.includes('PRIVATE-TOKEN'), false); assert.equal(rejected.includes('secret.invalid'), false)
+  assert.equal(appLoginPhase('syncing_device').includes('就绪'), false)
 })

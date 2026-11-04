@@ -62,7 +62,8 @@ export default function JegotripConfigurationDialog({ open, onClose, onSaved }: 
       <Alert severity="warning">授信由服务器认可的账号/号码/设备上下文决定，不是一串能替代所有配置的永久代码。运营商认证 token、App 会话、电话 token 和 SDK 设备标识不能混用；接收器与媒体仍须真实核验。</Alert>
       <Alert severity="info">
         <Typography variant="subtitle2">手机授信后迁移到 SimAdmin</Typography>
-        <Typography variant="body2">在本人手机完成合法授信后，复用同一账号/号码与 App 的 phone_uuid / device.dat 原样 UUID。登录表单选择「复用手机 App 已授信 UUID」，先用「只查询设备授信」读回服务器状态，再决定接管或开启业务。</Typography>
+        <Typography variant="body2">在本人手机完成合法授信后，复用同一账号/号码与 App 的 phone_uuid / device.dat 原样 UUID。登录表单选择「复用手机 App 已授信 UUID」，默认只接管已开启托管；本次 getCallStatus 明确认可后才继续，不 enroll、不请求 VTD 或生成另一 UUID。</Typography>
+        <Typography variant="body2">业务未开启时，另选「复用已授信 UUID 并开启托管」并明确授权；不从旧查询记录取得许可。可选设备同步只使用本人手机真实报告资料，缺值不猜，也不把报告接受当作授信或收件成功。</Typography>
         <Typography variant="body2">已有账号要换 UUID，请先在设备标识管理中选择原号码并录入手机 UUID；版本守卫和旧值保护不变。不要复制本地 phone_safe_num、enrollId 或 SDK 的另一个 UUID，也不要勾选本地“已授信”来替代服务器结果。</Typography>
       </Alert>
       <Typography variant="body2" color="text.secondary">服务地址、可信证书和 SDK 应用参数属于安装侧共享协议配置，不是每个账号的手机硬件信息。正常登录无需反复修改；完整原生安装上下文尚未准备好时，不会降级为仅认证或假装托管成功。</Typography>
@@ -72,6 +73,7 @@ export default function JegotripConfigurationDialog({ open, onClose, onSaved }: 
       </Button>
       {advanced && <Stack id="jegotrip-private-installation" spacing={2}>
         <Typography variant="caption" color="text.secondary">完整 JSON 格式为 version: 1、http 和 runtime。http.device_identity_mode 默认为 store，device_id 可省略；static 仅保留旧固定值兼容，不能跨号码复用。SDK 设备参数、ClientId、接收器 namespace 和媒体仍是独立原生上下文，不会被 App UUID 擅自替换。runtime 为 null 仅保留认证兼容。</Typography>
+        <Typography variant="caption" color="text.secondary">可选 http.endpoints.device_sync 与 http.device_sync_profile 仅供已授信复用后的原设备报告。只填写本人手机观察到的 App 版本/版本码、型号、OS、渠道等资料；不制造厂商推送 token、MAC 或硬件参数。userId 从本次 user-info.accountid 取得，device_id/imei 固定使用所选原 App UUID；未配置报告资料时不发送同步。</Typography>
         <Button component="label" variant="outlined" disabled={busy}>选择私有安装 JSON
           <input hidden type="file" accept=".json,application/json" onChange={(event) => {
             const file = event.target.files?.[0]

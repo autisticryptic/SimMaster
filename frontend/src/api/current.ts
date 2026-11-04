@@ -199,10 +199,15 @@ export interface AppLoginSetup {
   configuration_error?: string | null
 }
 
-export type JegotripLoginIntent = 'authenticate' | 'enable_hosting' | 'attach_hosting' | 'check_device_trust'
+export type JegotripLoginIntent = 'authenticate' | 'enable_hosting' | 'attach_hosting' | 'check_device_trust' | 'reuse_hosting' | 'enable_trusted_hosting'
 export interface JegotripTrustQueryObservation {
-  state: 'not_configured' | 'observed' | 'failed'
+  state: 'not_configured' | 'not_requested' | 'observed' | 'failed'
   authentication_code: number | null
+  error: string | null
+  server_code: number | null
+}
+export interface JegotripDeviceSyncObservation {
+  state: 'not_configured' | 'not_requested' | 'request_uncertain' | 'accepted' | 'rejected'
   error: string | null
   server_code: number | null
 }
@@ -215,6 +220,9 @@ export interface JegotripDeviceTrustObservation {
   hosting_enabled: boolean | null
   business_query_error: string | null
   business_query_server_code: number | null
+  call_status?: JegotripTrustQueryObservation | null
+  local_cs_forward?: number | null
+  device_sync?: JegotripDeviceSyncObservation | null
 }
 export interface JegotripConfigurationView {
   configuration_source: string

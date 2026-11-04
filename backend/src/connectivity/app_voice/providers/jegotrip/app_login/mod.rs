@@ -6,6 +6,8 @@ mod http;
 mod app_version;
 mod device_identity;
 mod device_trust;
+mod device_sync;
+mod trusted_reuse;
 mod push_status;
 mod store;
 mod settings;
@@ -19,6 +21,7 @@ pub(crate) use device_identity::DeviceIdentityState;
 pub(crate) use push_status::PushStatusView;
 pub use accounts::JegotripAccountView;
 pub use device_trust::DeviceTrustObservation;
+pub use device_sync::{DeviceSyncObservation,DeviceSyncState};
 use super::{account_runtime::AccountManager, account_config::AccountConfig};
 use futures_util::FutureExt;
 use crate::platform::db::Database;
@@ -36,7 +39,7 @@ const ERRORS: &[&str] = &[
     "app_login_busy", "app_login_unavailable", "app_login_shutting_down", "app_login_interrupted",
     "app_login_timeout", "app_login_entropy_failed", "app_login_transport_failed",
     "app_login_response_invalid", "app_login_rate_limited", "app_login_server_rejected",
-    "app_login_version_discovery_failed", "app_login_device_untrusted", "app_login_business_not_enabled",
+    "app_login_version_discovery_failed", "app_login_device_untrusted", "app_login_business_not_enabled", "app_login_device_sync_context_missing",
     "app_login_device_identity_conflict", "app_login_device_identity_revision_conflict", "app_login_device_identity_not_found",
     "app_login_device_identity_limit", "app_login_device_identity_in_use",
     "app_login_verification_required", "app_login_migration_required", "app_login_existing_business_action_required",
@@ -54,11 +57,12 @@ pub(crate) fn valid_attempt_id(s: &str) -> bool { s.len() == 32 && s.bytes().all
 
 #[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
 #[serde(rename_all="snake_case")]
-pub enum LoginIntent { Authenticate, #[default] EnableHosting, AttachHosting, CheckDeviceTrust }
+pub enum LoginIntent { Authenticate, #[default] EnableHosting, AttachHosting, CheckDeviceTrust, ReuseHosting, EnableTrustedHosting }
 impl LoginIntent {
-    fn as_str(self)->&'static str {match self {Self::Authenticate=>"authenticate",Self::EnableHosting=>"enable_hosting",Self::AttachHosting=>"attach_hosting",Self::CheckDeviceTrust=>"check_device_trust"}}
-    fn parse(value:&str)->Option<Self> {match value {"authenticate"=>Some(Self::Authenticate),"enable_hosting"=>Some(Self::EnableHosting),"attach_hosting"=>Some(Self::AttachHosting),"check_device_trust"=>Some(Self::CheckDeviceTrust),_=>None}}
-    fn needs_native(self)->bool {matches!(self,Self::EnableHosting|Self::AttachHosting)}
+    fn as_str(self)->&'static str {match self {Self::Authenticate=>"authenticate",Self::EnableHosting=>"enable_hosting",Self::AttachHosting=>"attach_hosting",Self::CheckDeviceTrust=>"check_device_trust",Self::ReuseHosting=>"reuse_hosting",Self::EnableTrustedHosting=>"enable_trusted_hosting"}}
+    fn parse(value:&str)->Option<Self> {match value {"authenticate"=>Some(Self::Authenticate),"enable_hosting"=>Some(Self::EnableHosting),"attach_hosting"=>Some(Self::AttachHosting),"check_device_trust"=>Some(Self::CheckDeviceTrust),"reuse_hosting"=>Some(Self::ReuseHosting),"enable_trusted_hosting"=>Some(Self::EnableTrustedHosting),_=>None}}
+    fn needs_native(self)->bool {matches!(self,Self::EnableHosting|Self::AttachHosting|Self::ReuseHosting|Self::EnableTrustedHosting)}
+    fn reuses_trusted_device(self)->bool {matches!(self,Self::ReuseHosting|Self::EnableTrustedHosting)}
 }
 
 /// Historical API contract: explicit consent to the complete hosting operation.
@@ -346,9 +350,12 @@ impl AppLoginManager {
         if !request.consent || (matches!(request.intent,LoginIntent::Authenticate|LoginIntent::CheckDeviceTrust) && request.start_receiver) {return Err(Error::new("app_login_request_invalid"));}
         let intent=request.intent;
         let common=LoginRequest {attempt_id:request.attempt_id,username:request.username,password:request.password,country_code:request.country_code,
-            enable_hosting:intent==LoginIntent::EnableHosting,start_receiver:request.start_receiver};
+            enable_hosting:matches!(intent,LoginIntent::EnableHosting|LoginIntent::EnableTrustedHosting),start_receiver:request.start_receiver};
         let preferred=request.device_id;
         if preferred.as_ref().is_some_and(|v| !device_identity::valid_device_id(v.expose_to_backend().trim())) {return Err(Error::new("app_login_request_invalid"));}
+        if intent.reuses_trusted_device() && !preferred.as_ref().is_some_and(|v|device_identity::valid_phone_app_uuid(v.expose_to_backend().trim())) {
+            return Err(Error::new("app_login_request_invalid"));
+        }
         common.validate_identity()?;self.submit_internal(common,intent,preferred)
     }
     fn submit_internal(self:&Arc<Self>,request:LoginRequest,intent:LoginIntent,preferred:Option<Secret>)->Result<AttemptView,Error> {
@@ -359,6 +366,7 @@ impl AppLoginManager {
         let configuration=configuration.ok_or(Error::new("app_login_deployment_missing"))?;
         if intent.needs_native() && configuration.runtime.is_none() {return Err(Error::new("app_login_native_configuration_missing"));}
         let mut client=self.factory.build(&configuration.http)?;
+        if intent.reuses_trusted_device() { client=client.with_trusted_reuse()?; }
         let accounts=self.accounts.upgrade().ok_or(Error::new("app_login_unavailable"))?;
         if intent.needs_native() {accounts.login_preflight_create().map_err(|_|Error::new("app_login_account_creation_failed"))?;}
         let permit=self.active.clone().try_acquire_owned().map_err(|_|Error::new("app_login_busy"))?;
@@ -370,7 +378,9 @@ impl AppLoginManager {
             (configuration.http.device_identity_mode==config::DeviceIdentityMode::Static).then(||configuration.http.device_id.expose_to_backend()));
         let (view,snapshot)=self.database.with_conn(|conn| {
             let tx=rusqlite::Transaction::new_unchecked(conn,rusqlite::TransactionBehavior::Immediate).map_err(|_|"app_login_storage_failed")?;
-            let snapshot=device_identity::resolve(&tx,&alias,explicit,Some(configuration.http.device_id.expose_to_backend()),now()).map_err(|e|e.code)?;
+            let snapshot=if intent.reuses_trusted_device() {
+                device_identity::resolve_reuse(&tx,&alias,explicit.ok_or("app_login_request_invalid")?,now()).map_err(|e|e.code)?
+            } else {device_identity::resolve(&tx,&alias,explicit,Some(configuration.http.device_id.expose_to_backend()),now()).map_err(|e|e.code)?};
             if admissions.devices.contains(&snapshot.id) {return Err("app_login_busy");}
             let view=store::insert_admitted(&tx,&request.attempt_id,&owner,intent,now())?;
             tx.commit().map_err(|_|"app_login_storage_failed")?;
@@ -407,11 +417,12 @@ impl AppLoginManager {
         if self.closed.load(Ordering::SeqCst) {return Err(Error::new("app_login_interrupted"));}
         self.database.with_conn(|c|store::step(c,id,owner,phase,business,now())).map_err(Error::new)
     }
-    fn confirm_device_identity(&self,guard:&mut ActiveGuard,key:&[u8])->Result<bool,Error> {
+    fn confirm_device_identity(&self,guard:&mut ActiveGuard,key:&[u8],strict_reuse:bool)->Result<bool,Error> {
         let mut admissions=lock(&self.admissions);
         let selected=self.database.with_conn(|conn| {
             let tx=rusqlite::Transaction::new_unchecked(conn,rusqlite::TransactionBehavior::Immediate).map_err(|_|"app_login_storage_failed")?;
-            let selected=device_identity::confirm(&tx,&guard.alias,&guard.snapshot,key,now()).map_err(|e|e.code)?;
+            let selected=if strict_reuse {device_identity::confirm_reuse(&tx,&guard.alias,&guard.snapshot,key,now())}
+                else {device_identity::confirm(&tx,&guard.alias,&guard.snapshot,key,now())}.map_err(|e|e.code)?;
             if selected.id!=guard.snapshot.id && admissions.devices.contains(&selected.id) {return Err("app_login_busy");}
             tx.commit().map_err(|_|"app_login_storage_failed")?;Ok(selected)
         }).map_err(Error::new)?;
@@ -426,7 +437,9 @@ impl AppLoginManager {
         client.ensure_app_version().await;
         // The original LoginActivity enrols this device before signing in; the
         // login body then carries the returned enrollId. Best effort only.
-        if intent!=LoginIntent::CheckDeviceTrust {client.ensure_device_enrollment().await;}
+        if !intent.reuses_trusted_device() {
+            if intent!=LoginIntent::CheckDeviceTrust {client.ensure_device_enrollment().await;}
+        }
         eprintln!("app_login_version_in_use {}",client.version_provenance().await);
         let outcome=self.run_with_version_gate(owner,&request,intent,revision,&configuration,&mut client,guard).await;
         request.password = Secret::from_owned(String::new());
@@ -437,9 +450,11 @@ impl AppLoginManager {
     /// that happens the version is re-learned once (App Store / official page),
     /// persisted, and the WHOLE flow is replayed so every body, query and header
     /// is rebuilt with the new value. One retry only: a repeated gate is final.
+    /// Trusted reuse stops this retry as soon as device/business writing began;
+    /// a later 524 cannot authorize replay of a possibly applied operation.
     async fn run_with_version_gate(&self,owner:&str,request:&LoginRequest,intent:LoginIntent,revision:u64,configuration:&DatabaseConfiguration,client:&mut AppClient,guard:&mut ActiveGuard)->Result<(),Error> {
         let error=match self.run_flow(owner,request,intent,revision,configuration,client,guard).await { Ok(())=>return Ok(()), Err(error)=>error };
-        if error.server_code!=Some(http::VERSION_GATE_CODE) { return Err(error); }
+        if error.server_code!=Some(http::VERSION_GATE_CODE) || client.trusted_reuse_write_started() { return Err(error); }
         let before=client.version_value().await;
         let Some((value,source))=client.refresh_app_version().await else {
             eprintln!("app_login_version_refresh_unavailable"); return Err(error);
@@ -459,16 +474,18 @@ impl AppLoginManager {
         self.step(owner,id,"reading_bound_number",None)?;
         let mut bound=client.bound_number(&request).await?;
         let key=client.account_key(&bound)?;
-        if self.confirm_device_identity(guard,&key)? {
+        if self.confirm_device_identity(guard,&key,intent.reuses_trusted_device())? {
             // A newly seen alias discovered an existing number's identity.
             // Re-authenticate ONCE with it, before any token/trust/business call;
             // never switch a device beneath an existing App session.
             client.use_device_identity(guard.snapshot.device_id.expose_to_backend());
-            if intent!=LoginIntent::CheckDeviceTrust {client.ensure_device_enrollment().await;}
+            if !intent.reuses_trusted_device() {
+                if intent!=LoginIntent::CheckDeviceTrust {client.ensure_device_enrollment().await;}
+            }
             client.login(&request).await?;
             let confirmed=client.bound_number(&request).await?;
             if client.account_key(&confirmed)?!=key {return Err(Error::new("app_login_identity_mismatch"));}
-            self.confirm_device_identity(guard,&key)?;
+            self.confirm_device_identity(guard,&key,intent.reuses_trusted_device())?;
             bound=confirmed;
         }
         self.database.with_conn(|c|store::set_mask(c,id,owner,&bound.masked(),now())).map_err(Error::new)?;
@@ -491,6 +508,9 @@ impl AppLoginManager {
         }
         if self.database.with_conn(|c|device_identity::native_ownership_pending(c,&key)).map_err(Error::new)? {
             return Err(Error::new("app_login_device_identity_in_use"));
+        }
+        if intent.reuses_trusted_device() {
+            return self.run_trusted_reuse(owner,request,intent,configuration,client,guard,&bound).await;
         }
         self.step(owner,id,"fetching_credentials",None)?;
         let material=client.phone_credentials(&bound).await?;

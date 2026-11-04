@@ -24,10 +24,13 @@ App 只有收到外层 code0、`authentication_code=1` 后才进入成功分支�
 
 1. 在本人手机中完成合法设备授信；保持 App 数据，不为取 UUID 清缓存或重装。
 2. 取得原 App `setting_power / phone_uuid` 或 `device.dat` 中的原样 UUID，保留大小写与连字符。这两处为 App 私有存储，本文不声称非 root 手机可直接读取；若 App 未提供导出入口，需要用户自己的合法读取方式，不自行安装工具或修改手机数据。
-3. 首次配置在登录页选择 **“复用手机 App 已授信 UUID”**；已有账号先在 **“设备标识管理”** 选择原号码，再点 **“录入手机 App 授信 UUID”** 做有版本守卫的替换，旧值所有权保留。36位 UUID 专用输入会拒绝误粘的 MD5、enrollId、IMEI 等。
-4. 同一账号先选择 **“只查询设备授信”**：正常账号登录、确认号码后，查询 securityVerify、已有设备后备和业务状态；**不 enroll、不取电话凭据、不建原生账号、不改业务、不启动接收器**。会保留 App 认证摘要和此次观察，不保留密码/App 会话。
-5. 页面分别显示两项服务器 `authentication_code`、业务读回、观察时间和标识版本。未配置、失败或未知都单独显示，历史记录不是永久授权。
-6. 服务器本次认可且业务已开时，可明确选择接管；业务未开时，是否允许 SimAdmin 开启仍以实际 setVoip/读回为准。后续还需原生接收链的验收，不因 UUID 保存成功就显示可收短信/电话。
+3. 首次配置在登录页选择 **“复用手机 App 已授信 UUID”**；已有账号先在 **“设备标识管理”** 选择原号码，再点 **“录入手机 App 授信 UUID”** 做有版本守卫的替换，旧值所有权保留。36位 UUID 专用输入会拒绝误粘的 MD5、enrollId、IMEI 等。选择手机 UUID 后默认采用 `reuse_hosting`，不是普通自动生成/enroll 登录。
+4. 可先选择 **“只查询设备授信”** 做独立诊断：正常账号登录、确认号码后，查询 securityVerify、已有设备后备和业务状态；**不 enroll、不取电话凭据、不建原生账号、不改业务、不启动接收器**。会保留 App 认证摘要和此次观察，不保留密码/App 会话；该旧诊断历史不授予后续动作。
+5. 正式复用选择 **“复用已授信 UUID 接管托管”**（`reuse_hosting`）：保持明确指定的原 UUID，不 enroll、不请求 VTD、不携静态旧 enrollId，也不会因发现同一号码已有另一 UUID 而静默切换。以本次 `getCallStatus.authentication_code=1` 为门禁，`cs_forward=2` 才接管；未明确认可或业务未开立即停止。
+6. 已授信但业务未开时，另选 **“复用已授信 UUID 并开启托管”**（`enable_trusted_hosting`）并明确同意业务操作。取得电话凭据/校验原生模板后、写开关或建账号前会再次读回；开启后同时确认认可码和业务。未知或拒绝不自动重放，不申请新设备授信。
+7. `device/v1/sync` 是原成功分支中的独立设备报告：仅安装侧明确配置本人手机真实资料时发送；`device_id/imei` 固定为该原 UUID，`userId` 取本次 user-info 的原 `accountid` 字段。不猜硬件/push token，未配置不发送。报告接受和 `localCsForward` 均不代表 SDK/媒体就绪。
+
+用户提供“同一时间一个设备授信”的规则，当前将其作为安全边界，而非已独立实测的服务端表结构。复用不取消手机授信、不为另一 UUID 发 VTD；手机同时在线还可能触发**独立的 SDK 会话冲突**。后续仍需原生收件/停止清理验收，不能把模拟成功当作真实迁移。
 
 **应迁移的当前最小候选是本人已授信的 App UUID + 同一本人账号/号码上下文。**
 不复制 `phone_safe_num` 的 MD5、`authentication_code` 缓存、旧 enrollId、App 会话或运营商 token 来冒充授权；
@@ -40,8 +43,8 @@ App 只有收到外层 code0、`authentication_code=1` 后才进入成功分支�
 | App `deviceId` / `device_id` | `DeviceUtil.getDeviceId → getIMEI`，持久随机 UUID；用于 enroll、安全设备查询及业务开关 | `jegotrip_device_identities` 按认证号码保存；随机或手工本人值。不是物理 IMEI，不创造授权 |
 | 本地 `phone_safe_num` | 区号+号码的 MD5 缓存；仅服务器验证成功后写入，setVoip506 后删除 | 不能把此标记作为服务器授信或当前接收就绪 |
 | `authentication_code` | 服务器返回的状态，App 另有本地状态缓存 | 状态不是可导入的认证凭据；HTTP200、code0 或本地布尔值都不能单独替代业务读回 |
-| `enrollId` / `expireTime` | 匿名设备注册的服务端结果；登录请求携带 enrollId | 自动取得，不要求手填。已有实测表明取得 enrollId 后仍可能未授信；不宣称永久有效 |
-| `sso_token` | `MobileAuthUtil` 的真实运营商认证回调第2参数 | 不是 App 登录 token。当前没有真实材料时，仅按原 receiveFail 分支发送空字符串做已有设备查询 |
+| `enrollId` / `expireTime` | 匿名设备注册的服务端结果；登录请求携带 enrollId | 普通登录兼容路径自动取得；明确授信复用路径不调用 enroll、不携静态旧值。登记成功不是授信，不宣称永久有效 |
+| `sso_token` | `MobileAuthUtil` 的真实运营商认证回调第2参数 | 不是 App 登录 token。旧诊断可按 receiveFail 后备传空字符串；明确授信复用用 getCallStatus 原认可分支，不进入 VTD 或新运营商认证 |
 | App 会话 token | 正常账号登录响应，用于后续 App HTTPS 身份认证 | 仅当次流程使用，不作为 sso_token、phone token 或设备授权 |
 | 电话 token | 原 App 的 `csb/token` / `getPhoneToken` / `CallUserInfo.cstToken`，传给 `JCClient.login` 的 password 参数 | 正常登录流程自动取得；不是用户密码、运营商 token 或 SipPwd |
 | SIP 密码 | `openVoipStatus` 返回的 SIP 材料，原 App 解密后用于网关 | 后台取得并解密，不要求用户手提；不与电话 token 混用 |
@@ -75,7 +78,8 @@ App 只有收到外层 code0、`authentication_code=1` 后才进入成功分支�
 | `http.device_identity_mode` | 本地身份策略，默认 `store` | 可省略，默认按认证号码持久管理 |
 | `http.device_id` | 旧固定值兼容 | `store` 新安装可省略；已有值不擅自旋转；`static` 模式必须给值且不可跨号码复用 |
 | App 版本来源、共享状态表、`app-version` 请求头 | iOS 商店/官方页面/手工值；首次拉取，524 后有界刷新 | 已动态化，无需每次官方更新都重编译；query/body 不是已测成功的承载 |
-| `user_agent`、`enroll_id` | 可选安装兼容项 | 正常流程自动 enroll；不应把过期 enrollId 固定成授权 |
+| `user_agent`、`enroll_id` | 可选安装兼容项 | 普通流程自动 enroll；明确授信复用不携旧 enrollId、不自动登记 |
+| `http.endpoints.device_sync` / `http.device_sync_profile` | 可选原 Android 设备报告上下文 | 仅明确授信复用、本次认可码1后可发送；版本/版本码、device_type、os_version、channel_id必须来自本人手机真实观察，可选push/MAC/品牌/型号/分辨率未知则省略；不允许profile配置设备或userId目标 |
 | `runtime.sdk.application_key`、逻辑入口、信任及独立解码 key | 原 SDK 共享上下文 | 安装侧保留；应用 key、Router access、Client 解码 key 和 reference key 不能互相替换 |
 | `runtime.sdk.device_id` | SDK 的可选显式标识 | 未配置时并非 App UUID 自动替代；不要求复制手机硬件信息来“生成”它 |
 | `runtime.sdk.selected_session_id` | 原生会话选择值，原默认 `<UnifiedSession>` | 是 selector，不是 token。当前显式原生模板仍要求正确值；本轮没有偷偷新增默认值 |
@@ -132,8 +136,19 @@ libmtc SHA256：`57086cd624d8227dc1b1b64a63d7c8b2258f87b261779b681a9bfd306ad9d2e
 `0x584218` 写 SDK 配置设备字段 `+5816`，`0x657fe4` 发送该 DeviceId，并拼接 `+5560` ClientId 前缀；
 该前缀从 `0x24f174 → 0x24efa4 → Context.getPackageName` 得到。后备 `0x4e89f4` 为另外的 native UUID 路径，不把未知分支说成 App UUID。
 
-当前实现对应 `app_login/{config,http,device_identity,device_trust,mod}.rs`、`account_config.rs`、
+当前实现对应 `app_login/{config,http,device_identity,device_trust,device_sync,trusted_reuse,mod}.rs`、`account_config.rs`、
 `runtime_backend.rs`、`runtime_provision.rs`；生产后端仍为 Rust，Python 仅静态分析辅助。
+
+### 本轮已授信复用的新静态定位与验证状态
+
+- `0x8e0000 / 0x85da9c`：queryCallStatus明确携原device_id的普通JSON。
+- `0x8e0000 / 0x61a0e0`：从body读取authentication_code、cs_forward、**localCsForward**；不能猜蛇形字段。
+- `0x8e0000 / 0x633a44, 0x636078`：getCallStatus认可码1直接走成功+updateDeviceId，不先重新取token/写VTD。
+- `0x8e0000 / 0x5f3704, 0x67be40`：sync.userId来自User.accountid；原Gson SerializedName已核为accountid。
+- `0x8e0000 / 0x6f5b3c`：updateDeviceId完成回调仅记录状态，不是业务/SDK grant。
+
+新增源码与模拟用例必须由**自身SHA**的两个Actions和官方制品验证；未通过前不是已交付绿色版，不能借旧6f85149的1249回归冒称成功。真机仍需本人已授信UUID与真实读回条件。
+脱敏新证据 `.local/jegotrip/trust-reuse-audit-20261104/`；模拟不证明服务器的单设备/撤销/期限规则。
 
 本轮未执行 APK/SDK、流量认证、验证码、业务开关或真实短信/电话。
 初次 IDA MCP 连接被拒绝后，用户手动打开原 libmtc；实时 metadata 的 SHA/base 已匹配。

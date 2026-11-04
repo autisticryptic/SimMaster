@@ -1331,3 +1331,6 @@ async fn a_phone_trust_observation_stays_historical_after_uuid_rotation_and_neve
     let diagnostics=f.manager.push_status().await.unwrap();assert!(diagnostics.native_accounts.is_empty());
     assert_eq!(f.factory.build_count(),0);assert!(next.line_id.is_none());f.manager.shutdown().await;
 }
+
+#[path = "trusted_reuse_tests.rs"]
+mod trusted_reuse;
