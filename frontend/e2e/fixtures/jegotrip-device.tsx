@@ -5,7 +5,7 @@ import AppAccountLoginPane from '../../src/pages/sim/AppAccountLoginPane'
 import JegotripConfigurationDialog from '../../src/pages/sim/JegotripConfigurationDialog'
 
 // Exact production components, with no SDK/runtime or device integration.
-function Fixture() {
+export function Fixture() {
   const [configurationOpen, setConfigurationOpen] = useState(false)
   return <Container maxWidth="md" sx={{ py: 2 }}>
     <AppAccountLoginPane open />
