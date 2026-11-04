@@ -119,12 +119,12 @@ async function checkInstallationGuide(page: Page, model: Awaited<ReturnType<type
   // Deterministic delayed File.text(): older reads must not repopulate secrets
   // after typing or collapsing/reopening. No arbitrary sleeps or real backend.
   await page.evaluate(() => {
-    const original = File.prototype.text
+    const original = (file: File) => Blob.prototype.text.call(file)
     const pending: Array<(value: string) => void> = []
     window.jegotripFileReads = { pending }
     File.prototype.text = function (this: File) {
       if (this.name.startsWith('delayed-')) return new Promise<string>((resolve) => { pending.push(resolve) })
-      return original.call(this)
+      return original(this)
     }
   })
   const file = dialog.locator('input[type="file"]')
