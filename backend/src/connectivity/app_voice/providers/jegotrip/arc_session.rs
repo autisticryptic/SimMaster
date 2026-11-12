@@ -246,25 +246,32 @@ impl ArcRpcSession {
     /// One tracker per ARC incarnation keeps nested sequences unique and binds
     /// owner/connection at construction, never when a batch arrives.
     pub fn take_hosting_tracker(&mut self) -> Result<HostingRpcTracker, CodecError> {
-        if self.phase() == ArcPhase::Closed || self.hosting_tracker_taken { return Err(CodecError::InvalidField); }
+        if self.phase() == ArcPhase::Closed || self.connection.session_revoked() || self.hosting_tracker_taken { return Err(CodecError::InvalidField); }
         self.hosting_tracker_taken = true;
         Ok(HostingRpcTracker::for_arc_session(self.owner.clone(), self.connection.clone()))
     }
 
     pub fn incoming_dispatcher(&self, binding: super::rpc_incoming::IncomingBinding<'_>)
         -> Result<super::rpc_incoming::IncomingDispatcher, CodecError> {
-        if self.phase() != ArcPhase::Authenticated { return Err(CodecError::InvalidField); }
+        if self.phase() != ArcPhase::Authenticated || self.connection.session_revoked() { return Err(CodecError::InvalidField); }
         super::rpc_incoming::IncomingDispatcher::for_arc_session(self.owner.clone(), self.connection.clone(), binding)
+    }
+
+    pub(super) fn client_ex_dispatcher(&self, binding: super::rpc_incoming::IncomingBinding<'_>)
+        -> Result<super::rpc_client_ex::ClientExDispatcher, CodecError> {
+        if self.phase() != ArcPhase::Authenticated || self.connection.session_revoked() { return Err(CodecError::InvalidField); }
+        let authentication = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
+        super::rpc_client_ex::ClientExDispatcher::for_arc_session(self.owner.clone(), self.connection.clone(), binding, &authentication.token)
     }
 
     pub fn incoming_call_dispatcher(&self,binding:super::call_binding::CallIncomingBinding<'_>)
         ->Result<super::call_binding::CallDispatcher,CodecError>{
-        if self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField);}
+        if self.phase()!=ArcPhase::Authenticated || self.connection.session_revoked(){return Err(CodecError::InvalidField);}
         super::call_binding::CallDispatcher::for_arc_session(self.owner.clone(),self.connection.clone(),binding)
     }
 
     pub(super) fn configure_call_control(&mut self,routing:&[RpcProperty<'_>])->Result<(),CodecError>{
-        if self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField);}
+        if self.phase()!=ArcPhase::Authenticated || self.connection.session_revoked(){return Err(CodecError::InvalidField);}
         self.call_book.configure(routing)
     }
     pub(super) fn register_call_notice(&mut self,notice:&OwnedCallNotice)->Result<Option<CallControlTicket>,CodecError>{
@@ -274,7 +281,7 @@ impl ArcRpcSession {
     pub(super) fn call_acknowledged(&mut self,ticket:&CallControlTicket,accepted:bool)->Result<(),CodecError>{self.call_book.acknowledged(ticket,accepted)}
     pub(super) fn call_acknowledgement_ready(&self,ticket:&CallControlTicket)->bool{self.call_book.acknowledgement_ready(ticket)}
     pub(super) fn prepare_call(&mut self,ticket:&CallControlTicket,operation:CallOperation,properties:&[RpcProperty<'_>])->Result<(i32,RpcBytes),CodecError>{
-        if self.phase()!=ArcPhase::Authenticated||!ticket.matches(&self.owner,&self.connection){return Err(CodecError::InvalidField);}
+        if self.phase()!=ArcPhase::Authenticated || self.connection.session_revoked() || !ticket.matches(&self.owner,&self.connection){return Err(CodecError::InvalidField);}
         if self.pending.len()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
         let id=self.next_id.ok_or(CodecError::InvalidCallId)?;let arguments=encode_operation(operation,ticket.native_id(),properties)?;
         let bytes={
@@ -291,7 +298,7 @@ impl ArcRpcSession {
     /// nonzero incarnation is generated/imported locally, never a credential or
     /// endpoint default. Configuring this engine performs no network operation.
     pub fn take_batch_scheduler(&mut self, incarnation: u32) -> Result<BatchScheduler, BatchError> {
-        if self.phase() != ArcPhase::Authenticated || self.batch_scheduler_taken
+        if self.phase() != ArcPhase::Authenticated || self.connection.session_revoked() || self.batch_scheduler_taken
             || self.pending.values().any(|p| matches!(p.kind, PendingKind::Swap)) { return Err(BatchError::Scope); }
         let scheduler = BatchScheduler::for_arc_session(self.owner.clone(), self.connection.clone(), incarnation)?;
         self.batch_scheduler_taken = true;
@@ -300,7 +307,7 @@ impl ArcRpcSession {
 
     fn allocate(&mut self, metadata: &[RpcProperty<'_>], method: &[u8], arguments: &[u8],
         pending: PendingRpc) -> Result<(i32, RpcBytes), CodecError> {
-        if self.phase() == ArcPhase::Closed { return Err(CodecError::InvalidField); }
+        if self.phase() == ArcPhase::Closed || self.connection.session_revoked() { return Err(CodecError::InvalidField); }
         if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
         let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
         let metadata=self.account_metadata(metadata,self.common_identity.as_deref())?;
@@ -367,7 +374,7 @@ impl ArcRpcSession {
     /// Preparing a valid logout retires other pending operations without reusing
     /// IDs; invalid input must leave authentication and pending state untouched.
     pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<(i32, RpcBytes), CodecError> {
-        if self.phase() != ArcPhase::Authenticated { return Err(CodecError::InvalidField); }
+        if self.phase() != ArcPhase::Authenticated || self.connection.session_revoked() { return Err(CodecError::InvalidField); }
         reject_auth_keys(routing)?;
         let auth = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
         let arguments = encode_logout_session(&auth.user_id, &auth.selected_session_id)?;
@@ -397,7 +404,7 @@ impl ArcRpcSession {
 
     fn prepare_swap(&mut self, payload: &BatchPayload<'_>, routing: &[RpcProperty<'_>], scheduler: Option<Arc<()>>)
         -> Result<(i32, RpcBytes), CodecError> {
-        if self.phase() != ArcPhase::Authenticated { return Err(CodecError::InvalidField); }
+        if self.phase() != ArcPhase::Authenticated || self.connection.session_revoked() { return Err(CodecError::InvalidField); }
         if scheduler.is_some() && payload.fields[0] == 0 { return Err(CodecError::InvalidField); }
         reject_auth_keys(routing)?;
         let auth = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
@@ -415,7 +422,7 @@ impl ArcRpcSession {
     /// 用本次原生 UID/selector/token 在原账号连接取件；不读取导入 token 或
     /// caller 身份，不替换路由。一次只允许一页，消费前不提交下一位置。
     pub(super) fn prepare_offline(&mut self, position: i64, routing: &[RpcProperty<'_>]) -> Result<(i32, RpcBytes), CodecError> {
-        if self.phase() != ArcPhase::Authenticated || self.pending.values().any(|pending| matches!(pending.kind, PendingKind::Offline { .. })) {
+        if self.phase() != ArcPhase::Authenticated || self.connection.session_revoked() || self.pending.values().any(|pending| matches!(pending.kind, PendingKind::Offline { .. })) {
             return Err(CodecError::InvalidField);
         }
         reject_auth_keys(routing)?;
@@ -450,7 +457,7 @@ impl ArcRpcSession {
 
     pub fn accepts_scope(&self, owner: &AttemptOwner, connection: &RpcConnectionScope) -> bool {
         self.phase != ArcPhase::Closed && &self.owner == owner
-            && self.connection.matches(connection) && self.connection.is_open()
+            && self.connection.matches(connection) && self.connection.is_open() && !self.connection.session_revoked()
     }
 
     fn failure(&mut self) -> ArcReply<'static> {

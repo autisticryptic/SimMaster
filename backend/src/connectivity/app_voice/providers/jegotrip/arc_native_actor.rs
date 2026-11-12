@@ -96,6 +96,7 @@ impl<I:AsyncRead+AsyncWrite+Unpin+Send+'static> Actor<I>{
         if Instant::now()>=end{return Err(RuntimeError::Timeout);}Ok(end)
     }
     fn common_tick(&mut self)->Result<(),RuntimeError>{
+        if self.scope.session_revoked(){return Err(RuntimeError::SessionRevoked);}
         if !self.scope.is_open(){return Err(RuntimeError::Closed);}
         let now=Instant::now();self.pending.retain(|id,_|self.backend.is_pending(*id));
         if self.logout_pending.as_ref().is_some_and(|p|p.completion.is_closed())

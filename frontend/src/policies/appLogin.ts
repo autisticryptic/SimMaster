@@ -110,6 +110,7 @@ const errors: Record<string, string> = {
   app_login_timeout: '任务超时，请先核对业务结果，不会自动重放开通。',
   app_login_shutting_down: '后台正在退出，未接受新的登录。',
   app_account_runtime_owner_unconfirmed: '原运行归属或清理尚未确认，不能强制接管。',
+  app_account_session_revoked: '无忧行服务器已撤销本次接收会话，可能有其他设备登录；已停止，不会自动重连争抢，请先核对本人手机。',
   app_account_revision_conflict: '账号配置版本已变化，请刷新后再操作。',
 }
 export function appLoginError(error: unknown): string {

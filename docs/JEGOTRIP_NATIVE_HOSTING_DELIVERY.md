@@ -49,7 +49,18 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 安装侧显式 `profile.offline_reception=true` 接入原连接的 `moreOfflineMessages / getOfflineMessages`，保持本次 native UID/selector/token 与原 receiver 绑定。原包、已支持 SMS、通知/事件和64位游标同事务提交后才取下一页；未知格式隔离、不推进，旧 schema/行 ID/自增水位与删除/重放边界保留。默认关闭，不替旧模板猜对象、域或媒体，不自动修改410。
 
-详见 [原生离线积压](JEGOTRIP_NATIVE_OFFLINE_INBOX.md)。新增用例必须由本次 SHA 的两个 Actions 和正式制品验证；实际默认/动态接收绑定、ClientEx/Alive、媒体与真实授信/收件仍分开验收。
+详见 [原生离线积压](JEGOTRIP_NATIVE_OFFLINE_INBOX.md)。0c4c1c4已完成该积压软件的自身双Actions/正式制品验证，仍不是实网或完整SDK验收。
+
+### 显式 ClientEx 控制子集（新增源码须自身SHA验证）
+
+安装侧 `profile.client_ex=true` 仅复用已有原 `incoming.object_id/domain`；默认false、旧JSON省略false，不从字符串猜默认绑定，也不把DIRECT与batch的原域策略合并。登录前只能捕获该绑定DATA，匹配本次ARC登录后才从其返回token激活dispatcher，避免同批登录/踢线竞态。
+
+- `checkAlive.ClientEx.Client` 的请求无业务参数，结果为bool/u32/footer；独立AccountAlive注册未接入，当前只返回false/0，不能由SDK登录或HostingAck造正向Alive。
+- `notifyCalls.ClientEx.Client` 保留完整64位标记，空map只合并为原swap唤醒，不是SMS/来电，也不重开原RPC/TLS截止。非空map依赖未实现的SDK/OEM通知hooks，明确拒绝而非吞成成功。
+- `notifyDisconnect.ClientEx.Client` 核对**本次ARC token**，不是App/phone token。匹配的撤销先锁存在原scope；回复失败、取消、队列满及关闭都保留 `app_account_session_revoked`，禁止自动重连争抢另一设备。只由owning actor有界尝试原控制回复，真正Join/fence仍须完成，SMS历史保持。
+- DIRECT控制回包不完成原SMS票据；batch控制result仅排队，不当peer ACK，撤销后不另发新poll补造回执。前端只显示固定中文说明，不反射原reason/token。
+
+原默认/动态接收器、AccountAlive端点/信任/注册及续保、非空通知hooks、媒体与真实授信/收件仍分开验收。新增源码的30项Rust/3项前端回归待本次两个Actions及官方制品，不能借0c4的旧绿结果。最新状态见[当前交接](HANDOFF.md)。
 
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 

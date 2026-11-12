@@ -108,7 +108,7 @@ impl CallDispatcher {
     }
 
     pub(super) fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
-        &self.owner == owner && self.scope.matches(scope) && self.scope.is_open()
+        &self.owner == owner && self.scope.matches(scope) && self.scope.is_open() && !self.scope.session_revoked()
     }
 
     /// Reject unrelated original tickets before examining routing or arguments.

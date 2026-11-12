@@ -10,6 +10,8 @@ use crate::connectivity::app_voice::providers::jegotrip::{
 use std::{sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, task::{Context, Waker}};
 use tokio::{io::{AsyncWriteExt, ReadBuf}};
 use tokio_rustls::rustls;
+#[path = "transport_client_ex_tests.rs"]
+mod client_ex;
 
 fn owner() -> AttemptOwner {
     let mut session = HostingSession::new("fixture-runtime-line".into()); session.import(imported(), 100).unwrap(); session.begin_login(100).unwrap()

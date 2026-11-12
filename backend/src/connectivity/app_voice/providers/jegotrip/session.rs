@@ -56,6 +56,9 @@ pub type BackendFuture<'a> = Pin<Box<dyn Future<Output = Result<(), BackendFailu
 pub enum BackendFailure {
     Unavailable,
     AuthenticationRejected,
+    /// A matched native token explicitly revoked this session. Never retry as
+    /// a transport failure or fight another device's current session.
+    SessionRevoked,
     Expired,
     Disconnected,
     HostingRejected,
@@ -248,7 +251,7 @@ impl HostingSession {
         }
         self.phase = match reason {
             BackendFailure::Expired => Phase::CredentialExpired,
-            BackendFailure::AuthenticationRejected | BackendFailure::HostingRejected => Phase::AuthenticationFailed,
+            BackendFailure::AuthenticationRejected | BackendFailure::SessionRevoked | BackendFailure::HostingRejected => Phase::AuthenticationFailed,
             BackendFailure::Unavailable | BackendFailure::Disconnected => Phase::Disconnected,
         };
         self.invalidate();

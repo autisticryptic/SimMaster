@@ -46,6 +46,7 @@ pub enum ProtocolEvent<'a> {
     Incoming(IncomingProtocolMessage),
     IncomingCall(IncomingCallDelivery),
     OfflineHint(super::rpc_offline::IncomingOfflineHint),
+    ClientEx { reply: OwnedCallPackets, notice: Option<super::rpc_client_ex::OwnedClientExNotice> },
     OutgoingReply(OwnedCallPackets),
 }
 
@@ -106,6 +107,8 @@ impl fmt::Debug for DirectReplayFrontier {
 pub struct ArcProtocol {
     rpc: ArcRpcSession, assembler: CallAssembler, incoming: Option<IncomingDispatcher>,
     call_incoming:Option<CallDispatcher>,
+    client_ex: Option<super::rpc_client_ex::ClientExDispatcher>,
+    client_ex_registration: Option<super::rpc_client_ex::ClientExRegistration>,
     direct_pending: BTreeMap<i32, PendingDirect>, direct_seen: DirectHistory, direct_last_id: i32,
 }
 
@@ -115,7 +118,7 @@ impl fmt::Debug for ArcProtocol {
 
 impl ArcProtocol {
     pub fn new(owner: AttemptOwner) -> Self {
-        Self { rpc: ArcRpcSession::new(owner), assembler: CallAssembler::default(), incoming: None, call_incoming:None,
+        Self { rpc: ArcRpcSession::new(owner), assembler: CallAssembler::default(), incoming: None, call_incoming:None, client_ex: None, client_ex_registration: None,
             direct_pending: BTreeMap::new(), direct_seen: DirectHistory::new(Instant::now()), direct_last_id: 0 }
     }
 
@@ -137,7 +140,7 @@ impl ArcProtocol {
         if self.rpc.phase() == ArcPhase::Closed { self.assembler.close(); }
     }
     pub fn close(&mut self) {
-        self.rpc.close(); self.assembler.close(); self.incoming = None; self.call_incoming=None; self.direct_pending.clear(); self.direct_seen.clear();
+        self.rpc.close(); self.assembler.close(); self.incoming = None; self.call_incoming=None; self.client_ex=None; self.client_ex_registration=None; self.direct_pending.clear(); self.direct_seen.clear();
     }
 
     pub fn take_batch_scheduler(&mut self, incarnation: u32) -> Result<BatchScheduler, ProtocolError> {
@@ -145,7 +148,9 @@ impl ArcProtocol {
     }
 
     pub fn install_incoming(&mut self, binding: IncomingBinding<'_>) -> Result<(), ProtocolError> {
-        if self.incoming.is_some() { return Err(CodecError::InvalidField.into()); }
+        if self.incoming.is_some() || self.client_ex.as_ref().is_some_and(|dispatcher| !dispatcher.matches_binding(&binding)) {
+            return Err(CodecError::InvalidField.into());
+        }
         self.incoming = Some(self.rpc.incoming_dispatcher(binding)?);
         Ok(())
     }
@@ -153,6 +158,24 @@ impl ArcProtocol {
     pub fn install_calls(&mut self,binding:CallIncomingBinding<'_>)->Result<(),ProtocolError>{
         if self.call_incoming.is_some(){return Err(CodecError::InvalidField.into());}
         self.call_incoming=Some(self.rpc.incoming_call_dispatcher(binding)?);Ok(())
+    }
+
+    pub(super) fn arm_client_ex(&mut self, binding: IncomingBinding<'_>) -> Result<(), ProtocolError> {
+        if self.rpc.phase() != ArcPhase::Initial || self.client_ex.is_some() || self.client_ex_registration.is_some() {
+            return Err(CodecError::InvalidField.into());
+        }
+        self.client_ex_registration = Some(super::rpc_client_ex::ClientExRegistration::capture(binding)?); Ok(())
+    }
+
+    /// The same original CommonObject registered as MessageReceiver dispatches
+    /// ClientEx first. No object/domain/token is accepted from the caller here.
+    pub(super) fn install_client_ex(&mut self) -> Result<(), ProtocolError> {
+        if self.client_ex.is_some() { return Err(CodecError::InvalidField.into()); }
+        let binding = self.incoming.as_ref().ok_or(CodecError::InvalidField)?.binding();
+        self.client_ex = Some(self.rpc.client_ex_dispatcher(binding)?); Ok(())
+    }
+    pub(super) fn captured_client_ex(&self) -> Option<super::rpc_client_ex::ClientExDispatcher> {
+        self.client_ex.as_ref().map(super::rpc_client_ex::ClientExDispatcher::captured_copy)
     }
 
     pub(super) fn configure_call_control(&mut self,routing:&[RpcProperty<'_>])->Result<(),ProtocolError>{Ok(self.rpc.configure_call_control(routing)?)}
@@ -190,7 +213,7 @@ impl ArcProtocol {
 
     pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
         let (id, bytes) = self.rpc.prepare_logout(routing)?;
-        self.incoming = None; self.call_incoming=None; self.direct_pending.clear(); self.direct_seen.clear();
+        self.incoming = None; self.call_incoming=None; self.client_ex=None; self.client_ex_registration=None; self.direct_pending.clear(); self.direct_seen.clear();
         self.packets(id, bytes.expose_to_transport())
     }
 
@@ -232,6 +255,11 @@ impl ArcProtocol {
         match message.kind {
             CallKind::Reply => match self.rpc.on_reply(owner, connection, message.payload.expose_to_transport()) {
                 Ok(Some(reply)) => {
+                    if matches!(&reply, ArcReply::Login(callback) if callback.callback == (super::controller::Callback::SdkLogin { success: true })) {
+                        if let Some(registration) = self.client_ex_registration.take() {
+                            self.client_ex = Some(self.rpc.client_ex_dispatcher(registration.binding())?);
+                        }
+                    }
                     if self.rpc.phase() == ArcPhase::Closed { self.close(); }
                     deliver(ProtocolEvent::Reply(reply));
                     Ok(true)
@@ -255,7 +283,7 @@ impl ArcProtocol {
     /// local consumer explicitly completes its original ticket.
     fn incoming_request<F>(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope, bytes: &[u8], deliver: F)
         -> Result<bool, ProtocolError> where F: for<'a> FnOnce(ProtocolEvent<'a>) {
-        if self.rpc.phase() != ArcPhase::Authenticated || self.incoming.is_none() && self.call_incoming.is_none() {
+        if self.rpc.phase() != ArcPhase::Authenticated || self.incoming.is_none() && self.call_incoming.is_none() && self.client_ex.is_none() {
             self.close(); return Err(TransportError::UnsupportedKind.into());
         }
         let request = match decode_request(bytes) { Ok(request) => request, Err(error) => { self.close(); return Err(error.into()); } };
@@ -265,7 +293,8 @@ impl ArcProtocol {
             method if method==super::rpc_calls::ACCEPTED_METHOD.as_bytes()=>Some(CallNoticeKind::Accepted),_=>None,
         };
         let offline_hint = request.method == super::rpc_offline::MORE_OFFLINE_METHOD.as_bytes();
-        if request.method != super::rpc_incoming::ONLINE_MESSAGE_METHOD.as_bytes() && call_kind.is_none() && !offline_hint {
+        let client_ex = super::rpc_client_ex::method_kind(request.method).is_some();
+        if request.method != super::rpc_incoming::ONLINE_MESSAGE_METHOD.as_bytes() && call_kind.is_none() && !offline_hint && !client_ex {
             self.close(); return Err(TransportError::UnsupportedKind.into());
         }
         if self.direct_pending.contains_key(&request.call_id) || self.direct_seen.contains_id(request.call_id) { return Ok(false); }
@@ -284,6 +313,16 @@ impl ArcProtocol {
             || magic.len() > direct_history::MAX_MAGIC_BYTES
             || retained_bytes + magic.len() > direct_history::MAX_RETAINED_BYTES {
             self.close(); return Err(CodecError::TooLarge.into());
+        }
+        if client_ex {
+            let dispatcher = self.client_ex.as_ref().ok_or(CodecError::InvalidField)?;
+            let action = dispatcher.on_direct(owner, scope, &request)?.ok_or(CodecError::InvalidField)?;
+            let reply = encode_reply(request.call_id, 0, action.result.expose_to_transport())?;
+            let packets = encode_call_packets(CallKind::Reply, reply.expose_to_transport(), TLS_FRAGMENT_THRESHOLD)?;
+            self.direct_last_id = request.call_id;
+            self.record_direct(request.call_id, magic.to_vec());
+            deliver(ProtocolEvent::ClientEx { reply: OwnedCallPackets { call_id: request.call_id, packets }, notice: action.notice });
+            return Ok(true);
         }
         if offline_hint {
             let position = match self.incoming.as_ref().ok_or(CodecError::InvalidField)?.on_direct_offline_hint(owner, scope, &request) {
@@ -337,7 +376,7 @@ impl ArcProtocol {
         self.direct_seen.record(id, magic);
     }
     pub(super) fn direct_replay_frontier(&self) -> Option<DirectReplayFrontier> {
-        if self.rpc.phase() != ArcPhase::Authenticated || !self.rpc.connection_scope().is_open() || self.direct_last_id <= 0 { return None; }
+        if self.rpc.phase() != ArcPhase::Authenticated || !self.rpc.connection_scope().is_open() || self.rpc.connection_scope().session_revoked() || self.direct_last_id <= 0 { return None; }
         let through = self.direct_pending.keys().next().map_or(self.direct_last_id, |pending| pending.saturating_sub(1))
             .min(self.direct_last_id);
         (through > 0).then(|| DirectReplayFrontier { owner: self.rpc.owner().clone(), scope: self.rpc.connection_scope(), through })

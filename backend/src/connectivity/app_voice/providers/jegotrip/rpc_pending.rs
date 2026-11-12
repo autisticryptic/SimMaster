@@ -16,12 +16,17 @@ use super::{
 use std::{collections::BTreeMap, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
 
 #[derive(Clone)]
-pub struct RpcConnectionScope(Arc<AtomicBool>, Arc<Mutex<()>>, Arc<tokio::sync::Notify>);
+pub struct RpcConnectionScope(Arc<AtomicBool>, Arc<Mutex<()>>, Arc<tokio::sync::Notify>, Arc<AtomicBool>);
 
 impl RpcConnectionScope {
     pub(super) fn fresh() -> Self {
-        Self(Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(())), Arc::new(tokio::sync::Notify::new()))
+        Self(Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(())), Arc::new(tokio::sync::Notify::new()), Arc::new(AtomicBool::new(false)))
     }
+    /// Authenticated native session revocation is sticky for THIS scope. It is
+    /// not IO closure: the owning actor may still write the one control reply
+    /// before closing/Joining, but no new RPC/readiness/reconnect is admitted.
+    pub(super) fn session_revoked(&self) -> bool { self.3.load(Ordering::Acquire) }
+    pub(super) fn mark_session_revoked(&self) { self.3.store(true, Ordering::Release); }
     pub(super) fn matches(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
     pub(super) fn is_open(&self) -> bool { self.0.load(Ordering::Acquire) }
     pub(super) fn close(&self) {

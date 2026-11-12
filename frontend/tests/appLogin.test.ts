@@ -184,3 +184,25 @@ void test('device sync and skipped endpoint labels never present report acceptan
   assert.equal(rejected.includes('PRIVATE-TOKEN'), false); assert.equal(rejected.includes('secret.invalid'), false)
   assert.equal(appLoginPhase('syncing_device').includes('就绪'), false)
 })
+
+void test('native session revocation has a Chinese non-reconnecting message rather than a trust or ready grant', () => {
+  const output = appLoginError('app_account_session_revoked')
+  assert.match(output, /服务器已撤销本次接收会话/)
+  assert.match(output, /不会自动重连争抢/)
+  assert.equal(output.includes('已授信'), false)
+  assert.equal(output.includes('就绪'), false)
+})
+void test('native revocation messages never reflect token reason details or a private endpoint', () => {
+  const output = appLoginError(new Error('app_account_session_revoked token=FIXTURE-PRIVATE-TOKEN https://fixture-private.invalid/ another-device-logined'))
+  assert.equal(output.includes('FIXTURE-PRIVATE-TOKEN'), false)
+  assert.equal(output.includes('fixture-private.invalid'), false)
+  assert.equal(output.includes('another-device-logined'), false)
+})
+void test('a native session error does not change UUID reuse inputs business labels or polling completion', () => {
+  const reuse: AppLoginDraft = { ...draft, intent: 'reuse_hosting', deviceMode: 'phone_app', deviceId: 'D5C0199B-1644-4D33-8912-B8BD5AB49224' }
+  const before = jegotripLoginInput(id, reuse)
+  appLoginError('app_account_session_revoked')
+  assert.deepEqual(jegotripLoginInput(id, reuse), before)
+  assert.equal(appBusinessLabel('accepted_unconfirmed'), '服务已接受，状态待确认')
+  assert.equal(appLoginPhase('completed').includes('就绪'), false)
+})

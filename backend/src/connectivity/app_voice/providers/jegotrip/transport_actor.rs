@@ -31,7 +31,7 @@ const MAX_PARAMETER_BYTES: usize = 128 * 1024;
 const MAX_PENDING_RPC: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuntimeError { Scope, InvalidConfiguration, Backpressure, Closed, Cancelled, Timeout, Io, Protocol, CallNotReady,CallRejected,UnregistrationRejected, LoggedOut, Tls(TlsError) }
+pub enum RuntimeError { Scope, InvalidConfiguration, Backpressure, Closed, Cancelled, Timeout, Io, Protocol, SessionRevoked, CallNotReady,CallRejected,UnregistrationRejected, LoggedOut, Tls(TlsError) }
 impl From<TlsError> for RuntimeError { fn from(error: TlsError) -> Self { Self::Tls(error) } }
 
 pub struct RuntimePolicy { pub io_timeout: Duration, pub rpc_timeout: Duration }
@@ -143,7 +143,7 @@ impl Gateway {
 }
 
 enum Operation {
-    Login(Login, Vec<Property>), Bootstrap(Zeroizing<Vec<u8>>, Vec<Property>), Configure(u32, Option<Binding>), ConfigureCalls(CallBinding), Logout(Vec<Property>),
+    Login(Login, Vec<Property>), Bootstrap(Zeroizing<Vec<u8>>, Vec<Property>), Configure(u32, Option<Binding>), ArmClientEx(Binding), ConfigureClientEx, ConfigureCalls(CallBinding), Logout(Vec<Property>),
     Swap(Vec<Property>, Option<Gateway>), CompleteBatch(ServerRequestTicket, bool), CompleteDirect(DirectReplyTicket, bool), CompleteCall(CallReplyTicket,bool,Vec<Property>),
     GetOffline(i64, Vec<Property>), CompleteOfflineHint(super::rpc_offline::IncomingOfflineHint, bool),
     ConfigureCallControl(Vec<Property>),Call(CallControlTicket,CallOperation,Vec<Property>,oneshot::Sender<Result<OwnedCallOperationReply,RuntimeError>>),
@@ -160,8 +160,9 @@ impl Operation {
             Self::Swap(routing, gateway) => routing.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()
                 + gateway.as_ref().map_or(0, |g| g.uri.len() + g.prefix.len() + g.channel.len() + g.int_code.len() + g.number.len() + g.password.len()
                     + g.metadata.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()),
-            Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) | Self::CompleteOfflineHint(_, _) => 0,
+            Self::ConfigureClientEx | Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) | Self::CompleteOfflineHint(_, _) => 0,
             Self::ConfigureCalls(binding)=>binding.object.len()+binding.domain.len(),
+            Self::ArmClientEx(binding)=>binding.object.len()+binding.domain.len()+binding.receiver.len(),
             Self::CompleteCall(_,_,properties)|Self::ConfigureCallControl(properties)|Self::Call(_,_,properties,_)=>properties.iter().map(|p|p.key.len()+p.value.len()).sum(),
         }
     }
@@ -185,7 +186,7 @@ impl RuntimeReceipt {
     /// transport submission; unregister/logout waits also require the original
     /// semantic result. None of these receipts grants a new connection or IO.
     pub fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
-        self.submitted_on(owner, scope) && self.scope.is_open()
+        self.submitted_on(owner, scope) && self.scope.is_open() && !self.scope.session_revoked()
     }
     /// Historical submission correlation only, never a readiness/open-IO
     /// lease. A fast negative SDK reply may close ARC before its sender's
@@ -203,13 +204,14 @@ impl RuntimeEvent {
     /// Checked snapshot; close blocks new access. No revoked reference or copied
     /// message is a later channel/readiness lease. Consumer uses original owner.
     pub fn events_for(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Option<&[OfflineEvent]> {
-        if &self.owner == owner && self.scope.matches(scope) && self.scope.is_open() { Some(&self.events) } else { None }
+        if &self.owner == owner && self.scope.matches(scope) && self.scope.is_open() && !self.scope.session_revoked() { Some(&self.events) } else { None }
     }
     pub fn into_events(self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Option<Vec<OfflineEvent>> {
-        if &self.owner == owner && self.scope.matches(scope) && self.scope.is_open() { Some(self.events) } else { None }
+        if &self.owner == owner && self.scope.matches(scope) && self.scope.is_open() && !self.scope.session_revoked() { Some(self.events) } else { None }
     }
     pub(super) fn terminal_failure(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Option<super::session::BackendFailure> {
         if &self.owner != owner || !self.scope.matches(scope) { return None; }
+        if self.scope.session_revoked() { return Some(super::session::BackendFailure::SessionRevoked); }
         self.events.iter().find_map(|event| match event {
             OfflineEvent::Callback(callback) if &callback.owner == owner => match callback.callback {
                 super::controller::Callback::SdkLogin { success: false } => Some(super::session::BackendFailure::AuthenticationRejected),
@@ -258,7 +260,7 @@ impl fmt::Debug for RuntimeCommands { fn fmt(&self, f: &mut fmt::Formatter<'_>) 
 impl RuntimeCommands {
     pub fn connection_scope(&self) -> RpcConnectionScope { self.scope.clone() }
     fn accepts(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
-        &self.owner == owner && self.scope.matches(scope) && self.scope.is_open()
+        &self.owner == owner && self.scope.matches(scope) && self.scope.is_open() && !self.scope.session_revoked()
     }
     fn enqueue(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, operation: Operation)
         -> Result<oneshot::Receiver<Result<RuntimeReceipt, RuntimeError>>, RuntimeError> {
@@ -327,6 +329,14 @@ impl RuntimeCommands {
         if !self.accepts(owner, scope) || !ticket.matches(owner, scope) { return Err(RuntimeError::Scope); }
         self.submit(owner, scope, Operation::CompleteDirect(ticket.captured_copy(), accepted)).await
     }
+    pub(super) async fn arm_client_ex(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, binding: IncomingBinding<'_>) -> Result<RuntimeReceipt, RuntimeError> {
+        if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
+        self.submit(owner, scope, Operation::ArmClientEx(Binding::capture(binding)?)).await
+    }
+    pub(super) async fn configure_client_ex(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Result<RuntimeReceipt, RuntimeError> {
+        if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
+        self.submit(owner, scope, Operation::ConfigureClientEx).await
+    }
     pub async fn configure_calls(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,binding:CallIncomingBinding<'_>)->Result<RuntimeReceipt,RuntimeError>{
         if !self.accepts(owner,scope){return Err(RuntimeError::Scope);}
         self.submit(owner,scope,Operation::ConfigureCalls(CallBinding::capture(binding)?)).await
@@ -371,7 +381,7 @@ impl RuntimeHandle {
     pub fn command_handle(&self) -> RuntimeCommands { RuntimeCommands { owner: self.owner.clone(), scope: self.scope.clone(), commands: self.commands.clone() } }
     pub fn connection_scope(&self) -> RpcConnectionScope { self.scope.clone() }
     fn accepts(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
-        &self.owner == owner && self.scope.matches(scope) && self.scope.is_open()
+        &self.owner == owner && self.scope.matches(scope) && self.scope.is_open() && !self.scope.session_revoked()
     }
     async fn submit(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, operation: Operation) -> Result<RuntimeReceipt, RuntimeError> {
         self.command_handle().submit(owner, scope, operation).await
@@ -513,6 +523,7 @@ impl<I> Drop for Actor<I> {
 impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     async fn run(mut self) -> RuntimeError {
         let result = self.loop_run().await;
+        let result = if self.scope.session_revoked() { RuntimeError::SessionRevoked } else { result };
         self.scope.close(); self.backend.close(); if let Some(tls)=&mut self.tls{tls.close();}
         if let Some(common)=&mut self.common{common.close();}self.common=None;self.io = None; self.commands.close();
         while let Ok(command) = self.commands.try_recv() { let _ = command.completion.send(Err(RuntimeError::Closed)); }
@@ -528,6 +539,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         let mut read = [0; 8192]; let mut timer = tokio::time::interval(Duration::from_millis(20));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            if self.scope.session_revoked() { return RuntimeError::SessionRevoked; }
             if !self.scope.is_open() { return RuntimeError::Closed; }
             tokio::select! {
                 biased;
@@ -599,8 +611,23 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     }
     async fn deliver_events(&mut self, events: Vec<OfflineEvent>, unhosting_accepted: &mut bool,call_replies:&mut Vec<OwnedCallOperationReply>) -> Result<(), RuntimeError> {
         let mut visible = Vec::new();
+        let mut revoked = false;
         for event in events {
             match event {
+                OfflineEvent::ClientEx(notice) => {
+                    if notice.is_revocation_for(&self.owner, &self.scope) {
+                        // No positive message/ACK/channel survives a revoked
+                        // session in this group. The sticky scope preserves the
+                        // reason even when this terminal queue is already full.
+                        visible.clear();
+                        visible.push(OfflineEvent::Callback(super::rpc_pending::OwnedRpcCallback {
+                            owner: self.owner.clone(), callback: super::controller::Callback::Failure(super::session::BackendFailure::SessionRevoked),
+                        }));
+                        revoked = true; break;
+                    }
+                    if !notice.matches(&self.owner, &self.scope) { return Err(RuntimeError::Scope); }
+                    visible.push(OfflineEvent::ClientEx(notice));
+                }
                 OfflineEvent::CallOperation(reply)=>{
                     if !self.call_pending.contains_key(&reply.request_id()){return Err(RuntimeError::Protocol);}
                     call_replies.push(reply);
@@ -632,9 +659,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             self.events.try_send(RuntimeEvent { owner: self.owner.clone(), scope: self.scope.clone(), events: visible })
                 .map_err(|_| RuntimeError::Backpressure)?;
         }
-        Ok(())
+        if revoked { Err(RuntimeError::SessionRevoked) } else { Ok(()) }
     }
     async fn command(&mut self, mut command: Command) -> Result<(), RuntimeError> {
+        if self.scope.session_revoked() { let _ = command.completion.send(Err(RuntimeError::SessionRevoked)); return Err(RuntimeError::SessionRevoked); }
         if !self.scope.is_open() { let _ = command.completion.send(Err(RuntimeError::Closed)); return Err(RuntimeError::Closed); }
         let now = Instant::now();
         if self.unhosting_pending.as_ref().is_some_and(|pending| now >= pending.deadline) {
@@ -644,7 +672,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _)) {
             let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
         }
-        if self.common.is_none() && self.tls.as_ref().is_none_or(|tls|tls.phase()!=TlsPhase::Verified) {
+        if !matches!(&command.operation, Operation::ArmClientEx(_)) && self.common.is_none() && self.tls.as_ref().is_none_or(|tls|tls.phase()!=TlsPhase::Verified) {
             let _ = command.completion.send(Err(RuntimeError::Tls(TlsError::NotReady))); return Ok(());
         }
         let native_deadline=if self.common.is_some(){
@@ -665,6 +693,20 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 let result = self.backend.configure(epoch, incoming.as_ref().map(Binding::borrowed)).map_err(|_| RuntimeError::Protocol);
                 let receipt = result.map(|()| RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), None));
                 if command.completion.send(receipt).is_err() { return Err(RuntimeError::Cancelled); }
+                return Ok(());
+            }
+            Operation::ArmClientEx(binding) => {
+                let result = self.backend.arm_client_ex(binding.borrowed()).map_err(|_| RuntimeError::InvalidConfiguration);
+                if command.completion.send(result.map(|()| RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), None))).is_err() {
+                    return Err(RuntimeError::Cancelled);
+                }
+                return Ok(());
+            }
+            Operation::ConfigureClientEx => {
+                let result = self.backend.configure_client_ex().map_err(|_| RuntimeError::InvalidConfiguration);
+                if command.completion.send(result.map(|()| RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), None))).is_err() {
+                    return Err(RuntimeError::Cancelled);
+                }
                 return Ok(());
             }
             Operation::ConfigureCallControl(routing)=>{

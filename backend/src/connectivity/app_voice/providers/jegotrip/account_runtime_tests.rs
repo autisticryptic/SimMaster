@@ -25,6 +25,8 @@ mod long_batch;
 mod reconnect;
 #[path = "account_recovery_tests.rs"]
 mod recovery;
+#[path = "account_client_ex_tests.rs"]
+mod client_ex;
 
 async fn phase(manager: &AccountManager, line: &str, wanted: &str) -> AccountView {
     tokio::time::timeout(Duration::from_secs(4), async {

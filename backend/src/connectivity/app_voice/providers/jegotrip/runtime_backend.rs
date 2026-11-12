@@ -201,7 +201,7 @@ pub struct RuntimeProfile {
     domain_name: Zeroizing<String>, domain_id: Zeroizing<String>, application_id: Zeroizing<String>,
     device_info_cc: Zeroizing<String>, client_properties: Vec<Property>, include_device_id: bool,
     login_routing: Vec<Property>, gateway_uri: Option<Zeroizing<String>>, gateway_metadata: Vec<Property>,
-    poll_routing: Vec<Property>, logout_routing: Vec<Property>, incoming: Option<Binding>, offline_reception: bool,
+    poll_routing: Vec<Property>, logout_routing: Vec<Property>, incoming: Option<Binding>, offline_reception: bool, client_ex: bool,
     reference_decode_key: Option<ConfigDecodeKey>, handshake_timeout: Duration, partial_timeout: Duration,
     io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>, byte_length:usize,
 }
@@ -213,6 +213,16 @@ impl RuntimeProfile {
     pub fn with_offline_reception(mut self, enabled: bool) -> Result<Self, ProfileError> {
         if enabled && self.incoming.is_none() { return Err(ProfileError::InvalidConfiguration); }
         self.offline_reception = enabled; Ok(self)
+    }
+    /// Opt in to exact ClientEx controls using the existing original receiver.
+    /// This neither derives a native object/domain nor registers AccountAlive.
+    pub fn with_client_ex(mut self, enabled: bool) -> Result<Self, ProfileError> {
+        if enabled {
+            let binding = self.incoming.as_ref().ok_or(ProfileError::InvalidConfiguration)?;
+            let _registration = super::rpc_client_ex::ClientExRegistration::capture(binding.borrowed())
+                .map_err(|_| ProfileError::InvalidConfiguration)?;
+        }
+        self.client_ex = enabled; Ok(self)
     }
     pub fn with_call_receiver(mut self,binding:Option<CallIncomingBinding<'_>>)->Result<Self,ProfileError>{
         if self.call_incoming.is_some(){return Err(ProfileError::InvalidConfiguration);}
@@ -337,7 +347,7 @@ impl RuntimeProfile {
             client_properties: properties(input.client_properties, &mut total)?, include_device_id: input.include_device_id,
             login_routing, gateway_uri: if derived_uri{None}else{Some(text(input.gateway_uri, false, &mut total)?)},
             gateway_metadata,
-            poll_routing, logout_routing, incoming, offline_reception: false, reference_decode_key: input.reference_decode_key,
+            poll_routing, logout_routing, incoming, offline_reception: false, client_ex: false, reference_decode_key: input.reference_decode_key,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
             io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,byte_length:total,
         })
@@ -514,12 +524,12 @@ impl NativeHostingBackend {
     pub(super) fn original_incoming_binding(&self, owner: &AttemptOwner, scope: &RpcConnectionScope)
         -> Option<super::rpc_incoming::IncomingBinding<'_>> {
         let attempt = self.original(owner).ok()?;
-        if !attempt.scope.matches(scope) || !scope.is_open() || !lock(&attempt.state).configured { return None; }
+        if !attempt.scope.matches(scope) || !scope.is_open() || scope.session_revoked() || !lock(&attempt.state).configured { return None; }
         self.profile.incoming.as_ref().map(Binding::borrowed)
     }
     pub(super) fn original_call_receiver_ready(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
         let Ok(attempt) = self.original(owner) else { return false; };
-        attempt.scope.matches(scope) && scope.is_open() && lock(&attempt.state).configured
+        attempt.scope.matches(scope) && scope.is_open() && !scope.session_revoked() && lock(&attempt.state).configured
             && self.profile.call_incoming.is_some() && self.profile.call_control.is_some()
     }
     #[cfg(test)]
@@ -533,6 +543,20 @@ impl NativeHostingBackend {
     }
     fn original(&self, owner: &AttemptOwner) -> Result<Arc<Attempt>, BackendFailure> {
         lock(&self.state).slot.as_ref().filter(|a| &a.owner == owner).cloned().ok_or(BackendFailure::Disconnected)
+    }
+    fn preserve_revocation(&self, owner: &AttemptOwner, result: Result<(), BackendFailure>) -> Result<(), BackendFailure> {
+        // Ok is historical submission, never a positive SDK/hosting result.
+        // Preserve its correlation while the owning actor may finish a control
+        // reply; only failures must be reclassified as nonretryable revocation.
+        if result.is_err() && self.original(owner).is_ok_and(|attempt| attempt.scope.session_revoked()) { Err(BackendFailure::SessionRevoked) } else { result }
+    }
+    async fn arm_original_client_ex(&self, attempt: &Attempt, commands: &RuntimeCommands) -> Result<(), BackendFailure> {
+        if !self.profile.client_ex { return Ok(()); }
+        let binding = self.profile.incoming.as_ref().ok_or(BackendFailure::Unavailable)?;
+        let receipt = commands.arm_client_ex(&attempt.owner, &attempt.scope, binding.borrowed()).await
+            .map_err(|_| BackendFailure::Disconnected)?;
+        if !receipt.matches(&attempt.owner, &attempt.scope) { return Err(BackendFailure::Disconnected); }
+        Ok(())
     }
     /// Borrowed tickets stay with the durable consumer on queue pressure. No
     /// implicit ACK on delivery, clone, channel installation or scope closure.
@@ -635,6 +659,7 @@ impl NativeHostingBackend {
                     selected_session_id:captured.selector.as_bytes(),phone_login_token:captured.password.as_bytes(),application_key:captured.appkey.as_bytes(),
                     domain_id:fields.domain_id,application_id:fields.application_id,device_info_cc:fields.device_info_cc,client_properties:&client},
                 None=>captured.login(&self.profile,&client)};
+            self.arm_original_client_ex(&attempt, &commands).await?;
             let submitted=commands.login(&attempt.owner,&attempt.scope,login(),&routing).await.map_err(|_|BackendFailure::Disconnected)?;
             if !submitted.submitted_on(&attempt.owner,&attempt.scope){return Err(BackendFailure::Disconnected);}Ok(())
         };
@@ -793,6 +818,7 @@ impl NativeHostingBackend {
                 domain_id:fields.domain_id,application_id:fields.application_id,device_info_cc:fields.device_info_cc,client_properties:&client},
             None=>captured.login(&self.profile,&client),
         };
+        self.arm_original_client_ex(&attempt, &commands).await?;
         let submitted = tokio::time::timeout(self.profile.handshake_timeout, async {
             loop {
                 match commands.login(&attempt.owner, &attempt.scope, login(), &routing).await {
@@ -943,10 +969,16 @@ impl NativeHostingBackend {
 }
 impl HostingBackend for NativeHostingBackend {
     fn login<'a>(&'a self, owner: AttemptOwner, request: SdkLoginRequest<'a>) -> BackendFuture<'a> {
-        Box::pin(self.login_original(owner, request))
+        Box::pin(async move {
+            let result = self.login_original(owner.clone(), request).await;
+            self.preserve_revocation(&owner, result)
+        })
     }
     fn update_status<'a>(&'a self, owner: AttemptOwner, status: i32, registration: GatewayRegistration<'a>) -> BackendFuture<'a> {
-        Box::pin(self.status_original(owner, status, registration))
+        Box::pin(async move {
+            let result = self.status_original(owner.clone(), status, registration).await;
+            self.preserve_revocation(&owner, result)
+        })
     }
     fn retire(&self, owner: &AttemptOwner) { if let Ok(attempt) = self.original(owner) { attempt.retire(); } }
     fn logout(&self, owner: AttemptOwner) -> BackendFuture<'_> { Box::pin(self.logout_original(owner)) }
@@ -960,12 +992,27 @@ fn emit(sender: &mpsc::Sender<BackendEvent>, attempt: &Attempt, payload: Backend
     sender.try_send(BackendEvent { owner: attempt.owner.clone(), scope: attempt.scope.clone(), payload }).is_ok()
 }
 fn terminal(sender: &mpsc::Sender<BackendEvent>, attempt: &Attempt, reason: BackendFailure) {
+    let reason = if attempt.scope.session_revoked() { BackendFailure::SessionRevoked } else { reason };
     attempt.retire();
     // The pump is the only producer and normal events reserve this slot.
     let _ = sender.try_send(BackendEvent { owner: attempt.owner.clone(), scope: attempt.scope.clone(), payload: BackendEventPayload::Terminal(reason) });
 }
 async fn terminal_after_runtime_close(sender: &mpsc::Sender<BackendEvent>, attempt: &Attempt,
     events: &mut mpsc::Receiver<RuntimeEvent>, timeout: Duration) {
+    if attempt.scope.session_revoked() && attempt.scope.is_open() {
+        // Suppress prior positive events, but do not preempt the actor's one
+        // original control reply. The actor's own fixed IO/RPC deadlines still
+        // apply; this bounded wait cannot reopen or extend them.
+        let _ = tokio::time::timeout(timeout, async {
+            loop {
+                tokio::select! { biased;
+                    _ = attempt.scope.closed() => break,
+                    event = events.recv() => if event.is_none() { break; },
+                }
+            }
+        }).await;
+        terminal(sender, attempt, BackendFailure::SessionRevoked); return;
+    }
     // Scope close can be observed before the actor has queued its private
     // negative callback. Await only that original actor's bounded shutdown
     // channel; never reopen a message/ready path or bind a current owner.
@@ -974,12 +1021,43 @@ async fn terminal_after_runtime_close(sender: &mpsc::Sender<BackendEvent>, attem
             if let Some(reason) = event.terminal_failure(&attempt.owner, &attempt.scope) { return Some(reason); }
         }
         None
-    }).await.ok().flatten().unwrap_or(BackendFailure::Disconnected);
+    }).await.ok().flatten().unwrap_or_else(|| if attempt.scope.session_revoked() { BackendFailure::SessionRevoked } else { BackendFailure::Disconnected });
     terminal(sender, attempt, original);
+}
+/// Coalesced control wake uses the same original poll admission, routing and
+/// retirement guard as the periodic pump. It never refreshes RPC/TLS deadlines.
+async fn poll_for_client_ex(attempt: &Arc<Attempt>, profile: &RuntimeProfile) -> Result<bool, BackendFailure> {
+    let _admission = attempt.poll_work.lock().await;
+    let poll = {
+        let state = lock(&attempt.state);
+        #[cfg(test)]
+        if state.polls_paused { return Ok(false); }
+        state.configured && !state.retired && !state.logout_started
+    };
+    if !poll { return Ok(false); }
+    let commands = attempt.commands(&attempt.owner, &attempt.scope).map_err(|_| BackendFailure::Disconnected)?;
+    let mut retirement = Retirement::new(attempt.clone());
+    let receipt = commands.poll(&attempt.owner, &attempt.scope, &borrowed(&profile.poll_routing)).await
+        .map_err(|_| BackendFailure::Disconnected)?;
+    if !receipt.matches(&attempt.owner, &attempt.scope) { return Err(BackendFailure::Disconnected); }
+    retirement.disarm(); Ok(true)
 }
 async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender: mpsc::Sender<BackendEvent>, mut events: mpsc::Receiver<RuntimeEvent>) {
     let mut timer = tokio::time::interval(POLL_CADENCE); timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut poll_requested = false;
+    let mut last_poll: Option<Instant> = None;
     loop {
+        // One bit coalesces hints. A flood cannot postpone a due poll by keeping
+        // the receive branch ready; nor can hints reset any operation budget.
+        if poll_requested && attempt.scope.is_open() && !attempt.scope.session_revoked()
+            && last_poll.is_none_or(|last| last.elapsed() >= POLL_CADENCE) {
+            poll_requested = false;
+            match poll_for_client_ex(&attempt, &profile).await {
+                Ok(true) => last_poll = Some(Instant::now()),
+                Ok(false) => {},
+                Err(reason) => { terminal(&sender, &attempt, reason); return; }
+            }
+        }
         tokio::select! {
             biased;
             _ = sender.closed() => { attempt.retire(); return; }
@@ -987,7 +1065,10 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
             event = events.recv() => {
                 let Some(event) = event else { terminal(&sender, &attempt, BackendFailure::Disconnected); return; };
                 if let Some(reason) = event.terminal_failure(&attempt.owner, &attempt.scope) {
-                    terminal(&sender, &attempt, reason); return;
+                    if reason == BackendFailure::SessionRevoked && attempt.scope.is_open() {
+                        terminal_after_runtime_close(&sender, &attempt, &mut events, profile.io_timeout).await;
+                    } else { terminal(&sender, &attempt, reason); }
+                    return;
                 }
                 let Some(visible) = event.into_events(&attempt.owner, &attempt.scope) else {
                     terminal(&sender, &attempt, BackendFailure::Disconnected); return;
@@ -1005,6 +1086,12 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                                 let mut retirement = Retirement::new(attempt.clone());
                                 match commands.configure(&attempt.owner, &attempt.scope, attempt.incarnation, profile.incoming.as_ref().map(Binding::borrowed)).await {
                                     Ok(receipt) if receipt.matches(&attempt.owner, &attempt.scope) => {
+                                        if profile.client_ex {
+                                            match commands.configure_client_ex(&attempt.owner, &attempt.scope).await {
+                                                Ok(receipt) if receipt.matches(&attempt.owner, &attempt.scope) => {},
+                                                _ => { terminal(&sender, &attempt, BackendFailure::Disconnected); return; }
+                                            }
+                                        }
                                         if let Some(binding)=&profile.call_incoming{
                                             match commands.configure_calls(&attempt.owner,&attempt.scope,binding.borrowed()).await{
                                                 Ok(receipt)if receipt.matches(&attempt.owner,&attempt.scope)=>{},
@@ -1026,6 +1113,12 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                                 terminal(&sender, &attempt, BackendFailure::Disconnected); return;
                             }
                             BackendEventPayload::Callback(callback)
+                        }
+                        OfflineEvent::ClientEx(notice) => {
+                            if !notice.matches(&attempt.owner, &attempt.scope) { terminal(&sender, &attempt, BackendFailure::Disconnected); return; }
+                            if matches!(notice.control(), super::rpc_client_ex::ClientExControl::PollHint { .. }) { poll_requested = true; }
+                            else { terminal(&sender, &attempt, BackendFailure::SessionRevoked); return; }
+                            continue;
                         }
                         OfflineEvent::OfflineHint(hint) => {
                             if !hint.matches(&attempt.owner, &attempt.scope) { terminal(&sender, &attempt, BackendFailure::Disconnected); return; }
@@ -1083,7 +1176,9 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                 };
                 let routing = borrowed(&profile.poll_routing); let mut retirement = Retirement::new(attempt.clone());
                 match commands.poll(&attempt.owner, &attempt.scope, &routing).await {
-                    Ok(receipt) if receipt.matches(&attempt.owner, &attempt.scope) => retirement.disarm(),
+                    Ok(receipt) if receipt.matches(&attempt.owner, &attempt.scope) => {
+                        last_poll = Some(Instant::now()); poll_requested = false; retirement.disarm();
+                    }
                     _ => { terminal(&sender, &attempt, BackendFailure::Disconnected); return; }
                 }
             }

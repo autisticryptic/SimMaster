@@ -42,6 +42,7 @@ pub enum OfflineEvent {
     DirectMessage(IncomingProtocolMessage),
     OfflineHint(super::rpc_offline::IncomingOfflineHint),
     OfflinePage(super::rpc_offline::OwnedOfflinePage),
+    ClientEx(super::rpc_client_ex::OwnedClientExNotice),
     BatchRetirement(super::batch_scheduler::BatchReplayRetirement),
     Call(IncomingCallDelivery),
     CallOperation(OwnedCallOperationReply),
@@ -61,6 +62,7 @@ pub struct OfflineBackend {
     scheduler: Option<BatchScheduler>,
     dispatcher: Option<IncomingDispatcher>,
     call_dispatcher:Option<CallDispatcher>,
+    client_ex: Option<super::rpc_client_ex::ClientExDispatcher>,
     call_pending:BTreeMap<(u32,i32),(CallNoticeKind,NativeCallId)>,
     offline_hints: std::collections::BTreeSet<(u32, i32)>,
     call_acks:BTreeMap<(u32,i32),(CallControlTicket,bool)>,
@@ -78,7 +80,7 @@ impl OfflineBackend {
     pub fn new(owner: AttemptOwner) -> Self {
         let mut protocol = ArcProtocol::new(owner);
         let tracker = protocol.take_hosting_tracker().expect("fresh ARC tracker");
-        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,call_pending:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new() }
+        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,client_ex:None,call_pending:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new() }
     }
     pub fn phase(&self) -> ArcPhase { self.protocol.phase() }
     pub(super) fn is_pending(&self, id: i32) -> bool { self.protocol.is_pending(id) }
@@ -120,7 +122,7 @@ impl OfflineBackend {
     pub fn close(&mut self) {
         self.protocol.close(); if let Some(s) = &mut self.scheduler { s.close(); }
         self.tracker.retire_all();
-        self.call_dispatcher=None;self.call_pending.clear();self.call_acks.clear();self.offline_hints.clear();
+        self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.call_acks.clear();self.offline_hints.clear();
         self.swaps.clear();self.dispatcher=None;
     }
     pub(super) fn configure_call_control(&mut self,routing:&[RpcProperty<'_>])->Result<(),ProtocolError>{
@@ -132,7 +134,7 @@ impl OfflineBackend {
     pub fn prepare_login(&mut self, inputs: ArcLoginInputs<'_>, routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_login(inputs, routing) }
     pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
-        let packets=self.protocol.prepare_logout(routing)?;self.call_dispatcher=None;self.call_pending.clear();self.call_acks.clear();self.offline_hints.clear();Ok(packets)
+        let packets=self.protocol.prepare_logout(routing)?;self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.call_acks.clear();self.offline_hints.clear();Ok(packets)
     }
     pub fn prepare_bootstrap(&mut self, key: &[u8], routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_bootstrap(key, routing) }
@@ -156,6 +158,17 @@ impl OfflineBackend {
         }
         self.scheduler = Some(self.protocol.take_batch_scheduler(incarnation)?);
         Ok(())
+    }
+
+    pub(super) fn arm_client_ex(&mut self, binding: IncomingBinding<'_>) -> Result<(), ProtocolError> {
+        self.protocol.arm_client_ex(binding)
+    }
+    pub(super) fn configure_client_ex(&mut self) -> Result<(), ProtocolError> {
+        if self.client_ex.is_some() || self.scheduler.is_none() || self.dispatcher.is_none() || self.phase() != ArcPhase::Authenticated {
+            return Err(CodecError::InvalidField.into());
+        }
+        if self.protocol.captured_client_ex().is_none() { self.protocol.install_client_ex()?; }
+        self.client_ex = Some(self.protocol.captured_client_ex().ok_or(CodecError::InvalidField)?); Ok(())
     }
 
     pub fn configure_calls(&mut self,binding:CallIncomingBinding<'_>)->Result<(),ProtocolError>{
@@ -215,6 +228,7 @@ impl OfflineBackend {
         let scheduler = &mut self.scheduler; let tracker = &mut self.tracker;
         let dispatcher = &self.dispatcher;let call_dispatcher=&self.call_dispatcher;let call_pending=&mut self.call_pending;let swaps = &mut self.swaps;
         let offline_hints = &mut self.offline_hints;
+        let client_ex = &self.client_ex;
         let result = self.protocol.on_plaintext_packet(owner, scope, packet, |event| {
             match event {
                 ProtocolEvent::Reply(ArcReply::Login(callback)) | ProtocolEvent::Reply(ArcReply::Failure(callback)) =>
@@ -230,6 +244,26 @@ impl OfflineBackend {
                     for callback in tracker.on_scheduled_delivery(&delivery) { events.push(OfflineEvent::Callback(callback)); }
                     for reply in tracker.take_unhosting_replies() { events.push(OfflineEvent::Unhosting(reply)); }
                     for incoming in delivery.requests {
+                        if super::rpc_client_ex::method_kind(incoming.request().method).is_some() {
+                            let action = match client_ex.as_ref().map(|dispatcher| dispatcher.on_batch(&incoming)).transpose() {
+                                Ok(Some(Some(action))) => action,
+                                _ => { processing_error = Some(CodecError::InvalidField.into()); return; }
+                            };
+                            // Control-result queuing is not a SMS/call consumer
+                            // ACK or proof of remote delivery. A valid revocation
+                            // has already been locked onto this original scope.
+                            match scheduler.complete_server_request(incoming.ticket(), 0, action.result.expose_to_transport()) {
+                                Ok(true) => {},
+                                Ok(false) => { processing_error = Some(CodecError::InvalidField.into()); return; },
+                                Err(error) => { processing_error = Some(error.into()); return; },
+                            }
+                            if let Some(notice) = action.notice {
+                                let revoked = notice.is_revocation_for(owner, scope);
+                                events.push(OfflineEvent::ClientEx(notice));
+                                if revoked { break; }
+                            }
+                            continue;
+                        }
                         if incoming.request().method == super::rpc_offline::MORE_OFFLINE_METHOD.as_bytes() {
                             let position = match dispatcher.as_ref().map(|dispatcher| dispatcher.on_batch_offline_hint(&incoming)).transpose() {
                                 Ok(Some(Some(position))) => position,
@@ -288,12 +322,17 @@ impl OfflineBackend {
                 ProtocolEvent::Control(kind) => events.push(OfflineEvent::Control(kind)),
                 ProtocolEvent::Incoming(message) => events.push(OfflineEvent::DirectMessage(message)),
                 ProtocolEvent::IncomingCall(call)=>events.push(OfflineEvent::Call(call)),
+                ProtocolEvent::ClientEx { reply, notice } => {
+                    events.push(OfflineEvent::Outgoing(reply));
+                    if let Some(notice) = notice { events.push(OfflineEvent::ClientEx(notice)); }
+                }
                 ProtocolEvent::OutgoingReply(reply) => events.push(OfflineEvent::Outgoing(reply)),
             }
         });
         if let Err(error) = result { self.close(); return Err(error); }
         if let Some(error) = processing_error { self.close(); return Err(error); }
         for event in &mut events{
+            if scope.session_revoked() { break; }
             if let OfflineEvent::Call(call)=event{
                 if matches!(call.ticket().source(),CallReplySource::Batch(_)){
                     let control=self.protocol.register_call_notice(call.notice())?;call.attach_control(control)?;

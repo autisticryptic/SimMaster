@@ -20,6 +20,8 @@ use tokio_rustls::rustls;
 mod bootstrap;
 #[path="runtime_call_tests.rs"]
 mod calls;
+#[path="runtime_client_ex_tests.rs"]
+mod client_ex;
 
 fn credentials(root: &str) -> ImportedCredentials {
     serde_json::from_value(serde_json::json!({

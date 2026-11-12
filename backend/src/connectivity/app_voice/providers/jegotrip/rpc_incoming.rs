@@ -103,6 +103,10 @@ impl IncomingDispatcher {
             receiver_kind: binding.receiver_kind.to_vec(), latest_gateway_oid: std::sync::Mutex::new(None) })
     }
 
+    pub(super) fn binding(&self) -> IncomingBinding<'_> {
+        IncomingBinding { object_id: &self.object_id, domain: &self.domain, receiver_kind: &self.receiver_kind }
+    }
+
     /// Latest in-scope `Sip.MessageGw.Oid` observed on an accepted Sip.Request.
     /// Scope closure retires the value with the binding; it is never global.
     pub fn latest_gateway_oid(&self) -> Option<Vec<u8>> {
@@ -120,7 +124,7 @@ impl IncomingDispatcher {
     }
 
     pub(super) fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
-        &self.owner == owner && self.connection.matches(scope) && self.connection.is_open()
+        &self.owner == owner && self.connection.matches(scope) && self.connection.is_open() && !self.connection.session_revoked()
     }
 
     /// Returns no event for an unrelated original scope or an unsupported method

@@ -95,6 +95,7 @@ fn failure_code(reason: BackendFailure) -> &'static str {
     match reason {
         BackendFailure::Unavailable => "app_account_backend_unavailable",
         BackendFailure::AuthenticationRejected => "app_account_authentication_rejected",
+        BackendFailure::SessionRevoked => "app_account_session_revoked",
         BackendFailure::Expired => "app_account_credential_expired",
         BackendFailure::Disconnected => "app_account_disconnected",
         BackendFailure::HostingRejected => "app_account_hosting_rejected",
