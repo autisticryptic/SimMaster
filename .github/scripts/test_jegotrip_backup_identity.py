@@ -136,6 +136,10 @@ class BackupIdentityTests(unittest.TestCase):
         self.assertIn("scope.active", component)
         self.assertIn("selected !== fileGeneration.current", component)
         self.assertIn("scope.active = false", component)
+        self.assertIn("key={JSON.stringify([props.open, props.disabled, contextKey])}", component)
+        effect = component.split("useEffect(() => {", 1)[1].split("}, [", 1)[0]
+        self.assertNotIn("setBusy(", effect)
+        self.assertNotIn("setError(", effect)
         for remote in ["fetch(", "api.", "localStorage", "sessionStorage", "console."]:
             self.assertNotIn(remote, component)
         login = (ROOT / "frontend/src/pages/sim/AppAccountLoginPane.tsx").read_text(encoding="utf-8")
