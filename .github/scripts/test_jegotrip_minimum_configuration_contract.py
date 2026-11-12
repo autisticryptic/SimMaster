@@ -74,7 +74,12 @@ class JegotripMinimumConfigurationContracts(unittest.TestCase):
         tests = source('frontend/e2e/jegotrip-device-identity.spec.ts')
         fixture = source('frontend/e2e/fixtures/jegotrip-device.tsx')
         self.assertIn('JegotripConfigurationDialog', fixture)
-        self.assertEqual(tests.count("test('"), 2)
+        self.assertEqual(tests.count("test('"), 4)
+        for title in ['device UI persists the automatic identity and supports a manual CAS update after reopening',
+                      'mobile device UI validates a manual value and never claims verification or hosting success',
+                      'desktop phone backup UI parses original files locally and preserves explicit identity CAS and consent',
+                      'mobile phone backup UI rejects protected metadata and cancels stale reads without uploading credentials']:
+            self.assertIn("test('" + title + "'", tests)
         for marker in ['checkInstallationGuide', 'NEWER-TYPED-INPUT', 'STALE-FILE-INPUT', 'STALE-HIDDEN-INPUT',
                        "await expect(editor).not.toBeAttached()", 'expected_revision: 3',
                        'Buffer.alloc(256 * 1024 + 1, 32)', 'expect(model.otherWrites).toEqual([])',

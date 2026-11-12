@@ -264,3 +264,93 @@ test('mobile device UI validates a manual value and never claims verification or
   expect(model.writes).toEqual([]); expect(model.logins).toEqual([])
   await checkPhoneTrustTransfer(page, model, 'mobile')
 })
+
+async function checkLocalBackupImport(page: Page, model: Awaited<ReturnType<typeof mockApis>>, label: 'desktop' | 'mobile') {
+  const original = 'D5C0199B-1644-4D33-8912-B8BD5AB49224'
+  const imported = 'A5C0199B-1644-4D33-8912-B8BD5AB49224'
+  const typed = 'B5C0199B-1644-4D33-8912-B8BD5AB49224'
+  await page.getByRole('button', { name: '生成并保存随机标识', exact: true }).click()
+  await expect(page.getByText(original, { exact: true })).toBeVisible()
+  expect(model.writes).toHaveLength(1)
+  const file = page.getByLabel('从原始备份读取登录 UUID（仅本地）', { exact: true })
+  const preferences = `<map><string name="phone_uuid">${imported}</string><string name="token">PRIVATE-TOKEN-NOT-FOR-IMPORT</string><int name="authentication_code" value="1"/></map>`
+  await file.setInputFiles({ name: 'setting_power.xml', mimeType: 'application/xml', buffer: Buffer.from(preferences) })
+  const uuidInput = page.getByRole('textbox', { name: '手机 App 授信 UUID', exact: true })
+  await expect(uuidInput).toHaveValue(imported)
+  await expect(page.getByRole('combobox', { name: /^托管操作(?:\s|$)/ })).toContainText('复用已授信 UUID 接管托管')
+  await expect(page.getByRole('checkbox', { name: /授权保持原 UUID.*接管已开启业务/ })).not.toBeChecked()
+  await expect(page.getByText(/没有上传备份、保存标识或查询服务器/)).toBeVisible()
+  await expect(page.getByText('PRIVATE-TOKEN-NOT-FOR-IMPORT', { exact: true })).not.toBeAttached()
+  expect(model.writes).toHaveLength(1); expect(model.checks).toEqual([]); expect(model.logins).toEqual([])
+
+  await file.setInputFiles({ name: 'setting_power.xml', mimeType: 'application/xml', buffer: Buffer.from('v1:::PRIVATE-PROTECTED-METADATA') })
+  await expect(page.getByText(/这是 SBA1 \/ v1::: 备份封装/)).toBeVisible()
+  await expect(uuidInput).toHaveValue(imported)
+  await page.screenshot({ path: `test-results/jegotrip-device-ui/${label}-backup-rejection.png`, fullPage: true })
+  const malformed = [
+    `<map><string name="phone_uuid">${imported}</string><string name="phone_uuid">${original}</string></map>`,
+    '<!DOCTYPE map [<!ENTITY value "PRIVATE-TOKEN">]><map><string name="phone_uuid">&value;</string></map>',
+    '<map><string name="uuid">SDK-ONLY-ID</string></map>',
+  ]
+  for (const content of malformed) {
+    await file.setInputFiles({ name: 'setting_power.xml', mimeType: 'application/xml', buffer: Buffer.from(content) })
+    await expect(uuidInput).toHaveValue(imported)
+    await expect(page.getByRole('alert').filter({ hasText: /重复或冲突|不接受 DTD|没有 phone_uuid/ })).toBeVisible()
+  }
+  await file.setInputFiles({ name: 'protected.zip', mimeType: 'application/zip', buffer: Buffer.from('PK\u0003\u0004') })
+  await expect(page.getByText(/ZIP 请先用项目的离线备份读取脚本/)).toBeVisible()
+  await file.setInputFiles({ name: 'oversized-identity.json', mimeType: 'application/json', buffer: Buffer.alloc(256 * 1024 + 1, 32) })
+  await expect(page.getByText(/UUID 来源文件超过 256 KiB/)).toBeVisible()
+
+  await page.evaluate(() => {
+    const originalText = (entry: File) => Blob.prototype.text.call(entry)
+    const pending: Array<(value: string) => void> = []
+    window.jegotripFileReads = { pending }
+    File.prototype.text = function (this: File) {
+      if (this.name.startsWith('delayed-')) return new Promise<string>((resolve) => { pending.push(resolve) })
+      return originalText(this)
+    }
+  })
+  const exportText = JSON.stringify({ version: 1, source: 'android_root_export', app_device_uuid: imported })
+  await file.setInputFiles({ name: 'delayed-identity.json', mimeType: 'application/json', buffer: Buffer.from('{}') })
+  await expect.poll(() => page.evaluate(() => window.jegotripFileReads?.pending.length)).toBe(1)
+  await uuidInput.fill(typed)
+  await page.evaluate((text) => { window.jegotripFileReads?.pending.shift()?.(text) }, exportText)
+  await expect(uuidInput).toHaveValue(typed)
+  await file.setInputFiles({ name: 'delayed-cancelled.json', mimeType: 'application/json', buffer: Buffer.from('{}') })
+  await expect.poll(() => page.evaluate(() => window.jegotripFileReads?.pending.length)).toBe(1)
+  await page.getByRole('button', { name: '取消本地读取', exact: true }).click()
+  await page.evaluate((text) => { window.jegotripFileReads?.pending.shift()?.(text) }, exportText)
+  await expect(uuidInput).toHaveValue(typed)
+  await file.setInputFiles({ name: 'identity.json', mimeType: 'application/json', buffer: Buffer.from(exportText) })
+  await expect(uuidInput).toHaveValue(imported)
+  expect(model.writes).toHaveLength(1); expect(model.checks).toEqual([]); expect(model.otherWrites).toEqual([])
+
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByLabel('从原始备份读取待保存 UUID（仅本地）', { exact: true }).setInputFiles({
+    name: 'device.dat', mimeType: 'application/octet-stream', buffer: Buffer.from(imported),
+  })
+  await expect(page.getByRole('textbox', { name: '待保存的手机 App UUID', exact: true })).toHaveValue(imported)
+  expect(model.writes).toHaveLength(1)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
+  await page.screenshot({ path: `test-results/jegotrip-device-ui/${label}-backup-identity.png`, fullPage: true })
+  page.once('dialog', (dialog) => { void dialog.accept() })
+  await page.getByRole('button', { name: '保存新标识', exact: true }).click()
+  await expect(page.getByText(imported, { exact: true })).toBeVisible()
+  expect(model.writes).toHaveLength(2)
+  expect(model.writes[1]).toEqual({ id: '0123456789abcdef0123456789abcdef', expected_revision: 1, account_id: null, device_id: imported })
+  expect(model.checks).toEqual([]); expect(model.logins).toEqual([]); expect(model.configWrites).toEqual([]); expect(model.otherWrites).toEqual([])
+}
+
+test('desktop phone backup UI parses original files locally and preserves explicit identity CAS and consent', async ({ page }) => {
+  const model = await mockApis(page)
+  await page.goto('/e2e/fixtures/jegotrip-device.html')
+  await checkLocalBackupImport(page, model, 'desktop')
+})
+
+test('mobile phone backup UI rejects protected metadata and cancels stale reads without uploading credentials', async ({ page }) => {
+  const model = await mockApis(page)
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto('/e2e/fixtures/jegotrip-device.html')
+  await checkLocalBackupImport(page, model, 'mobile')
+})

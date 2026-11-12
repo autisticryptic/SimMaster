@@ -25,9 +25,9 @@
 `.local/jegotrip/verified-native-*.json`（本地私有证据目录）。每次提交的 run id、
 artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`。
 
-## 1.1 本轮新增：保持原 UUID 的已授信复用（自身 CI 待验证）
+## 1.1 保持原 UUID 的已授信复用（a1ad162 软件已验证，实网未验收）
 
-新源码不是上表已验证版本的同 SHA 交付；必须等自身两个 Actions、官方 digest/CRC 和精确测试名通过，才能作为新的软件 checkpoint。部署不采用未绿色版本。
+`a1ad16211a42c7262d8b3f509a5d7911bba57900` 的 Build-Release（41848076386）和 Validate Beta Refactor（41848076643）均成功；官方 digest/CRC、每工作流1282项精确 provider 回归和原桌面/手机界面用例已核验。该结果是软件门禁，不是手机授信真实复用或完整收件验收；该轮没有部署410。后续补丁仍必须通过自身SHA的门禁，不能借用本条旧结果。
 
 - `intent=reuse_hosting`：明确指定本人手机36位App UUID，保持同账号/号码绑定；不 enroll、不请求 VTD、不使用旧 enrollId、不自动更换到另一 canonical UUID。本次 getCallStatus 明确认可且业务已开才继续。
 - `intent=enable_trusted_hosting`：同一已授信复用策略，另有明确的业务开启同意。phone/SIP及原生模板校验后再次查询；开启后认可码和业务读回都必须通过。
@@ -36,6 +36,14 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 - 原SDK设备标识、phone token、TLS、原账号/收件ACK与stop→logoutSession→Join边界不改变。模拟覆盖的是已支持子集，不证明手机授权已实际迁移、原生通信全部实现或收件及时。
 
 用户提供同一时间只有一个设备授信的规则，本轮按此保护，不写新的VTD或取消手机认可。SDK another-device-logined / same-device-login分支属于另一个会话层，不能当VTD服务器唯一键证据。
+
+## 1.2 手机原始备份的本地 UUID 读取（本轮新增）
+
+网页支持从原始 `setting_power.xml`、可读 `device.dat` 或离线脚本的 UUID-only JSON 在本地填入 App UUID。普通 root ZIP 由 `scripts/jegotrip_backup_identity.py` 在内存读取，检查来源一致性、资源界限和选定成员 CRC，不恢复、不上传，不导出密码/token/缓存授信。
+
+读取不自动保存或登录，清除登录同意；已有标识仍走原 CAS、确认和占用保护。SBA1 / v1::: 数据明确作为不可直接读的封装拒绝，不猜密钥、UUID、接收 namespace 或授信。异步读取在取消、手工更改、目标切换及关闭后失效。
+
+详见 [手机备份读取说明](JEGOTRIP_PHONE_BACKUP_IMPORT.md)。这批新增界面与解析用例须自身两Actions/官方制品验证；不代表已经读出本轮加密备份、复用真实授权或补齐离线取件/媒体。
 
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 

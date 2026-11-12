@@ -41,6 +41,9 @@ class DocumentationLayoutTests(unittest.TestCase):
             # Maintained configuration/data-source guide, not a dated handoff or
             # an export of the private installation template.
             'JEGOTRIP_MINIMUM_CONFIGURATION.md',
+            # Maintained local root-backup import contract; contains no private
+            # archive, credentials, cached authorization or dated handoff.
+            'JEGOTRIP_PHONE_BACKUP_IMPORT.md',
         }
         # This private, untracked report belongs to the user and is not part of
         # the maintained public documentation set.

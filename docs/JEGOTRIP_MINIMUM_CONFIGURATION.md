@@ -24,7 +24,7 @@ App 只有收到外层 code0、`authentication_code=1` 后才进入成功分支�
 
 1. 在本人手机中完成合法设备授信；保持 App 数据，不为取 UUID 清缓存或重装。
 2. 取得原 App `setting_power / phone_uuid` 或 `device.dat` 中的原样 UUID，保留大小写与连字符。这两处为 App 私有存储，本文不声称非 root 手机可直接读取；若 App 未提供导出入口，需要用户自己的合法读取方式，不自行安装工具或修改手机数据。
-3. 首次配置在登录页选择 **“复用手机 App 已授信 UUID”**；已有账号先在 **“设备标识管理”** 选择原号码，再点 **“录入手机 App 授信 UUID”** 做有版本守卫的替换，旧值所有权保留。36位 UUID 专用输入会拒绝误粘的 MD5、enrollId、IMEI 等。选择手机 UUID 后默认采用 `reuse_hosting`，不是普通自动生成/enroll 登录。
+3. 首次配置可先从原始 `setting_power.xml`、可读 `device.dat` 或离线脚本的 UUID-only JSON **在浏览器本地读取**；普通 root ZIP 先在本地解析，SBA1/v1::: 封装需原工具导出解密数据。读取不保存、不登录、不勾选授权，也不导入 token/缓存授信。详见 [手机备份读取说明](JEGOTRIP_PHONE_BACKUP_IMPORT.md)。随后在登录页选择 **“复用手机 App 已授信 UUID”**；已有账号先在 **“设备标识管理”** 选择原号码，再点 **“录入手机 App 授信 UUID”** 做有版本守卫的替换，旧值所有权保留。36位 UUID 专用输入会拒绝误粘的 MD5、enrollId、IMEI 等。选择手机 UUID 后默认采用 `reuse_hosting`，不是普通自动生成/enroll 登录。
 4. 可先选择 **“只查询设备授信”** 做独立诊断：正常账号登录、确认号码后，查询 securityVerify、已有设备后备和业务状态；**不 enroll、不取电话凭据、不建原生账号、不改业务、不启动接收器**。会保留 App 认证摘要和此次观察，不保留密码/App 会话；该旧诊断历史不授予后续动作。
 5. 正式复用选择 **“复用已授信 UUID 接管托管”**（`reuse_hosting`）：保持明确指定的原 UUID，不 enroll、不请求 VTD、不携静态旧 enrollId，也不会因发现同一号码已有另一 UUID 而静默切换。以本次 `getCallStatus.authentication_code=1` 为门禁，`cs_forward=2` 才接管；未明确认可或业务未开立即停止。
 6. 已授信但业务未开时，另选 **“复用已授信 UUID 并开启托管”**（`enable_trusted_hosting`）并明确同意业务操作。取得电话凭据/校验原生模板后、写开关或建账号前会再次读回；开启后同时确认认可码和业务。未知或拒绝不自动重放，不申请新设备授信。

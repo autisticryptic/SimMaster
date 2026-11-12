@@ -4,6 +4,7 @@ import { api, type AppLoginAttempt, type AppLoginSetup, type JegotripAppVersionV
 import { appBusinessLabel, appLoginError, jegotripLoginInput, appLoginNeedsPolling, appLoginPhase, canSubmitJegotripLogin, emptyAppLoginDraft, validJegotripDeviceId, validPhoneAppUuid, deviceTrustQueryLabel, deviceSyncLabel, type AppLoginDraft } from '../../policies/appLogin'
 import JegotripDeviceIdentityPane from './JegotripDeviceIdentityPane'
 import JegotripPushStatusPane from './JegotripPushStatusPane'
+import JegotripPhoneBackupInput from './JegotripPhoneBackupInput'
 
 const emptyDraft = emptyAppLoginDraft
 
@@ -18,6 +19,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
   const [deviceRefresh, setDeviceRefresh] = useState(0)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [backupNote, setBackupNote] = useState<string | null>(null)
   const generation = useRef({ active: false })
   const checkingTrust = draft.intent === 'check_device_trust'
   const reusingTrust = draft.intent === 'reuse_hosting' || draft.intent === 'enable_trusted_hosting'
@@ -27,7 +29,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
   useEffect(() => {
     const scope = { active: open }
     generation.current = scope
-    setDraft(emptyDraft()); setAttempt(null); setSubmitting(false); setError(null); setSetup(null)
+    setDraft(emptyDraft()); setAttempt(null); setSubmitting(false); setError(null); setSetup(null); setBackupNote(null)
     setAppVersion(null); setVersionInput(''); setVersionNote(null); setDeviceRefresh(0)
     if (open) void api.getJegotripLoginSetup().then((response) => {
       if (scope.active) setSetup(response.data ?? null)
@@ -141,6 +143,7 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
     <TextField select size="small" label="本次登录的设备标识" value={draft.deviceMode ?? 'auto'} disabled={pending}
       onChange={(event) => {
         const mode = event.target.value === 'phone_app' ? 'phone_app' : event.target.value === 'manual' ? 'manual' : 'auto'
+        setBackupNote(null)
         setDraft({ ...draft, deviceMode: mode, consent: false,
           intent: mode === 'phone_app' ? 'reuse_hosting' : reusingTrust ? 'attach_hosting' : draft.intent,
           startReceiver: mode === 'phone_app' ? true : draft.startReceiver })
@@ -150,11 +153,21 @@ export default function AppAccountLoginPane({ open, onCreated }: { open: boolean
     </TextField>
     {(draft.deviceMode === 'manual' || draft.deviceMode === 'phone_app') && <TextField size="small"
       label={draft.deviceMode === 'phone_app' ? '手机 App 授信 UUID' : '首次登录使用的设备标识'} value={draft.deviceId ?? ''} disabled={pending}
-      onChange={(event) => setDraft({ ...draft, deviceId: event.target.value })} inputProps={{ maxLength: 64 }}
+      onChange={(event) => { setBackupNote(null); setDraft({ ...draft, deviceId: event.target.value }) }} inputProps={{ maxLength: 64 }}
       error={!!draft.deviceId && !(draft.deviceMode === 'phone_app' ? validPhoneAppUuid(draft.deviceId) : validJegotripDeviceId(draft.deviceId))}
       helperText={draft.deviceMode === 'phone_app'
         ? '复制本人手机 App 的 phone_uuid / device.dat 中原样的 36 位 UUID（含连字符）；不是硬件 IMEI、phone_safe_num 的 MD5、enrollId 或 SDK UUID。已有账号更换请先用下方标识管理。'
         : '8–64 位，仅字母、数字、下划线与连字符；现有账号更换标识请用下方管理，不会自动覆盖旧绑定。'} />}
+    <JegotripPhoneBackupInput open={open} disabled={pending}
+      contextKey={JSON.stringify([draft.deviceMode, draft.deviceId, draft.intent, draft.mode, draft.username, draft.country])}
+      label="从原始备份读取登录 UUID（仅本地）" onUuid={(value) => {
+        setDraft((current) => ({ ...current, deviceMode: 'phone_app', deviceId: value, consent: false,
+          intent: current.intent === 'check_device_trust' ? 'check_device_trust' : 'reuse_hosting',
+          startReceiver: current.intent !== 'check_device_trust' }))
+        setBackupNote('已在本地读取 App UUID；没有上传备份、保存标识或查询服务器。授权勾选已清除，账号/号码仍需你核对，正式复用仍以本次服务器结果为准。')
+        setError(null)
+      }} />
+    {backupNote && <Alert severity="info">{backupNote}</Alert>}
     {draft.deviceMode === 'phone_app' && <Alert severity="info">先在本人手机完成授信，再复用同一账号/号码与原 App UUID。复用接管/开启流程不 enroll、不请求 VTD，也不使用旧 enrollId；不会自动改用另一 UUID。按单设备复用边界，不同时申请新设备授信；手机 App 同时收件还可能发生独立的 SDK 会话冲突。</Alert>}
     <Typography variant="caption" color="text.secondary">标识保存在独立数据库中，重试/重启不反复随机。不同号码不共用；标识不是认证 token，也不保证通过服务端一键验证。</Typography>
     <TextField select size="small" label="托管操作" value={draft.intent ?? 'enable_hosting'} disabled={pending}

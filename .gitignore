@@ -44,6 +44,9 @@ temp/
 .tmp
 /.tmp-*
 /20??-??-??*.jsonl
+/pi-session-*.html
+# 用户提供的无忧行手机备份含账号/会话/设备私有数据，禁止发布
+/无忧行*.zip
 .device-dump/
 # Python 缓存
 __pycache__/

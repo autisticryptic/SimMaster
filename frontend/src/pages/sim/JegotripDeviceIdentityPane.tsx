@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Alert, Button, MenuItem, Stack, TextField, Typography } from '@mui/material'
 import { api, type JegotripAccountView, type JegotripDeviceIdentityState } from '../../api/current'
 import { appLoginError, validJegotripDeviceId, validPhoneAppUuid } from '../../policies/appLogin'
+import JegotripPhoneBackupInput from './JegotripPhoneBackupInput'
 
 export default function JegotripDeviceIdentityPane({ open, disabled, refreshKey }: { open: boolean; disabled: boolean; refreshKey: number }) {
   const [view, setView] = useState<JegotripDeviceIdentityState | null>(null)
@@ -77,6 +78,11 @@ export default function JegotripDeviceIdentityPane({ open, disabled, refreshKey 
     </Stack>
     <Alert severity="info">默认首次生成随机 UUID，此后按认证后的账号/号码持久复用；不同号码不共用标识。同一号码用手机号或邮箱登录时会归并绑定。生成或更换标识不代表绕过一键验证。</Alert>
     <Button variant="outlined" disabled={locked} onClick={() => { setMode('manual'); setPhoneImport(true); setValue(''); setNote(null); setError(null) }}>录入手机 App 授信 UUID</Button>
+    <JegotripPhoneBackupInput open={open} disabled={locked} label="从原始备份读取待保存 UUID（仅本地）"
+      contextKey={JSON.stringify([selected, row?.revision, accountId, mode, value, phoneImport])} onUuid={(uuid) => {
+        setMode('manual'); setPhoneImport(true); setValue(uuid); setError(null)
+        setNote('已在本地读取 App UUID，尚未保存或查询授信。请确认原账号/号码；已有标识替换仍须版本校验、确认和原所有权保护。')
+      }} />
     {phoneImport && <Alert severity="info">先选择已有号码的标识再替换，或为首次登录新增。复制本人 App 的 phone_uuid / device.dat 原样 UUID，不是 IMEI、MD5、enrollId 或 SDK 标识。保存后用同一账号选择「只查询设备授信」核验；不会在数据库写“已授信”或修改业务。</Alert>}
     {view?.configured_mode === 'static' && <Alert severity="warning">当前安装配置是 static 固定值模式。要为新账号默认随机生成，可将 http.device_identity_mode 改为 store；已有号码的标识仍保留，禁止跨号码复用固定值。</Alert>}
     {view && <Typography variant="caption" color="text.secondary">当前 {view.identities.length}/{view.max_identities} 个有效标识；仅显示标识、来源与脱敏绑定，不保存账号密码。</Typography>}

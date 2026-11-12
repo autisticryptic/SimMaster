@@ -139,7 +139,14 @@ class JegotripTrustedReuseContracts(unittest.TestCase):
         for forbidden in ['localStorage','sessionStorage','indexedDB','console.log']:
             self.assertNotIn(forbidden,pane)
         browser=text('frontend/e2e/jegotrip-device-identity.spec.ts')
-        self.assertEqual(browser.count("test('"),2)
+        self.assertEqual(browser.count("test('"),4)
+        for title in ['device UI persists the automatic identity and supports a manual CAS update after reopening',
+                      'mobile device UI validates a manual value and never claims verification or hosting success',
+                      'desktop phone backup UI parses original files locally and preserves explicit identity CAS and consent',
+                      'mobile phone backup UI rejects protected metadata and cancels stale reads without uploading credentials']:
+            self.assertIn("test('"+title+"'",browser)
+        self.assertIn('PRIVATE-TOKEN-NOT-FOR-IMPORT',browser)
+        self.assertIn('delayed-cancelled.json',browser)
         self.assertIn("toContainText('复用已授信 UUID 接管托管')",browser)
         self.assertIn("toHaveAttribute('aria-disabled', 'true')",browser)
         self.assertIn('expect(model.logins).toEqual([])',browser)
