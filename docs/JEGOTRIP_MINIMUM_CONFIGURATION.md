@@ -156,7 +156,7 @@ libmtc SHA256：`57086cd624d8227dc1b1b64a63d7c8b2258f87b261779b681a9bfd306ad9d2e
 
 ## 6. 仍需继续完成的部分
 
-1. 旧任务36：真实接收器默认/动态绑定、适用 AccountAlive、来电通知及媒体配置仍需完成。原生 `moreOfflineMessages → getOfflineMessages` 积压软件已由0c4的自身双Actions/正式制品核验，详见[原生离线积压](JEGOTRIP_NATIVE_OFFLINE_INBOX.md)，不等于真实收件或完整SDK。新增 `profile.client_ex` 默认为false，仅复用已有原绑定；空通知map唤醒、原token匹配撤销及不可重连错误须新源码自身验证。它不自动填接收域、不申请Alive；无独立注册证明时checkAlive仍false/0，详见[原生控制子集](JEGOTRIP_NATIVE_HOSTING_DELIVERY.md#显式-clientex-控制子集新增源码须自身sha验证)。
+1. 旧任务36：真实接收器默认/动态绑定、适用 AccountAlive、来电通知及媒体配置仍需完成。原生 `moreOfflineMessages → getOfflineMessages` 积压软件已由0c4的自身双Actions/正式制品核验，详见[原生离线积压](JEGOTRIP_NATIVE_OFFLINE_INBOX.md)，不等于真实收件或完整SDK。新增 `profile.client_ex` 默认为false，仅复用已有原绑定；空通知map唤醒、原token匹配撤销及不可重连错误已由38ae8d7自身双Actions/正式制品核验，不等于默认/动态SDK全部装配。它不自动填接收域、不申请Alive；无独立注册证明时checkAlive仍false/0，详见[原生控制子集](JEGOTRIP_NATIVE_HOSTING_DELIVERY.md#显式-clientex-控制子集)。
 2. 旧任务16：合法业务条件下真实原生登录/注册、短信落库与原ACK、来电/双向音频和 stop/Join。
 3. 旧任务17：完整验收后最终收尾。**最小配置分析、界面简化或已有1242项隔离回归都不能代替这三项。**
 

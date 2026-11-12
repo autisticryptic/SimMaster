@@ -51,7 +51,7 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 详见 [原生离线积压](JEGOTRIP_NATIVE_OFFLINE_INBOX.md)。0c4c1c4已完成该积压软件的自身双Actions/正式制品验证，仍不是实网或完整SDK验收。
 
-### 显式 ClientEx 控制子集（新增源码须自身SHA验证）
+### 显式 ClientEx 控制子集
 
 安装侧 `profile.client_ex=true` 仅复用已有原 `incoming.object_id/domain`；默认false、旧JSON省略false，不从字符串猜默认绑定，也不把DIRECT与batch的原域策略合并。登录前只能捕获该绑定DATA，匹配本次ARC登录后才从其返回token激活dispatcher，避免同批登录/踢线竞态。
 
@@ -60,7 +60,7 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 - `notifyDisconnect.ClientEx.Client` 核对**本次ARC token**，不是App/phone token。匹配的撤销先锁存在原scope；回复失败、取消、队列满及关闭都保留 `app_account_session_revoked`，禁止自动重连争抢另一设备。只由owning actor有界尝试原控制回复，真正Join/fence仍须完成，SMS历史保持。
 - DIRECT控制回包不完成原SMS票据；batch控制result仅排队，不当peer ACK，撤销后不另发新poll补造回执。前端只显示固定中文说明，不反射原reason/token。
 
-原默认/动态接收器、AccountAlive端点/信任/注册及续保、非空通知hooks、媒体与真实授信/收件仍分开验收。新增源码的30项Rust/3项前端回归待本次两个Actions及官方制品，不能借0c4的旧绿结果。最新状态见[当前交接](HANDOFF.md)。
+原默认/动态接收器、AccountAlive端点/信任/注册及续保、非空通知hooks、媒体与真实授信/收件仍分开验收。**本子集在38ae8d7自身两个Actions/正式制品已验证：各1339 provider（保留原1309+新30）、26HTTP、82前端单元/4浏览器/12图，以及两个ABI完整包摘要/全CRC/全部成员SHA均核。** 首76532bd两个工作流的原Common bootstrap栈溢出已由仅两源路径堆委派修复，旧同名断言通过；不改变测试栈/超时、不删除失败制品。新源码仍须自己的SHA门禁，不能借此历史结果。最新剩余项见[当前交接](HANDOFF.md)。
 
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 

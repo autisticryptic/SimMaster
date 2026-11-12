@@ -13,6 +13,9 @@
 
 ## 已核验的软件基线
 
+- **`38ae8d785fcbe10b6416b1240ad4c2150d811664`**：显式原绑定ClientEx控制子集与会话撤销保护。Build43253503712 / Beta43253503724均success；每workflow1339精确provider回归（原1309+新30）、26HTTP、原registry/Trunk/通知/DNS/矩阵通过，前端82精确单元/4浏览器/12图、自身SHA/run/官方digest/全ZIP CRC已核。ARM64/AMD64正式包各29成员/20前端文件完整SHA、tar/ZIP摘要、meta完整commit/target/version及ELF已核，未执行或部署。本组件不包含独立Alive正向/默认动态接收/完整实网验收。
+- 新权威证据：`.local/jegotrip/resume-20261112-1957/`中的交付、源码读回、失败关闭、UI及双架构包证明，以及`.local/jegotrip/verified-native-38ae8d7.json`。公开文档收尾只改docs，构建输入仍与38ae一致，不冒称另一个新二进制。
+
 - **`0c4c1c45de2c92601f25ac6c2e7272d269efe7c7`**：原UUID复用软件、本地原始备份读取、快捷root导出与原生离线积压消费。Build43199766742 / Beta43199766709均success，双架构、正式digest/全ZIP CRC、每workflow1309精确provider回归、26HTTP、79前端单元、4浏览器用例/12图已核。
 - 原 `a1ad162` 复用流程不enroll/VTD/旧enrollId/自动换身份。本次 `getCallStatus.authentication_code=1` 与业务读回后才取得凭据；校验原生模板后再次读回。设备sync仅用明确本人手机资料、原UUID和本次accountid；不确定写入不重放。
 - `profile.offline_reception` 默认false，必须已有原receiver绑定。signed64初值-1/limit100、本次UID/selector/token取件；原包、支持SMS、通知/事件/cursor同事务提交才继续。未知type2隔离不推进，删除不复活；原行ID、自增水位、索引、容量与无进展保护保持。
@@ -20,7 +23,7 @@
 - 权威证据：`.local/jegotrip/resume-20261112-1631/{DELIVERY_0c4c1c4.md,FINAL_STATUS_0c4c1c4.json,verification-readback-0c4c1c4.json}`及`.local/jegotrip/verified-native-0c4c1c4.json`。不能借这些旧绿结果验证下面的新源码。
 - 410最后完整部署证据为11月4日`6f85149`。本次未查询/部署410，没有新的授信认可、短信/来电/媒体或时延实测。
 
-## 本次恢复与新源码（待自身SHA验证）
+## 本次恢复与已验证的 ClientEx 子集
 
 指定目录3份历史JSONL共1485+878+1174条逐行解析、0失败；原用户要求、完整摘要与最后任务已恢复。962个tracked文件冻结在原0c4基线。续接证据目录：`.local/jegotrip/resume-20261112-1957/`。
 
@@ -40,7 +43,8 @@
 - 本次token匹配的撤销在任何回复写入/排队/await前锁存在**原scope**。允许owning actor有界尝试该控制回复，但禁止新RPC/positive事件/readiness；写失败、取消、队列满或句柄关闭都不能把撤销改成可重连的IO错误。
 - `SessionRevoked / app_account_session_revoked`独立非重连错误，停止原run、保留真实Join/fence与历史；前端只显示固定中文说明，不反射原reason/token。不自动新登录、SDK强制接管或改变手机业务。
 - 空通知hint以一位合并，沿用原poll admission/routing/250ms周期与固定RPC/TLS预算，不续期token/授信，不提前ACK短信。batch控制结果排队不是发送或peer ACK；撤销后的batch结果不主动另发新poll。
-- 新30项Rust与3项前端回归已写入原模块/两个工作流；原测试名/断言/执行过滤器、预算、lint与所有权保护待冻结再核。**本机205项静态/备份/假ADB检查已通过；新Rust/前端仍待自身双Actions，不能标完成。**
+- 新30项Rust与3项前端回归已由自身两个Actions实际执行；原1309测试名/断言、旧前端断言与两工作流过滤器/预算/lint均保护。**本机205项静态/备份/假ADB复核通过；完整软件制品核验完成，仍不等于真实授信或收件成功。**
+- 首76532bd双Actions编译和两ABI构建通过，但同一原有Common bootstrap回归栈溢出。38ae只改两公开路径：原native入口堆分配大型future，错误包装只持BackendFuture指针；保留原分派字面契约/全部测试/标准栈与超时。该原同名回归在本次两工作流均过，失败官方ZIP/CRC/log/annotations、本机首字面guard/下载部分/包目标triplet误判均保留，未靠提高栈或减断言收尾。
 - 只读子审查再次401无结果，不是signoff；主助手直接审查。旧Capstone平台库不能加载，未安装工具，改用IDA原汇编与reloc字节复核。失败记录保留。
 
 ## 已取得的本人手机静态材料
@@ -49,11 +53,9 @@
 
 ## 接下来按顺序
 
-1. 冻结并审查新ClientEx源码；普通提交/push，执行自身两个Actions。失败只修根因，保留失败日志/制品，不删测试、减断言、改超时或预算。
-2. 核验本次完整SHA、官方artifact digest、全部ZIP CRC、精确旧/新测试、浏览器报告SHA/run与双架构；更新本页及私有交付后才作为本次软件组件交付。
-3. 继续默认/动态MessageReceiver、CallClientEx的真实adapter/域策略，非空通知hooks、独立AccountAlive端点/信任/注册与续保、来电通知/媒体装配。客户端正向Alive状态没有闭合，不能将三控制子集称完整SDK。
-4. 具备本次服务器认可、正确原生模板和明确操作条件后，按授权保护410配置/历史/units/helper且无回滚备份部署；验收外来SMS落库/原回执、来电/双向媒体、断连、stop→logoutSession→Join与持续端到端时延。
-5. 授信TTL/撤销/替换与服务端积压重放规则不可由客户端fixture证明。不用新VTD/UUID、缓存授权、收费外发或设备变更补造成功。**完整用户目标仍未完成。**
+1. 继续默认/动态MessageReceiver、CallClientEx的真实adapter/域策略，非空通知hooks、独立AccountAlive端点/信任/注册与续保、来电通知/媒体装配。客户端正向Alive状态没有闭合，不能将三控制子集称完整SDK。
+2. 具备本次服务器认可、正确原生模板和明确操作条件后，按授权保护410配置/历史/units/helper且无回滚备份部署；验收外来SMS落库/原回执、来电/双向媒体、断连、stop→logoutSession→Join与持续端到端时延。
+3. 授信TTL/撤销/替换与服务端积压重放规则不可由客户端fixture证明。不用新VTD/UUID、缓存授权、收费外发或设备变更补造成功。**完整用户目标仍未完成。**
 
 ## 保持的其他边界
 
