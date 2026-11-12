@@ -85,7 +85,14 @@ class AppAccountContractTests(unittest.TestCase):
 
     def test_durable_generic_inbox_preserves_original_scope_without_claiming_sms(self):
         inbox = (PROVIDER / 'account_inbox.rs').read_text(encoding='utf-8')
-        self.assertIn('UNIQUE(line_id,revision,run_nonce,source_kind,peer_epoch,sequence)', inbox)
+        self.assertIn('UNIQUE(line_id,revision,run_nonce,source_kind,peer_epoch,sequence,offline_identity)', inbox)
+        offline = (PROVIDER / 'offline_inbox.rs').read_text(encoding='utf-8')
+        # Preserve the original direct/batch uniqueness despite nullable offline
+        # identity, and independently fence positions for each native principal.
+        self.assertIn('CREATE UNIQUE INDEX IF NOT EXISTS idx_app_voice_inbox_original_sequence ON app_voice_inbox(line_id,revision,run_nonce,source_kind,peer_epoch,sequence)', offline)
+        self.assertIn("WHERE source_kind IN ('direct','batch')", offline)
+        self.assertIn('CREATE UNIQUE INDEX IF NOT EXISTS idx_app_voice_offline_position ON app_voice_inbox(line_id,revision,offline_identity,sequence)', offline)
+        self.assertIn("WHERE source_kind='offline'", offline)
         self.assertIn('TransactionBehavior::Immediate', inbox)
         self.assertIn('const MAX_PER_ACCOUNT: i64 = 128', inbox)
         self.assertIn('const MAX_TOTAL: i64 = 2048', inbox)
