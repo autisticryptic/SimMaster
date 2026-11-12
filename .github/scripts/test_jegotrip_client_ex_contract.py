@@ -64,6 +64,10 @@ class ClientExContracts(unittest.TestCase):
         self.assertIn("BackendFailure::SessionRevoked } else { reason }", backend)
         self.assertIn("attempt.scope.session_revoked() && attempt.scope.is_open()", backend)
         self.assertIn("terminal_after_runtime_close", backend)
+        self.assertIn("let original: BackendFuture<'a> = Box::pin(self.login_original", backend)
+        self.assertIn("Box::pin(self.login_common_state(owner,request))", backend)
+        self.assertNotIn("RUST_MIN_STACK", backend)
+        self.assertNotIn("Builder::new().stack_size", backend)
 
     def test_control_hints_keep_original_polls_budgets_and_durable_message_ack_separate(self):
         backend = source("runtime_backend.rs")

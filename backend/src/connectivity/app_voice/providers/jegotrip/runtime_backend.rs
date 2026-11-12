@@ -596,7 +596,12 @@ impl NativeHostingBackend {
         let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;
         attempt.commands(owner,scope)?.call(owner,scope,ticket,operation,properties).await
     }
-    async fn login_common_original(&self,owner:AttemptOwner,request:SdkLoginRequest<'_>)->Result<(),BackendFailure>{
+    fn login_common_original<'a>(&'a self, owner: AttemptOwner, request: SdkLoginRequest<'a>) -> BackendFuture<'a> {
+        // Native/bootstrap IO state is boxed at its entrypoint. The original
+        // direct/native dispatch contract and every deadline remain unchanged.
+        Box::pin(self.login_common_state(owner,request))
+    }
+    async fn login_common_state(&self,owner:AttemptOwner,request:SdkLoginRequest<'_>)->Result<(),BackendFailure>{
         let captured=LoginCapture::capture(request,&self.profile)?;let common=self.profile.common.as_ref().ok_or(BackendFailure::Unavailable)?;
         let begin=Instant::now();let end=begin.checked_add(common.attempt_timeout).ok_or(BackendFailure::Unavailable)?;
         // The policy is a plain value: build one per prepared Common runtime.
@@ -969,16 +974,15 @@ impl NativeHostingBackend {
 }
 impl HostingBackend for NativeHostingBackend {
     fn login<'a>(&'a self, owner: AttemptOwner, request: SdkLoginRequest<'a>) -> BackendFuture<'a> {
-        Box::pin(async move {
-            let result = self.login_original(owner.clone(), request).await;
-            self.preserve_revocation(&owner, result)
-        })
+        // Construct the large original future separately on the heap; the
+        // terminal-error wrapper owns only this pointer and the original owner.
+        // Boxing changes layout, not admission, cancellation or IO deadlines.
+        let original: BackendFuture<'a> = Box::pin(self.login_original(owner.clone(), request));
+        Box::pin(async move { self.preserve_revocation(&owner, original.await) })
     }
     fn update_status<'a>(&'a self, owner: AttemptOwner, status: i32, registration: GatewayRegistration<'a>) -> BackendFuture<'a> {
-        Box::pin(async move {
-            let result = self.status_original(owner.clone(), status, registration).await;
-            self.preserve_revocation(&owner, result)
-        })
+        let original: BackendFuture<'a> = Box::pin(self.status_original(owner.clone(), status, registration));
+        Box::pin(async move { self.preserve_revocation(&owner, original.await) })
     }
     fn retire(&self, owner: &AttemptOwner) { if let Ok(attempt) = self.original(owner) { attempt.retire(); } }
     fn logout(&self, owner: AttemptOwner) -> BackendFuture<'_> { Box::pin(self.logout_original(owner)) }
