@@ -155,6 +155,9 @@ pub struct ProfileConfig {
     pub poll_routing: Vec<ProfileProperty>,
     pub logout_routing: Vec<ProfileProperty>,
     pub incoming: Option<IncomingBinding>,
+    /// 安装侧明确开启离线积压消费；默认关闭，不改变旧在线接收行为。
+    #[serde(default)]
+    pub offline_reception: bool,
     /// Native Common bootstrap over the SAME explicit physical Router: the
     /// logical AccountEntry destination and DomainName/DomainId/AppId/CC come
     /// only from the matched getAppConfigs reply. Only valid with RouterCommon;
@@ -290,6 +293,7 @@ impl AccountConfig {
             RuntimeProfile::supplied_bootstrap(inputs,RuntimeBootstrapInputs{account_trust,routing:&routing,client_config_decode_key:client_key,
                 handoff_timeout:Duration::from_millis(bootstrap.handoff_timeout_ms)}).map_err(|_|INVALID)?
         }else{RuntimeProfile::supplied(inputs).map_err(|_|INVALID)?};
+        let profile=profile.with_offline_reception(p.offline_reception).map_err(|_|INVALID)?;
         let profile=profile.with_call_receiver(p.call_incoming.as_ref().map(|binding|super::call_binding::CallIncomingBinding{object_id:&binding.object_id,domain:&binding.domain})).map_err(|_|INVALID)?;
         if let Some(properties)=&p.call_control{profile.with_call_control(&borrowed(properties)?).map_err(|_|INVALID)}else{Ok(profile)}
     }
@@ -485,11 +489,14 @@ pub(super) struct PrivateProfileRef<'a> {
     login_routing: PrivateProperties<'a>, gateway_uri: &'a str,
     gateway_metadata: PrivateProperties<'a>, poll_routing: PrivateProperties<'a>,
     logout_routing: PrivateProperties<'a>, incoming: Option<PrivateIncomingRef<'a>>,
+    #[serde(skip_serializing_if = "offline_disabled")]
+    offline_reception: bool,
     bootstrap_via_router: Option<PrivateRouterBootstrapRef<'a>>,
     call_incoming:Option<PrivateCallIncomingRef<'a>>,call_control:Option<PrivateProperties<'a>>,
     connect_timeout_ms: u64, handshake_timeout_ms: u64, partial_timeout_ms: u64,
     io_timeout_ms: u64, rpc_timeout_ms: u64,
 }
+fn offline_disabled(value: &bool) -> bool { !value }
 fn private_properties(properties: &[ProfileProperty]) -> PrivateProperties<'_> {
     PrivateProperties(properties)
 }
@@ -525,6 +532,7 @@ impl<'a> PrivateConfigRef<'a> {
                 gateway_uri: p.gateway_uri.expose_to_backend(), gateway_metadata: private_properties(&p.gateway_metadata),
                 poll_routing: private_properties(&p.poll_routing), logout_routing: private_properties(&p.logout_routing),
                 incoming: p.incoming.as_ref().map(|b| PrivateIncomingRef { object_id: &b.object_id, domain: &b.domain, receiver_kind: &b.receiver_kind }),
+                offline_reception: p.offline_reception,
                 bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
                 call_incoming:p.call_incoming.as_ref().map(|binding|PrivateCallIncomingRef{object_id:&binding.object_id,domain:&binding.domain}),
                 call_control:p.call_control.as_ref().map(|properties|PrivateProperties(properties)),
@@ -559,6 +567,7 @@ pub(super) fn private_profile_ref(p: &ProfileConfig) -> PrivateProfileRef<'_> {
         gateway_uri: p.gateway_uri.expose_to_backend(), gateway_metadata: private_properties(&p.gateway_metadata),
         poll_routing: private_properties(&p.poll_routing), logout_routing: private_properties(&p.logout_routing),
         incoming: p.incoming.as_ref().map(|b| PrivateIncomingRef { object_id: &b.object_id, domain: &b.domain, receiver_kind: &b.receiver_kind }),
+        offline_reception: p.offline_reception,
         bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
         call_incoming: p.call_incoming.as_ref().map(|b| PrivateCallIncomingRef { object_id: &b.object_id, domain: &b.domain }),
         call_control: p.call_control.as_deref().map(private_properties),

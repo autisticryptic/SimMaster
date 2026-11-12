@@ -421,6 +421,10 @@ jobs:
             connectivity::app_voice::providers::jegotrip::batch_scheduler::tests \
             connectivity::app_voice::providers::jegotrip::batch_retention::tests \
             connectivity::app_voice::providers::jegotrip::rpc_incoming::tests \
+            connectivity::app_voice::providers::jegotrip::rpc_offline::tests \
+            connectivity::app_voice::providers::jegotrip::arc_session::offline_tests \
+            connectivity::app_voice::providers::jegotrip::offline_inbox::tests \
+            connectivity::app_voice::providers::jegotrip::account_runtime::offline_tests \
             connectivity::app_voice::providers::jegotrip::offline_backend::tests \
             connectivity::app_voice::providers::jegotrip::packet_stream::tests \
             connectivity::app_voice::providers::jegotrip::router_packets::tests \

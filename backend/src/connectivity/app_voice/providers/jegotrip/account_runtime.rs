@@ -850,6 +850,7 @@ async fn handle_message(run: &ManagedRun, controller: &mut HostingController, de
 
 async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Receiver<BackendEvent>) {
     let mut pending = VecDeque::new();
+    let mut offline = offline_reception::State::default();
     let mut timer = tokio::time::interval(Duration::from_millis(250));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -889,6 +890,8 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                                 run.hosted_once.store(true, Ordering::SeqCst);
                                 run.install_message_readiness(&owner, &scope);
                                 if let Some(calls) = &run.calls { if let Err(code) = calls.start(&owner,&scope).await { *lock(&run.error)=Some(code);run.retire(); } }
+                                offline.hosted(&run);
+                                offline_reception::drive(&run, &controller, &mut offline).await;
                             },
                             Ok(_) => {},
                             Err(reason) => { *lock(&run.error) = Some(controller_error(reason)); run.retire(); }
@@ -915,6 +918,14 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                         if reason != BackendFailure::Disconnected || error.is_none() { *error = Some(failure_code(reason)); }
                         drop(error); run.retire();
                     }
+                    BackendEventPayload::OfflineHint(hint) => {
+                        controller.tick(unix_now(), Instant::now());
+                        offline_reception::hint(&run, &controller, &mut offline, hint).await;
+                    }
+                    BackendEventPayload::OfflinePage(page) => {
+                        controller.tick(unix_now(), Instant::now());
+                        offline_reception::page(&run, &controller, &mut offline, page).await;
+                    }
                     BackendEventPayload::BatchRetirement(proof) => {
                         controller.tick(unix_now(), Instant::now());
                         if controller.phase()!=Phase::Hosted || !run.accepting.load(Ordering::SeqCst) { continue; }
@@ -937,7 +948,7 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
             }
             _ = timer.tick() => {
                 let Some(run) = run.upgrade() else { return; };
-                if !run.accepting.load(Ordering::SeqCst) { pending.clear(); continue; }
+                if !run.accepting.load(Ordering::SeqCst) { pending.clear(); offline.clear(); continue; }
                 let mut controller = run.controller.lock().await;
                 if run.accepting.load(Ordering::SeqCst) {
                     if let Err(code) = run.configuration_current() {
@@ -948,12 +959,20 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                     } else { controller.tick(unix_now(), Instant::now()); }
                     if run.accepting.load(Ordering::SeqCst) {
                         if let Some(message) = pending.pop_front() { handle_message(&run, &mut controller, message, &mut pending).await; }
-                    } else { pending.clear(); }
+                        offline_reception::drive(&run, &controller, &mut offline).await;
+                    } else { pending.clear(); offline.clear(); }
                 }
             }
         }
     }
 }
+
+#[path = "offline_reception.rs"]
+mod offline_reception;
+
+#[cfg(test)]
+#[path = "account_offline_tests.rs"]
+mod offline_tests;
 
 #[cfg(test)]
 #[path = "account_runtime_tests.rs"]

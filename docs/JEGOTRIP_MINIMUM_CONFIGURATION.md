@@ -156,7 +156,7 @@ libmtc SHA256：`57086cd624d8227dc1b1b64a63d7c8b2258f87b261779b681a9bfd306ad9d2e
 
 ## 6. 仍需继续完成的部分
 
-1. 旧任务36：真实接收器默认/动态绑定、适用离线积压 `moreOfflineMessages`、必要 AccountAlive、来电通知及媒体配置。
+1. 旧任务36：真实接收器默认/动态绑定、适用 AccountAlive、来电通知及媒体配置仍需完成。原生 `moreOfflineMessages → getOfflineMessages` 积压取件/持久消费本轮新增显式软件通路，边界与自身验证要求见 [原生离线积压](JEGOTRIP_NATIVE_OFFLINE_INBOX.md)，不将其当作真实收件或完整SDK已实现。
 2. 旧任务16：合法业务条件下真实原生登录/注册、短信落库与原ACK、来电/双向音频和 stop/Join。
 3. 旧任务17：完整验收后最终收尾。**最小配置分析、界面简化或已有1242项隔离回归都不能代替这三项。**
 

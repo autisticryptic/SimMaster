@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicUsize,Ordering};
 use tokio::{net::TcpListener,io::AsyncReadExt};
 use tokio_rustls::rustls::version::TLS13;
 const ENTRY:&str="AccountEntry:sarc -h 42.7 -p 98;";
+#[path = "runtime_common_offline_tests.rs"]
+mod offline;
 const BOOTSTRAP_SDK:&str="BootEntry:sarc -h 42.7 -p 98;";
 const DESTINATION:&str="DestEntry:sarc -h 42.7 -p 98;";
 fn bootstrap_inputs()->RuntimeProfileInputs<'static>{RuntimeProfileInputs{domain_name:"",domain_id:"",application_id:"",device_info_cc:"",gateway_uri:"",..inputs()}}

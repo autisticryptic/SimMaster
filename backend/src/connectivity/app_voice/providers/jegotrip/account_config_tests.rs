@@ -85,6 +85,7 @@ fn fixture(root: &str) -> AccountConfig {
         logout_routing: vec![ProfileProperty { key: vec![0xfc], value: vec![0, 0xff] }],
         incoming: Some(IncomingBinding { object_id: b"#fixture-client".to_vec(), domain: b"fixture-domain".to_vec(),
             receiver_kind: b"fixture.kind".to_vec() }),
+        offline_reception: false,
         bootstrap_via_router: None,
         call_incoming:None,call_control:None,
         connect_timeout_ms: 1000, handshake_timeout_ms: 3000, partial_timeout_ms: 300,

@@ -12,9 +12,40 @@
 | 脚本生成的 UUID-only JSON | 网页在本地解析，只接受 `version`、`source`、`app_device_uuid` 三个字段 |
 | `SBA1` 数据或 `v1:::` 元数据 | 明确提示封装不可直接读取，不将其当成 XML、UUID 或认证 token；需要原工具导出解密后的原始数据 |
 
-SDK 的另一个 UUID、`phone_safe_num`、缓存 `authentication_code`、旧 `enrollId`、App/运营商/电话 token 和 SIP 密码**都不会被导入或导出**。一份历史“托管成功”的备份不证明当前服务器仍认可原身份。
+网页的 UUID-only 文件**不导入** SDK 的另一个 UUID，也不导入 `phone_safe_num`、缓存 `authentication_code`、旧 `enrollId`、App/运营商/电话 token 或 SIP 密码。快捷脚本会把独立 SDK UUID 另存私有核对文件，**不拿它代替 App UUID、不自动写入原生安装配置**。一份历史“托管成功”的备份不证明当前服务器仍认可原身份。
 
-## 2. 准备原始 root 备份
+## 2. 一键从 root 手机读取（推荐）
+
+将本人手机通过 USB 连接电脑，允许 USB 调试和已有 root 管理器的 shell 权限。在项目根执行：
+
+```powershell
+.\scripts\Export-JegotripTrust.ps1
+```
+
+只有一台已授权的 USB 手机时自动选中；多设备时明确选择，**不探测另一台设备**：
+
+```powershell
+.\scripts\Export-JegotripTrust.ps1 -Model 24122RKC7C
+# 也可以用 -Serial 指定自己的设备，不要在公开报告中贴序列号。
+```
+
+- 使用已有 ADB、Python 和 `su`，不安装工具、不调用会重启 daemon 的 `adb root`。
+- 默认只读取原 App UUID、独立 SDK UUID 和 App 版本，不复制全数据库/APK/日志，不读取账号密码或缓存 token 文件。
+- 同一 App 和 SDK 身份配置都读取两遍并核对一致；变化或 root/包/格式/权限异常立即停止，不生成替代 UUID。App 数据目录、配置目录或文件是符号链接时拒绝，不沿 root 权限跟随。
+- 自动在本项目 `.local/jegotrip/trusted-phone/<时间-随机后缀>/` 创建仅当前 Windows 用户和 SYSTEM 可访问的目录；不覆盖旧导出。只设置新目录的 DACL，不读取/修改审计 SACL，也不要求管理员审计权限；读取后、写入前再次核验私有路径与 ACL。
+- `identity.json` 可直接用网页的本地文件入口；`sdk-context.private.json` 只供独立身份与版本核对，不含授信布尔值或登录凭据。
+- `-WhatIf` 只显示将要做的操作，不查询手机；`-AdbPath` 可指定已安装的 ADB。
+- 如果本机执行策略阻止自有脚本，可仅对本次进程使用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Export-JegotripTrust.ps1`，不更改系统执行策略。
+
+手机已经离线时，也能从已保存的普通 root ZIP 生成同一格式，**不启动 ADB**：
+
+```powershell
+.\scripts\Export-JegotripTrust.ps1 -OfflineBackup .\.local\jegotrip\device-readonly-20261112\phone-root-export.zip
+```
+
+这提取的是已有身份材料，不是“生成/复制服务器授信证书”。离线 ZIP 中 App 与 SDK 身份必须来自同一个导出根，不能把另一份账号/设备的 SDK UUID 混进来。采集后仍用同本人账号/号码和原 UUID，按本次服务器回答继续复用。
+
+## 2.1 手工准备原始 root 备份
 
 在本人的 root 手机上，用已有文件管理器只读复制：
 
@@ -54,7 +85,7 @@ python -B -X utf8 .\scripts\jegotrip_backup_identity.py ".\无忧行-原始配�
 
 ## 5. 与原生通信工作的关系
 
-本入口解决的是材料读取和防误导，不等于原生接收通路已经完整。MessageReceiver / ClientEx 的实际绑定、`moreOfflineMessages → getOfflineMessages` 集合及持久游标/ACK、AccountAlive、完整媒体和真实收件时延须另行完成。
+本入口解决的是材料读取和防误导，不等于原生接收通路已经完整。新的显式 `offline_reception` Rust 通路、原集合/64位位置、事务消费和未知原包保留见 [原生离线积压](JEGOTRIP_NATIVE_OFFLINE_INBOX.md)；必须经过自身两Actions验证，不能借旧版本通过结果。MessageReceiver / ClientEx 的实际绑定、AccountAlive、完整媒体和真实收件时延仍须按实际证据完成。
 
 编码、界面 fixture 与 Actions 回归不证明服务器授权或手机真实授信复用成功。完整验收仍需原始可读材料、当次真实服务器认可和明确操作条件。
 

@@ -45,6 +45,7 @@ pub enum ProtocolEvent<'a> {
     Control(CallKind),
     Incoming(IncomingProtocolMessage),
     IncomingCall(IncomingCallDelivery),
+    OfflineHint(super::rpc_offline::IncomingOfflineHint),
     OutgoingReply(OwnedCallPackets),
 }
 
@@ -85,7 +86,7 @@ impl fmt::Debug for IncomingProtocolMessage {
 }
 
 #[derive(Clone,Copy)]
-enum DirectResponse{Message,Call{kind:CallNoticeKind,native_id:NativeCallId}}
+enum DirectResponse{Message,OfflineHint,Call{kind:CallNoticeKind,native_id:NativeCallId}}
 struct PendingDirect { magic: Vec<u8>, response:DirectResponse }
 
 /// Private protocol replay boundary, NOT a server ACK, channel or new owner.
@@ -193,6 +194,12 @@ impl ArcProtocol {
         self.packets(id, bytes.expose_to_transport())
     }
 
+    pub(super) fn prepare_offline(&mut self, position: i64, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
+        if self.incoming.is_none() { return Err(CodecError::InvalidField.into()); }
+        let (id, bytes) = self.rpc.prepare_offline(position, routing)?;
+        self.packets(id, bytes.expose_to_transport())
+    }
+
     pub fn prepare_swap_calls(&mut self, payload: &BatchPayload<'_>, routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> {
         let (id, bytes) = self.rpc.prepare_swap_calls(payload, routing)?;
@@ -257,7 +264,8 @@ impl ArcProtocol {
             method if method==super::rpc_calls::RELEASED_METHOD.as_bytes()=>Some(CallNoticeKind::Released),
             method if method==super::rpc_calls::ACCEPTED_METHOD.as_bytes()=>Some(CallNoticeKind::Accepted),_=>None,
         };
-        if request.method != super::rpc_incoming::ONLINE_MESSAGE_METHOD.as_bytes() && call_kind.is_none() {
+        let offline_hint = request.method == super::rpc_offline::MORE_OFFLINE_METHOD.as_bytes();
+        if request.method != super::rpc_incoming::ONLINE_MESSAGE_METHOD.as_bytes() && call_kind.is_none() && !offline_hint {
             self.close(); return Err(TransportError::UnsupportedKind.into());
         }
         if self.direct_pending.contains_key(&request.call_id) || self.direct_seen.contains_id(request.call_id) { return Ok(false); }
@@ -276,6 +284,19 @@ impl ArcProtocol {
             || magic.len() > direct_history::MAX_MAGIC_BYTES
             || retained_bytes + magic.len() > direct_history::MAX_RETAINED_BYTES {
             self.close(); return Err(CodecError::TooLarge.into());
+        }
+        if offline_hint {
+            let position = match self.incoming.as_ref().ok_or(CodecError::InvalidField)?.on_direct_offline_hint(owner, scope, &request) {
+                Ok(Some(position)) => position,
+                Ok(None) => { self.close(); return Err(CodecError::InvalidField.into()); }
+                Err(error) => { self.close(); return Err(error.into()); }
+            };
+            self.direct_last_id = request.call_id;
+            self.direct_pending.insert(request.call_id, PendingDirect { magic: magic.to_vec(), response: DirectResponse::OfflineHint });
+            let original = self.rpc.owner().clone(); let original_scope = self.rpc.connection_scope();
+            let ticket = DirectReplyTicket { owner: original.clone(), connection: original_scope.clone(), call_id: request.call_id };
+            deliver(ProtocolEvent::OfflineHint(super::rpc_offline::IncomingOfflineHint::direct(original, original_scope, position, ticket)));
+            return Ok(true);
         }
         if let Some(kind)=call_kind{
             let dispatcher=match self.call_incoming.as_ref(){Some(value)=>value,None=>{self.close();return Err(TransportError::UnsupportedKind.into());}};
@@ -336,6 +357,18 @@ impl ArcProtocol {
         self.record_direct(ticket.call_id, pending.magic);
         Ok(Some(OwnedCallPackets { call_id: ticket.call_id, packets }))
     }
+    pub(super) fn complete_offline_hint(&mut self, ticket: &DirectReplyTicket, accepted: bool) -> Result<Option<OwnedCallPackets>, ProtocolError> {
+        if !self.rpc.accepts_scope(&ticket.owner, &ticket.connection) { return Ok(None); }
+        let Some(pending) = self.direct_pending.get(&ticket.call_id) else { return Ok(None); };
+        if !matches!(pending.response, DirectResponse::OfflineHint) { return Err(CodecError::InvalidField.into()); }
+        let result = encode_online_message_result(accepted)?;
+        let reply = encode_reply(ticket.call_id, 0, result.expose_to_transport())?;
+        let packets = encode_call_packets(CallKind::Reply, reply.expose_to_transport(), TLS_FRAGMENT_THRESHOLD)?;
+        let pending = self.direct_pending.remove(&ticket.call_id).ok_or(CodecError::InvalidField)?;
+        self.record_direct(ticket.call_id, pending.magic);
+        Ok(Some(OwnedCallPackets { call_id: ticket.call_id, packets }))
+    }
+
     pub fn complete_call(&mut self,ticket:&CallReplyTicket,accepted:bool,properties:&[RpcProperty<'_>])->Result<Option<OwnedCallPackets>,ProtocolError>{
         let CallReplySource::Direct(inner)=ticket.source()else{return Err(CodecError::InvalidField.into());};
         if !ticket.matches(self.rpc.owner(),&self.rpc.connection_scope()) || !self.rpc.accepts_scope(&inner.owner,&inner.connection){return Ok(None);}

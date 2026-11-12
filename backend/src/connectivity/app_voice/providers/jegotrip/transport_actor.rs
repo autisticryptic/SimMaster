@@ -145,6 +145,7 @@ impl Gateway {
 enum Operation {
     Login(Login, Vec<Property>), Bootstrap(Zeroizing<Vec<u8>>, Vec<Property>), Configure(u32, Option<Binding>), ConfigureCalls(CallBinding), Logout(Vec<Property>),
     Swap(Vec<Property>, Option<Gateway>), CompleteBatch(ServerRequestTicket, bool), CompleteDirect(DirectReplyTicket, bool), CompleteCall(CallReplyTicket,bool,Vec<Property>),
+    GetOffline(i64, Vec<Property>), CompleteOfflineHint(super::rpc_offline::IncomingOfflineHint, bool),
     ConfigureCallControl(Vec<Property>),Call(CallControlTicket,CallOperation,Vec<Property>,oneshot::Sender<Result<OwnedCallOperationReply,RuntimeError>>),
 }
 impl Operation {
@@ -154,12 +155,12 @@ impl Operation {
                 &login.domain_id, &login.application_id, &login.cc].iter().map(|v| v.len()).sum::<usize>()
                 + login.properties.iter().chain(routing).map(|p| p.key.len() + p.value.len()).sum::<usize>(),
             Self::Bootstrap(key, routing) => key.len() + routing.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>(),
-            Self::Logout(routing) => routing.iter().map(|p| p.key.len() + p.value.len()).sum(),
+            Self::Logout(routing) | Self::GetOffline(_, routing) => routing.iter().map(|p| p.key.len() + p.value.len()).sum(),
             Self::Configure(_, incoming) => incoming.as_ref().map_or(0, |b| b.object.len() + b.domain.len() + b.receiver.len()),
             Self::Swap(routing, gateway) => routing.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()
                 + gateway.as_ref().map_or(0, |g| g.uri.len() + g.prefix.len() + g.channel.len() + g.int_code.len() + g.number.len() + g.password.len()
                     + g.metadata.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()),
-            Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) => 0,
+            Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) | Self::CompleteOfflineHint(_, _) => 0,
             Self::ConfigureCalls(binding)=>binding.object.len()+binding.domain.len(),
             Self::CompleteCall(_,_,properties)|Self::ConfigureCallControl(properties)|Self::Call(_,_,properties,_)=>properties.iter().map(|p|p.key.len()+p.value.len()).sum(),
         }
@@ -306,6 +307,18 @@ impl RuntimeCommands {
         if result.is_ok() { if let Some(guard) = &mut retirement { guard.completed = true; } }
         result
     }
+    /// 只有账号消费器传入的已提交位置可继续取件；SDK token 仍由原 actor 提供。
+    pub(super) async fn get_offline(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, position: i64, routing: &[RpcProperty<'_>])
+        -> Result<RuntimeReceipt, RuntimeError> {
+        if !self.accepts(owner, scope) || position < -1 || position == i64::MAX { return Err(RuntimeError::Scope); }
+        self.submit(owner, scope, Operation::GetOffline(position, Property::capture(routing)?)).await
+    }
+    pub(super) async fn complete_offline_hint(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, hint: &super::rpc_offline::IncomingOfflineHint, accepted: bool)
+        -> Result<RuntimeReceipt, RuntimeError> {
+        if !self.accepts(owner, scope) || !hint.matches(owner, scope) { return Err(RuntimeError::Scope); }
+        self.submit(owner, scope, Operation::CompleteOfflineHint(hint.captured_copy(), accepted)).await
+    }
+
     pub async fn complete_batch(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, ticket: &ServerRequestTicket, accepted: bool) -> Result<RuntimeReceipt, RuntimeError> {
         if !self.accepts(owner, scope) || !ticket.matches(owner, scope) { return Err(RuntimeError::Scope); }
         self.submit(owner, scope, Operation::CompleteBatch(ticket.captured_copy(), accepted)).await
@@ -628,7 +641,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             let _ = command.completion.send(Err(RuntimeError::Timeout));
             return Err(RuntimeError::Timeout);
         }
-        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_)) {
+        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _)) {
             let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
         }
         if self.common.is_none() && self.tls.as_ref().is_none_or(|tls|tls.phase()!=TlsPhase::Verified) {
@@ -640,10 +653,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             if self.backend.phase()!=ArcPhase::Authenticated{if let Some(attempt)=self.native_attempt_end{end=end.min(attempt);}}
             if now>=end{let _=command.completion.send(Err(RuntimeError::Timeout));return Err(RuntimeError::Timeout);}Some(end)
         }else{None};
-        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_)) {
+        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
-        let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_));
+        let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _));
         let is_logout = matches!(&command.operation, Operation::Logout(_));
         let mut unhosting_sequence = None;let mut call_wait=None;
         let elapsed_ms = self.elapsed_ms(now);
@@ -696,6 +709,17 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 Ok(Some(packets)) => Ok(packets),
                 _ => { let _ = command.completion.send(Err(RuntimeError::Protocol)); return Ok(()); }
             },
+            Operation::GetOffline(position, routing) => self.backend.prepare_offline(position, &borrowed(&routing)),
+            Operation::CompleteOfflineHint(hint, accepted) => {
+                match self.backend.complete_offline_hint(&hint, accepted) {
+                    Ok(Some(super::offline_backend::CallCompletion::Direct(packets))) => Ok(packets),
+                    Ok(Some(super::offline_backend::CallCompletion::BatchQueued)) => {
+                        if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), None))).is_err() { return Err(RuntimeError::Cancelled); }
+                        return Ok(());
+                    }
+                    _ => { let _ = command.completion.send(Err(RuntimeError::Protocol)); return Ok(()); }
+                }
+            }
             Operation::Logout(routing) => self.backend.prepare_logout(&borrowed(&routing)),
             Operation::Bootstrap(key, routing) => self.backend.prepare_bootstrap(&key, &borrowed(&routing)),
             Operation::Login(login, routing) => {

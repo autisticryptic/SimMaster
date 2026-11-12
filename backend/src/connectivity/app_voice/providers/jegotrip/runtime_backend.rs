@@ -201,7 +201,7 @@ pub struct RuntimeProfile {
     domain_name: Zeroizing<String>, domain_id: Zeroizing<String>, application_id: Zeroizing<String>,
     device_info_cc: Zeroizing<String>, client_properties: Vec<Property>, include_device_id: bool,
     login_routing: Vec<Property>, gateway_uri: Option<Zeroizing<String>>, gateway_metadata: Vec<Property>,
-    poll_routing: Vec<Property>, logout_routing: Vec<Property>, incoming: Option<Binding>,
+    poll_routing: Vec<Property>, logout_routing: Vec<Property>, incoming: Option<Binding>, offline_reception: bool,
     reference_decode_key: Option<ConfigDecodeKey>, handshake_timeout: Duration, partial_timeout: Duration,
     io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>, byte_length:usize,
 }
@@ -209,6 +209,11 @@ impl fmt::Debug for RuntimeProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RuntimeProfile(<redacted>)") }
 }
 impl RuntimeProfile {
+    /// 明确的本地消费策略，不发送新属性，不创造接收器或服务端认可。
+    pub fn with_offline_reception(mut self, enabled: bool) -> Result<Self, ProfileError> {
+        if enabled && self.incoming.is_none() { return Err(ProfileError::InvalidConfiguration); }
+        self.offline_reception = enabled; Ok(self)
+    }
     pub fn with_call_receiver(mut self,binding:Option<CallIncomingBinding<'_>>)->Result<Self,ProfileError>{
         if self.call_incoming.is_some(){return Err(ProfileError::InvalidConfiguration);}
         if let Some(binding)=binding{
@@ -332,7 +337,7 @@ impl RuntimeProfile {
             client_properties: properties(input.client_properties, &mut total)?, include_device_id: input.include_device_id,
             login_routing, gateway_uri: if derived_uri{None}else{Some(text(input.gateway_uri, false, &mut total)?)},
             gateway_metadata,
-            poll_routing, logout_routing, incoming, reference_decode_key: input.reference_decode_key,
+            poll_routing, logout_routing, incoming, offline_reception: false, reference_decode_key: input.reference_decode_key,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
             io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,byte_length:total,
         })
@@ -404,6 +409,8 @@ pub enum BackendEventPayload {
     Callback(OwnedRpcCallback),
     BatchMessage(ScheduledIncomingMessage),
     DirectMessage(IncomingProtocolMessage),
+    OfflineHint(super::rpc_offline::IncomingOfflineHint),
+    OfflinePage(super::rpc_offline::OwnedOfflinePage),
     BatchRetirement(super::batch_scheduler::BatchReplayRetirement),
     Call(IncomingCallDelivery),
     Terminal(BackendFailure),
@@ -529,6 +536,24 @@ impl NativeHostingBackend {
     }
     /// Borrowed tickets stay with the durable consumer on queue pressure. No
     /// implicit ACK on delivery, clone, channel installation or scope closure.
+    pub(super) fn offline_reception_enabled(&self) -> bool { self.profile.offline_reception }
+    pub(super) async fn get_offline(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, position: i64) -> Result<RuntimeReceipt, RuntimeError> {
+        let attempt = self.original(owner).map_err(|_| RuntimeError::Scope)?;
+        let _admission = attempt.poll_work.lock().await;
+        {
+            let state = lock(&attempt.state);
+            if !state.configured || state.retired || state.logout_started || state.unregister_started || self.profile.incoming.is_none() || !self.profile.offline_reception {
+                return Err(RuntimeError::Closed);
+            }
+        }
+        attempt.commands(owner, scope)?.get_offline(owner, scope, position, &borrowed(&self.profile.poll_routing)).await
+    }
+    pub(super) async fn complete_offline_hint(&self, owner: &AttemptOwner, scope: &RpcConnectionScope,
+        hint: &super::rpc_offline::IncomingOfflineHint, accepted: bool) -> Result<RuntimeReceipt, RuntimeError> {
+        let attempt = self.original(owner).map_err(|_| RuntimeError::Scope)?;
+        attempt.commands(owner, scope)?.complete_offline_hint(owner, scope, hint, accepted).await
+    }
+
     pub async fn complete_batch(&self, owner: &AttemptOwner, scope: &RpcConnectionScope,
         ticket: &ServerRequestTicket, accepted: bool) -> Result<RuntimeReceipt, RuntimeError> {
         let attempt = self.original(owner).map_err(|_| RuntimeError::Scope)?;
@@ -1001,6 +1026,14 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                                 terminal(&sender, &attempt, BackendFailure::Disconnected); return;
                             }
                             BackendEventPayload::Callback(callback)
+                        }
+                        OfflineEvent::OfflineHint(hint) => {
+                            if !hint.matches(&attempt.owner, &attempt.scope) { terminal(&sender, &attempt, BackendFailure::Disconnected); return; }
+                            BackendEventPayload::OfflineHint(hint)
+                        }
+                        OfflineEvent::OfflinePage(page) => {
+                            if !page.matches(&attempt.owner, &attempt.scope) { terminal(&sender, &attempt, BackendFailure::Disconnected); return; }
+                            BackendEventPayload::OfflinePage(page)
                         }
                         OfflineEvent::Message(message) => {
                             if message.owner() != &attempt.owner || !message.ticket().matches(&attempt.owner, &attempt.scope) {

@@ -53,7 +53,7 @@ impl Drop for ArcAuthentication {
 }
 
 #[derive(Clone, Copy)]
-enum PendingKind { Bootstrap, Login, Swap, Logout, Call }
+enum PendingKind { Bootstrap, Login, Swap, Logout, Call, Offline { position: i64 } }
 struct PendingCall{ticket:CallControlTicket,operation:CallOperation}
 
 struct PendingRpc {
@@ -172,6 +172,7 @@ pub enum ArcReply<'a> {
     Swap(OwnedBatchReply<'a>),
     Failure(OwnedRpcCallback),
     Call(OwnedCallOperationReply),
+    Offline(super::rpc_offline::OwnedOfflinePage),
 }
 
 impl fmt::Debug for ArcReply<'_> {
@@ -411,6 +412,25 @@ impl ArcRpcSession {
         Ok((id, bytes))
     }
 
+    /// 用本次原生 UID/selector/token 在原账号连接取件；不读取导入 token 或
+    /// caller 身份，不替换路由。一次只允许一页，消费前不提交下一位置。
+    pub(super) fn prepare_offline(&mut self, position: i64, routing: &[RpcProperty<'_>]) -> Result<(i32, RpcBytes), CodecError> {
+        if self.phase() != ArcPhase::Authenticated || self.pending.values().any(|pending| matches!(pending.kind, PendingKind::Offline { .. })) {
+            return Err(CodecError::InvalidField);
+        }
+        reject_auth_keys(routing)?;
+        if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
+        let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
+        let auth = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
+        let arguments = super::rpc_offline::encode_get_offline(&auth.user_id, &auth.selected_session_id, position)?;
+        let mut metadata = self.account_metadata(routing, self.common_identity.as_deref())?;
+        metadata.push(RpcProperty { key: b"token", value: &auth.token });
+        let bytes = encode_request(id, &metadata, super::rpc_offline::GET_OFFLINE_METHOD.as_bytes(), arguments.expose_to_transport())?;
+        self.next_id = id.checked_add(1);
+        self.pending.insert(id, PendingRpc { kind: PendingKind::Offline { position }, selected_session_id: None, scheduler: None, call: None });
+        Ok((id, bytes))
+    }
+
     /// Retire timeouts explicitly. A submitted login may have changed remote
     /// state, so cancelling it closes this incarnation rather than reopening it.
     pub fn retire_request(&mut self, id: i32) {
@@ -451,6 +471,15 @@ impl ArcRpcSession {
         };
         let Some(mut pending) = self.pending.remove(&reply.call_id) else { return Ok(None); };
         let result = match pending.kind {
+            PendingKind::Offline { position } => {
+                if self.phase() != ArcPhase::Authenticated || reply.result_code != 0 { self.close(); return Err(CodecError::RemoteFailure); }
+                let auth = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
+                match super::rpc_offline::OwnedOfflinePage::original(self.owner.clone(), self.connection.clone(), reply.call_id, position,
+                    &auth.user_id, &auth.selected_session_id, self.common_identity.as_deref(), reply.result_stream) {
+                    Ok(page) => ArcReply::Offline(page),
+                    Err(error) => { self.close(); return Err(error); }
+                }
+            }
             PendingKind::Call=>{
                 let Some(call)=pending.call.take()else{self.close();return Err(CodecError::InvalidField);};
                 let material=match decode_operation_result(call.operation,reply.result_code,reply.result_stream){
@@ -534,6 +563,10 @@ fn reject_auth_keys(properties: &[RpcProperty<'_>]) -> Result<(), CodecError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "rpc_offline_session_tests.rs"]
+mod offline_tests;
 
 #[cfg(test)]
 #[path = "arc_session_tests.rs"]

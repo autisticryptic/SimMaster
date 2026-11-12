@@ -45,6 +45,12 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 详见 [手机备份读取说明](JEGOTRIP_PHONE_BACKUP_IMPORT.md)。这批新增界面与解析用例须自身两Actions/官方制品验证；不代表已经读出本轮加密备份、复用真实授权或补齐离线取件/媒体。
 
+## 1.3 原生离线积压事务消费（本轮新增，须自身验证）
+
+安装侧显式 `profile.offline_reception=true` 接入原连接的 `moreOfflineMessages / getOfflineMessages`，保持本次 native UID/selector/token 与原 receiver 绑定。原包、已支持 SMS、通知/事件和64位游标同事务提交后才取下一页；未知格式隔离、不推进，旧 schema/行 ID/自增水位与删除/重放边界保留。默认关闭，不替旧模板猜对象、域或媒体，不自动修改410。
+
+详见 [原生离线积压](JEGOTRIP_NATIVE_OFFLINE_INBOX.md)。新增用例必须由本次 SHA 的两个 Actions 和正式制品验证；实际默认/动态接收绑定、ClientEx/Alive、媒体与真实授信/收件仍分开验收。
+
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 
 原 App 并未依赖公共 CA：`assets/app2.cer` 就是服务端叶子证书

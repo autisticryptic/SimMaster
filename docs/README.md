@@ -1,6 +1,6 @@
 # 文档导航
 
-项目文档按主题收敛为 **19份受控Markdown**，不再用几十份日期报告重复描述“当前状态”。
+项目文档按主题收敛为 **20份受控Markdown**，不再用几十份日期报告重复描述“当前状态”。
 用户本地私有eSIM报告不在公开文档集合内，不会随整理提交。
 
 ## 先看什么
@@ -21,6 +21,7 @@
 | [无忧行托管交付](JEGOTRIP_NATIVE_HOSTING_DELIVERY.md) | 已验证的原生软件子集、授信复用及真实收件验收边界 |
 | [无忧行最小配置](JEGOTRIP_MINIMUM_CONFIGURATION.md) | App UUID、共享参数和手机授信材料分层 |
 | [手机备份读取](JEGOTRIP_PHONE_BACKUP_IMPORT.md) | 原始 root 备份的本地 UUID-only 读取，不上传密码/token 或缓存授信 |
+| [原生离线积压](JEGOTRIP_NATIVE_OFFLINE_INBOX.md) | 原生64位取件、事务持久游标、未知原包和授权/真实验收边界 |
 | [架构](ARCHITECTURE.md) | 线路/SIM身份、原工作台、强制namespace、路由域和DNS |
 | [设备驱动](DEVICE_DRIVERS.md) | 设备能力边界与新增适配 |
 | [原生后端](NATIVE_BACKEND_STATUS.md) | native发现、事件、短信、资源/SIM账本、维护和MEP边界 |

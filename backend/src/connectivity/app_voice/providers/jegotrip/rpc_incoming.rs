@@ -136,6 +136,31 @@ impl IncomingDispatcher {
         self.dispatch(&BatchRequest { method: request.method, arguments: request.arguments, metadata: request.metadata.clone() })
     }
 
+    /// 积压提示是位置，不是消息正文；先匹配原对象/域再读取参数。
+    pub(super) fn on_direct_offline_hint(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, request: &RpcRequest<'_>)
+        -> Result<Option<i64>, CodecError> {
+        if !self.matches(owner, scope) || request.method != super::rpc_offline::MORE_OFFLINE_METHOD.as_bytes() { return Ok(None); }
+        self.offline_hint(&request.metadata, request.arguments).map(Some)
+    }
+    pub(super) fn on_batch_offline_hint(&self, request: &IncomingBatchRequest) -> Result<Option<i64>, CodecError> {
+        if !request.ticket().matches(&self.owner, &self.connection) { return Ok(None); }
+        let request = request.request();
+        if request.method != super::rpc_offline::MORE_OFFLINE_METHOD.as_bytes() { return Ok(None); }
+        self.offline_hint(&request.metadata, request.arguments).map(Some)
+    }
+    fn offline_hint(&self, metadata: &[RpcProperty<'_>], arguments: &[u8]) -> Result<i64, CodecError> {
+        if metadata.len() > MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
+        for (index, property) in metadata.iter().enumerate() {
+            if property.key.len() > MAX_FIELD_BYTES || property.value.len() > MAX_FIELD_BYTES { return Err(CodecError::TooLarge); }
+            if metadata[..index].iter().any(|prior| prior.key == property.key) { return Err(CodecError::DuplicateKey); }
+        }
+        let property = |key: &[u8]| metadata.iter().find(|property| property.key == key).map(|property| property.value);
+        if property(b"id") != Some(self.object_id.as_slice()) || property(b"domain") != Some(self.domain.as_slice()) {
+            return Err(CodecError::InvalidField);
+        }
+        super::rpc_offline::decode_more_offline(arguments)
+    }
+
     fn dispatch(&self, request: &BatchRequest<'_>) -> Result<Option<IncomingMessage>, CodecError> {
         if request.method != ONLINE_MESSAGE_METHOD.as_bytes() { return Ok(None); }
         if request.metadata.len() > MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }

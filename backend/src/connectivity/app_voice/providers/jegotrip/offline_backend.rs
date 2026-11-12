@@ -40,6 +40,8 @@ pub enum OfflineEvent {
     Callback(OwnedRpcCallback),
     Message(ScheduledIncomingMessage),
     DirectMessage(IncomingProtocolMessage),
+    OfflineHint(super::rpc_offline::IncomingOfflineHint),
+    OfflinePage(super::rpc_offline::OwnedOfflinePage),
     BatchRetirement(super::batch_scheduler::BatchReplayRetirement),
     Call(IncomingCallDelivery),
     CallOperation(OwnedCallOperationReply),
@@ -60,6 +62,7 @@ pub struct OfflineBackend {
     dispatcher: Option<IncomingDispatcher>,
     call_dispatcher:Option<CallDispatcher>,
     call_pending:BTreeMap<(u32,i32),(CallNoticeKind,NativeCallId)>,
+    offline_hints: std::collections::BTreeSet<(u32, i32)>,
     call_acks:BTreeMap<(u32,i32),(CallControlTicket,bool)>,
     swaps: BTreeMap<i32, u64>,
 }
@@ -75,7 +78,7 @@ impl OfflineBackend {
     pub fn new(owner: AttemptOwner) -> Self {
         let mut protocol = ArcProtocol::new(owner);
         let tracker = protocol.take_hosting_tracker().expect("fresh ARC tracker");
-        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,call_pending:BTreeMap::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new() }
+        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,call_pending:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new() }
     }
     pub fn phase(&self) -> ArcPhase { self.protocol.phase() }
     pub(super) fn is_pending(&self, id: i32) -> bool { self.protocol.is_pending(id) }
@@ -117,7 +120,7 @@ impl OfflineBackend {
     pub fn close(&mut self) {
         self.protocol.close(); if let Some(s) = &mut self.scheduler { s.close(); }
         self.tracker.retire_all();
-        self.call_dispatcher=None;self.call_pending.clear();self.call_acks.clear();
+        self.call_dispatcher=None;self.call_pending.clear();self.call_acks.clear();self.offline_hints.clear();
         self.swaps.clear();self.dispatcher=None;
     }
     pub(super) fn configure_call_control(&mut self,routing:&[RpcProperty<'_>])->Result<(),ProtocolError>{
@@ -129,10 +132,15 @@ impl OfflineBackend {
     pub fn prepare_login(&mut self, inputs: ArcLoginInputs<'_>, routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_login(inputs, routing) }
     pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
-        let packets=self.protocol.prepare_logout(routing)?;self.call_dispatcher=None;self.call_pending.clear();self.call_acks.clear();Ok(packets)
+        let packets=self.protocol.prepare_logout(routing)?;self.call_dispatcher=None;self.call_pending.clear();self.call_acks.clear();self.offline_hints.clear();Ok(packets)
     }
     pub fn prepare_bootstrap(&mut self, key: &[u8], routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_bootstrap(key, routing) }
+
+    pub(super) fn prepare_offline(&mut self, position: i64, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
+        if self.dispatcher.is_none() || self.scheduler.is_none() { return Err(CodecError::InvalidField.into()); }
+        self.protocol.prepare_offline(position, routing)
+    }
 
     /// After matched ARC login, explicitly install original local epoch and
     /// registered incoming receiver. None keeps incoming unsupported, not ready.
@@ -206,6 +214,7 @@ impl OfflineBackend {
         let mut events = Vec::new(); let mut processing_error = None;
         let scheduler = &mut self.scheduler; let tracker = &mut self.tracker;
         let dispatcher = &self.dispatcher;let call_dispatcher=&self.call_dispatcher;let call_pending=&mut self.call_pending;let swaps = &mut self.swaps;
+        let offline_hints = &mut self.offline_hints;
         let result = self.protocol.on_plaintext_packet(owner, scope, packet, |event| {
             match event {
                 ProtocolEvent::Reply(ArcReply::Login(callback)) | ProtocolEvent::Reply(ArcReply::Failure(callback)) =>
@@ -221,6 +230,19 @@ impl OfflineBackend {
                     for callback in tracker.on_scheduled_delivery(&delivery) { events.push(OfflineEvent::Callback(callback)); }
                     for reply in tracker.take_unhosting_replies() { events.push(OfflineEvent::Unhosting(reply)); }
                     for incoming in delivery.requests {
+                        if incoming.request().method == super::rpc_offline::MORE_OFFLINE_METHOD.as_bytes() {
+                            let position = match dispatcher.as_ref().map(|dispatcher| dispatcher.on_batch_offline_hint(&incoming)).transpose() {
+                                Ok(Some(Some(position))) => position,
+                                _ => { processing_error = Some(CodecError::InvalidField.into()); return; }
+                            };
+                            let key = (incoming.ticket().peer_incarnation(), incoming.ticket().sequence());
+                            if offline_hints.len() >= super::rpc_stream::MAX_MAP_ENTRIES || !offline_hints.insert(key) {
+                                processing_error = Some(CodecError::TooLarge.into()); return;
+                            }
+                            events.push(OfflineEvent::OfflineHint(super::rpc_offline::IncomingOfflineHint::batch(incoming.ticket().owner().clone(),
+                                scope.clone(), position, incoming.into_ticket())));
+                            continue;
+                        }
                         if let Some(kind)=notice_kind(incoming.request().method){
                             let Some(dispatcher)=call_dispatcher.as_ref()else{processing_error=Some(super::transport_packets::TransportError::UnsupportedKind.into());return;};
                             let decoded=match dispatcher.on_batch_request(&incoming){Ok(value)=>value,Err(error)=>{processing_error=Some(error.into());return;}};
@@ -260,6 +282,8 @@ impl OfflineBackend {
                 }
                 ProtocolEvent::Reply(ArcReply::Logout(reply)) => events.push(OfflineEvent::Logout(reply)),
                 ProtocolEvent::Reply(ArcReply::Call(reply))=>events.push(OfflineEvent::CallOperation(reply)),
+                ProtocolEvent::Reply(ArcReply::Offline(page)) => events.push(OfflineEvent::OfflinePage(page)),
+                ProtocolEvent::OfflineHint(hint) => events.push(OfflineEvent::OfflineHint(hint)),
                 ProtocolEvent::Reply(ArcReply::Bootstrap(configuration)) => events.push(OfflineEvent::Bootstrap(configuration)),
                 ProtocolEvent::Control(kind) => events.push(OfflineEvent::Control(kind)),
                 ProtocolEvent::Incoming(message) => events.push(OfflineEvent::DirectMessage(message)),
@@ -281,7 +305,7 @@ impl OfflineBackend {
     }
 
     pub fn complete_message(&mut self, ticket: &ServerRequestTicket, accepted: bool) -> Result<bool, ProtocolError> {
-        if self.call_pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())){return Err(CodecError::InvalidField.into());}
+        if self.call_pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())) || self.offline_hints.contains(&(ticket.peer_incarnation(),ticket.sequence())) {return Err(CodecError::InvalidField.into());}
         let bytes = encode_online_message_result(accepted)?;
         let result = self.scheduler.as_mut().ok_or(CodecError::InvalidField)?
             .complete_server_request(ticket, 0, bytes.expose_to_transport());
@@ -289,6 +313,22 @@ impl OfflineBackend {
             if self.phase() == ArcPhase::Closed { self.close(); }
             Err(error.into())
         } }
+    }
+
+    pub(super) fn complete_offline_hint(&mut self, hint: &super::rpc_offline::IncomingOfflineHint, accepted: bool)
+        -> Result<Option<CallCompletion>, ProtocolError> {
+        if !hint.matches(&self.tracker.batch_owner()?, &self.protocol.connection_scope()) { return Ok(None); }
+        match hint.ticket() {
+            super::rpc_offline::OfflineHintTicket::Direct(ticket) => self.protocol.complete_offline_hint(ticket, accepted).map(|packets| packets.map(CallCompletion::Direct)),
+            super::rpc_offline::OfflineHintTicket::Batch(ticket) => {
+                let key = (ticket.peer_incarnation(), ticket.sequence());
+                if !self.offline_hints.contains(&key) { return Ok(None); }
+                let result = encode_online_message_result(accepted)?;
+                if self.scheduler.as_mut().ok_or(CodecError::InvalidField)?.complete_server_request(ticket, 0, result.expose_to_transport())? {
+                    self.offline_hints.remove(&key); Ok(Some(CallCompletion::BatchQueued))
+                } else { Ok(None) }
+            }
+        }
     }
 
     pub(super) fn direct_replay_frontier(&self) -> Option<super::arc_protocol::DirectReplayFrontier> {

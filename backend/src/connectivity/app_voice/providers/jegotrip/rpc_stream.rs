@@ -103,6 +103,8 @@ impl Writer {
     /// Native call identifiers use a distinct full-width BE64 field. They are
     /// not ARC/direct/batch i32 request correlation identifiers.
     pub fn u64(&mut self, value: u64) -> Result<(), CodecError> { self.append(&value.to_be_bytes()) }
+    /// 原离线位置使用 signed64，初始 -1 不能截断成 i32 或当成调用 ID。
+    pub fn i64(&mut self, value: i64) -> Result<(), CodecError> { self.append(&value.to_be_bytes()) }
     pub fn i32(&mut self, value: i32) -> Result<(), CodecError> { self.append(&value.to_be_bytes()) }
 
     pub fn bytes(&mut self, value: &[u8]) -> Result<(), CodecError> {
@@ -165,6 +167,10 @@ impl<'a> Reader<'a> {
 
     pub fn u64(&mut self) -> Result<u64, CodecError> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().map_err(|_| CodecError::Truncated)?))
+    }
+
+    pub fn i64(&mut self) -> Result<i64, CodecError> {
+        Ok(i64::from_be_bytes(self.take(8)?.try_into().map_err(|_| CodecError::Truncated)?))
     }
 
     pub fn i32(&mut self) -> Result<i32, CodecError> {

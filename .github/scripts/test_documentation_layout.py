@@ -44,6 +44,9 @@ class DocumentationLayoutTests(unittest.TestCase):
             # Maintained local root-backup import contract; contains no private
             # archive, credentials, cached authorization or dated handoff.
             'JEGOTRIP_PHONE_BACKUP_IMPORT.md',
+            # Maintained native-offline transaction/codec boundary, not a dated
+            # status dump or an export of phone/SDK secrets.
+            'JEGOTRIP_NATIVE_OFFLINE_INBOX.md',
         }
         # This private, untracked report belongs to the user and is not part of
         # the maintained public documentation set.

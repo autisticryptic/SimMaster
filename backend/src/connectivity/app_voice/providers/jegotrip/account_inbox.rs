@@ -17,27 +17,29 @@ use serde::Serialize;
 use std::{fmt, sync::atomic::{AtomicBool, Ordering}};
 use zeroize::Zeroizing;
 
-const STORAGE: &str = "app_account_inbox_storage_failed";
-const SCOPE: &str = "app_account_inbox_scope_invalid";
-const FULL: &str = "app_account_inbox_full";
-const INVALID: &str = "app_account_inbox_message_invalid";
+pub(super) const STORAGE: &str = "app_account_inbox_storage_failed";
+pub(super) const SCOPE: &str = "app_account_inbox_scope_invalid";
+pub(super) const FULL: &str = "app_account_inbox_full";
+pub(super) const INVALID: &str = "app_account_inbox_message_invalid";
 const MAX_FIELD_BYTES: usize = 64 * 1024;
-const MAX_PER_ACCOUNT: i64 = 128;
-const MAX_IDENTITIES_PER_ACCOUNT: i64 = 512;
-const MAX_TOTAL: i64 = 2048;
-const MAX_TOTAL_BYTES: i64 = 16 * 1024 * 1024;
+pub(super) const MAX_PER_ACCOUNT: i64 = 128;
+pub(super) const MAX_IDENTITIES_PER_ACCOUNT: i64 = 512;
+pub(super) const MAX_TOTAL: i64 = 2048;
+pub(super) const MAX_TOTAL_BYTES: i64 = 16 * 1024 * 1024;
 
-pub fn initialize_schema(conn: &Connection) -> Result<(), &'static str> {
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS app_voice_inbox(
+pub(super) const CREATE_INBOX_SQL: &str = "CREATE TABLE IF NOT EXISTS app_voice_inbox(
         id INTEGER PRIMARY KEY AUTOINCREMENT,line_id TEXT NOT NULL,revision INTEGER NOT NULL,
-        run_nonce TEXT NOT NULL,source_kind TEXT NOT NULL CHECK(source_kind IN ('direct','batch')),
+        run_nonce TEXT NOT NULL,source_kind TEXT NOT NULL CHECK(source_kind IN ('direct','batch','offline')),
         peer_epoch INTEGER NOT NULL,sequence INTEGER NOT NULL,fingerprint TEXT NOT NULL,
         body BLOB NOT NULL,sender BLOB,opaque_time BLOB,
         receiver_object BLOB,receiver_domain BLOB,receiver_kind BLOB,
-        reply_state TEXT NOT NULL DEFAULT 'pending' CHECK(reply_state IN ('pending','direct_submitted','batch_queued')),
-        created_at TEXT NOT NULL,
-        UNIQUE(line_id,revision,run_nonce,source_kind,peer_epoch,sequence));
-        CREATE INDEX IF NOT EXISTS idx_app_voice_inbox_line ON app_voice_inbox(line_id,id);
+        reply_state TEXT NOT NULL DEFAULT 'pending' CHECK(reply_state IN ('pending','direct_submitted','batch_queued','offline_committed')),
+        created_at TEXT NOT NULL,offline_identity TEXT,offline_envelope BLOB,
+        UNIQUE(line_id,revision,run_nonce,source_kind,peer_epoch,sequence,offline_identity));";
+
+pub fn initialize_schema(conn: &Connection) -> Result<(), &'static str> {
+    conn.execute_batch(CREATE_INBOX_SQL).map_err(|_| STORAGE)?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_app_voice_inbox_line ON app_voice_inbox(line_id,id);
         CREATE TABLE IF NOT EXISTS app_voice_direct_replay_fences(
             line_id TEXT NOT NULL,revision INTEGER NOT NULL,run_nonce TEXT NOT NULL,
             through_sequence INTEGER NOT NULL CHECK(through_sequence>0 AND through_sequence<=2147483647),
@@ -55,12 +57,13 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), &'static str> {
         ("receiver_kind", "ALTER TABLE app_voice_inbox ADD COLUMN receiver_kind BLOB")] {
         if !columns.iter().any(|existing| existing == column) { conn.execute(statement, []).map_err(|_| STORAGE)?; }
     }
+    super::offline_inbox::initialize_schema(conn)?;
     super::batch_retention::initialize_schema(conn)
 }
 fn valid_nonce(nonce: &str) -> bool {
     nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn message_size(message: &IncomingMessage) -> Result<i64, &'static str> {
+pub(super) fn message_size(message: &IncomingMessage) -> Result<i64, &'static str> {
     let mut bytes = 0usize;
     for value in [Some(message.body.as_slice()), message.from.as_deref(), message.time.as_deref()].into_iter().flatten() {
         if value.len() > MAX_FIELD_BYTES { return Err(INVALID); }
@@ -68,7 +71,7 @@ fn message_size(message: &IncomingMessage) -> Result<i64, &'static str> {
     }
     Ok(bytes as i64)
 }
-fn fingerprint(message: &IncomingMessage) -> String {
+pub(super) fn fingerprint(message: &IncomingMessage) -> String {
     let mut digest = Context::new(&SHA256);
     // Explicit presence+length makes NULL different from an empty binary field.
     // This is an exact-content dedup aid, never credential/authentication proof.
@@ -78,7 +81,7 @@ fn fingerprint(message: &IncomingMessage) -> String {
     }
     digest.finish().as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
 }
-fn require_account(conn: &Connection, line: &str, revision: u64) -> Result<(), &'static str> {
+pub(super) fn require_account(conn: &Connection, line: &str, revision: u64) -> Result<(), &'static str> {
     let account = account_store::metadata(conn, line)?.ok_or(SCOPE)?;
     if account.revision != revision { return Err(SCOPE); }
     Ok(())
@@ -88,13 +91,14 @@ fn require_account(conn: &Connection, line: &str, revision: u64) -> Result<(), &
 /// backend event, original resource owner and current hosted phase. It cannot be
 /// supplied or serialized by HTTP callers, and never creates/relabels a scope.
 pub(super) struct InboxScope {
-    line_id: String, revision: u64, nonce: String, owner: AttemptOwner, scope: RpcConnectionScope,
-    receiver: Option<ReceiverContext>,
-    notifications: Result<Option<Box<dyn account_notifications::NoticeSnapshot>>, &'static str>,
+    pub(super) line_id: String, pub(super) revision: u64, pub(super) nonce: String,
+    pub(super) owner: AttemptOwner, pub(super) scope: RpcConnectionScope,
+    pub(super) receiver: Option<ReceiverContext>,
+    pub(super) notifications: Result<Option<Box<dyn account_notifications::NoticeSnapshot>>, &'static str>,
 }
-struct ReceiverContext { object: Zeroizing<Vec<u8>>, domain: Zeroizing<Vec<u8>>, kind: Zeroizing<Vec<u8>> }
+pub(super) struct ReceiverContext { pub(super) object: Zeroizing<Vec<u8>>, pub(super) domain: Zeroizing<Vec<u8>>, pub(super) kind: Zeroizing<Vec<u8>> }
 impl ReceiverContext {
-    fn bytes(&self) -> usize { self.object.len() + self.domain.len() + self.kind.len() }
+    pub(super) fn bytes(&self) -> usize { self.object.len() + self.domain.len() + self.kind.len() }
 }
 impl fmt::Debug for InboxScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("InboxScope(<redacted>)") }
@@ -164,7 +168,7 @@ impl InboxScope {
                 COALESCE(SUM(line_id=?1 AND reply_state!='pending' AND EXISTS(SELECT 1 FROM app_voice_sms_projection p
                     WHERE p.inbox_id=i.id AND p.line_id=i.line_id AND p.revision=i.revision)),0),COUNT(*),
                 COALESCE(SUM(length(body)+COALESCE(length(sender),0)+COALESCE(length(opaque_time),0)
-                    +COALESCE(length(receiver_object),0)+COALESCE(length(receiver_domain),0)+COALESCE(length(receiver_kind),0)),0) FROM app_voice_inbox i",
+                    +COALESCE(length(receiver_object),0)+COALESCE(length(receiver_domain),0)+COALESCE(length(receiver_kind),0)+COALESCE(length(offline_envelope),0)),0)+(SELECT COALESCE(SUM(length(envelope)),0) FROM app_voice_offline_quarantine) FROM app_voice_inbox i",
                 [&self.line_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(|_| STORAGE)?;
             if local >= MAX_PER_ACCOUNT || local + completed >= MAX_IDENTITIES_PER_ACCOUNT
                 || total >= MAX_TOTAL || stored.checked_add(size).map_or(true,|bytes|bytes>MAX_TOTAL_BYTES) {
@@ -313,7 +317,7 @@ pub(super) fn metadata(conn:&Connection,line:&str,limit:usize)->Result<Vec<Inbox
     let mut output=Vec::new();
     for row in raw {
         let (id,state,stamp,projection)=row.map_err(|_|STORAGE)?;
-        let state=match state.as_str(){"pending"=>"pending","direct_submitted"=>"direct_submitted","batch_queued"=>"batch_queued",_=>return Err(STORAGE)};
+        let state=match state.as_str(){"pending"=>"pending","direct_submitted"=>"direct_submitted","batch_queued"=>"batch_queued","offline_committed"=>"offline_committed",_=>return Err(STORAGE)};
         let classification=match projection{None=>"unclassified",Some(0)=>"smgw_text",Some(1)=>"smgw_text_deleted",_=>return Err(STORAGE)};
         output.push(InboxMetadata{inbox_id:id,classification,reply_state:state,created_at:stamp});
     }
@@ -326,6 +330,7 @@ pub(super) fn delete_private_for_account(conn:&Connection,line:&str)->Result<(),
         conn.execute("DELETE FROM app_voice_sms_projection WHERE line_id=?1 AND deleted=1",[line]).map_err(|_|STORAGE)?;
         conn.execute("DELETE FROM app_voice_inbox WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;
     }
+    super::offline_inbox::delete_account(conn, line)?;
     account_notifications::cancel_account(conn,line)?;
     account_runs::delete_account_state(conn,line)?;
     Ok(())

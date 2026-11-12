@@ -39,7 +39,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), &'static str> {
     conn.execute_batch("DROP TRIGGER IF EXISTS app_voice_sms_deleted;
         CREATE TRIGGER app_voice_sms_deleted AFTER DELETE ON sms_messages
         WHEN OLD.transport='app_voice' BEGIN
-            UPDATE app_voice_inbox SET body=X'',sender=NULL,opaque_time=NULL
+            UPDATE app_voice_inbox SET body=X'',sender=NULL,opaque_time=NULL,offline_envelope=NULL
                 WHERE line_id=OLD.line_id AND id IN
                     (SELECT inbox_id FROM app_voice_sms_projection WHERE sms_id=OLD.id AND line_id=OLD.line_id);
             UPDATE app_voice_sms_projection SET deleted=1,sent_at_millis=NULL
