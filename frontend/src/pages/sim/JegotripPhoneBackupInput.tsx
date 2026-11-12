@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 import { Alert, Button, Stack, Typography } from '@mui/material'
 import { PHONE_BACKUP_MAX_BYTES, phoneBackupError, phoneUuidFromBackupText } from '../../policies/phoneBackupIdentity'
 
@@ -12,7 +12,7 @@ function BackupFileReader({ open, disabled, label, onUuid }: Omit<PhoneBackupInp
   const [error, setError] = useState<string | null>(null)
   const generation = useRef({ active: false })
   const fileGeneration = useRef(0)
-  useEffect(() => {
+  useLayoutEffect(() => {
     const scope = { active: open && !disabled }
     generation.current = scope
     fileGeneration.current += 1
