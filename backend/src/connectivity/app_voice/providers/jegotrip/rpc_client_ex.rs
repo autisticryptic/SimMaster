@@ -41,6 +41,21 @@ fn disconnect_reason(bytes: &[u8]) -> DisconnectReason {
     else { DisconnectReason::Other }
 }
 
+/// 655DA8 forwards these two exact SDK command shapes to separate local
+/// Message/Invite consumers. Their notification ID is not an SMS receipt or
+/// call-control grant. Until those consumers are installed, answer false for
+/// these recognized requests instead of treating the whole stream as corrupt.
+/// Unknown commands/fields still fail closed; no business value is interpreted.
+fn recognized_notification_command(properties: &[RpcProperty<'_>]) -> bool {
+    let command = properties.iter().find(|p| p.key == b"Notify.Command").map(|p| p.value);
+    let keys: [&[u8]; 3] = match command {
+        Some(b"Message") => [b"Notify.Command", b"Notify.MsgIdx", b"Notify.Box"],
+        Some(b"Invite") => [b"Notify.Command", b"Notify.CallId", b"Notify.Caller"],
+        _ => return false,
+    };
+    properties.len() == keys.len() && keys.iter().all(|key| properties.iter().any(|p| p.key == *key))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ClientExControl { PollHint { notification_id: u64 }, Revoked { reason: DisconnectReason } }
 
@@ -148,14 +163,19 @@ impl ClientExDispatcher {
             return Err(CodecError::InvalidField);
         }
         let mut reader = Reader::versioned(arguments)?;
+        let mut notify_accepted = true;
         let control = match kind {
             ClientExKind::CheckAlive => None,
             ClientExKind::NotifyCalls => {
                 let notification_id = reader.u64()?;
                 let properties = reader.properties()?;
-                // The nonempty map enters SDK/OEM-specific onNotification hooks.
-                // Do not acknowledge an unimplemented hook as handled or as SMS.
-                if !properties.is_empty() { return Err(CodecError::InvalidField); }
+                if !properties.is_empty() {
+                    if !recognized_notification_command(&properties) { return Err(CodecError::InvalidField); }
+                    // A well-formed, recognized but unsupported SDK command is
+                    // an explicit negative result, not a successful poll hint,
+                    // fabricated user event, or loss of the authenticated link.
+                    notify_accepted = false;
+                }
                 Some(ClientExControl::PollHint { notification_id })
             }
             ClientExKind::NotifyDisconnect => {
@@ -167,7 +187,7 @@ impl ClientExDispatcher {
         if !self.scope.is_open() || self.scope.session_revoked() { return Ok(None); }
         let accepted = match kind {
             ClientExKind::CheckAlive => false,
-            ClientExKind::NotifyCalls => true,
+            ClientExKind::NotifyCalls => notify_accepted,
             ClientExKind::NotifyDisconnect => property(b"token") == Some(self.token.as_slice()),
         };
         let result = encode_result(kind, accepted, 0)?;

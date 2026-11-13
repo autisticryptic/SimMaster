@@ -1,6 +1,8 @@
 //! Actions-only original Router/SARC/Common ClientEx; no innerTLS fallback.
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip::rpc_client_ex::{CHECK_ALIVE_METHOD, NOTIFY_DISCONNECT_METHOD};
+#[path = "runtime_notification_rejection_tests.rs"]
+mod notification_rejection;
 fn client_ex_packet(method: &str, token: Option<&[u8]>) -> Vec<u8> {
     let mut writer = Writer::versioned().unwrap(); if method == NOTIFY_DISCONNECT_METHOD { writer.bytes(b"another-device-logined:fixture-private").unwrap(); }
     let mut metadata = vec![RpcProperty { key: b"id", value: b"#fixture-client" }, RpcProperty { key: b"domain", value: b"fixture-domain" },

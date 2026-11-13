@@ -9,6 +9,9 @@ use super::super::{
     tests::imported,
 };
 
+#[path = "client_ex_notification_tests.rs"]
+mod notification_rejection;
+
 fn owner() -> AttemptOwner {
     let mut session = HostingSession::new("fixture-client-ex-line".into());
     session.import(imported(), 100).unwrap(); session.begin_login(100).unwrap()

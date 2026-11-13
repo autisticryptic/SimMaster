@@ -6,6 +6,9 @@ use super::super::{account_inbox::InboxScope,account_test_support::{config,regis
     session::HostingSession,tls_engine::tests::Certificates};
 use std::sync::{Mutex,atomic::{AtomicUsize,Ordering}};
 
+#[path = "account_notification_deadline_tests.rs"]
+mod deadline;
+
 struct FixedPlan {targets:usize}
 impl NoticeSnapshot for FixedPlan {
     fn plan(&self,message:&SmsMessage)->Result<NoticePlan,&'static str>{NoticePlan::bounded((0..self.targets).map(|n|NoticeTarget {

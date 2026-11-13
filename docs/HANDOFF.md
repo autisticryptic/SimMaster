@@ -78,6 +78,15 @@
 
 独立stcp/mode1通道的安全边界仍待明确确认；多次Retry不当作授权。这项纯编解码工作不依赖该选择，也不授权真实账号请求/410部署。私有前置证据`.local/jegotrip/alive-protocol-20261113/`，本次源码/核验目录`.local/jegotrip/alive-codec-20261113/`。
 
+## 继续中的通知可靠性修复（待自身SHA验证）
+
+本轮实际修改两个运行路径，不再重复已通过的只读核验：
+
+- 原`Notify.Command=Message`（MsgIdx/Box）及`Invite`（CallId/Caller）的严格三键形状已从原库定位。它们会进入独立的MTC活动通知与业务关联回调，不等于实际SMS/来电。对这些已识别但尚无完整消费者的提示，现在准备回原格式的明确false，而不是把整个已认证连接当作损坏；不产生成功hint、用户消息/来电、Alive或新就绪。未知命令、额外/缺少键、重复map及畸形流仍拒绝。正常收件与原250ms轮询规则不改变。
+- 本地通知worker的拥有者等待超时/取消不能证明远端未收到：改为保留原claim并终结为uncertain，不自动重发可能已送达的内容；构造dispatcher future延迟到分支真正被轮询，并在进入前复核停止与截止。原30秒attempt、24小时TTL、4 worker、队列及显式失败5次/Deferred策略保持，不回填旧历史。
+
+新增20项回归准备覆盖10项原控制拒绝、8项通知deadline/claim、2项真实Router/TLS/Common连接与SMS票据分离；本机225静态检查已过，但新的Rust与制品仍须自身双Actions门禁。非空SDK/OEM通知的实际业务关联仍未完成，不能把false回复当作已处理成功。独立Alive、非TLS确认及实网/410边界均保持。私有证据目录`.local/jegotrip/notification-reliability-20261113/`。
+
 ## 接下来按顺序
 
 1. 未限定本地接收模式已完成自身门禁；继续动态限定接收器、独立Alive的原生传输/端点来源/注册续保、非空通知hooks及剩余媒体/通知。当前仍可离线，不需要现在连接手机；确需新的实机来源证据时另行请求。

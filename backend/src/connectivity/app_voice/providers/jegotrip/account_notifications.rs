@@ -163,17 +163,32 @@ fn uncertain(database:&Database,work:&NoticeWork){
 }
 struct DispatchGuard {database:Arc<Database>,work:Option<NoticeWork>}
 impl Drop for DispatchGuard {fn drop(&mut self){if let Some(work)=&self.work{uncertain(&self.database,work);}}}
-async fn send_one(database:Arc<Database>,dispatcher:Arc<dyn NoticeDispatcher>,work:NoticeWork,mut shutdown:ShutdownSignal){
+async fn send_one(database:Arc<Database>,dispatcher:Arc<dyn NoticeDispatcher>,work:NoticeWork,shutdown:ShutdownSignal){
+    let deadline=tokio::time::Instant::now()+ATTEMPT_TIMEOUT;
+    send_one_before(database,dispatcher,work,shutdown,deadline).await;
+}
+/// The owning attempt may impose an earlier deadline, never a larger budget.
+/// Expiry/cancellation does not prove a remote send failed: dropping the guard
+/// records uncertainty and must not put possibly delivered work back in pending.
+async fn send_one_before(database:Arc<Database>,dispatcher:Arc<dyn NoticeDispatcher>,work:NoticeWork,mut shutdown:ShutdownSignal,deadline:tokio::time::Instant){
     let mut guard=DispatchGuard{database,work:Some(work)};
     let work=guard.work.as_ref().expect("owned job");
     if shutdown.is_shutting_down()||still_admitted(&guard.database,work)!=Ok(true){return;}
     let budget=Duration::from_secs((work.expires-now()).max(0) as u64).min(ATTEMPT_TIMEOUT);
-    let deadline=tokio::time::Instant::now()+budget;
+    let deadline=deadline.min(tokio::time::Instant::now()+budget);
+    if tokio::time::Instant::now()>=deadline{return;}
+    let dispatch_shutdown=shutdown.clone();
     let outcome=tokio::select!{biased;
         _=shutdown.wait()=>return,
-        _=tokio::time::sleep_until(deadline)=>NoticeOutcome::Failed,
-        result=dispatcher.deliver(work)=>result,
+        _=tokio::time::sleep_until(deadline)=>return,
+        // Defer even constructing the dispatch future until its branch is
+        // polled; recheck before entering a synchronous dispatcher.
+        result=async {
+            if dispatch_shutdown.is_shutting_down()||tokio::time::Instant::now()>=deadline{return None;}
+            Some(dispatcher.deliver(work).await)
+        }=>result,
     };
+    let Some(outcome)=outcome else{return;};
     if finish(&guard.database,work,outcome,now()).is_ok(){guard.work=None;}
 }
 
