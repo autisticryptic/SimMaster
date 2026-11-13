@@ -13,6 +13,8 @@
 
 ## 已核验的软件基线
 
+- **`ed4bc650bb981cd02790c2fa8713b0a79c2e894d`（最新纯编解码前置）**：无网络AccountAlive参数/结果codec，既有运行时、TLS、配置和checkAlive行为逐字保持。Build43368280015 / Beta43368280032均success；各1386精确provider回归（原1370+新16）、26HTTP及原registry/Trunk/通知/DNS/矩阵通过，各82前端单元/4浏览器/12图SHA-run/官方digest/全CRC与两ABI完整包成员/meta/ELF已核。本机219静态检查通过。源码与核验在`.local/jegotrip/alive-codec-20261113/`及`.local/jegotrip/verified-native-ed4bc65.json`；未新增或启用任何通道，不能把这个前置组件称作Alive注册成功。
+
 - **`a1c6d88061808c37b101899c8c9dbc5815b76308`（本次）**：原生未限定本地接收器、分离的DIRECT/batch域规则、NULL接收域与原HostingAck前的有界短信队列，以及会话撤销后的即时媒体停止。Build43358440268 / Beta43358440285均success；每workflow1370精确provider回归（完整保留原1339，新增28接收+3媒体）、26HTTP及原registry/Trunk/通知/DNS/矩阵通过。前端各82精确单元/4浏览器/12图、自身SHA/run、官方digest/全ZIP CRC通过；ARM64/AMD64正式包各29成员/20前端文件、全部SHA、meta完整commit/target/version1.1.5及ELF已核。仅软件子集交付，未执行制品或部署。
 - 本次权威证据：`.local/jegotrip/native-hosting-20261113/`的源码读回、失败关闭、前端和包证明及最终交付，另有`.local/jegotrip/verified-native-a1c6d88.json`。文档收尾只改docs，构建输入保持a1c6d88，不冒称另一个新二进制。
 
@@ -68,11 +70,11 @@
 - 新私有证据目录`.local/jegotrip/native-hosting-20261113/`。31份首段及18组后续只读IDA结果保留；历史SDK日志只输出形状，确认独立Alive的`stcp`引用仅有h/p选项，不能把RouterClient.TlsOnly、主连接登录或历史registerAlive成功当成本次独立Alive注册。该路径仍待单独实现与验证，不改写成猜测的ARC/TLS地址。
 - 新只读子审查401无结果，主助手直接审查；0手机/Provider/410/SDK执行/IDB写。
 
-## 当前追加：AccountAlive纯编解码（待新SHA门禁）
+## 当前追加：AccountAlive纯编解码（ed4bc65已验证）
 
 仅新增`rpc_alive`无网络编解码前置：type0、单项方法版本列表[0]、原UID/selector、完整64位请求时间与32位间隔，结果bool/Common footer。原590C08与593000使用相同+2328/+2152字段对；不把它们替成App UUID或phone token。原数值包括零/最高位仅作为DATA保留，不读取系统时钟、不计算续保期限、不发注册或重试。
 
-16项新增回归含独立字节夹具、截断/版本/长度/重复footer/错误码/脱敏，以及匹配SDK登录后解码true仍不能把checkAlive变成true的反例。`RawRegisterAliveResult`没有owner、scope或RPC关联品牌，不是注册许可。原`AccountAliveState::Unsupported`与checkAlive false/0、全部连接/配置代码保持；不增加任何TLS或非TLS通道。新增源码必须自身双Actions/官方制品验证，不能借a1旧绿。
+16项新增回归含独立字节夹具、截断/版本/长度/重复footer/错误码/脱敏，以及匹配SDK登录后解码true仍不能把checkAlive变成true的反例。`RawRegisterAliveResult`没有owner、scope或RPC关联品牌，不是注册许可。原`AccountAliveState::Unsupported`与checkAlive false/0、全部连接/配置代码保持；不增加任何TLS或非TLS通道。已由ed4bc65自身两个Actions和正式制品验证（各1386 provider/26HTTP、原前端与双ABI），原1370测试断言逐字保持，未借a1旧绿。
 
 独立stcp/mode1通道的安全边界仍待明确确认；多次Retry不当作授权。这项纯编解码工作不依赖该选择，也不授权真实账号请求/410部署。私有前置证据`.local/jegotrip/alive-protocol-20261113/`，本次源码/核验目录`.local/jegotrip/alive-codec-20261113/`。
 
