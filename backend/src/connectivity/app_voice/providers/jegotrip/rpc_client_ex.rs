@@ -91,6 +91,7 @@ pub(super) struct ClientExDispatcher {
     object: Zeroizing<Vec<u8>>,
     domain: Zeroizing<Vec<u8>>,
     token: Zeroizing<Vec<u8>>,
+    native: Option<super::native_receiver::NativeReceiverBinding>,
 }
 impl fmt::Debug for ClientExDispatcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("ClientExDispatcher(<redacted>)") }
@@ -111,29 +112,39 @@ impl ClientExDispatcher {
             return Err(CodecError::TooLarge);
         }
         Ok(Self { owner, scope, object: Zeroizing::new(binding.object_id.to_vec()),
-            domain: Zeroizing::new(binding.domain.to_vec()), token: Zeroizing::new(token.to_vec()) })
+            domain: Zeroizing::new(binding.domain.to_vec()), token: Zeroizing::new(token.to_vec()), native: None })
+    }
+    pub(super) fn for_native_client(owner: AttemptOwner, scope: RpcConnectionScope, policy: std::sync::Arc<super::native_receiver::NativeReceiverPolicy>, token: &[u8])
+        -> Result<Self, CodecError> {
+        if token.is_empty() || token.len() > MAX_FIELD_BYTES { return Err(CodecError::InvalidField); }
+        let native = super::native_receiver::NativeReceiverBinding::original(owner.clone(), scope.clone(), policy)?;
+        Ok(Self { owner, scope, object: Zeroizing::new(super::native_receiver::MESSAGE_OBJECT.to_vec()), domain: Zeroizing::new(Vec::new()),
+            token: Zeroizing::new(token.to_vec()), native: Some(native) })
     }
     pub(super) fn matches_binding(&self, binding: &IncomingBinding<'_>) -> bool {
-        self.object.as_slice() == binding.object_id && self.domain.as_slice() == binding.domain
+        self.native.is_none() && self.object.as_slice() == binding.object_id && self.domain.as_slice() == binding.domain
     }
     pub(super) fn captured_copy(&self) -> Self {
         Self { owner: self.owner.clone(), scope: self.scope.clone(), object: Zeroizing::new(self.object.to_vec()),
-            domain: Zeroizing::new(self.domain.to_vec()), token: Zeroizing::new(self.token.to_vec()) }
+            domain: Zeroizing::new(self.domain.to_vec()), token: Zeroizing::new(self.token.to_vec()), native: self.native.clone() }
     }
     pub(super) fn on_direct(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, request: &RpcRequest<'_>)
         -> Result<Option<ClientExAction>, CodecError> {
         if &self.owner != owner || !self.scope.matches(scope) || !scope.is_open() || scope.session_revoked() { return Ok(None); }
-        self.dispatch(request.method, request.arguments, &request.metadata)
+        self.dispatch(request.method, request.arguments, &request.metadata, super::native_receiver::ReceiverTransport::Direct)
     }
     pub(super) fn on_batch(&self, incoming: &IncomingBatchRequest) -> Result<Option<ClientExAction>, CodecError> {
         if !incoming.ticket().matches(&self.owner, &self.scope) || self.scope.session_revoked() { return Ok(None); }
-        let request = incoming.request(); self.dispatch(request.method, request.arguments, &request.metadata)
+        let request = incoming.request(); self.dispatch(request.method, request.arguments, &request.metadata, super::native_receiver::ReceiverTransport::Batch)
     }
-    fn dispatch(&self, method: &[u8], arguments: &[u8], metadata: &[RpcProperty<'_>]) -> Result<Option<ClientExAction>, CodecError> {
+    fn dispatch(&self, method: &[u8], arguments: &[u8], metadata: &[RpcProperty<'_>], transport: super::native_receiver::ReceiverTransport) -> Result<Option<ClientExAction>, CodecError> {
         let Some(kind) = method_kind(method) else { return Ok(None); };
         validate_metadata(metadata)?;
         let property = |key: &[u8]| metadata.iter().find(|property| property.key == key).map(|property| property.value);
-        if property(b"id") != Some(self.object.as_slice()) || property(b"domain") != Some(self.domain.as_slice()) {
+        if let Some(native) = &self.native {
+            if !native.matches(&self.owner, &self.scope) { return Err(CodecError::InvalidField); }
+            native.policy().validate(super::native_receiver::ReceiverObject::Message, metadata, transport)?;
+        } else if property(b"id") != Some(self.object.as_slice()) || property(b"domain") != Some(self.domain.as_slice()) {
             return Err(CodecError::InvalidField);
         }
         let mut reader = Reader::versioned(arguments)?;

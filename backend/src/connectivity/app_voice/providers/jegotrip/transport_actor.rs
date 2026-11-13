@@ -145,6 +145,7 @@ impl Gateway {
 enum Operation {
     Login(Login, Vec<Property>), Bootstrap(Zeroizing<Vec<u8>>, Vec<Property>), Configure(u32, Option<Binding>), ArmClientEx(Binding), ConfigureClientEx, ConfigureCalls(CallBinding), Logout(Vec<Property>),
     Swap(Vec<Property>, Option<Gateway>), CompleteBatch(ServerRequestTicket, bool), CompleteDirect(DirectReplyTicket, bool), CompleteCall(CallReplyTicket,bool,Vec<Property>),
+    ArmNativeReceivers(std::sync::Arc<super::native_receiver::NativeReceiverSetup>), ConfigureNativeReceivers(u32),
     GetOffline(i64, Vec<Property>), CompleteOfflineHint(super::rpc_offline::IncomingOfflineHint, bool),
     ConfigureCallControl(Vec<Property>),Call(CallControlTicket,CallOperation,Vec<Property>,oneshot::Sender<Result<OwnedCallOperationReply,RuntimeError>>),
 }
@@ -162,6 +163,8 @@ impl Operation {
                     + g.metadata.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()),
             Self::ConfigureClientEx | Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) | Self::CompleteOfflineHint(_, _) => 0,
             Self::ConfigureCalls(binding)=>binding.object.len()+binding.domain.len(),
+            Self::ConfigureNativeReceivers(_) => 0,
+            Self::ArmNativeReceivers(setup) => setup.retained_bytes(),
             Self::ArmClientEx(binding)=>binding.object.len()+binding.domain.len()+binding.receiver.len(),
             Self::CompleteCall(_,_,properties)|Self::ConfigureCallControl(properties)|Self::Call(_,_,properties,_)=>properties.iter().map(|p|p.key.len()+p.value.len()).sum(),
         }
@@ -328,6 +331,15 @@ impl RuntimeCommands {
     pub async fn complete_direct(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, ticket: &DirectReplyTicket, accepted: bool) -> Result<RuntimeReceipt, RuntimeError> {
         if !self.accepts(owner, scope) || !ticket.matches(owner, scope) { return Err(RuntimeError::Scope); }
         self.submit(owner, scope, Operation::CompleteDirect(ticket.captured_copy(), accepted)).await
+    }
+    pub(super) async fn arm_native_receivers(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, setup: std::sync::Arc<super::native_receiver::NativeReceiverSetup>)
+        -> Result<RuntimeReceipt, RuntimeError> {
+        if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
+        self.submit(owner, scope, Operation::ArmNativeReceivers(setup)).await
+    }
+    pub(super) async fn configure_native_receivers(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, incarnation: u32) -> Result<RuntimeReceipt, RuntimeError> {
+        if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
+        self.submit(owner, scope, Operation::ConfigureNativeReceivers(incarnation)).await
     }
     pub(super) async fn arm_client_ex(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, binding: IncomingBinding<'_>) -> Result<RuntimeReceipt, RuntimeError> {
         if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
@@ -672,7 +684,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _)) {
             let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
         }
-        if !matches!(&command.operation, Operation::ArmClientEx(_)) && self.common.is_none() && self.tls.as_ref().is_none_or(|tls|tls.phase()!=TlsPhase::Verified) {
+        if !matches!(&command.operation, Operation::ArmClientEx(_) | Operation::ArmNativeReceivers(_)) && self.common.is_none() && self.tls.as_ref().is_none_or(|tls|tls.phase()!=TlsPhase::Verified) {
             let _ = command.completion.send(Err(RuntimeError::Tls(TlsError::NotReady))); return Ok(());
         }
         let native_deadline=if self.common.is_some(){
@@ -693,6 +705,20 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 let result = self.backend.configure(epoch, incoming.as_ref().map(Binding::borrowed)).map_err(|_| RuntimeError::Protocol);
                 let receipt = result.map(|()| RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), None));
                 if command.completion.send(receipt).is_err() { return Err(RuntimeError::Cancelled); }
+                return Ok(());
+            }
+            Operation::ArmNativeReceivers(setup) => {
+                let result = self.backend.arm_native_receivers(setup).map_err(|_| RuntimeError::InvalidConfiguration);
+                if command.completion.send(result.map(|()| RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), None))).is_err() {
+                    return Err(RuntimeError::Cancelled);
+                }
+                return Ok(());
+            }
+            Operation::ConfigureNativeReceivers(incarnation) => {
+                let result = self.backend.configure_native_receivers(incarnation).map_err(|_| RuntimeError::InvalidConfiguration);
+                if command.completion.send(result.map(|()| RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), None))).is_err() {
+                    return Err(RuntimeError::Cancelled);
+                }
                 return Ok(());
             }
             Operation::ArmClientEx(binding) => {

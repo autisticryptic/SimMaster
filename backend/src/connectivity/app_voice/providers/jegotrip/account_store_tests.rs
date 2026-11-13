@@ -31,6 +31,7 @@ fn fixture(root: &str) -> AccountConfig {
             receiver_kind: b"fixture.kind".to_vec() }),
         offline_reception: false,
         client_ex: false,
+        native_receivers: None,
         bootstrap_via_router: None,
         call_incoming:None,call_control:None,
         connect_timeout_ms: 1000, handshake_timeout_ms: 3000, partial_timeout_ms: 300,

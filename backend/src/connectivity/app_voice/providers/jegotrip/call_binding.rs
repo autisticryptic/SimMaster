@@ -83,6 +83,7 @@ pub struct CallDispatcher {
     scope: RpcConnectionScope,
     object_id: Zeroizing<Vec<u8>>,
     domain: Zeroizing<Vec<u8>>,
+    native: Option<super::native_receiver::NativeReceiverBinding>,
 }
 
 impl fmt::Debug for CallDispatcher {
@@ -104,7 +105,13 @@ impl CallDispatcher {
             }
         }
         Ok(Self { owner, scope, object_id: Zeroizing::new(binding.object_id.to_vec()),
-            domain: Zeroizing::new(binding.domain.to_vec()) })
+            domain: Zeroizing::new(binding.domain.to_vec()), native: None })
+    }
+
+    pub(super) fn for_native_client(owner: AttemptOwner, scope: RpcConnectionScope, policy: std::sync::Arc<super::native_receiver::NativeReceiverPolicy>)
+        -> Result<Self, CodecError> {
+        let native = super::native_receiver::NativeReceiverBinding::original(owner.clone(), scope.clone(), policy)?;
+        Ok(Self { owner, scope, object_id: Zeroizing::new(super::native_receiver::CALL_OBJECT.to_vec()), domain: Zeroizing::new(Vec::new()), native: Some(native) })
     }
 
     pub(super) fn matches(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
@@ -116,24 +123,27 @@ impl CallDispatcher {
     pub fn on_batch_request(&self, incoming: &IncomingBatchRequest) -> Result<Option<OwnedCallNotice>, CodecError> {
         if !incoming.ticket().matches(&self.owner, &self.scope) { return Ok(None); }
         let request: BatchRequest<'_> = incoming.request();
-        self.dispatch(request.method, request.arguments, &request.metadata)
+        self.dispatch(request.method, request.arguments, &request.metadata, super::native_receiver::ReceiverTransport::Batch)
     }
 
     pub(super) fn on_direct_request(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, request: &RpcRequest<'_>)
         -> Result<Option<OwnedCallNotice>, CodecError> {
         if !self.matches(owner, scope) { return Ok(None); }
         // Borrow metadata rather than cloning an unbounded caller-supplied map.
-        self.dispatch(request.method, request.arguments, &request.metadata)
+        self.dispatch(request.method, request.arguments, &request.metadata, super::native_receiver::ReceiverTransport::Direct)
     }
 
-    fn dispatch(&self, method: &[u8], arguments: &[u8], metadata: &[RpcProperty<'_>])
+    fn dispatch(&self, method: &[u8], arguments: &[u8], metadata: &[RpcProperty<'_>], transport: super::native_receiver::ReceiverTransport)
         -> Result<Option<OwnedCallNotice>, CodecError> {
         if method != INVITED_METHOD.as_bytes() && method != RELEASED_METHOD.as_bytes()
             && method != ACCEPTED_METHOD.as_bytes() { return Ok(None); }
         let mut metadata_bytes = 0;
         measure_properties(metadata, &mut metadata_bytes)?;
         let property = |key: &[u8]| metadata.iter().find(|p| p.key == key).map(|p| p.value);
-        if property(b"id") != Some(self.object_id.as_slice()) || property(b"domain") != Some(self.domain.as_slice()) {
+        if let Some(native) = &self.native {
+            if !native.matches(&self.owner, &self.scope) { return Err(CodecError::InvalidField); }
+            native.policy().validate(super::native_receiver::ReceiverObject::Call, metadata, transport)?;
+        } else if property(b"id") != Some(self.object_id.as_slice()) || property(b"domain") != Some(self.domain.as_slice()) {
             return Err(CodecError::InvalidField);
         }
         let Some(notice) = decode_notice(method, arguments)? else { return Ok(None); };

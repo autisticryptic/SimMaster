@@ -147,7 +147,7 @@ impl OfflineBackend {
     /// After matched ARC login, explicitly install original local epoch and
     /// registered incoming receiver. None keeps incoming unsupported, not ready.
     pub fn configure(&mut self, incarnation: u32, incoming: Option<IncomingBinding<'_>>) -> Result<(), ProtocolError> {
-        if self.scheduler.is_some() || self.phase() != ArcPhase::Authenticated || incarnation == 0 {
+        if self.scheduler.is_some() || self.protocol.native_setup().is_some() || self.phase() != ArcPhase::Authenticated || incarnation == 0 {
             return Err(CodecError::InvalidField.into());
         }
         if let Some(binding) = incoming {
@@ -156,6 +156,22 @@ impl OfflineBackend {
             self.dispatcher = Some(IncomingDispatcher::for_arc_session(self.tracker.batch_owner()?,
                 self.protocol.connection_scope(), binding)?);
         }
+        self.scheduler = Some(self.protocol.take_batch_scheduler(incarnation)?);
+        Ok(())
+    }
+
+    pub(super) fn arm_native_receivers(&mut self, setup: std::sync::Arc<super::native_receiver::NativeReceiverSetup>) -> Result<(), ProtocolError> {
+        self.protocol.arm_native_receivers(setup)
+    }
+    pub(super) fn configure_native_receivers(&mut self, incarnation: u32) -> Result<(), ProtocolError> {
+        if self.scheduler.is_some() || self.dispatcher.is_some() || self.call_dispatcher.is_some() || self.client_ex.is_some()
+            || self.protocol.native_setup().is_none() || incarnation == 0 { return Err(CodecError::InvalidField.into()); }
+        // The original login synchronously activated the direct dispatchers.
+        // Install the SAME native policy for authenticated batch delivery, not
+        // a copied/empty legacy domain or a receiver inferred from this request.
+        self.dispatcher = Some(self.protocol.native_message_dispatcher()?);
+        self.call_dispatcher = Some(self.protocol.native_call_dispatcher()?);
+        self.client_ex = self.protocol.captured_client_ex();
         self.scheduler = Some(self.protocol.take_batch_scheduler(incarnation)?);
         Ok(())
     }

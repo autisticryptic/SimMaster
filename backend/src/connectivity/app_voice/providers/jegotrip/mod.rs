@@ -37,6 +37,7 @@ pub mod packet_stream;
 pub mod packet_transport;
 pub mod router_packets;
 pub mod native_events;
+pub(crate) mod native_receiver;
 pub mod rpc_arguments;
 pub mod rpc_calls;
 pub mod call_binding;

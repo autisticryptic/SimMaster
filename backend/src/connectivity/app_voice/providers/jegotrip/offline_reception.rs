@@ -64,10 +64,17 @@ pub(super) async fn page(run: &ManagedRun, controller: &HostingController, state
         fail(run, "app_account_offline_page_unmatched"); return;
     }
     state.inflight = None;
-    let Some(binding) = run.backend.original_incoming_binding(&owner, &scope) else { fail(run, "app_account_offline_binding_missing"); return; };
     let notifications = run.notifications.as_ref().map(|planner| planner.capture()).transpose();
-    let context = match InboxScope::original(&run.line_id, run.revision, &run.inbox_nonce, &owner, &scope)
-        .and_then(|context| context.with_receiver(binding)).map(|context| context.with_notifications(notifications)) {
+    let context = InboxScope::original(&run.line_id, run.revision, &run.inbox_nonce, &owner, &scope)
+        .and_then(|context| {
+            if let Some(binding) = run.backend.original_native_binding(&owner, &scope) {
+                context.with_native_receiver(&binding)
+            } else {
+                let binding = run.backend.original_incoming_binding(&owner, &scope).ok_or("app_account_offline_binding_missing")?;
+                context.with_receiver(binding)
+            }
+        }).map(|context| context.with_notifications(notifications));
+    let context = match context {
         Ok(context) => context,
         Err(code) => { fail(run, code); return; }
     };

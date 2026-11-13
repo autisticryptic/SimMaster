@@ -51,9 +51,20 @@
 
 先前用户明确授权后只读导出175普通App文件（121 XML、36 files、18 databases）和43外部App scoped文件、8.9.4.0 APK/libmtc；另一台Nexus_4未读取。原Java样本8.9.7.0，库相同；Java版本差异不混用。App UUID、独立ZpandDevice UUID和device_id.xml标识各自保留，前后hash/普通ZIP CRC和私有ACL已核；Realm FIFO仅元数据，不跟随。两份SBA1/v1封装仍未解密，不将历史托管缓存当当前授权。
 
+## 本次继续中的原生接收装配（待自身SHA验证）
+
+基于已验c531916/38ae，新增安装侧`profile.native_receivers`（缺省None；显式`{}`使用原空deny-list DIRECT域策略），仅支持原Router/Common，不能与旧`incoming/call_incoming`同时配置。源码不把App UUID、DomainName或出站domain当接收域。
+
+- 已核原ClientAdapter的本地激活和`MessageReceiver`/`CallClientEx`注册；DIRECT连接快照域策略与匹配外层的batch adapter分发不同。仅处理精确无facet/adapter/cloud限定的本地对象，未知引用仍拒绝，不猜动态绑定。
+- 原native接收DATA在登录前有界预装配，仅匹配本次login后同步激活，覆盖同批首条消息/来电。ClientEx仍按配置启用、本次ARC token撤销仍不可重连，checkAlive不造独立Alive正向。
+- native模式`Sip.Request`自动走原短信消费器；确实没有一个固定必填接收domain，私有inbox用NULL表达，不伪造空域、不回填旧行。原精确绑定的非空domain约束保持；native离线游标另有上下文标记，不混用旧cursor。
+- 早到native短信只可在原HostingPending的16条/1MiB队列等待原HostingAck，未确认前不落库/通知/ACK，不建立新deadline；拒绝/过期/撤销仍停止。来电控制/媒体仍需要原配置，不从接收器存在推导就绪。
+- 新契约与回归覆盖DIRECT/batch缺域区别、原scope/去重/ACK、首包竞态、真实Common/账号事务/离线游标；本机212静态检查已过，Rust/前端尚待本次双Actions。新私有证据目录`.local/jegotrip/native-hosting-20261113/`，不借38ae旧绿标完成。
+- 新只读子审查401无结果，主助手直接审查；0手机/Provider/410/SDK执行/IDB写。
+
 ## 接下来按顺序
 
-1. 继续默认/动态MessageReceiver、CallClientEx的真实adapter/域策略，非空通知hooks、独立AccountAlive端点/信任/注册与续保、来电通知/媒体装配。客户端正向Alive状态没有闭合，不能将三控制子集称完整SDK。
+1. 先完成上述新源码自身双Actions/正式制品核验，保留全部旧断言、预算和失败记录，再继续动态限定接收器、独立Alive端点/注册续保与剩余媒体/通知。
 2. 具备本次服务器认可、正确原生模板和明确操作条件后，按授权保护410配置/历史/units/helper且无回滚备份部署；验收外来SMS落库/原回执、来电/双向媒体、断连、stop→logoutSession→Join与持续端到端时延。
 3. 授信TTL/撤销/替换与服务端积压重放规则不可由客户端fixture证明。不用新VTD/UUID、缓存授权、收费外发或设备变更补造成功。**完整用户目标仍未完成。**
 

@@ -257,6 +257,26 @@ impl ArcRpcSession {
         super::rpc_incoming::IncomingDispatcher::for_arc_session(self.owner.clone(), self.connection.clone(), binding)
     }
 
+    pub(super) fn native_receiver_scope(&self) -> bool {
+        self.common_transport_claimed && self.phase() == ArcPhase::Authenticated && !self.connection.session_revoked()
+    }
+    pub(super) fn incoming_native_dispatcher(&self, policy: Arc<super::native_receiver::NativeReceiverPolicy>) -> Result<super::rpc_incoming::IncomingDispatcher, CodecError> {
+        if !self.native_receiver_scope() { return Err(CodecError::InvalidField); }
+        super::rpc_incoming::IncomingDispatcher::for_native_client(self.owner.clone(), self.connection.clone(), policy)
+    }
+    pub(super) fn native_call_dispatcher(&self, policy: Arc<super::native_receiver::NativeReceiverPolicy>) -> Result<super::call_binding::CallDispatcher, CodecError> {
+        if !self.native_receiver_scope() { return Err(CodecError::InvalidField); }
+        super::call_binding::CallDispatcher::for_native_client(self.owner.clone(), self.connection.clone(), policy)
+    }
+    pub(super) fn native_client_ex_dispatcher(&self, policy: Arc<super::native_receiver::NativeReceiverPolicy>) -> Result<super::rpc_client_ex::ClientExDispatcher, CodecError> {
+        if !self.native_receiver_scope() { return Err(CodecError::InvalidField); }
+        let authentication = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
+        super::rpc_client_ex::ClientExDispatcher::for_native_client(self.owner.clone(), self.connection.clone(), policy, &authentication.token)
+    }
+    pub(super) fn can_arm_native_receivers(&self) -> bool {
+        self.common_transport_claimed && self.phase() == ArcPhase::Initial && self.pending.is_empty()
+    }
+
     pub(super) fn client_ex_dispatcher(&self, binding: super::rpc_incoming::IncomingBinding<'_>)
         -> Result<super::rpc_client_ex::ClientExDispatcher, CodecError> {
         if self.phase() != ArcPhase::Authenticated || self.connection.session_revoked() { return Err(CodecError::InvalidField); }

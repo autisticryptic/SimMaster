@@ -202,6 +202,7 @@ pub struct RuntimeProfile {
     device_info_cc: Zeroizing<String>, client_properties: Vec<Property>, include_device_id: bool,
     login_routing: Vec<Property>, gateway_uri: Option<Zeroizing<String>>, gateway_metadata: Vec<Property>,
     poll_routing: Vec<Property>, logout_routing: Vec<Property>, incoming: Option<Binding>, offline_reception: bool, client_ex: bool,
+    native_receivers: Option<Arc<super::native_receiver::NativeReceiverPolicy>>,
     reference_decode_key: Option<ConfigDecodeKey>, handshake_timeout: Duration, partial_timeout: Duration,
     io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>, byte_length:usize,
 }
@@ -211,20 +212,32 @@ impl fmt::Debug for RuntimeProfile {
 impl RuntimeProfile {
     /// 明确的本地消费策略，不发送新属性，不创造接收器或服务端认可。
     pub fn with_offline_reception(mut self, enabled: bool) -> Result<Self, ProfileError> {
-        if enabled && self.incoming.is_none() { return Err(ProfileError::InvalidConfiguration); }
+        if self.native_receivers.is_none() {
+            if enabled && self.incoming.is_none() { return Err(ProfileError::InvalidConfiguration); }
+        }
         self.offline_reception = enabled; Ok(self)
     }
     /// Opt in to exact ClientEx controls using the existing original receiver.
     /// This neither derives a native object/domain nor registers AccountAlive.
     pub fn with_client_ex(mut self, enabled: bool) -> Result<Self, ProfileError> {
-        if enabled {
+        if enabled && self.native_receivers.is_none() {
             let binding = self.incoming.as_ref().ok_or(ProfileError::InvalidConfiguration)?;
             let _registration = super::rpc_client_ex::ClientExRegistration::capture(binding.borrowed())
                 .map_err(|_| ProfileError::InvalidConfiguration)?;
         }
         self.client_ex = enabled; Ok(self)
     }
+    pub(super) fn with_native_receivers(mut self, config: Option<&super::native_receiver::NativeReceiverConfig>) -> Result<Self, ProfileError> {
+        let Some(config) = config else { return Ok(self); };
+        if self.common.is_none() || self.native_receivers.is_some() || self.incoming.is_some() || self.call_incoming.is_some() {
+            return Err(ProfileError::InvalidConfiguration);
+        }
+        let policy = super::native_receiver::NativeReceiverPolicy::capture(config).map_err(|_| ProfileError::InvalidConfiguration)?;
+        add_bytes(&mut self.byte_length, policy.retained_bytes())?;
+        self.native_receivers = Some(policy); Ok(self)
+    }
     pub fn with_call_receiver(mut self,binding:Option<CallIncomingBinding<'_>>)->Result<Self,ProfileError>{
+        if self.native_receivers.is_some() && binding.is_some() { return Err(ProfileError::InvalidConfiguration); }
         if self.call_incoming.is_some(){return Err(ProfileError::InvalidConfiguration);}
         if let Some(binding)=binding{
             for value in [binding.object_id,binding.domain]{
@@ -236,7 +249,7 @@ impl RuntimeProfile {
         Ok(self)
     }
     pub fn with_call_control(mut self,routing:&[RpcProperty<'_>])->Result<Self,ProfileError>{
-        if self.call_incoming.is_none()||self.call_control.is_some(){return Err(ProfileError::InvalidConfiguration);}
+        if (self.call_incoming.is_none() && self.native_receivers.is_none()) || self.call_control.is_some(){return Err(ProfileError::InvalidConfiguration);}
         super::call_control::validate_routing(routing).map_err(|_|ProfileError::InvalidConfiguration)?;
         self.call_control=Some(properties(routing,&mut self.byte_length)?);Ok(self)
     }
@@ -348,6 +361,7 @@ impl RuntimeProfile {
             login_routing, gateway_uri: if derived_uri{None}else{Some(text(input.gateway_uri, false, &mut total)?)},
             gateway_metadata,
             poll_routing, logout_routing, incoming, offline_reception: false, client_ex: false, reference_decode_key: input.reference_decode_key,
+            native_receivers: None,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
             io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,byte_length:total,
         })
@@ -527,10 +541,19 @@ impl NativeHostingBackend {
         if !attempt.scope.matches(scope) || !scope.is_open() || scope.session_revoked() || !lock(&attempt.state).configured { return None; }
         self.profile.incoming.as_ref().map(Binding::borrowed)
     }
+    pub(super) fn original_native_binding(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Option<super::native_receiver::NativeReceiverBinding> {
+        let attempt = self.original(owner).ok()?;
+        if !attempt.scope.matches(scope) || !scope.is_open() || scope.session_revoked() || !lock(&attempt.state).configured { return None; }
+        super::native_receiver::NativeReceiverBinding::original(owner.clone(), scope.clone(), self.profile.native_receivers.clone()?).ok()
+    }
+    pub(super) fn original_message_receiver_ready(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
+        self.original_native_binding(owner, scope).is_some() || self.original_incoming_binding(owner, scope)
+            .is_some_and(|binding| binding.receiver_kind == super::smgw_text::SMGW_RECEIVER)
+    }
     pub(super) fn original_call_receiver_ready(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
         let Ok(attempt) = self.original(owner) else { return false; };
         attempt.scope.matches(scope) && scope.is_open() && !scope.session_revoked() && lock(&attempt.state).configured
-            && self.profile.call_incoming.is_some() && self.profile.call_control.is_some()
+            && (self.profile.call_incoming.is_some() || self.profile.native_receivers.is_some()) && self.profile.call_control.is_some()
     }
     #[cfg(test)]
     pub(super) fn pause_original_polls_for_test(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, paused: bool) -> Result<(), RuntimeError> {
@@ -551,6 +574,14 @@ impl NativeHostingBackend {
         if result.is_err() && self.original(owner).is_ok_and(|attempt| attempt.scope.session_revoked()) { Err(BackendFailure::SessionRevoked) } else { result }
     }
     async fn arm_original_client_ex(&self, attempt: &Attempt, commands: &RuntimeCommands) -> Result<(), BackendFailure> {
+        if let Some(policy) = &self.profile.native_receivers {
+            let routing = self.profile.call_control.as_deref().map(borrowed);
+            let setup = super::native_receiver::NativeReceiverSetup::capture(policy.clone(), self.profile.client_ex, routing.as_deref())
+                .map_err(|_| BackendFailure::Unavailable)?;
+            let receipt = commands.arm_native_receivers(&attempt.owner, &attempt.scope, setup).await.map_err(|_| BackendFailure::Disconnected)?;
+            if !receipt.matches(&attempt.owner, &attempt.scope) { return Err(BackendFailure::Disconnected); }
+            return Ok(());
+        }
         if !self.profile.client_ex { return Ok(()); }
         let binding = self.profile.incoming.as_ref().ok_or(BackendFailure::Unavailable)?;
         let receipt = commands.arm_client_ex(&attempt.owner, &attempt.scope, binding.borrowed()).await
@@ -566,7 +597,7 @@ impl NativeHostingBackend {
         let _admission = attempt.poll_work.lock().await;
         {
             let state = lock(&attempt.state);
-            if !state.configured || state.retired || state.logout_started || state.unregister_started || self.profile.incoming.is_none() || !self.profile.offline_reception {
+            if !state.configured || state.retired || state.logout_started || state.unregister_started || (self.profile.incoming.is_none() && self.profile.native_receivers.is_none()) || !self.profile.offline_reception {
                 return Err(RuntimeError::Closed);
             }
         }
@@ -1088,6 +1119,14 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                                     Ok(commands) => commands, Err(_) => { terminal(&sender, &attempt, BackendFailure::Disconnected); return; }
                                 };
                                 let mut retirement = Retirement::new(attempt.clone());
+                                if profile.native_receivers.is_some() {
+                                    match commands.configure_native_receivers(&attempt.owner, &attempt.scope, attempt.incarnation).await {
+                                        Ok(receipt) if receipt.matches(&attempt.owner, &attempt.scope) => {
+                                            lock(&attempt.state).configured = true; retirement.disarm();
+                                        }
+                                        _ => { terminal(&sender, &attempt, BackendFailure::Disconnected); return; }
+                                    }
+                                } else {
                                 match commands.configure(&attempt.owner, &attempt.scope, attempt.incarnation, profile.incoming.as_ref().map(Binding::borrowed)).await {
                                     Ok(receipt) if receipt.matches(&attempt.owner, &attempt.scope) => {
                                         if profile.client_ex {
@@ -1111,6 +1150,7 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                                         lock(&attempt.state).configured = true; retirement.disarm();
                                     }
                                     _ => { terminal(&sender, &attempt, BackendFailure::Disconnected); return; }
+                                }
                                 }
                             }
                             if matches!(callback.callback, Callback::Channels { .. }) {

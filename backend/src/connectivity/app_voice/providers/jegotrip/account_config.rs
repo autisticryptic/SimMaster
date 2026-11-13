@@ -162,6 +162,11 @@ pub struct ProfileConfig {
     /// Does not derive object/domain, activate AccountAlive or grant readiness.
     #[serde(default)]
     pub client_ex: bool,
+    /// Opt-in native local client adapter. None keeps legacy exact bindings.
+    /// Known MessageReceiver/Sip.Request and CallClientEx objects are installed
+    /// only on the original authenticated Common runtime, not from this flag.
+    #[serde(default)]
+    pub native_receivers: Option<super::native_receiver::NativeReceiverConfig>,
     /// Native Common bootstrap over the SAME explicit physical Router: the
     /// logical AccountEntry destination and DomainName/DomainId/AppId/CC come
     /// only from the matched getAppConfigs reply. Only valid with RouterCommon;
@@ -297,6 +302,7 @@ impl AccountConfig {
             RuntimeProfile::supplied_bootstrap(inputs,RuntimeBootstrapInputs{account_trust,routing:&routing,client_config_decode_key:client_key,
                 handoff_timeout:Duration::from_millis(bootstrap.handoff_timeout_ms)}).map_err(|_|INVALID)?
         }else{RuntimeProfile::supplied(inputs).map_err(|_|INVALID)?};
+        let profile=profile.with_native_receivers(p.native_receivers.as_ref()).map_err(|_|INVALID)?;
         let profile=profile.with_offline_reception(p.offline_reception).map_err(|_|INVALID)?;
         let profile=profile.with_client_ex(p.client_ex).map_err(|_|INVALID)?;
         let profile=profile.with_call_receiver(p.call_incoming.as_ref().map(|binding|super::call_binding::CallIncomingBinding{object_id:&binding.object_id,domain:&binding.domain})).map_err(|_|INVALID)?;
@@ -305,7 +311,9 @@ impl AccountConfig {
 
     pub(super) fn runtime_calls(&self) -> Result<Option<super::call_settings::CallSettings>, &'static str> {
         let Some(media) = &self.call_media else { return Ok(None); };
-        if self.profile.call_incoming.is_none() || self.profile.call_control.is_none() { return Err(INVALID); }
+        if self.profile.native_receivers.is_none() {
+            if self.profile.call_incoming.is_none() || self.profile.call_control.is_none() { return Err(INVALID); }
+        } else if self.profile.call_control.is_none() { return Err(INVALID); }
         let routing = borrowed(&media.routing)?; let properties = borrowed(&media.properties)?;
         let features = media.features.iter().map(|feature| feature.value.as_slice()).collect::<Vec<_>>();
         let key = media.reference_decode_key.as_ref().map(|key| ConfigDecodeKey::supplied(key.expose_to_backend().as_bytes()).map_err(|_| INVALID)).transpose()?;
@@ -487,6 +495,15 @@ fn private_router_bootstrap(b:&Option<RouterBootstrapConfig>)->Option<PrivateRou
     b.as_ref().map(|b|PrivateRouterBootstrapRef{routing:PrivateProperties(&b.routing),handoff_timeout_ms:b.handoff_timeout_ms})
 }
 #[derive(Serialize)]
+struct PrivateDomainFilter<'a> { mode: &'static str, values: &'a [Vec<u8>] }
+#[derive(Serialize)]
+struct PrivateNativeReceivers<'a> { direct_domains: Option<PrivateDomainFilter<'a>> }
+fn private_native_receivers(config: &Option<super::native_receiver::NativeReceiverConfig>) -> Option<PrivateNativeReceivers<'_>> {
+    config.as_ref().map(|config| PrivateNativeReceivers { direct_domains: config.direct_domains.as_ref().map(|filter| PrivateDomainFilter {
+        mode: match filter.mode { super::native_receiver::DomainMode::DenyList => "deny_list", super::native_receiver::DomainMode::AllowList => "allow_list" }, values: &filter.values,
+    }) })
+}
+#[derive(Serialize)]
 pub(super) struct PrivateProfileRef<'a> {
     route: PrivateProfileRoute<'a>, authority: &'a str, enable_sni: bool, identity_type: &'a str,
     domain_name: Option<&'a str>, domain_id: Option<&'a str>, application_id: Option<&'a str>, device_info_cc: Option<&'a str>,
@@ -498,6 +515,8 @@ pub(super) struct PrivateProfileRef<'a> {
     offline_reception: bool,
     #[serde(skip_serializing_if = "offline_disabled")]
     client_ex: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_receivers: Option<PrivateNativeReceivers<'a>>,
     bootstrap_via_router: Option<PrivateRouterBootstrapRef<'a>>,
     call_incoming:Option<PrivateCallIncomingRef<'a>>,call_control:Option<PrivateProperties<'a>>,
     connect_timeout_ms: u64, handshake_timeout_ms: u64, partial_timeout_ms: u64,
@@ -541,6 +560,7 @@ impl<'a> PrivateConfigRef<'a> {
                 incoming: p.incoming.as_ref().map(|b| PrivateIncomingRef { object_id: &b.object_id, domain: &b.domain, receiver_kind: &b.receiver_kind }),
                 offline_reception: p.offline_reception,
                 client_ex: p.client_ex,
+                native_receivers: private_native_receivers(&p.native_receivers),
                 bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
                 call_incoming:p.call_incoming.as_ref().map(|binding|PrivateCallIncomingRef{object_id:&binding.object_id,domain:&binding.domain}),
                 call_control:p.call_control.as_ref().map(|properties|PrivateProperties(properties)),
@@ -577,6 +597,7 @@ pub(super) fn private_profile_ref(p: &ProfileConfig) -> PrivateProfileRef<'_> {
         incoming: p.incoming.as_ref().map(|b| PrivateIncomingRef { object_id: &b.object_id, domain: &b.domain, receiver_kind: &b.receiver_kind }),
         offline_reception: p.offline_reception,
         client_ex: p.client_ex,
+        native_receivers: private_native_receivers(&p.native_receivers),
         bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
         call_incoming: p.call_incoming.as_ref().map(|b| PrivateCallIncomingRef { object_id: &b.object_id, domain: &b.domain }),
         call_control: p.call_control.as_deref().map(private_properties),

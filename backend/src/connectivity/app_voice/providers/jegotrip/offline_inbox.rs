@@ -71,7 +71,8 @@ fn context_key(context: &InboxScope, page: &OwnedOfflinePage) -> Result<String, 
     if !page.matches(&context.owner, &context.scope) { return Err(SCOPE); }
     let receiver = context.receiver.as_ref().ok_or(SCOPE)?;
     let mut digest = Context::new(&SHA256);
-    for value in [page.identity_key().as_bytes(), receiver.object.as_slice(), receiver.domain.as_slice(), receiver.kind.as_slice()] {
+    if receiver.domain.is_none() { digest.update(b"native-client-adapter-v1\0"); }
+    for value in [page.identity_key().as_bytes(), receiver.object.as_slice(), receiver.domain.as_ref().map_or(&[][..], |domain| domain.as_slice()), receiver.kind.as_slice()] {
         digest.update(&(value.len() as u64).to_be_bytes()); digest.update(value);
     }
     Ok(digest.finish().as_ref().iter().map(|byte| format!("{byte:02x}")).collect())
@@ -139,7 +140,7 @@ impl InboxScope {
                 if record.position < current { continue; } // 已提交的原位置 fence，绝不再投影。
                 let find = |name: &[u8]| decoded.properties.iter().find(|property| property.key == name).map(|property| property.value.to_vec());
                 let message = IncomingMessage { body: decoded.body.to_vec(), from: find(b"Sip.Message.From"), time: find(b"Sip.Message.Time") };
-                let size = account_inbox::message_size(&message)? + receiver.object.len() as i64 + receiver.domain.len() as i64
+                let size = account_inbox::message_size(&message)? + receiver.object.len() as i64 + receiver.domain.as_ref().map_or(0, |domain| domain.len()) as i64
                     + decoded.receiver_kind.len() as i64 + record.envelope.len() as i64;
                 let (local, completed, total, stored): (i64, i64, i64, i64) = tx.query_row("SELECT
                     COALESCE(SUM(line_id=?1 AND (reply_state='pending' OR NOT EXISTS(SELECT 1 FROM app_voice_sms_projection p WHERE p.inbox_id=i.id AND p.line_id=i.line_id AND p.revision=i.revision))),0),
@@ -153,7 +154,7 @@ impl InboxScope {
                     receiver_object,receiver_domain,receiver_kind,reply_state,created_at,offline_identity,offline_envelope)
                     VALUES(?1,?2,?3,'offline',0,?4,?5,?6,?7,?8,?9,?10,?11,'offline_committed',?12,?13,?14)",
                     params![self.line_id, self.revision as i64, self.nonce, record.position, account_inbox::fingerprint(&message), message.body.as_slice(), message.from.as_deref(), message.time.as_deref(),
-                        receiver.object.as_slice(), receiver.domain.as_slice(), decoded.receiver_kind, stamp, key, record.envelope]).map_err(|_| STORAGE)?;
+                        receiver.object.as_slice(), receiver.domain.as_ref().map(|domain| domain.as_slice()), decoded.receiver_kind, stamp, key, record.envelope]).map_err(|_| STORAGE)?;
                 let id = tx.last_insert_rowid();
                 let classified = (decoded.receiver_kind == receiver.kind.as_slice()).then(|| smgw_text::classify(decoded.receiver_kind, &message)).flatten();
                 let classification = if classified.is_some() { "smgw_text" } else { "unclassified" };

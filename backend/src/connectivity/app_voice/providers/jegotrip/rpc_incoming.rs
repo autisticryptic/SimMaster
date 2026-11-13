@@ -77,6 +77,7 @@ pub struct IncomingDispatcher {
     domain: Vec<u8>,
     receiver_kind: Vec<u8>,
     latest_gateway_oid: std::sync::Mutex<Option<zeroize::Zeroizing<Vec<u8>>>>,
+    native: Option<super::native_receiver::NativeReceiverBinding>,
 }
 
 const MAX_GATEWAY_OID_BYTES: usize = 256;
@@ -100,7 +101,14 @@ impl IncomingDispatcher {
         }
         if binding.receiver_kind.contains(&b'*') || !connection.is_open() { return Err(CodecError::InvalidField); }
         Ok(Self { owner, connection, object_id: binding.object_id.to_vec(), domain: binding.domain.to_vec(),
-            receiver_kind: binding.receiver_kind.to_vec(), latest_gateway_oid: std::sync::Mutex::new(None) })
+            receiver_kind: binding.receiver_kind.to_vec(), latest_gateway_oid: std::sync::Mutex::new(None), native: None })
+    }
+
+    pub(super) fn for_native_client(owner: AttemptOwner, scope: RpcConnectionScope, policy: std::sync::Arc<super::native_receiver::NativeReceiverPolicy>)
+        -> Result<Self, CodecError> {
+        let native = super::native_receiver::NativeReceiverBinding::original(owner.clone(), scope.clone(), policy)?;
+        Ok(Self { owner, connection: scope, object_id: super::native_receiver::MESSAGE_OBJECT.to_vec(), domain: Vec::new(),
+            receiver_kind: super::smgw_text::SMGW_RECEIVER.to_vec(), latest_gateway_oid: std::sync::Mutex::new(None), native: Some(native) })
     }
 
     pub(super) fn binding(&self) -> IncomingBinding<'_> {
@@ -131,41 +139,44 @@ impl IncomingDispatcher {
     /// before parsing its arguments. In-scope malformed routing is an error.
     pub fn on_batch_request(&self, request: &IncomingBatchRequest) -> Result<Option<IncomingMessage>, CodecError> {
         if !request.ticket().matches(&self.owner, &self.connection) { return Ok(None); }
-        self.dispatch(&request.request())
+        self.dispatch(&request.request(), super::native_receiver::ReceiverTransport::Batch)
     }
 
     pub(super) fn on_direct_request(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, request: &RpcRequest<'_>)
         -> Result<Option<IncomingMessage>, CodecError> {
         if !self.matches(owner, scope) { return Ok(None); }
-        self.dispatch(&BatchRequest { method: request.method, arguments: request.arguments, metadata: request.metadata.clone() })
+        self.dispatch(&BatchRequest { method: request.method, arguments: request.arguments, metadata: request.metadata.clone() }, super::native_receiver::ReceiverTransport::Direct)
     }
 
     /// 积压提示是位置，不是消息正文；先匹配原对象/域再读取参数。
     pub(super) fn on_direct_offline_hint(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, request: &RpcRequest<'_>)
         -> Result<Option<i64>, CodecError> {
         if !self.matches(owner, scope) || request.method != super::rpc_offline::MORE_OFFLINE_METHOD.as_bytes() { return Ok(None); }
-        self.offline_hint(&request.metadata, request.arguments).map(Some)
+        self.offline_hint(&request.metadata, request.arguments, super::native_receiver::ReceiverTransport::Direct).map(Some)
     }
     pub(super) fn on_batch_offline_hint(&self, request: &IncomingBatchRequest) -> Result<Option<i64>, CodecError> {
         if !request.ticket().matches(&self.owner, &self.connection) { return Ok(None); }
         let request = request.request();
         if request.method != super::rpc_offline::MORE_OFFLINE_METHOD.as_bytes() { return Ok(None); }
-        self.offline_hint(&request.metadata, request.arguments).map(Some)
+        self.offline_hint(&request.metadata, request.arguments, super::native_receiver::ReceiverTransport::Batch).map(Some)
     }
-    fn offline_hint(&self, metadata: &[RpcProperty<'_>], arguments: &[u8]) -> Result<i64, CodecError> {
+    fn offline_hint(&self, metadata: &[RpcProperty<'_>], arguments: &[u8], transport: super::native_receiver::ReceiverTransport) -> Result<i64, CodecError> {
         if metadata.len() > MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
         for (index, property) in metadata.iter().enumerate() {
             if property.key.len() > MAX_FIELD_BYTES || property.value.len() > MAX_FIELD_BYTES { return Err(CodecError::TooLarge); }
             if metadata[..index].iter().any(|prior| prior.key == property.key) { return Err(CodecError::DuplicateKey); }
         }
         let property = |key: &[u8]| metadata.iter().find(|property| property.key == key).map(|property| property.value);
-        if property(b"id") != Some(self.object_id.as_slice()) || property(b"domain") != Some(self.domain.as_slice()) {
+        if let Some(native) = &self.native {
+            if !native.matches(&self.owner, &self.connection) { return Err(CodecError::InvalidField); }
+            native.policy().validate(super::native_receiver::ReceiverObject::Message, metadata, transport)?;
+        } else if property(b"id") != Some(self.object_id.as_slice()) || property(b"domain") != Some(self.domain.as_slice()) {
             return Err(CodecError::InvalidField);
         }
         super::rpc_offline::decode_more_offline(arguments)
     }
 
-    fn dispatch(&self, request: &BatchRequest<'_>) -> Result<Option<IncomingMessage>, CodecError> {
+    fn dispatch(&self, request: &BatchRequest<'_>, transport: super::native_receiver::ReceiverTransport) -> Result<Option<IncomingMessage>, CodecError> {
         if request.method != ONLINE_MESSAGE_METHOD.as_bytes() { return Ok(None); }
         if request.metadata.len() > MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
         for (index, p) in request.metadata.iter().enumerate() {
@@ -173,7 +184,10 @@ impl IncomingDispatcher {
             if request.metadata[..index].iter().any(|prior| prior.key == p.key) { return Err(CodecError::DuplicateKey); }
         }
         let property = |key: &[u8]| request.metadata.iter().find(|p| p.key == key).map(|p| p.value);
-        if property(b"id") != Some(self.object_id.as_slice()) || property(b"domain") != Some(self.domain.as_slice()) {
+        if let Some(native) = &self.native {
+            if !native.matches(&self.owner, &self.connection) { return Err(CodecError::InvalidField); }
+            native.policy().validate(super::native_receiver::ReceiverObject::Message, &request.metadata, transport)?;
+        } else if property(b"id") != Some(self.object_id.as_slice()) || property(b"domain") != Some(self.domain.as_slice()) {
             return Err(CodecError::InvalidField);
         }
         // __magic is opaque native request dedup input, never interpreted as

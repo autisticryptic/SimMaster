@@ -154,6 +154,16 @@ libmtc SHA256：`57086cd624d8227dc1b1b64a63d7c8b2258f87b261779b681a9bfd306ad9d2e
 初次 IDA MCP 连接被拒绝后，用户手动打开原 libmtc；实时 metadata 的 SHA/base 已匹配。
 后续全部仅只读查询，不保存或修改 IDB；这些字节证据仍不是手机授信迁移成功的实测。
 
+### 原生本地接收器配置（新增，须自身SHA验证）
+
+原生`Router/Common`模式可显式配置 `runtime.profile.native_receivers: {}`，使用已核对的本地`MessageReceiver/Sip.Request`与`CallClientEx`对象；与旧`incoming`、`call_incoming`互斥，缺省仍保留旧精确绑定，不改已保存模板。新模式不从出站`domain`、App UUID或DomainName伪造接收域。
+
+`native_receivers.direct_domains`可省略（原空deny-list），或明确给 `{ "mode": "allow_list" / "deny_list", "values": [字节数组...] }`。它仅过滤同一原生连接的DIRECT请求；已匹配外层账号/epoch/token的batch走独立本地对象表，不重复DIRECT域检查。两个路径仍严格校验原owner/scope、对象、方法、计数及大小。当前只支持无facet/adapter/cloud限定的精确对象；不做默认定位器或任意引用回退。
+
+`client_ex`、`offline_reception`仍是独立明确选项；来电控制`call_control`及媒体配置不被推断，独立Alive未注册时checkAlive仍false/0。早到短信仅在原HostingPending预算内有界等待，不在确认前入库或ACK；后续原包/SMS/通知事务、删除、cursor和Join规则保持。native inbox的单一接收domain记NULL，表示无此固定绑定，不冒称记录了一个远端域，也不回填旧记录。
+
+本轮新增生产代码及回归需自己的双Actions与正式制品验证，当前最新状态见[交接](HANDOFF.md)。
+
 ## 6. 仍需继续完成的部分
 
 1. 旧任务36：真实接收器默认/动态绑定、适用 AccountAlive、来电通知及媒体配置仍需完成。原生 `moreOfflineMessages → getOfflineMessages` 积压软件已由0c4的自身双Actions/正式制品核验，详见[原生离线积压](JEGOTRIP_NATIVE_OFFLINE_INBOX.md)，不等于真实收件或完整SDK。新增 `profile.client_ex` 默认为false，仅复用已有原绑定；空通知map唤醒、原token匹配撤销及不可重连错误已由38ae8d7自身双Actions/正式制品核验，不等于默认/动态SDK全部装配。它不自动填接收域、不申请Alive；无独立注册证明时checkAlive仍false/0，详见[原生控制子集](JEGOTRIP_NATIVE_HOSTING_DELIVERY.md#显式-clientex-控制子集)。

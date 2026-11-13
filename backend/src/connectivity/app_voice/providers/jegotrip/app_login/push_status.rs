@@ -16,9 +16,9 @@ impl PushTemplateStatus {
     pub(super) fn inspect(template:Option<&RuntimeTemplate>)->Self {
         let Some(template)=template else {return Self::default();};
         let p=&template.profile;
-        Self {runtime_template_present:true,sms_receiver_present:p.incoming.is_some(),
-            sip_request_receiver_selected:p.incoming.as_ref().is_some_and(|b|b.receiver_kind.as_slice()==b"Sip.Request"),
-            call_receiver_present:p.call_incoming.is_some(),call_control_present:p.call_control.is_some(),
+        Self {runtime_template_present:true,sms_receiver_present:p.incoming.is_some() || p.native_receivers.is_some(),
+            sip_request_receiver_selected:p.native_receivers.is_some() || p.incoming.as_ref().is_some_and(|b|b.receiver_kind.as_slice()==b"Sip.Request"),
+            call_receiver_present:p.call_incoming.is_some() || p.native_receivers.is_some(),call_control_present:p.call_control.is_some(),
             call_media_present:template.call_media.is_some(),reconnect_configured:template.reconnect.is_some()}
     }
 }

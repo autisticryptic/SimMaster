@@ -109,6 +109,7 @@ pub struct ArcProtocol {
     call_incoming:Option<CallDispatcher>,
     client_ex: Option<super::rpc_client_ex::ClientExDispatcher>,
     client_ex_registration: Option<super::rpc_client_ex::ClientExRegistration>,
+    native_receivers: Option<std::sync::Arc<super::native_receiver::NativeReceiverSetup>>,
     direct_pending: BTreeMap<i32, PendingDirect>, direct_seen: DirectHistory, direct_last_id: i32,
 }
 
@@ -118,7 +119,7 @@ impl fmt::Debug for ArcProtocol {
 
 impl ArcProtocol {
     pub fn new(owner: AttemptOwner) -> Self {
-        Self { rpc: ArcRpcSession::new(owner), assembler: CallAssembler::default(), incoming: None, call_incoming:None, client_ex: None, client_ex_registration: None,
+        Self { rpc: ArcRpcSession::new(owner), assembler: CallAssembler::default(), incoming: None, call_incoming:None, client_ex: None, client_ex_registration: None, native_receivers: None,
             direct_pending: BTreeMap::new(), direct_seen: DirectHistory::new(Instant::now()), direct_last_id: 0 }
     }
 
@@ -140,6 +141,7 @@ impl ArcProtocol {
         if self.rpc.phase() == ArcPhase::Closed { self.assembler.close(); }
     }
     pub fn close(&mut self) {
+        self.native_receivers = None;
         self.rpc.close(); self.assembler.close(); self.incoming = None; self.call_incoming=None; self.client_ex=None; self.client_ex_registration=None; self.direct_pending.clear(); self.direct_seen.clear();
     }
 
@@ -148,7 +150,7 @@ impl ArcProtocol {
     }
 
     pub fn install_incoming(&mut self, binding: IncomingBinding<'_>) -> Result<(), ProtocolError> {
-        if self.incoming.is_some() || self.client_ex.as_ref().is_some_and(|dispatcher| !dispatcher.matches_binding(&binding)) {
+        if self.native_receivers.is_some() || self.incoming.is_some() || self.client_ex.as_ref().is_some_and(|dispatcher| !dispatcher.matches_binding(&binding)) {
             return Err(CodecError::InvalidField.into());
         }
         self.incoming = Some(self.rpc.incoming_dispatcher(binding)?);
@@ -156,12 +158,39 @@ impl ArcProtocol {
     }
 
     pub fn install_calls(&mut self,binding:CallIncomingBinding<'_>)->Result<(),ProtocolError>{
-        if self.call_incoming.is_some(){return Err(CodecError::InvalidField.into());}
+        if self.native_receivers.is_some() || self.call_incoming.is_some(){return Err(CodecError::InvalidField.into());}
         self.call_incoming=Some(self.rpc.incoming_call_dispatcher(binding)?);Ok(())
     }
 
+    pub(super) fn arm_native_receivers(&mut self, setup: std::sync::Arc<super::native_receiver::NativeReceiverSetup>) -> Result<(), ProtocolError> {
+        if !self.rpc.can_arm_native_receivers() || self.native_receivers.is_some() || self.client_ex_registration.is_some()
+            || self.incoming.is_some() || self.call_incoming.is_some() || self.client_ex.is_some() {
+            return Err(CodecError::InvalidField.into());
+        }
+        self.native_receivers = Some(setup); Ok(())
+    }
+    pub(super) fn native_setup(&self) -> Option<std::sync::Arc<super::native_receiver::NativeReceiverSetup>> {
+        self.rpc.native_receiver_scope().then(|| self.native_receivers.clone()).flatten()
+    }
+    pub(super) fn native_message_dispatcher(&self) -> Result<IncomingDispatcher, ProtocolError> {
+        let setup = self.native_setup().ok_or(CodecError::InvalidField)?;
+        Ok(self.rpc.incoming_native_dispatcher(setup.policy.clone())?)
+    }
+    pub(super) fn native_call_dispatcher(&self) -> Result<CallDispatcher, ProtocolError> {
+        let setup = self.native_setup().ok_or(CodecError::InvalidField)?;
+        Ok(self.rpc.native_call_dispatcher(setup.policy.clone())?)
+    }
+    fn activate_native_receivers(&mut self) -> Result<(), ProtocolError> {
+        let Some(setup) = self.native_setup() else { return Ok(()); };
+        self.incoming = Some(self.rpc.incoming_native_dispatcher(setup.policy.clone())?);
+        self.call_incoming = Some(self.rpc.native_call_dispatcher(setup.policy.clone())?);
+        if setup.client_ex { self.client_ex = Some(self.rpc.native_client_ex_dispatcher(setup.policy.clone())?); }
+        if let Some(routing) = setup.control() { self.rpc.configure_call_control(&routing)?; }
+        Ok(())
+    }
+
     pub(super) fn arm_client_ex(&mut self, binding: IncomingBinding<'_>) -> Result<(), ProtocolError> {
-        if self.rpc.phase() != ArcPhase::Initial || self.client_ex.is_some() || self.client_ex_registration.is_some() {
+        if self.native_receivers.is_some() || self.rpc.phase() != ArcPhase::Initial || self.client_ex.is_some() || self.client_ex_registration.is_some() {
             return Err(CodecError::InvalidField.into());
         }
         self.client_ex_registration = Some(super::rpc_client_ex::ClientExRegistration::capture(binding)?); Ok(())
@@ -170,7 +199,7 @@ impl ArcProtocol {
     /// The same original CommonObject registered as MessageReceiver dispatches
     /// ClientEx first. No object/domain/token is accepted from the caller here.
     pub(super) fn install_client_ex(&mut self) -> Result<(), ProtocolError> {
-        if self.client_ex.is_some() { return Err(CodecError::InvalidField.into()); }
+        if self.native_receivers.is_some() || self.client_ex.is_some() { return Err(CodecError::InvalidField.into()); }
         let binding = self.incoming.as_ref().ok_or(CodecError::InvalidField)?.binding();
         self.client_ex = Some(self.rpc.client_ex_dispatcher(binding)?); Ok(())
     }
@@ -213,6 +242,7 @@ impl ArcProtocol {
 
     pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
         let (id, bytes) = self.rpc.prepare_logout(routing)?;
+        self.native_receivers = None;
         self.incoming = None; self.call_incoming=None; self.client_ex=None; self.client_ex_registration=None; self.direct_pending.clear(); self.direct_seen.clear();
         self.packets(id, bytes.expose_to_transport())
     }
@@ -256,6 +286,7 @@ impl ArcProtocol {
             CallKind::Reply => match self.rpc.on_reply(owner, connection, message.payload.expose_to_transport()) {
                 Ok(Some(reply)) => {
                     if matches!(&reply, ArcReply::Login(callback) if callback.callback == (super::controller::Callback::SdkLogin { success: true })) {
+                        self.activate_native_receivers()?;
                         if let Some(registration) = self.client_ex_registration.take() {
                             self.client_ex = Some(self.rpc.client_ex_dispatcher(registration.binding())?);
                         }

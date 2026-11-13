@@ -96,9 +96,9 @@ pub(super) struct InboxScope {
     pub(super) receiver: Option<ReceiverContext>,
     pub(super) notifications: Result<Option<Box<dyn account_notifications::NoticeSnapshot>>, &'static str>,
 }
-pub(super) struct ReceiverContext { pub(super) object: Zeroizing<Vec<u8>>, pub(super) domain: Zeroizing<Vec<u8>>, pub(super) kind: Zeroizing<Vec<u8>> }
+pub(super) struct ReceiverContext { pub(super) object: Zeroizing<Vec<u8>>, pub(super) domain: Option<Zeroizing<Vec<u8>>>, pub(super) kind: Zeroizing<Vec<u8>> }
 impl ReceiverContext {
-    pub(super) fn bytes(&self) -> usize { self.object.len() + self.domain.len() + self.kind.len() }
+    pub(super) fn bytes(&self) -> usize { self.object.len() + self.domain.as_ref().map_or(0, |value| value.len()) + self.kind.len() }
 }
 impl fmt::Debug for InboxScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("InboxScope(<redacted>)") }
@@ -118,7 +118,16 @@ impl InboxScope {
             if value.is_empty() || value.len() > MAX_FIELD_BYTES { return Err(INVALID); }
         }
         self.receiver = Some(ReceiverContext { object: Zeroizing::new(binding.object_id.to_vec()),
-            domain: Zeroizing::new(binding.domain.to_vec()), kind: Zeroizing::new(binding.receiver_kind.to_vec()) });
+            domain: Some(Zeroizing::new(binding.domain.to_vec())), kind: Zeroizing::new(binding.receiver_kind.to_vec()) });
+        Ok(self)
+    }
+    pub(super) fn with_native_receiver(mut self, binding: &super::native_receiver::NativeReceiverBinding) -> Result<Self, &'static str> {
+        if self.receiver.is_some() || !binding.matches(&self.owner, &self.scope) { return Err(SCOPE); }
+        // NULL is intentional: this mode has no single mandatory wire domain.
+        // Never store an invented empty/sentinel domain as if it came from the
+        // peer, nor reclassify old NULL-context rows using today's configuration.
+        self.receiver = Some(ReceiverContext { object: Zeroizing::new(super::native_receiver::MESSAGE_OBJECT.to_vec()),
+            domain: None, kind: Zeroizing::new(smgw_text::SMGW_RECEIVER.to_vec()) });
         Ok(self)
     }
     fn commit(&self, database: &Database, kind: &'static str, epoch: u32, sequence: i32, message: &IncomingMessage)
@@ -128,7 +137,7 @@ impl InboxScope {
         let size = message_size(message)? + self.receiver.as_ref().map_or(0, |receiver| receiver.bytes() as i64);
         let fingerprint = fingerprint(message);
         let object = self.receiver.as_ref().map(|receiver| receiver.object.as_slice());
-        let domain = self.receiver.as_ref().map(|receiver| receiver.domain.as_slice());
+        let domain = self.receiver.as_ref().and_then(|receiver| receiver.domain.as_ref().map(|domain| domain.as_slice()));
         let receiver_kind = self.receiver.as_ref().map(|receiver| receiver.kind.as_slice());
         // Never hold the NONBLOCKING IO poll gate across SQLite/config IO. The
         // captured observation can be committed historically if physical close

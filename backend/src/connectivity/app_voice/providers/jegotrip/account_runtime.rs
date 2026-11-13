@@ -179,8 +179,7 @@ impl ManagedRun {
         Ok(())
     }
     fn install_message_readiness(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) {
-        let verified_receiver = self.backend.original_incoming_binding(owner, scope)
-            .is_some_and(|binding| binding.receiver_kind == super::smgw_text::SMGW_RECEIVER);
+        let verified_receiver = self.backend.original_message_receiver_ready(owner, scope);
         if self.sms_supported && self.accepting.load(Ordering::SeqCst) && verified_receiver {
             *lock(&self.messaging_readiness) = Some(MessagingReadiness { owner: owner.clone(), scope: scope.clone() });
         }
@@ -193,8 +192,7 @@ impl ManagedRun {
         if !consumer_live { return false; }
         let readiness = lock(&self.messaging_readiness);
         readiness.as_ref().is_some_and(|original| original.scope.is_open()
-            && self.backend.original_incoming_binding(&original.owner, &original.scope)
-                .is_some_and(|binding| binding.receiver_kind == super::smgw_text::SMGW_RECEIVER))
+            && self.backend.original_message_receiver_ready(&original.owner, &original.scope))
     }
     fn call_ready(&self, now: u64) -> bool {
         if !self.accepting.load(Ordering::SeqCst) || self.stopping.load(Ordering::SeqCst)
@@ -561,7 +559,8 @@ impl AccountManager {
         if stored.revision != metadata.revision { return Err("app_account_revision_conflict"); }
         config.validate(now)?;
         let inbox_nonce = local_nonce()?;
-        let sms_supported = config.profile.incoming.as_ref().is_some_and(|binding| binding.receiver_kind == super::smgw_text::SMGW_RECEIVER);
+        let sms_supported = config.profile.native_receivers.is_some()
+            || config.profile.incoming.as_ref().is_some_and(|binding| binding.receiver_kind == super::smgw_text::SMGW_RECEIVER);
         let credential_expiry = config.credentials.sdk.expires_at_unix_seconds;
         let cleanup_on_disconnect = config.cleanup_on_disconnect;
         let reconnect = config.reconnect;
@@ -816,19 +815,34 @@ struct PendingDelivery { owner: super::session::AttemptOwner, scope: super::rpc_
 async fn handle_message(run: &ManagedRun, controller: &mut HostingController, delivery: PendingDelivery,
     pending: &mut VecDeque<PendingDelivery>) {
     if !run.accepting.load(Ordering::SeqCst) { return; }
-    if controller.phase() != Phase::Hosted { *lock(&run.error) = Some("app_account_inbox_not_hosted"); run.retire(); return; }
     if controller.resource_owner().as_ref() != Some(&delivery.owner)
         || !run.backend.original_scope(&delivery.owner).is_some_and(|scope| scope.matches(&delivery.scope)) { return; }
     let bytes = pending.iter().map(|message| message.message.byte_length()).sum::<usize>();
     if pending.len() >= MAX_PENDING_MESSAGES || bytes.saturating_add(delivery.message.byte_length()) > MAX_PENDING_MESSAGE_BYTES {
         *lock(&run.error) = Some("app_account_inbox_backpressure"); run.retire(); return;
     }
-    let binding = match run.backend.original_incoming_binding(&delivery.owner, &delivery.scope) {
-        Some(binding) => binding, None => { *lock(&run.error) = Some("app_account_inbox_scope_invalid"); run.retire(); return; }
-    };
+    if controller.phase() != Phase::Hosted {
+        // Native receivers activate synchronously with the matched login. An
+        // early original message may therefore arrive while registration is
+        // still pending. Retain only its bounded ticket, with NO persistence,
+        // notification, ACK or new deadline; the existing controller deadline
+        // must still reach its own HostingAck before this queue is consumed.
+        if controller.phase() == Phase::HostingPending && run.backend.original_native_binding(&delivery.owner, &delivery.scope).is_some() {
+            pending.push_back(delivery); return;
+        }
+        *lock(&run.error) = Some("app_account_inbox_not_hosted"); run.retire(); return;
+    }
     let notifications=run.notifications.as_ref().map(|planner|planner.capture()).transpose();
-    let context = match InboxScope::original(&run.line_id, run.revision, &run.inbox_nonce, &delivery.owner, &delivery.scope)
-        .and_then(|context| context.with_receiver(binding)).map(|context|context.with_notifications(notifications)) {
+    let context = InboxScope::original(&run.line_id, run.revision, &run.inbox_nonce, &delivery.owner, &delivery.scope)
+        .and_then(|context| {
+            if let Some(binding) = run.backend.original_native_binding(&delivery.owner, &delivery.scope) {
+                context.with_native_receiver(&binding)
+            } else {
+                let binding = run.backend.original_incoming_binding(&delivery.owner, &delivery.scope).ok_or("app_account_inbox_scope_invalid")?;
+                context.with_receiver(binding)
+            }
+        }).map(|context| context.with_notifications(notifications));
+    let context = match context {
         Ok(context) => context, Err(code) => { *lock(&run.error) = Some(code); run.retire(); return; }
     };
     let result = match &delivery.message {

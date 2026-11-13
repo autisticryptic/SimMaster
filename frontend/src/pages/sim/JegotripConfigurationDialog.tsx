@@ -74,6 +74,7 @@ export default function JegotripConfigurationDialog({ open, onClose, onSaved }: 
       {advanced && <Stack id="jegotrip-private-installation" spacing={2}>
         <Typography variant="caption" color="text.secondary">完整 JSON 格式为 version: 1、http 和 runtime。http.device_identity_mode 默认为 store，device_id 可省略；static 仅保留旧固定值兼容，不能跨号码复用。SDK 设备参数、ClientId、接收器 namespace 和媒体仍是独立原生上下文，不会被 App UUID 擅自替换。runtime 为 null 仅保留认证兼容。</Typography>
         <Typography variant="caption" color="text.secondary">可选 http.endpoints.device_sync 与 http.device_sync_profile 仅供已授信复用后的原设备报告。只填写本人手机观察到的 App 版本/版本码、型号、OS、渠道等资料；不制造厂商推送 token、MAC 或硬件参数。userId 从本次 user-info.accountid 取得，device_id/imei 固定使用所选原 App UUID；未配置报告资料时不发送同步。</Typography>
+        <Typography variant="caption" color="text.secondary">可选 runtime.profile.native_receivers: {`{}`} 使用已还原的原生本地 MessageReceiver／Sip.Request 与 CallClientEx，不再手填这两个接收对象的固定域；仅用于原 Router/Common 连接，与旧 incoming／call_incoming 精确绑定互斥。DIRECT 域过滤与已认证 batch 分开，未知 adapter／facet 仍拒绝。来电控制、媒体与独立 Alive 注册不会因此就绪。</Typography>
         <Button component="label" variant="outlined" disabled={busy}>选择私有安装 JSON
           <input hidden type="file" accept=".json,application/json" onChange={(event) => {
             const file = event.target.files?.[0]
