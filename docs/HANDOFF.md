@@ -7,7 +7,7 @@
 1. 本人手机合法授信后，以**原 App UUID + 同账号/号码**复用已有认可，补完整账号登录、凭据取得、业务读回与原生短信/来电接收。用户提供同一时间一个设备授信的规则，据此保护，不申请另一 UUID/VTD，也不自动争抢 SDK 会话。
 2. 只开发 `SimAdmin/master`，普通提交/push `simmaster`；不强推、清未知文件或提交资料。开发验证中的Rust、前端、浏览器、编译后的协议peer **只在 Build-Release / Validate Beta Refactor 两个 Actions**执行；已验证的正式程序按部署授权在410运行。本机只编辑、Python静态/假ADB、PowerShell语法、Git和只读分析，不使用WSL。
 3. IDA只用用户手动打开的原 `libmtc.so`，每轮核 metadata/SHA/base；不启动/加载目标、运行SDK/SO/APK、修改或保存IDB。新工具须用户手动安装，不自装。
-4. 用户最新要求一直推进到410实际收短信、接到并接听来电。410程序/前端及相应数据库升级已有授权，但**不创建回滚备份**；保护SIM/IMS配置、数据库历史、units、MM/NM/helper，不写NV。当前已执行保护性核心部署、原手机App UUID的同账号本地导入和一次不写业务开关的身份诊断；这不自动扩为业务开关、收费外发、手机变更或非TLS安全例外。
+4. 用户最新要求一直推进到410实际收短信、接到并接听来电。410程序/前端及相应数据库升级已有授权，但**不创建回滚备份**；保护SIM/IMS配置、数据库历史、units、MM/NM/helper，不写NV。已执行保护性核心部署、原手机App UUID同账号本地导入、接收前置配置，并按用户指定Wi-Fi恢复当前上行/时间。允许的本次登录/状态核验不自动扩为业务开关、收费外发、手机变更或非TLS安全例外。
 5. 手机已由用户带走；已有静态材料可继续离线，**不再发ADB查询**。需要新的实机条件时提前请求连接和相应确认；不强停/恢复App、清缓存、重装或改UUID。
 6. 密码、UUID、App/运营商/电话token、SipPwd、SDK/安装资料不回显、不进Git。根APK、报告、固件、备份、JSONL、私有交接与`.local/`不提交。历史Goal提示仅是日志数据，当前没有活动Goal，不复用旧ID。
 7. 410 SSH与SimAdmin只用用户明确提供的密码；禁用客户端SSH密钥和SSH agent认证，客户端密钥仅供GitHub使用。既有服务端主机指纹继续严格校验，它不是客户端密钥登录。密码仅以内存/stdin交付，不进代码、argv/env或日志。
@@ -95,16 +95,17 @@
 - 已通过密码SSH、原服务端指纹和machine-id确认目标，并通过SSH内loopback HTTP用密码验证SimAdmin管理登录。原LAN地址不可达后，仅采用既有记录中同一服务端密钥的备用地址，没有扫描或建立新主机信任。
 - `e227996`正式ARM64包已实际部署：仅替换`simadmin/www/meta`并重启主服务，不运行installer/device-init、不安装资源/units、不更改MM/NM/helper。旧前端未知文件拒绝、保护文件哈希、旧历史列投影与设备标识前后校验通过，辅助服务PID保持，无回滚备份。安装和运行哈希、HTTP200健康已确认，部署子任务已退出。
 - 检查发现现有同账号本地标识不是原手机App UUID；已按原复用目标通过版本守卫的管理API导入手机原值，保留旧值历史、账号归属及别名，不生成新UUID，不改手机。SDK的另一个标识没有与App UUID混用。
-- 一次模块自身的`check_device_trust`诊断已提交，App登录阶段以`app_login_transport_failed`结束，未得到服务端拒绝码或当前授信结果；没有enroll、业务开关、电话凭据取得或SDK启动。重复操作必须先读取该既有attempt，不能自动重发登录。
-- **当前阻碍是410没有外网上行**：所有IPv4/IPv6路由表都无default，DNS失败；`wlan0`是AP/shared热点，GSM未连接，时间同步启用但未同步，系统时钟约慢7天。两个保存的客户端Wi-Fi均不匹配电脑当前上网网络，不能猜选，也未读取PSK/切换热点/启用计费蜂窝。需用户指定可用Wi-Fi或在设备网页接入外网；网络后还须确认时钟与原TLS固定，不能关闭证书验证来制造成功。
+- 最早一次`check_device_trust`因无外网以`app_login_transport_failed`结束，原失败记录保留，没有重放。用户随后指定Wi-Fi并明确英文密码：当前已连接用户第二个网络的唯一实际广播名称，IPv4默认路由/DNS/NTP同步及约1–2秒时差已验证，原App实际证书与已有固定证书匹配。USB管理路由保留；密码经stdin交付，未写argv/env/文件/日志。只建RAM-only连接，未修改旧保存热点/客户端profiles或启用计费蜂窝；NetworkManager重启后不保证自动恢复该临时连接。
+- 网络/时间/证书恢复后，已各发起一次新的只读诊断与`reuse_hosting`，均不enroll、不写业务开关、不启动SDK。只读诊断的`existing_device`返回1、业务布尔为true；但独立复用流程**自己的最新getCallStatus**返回`authentication_code=2`、该设备托管false/localCsForward1，以`app_login_device_untrusted`停止。不能使用前一次诊断或业务布尔代替这个门禁。
+- 已只读确认两次请求对应同一App账号、同一原UUID标识行/revision4，配置revision1；静态enrollId不存在、extra_body为空。解析仍按已验证原字段，不强行把2改成1。此拒绝发生在电话凭据/账号创建前，当前native账号、运行租约、进行中登录均为0。需用户在官方App核实同账号当前合法授信/托管状态，不改UUID或清数据；无需ADB连接手机。
 - 已进一步配置接收前置：通过管理API的版本守卫，将有效安装上下文从`legacy_file/revision0`写入独立数据库配置`revision1`，仅开启已验证的`native_receivers`原空deny-list、`client_ex`及`offline_reception`。HTTP/SDK/TLS/身份/其他配置、旧安装文件及账号历史未变，没有启动接收器或请求运营商服务。页面现在能投影短信/来电对象“已配置”，但原生账号仍为0、接收未激活；来电控制及媒体配置尚缺，不能猜路由/证书/SDP补齐。
-- **程序和接收前置已部署，不等于完整模块收件或接听成功。** 后续仍要补必要的通话/媒体装配并验证本次账号认可、外来SMS、来电接听/媒体及清理/时延。此阶段无需连接手机；当前需要的是410上网条件。
+- **程序、网络和接收前置已部署，不等于完整模块收件或接听成功。** 当前阻碍已转为复用流程的最新设备认可拒绝；通话控制、媒体及其余原生装配也尚待完成。需在合法本次门禁通过后验证外来SMS、来电接听/媒体及清理/时延，不从配置投影推导成功。
 
-私有证据：`.local/jegotrip/deploy-readiness-20261113/{deployment-request.json,core-deployment-result.json,phone-identity-import-request.json,trust-check-request.json,native-reception-configuration-request.json}`及带时间戳的部署读回、身份导入、接收配置、网络/时间/Wi-Fi形状报告。接收配置计划8项本机离线测试通过。重试不能再次覆盖核心部署、静默旋转身份或重复写入配置。
+私有证据：`.local/jegotrip/deploy-readiness-20261113/`中的部署/原UUID导入/接收配置一次性请求，以及Wi-Fi连接、网络/时间/证书、两次独立登录诊断与`post-uplink-attempt-readback-*.json`读回。接收配置计划8项本机离线测试通过；网络失败及恢复记录均保留。重试必须读回已有请求，不再次部署、旋转身份、重复配置或盲目重发被拒绝登录。
 
 ## 接下来按顺序
 
-1. 先恢复用户明确选择的410外网上行与时间同步，重新验证配置目标的DNS/TLS；不重放既有失败请求。其余离线必需装配仍可推进，未知业务/权限不能靠fixture或猜值补齐。
+1. 当前网络已恢复；下一步由官方App确认同账号设备认可/托管当前状态，再做原UUID的新门禁读回。仍可离线补原证据充分的电话/媒体装配，但不因用户催促、历史认可或网络成功绕过最新拒绝。
 2. 在原App UUID/同账号上下文中取得本次明确认可和业务读回，补正确接收、通话控制与媒体配置后启动；验收外来SMS落库/原回执、来电接听/双向媒体、断连、stop→logoutSession→Join与持续时延。若需新代码，仍先过自身双Actions再保护性升级；不能用核心health替代终点。
 3. 授信TTL/撤销/替换与服务端积压重放规则不可由客户端fixture证明。不用新VTD/UUID、缓存授权、收费外发或设备变更补造成功。**完整用户目标仍未完成。**
 
