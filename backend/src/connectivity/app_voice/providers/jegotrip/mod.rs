@@ -58,6 +58,7 @@ pub mod rpc_envelope;
 pub mod rpc_incoming;
 pub(crate) mod rpc_client_ex;
 pub mod rpc_offline;
+pub(crate) mod rpc_alive;
 pub mod rpc_login;
 pub mod rpc_logout;
 pub mod rpc_pending;

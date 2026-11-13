@@ -68,6 +68,14 @@
 - 新私有证据目录`.local/jegotrip/native-hosting-20261113/`。31份首段及18组后续只读IDA结果保留；历史SDK日志只输出形状，确认独立Alive的`stcp`引用仅有h/p选项，不能把RouterClient.TlsOnly、主连接登录或历史registerAlive成功当成本次独立Alive注册。该路径仍待单独实现与验证，不改写成猜测的ARC/TLS地址。
 - 新只读子审查401无结果，主助手直接审查；0手机/Provider/410/SDK执行/IDB写。
 
+## 当前追加：AccountAlive纯编解码（待新SHA门禁）
+
+仅新增`rpc_alive`无网络编解码前置：type0、单项方法版本列表[0]、原UID/selector、完整64位请求时间与32位间隔，结果bool/Common footer。原590C08与593000使用相同+2328/+2152字段对；不把它们替成App UUID或phone token。原数值包括零/最高位仅作为DATA保留，不读取系统时钟、不计算续保期限、不发注册或重试。
+
+16项新增回归含独立字节夹具、截断/版本/长度/重复footer/错误码/脱敏，以及匹配SDK登录后解码true仍不能把checkAlive变成true的反例。`RawRegisterAliveResult`没有owner、scope或RPC关联品牌，不是注册许可。原`AccountAliveState::Unsupported`与checkAlive false/0、全部连接/配置代码保持；不增加任何TLS或非TLS通道。新增源码必须自身双Actions/官方制品验证，不能借a1旧绿。
+
+独立stcp/mode1通道的安全边界仍待明确确认；多次Retry不当作授权。这项纯编解码工作不依赖该选择，也不授权真实账号请求/410部署。私有前置证据`.local/jegotrip/alive-protocol-20261113/`，本次源码/核验目录`.local/jegotrip/alive-codec-20261113/`。
+
 ## 接下来按顺序
 
 1. 未限定本地接收模式已完成自身门禁；继续动态限定接收器、独立Alive的原生传输/端点来源/注册续保、非空通知hooks及剩余媒体/通知。当前仍可离线，不需要现在连接手机；确需新的实机来源证据时另行请求。
