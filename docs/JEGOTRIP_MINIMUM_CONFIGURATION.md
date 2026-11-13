@@ -87,7 +87,8 @@ App 只有收到外层 code0、`authentication_code=1` 后才进入成功分支�
 | `profile.route.router_common` | 物理 Router、`-ri`、对应可信 anchors、固定预算 | 保留原地址/身份/证书对应关系，不能删 `-ri` 或把备用提示当 TLS 授权 |
 | `profile.bootstrap_via_router` | 真实 `getAppConfigs` 后交接 | 目的地及 DomainName/DomainId/AppId/CC 来自匹配回复；不能预填猜测值 |
 | `profile.gateway_uri` / `gateway_metadata` | 匹配 loginSession 身份 / 原默认 `#SipGateway` | 正确 native bootstrap 模式下空 URI 动态派生；其他路径仍要求实际值 |
-| `incoming` / `call_incoming` / `call_control` | 原对象、域及通话路由策略 | **仍有装配缺口**。发现对象字符串不等于完整绑定，不能删检查让页面显示就绪 |
+| `profile.native_receivers` | 可选原生本地接收器及独立DIRECT域策略 | 显式`{}`使用原空deny-list；a1c6d88软件已验证，仅支持原Router/Common与未限定本地对象，不与旧incoming/call_incoming混用，不授媒体/Alive能力 |
+| `incoming` / `call_incoming` / `call_control` | 旧精确对象/域及通话路由策略 | 旧绑定校验保留；新native模式可替代前两者，call_control仍需真实原路由。动态限定引用与完整装配仍有缺口，不从字符串推导就绪 |
 | `call_media` | 原媒体可信连接与本地音频/Trunk 策略 | 需正确配置与真实双向媒体验收，不是手机硬件身份 |
 | `cleanup_on_disconnect` / `reconnect` | 本地有限生命周期策略 | 可选，默认行为保留；不是 token 续期或 Android 离线唤醒 |
 
@@ -154,7 +155,7 @@ libmtc SHA256：`57086cd624d8227dc1b1b64a63d7c8b2258f87b261779b681a9bfd306ad9d2e
 初次 IDA MCP 连接被拒绝后，用户手动打开原 libmtc；实时 metadata 的 SHA/base 已匹配。
 后续全部仅只读查询，不保存或修改 IDB；这些字节证据仍不是手机授信迁移成功的实测。
 
-### 原生本地接收器配置（新增，须自身SHA验证）
+### 原生本地接收器配置（a1c6d88软件已验证）
 
 原生`Router/Common`模式可显式配置 `runtime.profile.native_receivers: {}`，使用已核对的本地`MessageReceiver/Sip.Request`与`CallClientEx`对象；与旧`incoming`、`call_incoming`互斥，缺省仍保留旧精确绑定，不改已保存模板。新模式不从出站`domain`、App UUID或DomainName伪造接收域。
 
@@ -162,11 +163,11 @@ libmtc SHA256：`57086cd624d8227dc1b1b64a63d7c8b2258f87b261779b681a9bfd306ad9d2e
 
 `client_ex`、`offline_reception`仍是独立明确选项；来电控制`call_control`及媒体配置不被推断，独立Alive未注册时checkAlive仍false/0。早到短信仅在原HostingPending预算内有界等待，不在确认前入库或ACK；后续原包/SMS/通知事务、删除、cursor和Join规则保持。native inbox的单一接收domain记NULL，表示无此固定绑定，不冒称记录了一个远端域，也不回填旧记录。
 
-本轮新增生产代码及回归需自己的双Actions与正式制品验证，当前最新状态见[交接](HANDOFF.md)。
+a1c6d88自身Build43358440268 / Beta43358440285均success：各1370精确provider回归（原1339+28接收+3媒体）、26HTTP、82前端单元/4浏览器/12图、双架构正式包摘要/全CRC及全部成员SHA已核。会话撤销后原媒体门与等待器立即失效，不等物理关闭；不改变确认、期限或真正Join要求。这仍不是实网托管验收，当前最新状态见[交接](HANDOFF.md)。
 
 ## 6. 仍需继续完成的部分
 
-1. 旧任务36：真实接收器默认/动态绑定、适用 AccountAlive、来电通知及媒体配置仍需完成。原生 `moreOfflineMessages → getOfflineMessages` 积压软件已由0c4的自身双Actions/正式制品核验，详见[原生离线积压](JEGOTRIP_NATIVE_OFFLINE_INBOX.md)，不等于真实收件或完整SDK。新增 `profile.client_ex` 默认为false，仅复用已有原绑定；空通知map唤醒、原token匹配撤销及不可重连错误已由38ae8d7自身双Actions/正式制品核验，不等于默认/动态SDK全部装配。它不自动填接收域、不申请Alive；无独立注册证明时checkAlive仍false/0，详见[原生控制子集](JEGOTRIP_NATIVE_HOSTING_DELIVERY.md#显式-clientex-控制子集)。
+1. 旧任务36：未限定本地接收器模式已验证，动态限定绑定、适用AccountAlive独立传输/来源/注册续保、非空通知hooks及剩余媒体装配仍需完成。原生 `moreOfflineMessages → getOfflineMessages` 积压软件保持原事务门槛，详见[原生离线积压](JEGOTRIP_NATIVE_OFFLINE_INBOX.md)，不等于真实收件或完整SDK。`profile.client_ex`仍默认false，可复用旧精确绑定或显式native模式；空通知map唤醒、原token匹配撤销/禁止重连已验证。它不从UUID/出站域造接收域，不自动申请Alive；无独立注册证明时checkAlive仍false/0。历史SDK日志中的stcp Alive路径也不是主ARC会话或TLS授权，详见[原生交付](JEGOTRIP_NATIVE_HOSTING_DELIVERY.md)。
 2. 旧任务16：合法业务条件下真实原生登录/注册、短信落库与原ACK、来电/双向音频和 stop/Join。
 3. 旧任务17：完整验收后最终收尾。**最小配置分析、界面简化或已有1242项隔离回归都不能代替这三项。**
 

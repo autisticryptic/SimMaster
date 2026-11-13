@@ -53,7 +53,7 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 ### 显式 ClientEx 控制子集
 
-安装侧 `profile.client_ex=true` 仅复用已有原 `incoming.object_id/domain`；默认false、旧JSON省略false，不从字符串猜默认绑定，也不把DIRECT与batch的原域策略合并。登录前只能捕获该绑定DATA，匹配本次ARC登录后才从其返回token激活dispatcher，避免同批登录/踢线竞态。
+安装侧 `profile.client_ex=true` 在旧精确绑定模式下仅复用原 `incoming.object_id/domain`；默认false、旧JSON省略false，不从字符串猜绑定，也不把DIRECT与batch的原域策略合并。登录前只能捕获该绑定DATA，匹配本次ARC登录后才从其返回token激活dispatcher，避免同批登录/踢线竞态。后续显式native接收模式见下节。
 
 - `checkAlive.ClientEx.Client` 的请求无业务参数，结果为bool/u32/footer；独立AccountAlive注册未接入，当前只返回false/0，不能由SDK登录或HostingAck造正向Alive。
 - `notifyCalls.ClientEx.Client` 保留完整64位标记，空map只合并为原swap唤醒，不是SMS/来电，也不重开原RPC/TLS截止。非空map依赖未实现的SDK/OEM通知hooks，明确拒绝而非吞成成功。
@@ -61,6 +61,18 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 - DIRECT控制回包不完成原SMS票据；batch控制result仅排队，不当peer ACK，撤销后不另发新poll补造回执。前端只显示固定中文说明，不反射原reason/token。
 
 原默认/动态接收器、AccountAlive端点/信任/注册及续保、非空通知hooks、媒体与真实授信/收件仍分开验收。**本子集在38ae8d7自身两个Actions/正式制品已验证：各1339 provider（保留原1309+新30）、26HTTP、82前端单元/4浏览器/12图，以及两个ABI完整包摘要/全CRC/全部成员SHA均核。** 首76532bd两个工作流的原Common bootstrap栈溢出已由仅两源路径堆委派修复，旧同名断言通过；不改变测试栈/超时、不删除失败制品。新源码仍须自己的SHA门禁，不能借此历史结果。最新剩余项见[当前交接](HANDOFF.md)。
+
+## 1.4 原生未限定接收器与即时媒体撤销（a1c6d88软件已验证）
+
+`a1c6d88061808c37b101899c8c9dbc5815b76308`：Build43358440268 / Beta43358440285均success。各1370精确provider回归（原1339逐字保留、新28接收+3媒体）、26HTTP、原registry/Trunk/通知/DNS/矩阵，以及82前端单元/4浏览器/12图、自身SHA/run和官方digest/全ZIP CRC已核；ARM64/AMD64包各29成员/20前端文件的全部SHA、meta、ELF及摘要已核，未执行/部署。
+
+- 安装侧可显式给 `profile.native_receivers: {}`，使用原空deny-list DIRECT策略；不配置仍保留旧模板。仅原Router/Common，不能混用旧incoming/call_incoming。
+- 精确本地`MessageReceiver/Sip.Request`和`CallClientEx`在匹配login后同步激活，覆盖同批首包；DIRECT域过滤独立于已认证batch本地对象表。不接受facet/adapter/cloud限定引用，不把App UUID/DomainName/出站域伪造成接收域。
+- 早到短信只在原HostingPending的16条/1MiB队列内等原HostingAck，不提前入库/通知/ACK，不重开期限。后续继续原事务与去重/删除/回执规则；单一接收域记NULL，native离线cursor另有上下文标记，不回填或混用历史。
+- 接收器存在不意味着call-control、媒体或独立Alive就绪。匹配本次token的会话撤销同步媒体IO门、立即唤醒等待器，已持有/迟到的正向结果不恢复媒体；无需等待终止控制回包或物理EOF，也不伪造远端release确认。
+- 首cdbbe02的Build成功，Beta一新增测试因两套夹具的selector预期混用而失败。helper改为分别严格核对各自原值，不删除UID/token/selector/ACK断言、不提高栈或时间预算；同名用例及新增媒体用例在a1两工作流均过。失败官方ZIP/digest/CRC/log/annotations与元数据限流重试记录均保留。
+
+独立Alive仍待原生传输、端点来源及注册/续保装配。历史SDK日志的stcp路径不等价于主连接登录或RouterClient.TlsOnly，不把它改写成猜测的ARC/TLS地址，不由历史成功造本次checkAlive正向。动态限定引用、非空SDK/OEM通知hooks、剩余媒体和真实授信/SMS/通话/时延仍未完整验收。证据在`.local/jegotrip/native-hosting-20261113/`与`.local/jegotrip/verified-native-a1c6d88.json`；最新入口为[当前交接](HANDOFF.md)。
 
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 

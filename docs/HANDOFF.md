@@ -13,6 +13,9 @@
 
 ## 已核验的软件基线
 
+- **`a1c6d88061808c37b101899c8c9dbc5815b76308`（本次）**：原生未限定本地接收器、分离的DIRECT/batch域规则、NULL接收域与原HostingAck前的有界短信队列，以及会话撤销后的即时媒体停止。Build43358440268 / Beta43358440285均success；每workflow1370精确provider回归（完整保留原1339，新增28接收+3媒体）、26HTTP及原registry/Trunk/通知/DNS/矩阵通过。前端各82精确单元/4浏览器/12图、自身SHA/run、官方digest/全ZIP CRC通过；ARM64/AMD64正式包各29成员/20前端文件、全部SHA、meta完整commit/target/version1.1.5及ELF已核。仅软件子集交付，未执行制品或部署。
+- 本次权威证据：`.local/jegotrip/native-hosting-20261113/`的源码读回、失败关闭、前端和包证明及最终交付，另有`.local/jegotrip/verified-native-a1c6d88.json`。文档收尾只改docs，构建输入保持a1c6d88，不冒称另一个新二进制。
+
 - **`38ae8d785fcbe10b6416b1240ad4c2150d811664`**：显式原绑定ClientEx控制子集与会话撤销保护。Build43253503712 / Beta43253503724均success；每workflow1339精确provider回归（原1309+新30）、26HTTP、原registry/Trunk/通知/DNS/矩阵通过，前端82精确单元/4浏览器/12图、自身SHA/run/官方digest/全ZIP CRC已核。ARM64/AMD64正式包各29成员/20前端文件完整SHA、tar/ZIP摘要、meta完整commit/target/version及ELF已核，未执行或部署。本组件不包含独立Alive正向/默认动态接收/完整实网验收。
 - 新权威证据：`.local/jegotrip/resume-20261112-1957/`中的交付、源码读回、失败关闭、UI及双架构包证明，以及`.local/jegotrip/verified-native-38ae8d7.json`。公开文档收尾只改docs，构建输入仍与38ae一致，不冒称另一个新二进制。
 
@@ -35,7 +38,7 @@
 - `notifyCalls`为原版本+完整64位标记+map。空map只触发原swap调度；非空map进入SDK/OEM通知hooks，当前不假称已实现。
 - `notifyDisconnect`为原版本+reason，原实现核对本次ARC token并处理另一设备/同设备/服务器踢线。App/phone token不等价。
 
-### 当前新实现
+### 38ae组件已验证的实现
 
 - `profile.client_ex`明确默认false，旧私有JSON省略false；只复用已有原incoming object/domain，不猜默认ID/域，不申请Alive。
 - `rpc_client_ex`精确控制codec，版本/计数/截断/trailing/字节预算保持。无独立Alive注册证明时checkAlive返回false/0；非空通知hook map明确拒绝，不当短信吞掉。
@@ -51,7 +54,7 @@
 
 先前用户明确授权后只读导出175普通App文件（121 XML、36 files、18 databases）和43外部App scoped文件、8.9.4.0 APK/libmtc；另一台Nexus_4未读取。原Java样本8.9.7.0，库相同；Java版本差异不混用。App UUID、独立ZpandDevice UUID和device_id.xml标识各自保留，前后hash/普通ZIP CRC和私有ACL已核；Realm FIFO仅元数据，不跟随。两份SBA1/v1封装仍未解密，不将历史托管缓存当当前授权。
 
-## 本次继续中的原生接收装配（待自身SHA验证）
+## 本次已验证的原生未限定接收装配（a1c6d88）
 
 基于已验c531916/38ae，新增安装侧`profile.native_receivers`（缺省None；显式`{}`使用原空deny-list DIRECT域策略），仅支持原Router/Common，不能与旧`incoming/call_incoming`同时配置。源码不把App UUID、DomainName或出站domain当接收域。
 
@@ -59,12 +62,15 @@
 - 原native接收DATA在登录前有界预装配，仅匹配本次login后同步激活，覆盖同批首条消息/来电。ClientEx仍按配置启用、本次ARC token撤销仍不可重连，checkAlive不造独立Alive正向。
 - native模式`Sip.Request`自动走原短信消费器；确实没有一个固定必填接收domain，私有inbox用NULL表达，不伪造空域、不回填旧行。原精确绑定的非空domain约束保持；native离线游标另有上下文标记，不混用旧cursor。
 - 早到native短信只可在原HostingPending的16条/1MiB队列等待原HostingAck，未确认前不落库/通知/ACK，不建立新deadline；拒绝/过期/撤销仍停止。来电控制/媒体仍需要原配置，不从接收器存在推导就绪。
-- 新契约与回归覆盖DIRECT/batch缺域区别、原scope/去重/ACK、首包竞态、真实Common/账号事务/离线游标；本机212静态检查已过，Rust/前端尚待本次双Actions。新私有证据目录`.local/jegotrip/native-hosting-20261113/`，不借38ae旧绿标完成。
+- 新契约与回归覆盖DIRECT/batch缺域区别、原scope/去重/ACK、首包竞态、真实Common/账号事务/离线游标；本机213静态检查通过，自身双Actions各1370精确provider回归与正式制品已核，不借38ae旧绿标完成。
+- 撤销还同步原媒体IO门并唤醒逻辑媒体等待器：已持有或迟到的正向通话结果不能恢复媒体；不必等终止控制回复写完或物理EOF，也不伪造远端release确认。3项新增回归与全部旧媒体/来电用例均过。
+- 首cdbbe02的Build成功，Beta仅一项新增早到短信测试失败：账户夹具与后端夹具的原selector不同，共用helper错用了后者的精确预期。修为各自核对本来的selector，保留UID/token/selector/逐字节ACK断言、全部旧断言及原预算；同名用例在a1两工作流通过。失败官方ZIP/digest/全CRC/log/annotations保留。核验时匿名GitHub API限流403按返回重置时间等待后通过，失败记录同样保留。
+- 新私有证据目录`.local/jegotrip/native-hosting-20261113/`。31份首段及18组后续只读IDA结果保留；历史SDK日志只输出形状，确认独立Alive的`stcp`引用仅有h/p选项，不能把RouterClient.TlsOnly、主连接登录或历史registerAlive成功当成本次独立Alive注册。该路径仍待单独实现与验证，不改写成猜测的ARC/TLS地址。
 - 新只读子审查401无结果，主助手直接审查；0手机/Provider/410/SDK执行/IDB写。
 
 ## 接下来按顺序
 
-1. 先完成上述新源码自身双Actions/正式制品核验，保留全部旧断言、预算和失败记录，再继续动态限定接收器、独立Alive端点/注册续保与剩余媒体/通知。
+1. 未限定本地接收模式已完成自身门禁；继续动态限定接收器、独立Alive的原生传输/端点来源/注册续保、非空通知hooks及剩余媒体/通知。当前仍可离线，不需要现在连接手机；确需新的实机来源证据时另行请求。
 2. 具备本次服务器认可、正确原生模板和明确操作条件后，按授权保护410配置/历史/units/helper且无回滚备份部署；验收外来SMS落库/原回执、来电/双向媒体、断连、stop→logoutSession→Join与持续端到端时延。
 3. 授信TTL/撤销/替换与服务端积压重放规则不可由客户端fixture证明。不用新VTD/UUID、缓存授权、收费外发或设备变更补造成功。**完整用户目标仍未完成。**
 
