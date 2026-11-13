@@ -97,15 +97,17 @@
 - 检查发现现有同账号本地标识不是原手机App UUID；已按原复用目标通过版本守卫的管理API导入手机原值，保留旧值历史、账号归属及别名，不生成新UUID，不改手机。SDK的另一个标识没有与App UUID混用。
 - 最早一次`check_device_trust`因无外网以`app_login_transport_failed`结束，原失败记录保留，没有重放。用户随后指定Wi-Fi并明确英文密码：当前已连接用户第二个网络的唯一实际广播名称，IPv4默认路由/DNS/NTP同步及约1–2秒时差已验证，原App实际证书与已有固定证书匹配。USB管理路由保留；密码经stdin交付，未写argv/env/文件/日志。只建RAM-only连接，未修改旧保存热点/客户端profiles或启用计费蜂窝；NetworkManager重启后不保证自动恢复该临时连接。
 - 网络/时间/证书恢复后，已各发起一次新的只读诊断与`reuse_hosting`，均不enroll、不写业务开关、不启动SDK。只读诊断的`existing_device`返回1、业务布尔为true；但独立复用流程**自己的最新getCallStatus**返回`authentication_code=2`、该设备托管false/localCsForward1，以`app_login_device_untrusted`停止。不能使用前一次诊断或业务布尔代替这个门禁。
-- 已只读确认两次请求对应同一App账号、同一原UUID标识行/revision4，配置revision1；静态enrollId不存在、extra_body为空。解析仍按已验证原字段，不强行把2改成1。此拒绝发生在电话凭据/账号创建前，当前native账号、运行租约、进行中登录均为0。需用户在官方App核实同账号当前合法授信/托管状态，不改UUID或清数据；无需ADB连接手机。
+- 已只读确认前述请求对应同一App账号、同一原UUID标识行/revision4，配置revision1；静态enrollId不存在、extra_body为空。此拒绝发生在电话凭据/账号创建前，当前native账号、运行租约、进行中登录均为0。用户已明确确认手机授信未过期，并提供更新的临时账号凭据；不能据此把410查询的2改成1，也不能反过来声称手机授信必然过期。
+- 11月14日已用最新明确账号/测试密码发起一次新`reuse_hosting`登录：账号认证和号码读回通过，但本次getCallStatus仍auth2/业务false/local1，未取电话凭据、创建native账号或启动SDK。密码只以内存/stdin使用，符号不经shell展开，不回显或另存；旧请求/凭据不重放。
+- 对实际手机8.9.4.0 APK再核hash/全ZIP CRC/8个DEX校验；263091个code item按原宽度解码。其`DeviceUtil.getDeviceId→getIMEI→setting_power/phone_uuid`及`jegotrip2.call.logic.CallLogic.queryCallStatus`单一device_id普通JSON与当前实现相符；原回调仍在exact auth1后才报告设备。暂无证据支持换SDK/其他UUID、在拒绝前强报设备或把2当成功。
 - 已进一步配置接收前置：通过管理API的版本守卫，将有效安装上下文从`legacy_file/revision0`写入独立数据库配置`revision1`，仅开启已验证的`native_receivers`原空deny-list、`client_ex`及`offline_reception`。HTTP/SDK/TLS/身份/其他配置、旧安装文件及账号历史未变，没有启动接收器或请求运营商服务。页面现在能投影短信/来电对象“已配置”，但原生账号仍为0、接收未激活；来电控制及媒体配置尚缺，不能猜路由/证书/SDP补齐。
 - **程序、网络和接收前置已部署，不等于完整模块收件或接听成功。** 当前阻碍已转为复用流程的最新设备认可拒绝；通话控制、媒体及其余原生装配也尚待完成。需在合法本次门禁通过后验证外来SMS、来电接听/媒体及清理/时延，不从配置投影推导成功。
 
-私有证据：`.local/jegotrip/deploy-readiness-20261113/`中的部署/原UUID导入/接收配置一次性请求，以及Wi-Fi连接、网络/时间/证书、两次独立登录诊断与`post-uplink-attempt-readback-*.json`读回。接收配置计划8项本机离线测试通过；网络失败及恢复记录均保留。重试必须读回已有请求，不再次部署、旋转身份、重复配置或盲目重发被拒绝登录。
+私有证据：`.local/jegotrip/deploy-readiness-20261113/`的部署/身份/接收/网络及独立请求读回，最新`credential-refresh-reuse-request.json`与`current-credential-attempt-readback-*.json`；原版静态核对在`.local/jegotrip/credential-refresh-20261114/`。Provider凭据解析5项本机夹具、接收计划8项通过，失败记录均保留。重试先读已有请求，不重复部署、旋转身份、配置或盲目重发登录。
 
 ## 接下来按顺序
 
-1. 当前网络已恢复；下一步由官方App确认同账号设备认可/托管当前状态，再做原UUID的新门禁读回。仍可离线补原证据充分的电话/媒体装配，但不因用户催促、历史认可或网络成功绕过最新拒绝。
+1. 账号更新与新登录已完成核验；继续排查手机与410的最新会话/设备业务上下文差异。需要官方App重新登录后刷新托管页面的当前结果或其他有依据的上下文，不重复索要已提供凭据、默认要求重新授信或清数据。离线可继续补电话/媒体，但任何启动仍须合法本次门禁通过。
 2. 在原App UUID/同账号上下文中取得本次明确认可和业务读回，补正确接收、通话控制与媒体配置后启动；验收外来SMS落库/原回执、来电接听/双向媒体、断连、stop→logoutSession→Join与持续时延。若需新代码，仍先过自身双Actions再保护性升级；不能用核心health替代终点。
 3. 授信TTL/撤销/替换与服务端积压重放规则不可由客户端fixture证明。不用新VTD/UUID、缓存授权、收费外发或设备变更补造成功。**完整用户目标仍未完成。**
 
