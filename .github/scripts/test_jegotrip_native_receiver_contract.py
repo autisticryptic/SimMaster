@@ -77,6 +77,19 @@ class NativeReceiverContracts(unittest.TestCase):
         self.assertIn("original_native_binding", backend)
         self.assertIn("(self.profile.call_incoming.is_some() || self.profile.native_receivers.is_some()) && self.profile.call_control.is_some()", backend)
         self.assertIn("ClientExKind::CheckAlive => false", source("rpc_client_ex.rs"))
+    def test_session_revocation_retires_logical_media_while_only_original_control_writer_can_finish(self):
+        scope = source("rpc_pending.rs")
+        revoked = scope[scope.index("pub(super) fn mark_session_revoked"):scope.index("pub(super) fn matches")]
+        self.assertIn("self.1.lock()", revoked)
+        self.assertIn("self.3.store(true, Ordering::Release); self.2.notify_waiters()", revoked)
+        self.assertIn("if !self.is_open() || self.session_revoked()", revoked)
+        media = source("call_control.rs")
+        self.assertIn("self.scope.is_open()&&!self.scope.session_revoked()&&self.identity.live.load", media)
+        self.assertIn("self.scope.with_io_gate(||if !self.scope.session_revoked()", media)
+        self.assertIn("self.scope.session_ended()", media)
+        self.assertIn("call_session_revocation_tests.rs", source("call_control_tests.rs"))
+        self.assertNotIn("#[ignore]", source("call_session_revocation_tests.rs"))
+
     def test_all_new_suites_run_on_both_workflows_with_original_filters_and_no_ignored_cases(self):
         for name in ["build-release.yml", "beta-validation.yml"]:
             text = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")

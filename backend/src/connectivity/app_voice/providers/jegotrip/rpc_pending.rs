@@ -26,7 +26,21 @@ impl RpcConnectionScope {
     /// not IO closure: the owning actor may still write the one control reply
     /// before closing/Joining, but no new RPC/readiness/reconnect is admitted.
     pub(super) fn session_revoked(&self) -> bool { self.3.load(Ordering::Acquire) }
-    pub(super) fn mark_session_revoked(&self) { self.3.store(true, Ordering::Release); }
+    pub(super) fn mark_session_revoked(&self) {
+        // Synchronize with data/media polls without closing the physical writer
+        // needed for the original terminal control reply. Accepted bytes cannot
+        // be recalled; all later data polls must observe the sticky flag.
+        let _gate = self.1.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.3.store(true, Ordering::Release); self.2.notify_waiters();
+    }
+    pub(super) async fn session_ended(&self) {
+        loop {
+            let notified = self.2.notified(); tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.is_open() || self.session_revoked() { return; }
+            notified.await;
+        }
+    }
     pub(super) fn matches(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
     pub(super) fn is_open(&self) -> bool { self.0.load(Ordering::Acquire) }
     pub(super) fn close(&self) {

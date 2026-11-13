@@ -4,6 +4,8 @@ use super::super::{arc_session::{ArcLoginInputs,ArcReply,ArcRpcSession},call_bin
     rpc_calls::{CallOperation,CallNoticeKind,NativeCallId},rpc_envelope::{RpcRequest,encode_reply,decode_request},
     rpc_stream::{Writer,RpcBytes},session::HostingSession,tests::imported};
 const ID:u64=0x0123_4567_89ab_cdef;
+#[path = "call_session_revocation_tests.rs"]
+mod session_revocation;
 fn owner()->AttemptOwner{let mut s=HostingSession::new("line-call-owner".into());s.import(imported(),100).unwrap();s.begin_login(100).unwrap()}
 fn context()->(ArcRpcSession,AttemptOwner,RpcConnectionScope,CallDispatcher){
     let original=owner();let mut rpc=ArcRpcSession::new(original.clone());let scope=rpc.connection_scope();

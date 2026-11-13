@@ -43,7 +43,7 @@ async fn early_message_before_hosting(accepted: bool) {
             peer.send(&[reply(swap.call_id, &super::super::super::tests::swap_result(Some(seq), accepted, payload.fields))]).await; break;
         }
         if accepted {
-            assert_eq!(next_reply(&mut peer, 1).await, [0, 1, 0, 0, 0, 0]);
+            assert_eq!(next_reply_for_selector(&mut peer, 1, b"fixture-original-selector").await, [0, 1, 0, 0, 0, 0]);
             assert_eq!(database.get_sms_messages_for_channel(10, 0, None, Some(&observed_line)).unwrap().len(), 1);
             done.send(()).unwrap(); finish_account(&mut peer).await;
         } else {
@@ -73,7 +73,7 @@ async fn native_account_direct_and_batch_sms_commit_before_their_own_ack_without
         assert_eq!(login.method, n::rpc_login::LOGIN_SESSION_METHOD.as_bytes()); peer.send(&[reply(login.call_id, &login_result())]).await;
         let (_, flag) = hosting_call(&mut peer).await; assert_eq!(flag, b"4");
         peer.send(&[direct(1, n::rpc_incoming::ONLINE_MESSAGE_METHOD.as_bytes(), &sms_args(), b"MessageReceiver", None)]).await;
-        assert_eq!(next_reply(&mut peer, 1).await, [0, 1, 0, 0, 0, 0]);
+        assert_eq!(next_reply_for_selector(&mut peer, 1, b"fixture-original-selector").await, [0, 1, 0, 0, 0, 0]);
         assert_eq!(database.get_sms_messages_for_channel(10, 0, None, Some(&server_line)).unwrap().len(), 1);
         let packet = peer.next().await.unwrap(); let swap = decode_request(&packet[1..]).unwrap(); let mut r = Reader::versioned(swap.arguments).unwrap(); r.bytes().unwrap(); r.bytes().unwrap(); let payload = n::rpc_batch::read_payload(&mut r).unwrap();
         let mut w = Writer::new(); w.boolean(true).unwrap(); for word in [9, 1, 1, payload.fields[0], payload.fields[1], payload.fields[2]] { w.u32(word).unwrap(); }

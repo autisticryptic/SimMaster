@@ -36,7 +36,7 @@ impl CallControlTicket{
     pub fn owner(&self)->&AttemptOwner{&self.owner}
     pub fn connection_scope(&self)->RpcConnectionScope{self.scope.clone()}
     pub fn native_id(&self)->NativeCallId{self.native_id}
-    pub fn is_live(&self)->bool{self.scope.is_open()&&self.identity.live.load(Ordering::Acquire)}
+    pub fn is_live(&self)->bool{self.scope.is_open()&&!self.scope.session_revoked()&&self.identity.live.load(Ordering::Acquire)}
     pub(super) fn remote_released(&self)->bool{self.identity.remote_released.load(Ordering::Acquire)}
     pub(super) fn same_call(&self,other:&Self)->bool{
         self.owner==other.owner&&self.scope.matches(&other.scope)&&self.native_id==other.native_id&&Arc::ptr_eq(&self.identity,&other.identity)
@@ -45,14 +45,14 @@ impl CallControlTicket{
     /// scope (in the media caller). Nonblocking IO polls or bounded in-memory
     /// publication only; no blocking locks, close or await in the closure.
     /// Revocation serializes with each poll, not a copied ticket.
-    pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{&self.owner==owner&&self.scope.matches(scope)&&scope.is_open()}
+    pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{&self.owner==owner&&self.scope.matches(scope)&&scope.is_open()&&!scope.session_revoked()}
     pub(super) fn captured_copy(&self)->Self{Self{owner:self.owner.clone(),scope:self.scope.clone(),native_id:self.native_id,identity:self.identity.clone()}}
     pub(super) fn with_media_gate<T>(&self,work:impl FnOnce()->T)->Option<T>{
         let _gate=match self.identity.gate.lock(){Ok(gate)=>gate,Err(poison)=>{
             let _gate=poison.into_inner();self.identity.live.store(false,Ordering::Release);self.identity.changed.notify_waiters();return None;
         }};
         if !self.is_live(){return None;}
-        self.scope.with_io_gate(||if self.identity.live.load(Ordering::Acquire){Some(work())}else{None}).flatten()
+        self.scope.with_io_gate(||if !self.scope.session_revoked()&&self.identity.live.load(Ordering::Acquire){Some(work())}else{None}).flatten()
     }
     /// One original native call gets at most one media connection attempt.
     /// Failure/Drop cannot grant an automatic second use of its Accept result.
@@ -62,7 +62,7 @@ impl CallControlTicket{
     pub(super) async fn revoked(&self){loop{
         let wake=self.identity.changed.notified();tokio::pin!(wake);wake.as_mut().enable();
         if !self.is_live(){return;}
-        tokio::select!{biased;_=self.scope.closed()=>return,_=wake=>{}}
+        tokio::select!{biased;_=self.scope.session_ended()=>return,_=wake=>{}}
     }}
     pub(super) fn revoke(&self){
         let _gate=self.identity.gate.lock().unwrap_or_else(|poison|poison.into_inner());

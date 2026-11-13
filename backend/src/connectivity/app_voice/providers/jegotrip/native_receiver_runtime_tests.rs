@@ -16,11 +16,14 @@ fn direct(id: i32, method: &[u8], arguments: &[u8], object: &[u8], domain: Optio
     let rpc = encode_request(id, &meta, method, arguments).unwrap(); let mut p = vec![0]; p.extend_from_slice(rpc.expose_to_transport()); p
 }
 async fn next_reply(peer: &mut CommonPeer, expected: i32) -> Vec<u8> {
+    next_reply_for_selector(peer, expected, b"fixture-selected-session").await
+}
+async fn next_reply_for_selector(peer: &mut CommonPeer, expected: i32, selector: &[u8]) -> Vec<u8> {
     loop {
         let packet = peer.next().await.unwrap();
         if packet[0] == 1 { let decoded = decode_reply(&packet[1..]).unwrap(); assert_eq!(decoded.call_id, expected); return decoded.result_stream.to_vec(); }
         let request = decode_request(&packet[1..]).unwrap(); assert_eq!(request.method, n::rpc_batch::SWAP_CALLS_METHOD.as_bytes());
-        let mut r = Reader::versioned(request.arguments).unwrap(); assert_eq!(r.bytes().unwrap(), b"fixture-user"); assert_eq!(r.bytes().unwrap(), b"fixture-selected-session");
+        let mut r = Reader::versioned(request.arguments).unwrap(); assert_eq!(r.bytes().unwrap(), b"fixture-user"); assert_eq!(r.bytes().unwrap(), selector);
         let payload = n::rpc_batch::read_payload(&mut r).unwrap();
         peer.send(&[reply(request.call_id, &super::super::tests::swap_result(None, true, payload.fields))]).await;
     }
