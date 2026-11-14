@@ -1,6 +1,7 @@
 //! Original ARC command actor using real Router/SARC/Common, not an innerTLS
 //! emulation. All protocol state/owner/scope is created BEFORE network work.
 use super::*;
+use std::sync::Arc;
 use super::super::{common_runtime::{CommonPath,CommonIoError},common_packets::CommonError,common_control::ControlError,
     netstream_runtime::{NetstreamPath,NetstreamError},router_runtime::{RouterPath,RouterIoError,RouterTimeouts},
     router_connector::RouterPolicy,object_reference::ReferenceEndpoint,transport_packets::TransportBytes,

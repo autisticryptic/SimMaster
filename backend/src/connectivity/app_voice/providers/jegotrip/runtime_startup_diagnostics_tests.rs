@@ -16,7 +16,7 @@ async fn no_payload_on_bad_name(listener:TcpListener,server:Arc<tokio_rustls::ru
 async fn bootstrap_startup_diagnostic_survives_retirement_only_for_its_original_owner() {
     let cert=Certificates::generate("DNS:wrong.fixture.invalid");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
     let port=listener.local_addr().unwrap().port();let server=tokio::spawn(no_payload_on_bad_name(listener,cert.server_config(&TLS13)));
-    let profile=RuntimeProfile::supplied_common_with_bootstrap(bootstrap_inputs(),bootstrap_common(&cert.root,port),bootstrap_route()).unwrap();
+    let profile=RuntimeProfile::supplied_common_bootstrap(bootstrap_inputs(),bootstrap_common(&cert.root,port),bootstrap_route()).unwrap();
     let connector=Arc::new(LegacyDenied{calls:AtomicUsize::new(0)});let(backend,mut events)=NativeHostingBackend::new(profile,connector.clone());
     let original=owner();
     assert_eq!(backend.login(original.clone(),SdkLoginRequest {server_address:BOOTSTRAP_SDK,..request(&cert.root)}).await,Err(BackendFailure::Disconnected));
