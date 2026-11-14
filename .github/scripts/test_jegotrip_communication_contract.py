@@ -23,6 +23,8 @@ class CommunicationContracts(unittest.TestCase):
         self.assertIn('QueryDisplayStatus',text);self.assertIn('QueryForwardingState',text)
     def test_current_authenticated_number_and_exact_json_protection_are_used(self):
         text=source('communication_http.rs')
+        self.assertIn('pub(in super::super) fn with_communication',text)
+        self.assertIn('pub(in super::super) async fn perform_communication',text)
         self.assertIn('!self.config.extra_body.is_empty()',text)
         self.assertIn('"phoneServerStatus":status',text);self.assertIn('"type":1',text)
         self.assertIn('Operation::QueryProfile|Operation::Logout=>(None,false)',text)
