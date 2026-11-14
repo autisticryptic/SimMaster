@@ -74,7 +74,7 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 独立Alive仍待原生传输、端点来源及注册/续保装配。历史SDK日志的stcp路径不等价于主连接登录或RouterClient.TlsOnly，不把它改写成猜测的ARC/TLS地址，不由历史成功造本次checkAlive正向。动态限定引用、非空SDK/OEM通知hooks、剩余媒体和真实授信/SMS/通话/时延仍未完整验收。证据在`.local/jegotrip/native-hosting-20261113/`与`.local/jegotrip/verified-native-a1c6d88.json`；最新入口为[当前交接](HANDOFF.md)。
 
-## 1.5 本地SDK接收准备与远端呼转分离（新增，待自身验证）
+## 1.5 本地SDK接收准备与远端呼转分离（2b8555a软件已验证）
 
 `intent=prepare_local_receiver`是独立、非默认操作，不是旧复用失败后的自动回退。实际8.9.4的`JustalkManager.login/updateStatus`使用电话token/SIP资料，并在SDK登录成功后注册status4；App的`cs_forward`呼转状态不是本地接收器运行状态，某个UI回调中的VoIP status0也不是通用SDK门禁。
 
@@ -84,7 +84,9 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 - 完成仅表示本地账号准备完成；可按显式选项启动SDK，但就绪仍必须来自原登录/网关注册ACK及正确接收器。关闭时仍status3注销、logoutSession和真正Join；不因准备完成宣称短信、来电或媒体已可用。
 - 旧`reuse_hosting/enable_trusted_hosting`的远端业务门禁与行为保持。新增观察带`purpose=local_receiver`，旧记录不回填、2KiB限制和原SDK撤销边界不变。
 
-本轮新增28 provider、3HTTP、8前端单元和2浏览器回归，原行为断言保留；新代码必须在自身双Actions/官方制品验证后才能运行于410，不借865的旧绿。完整通知、独立Alive、动态通话/媒体和真实接收验收仍在当前目标中，不能把本节当作整体完成。
+本轮代码`2b8555acc03319cacd1055f15e9a8ae7ed1ad448`已由自身Build43563389936 / Beta43563389938和官方双ABI制品验证：各1446 provider（1418旧+28新）、29HTTP（26旧+3新）、90前端单元/6浏览器/14图；239本机静态通过。旧行为断言/预算保留，两个源码清单期望扩展为新模式及共用严格身份守卫。首a23的唯一新增夹具前置enroll误配已修，失败ZIP/CRC/digest/日志/注解保留并由同名双CI通过关闭。
+
+410已单次核心升级到本SHA，当前原UUID/同账号的首次本地准备取得电话资料、创建native账号，随后原生连接断开，尚未收件。已只停止此失败运行并验证lease释放，保留账号和原失败attempt；没有开启呼转、同步设备或新授信。独立无凭据TLS诊断发现配置Router的CA链可通过而SAN名称校验不通过，仍需正确身份绑定/原生阶段诊断，不能关闭校验或从证书猜地址。完整通知、独立Alive、动态通话/媒体和真实接收验收仍在当前目标中，本节不是整体完成。
 
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 
