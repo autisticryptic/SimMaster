@@ -35,13 +35,16 @@ impl PreparedCommonRuntime{
     ///slot, then consumes ConnectedCommonRuntime::attach with no await gap.
     pub async fn connect(mut self,router_policy:&RouterPolicy,access:&[RpcProperty<'_>],identity:&[u8],endpoint:&ReferenceEndpoint,index:usize,
         mut timeouts:RouterTimeouts,compress_above:Option<usize>)->Result<ConnectedCommonRuntime,RuntimeError>{
-        let result=async {
-        if !self.scope.is_open(){return Err(RuntimeError::Scope);}
-        let now=Instant::now();if now>=self.attempt_end{return Err(RuntimeError::Timeout);}
-        if !matches!(endpoint.scheme(),b"arc"|b"sarc")||index>=32||compress_above.is_some_and(|value|value==0||value>MAX_PARAMETER_BYTES){return Err(RuntimeError::InvalidConfiguration);}
-        let host=endpoint.router_host().map_err(|_|RuntimeError::InvalidConfiguration)?;
-        if matches!(host,super::super::object_reference::RouterHost::Address(_))&&index!=0{return Err(RuntimeError::InvalidConfiguration);}
-        self.backend.as_mut().ok_or(RuntimeError::Closed)?.bind_common_identity(identity).map_err(|_|RuntimeError::InvalidConfiguration)?;
+        // Keep the original single async state machine. An extra async/Result
+        // wrapper duplicates the large Common startup frame on standard stacks.
+        let trace=self.startup_trace.clone();let owner=self.owner.clone();let scope=self.scope.clone();
+        let failed=|error|{trace.runtime(&owner,&scope,error);error};
+        if !self.scope.is_open(){return Err(failed(RuntimeError::Scope));}
+        let now=Instant::now();if now>=self.attempt_end{return Err(failed(RuntimeError::Timeout));}
+        if !matches!(endpoint.scheme(),b"arc"|b"sarc")||index>=32||compress_above.is_some_and(|value|value==0||value>MAX_PARAMETER_BYTES){return Err(failed(RuntimeError::InvalidConfiguration));}
+        let host=endpoint.router_host().map_err(|_|failed(RuntimeError::InvalidConfiguration))?;
+        if matches!(host,super::super::object_reference::RouterHost::Address(_))&&index!=0{return Err(failed(RuntimeError::InvalidConfiguration));}
+        self.backend.as_mut().ok_or_else(||failed(RuntimeError::Closed))?.bind_common_identity(identity).map_err(|_|failed(RuntimeError::InvalidConfiguration))?;
         timeouts.startup=timeouts.startup.min(self.attempt_end.duration_since(now));
         let connecting=async{
             let router=RouterPath::open(self.owner.clone(),self.scope.clone(),router_policy,access,timeouts).await.map_err(|error|{
@@ -55,17 +58,14 @@ impl PreparedCommonRuntime{
             })
         };
         let common=tokio::select!{biased;
-            _=self.scope.closed()=>return Err(RuntimeError::Closed),
-            result=tokio::time::timeout_at(self.attempt_end.into(),connecting)=>result.map_err(|_|RuntimeError::Timeout)??,
+            _=self.scope.closed()=>return Err(failed(RuntimeError::Closed)),
+            result=tokio::time::timeout_at(self.attempt_end.into(),connecting)=>result.map_err(|_|failed(RuntimeError::Timeout))??,
         };
-        if common.owner()!=self.owner||!common.scope().matches(&self.scope){return Err(RuntimeError::Scope);}
-        let backend=self.backend.take().ok_or(RuntimeError::Closed)?;let policy=self.policy.take().ok_or(RuntimeError::Closed)?;
+        if common.owner()!=self.owner||!common.scope().matches(&self.scope){return Err(failed(RuntimeError::Scope));}
+        let backend=self.backend.take().ok_or_else(||failed(RuntimeError::Closed))?;let policy=self.policy.take().ok_or_else(||failed(RuntimeError::Closed))?;
         self.transferred=true;
         Ok(ConnectedCommonRuntime{owner:self.owner.clone(),scope:self.scope.clone(),backend:Some(backend),common:Some(common),policy:Some(policy),
             start:self.start,attempt_end:self.attempt_end,attached:false})
-        }.await;
-        if let Err(error)=result.as_ref(){self.startup_trace.runtime(&self.owner,&self.scope,*error);}
-        result
     }
 }
 impl ConnectedCommonRuntime{

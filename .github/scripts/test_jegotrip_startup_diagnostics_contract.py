@@ -41,6 +41,8 @@ class StartupDiagnosticContracts(unittest.TestCase):
         self.assertIn('if !self.transferred{self.scope.close();}', text)
         self.assertIn('timeouts.startup=timeouts.startup.min(self.attempt_end.duration_since(now))', text)
         self.assertIn('timeout_at(self.attempt_end.into(),connecting)', text)
+        self.assertNotIn('let result=async {', text)
+        self.assertIn('let failed=|error|{trace.runtime(&owner,&scope,error);error}', text)
 
     def test_runtime_projection_cannot_use_another_attempt_or_create_ready(self):
         text = native('runtime_backend.rs')
