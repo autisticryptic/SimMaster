@@ -697,7 +697,7 @@ fn bounded_backend_queue_reserves_terminal_slot_and_pressure_retires_original_at
     let attempt = Attempt { owner: original.clone(), scope: scope.clone(), incarnation: 1,
         state: Mutex::new(AttemptState::default()), commands: Mutex::new(None), handle: AsyncMutex::new(None),
         session_uri: Mutex::new(None),
-        work: AsyncMutex::new(()), poll_work: AsyncMutex::new(()),bootstrap_scope:None,bootstrap_handle:AsyncMutex::new(None) };
+        work: AsyncMutex::new(()), poll_work: AsyncMutex::new(()),bootstrap_scope:None,bootstrap_handle:AsyncMutex::new(None),startup_traces:None };
     let (sender, mut receiver) = mpsc::channel(EVENT_CAPACITY);
     for _ in 0..EVENT_CAPACITY - 1 {
         assert!(emit(&sender, &attempt, BackendEventPayload::Callback(OwnedRpcCallback { owner: original.clone(), callback: Callback::Failure(BackendFailure::Disconnected) })));

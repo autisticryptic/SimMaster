@@ -345,6 +345,11 @@ export interface AppLoginAttempt {
   device_trust?: JegotripDeviceTrustObservation | null
 }
 
+export interface JegotripStartupFailure {
+  phase: 'bootstrap' | 'account'
+  stage: 'preparation' | 'attempt' | 'router_connect' | 'router_tls' | 'router_control' | 'router_io' | 'logical_channel' | 'common_framing'
+  code: string
+}
 export interface AppAccountView {
   line_id: string
   provider_id: string
@@ -356,6 +361,7 @@ export interface AppAccountView {
   outbound_authorized: boolean
   last_error?: string
   account_alive_state?: 'absent' | 'disabled' | 'unsupported'
+  startup_failure?: JegotripStartupFailure
 }
 
 async function request<T>(

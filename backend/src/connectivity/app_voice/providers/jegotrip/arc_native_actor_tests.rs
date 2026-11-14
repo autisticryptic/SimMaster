@@ -1,4 +1,7 @@
 //! Actions-only original Router/TLS/Channel/Common -> ARC actor regressions.
+#[path = "startup_diagnostics_tests.rs"]
+mod startup_diagnostics;
+
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip::{common_runtime::tests::CommonPeer,
     netstream_runtime::tests::{owner,policy as router_policy,timeouts,reference},object_reference::ReferenceTarget,

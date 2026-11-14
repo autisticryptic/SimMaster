@@ -14,6 +14,8 @@
 
 ## 已核验的软件基线
 
+- **当前追加待验证：原生启动分层诊断**。仅给原Common启动的bootstrap/账号连接保留首个有限`phase/stage/code`，旧失败映射、TLS/精确SAN、Router选择、重试与ready门禁不变；整体超时不猜具体网络阶段。`AccountView`/推送面板只显示同一owner/scope的观察，停止后不回填旧诊断。新增15项Rust隔离peer/归属/取消/账号清理回归、5项前端单元和1项桌面/手机浏览器用例；尚待本SHA自身双Actions和正式制品审计，不借2b旧绿。246项本机Python静态/备份/假ADB检查通过。没有部署、重启SDK或重发App登录；真实TLS绑定和完整接收/电话/媒体仍未解决。
+
 - **`2b8555acc03319cacd1055f15e9a8ae7ed1ad448`（本地SDK接收准备，已验证并部署）**：实际8.9.4核心登录/注册使用当前电话token/SIP资料，不把App的`cs_forward`或某个UI回调的VoIP status当通用SDK门禁。新增非默认`prepare_local_receiver`，原UUID/同账号、当前已有设备认可、当前电话资料和再次认可后才准备本地账号，呼转只观察，不enroll/同步设备/修改业务；旧呼转复用和native ACK/撤销/Join保护保持。Build43563389936 / Beta43563389938均success，各1446 provider（1418旧+28新）、29HTTP（26旧+3新）、90前端单元/6浏览器/14图及双ABI官方digest/全CRC/29成员20www/meta/ELF已核，本机239静态通过。首a23仅新增UUID冲突测试误配普通认证的可选enroll前置，已仅修夹具、原断言/生产路径/预算不改并关闭失败留证。410已运行本SHA/PID75130；实际SDK首启仍断连，详见下节，完整目标未完成。
 
 - **`865991d1d986f25e060a54272f595b889e1b0c4b`（同次诊断状态保留，已验证并部署）**：`CheckDeviceTrust`保存原来已发出的那一次`getCallStatus`授权码及`localCsForward`，不增加请求/重试、不改变原UUID、HTTP wire或复用门禁。旧记录不回填；复用/诊断形状分别校验，原2KiB上限保持。Build43549614252 / Beta43549614209首轮success，各1418精确provider（1406旧+12新）、26HTTP与原registry/Trunk/通知/DNS/矩阵通过；各82前端单元、4浏览器、12图及双ABI各29成员/20前端文件的官方digest/全CRC/SHA/meta/ELF已核。本机231静态通过，旧断言/工作流/前端/API/依赖与预算保持。410已仅核心升级到本SHA/PID26706，历史/身份/配置/辅助服务保护通过，无回滚备份。证据`.local/jegotrip/diagnostic-status-20261114/`；完整托管仍未完成。

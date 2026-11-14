@@ -1,4 +1,4 @@
-import type { AppLoginAttempt, AppLoginInput, JegotripLoginInput, JegotripLoginIntent, JegotripTrustQueryObservation, JegotripDeviceSyncObservation } from '../api/current'
+import type { AppLoginAttempt, AppLoginInput, JegotripLoginInput, JegotripLoginIntent, JegotripTrustQueryObservation, JegotripDeviceSyncObservation, JegotripStartupFailure } from '../api/current'
 
 export type AppLoginMode = 'account' | 'phone'
 export interface AppLoginDraft {
@@ -155,6 +155,25 @@ export function localReceiverTaskLabel(attempt: AppLoginAttempt): string {
   if (attempt.error) return appLoginError(attempt.error)
   if (!attempt.completed) return appLoginPhase(attempt.phase)
   return attempt.line_id ? '本地接收账号已准备；SDK与收件状态请查看独立账号' : '本地接收任务已结束，未建立接收账号'
+}
+
+export function startupFailureLabel(failure: unknown): string {
+  const fields = typeof failure === 'object' && failure !== null ? failure as Partial<JegotripStartupFailure> : {}
+  const own = (values: Record<string, string>, key: unknown) => typeof key === 'string' && Object.prototype.hasOwnProperty.call(values, key) ? values[key] : undefined
+  const phase = own({ bootstrap: 'Bootstrap', account: '账号连接' }, fields.phase) ?? '来源未知'
+  const stage = own({ preparation: '准备参数', attempt: '启动流程（具体阶段未确认）', router_connect: 'Router TCP/DNS', router_tls: 'Router TLS', router_control: 'Router控制',
+    router_io: 'Router收发', logical_channel: '逻辑通道', common_framing: 'Common封装' }, fields.stage) ?? '阶段未知'
+  const reasons: Record<string, string> = {
+    jegotrip_tls_handshake_failed: 'TLS握手或证书验证失败', jegotrip_tls_deadline_expired: 'TLS截止时间已到',
+    jegotrip_tls_closed: 'TLS连接已关闭', jegotrip_connector_io_failed: '连接I/O失败', jegotrip_connector_timeout: '连接超时',
+    jegotrip_router_control_rejected: 'Router拒绝连接', jegotrip_router_control_protocol_failed: 'Router控制响应无效',
+    jegotrip_router_control_timeout: 'Router控制超时', jegotrip_router_io_failed: 'Router收发失败', jegotrip_router_timeout: 'Router超时',
+    jegotrip_logical_channel_timeout: '逻辑通道超时', jegotrip_logical_channel_session_failed: '逻辑通道建立失败',
+    jegotrip_common_startup_packet_failed: 'Common封装无效', jegotrip_common_startup_control_failed: 'Common控制失败',
+    jegotrip_startup_scope_invalid: '原连接归属已失效', jegotrip_startup_configuration_invalid: '准备参数无效',
+    jegotrip_startup_closed: '原连接已关闭', jegotrip_startup_cancelled: '原连接准备已取消', jegotrip_startup_timeout: '准备超时',
+  }
+  return `${phase} / ${stage}：${own(reasons, fields.code) ?? '未识别的原生启动错误'}（仅失败阶段观察，不恢复连接或就绪）`
 }
 
 export function deviceSyncLabel(observation: JegotripDeviceSyncObservation): string {

@@ -3,11 +3,12 @@
 use super::*;
 use super::super::{common_runtime::{CommonPath,CommonIoError},common_packets::CommonError,common_control::ControlError,
     netstream_runtime::{NetstreamPath,NetstreamError},router_runtime::{RouterPath,RouterIoError,RouterTimeouts},
-    router_connector::RouterPolicy,object_reference::ReferenceEndpoint,transport_packets::TransportBytes};
+    router_connector::RouterPolicy,object_reference::ReferenceEndpoint,transport_packets::TransportBytes,
+    startup_diagnostics::StartupTrace};
 
 pub(crate) struct PreparedCommonRuntime{
     owner:AttemptOwner,scope:RpcConnectionScope,backend:Option<OfflineBackend>,policy:Option<RuntimePolicy>,
-    start:Instant,attempt_end:Instant,transferred:bool,
+    startup_trace:Arc<StartupTrace>,start:Instant,attempt_end:Instant,transferred:bool,
 }
 impl fmt::Debug for PreparedCommonRuntime{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("PreparedCommonRuntime(<redacted>)")}}
 impl Drop for PreparedCommonRuntime{fn drop(&mut self){if !self.transferred{self.scope.close();}}}
@@ -23,14 +24,17 @@ pub(crate) fn prepare_common(owner:AttemptOwner,policy:RuntimePolicy,attempt_end
     if !policy.valid()||attempt_end.checked_duration_since(start).is_none_or(|left|left.is_zero()||left>Duration::from_secs(120)){return Err(RuntimeError::InvalidConfiguration);}
     let mut backend=OfflineBackend::new(owner.clone());backend.claim_common_transport().map_err(|_|RuntimeError::InvalidConfiguration)?;
     let scope=backend.connection_scope();
-    Ok(PreparedCommonRuntime{owner,scope,backend:Some(backend),policy:Some(policy),start,attempt_end,transferred:false})
+    let startup_trace=Arc::new(StartupTrace::original(owner.clone(),scope.clone()));
+    Ok(PreparedCommonRuntime{owner,scope,backend:Some(backend),policy:Some(policy),startup_trace,start,attempt_end,transferred:false})
 }
 impl PreparedCommonRuntime{
     pub fn connection_scope(&self)->RpcConnectionScope{self.scope.clone()}
+    pub(crate) fn startup_trace(&self)->Arc<StartupTrace>{self.startup_trace.clone()}
     /// No actor is spawned here. The caller first acquires its owning-handle
     ///slot, then consumes ConnectedCommonRuntime::attach with no await gap.
     pub async fn connect(mut self,router_policy:&RouterPolicy,access:&[RpcProperty<'_>],identity:&[u8],endpoint:&ReferenceEndpoint,index:usize,
         mut timeouts:RouterTimeouts,compress_above:Option<usize>)->Result<ConnectedCommonRuntime,RuntimeError>{
+        let result=async {
         if !self.scope.is_open(){return Err(RuntimeError::Scope);}
         let now=Instant::now();if now>=self.attempt_end{return Err(RuntimeError::Timeout);}
         if !matches!(endpoint.scheme(),b"arc"|b"sarc")||index>=32||compress_above.is_some_and(|value|value==0||value>MAX_PARAMETER_BYTES){return Err(RuntimeError::InvalidConfiguration);}
@@ -39,9 +43,15 @@ impl PreparedCommonRuntime{
         self.backend.as_mut().ok_or(RuntimeError::Closed)?.bind_common_identity(identity).map_err(|_|RuntimeError::InvalidConfiguration)?;
         timeouts.startup=timeouts.startup.min(self.attempt_end.duration_since(now));
         let connecting=async{
-            let router=RouterPath::open(self.owner.clone(),self.scope.clone(),router_policy,access,timeouts).await.map_err(router_error)?;
-            let stream=NetstreamPath::open(router,endpoint,index,self.attempt_end,timeouts.partial).await.map_err(netstream_error)?;
-            CommonPath::from_original(stream,timeouts.partial,compress_above).map_err(common_error)
+            let router=RouterPath::open(self.owner.clone(),self.scope.clone(),router_policy,access,timeouts).await.map_err(|error|{
+                self.startup_trace.router(&self.owner,&self.scope,error);router_error(error)
+            })?;
+            let stream=NetstreamPath::open(router,endpoint,index,self.attempt_end,timeouts.partial).await.map_err(|error|{
+                self.startup_trace.netstream(&self.owner,&self.scope,error);netstream_error(error)
+            })?;
+            CommonPath::from_original(stream,timeouts.partial,compress_above).map_err(|error|{
+                self.startup_trace.common(&self.owner,&self.scope,error);common_error(error)
+            })
         };
         let common=tokio::select!{biased;
             _=self.scope.closed()=>return Err(RuntimeError::Closed),
@@ -52,6 +62,9 @@ impl PreparedCommonRuntime{
         self.transferred=true;
         Ok(ConnectedCommonRuntime{owner:self.owner.clone(),scope:self.scope.clone(),backend:Some(backend),common:Some(common),policy:Some(policy),
             start:self.start,attempt_end:self.attempt_end,attached:false})
+        }.await;
+        if let Err(error)=result.as_ref(){self.startup_trace.runtime(&self.owner,&self.scope,*error);}
+        result
     }
 }
 impl ConnectedCommonRuntime{

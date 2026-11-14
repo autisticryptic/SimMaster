@@ -27,6 +27,7 @@ use super::{
     session::{AttemptOwner, BackendFailure, BackendFuture, GatewayRegistration, HostingBackend,
         SdkLoginRequest, STATUS_REGISTER, STATUS_UNREGISTER},
     tls_engine::{valid_authority, TlsError, TlsParameters},
+    startup_diagnostics::{StartupFailure,StartupPhase,StartupTrace},
     transport_actor::{self, RuntimeCommands, RuntimeError, RuntimeEvent, RuntimeHandle, RuntimePolicy, RuntimeReceipt},
 };
 use ring::rand::{SecureRandom, SystemRandom};
@@ -474,6 +475,9 @@ struct Attempt {
     session_uri: Mutex<Option<Zeroizing<String>>>,
     bootstrap_scope: Option<RpcConnectionScope>,
     bootstrap_handle: AsyncMutex<Option<RuntimeHandle>>,
+    // Diagnostic-only handles preserve their original source/destination
+    // identities after an error closes the scope. They never own IO or grants.
+    startup_traces: Option<(Arc<StartupTrace>,Option<Arc<StartupTrace>>)>,
     // Serializes login/attach and controller commands with resource cleanup.
     // The independent event pump polls/configures without a controller lock.
     work: AsyncMutex<()>,
@@ -534,6 +538,14 @@ impl NativeHostingBackend {
         let attempt=self.original(owner).ok()?;
         let observation=lock(&attempt.state).account_alive;
         observation.map(super::runtime_provision::AccountAliveState::label)
+    }
+    pub(super) fn startup_failure_observation(&self,owner:&AttemptOwner)->Option<StartupFailure> {
+        let attempt=self.original(owner).ok()?;
+        let (destination,bootstrap)=attempt.startup_traces.as_ref()?;
+        if let (Some(trace),Some(scope))=(bootstrap,attempt.bootstrap_scope.as_ref()) {
+            if let Some(failure)=trace.snapshot(owner,scope,StartupPhase::Bootstrap) {return Some(failure);}
+        }
+        destination.snapshot(owner,&attempt.scope,StartupPhase::Account)
     }
     pub(super) fn original_incoming_binding(&self, owner: &AttemptOwner, scope: &RpcConnectionScope)
         -> Option<super::rpc_incoming::IncomingBinding<'_>> {
@@ -645,6 +657,7 @@ impl NativeHostingBackend {
             true=>Some(transport_actor::native::prepare_common(owner.clone(),runtime_policy(),end).map_err(|_|BackendFailure::Unavailable)?),false=>None};
         if bootstrap.as_ref().is_some_and(|bootstrap|bootstrap.connection_scope().matches(&destination.connection_scope())){return Err(BackendFailure::Unavailable);}
         let bootstrap_scope=bootstrap.as_ref().map(|bootstrap|bootstrap.connection_scope());
+        let startup_traces=Some((destination.startup_trace(),bootstrap.as_ref().map(|prepared|prepared.startup_trace())));
         let attempt={
             let mut state=lock(&self.state);
             if state.slot.as_ref().is_some_and(|a|!lock(&a.state).released)||state.owners.iter().any(|old|old==&owner)||state.owners.len()>=MAX_ATTEMPTS{return Err(BackendFailure::Unavailable);}
@@ -653,7 +666,7 @@ impl NativeHostingBackend {
                 if value!=0&&!state.incarnations.contains(&value){incarnation=Some(value);break;}}
             let incarnation=incarnation.ok_or(BackendFailure::Unavailable)?;
             let attempt=Arc::new(Attempt{owner:owner.clone(),scope:destination.connection_scope(),incarnation,state:Mutex::new(AttemptState::default()),commands:Mutex::new(None),
-                handle:AsyncMutex::new(None),session_uri:Mutex::new(None),bootstrap_scope,bootstrap_handle:AsyncMutex::new(None),work:AsyncMutex::new(()),poll_work:AsyncMutex::new(())});
+                handle:AsyncMutex::new(None),session_uri:Mutex::new(None),bootstrap_scope,bootstrap_handle:AsyncMutex::new(None),startup_traces,work:AsyncMutex::new(()),poll_work:AsyncMutex::new(())});
             state.owners.push(owner);state.incarnations.push(incarnation);state.slot=Some(attempt.clone());attempt
         };
         let mut retirement=Retirement::new(attempt.clone());let _work=attempt.work.lock().await;
@@ -803,7 +816,7 @@ impl NativeHostingBackend {
                 RuntimePolicy{io_timeout:self.profile.io_timeout,rpc_timeout:self.profile.rpc_timeout},None).map_err(|_|BackendFailure::Unavailable)?)}else{None};
             attempt = Arc::new(Attempt { owner: owner.clone(), scope: prepared.connection_scope(), incarnation,
                 state: Mutex::new(AttemptState::default()), commands: Mutex::new(None), handle: AsyncMutex::new(None),session_uri:Mutex::new(None),
-                bootstrap_scope:bootstrap_prepared.as_ref().map(|prepared|prepared.connection_scope()),bootstrap_handle:AsyncMutex::new(None),
+                bootstrap_scope:bootstrap_prepared.as_ref().map(|prepared|prepared.connection_scope()),bootstrap_handle:AsyncMutex::new(None),startup_traces:None,
                 work: AsyncMutex::new(()), poll_work: AsyncMutex::new(()) });
             state.owners.push(owner); state.incarnations.push(incarnation); state.slot = Some(attempt.clone());
         }
