@@ -106,15 +106,15 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 410已仅核心升级到df2/PID127787，保留账号/原UUID、配置和历史，无备份。新代码能力未自动改成安装配置：当前仍无启用的native_call_control及媒体配置。本次只对保留账号做一次TLS分层启动，失败层已明确，按本次run_nonce守卫停止并独立确认native1/stopped/lease0、App attempt50/active0、SMS39/call0，部署进程已退出。前述两个Router的SAN code62探测是独立证据，实际TLS错误仍不能证明唯一根因；不关闭身份校验或猜authority。
 
-**完整Accept参数装配（mediaType、keepAlive、SDK.IsNew等原条件）、媒体信任/传输、独立Alive与通知及真实接听仍未完成，不是整体目标完成。** Alive默认180/启用夹到60..600、epoch wire时间与独立调度时钟已新增只读依据；Call keepAlive则来自另一CALL设置，尚未装配，不能混用。权威软件证据在`.local/jegotrip/goal-replication-20261114/native-call/`，部署/本次唯一启停在`deploy-native-df2ef9d/`。
+**df2自身尚不含完整Accept参数/通话保活；后续5676的显式内置音频补充见1.8。其他媒体变体、动态信任/配置、独立Alive与通知及真实接听仍未完成，不是整体目标完成。** Alive默认180/启用夹到60..600、epoch wire时间与独立调度时钟已新增只读依据；Call keepAlive则来自另一CALL设置，尚未装配，不能混用。权威软件证据在`.local/jegotrip/goal-replication-20261114/native-call/`，部署/本次唯一启停在`deploy-native-df2ef9d/`。
 
-## 1.8 原生内置音频 Accept 与通话保活（新增，待自身验证）
+## 1.8 原生内置音频 Accept 与通话保活（5676a6a软件已验证，未部署）
 
 高级媒体配置可显式提供 `"native_lifecycle":{"session_timer_seconds":30}`；单位为秒，按原协议转成有符号32位可表示的毫秒，0关闭周期保活。此值是明确的部署侧Call设置，不是假定手机当前值，也不是AccountAlive间隔。缺省None时旧Accept与旧私有v1配置保持；只有`native_call_control`及受支持的明确媒体配置可启用。
 
 该路径针对无外接CallI stream的内置单音频引擎：使用原SDP封装与协商payload，发送`mediaType=audio`、`keepAlive`及`SDK.IsNew=1`；不伪造IoT、crypto、直连地址或服务器认证。新增KeepAlive本地操作仍编码为原`inform.CallServerEx.CallEx`，不混淆首次存在性Inform；匹配Accept后才允许，使用原per-call对象、token和RPC关联，单pending，迟到结果不恢复已释放呼叫。
 
-原Accept结果启动周期，真实MediaReady后通知保活任务发送一次`RseEx.AcceptDuration/RseEx.ConnDuration`毫秒耗时。部署实现使用单调elapsed避免壁钟回拨伪造负数；周期不因即时连接报告或一次RPC耗时重新开始，漏tick只合并、不突发补发。拥有者保留任务句柄；停止先撤销call/media资格，再按原RPC期限Join已有工作，不脱离、不重试未知结果。新增19项回归覆盖纯时钟、关联、配置和真实隔离Router/TLS/Common、独立Mpath/PCMA双向传输、负回执及挂断等待。尚待自身双Actions/正式制品；不表示实际410已接听或独立Alive已完成。
+原Accept结果启动周期，真实MediaReady后通知保活任务发送一次`RseEx.AcceptDuration/RseEx.ConnDuration`毫秒耗时。部署实现使用单调elapsed避免壁钟回拨伪造负数；周期不因即时连接报告或一次RPC耗时重新开始，漏tick只合并、不突发补发。拥有者保留任务句柄；停止先撤销call/media资格，再按原RPC期限Join已有工作，不脱离、不重试未知结果。新增19项回归覆盖纯时钟、关联、配置和真实隔离Router/TLS/Common、独立Mpath/PCMA双向传输、负回执及挂断等待。5676a6a自身Build43588312755/Beta43588312821各1504 provider/29HTTP、95前端单元/7浏览器16图及双ABI完整官方工件已核，262本机静态通过；旧行为断言、工作流过滤器、标准栈/超时和依赖不变。首510两个Actions的7个新计时夹具提前丢弃RPC对象，原scope因此正确关闭；只保留`_rpc`变量到测试末尾，未放宽任何生产守卫或断言，同名双CI通过后关闭失败并保留原工件。该源码没有部署或再次进行Provider/SDK操作，410仍保留上一次df2。独立Alive、其他媒体/通信分支及真实收件验收仍未完成。
 
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 
