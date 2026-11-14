@@ -1334,3 +1334,6 @@ async fn a_phone_trust_observation_stays_historical_after_uuid_rotation_and_neve
 
 #[path = "trusted_reuse_tests.rs"]
 mod trusted_reuse;
+
+#[path = "diagnostic_status_tests.rs"]
+mod diagnostic_status;

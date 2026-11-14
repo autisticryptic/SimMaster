@@ -49,7 +49,9 @@ pub struct DeviceTrustObservation {
     pub hosting_enabled: Option<bool>,
     pub business_query_error: Option<String>,
     pub business_query_server_code: Option<u32>,
-    /// New reuse observations are additive; old 2KiB records still decode.
+    /// Additive finite fields of an already-issued getCallStatus response.
+    /// Reuse records carry device_sync; diagnostic records never do. Neither
+    /// observation kind grants permission or supplies a later attempt's state.
     #[serde(default,skip_serializing_if="Option::is_none")]
     pub call_status:Option<TrustQueryObservation>,
     #[serde(default,skip_serializing_if="Option::is_none")]
@@ -77,15 +79,33 @@ impl DeviceTrustObservation {
         observation.local_cs_forward=status.ok().and_then(|s|s.local_cs_forward);
         observation.device_sync=Some(sync);observation
     }
+    /// Enrich an explicit diagnostic with the SAME response already used for
+    /// its business observation. No second query or runtime grant is created.
+    pub(super) fn with_diagnostic_status(mut self,status:Result<CallStatus,Error>)->Self {
+        self.call_status=Some(TrustQueryObservation::capture(status.map(|s|Some(TrustDecision {authentication_code:s.authentication_code}))));
+        self.local_cs_forward=status.ok().and_then(|s|s.local_cs_forward);
+        self
+    }
+    fn diagnostic_status_valid(&self,status:&TrustQueryObservation)->bool {
+        if self.security_verify.state==TrustQueryState::NotRequested || self.existing_device.state==TrustQueryState::NotRequested {return false;}
+        match status.state {
+            TrustQueryState::Observed=>self.hosting_enabled.is_some() && self.business_query_error.is_none() && self.business_query_server_code.is_none(),
+            TrustQueryState::Failed=>self.hosting_enabled.is_none() && self.local_cs_forward.is_none()
+                && self.business_query_error==status.error && self.business_query_server_code==status.server_code,
+            TrustQueryState::NotConfigured|TrustQueryState::NotRequested=>false,
+        }
+    }
     fn valid(&self) -> bool {
-        let reuse_valid=match &self.call_status {
-            Some(status)=>status.valid() && self.security_verify.state==TrustQueryState::NotRequested
-                && self.existing_device.state==TrustQueryState::NotRequested
-                && self.local_cs_forward.is_none_or(|n|(0..=999999).contains(&n))
-                && self.device_sync.as_ref().is_some_and(DeviceSyncObservation::valid),
+        let status_valid=match &self.call_status {
+            Some(status)=>status.valid() && self.local_cs_forward.is_none_or(|n|(0..=999999).contains(&n))
+                && match &self.device_sync {
+                    Some(sync)=>self.security_verify.state==TrustQueryState::NotRequested
+                        && self.existing_device.state==TrustQueryState::NotRequested && sync.valid(),
+                    None=>self.diagnostic_status_valid(status),
+                },
             None=>self.local_cs_forward.is_none() && self.device_sync.is_none(),
         };
-        reuse_valid && valid_attempt_id(&self.device_identity_id) && self.device_identity_revision > 0 && self.observed_at >= 0
+        status_valid && valid_attempt_id(&self.device_identity_id) && self.device_identity_revision > 0 && self.observed_at >= 0
             && self.security_verify.valid() && self.existing_device.valid()
             && match (&self.hosting_enabled, &self.business_query_error) {
                 (Some(_), None) => self.business_query_server_code.is_none(),

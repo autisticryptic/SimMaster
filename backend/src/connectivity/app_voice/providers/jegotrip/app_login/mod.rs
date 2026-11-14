@@ -501,8 +501,12 @@ impl AppLoginManager {
             self.step(owner,id,"checking_device_trust",None)?;
             let security=client.security_verify_device().await;
             let existing=client.verify_trusted_device().await;
-            let business=client.business_enabled().await;
-            let observation=DeviceTrustObservation::capture(&guard.snapshot,now(),security,existing,business);
+            // Retain finite fields of this one response, not only its switch.
+            // Comparing diagnostics must not borrow a code from another call.
+            let status=client.call_status().await;
+            let business=status.map(|s|s.hosting_enabled);
+            let observation=DeviceTrustObservation::capture(&guard.snapshot,now(),security,existing,business)
+                .with_diagnostic_status(status);
             self.database.with_conn(|c|store::set_device_trust(c,id,owner,&observation,now())).map_err(Error::new)?;
             return Ok(());
         }
