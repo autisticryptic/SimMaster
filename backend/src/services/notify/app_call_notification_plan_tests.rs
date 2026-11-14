@@ -29,7 +29,7 @@ fn app_call_bounded_renderer_preserves_literal_tokens_without_recursive_replacem
 }
 #[test]
 fn app_call_repeated_expansion_is_rejected_before_large_allocation_or_queue_admission(){
-    let mut r=record();r.phone_number="A".repeat(128);let mut c=call_config();c.rules[0].template="{{caller}}".repeat(16000);assert!(CallNoticeSnapshot::plan(&snapshot(c),&r).is_err());
+    let mut r=record();r.phone_number="A".repeat(128);let mut c=call_config();c.rules[0].template="{{caller}}".repeat(12000);assert!(CallNoticeSnapshot::plan(&snapshot(c),&r).is_err());
 }
 #[test]
 fn app_call_destination_and_rule_changes_have_distinct_immutable_fingerprints(){
