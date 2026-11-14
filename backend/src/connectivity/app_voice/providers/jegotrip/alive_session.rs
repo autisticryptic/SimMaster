@@ -50,6 +50,7 @@ impl AliveLink{
         if !self.live(){return Err("app_account_alive_scope_invalid");}
         let state=lock(&self.state);
         Ok(state.activity.and_then(|at|at.checked_add(Duration::from_secs(u64::from(state.interval)*2))).unwrap_or(now))
+    }
 }
 struct Pending{id:i32,deadline:Instant}
 struct AgentGuard{scope:RpcConnectionScope,success:bool}
