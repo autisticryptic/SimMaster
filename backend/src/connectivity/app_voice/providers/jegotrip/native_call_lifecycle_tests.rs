@@ -22,7 +22,7 @@ fn native_call_timer_is_explicit_seconds_checked_for_signed_millisecond_overflow
 }
 #[test]
 fn native_builtin_audio_accept_has_sdp_media_type_timer_and_new_stack_without_auth_material(){
-    let(_,_,_,ticket,timing)=prepared_timing(30);let fields=timing.accept_properties(&ticket,b"original-sdp").unwrap();
+    let(_rpc,_,_,ticket,timing)=prepared_timing(30);let fields=timing.accept_properties(&ticket,b"original-sdp").unwrap();
     assert_eq!(fields.len(),4);for (key,expected) in [(b"RseEx.SDP".as_slice(),b"original-sdp".as_slice()),(b"mediaType",b"audio"),(b"keepAlive",b"30000"),(b"SDK.IsNew",b"1")]{
         assert_eq!(fields.iter().find(|p|p.key==key).unwrap().value,expected);
     }
@@ -31,7 +31,7 @@ fn native_builtin_audio_accept_has_sdp_media_type_timer_and_new_stack_without_au
 }
 #[test]
 fn native_call_timing_is_bound_to_the_original_ticket_not_just_its_numeric_call_id(){
-    let(_,_,_,ticket,mut timing)=prepared_timing(1);let(_,_,_,foreign,_)=prepared_timing(1);let now=Instant::now();
+    let(_rpc,_,_,ticket,mut timing)=prepared_timing(1);let(_foreign_rpc,_,_,foreign,_)=prepared_timing(1);let now=Instant::now();
     assert_eq!(ticket.native_id(),foreign.native_id());assert!(timing.begin_accept(&foreign,now).is_err());
     assert!(timing.accept_properties(&foreign,b"data").is_err());assert!(timing.next(&foreign,now).is_err());
     assert!(timing.begin_accept(&ticket,now).is_ok());ticket.connection_scope().close();assert!(timing.next(&ticket,now).is_err());
@@ -46,7 +46,7 @@ fn native_call_timing_requires_one_matched_positive_accept_before_timer_or_conne
 }
 #[test]
 fn native_call_period_starts_at_accept_result_and_keeps_duration_as_one_shot_data(){
-    let(_,_,_,ticket,mut timing,start)=accepted_timing(1);
+    let(_rpc,_,_,ticket,mut timing,start)=accepted_timing(1);
     assert!(timing.take_due(&ticket,start+Duration::from_millis(1009)).unwrap().is_none());
     let fields=timing.take_due(&ticket,start+Duration::from_millis(1010)).unwrap().unwrap();
     assert_eq!(value(&fields,b"keepAlive"),Some(b"1000".as_slice()));assert_eq!(value(&fields,b"RseEx.AcceptDuration"),Some(b"10".as_slice()));
@@ -55,7 +55,7 @@ fn native_call_period_starts_at_accept_result_and_keeps_duration_as_one_shot_dat
 }
 #[test]
 fn native_connected_report_is_immediate_without_resetting_the_original_periodic_deadline(){
-    let(_,_,_,ticket,mut timing,start)=accepted_timing(1);let connected=start+Duration::from_millis(210);timing.connected(&ticket,connected).unwrap();
+    let(_rpc,_,_,ticket,mut timing,start)=accepted_timing(1);let connected=start+Duration::from_millis(210);timing.connected(&ticket,connected).unwrap();
     assert_eq!(timing.next(&ticket,connected).unwrap(),Some(connected));let fields=timing.take_due(&ticket,connected).unwrap().unwrap();
     assert_eq!(value(&fields,b"RseEx.AcceptDuration"),Some(b"10".as_slice()));assert_eq!(value(&fields,b"RseEx.ConnDuration"),Some(b"210".as_slice()));
     assert_eq!(timing.next(&ticket,connected).unwrap(),Some(start+Duration::from_millis(1010)));
@@ -63,21 +63,21 @@ fn native_connected_report_is_immediate_without_resetting_the_original_periodic_
 }
 #[test]
 fn native_call_missed_ticks_coalesce_without_a_burst_or_replaying_duration_fields(){
-    let(_,_,_,ticket,mut timing,start)=accepted_timing(1);let now=start+Duration::from_millis(5500);
+    let(_rpc,_,_,ticket,mut timing,start)=accepted_timing(1);let now=start+Duration::from_millis(5500);
     assert!(timing.take_due(&ticket,now).unwrap().is_some());assert!(timing.take_due(&ticket,now).unwrap().is_none());
     assert_eq!(timing.next(&ticket,now).unwrap(),Some(start+Duration::from_millis(6010)));
     assert_eq!(timing.take_due(&ticket,start+Duration::from_millis(6010)).unwrap().unwrap().len(),1);
 }
 #[test]
 fn native_zero_timer_disables_periodic_io_but_keeps_the_single_original_connected_report(){
-    let(_,_,_,ticket,mut timing,start)=accepted_timing(0);assert!(timing.next(&ticket,start+Duration::from_secs(1)).unwrap().is_none());
+    let(_rpc,_,_,ticket,mut timing,start)=accepted_timing(0);assert!(timing.next(&ticket,start+Duration::from_secs(1)).unwrap().is_none());
     assert!(timing.take_due(&ticket,start+Duration::from_secs(100)).unwrap().is_none());timing.connected(&ticket,start+Duration::from_secs(1)).unwrap();
     let fields=timing.take_due(&ticket,start+Duration::from_secs(1)).unwrap().unwrap();assert_eq!(value(&fields,b"keepAlive"),Some(b"0".as_slice()));
     assert!(timing.take_due(&ticket,start+Duration::from_secs(100)).unwrap().is_none());assert!(timing.next(&ticket,start+Duration::from_secs(100)).unwrap().is_none());
 }
 #[test]
 fn native_call_clock_rollback_does_not_wrap_a_duration_or_consume_the_original_tick(){
-    let(_,_,_,ticket,mut timing,start)=accepted_timing(1);assert!(timing.take_due(&ticket,start).is_err());
+    let(_rpc,_,_,ticket,mut timing,start)=accepted_timing(1);assert!(timing.take_due(&ticket,start).is_err());
     assert!(timing.connected(&ticket,start).is_err());let fields=timing.take_due(&ticket,start+Duration::from_millis(1010)).unwrap().unwrap();assert_eq!(value(&fields,b"RseEx.AcceptDuration"),Some(b"10".as_slice()));
 }
 #[test]
