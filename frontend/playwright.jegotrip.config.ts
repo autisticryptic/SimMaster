@@ -4,7 +4,7 @@ import { defineConfig, devices } from '@playwright/test'
 // request is proxied to an unused loopback port, never a modem/backend/provider.
 export default defineConfig({
   testDir: './e2e',
-  testMatch: 'jegotrip-device-identity.spec.ts',
+  testMatch: ['jegotrip-device-identity.spec.ts', 'jegotrip-local-receiver.spec.ts'],
   timeout: 45_000,
   expect: { timeout: 10_000 },
   workers: 1,

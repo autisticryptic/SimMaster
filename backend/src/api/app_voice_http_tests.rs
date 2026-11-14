@@ -907,6 +907,97 @@ mod app_voice_accounts {
         assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["io_cleanup_required"],false);
     }
 
+    fn local_receiver_http_configuration(root:&str,base:&str,existing:bool)->serde_json::Value {
+        let native=config_json(root);let mut sdk=native["credentials"]["sdk"].clone();let mut hosting=native["credentials"]["hosting"].clone();
+        for key in ["account_identity","phone_login_token","tls_only","expires_at_unix_seconds"] {sdk.as_object_mut().unwrap().remove(key);}
+        for key in ["sip_number","sip_password","enrollment_confirmed"] {hosting.as_object_mut().unwrap().remove(key);}
+        serde_json::json!({"version":1,"http":{"base_url":base,"anonymous_token":"fixture-anonymous","signature_salt":"fixture-signature-salt",
+            "password_salt":"fixture-password-salt","sip_password_key":"0123456789abcdefABCDEFGH","device_id":"fixture-http-device",
+            "endpoints":{"login":"login","user_info":"user","phone_token":"csb/token","voip_status":"voip","call_status":"state","enable_hosting":"enable",
+                "verification_trustful_device":if existing {Some("trust")}else{None::<&str>}},
+            "body_protection":null,"root_der_base64":root,"user_agent":null,"enroll_id":null},
+            "runtime":{"sdk":sdk,"hosting":hosting,"profile":native["profile"],"bootstrap":null,"call_media":null,"cleanup_on_disconnect":false,"reconnect":null}})
+    }
+    fn local_receiver_http_request()->serde_json::Value {
+        serde_json::json!({"attempt_id":"0123456789abcdef0123456789abcdef","username":"fixture-user@example.invalid","password":"fixture-password",
+            "country_code":null,"intent":"prepare_local_receiver","consent":true,"start_receiver":false,"device_id":"D5C0199B-1644-4D33-8912-B8BD5AB49224"})
+    }
+
+    #[tokio::test]
+    async fn local_receiver_api_requires_auth_explicit_uuid_and_consent_without_importing_grants() {
+        let state=build_test_router().await.expect("Actions private D-Bus required; no skip");let served=serve(state.router.clone()).await;
+        let input=local_receiver_http_request();
+        let (status,_,body)=account_request(&served,reqwest::Method::POST,"/api/jegotrip/login/attempts",Some(input.clone()),None).await;
+        assert_eq!(status,StatusCode::UNAUTHORIZED);no_secrets(&body);let cookie=authenticate(&served).await;
+        for (key,value) in [("device_id",serde_json::Value::Null),("device_id",serde_json::json!("fixture-sdk-id")),("consent",serde_json::json!(false))] {
+            let mut bad=input.clone();bad[key]=value;
+            let (status,headers,body)=account_request(&served,reqwest::Method::POST,"/api/jegotrip/login/attempts",Some(bad),Some(&cookie)).await;
+            assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);
+        }
+        for key in ["device_trust","purpose","trust_granted","sso_token","enrollId","device_sync_profile"] {
+            let mut bad=input.clone();bad[key]=serde_json::json!("fixture-forged-grant");
+            let (status,headers,body)=account_request(&served,reqwest::Method::POST,"/api/jegotrip/login/attempts",Some(bad),Some(&cookie)).await;
+            assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);
+        }
+        let (status,headers,body)=account_request(&served,reqwest::Method::GET,"/api/jegotrip/login/setup",None,Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["accepting_local_receiver"],false);
+        assert!(state.app.app_logins.list().unwrap().is_empty());assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_receiver_api_missing_existing_device_query_returns_503_without_an_attempt_or_identity() {
+        let state=build_test_router().await.expect("Actions private D-Bus required; no skip");
+        let mut bytes=[0u8;16];ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(),&mut bytes).unwrap();
+        let nonce=bytes.iter().map(|v|format!("{v:02x}")).collect::<String>();
+        let lock_path=std::env::temp_dir().join(format!("jegotrip-local-missing-{nonce}.lock"));
+        state.app.app_accounts.claim_process_ownership(&lock_path).unwrap();
+        state.app.app_logins.initialize(std::env::temp_dir().join(format!("missing-local-{nonce}.json"))).unwrap();
+        let served=serve(build_router(state.app.clone(),CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))).await;
+        let cookie=authenticate(&served).await;let cert=Certificates::generate("IP:127.0.0.1");
+        let configuration=local_receiver_http_configuration(&cert.root,"https://127.0.0.1:1/",false);
+        let (status,headers,body)=account_request(&served,reqwest::Method::PUT,"/api/jegotrip/config",
+            Some(serde_json::json!({"expected_revision":0,"configuration":configuration})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["accepting_local_receiver"],false);
+        let (status,headers,body)=account_request(&served,reqwest::Method::POST,"/api/jegotrip/login/attempts",Some(local_receiver_http_request()),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::SERVICE_UNAVAILABLE);no_store(&headers);no_secrets(&body);assert!(body.contains("app_login_receiver_device_check_missing"));
+        assert!(state.app.app_logins.list().unwrap().is_empty());assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+        assert_eq!(state.app.database.with_conn(|c|c.query_row("SELECT COUNT(*) FROM jegotrip_device_identities",[],|r|r.get::<_,i64>(0)).map_err(|_|"test_query_failed")).unwrap(),0);
+        state.app.app_logins.shutdown().await;let _=std::fs::remove_file(lock_path);
+    }
+
+    #[tokio::test]
+    async fn local_receiver_api_uses_its_own_intent_and_does_not_fallback_after_a_tls_refusal() {
+        let state=build_test_router().await.expect("Actions private D-Bus required; no skip");
+        let mut bytes=[0u8;16];ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(),&mut bytes).unwrap();
+        let nonce=bytes.iter().map(|v|format!("{v:02x}")).collect::<String>();let lock_path=std::env::temp_dir().join(format!("jegotrip-local-api-{nonce}.lock"));
+        state.app.app_accounts.claim_process_ownership(&lock_path).unwrap();
+        state.app.app_logins.initialize(std::env::temp_dir().join(format!("missing-local-api-{nonce}.json"))).unwrap();
+        let served=serve(build_router(state.app.clone(),CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))).await;
+        let cookie=authenticate(&served).await;let cert=Certificates::generate("IP:127.0.0.1");
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let configuration=local_receiver_http_configuration(&cert.root,&format!("https://{address}/"),true);
+        let (status,headers,body)=account_request(&served,reqwest::Method::PUT,"/api/jegotrip/config",
+            Some(serde_json::json!({"expected_revision":0,"configuration":configuration})),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["accepting_local_receiver"],true);
+        let submit=account_request(&served,reqwest::Method::POST,"/api/jegotrip/login/attempts",Some(local_receiver_http_request()),Some(&cookie));
+        let refusal=async move {let (socket,_)=listener.accept().await.unwrap();drop(socket);};
+        let ((status,headers,body),())=tokio::time::timeout(std::time::Duration::from_secs(8),async {tokio::join!(submit,refusal)}).await.unwrap();
+        assert_eq!(status,StatusCode::ACCEPTED);no_store(&headers);no_secrets(&body);
+        let result=tokio::time::timeout(std::time::Duration::from_secs(8),async {loop {
+            let (status,headers,body)=account_request(&served,reqwest::Method::GET,"/api/jegotrip/login/attempts/0123456789abcdef0123456789abcdef",None,Some(&cookie)).await;
+            assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);let value:serde_json::Value=serde_json::from_str(&body).unwrap();
+            if value["data"]["completed"]==true {break value;}
+            tokio::task::yield_now().await;
+        }}).await.unwrap();
+        assert_eq!(result["data"]["intent"],"prepare_local_receiver");assert_eq!(result["data"]["business_state"],"not_requested");
+        assert_eq!(result["data"]["line_id"],serde_json::Value::Null);assert_eq!(result["data"]["error"],"app_login_transport_failed");
+        assert_eq!(state.app.app_logins.list().unwrap().len(),1);assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+        state.app.app_logins.shutdown().await;let _=std::fs::remove_file(lock_path);
+    }
+
     #[tokio::test]
     async fn body_limit_blocks_oversized_private_import_and_keeps_storage_empty() {
         let state = build_test_router().await.expect("Actions private D-Bus required; do not skip");

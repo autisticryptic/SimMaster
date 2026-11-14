@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { appLoginInput, canSubmitAppLogin, jegotripLoginInput, canSubmitJegotripLogin, emptyAppLoginDraft, validJegotripDeviceId, validPhoneAppUuid, deviceTrustQueryLabel, deviceSyncLabel, appLoginError, appBusinessLabel, appLoginPhase, appLoginNeedsPolling, type AppLoginDraft } from '../src/policies/appLogin.ts'
+import { appLoginInput, canSubmitAppLogin, jegotripLoginInput, canSubmitJegotripLogin, emptyAppLoginDraft, validJegotripDeviceId, validPhoneAppUuid, deviceTrustQueryLabel, deviceSyncLabel, callForwardingQueryLabel, localReceiverTaskLabel, appLoginError, appBusinessLabel, appLoginPhase, appLoginNeedsPolling, type AppLoginDraft } from '../src/policies/appLogin.ts'
 import type { AppLoginAttempt } from '../src/api/current.ts'
 
 const id = '0123456789abcdef0123456789abcdef'
@@ -205,4 +205,65 @@ void test('a native session error does not change UUID reuse inputs business lab
   assert.deepEqual(jegotripLoginInput(id, reuse), before)
   assert.equal(appBusinessLabel('accepted_unconfirmed'), '服务已接受，状态待确认')
   assert.equal(appLoginPhase('completed').includes('就绪'), false)
+})
+
+void test('local receiver preparation is a separate explicit original-UUID operation without a forwarding write', () => {
+  const local: AppLoginDraft = { ...draft, intent: 'prepare_local_receiver', deviceMode: 'phone_app', deviceId: ' D5C0199B-1644-4D33-8912-B8BD5AB49224 ' }
+  assert.equal(canSubmitJegotripLogin(local), true)
+  assert.deepEqual(jegotripLoginInput(id, local), { attempt_id: id, username: 'user@example.invalid', password: ' p@ss ', country_code: null,
+    intent: 'prepare_local_receiver', consent: true, start_receiver: true, device_id: 'D5C0199B-1644-4D33-8912-B8BD5AB49224' })
+  for (const field of ['enable_hosting', 'device_sync_profile', 'sso_token', 'phone_login_token', 'authentication_code']) assert.equal(field in jegotripLoginInput(id, local), false)
+})
+void test('local receiver preparation cannot silently substitute automatic manual or malformed device identity', () => {
+  const local: AppLoginDraft = { ...draft, intent: 'prepare_local_receiver', deviceMode: 'phone_app', deviceId: 'D5C0199B-1644-4D33-8912-B8BD5AB49224' }
+  for (const deviceMode of ['auto', 'manual'] as const) assert.equal(canSubmitJegotripLogin({ ...local, deviceMode }), false)
+  for (const deviceId of ['', 'fixture-sdk-id', '0123456789abcdef0123456789abcdef', '123456789012345']) assert.equal(canSubmitJegotripLogin({ ...local, deviceId }), false)
+  assert.equal(canSubmitJegotripLogin({ ...local, consent: false }), false)
+  assert.throws(() => jegotripLoginInput('not-an-attempt', local))
+})
+void test('local receiver start selection is explicit and old full-hosting defaults are not changed', () => {
+  const local: AppLoginDraft = { ...draft, intent: 'prepare_local_receiver', deviceMode: 'phone_app', deviceId: 'D5C0199B-1644-4D33-8912-B8BD5AB49224', startReceiver: false }
+  assert.equal(jegotripLoginInput(id, local).start_receiver, false)
+  assert.equal(jegotripLoginInput(id, { ...local, startReceiver: true }).start_receiver, true)
+  assert.equal(emptyAppLoginDraft().intent, 'enable_hosting')
+  assert.equal(emptyAppLoginDraft().consent, false)
+})
+void test('a remote reuse refusal never automatically changes the requested operation to local reception', () => {
+  const reuse: AppLoginDraft = { ...draft, intent: 'reuse_hosting', deviceMode: 'phone_app', deviceId: 'D5C0199B-1644-4D33-8912-B8BD5AB49224' }
+  const before = jegotripLoginInput(id, reuse)
+  appLoginError('app_login_device_untrusted')
+  assert.deepEqual(jegotripLoginInput(id, reuse), before)
+  assert.equal(before.intent, 'reuse_hosting')
+})
+void test('forwarding query labels do not turn an App code into an SDK failure or readiness', () => {
+  const observed = { state: 'observed' as const, authentication_code: 2, error: null, server_code: null }
+  const label = callForwardingQueryLabel(observed)
+  assert.match(label, /本次返回 2/)
+  assert.match(label, /不是本地SDK注册结果/)
+  assert.equal(label.includes('未认可该设备'), false)
+  assert.equal(label.includes('就绪'), false)
+  for (const code of [null, -1, 1.5, 1000000, Number.NaN]) assert.match(callForwardingQueryLabel({ ...observed, authentication_code: code }), /未返回规范/)
+})
+void test('local receiver completion with an account is preparation rather than a claim of online SMS or media', () => {
+  const attempt: AppLoginAttempt = { attempt_id: id, intent: 'prepare_local_receiver', phase: 'completed', business_state: 'not_requested', completed: true,
+    line_id: 'app_voice:fixture', masked_number: '***0123', error: null, server_code: null, created_at: 1, updated_at: 2 }
+  assert.match(localReceiverTaskLabel(attempt), /本地接收账号已准备/)
+  assert.equal(localReceiverTaskLabel(attempt).includes('就绪'), false)
+  assert.match(localReceiverTaskLabel({ ...attempt, line_id: null }), /未建立接收账号/)
+  assert.equal(localReceiverTaskLabel({ ...attempt, phase: 'starting_receiver', completed: false }), appLoginPhase('starting_receiver'))
+  assert.equal(appBusinessLabel(attempt.business_state), '未提交开通')
+})
+void test('local receiver diagnostics and task errors remain redacted instead of echoing a service URL or token', () => {
+  const error = 'https://private.invalid/?token=PRIVATE-TOKEN'
+  const label = callForwardingQueryLabel({ state: 'failed', authentication_code: null, error, server_code: null })
+  assert.equal(label.includes('PRIVATE-TOKEN'), false); assert.equal(label.includes('private.invalid'), false)
+  assert.match(appLoginError('app_login_receiver_device_check_missing'), /已有设备查询端点/)
+  assert.match(appLoginError('app_login_receiver_device_check_missing'), /未请求电话资料或启动SDK/)
+})
+void test('local receiver request serialization never forwards a supplied observation or forged grant', () => {
+  const local = { ...draft, intent: 'prepare_local_receiver' as const, deviceMode: 'phone_app' as const, deviceId: 'D5C0199B-1644-4D33-8912-B8BD5AB49224',
+    purpose: 'local_receiver', authentication_code: 1, trust_granted: true, device_trust: { ready: true } }
+  const input = jegotripLoginInput(id, local)
+  for (const field of ['purpose', 'authentication_code', 'trust_granted', 'device_trust']) assert.equal(field in input, false)
+  assert.equal(input.intent, 'prepare_local_receiver')
 })

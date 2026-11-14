@@ -197,9 +197,10 @@ export interface AppLoginSetup {
   configuration_source?: string
   configuration_revision?: number
   configuration_error?: string | null
+  accepting_local_receiver?: boolean
 }
 
-export type JegotripLoginIntent = 'authenticate' | 'enable_hosting' | 'attach_hosting' | 'check_device_trust' | 'reuse_hosting' | 'enable_trusted_hosting'
+export type JegotripLoginIntent = 'authenticate' | 'enable_hosting' | 'attach_hosting' | 'check_device_trust' | 'reuse_hosting' | 'enable_trusted_hosting' | 'prepare_local_receiver'
 export interface JegotripTrustQueryObservation {
   state: 'not_configured' | 'not_requested' | 'observed' | 'failed'
   authentication_code: number | null
@@ -215,6 +216,7 @@ export interface JegotripDeviceTrustObservation {
   device_identity_id: string
   device_identity_revision: number
   observed_at: number
+  purpose?: 'local_receiver' | null
   security_verify: JegotripTrustQueryObservation
   existing_device: JegotripTrustQueryObservation
   hosting_enabled: boolean | null
@@ -232,6 +234,7 @@ export interface JegotripConfigurationView {
   native_configured: boolean
   accepting_authenticate: boolean
   accepting_enable_hosting: boolean
+  accepting_local_receiver?: boolean
 }
 export interface JegotripAppVersionView {
   stored: { version: string; source: string; observed_at: number } | null

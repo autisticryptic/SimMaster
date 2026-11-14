@@ -37,6 +37,10 @@ impl TrustQueryObservation {
     }
 }
 
+#[derive(Clone,Copy,Debug,Deserialize,Serialize,PartialEq,Eq)]
+#[serde(rename_all="snake_case")]
+pub enum DeviceTrustPurpose { LocalReceiver }
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceTrustObservation {
@@ -44,6 +48,10 @@ pub struct DeviceTrustObservation {
     pub device_identity_id: String,
     pub device_identity_revision: u64,
     pub observed_at: i64,
+    /// New local receiver observations are explicitly distinguished from old
+    /// remote-business reuse/diagnostics. Historical rows remain unmodified.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub purpose:Option<DeviceTrustPurpose>,
     pub security_verify: TrustQueryObservation,
     pub existing_device: TrustQueryObservation,
     pub hosting_enabled: Option<bool>,
@@ -67,7 +75,7 @@ impl DeviceTrustObservation {
             Ok(enabled) => (Some(enabled), None, None),
             Err(error) => (None, Some(stored_code(error.code).unwrap_or("app_login_internal_failed").to_owned()), error.server_code),
         };
-        Self { device_identity_id: snapshot.id.clone(), device_identity_revision: snapshot.revision, observed_at: at,
+        Self { device_identity_id: snapshot.id.clone(), device_identity_revision: snapshot.revision, observed_at: at, purpose:None,
             security_verify: TrustQueryObservation::capture(security), existing_device: TrustQueryObservation::capture(existing),
             hosting_enabled, business_query_error, business_query_server_code,call_status:None,local_cs_forward:None,device_sync:None }
     }
@@ -95,7 +103,36 @@ impl DeviceTrustObservation {
             TrustQueryState::NotConfigured|TrustQueryState::NotRequested=>false,
         }
     }
+    pub(super) fn capture_local_receiver(snapshot:&Snapshot,at:i64,existing:Result<Option<TrustDecision>,Error>,status:Option<Result<CallStatus,Error>>)->Self {
+        let (hosting_enabled,business_query_error,business_query_server_code,call_status,local_cs_forward)=match status {
+            None=>(None,None,None,TrustQueryObservation::not_requested(),None),
+            Some(Ok(value))=>(Some(value.hosting_enabled),None,None,
+                TrustQueryObservation::capture(Ok(Some(TrustDecision {authentication_code:value.authentication_code}))),value.local_cs_forward),
+            Some(Err(error))=>(None,Some(stored_code(error.code).unwrap_or("app_login_internal_failed").to_owned()),error.server_code,
+                TrustQueryObservation::capture(Err(error)),None),
+        };
+        Self {device_identity_id:snapshot.id.clone(),device_identity_revision:snapshot.revision,observed_at:at,
+            purpose:Some(DeviceTrustPurpose::LocalReceiver),security_verify:TrustQueryObservation::not_requested(),
+            existing_device:TrustQueryObservation::capture(existing),hosting_enabled,business_query_error,business_query_server_code,
+            call_status:Some(call_status),local_cs_forward,device_sync:None}
+    }
+    fn local_receiver_valid(&self)->bool {
+        let Some(status)=&self.call_status else{return false;};
+        valid_attempt_id(&self.device_identity_id) && self.device_identity_revision>0 && self.observed_at>=0
+            && self.security_verify.valid() && self.security_verify.state==TrustQueryState::NotRequested
+            && self.existing_device.valid() && self.existing_device.state!=TrustQueryState::NotRequested
+            && self.device_sync.is_none() && status.valid() && self.local_cs_forward.is_none_or(|n|(0..=999999).contains(&n))
+            && match status.state {
+                TrustQueryState::NotRequested=>self.hosting_enabled.is_none() && self.business_query_error.is_none()
+                    && self.business_query_server_code.is_none() && self.local_cs_forward.is_none(),
+                TrustQueryState::Observed=>self.hosting_enabled.is_some() && self.business_query_error.is_none() && self.business_query_server_code.is_none(),
+                TrustQueryState::Failed=>self.hosting_enabled.is_none() && self.local_cs_forward.is_none()
+                    && self.business_query_error==status.error && self.business_query_server_code==status.server_code,
+                TrustQueryState::NotConfigured=>false,
+            }
+    }
     fn valid(&self) -> bool {
+        if self.purpose==Some(DeviceTrustPurpose::LocalReceiver) {return self.local_receiver_valid();}
         let status_valid=match &self.call_status {
             Some(status)=>status.valid() && self.local_cs_forward.is_none_or(|n|(0..=999999).contains(&n))
                 && match &self.device_sync {

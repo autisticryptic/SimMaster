@@ -50,12 +50,14 @@ export function canSubmitJegotripLogin(draft: AppLoginDraft): boolean {
   const intent = draft.intent ?? 'enable_hosting'
   const deviceMode = draft.deviceMode ?? 'auto'
   const reusing = intent === 'reuse_hosting' || intent === 'enable_trusted_hosting'
+  const localReceiver = intent === 'prepare_local_receiver'
   return canSubmitAppLogin(draft)
     && (deviceMode === 'auto' || (deviceMode === 'manual' && validJegotripDeviceId(draft.deviceId ?? ''))
       || (deviceMode === 'phone_app' && validPhoneAppUuid(draft.deviceId ?? '')))
     && (!reusing || deviceMode === 'phone_app')
-    && (deviceMode !== 'phone_app' || reusing || intent === 'authenticate' || intent === 'check_device_trust')
-    && (reusing || intent === 'enable_hosting' || intent === 'attach_hosting'
+    && (!localReceiver || deviceMode === 'phone_app')
+    && (deviceMode !== 'phone_app' || reusing || localReceiver || intent === 'authenticate' || intent === 'check_device_trust')
+    && (reusing || localReceiver || intent === 'enable_hosting' || intent === 'attach_hosting'
       || ((intent === 'authenticate' || intent === 'check_device_trust') && !draft.startReceiver))
 }
 
@@ -91,6 +93,7 @@ const errors: Record<string, string> = {
   app_login_native_configuration_invalid: '原生接收配置不完整或不受支持，未提交业务开通。',
   app_login_account_creation_failed: '本地账号保存失败；请先核对任务中的远端业务结果。',
   app_login_receiver_start_failed: '账号已保存，但接收器启动失败；请查看独立账号状态。',
+  app_login_receiver_device_check_missing: '本地接收准备需要已有设备查询端点；当前未配置，未请求电话资料或启动SDK。',
   app_login_version_discovery_failed: '未能从 App Store 或官方页面取得版本号；请手工填写后保存。',
   app_login_device_identity_conflict: '该标识已分配或保留给另一身份，或与本账号现有标识不一致。请勿复用他人标识；更换现有标识请使用下方设备标识管理。',
   app_login_device_identity_revision_conflict: '设备标识已被其他操作修改，请刷新后再保存。',
@@ -139,6 +142,19 @@ export function deviceTrustQueryLabel(observation: JegotripTrustQueryObservation
   if (observation.authentication_code === 1) return '服务器本次返回 1（认可该设备）'
   if (observation.authentication_code === 2) return '服务器本次返回 2（未认可该设备）'
   return '服务器未返回已支持的明确授信结论'
+}
+
+export function callForwardingQueryLabel(observation: JegotripTrustQueryObservation): string {
+  if (observation.state !== 'observed') return deviceTrustQueryLabel(observation)
+  const code = observation.authentication_code
+  if (typeof code !== 'number' || !Number.isInteger(code) || code < 0 || code > 999999) return '接口未返回规范状态码；不推断SDK状态'
+  return `接口本次返回 ${code}（独立呼转业务观察，不是本地SDK注册结果）`
+}
+
+export function localReceiverTaskLabel(attempt: AppLoginAttempt): string {
+  if (attempt.error) return appLoginError(attempt.error)
+  if (!attempt.completed) return appLoginPhase(attempt.phase)
+  return attempt.line_id ? '本地接收账号已准备；SDK与收件状态请查看独立账号' : '本地接收任务已结束，未建立接收账号'
 }
 
 export function deviceSyncLabel(observation: JegotripDeviceSyncObservation): string {

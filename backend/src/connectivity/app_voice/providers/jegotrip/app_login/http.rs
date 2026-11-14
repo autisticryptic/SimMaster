@@ -217,6 +217,9 @@ pub(super) struct AppClient { config:HttpDeployment, transport:Arc<dyn Transport
     /// SDK identity remains a separate explicit runtime parameter.
     device_id_override:Option<Secret>,
     /// Reuse is an operation policy, never a locally granted trust bit.
+    /// Separate local SDK preparation policy. This flag is never a grant and
+    /// cannot be supplied by a response or persisted diagnostic observation.
+    local_receiver:bool,
     trusted_reuse:bool,
     trusted_reuse_write_started:std::sync::atomic::AtomicBool,
     version_cache:std::sync::Mutex<Option<(String,&'static str,std::time::Instant)>> }
@@ -270,7 +273,7 @@ impl AppClient {
         hash.update(&[0]);hash.update(&request.identity_key());
         Ok(hash.finish().as_ref().to_vec())
     }
-    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_store:None,enroll_id:std::sync::Mutex::new(None),device_id_override:None,trusted_reuse:false,trusted_reuse_write_started:std::sync::atomic::AtomicBool::new(false),version_cache:std::sync::Mutex::new(None)}) }
+    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_store:None,enroll_id:std::sync::Mutex::new(None),device_id_override:None,local_receiver:false,trusted_reuse:false,trusted_reuse_write_started:std::sync::atomic::AtomicBool::new(false),version_cache:std::sync::Mutex::new(None)}) }
     pub(super) fn with_trusted_reuse(mut self)->Result<Self,Error> {
         // A private extra field must not sneak a stale enrolment, carrier
         // credential or a different report owner into this explicit policy.
@@ -280,6 +283,15 @@ impl AppClient {
         }
         self.trusted_reuse=true;Ok(self)
     }
+    pub(super) fn with_local_receiver(self)->Result<Self,Error> {
+        if self.local_receiver || self.trusted_reuse || self.session.is_some() {return Err(Error::new("app_login_request_invalid"));}
+        if self.config.endpoints.verification_trustful_device.is_none() {return Err(Error::new("app_login_receiver_device_check_missing"));}
+        // Reuse the immutable original-UUID/no-enrolment HTTP policy, not its
+        // remote call-forwarding workflow. Only this mode may perform the
+        // current empty-carrier-token existing-device check below.
+        let mut client=self.with_trusted_reuse()?;client.local_receiver=true;Ok(client)
+    }
+    pub(super) fn is_local_receiver(&self)->bool {self.local_receiver}
     pub(super) fn trusted_reuse_write_started(&self)->bool { self.trusted_reuse_write_started.load(std::sync::atomic::Ordering::SeqCst) }
     /// Bind a checked installation-store identity before any network request.
     pub fn with_device_id(mut self,device_id:&str)->Self { self.use_device_identity(device_id); self }
@@ -521,12 +533,24 @@ impl AppClient {
         Ok(BoundNumber {country:country.to_owned(),mobile:Secret::from_owned(mobile.to_owned()),app_account_id})
     }
     pub async fn phone_credentials(&self,bound:&BoundNumber)->Result<PhoneMaterial,Error> {
+        if self.local_receiver {return Err(Error::new("app_login_request_invalid"));}
+        self.fetch_phone_material(bound).await
+    }
+    pub(super) async fn receiver_phone_credentials(&self,bound:&BoundNumber)->Result<PhoneMaterial,Error> {
+        if !self.local_receiver {return Err(Error::new("app_login_request_invalid"));}
+        self.fetch_phone_material(bound).await
+    }
+    async fn fetch_phone_material(&self,bound:&BoundNumber)->Result<PhoneMaterial,Error> {
         let identity=bound.identity();let payload=self.payload(serde_json::json!({"accountId":&**identity}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         let token_doc=self.post(&self.config.endpoints.phone_token,&bytes,Authentication::Session,true).await?;
         let token=crypto::secret_field(crypto::body(&token_doc)?,"token")?;
         let sip_doc=self.post(&self.config.endpoints.voip_status,b"",Authentication::Session,false).await?;
-        let encrypted=crypto::secret_field(crypto::body(&sip_doc)?,"sip_password")?;
+        let body=crypto::body(&sip_doc)?;
+        // JustalkManager.login/updateStatus use the actual phone/SIP material.
+        // VoipStatus.status in one UI callback is not a general SDK grant or
+        // prerequisite; empty/malformed material and HTTP errors still fail.
+        let encrypted=crypto::secret_field(body,"sip_password")?;
         let sip_password=crypto::sip_password(&encrypted,&self.config)?;
         Ok(PhoneMaterial {token,sip_password})
     }
@@ -536,6 +560,13 @@ impl AppClient {
     /// Original CallLogic uses ordinary JSON here, and equipment_type is "1".
     pub async fn verify_trusted_device(&self)->Result<Option<TrustDecision>,Error> {
         if self.trusted_reuse { return Err(Error::new("app_login_request_invalid")); }
+        self.query_existing_device().await
+    }
+    pub(super) async fn receiver_device_recognition(&self)->Result<Option<TrustDecision>,Error> {
+        if !self.local_receiver {return Err(Error::new("app_login_request_invalid"));}
+        self.query_existing_device().await
+    }
+    async fn query_existing_device(&self)->Result<Option<TrustDecision>,Error> {
         let Some(path)=self.config.endpoints.verification_trustful_device.clone() else { return Ok(None); };
         if self.session.is_none() {return Err(Error::new("app_login_unavailable"));}
         let payload=self.payload(serde_json::json!({
@@ -618,6 +649,7 @@ impl AppClient {
         let _=profile.payload(self.device_id()?,account.expose_to_backend())?;Ok(())
     }
     pub(super) async fn sync_device(&self,bound:&BoundNumber,status:CallStatus)->Result<(),Error> {
+        if self.local_receiver {return Err(Error::new("app_login_request_invalid"));}
         if !self.trusted_reuse || status.authentication_code!=Some(1) { return Err(Error::new("app_login_device_untrusted")); }
         let profile=self.config.device_sync_profile.as_ref().ok_or(Error::new("app_login_device_sync_context_missing"))?;
         let account=bound.app_account_id.as_ref().ok_or(Error::new("app_login_device_sync_context_missing"))?;
@@ -631,6 +663,7 @@ impl AppClient {
         self.post(path,&bytes,Authentication::Session,true).await?;Ok(())
     }
     pub async fn enable_business(&self)->Result<(),Error> {
+        if self.local_receiver {return Err(Error::new("app_login_request_invalid"));}
         let payload=self.payload(serde_json::json!({"cs_forward":"2","device_id":self.device_id()?}),self.version_value().await.as_deref());
         let bytes=Zeroizing::new(serde_json::to_vec(&payload.0).map_err(|_|Error::new("app_login_request_invalid"))?);
         if self.trusted_reuse { self.trusted_reuse_write_started.store(true,std::sync::atomic::Ordering::SeqCst); }

@@ -8,6 +8,7 @@ mod device_identity;
 mod device_trust;
 mod device_sync;
 mod trusted_reuse;
+mod local_receiver;
 mod push_status;
 mod store;
 mod settings;
@@ -46,6 +47,7 @@ const ERRORS: &[&str] = &[
     "app_login_session_revoked", "app_login_service_maintenance", "app_login_phone_binding_required",
     "app_login_identity_mismatch", "app_login_native_configuration_invalid", "app_login_business_unconfirmed",
     "app_login_account_creation_failed", "app_login_receiver_start_failed", "app_login_internal_failed",
+    "app_login_receiver_device_check_missing",
 ];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Error { pub code: &'static str, pub server_code: Option<u32> }
@@ -57,12 +59,13 @@ pub(crate) fn valid_attempt_id(s: &str) -> bool { s.len() == 32 && s.bytes().all
 
 #[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
 #[serde(rename_all="snake_case")]
-pub enum LoginIntent { Authenticate, #[default] EnableHosting, AttachHosting, CheckDeviceTrust, ReuseHosting, EnableTrustedHosting }
+pub enum LoginIntent { Authenticate, #[default] EnableHosting, AttachHosting, CheckDeviceTrust, ReuseHosting, EnableTrustedHosting, PrepareLocalReceiver }
 impl LoginIntent {
-    fn as_str(self)->&'static str {match self {Self::Authenticate=>"authenticate",Self::EnableHosting=>"enable_hosting",Self::AttachHosting=>"attach_hosting",Self::CheckDeviceTrust=>"check_device_trust",Self::ReuseHosting=>"reuse_hosting",Self::EnableTrustedHosting=>"enable_trusted_hosting"}}
-    fn parse(value:&str)->Option<Self> {match value {"authenticate"=>Some(Self::Authenticate),"enable_hosting"=>Some(Self::EnableHosting),"attach_hosting"=>Some(Self::AttachHosting),"check_device_trust"=>Some(Self::CheckDeviceTrust),"reuse_hosting"=>Some(Self::ReuseHosting),"enable_trusted_hosting"=>Some(Self::EnableTrustedHosting),_=>None}}
-    fn needs_native(self)->bool {matches!(self,Self::EnableHosting|Self::AttachHosting|Self::ReuseHosting|Self::EnableTrustedHosting)}
+    fn as_str(self)->&'static str {match self {Self::Authenticate=>"authenticate",Self::EnableHosting=>"enable_hosting",Self::AttachHosting=>"attach_hosting",Self::CheckDeviceTrust=>"check_device_trust",Self::ReuseHosting=>"reuse_hosting",Self::EnableTrustedHosting=>"enable_trusted_hosting",Self::PrepareLocalReceiver=>"prepare_local_receiver"}}
+    fn parse(value:&str)->Option<Self> {match value {"authenticate"=>Some(Self::Authenticate),"enable_hosting"=>Some(Self::EnableHosting),"attach_hosting"=>Some(Self::AttachHosting),"check_device_trust"=>Some(Self::CheckDeviceTrust),"reuse_hosting"=>Some(Self::ReuseHosting),"enable_trusted_hosting"=>Some(Self::EnableTrustedHosting),"prepare_local_receiver"=>Some(Self::PrepareLocalReceiver),_=>None}}
+    fn needs_native(self)->bool {matches!(self,Self::EnableHosting|Self::AttachHosting|Self::ReuseHosting|Self::EnableTrustedHosting|Self::PrepareLocalReceiver)}
     fn reuses_trusted_device(self)->bool {matches!(self,Self::ReuseHosting|Self::EnableTrustedHosting)}
+    fn requires_original_device(self)->bool {self.reuses_trusted_device() || self==Self::PrepareLocalReceiver}
 }
 
 /// Historical API contract: explicit consent to the complete hosting operation.
@@ -139,7 +142,7 @@ impl fmt::Debug for ConfigurationWriteRequest {fn fmt(&self,f:&mut fmt::Formatte
 pub struct ConfigurationView {
     pub configuration_source:&'static str, pub revision:u64, pub initialized:bool,
     pub http_configured:bool, pub native_configured:bool,
-    pub accepting_authenticate:bool, pub accepting_enable_hosting:bool,
+    pub accepting_authenticate:bool, pub accepting_enable_hosting:bool, pub accepting_local_receiver:bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -159,6 +162,7 @@ pub struct LoginSetup {
     pub accepting_authenticate:bool, pub native_configured:bool,
     pub configuration_source:&'static str, pub configuration_revision:u64,
     pub configuration_error:Option<&'static str>,
+    pub accepting_local_receiver:bool,
 }
 #[derive(Default)]
 struct Admissions { aliases:BTreeSet<Vec<u8>>, devices:BTreeSet<String> }
@@ -218,8 +222,10 @@ impl AppLoginManager {
         let initialized=lock(&self.owner).is_some();
         let open=initialized && !self.closed.load(Ordering::SeqCst);
         let http=configuration.is_some();let native=configuration.as_ref().is_some_and(|c|c.runtime.is_some());
+        let existing_device=configuration.as_ref().is_some_and(|c|c.http.endpoints.verification_trustful_device.is_some());
         Ok(ConfigurationView {configuration_source:source,revision,initialized,http_configured:http,native_configured:native,
-            accepting_authenticate:open&&http,accepting_enable_hosting:open&&http&&native})
+            accepting_authenticate:open&&http,accepting_enable_hosting:open&&http&&native,
+            accepting_local_receiver:open&&http&&native&&existing_device})
     }
     pub(crate) fn configure(&self,request:ConfigurationWriteRequest)->Result<ConfigurationView,Error> {
         if lock(&self.owner).is_none() {return Err(Error::new("app_login_unavailable"));}
@@ -240,9 +246,11 @@ impl AppLoginManager {
         match self.configuration() {
             Ok(view)=>LoginSetup {implemented:true,deployment_present:view.http_configured,accepting:view.accepting_enable_hosting,
                 manual_sdk_credentials_required:false,accepting_authenticate:view.accepting_authenticate,native_configured:view.native_configured,
-                configuration_source:view.configuration_source,configuration_revision:view.revision,configuration_error:None},
+                configuration_source:view.configuration_source,configuration_revision:view.revision,configuration_error:None,
+                accepting_local_receiver:view.accepting_local_receiver},
             Err(code)=>LoginSetup {implemented:true,deployment_present:false,accepting:false,manual_sdk_credentials_required:false,
-                accepting_authenticate:false,native_configured:false,configuration_source:"invalid",configuration_revision:0,configuration_error:Some(code)},
+                accepting_authenticate:false,native_configured:false,configuration_source:"invalid",configuration_revision:0,configuration_error:Some(code),
+                accepting_local_receiver:false},
         }
     }
     pub fn app_accounts(&self)->Result<Vec<JegotripAccountView>,&'static str> {
@@ -353,7 +361,7 @@ impl AppLoginManager {
             enable_hosting:matches!(intent,LoginIntent::EnableHosting|LoginIntent::EnableTrustedHosting),start_receiver:request.start_receiver};
         let preferred=request.device_id;
         if preferred.as_ref().is_some_and(|v| !device_identity::valid_device_id(v.expose_to_backend().trim())) {return Err(Error::new("app_login_request_invalid"));}
-        if intent.reuses_trusted_device() && !preferred.as_ref().is_some_and(|v|device_identity::valid_phone_app_uuid(v.expose_to_backend().trim())) {
+        if (intent.reuses_trusted_device() || intent==LoginIntent::PrepareLocalReceiver) && !preferred.as_ref().is_some_and(|v|device_identity::valid_phone_app_uuid(v.expose_to_backend().trim())) {
             return Err(Error::new("app_login_request_invalid"));
         }
         common.validate_identity()?;self.submit_internal(common,intent,preferred)
@@ -366,7 +374,8 @@ impl AppLoginManager {
         let configuration=configuration.ok_or(Error::new("app_login_deployment_missing"))?;
         if intent.needs_native() && configuration.runtime.is_none() {return Err(Error::new("app_login_native_configuration_missing"));}
         let mut client=self.factory.build(&configuration.http)?;
-        if intent.reuses_trusted_device() { client=client.with_trusted_reuse()?; }
+        if intent==LoginIntent::PrepareLocalReceiver {client=client.with_local_receiver()?;}
+        else if intent.reuses_trusted_device() { client=client.with_trusted_reuse()?; }
         let accounts=self.accounts.upgrade().ok_or(Error::new("app_login_unavailable"))?;
         if intent.needs_native() {accounts.login_preflight_create().map_err(|_|Error::new("app_login_account_creation_failed"))?;}
         let permit=self.active.clone().try_acquire_owned().map_err(|_|Error::new("app_login_busy"))?;
@@ -378,7 +387,7 @@ impl AppLoginManager {
             (configuration.http.device_identity_mode==config::DeviceIdentityMode::Static).then(||configuration.http.device_id.expose_to_backend()));
         let (view,snapshot)=self.database.with_conn(|conn| {
             let tx=rusqlite::Transaction::new_unchecked(conn,rusqlite::TransactionBehavior::Immediate).map_err(|_|"app_login_storage_failed")?;
-            let snapshot=if intent.reuses_trusted_device() {
+            let snapshot=if intent.requires_original_device() {
                 device_identity::resolve_reuse(&tx,&alias,explicit.ok_or("app_login_request_invalid")?,now()).map_err(|e|e.code)?
             } else {device_identity::resolve(&tx,&alias,explicit,Some(configuration.http.device_id.expose_to_backend()),now()).map_err(|e|e.code)?};
             if admissions.devices.contains(&snapshot.id) {return Err("app_login_busy");}
@@ -474,7 +483,7 @@ impl AppLoginManager {
         self.step(owner,id,"reading_bound_number",None)?;
         let mut bound=client.bound_number(&request).await?;
         let key=client.account_key(&bound)?;
-        if self.confirm_device_identity(guard,&key,intent.reuses_trusted_device())? {
+        if self.confirm_device_identity(guard,&key,intent.requires_original_device())? {
             // A newly seen alias discovered an existing number's identity.
             // Re-authenticate ONCE with it, before any token/trust/business call;
             // never switch a device beneath an existing App session.
@@ -485,7 +494,7 @@ impl AppLoginManager {
             client.login(&request).await?;
             let confirmed=client.bound_number(&request).await?;
             if client.account_key(&confirmed)?!=key {return Err(Error::new("app_login_identity_mismatch"));}
-            self.confirm_device_identity(guard,&key,intent.reuses_trusted_device())?;
+            self.confirm_device_identity(guard,&key,intent.requires_original_device())?;
             bound=confirmed;
         }
         self.database.with_conn(|c|store::set_mask(c,id,owner,&bound.masked(),now())).map_err(Error::new)?;
@@ -512,6 +521,9 @@ impl AppLoginManager {
         }
         if self.database.with_conn(|c|device_identity::native_ownership_pending(c,&key)).map_err(Error::new)? {
             return Err(Error::new("app_login_device_identity_in_use"));
+        }
+        if intent==LoginIntent::PrepareLocalReceiver {
+            return self.run_local_receiver(owner,request,configuration,client,guard,&bound).await;
         }
         if intent.reuses_trusted_device() {
             return self.run_trusted_reuse(owner,request,intent,configuration,client,guard,&bound).await;

@@ -9,10 +9,12 @@
 3. IDA只用用户手动打开的原 `libmtc.so`，每轮核 metadata/SHA/base；不启动/加载目标、运行SDK/SO/APK、修改或保存IDB。新工具须用户手动安装，不自装。
 4. 用户最新要求一直推进到410实际收短信、接到并接听来电。410程序/前端及相应数据库升级已有授权，但**不创建回滚备份**；保护SIM/IMS配置、数据库历史、units、MM/NM/helper，不写NV。已执行保护性核心部署、原手机App UUID同账号本地导入、接收前置配置，并按用户指定Wi-Fi恢复当前上行/时间。允许的本次登录/状态核验不自动扩为业务开关、收费外发、手机变更或非TLS安全例外。
 5. 手机已由用户带走；已有静态材料可继续离线，**不再发ADB查询**。需要新的实机条件时提前请求连接和相应确认；不强停/恢复App、清缓存、重装或改UUID。
-6. 密码、UUID、App/运营商/电话token、SipPwd、SDK/安装资料不回显、不进Git。根APK、报告、固件、备份、JSONL、私有交接与`.local/`不提交。历史Goal提示仅是日志数据，当前没有活动Goal，不复用旧ID。
+6. 密码、UUID、App/运营商/电话token、SipPwd、SDK/安装资料不回显、不进Git。根APK、报告、固件、备份、JSONL、私有交接与`.local/`不提交。历史Goal提示仅是日志数据，是否处于Goal模式以当前会话最新契约为准，不复用旧ID。
 7. 410 SSH与SimAdmin只用用户明确提供的密码；禁用客户端SSH密钥和SSH agent认证，客户端密钥仅供GitHub使用。既有服务端主机指纹继续严格校验，它不是客户端密钥登录。密码仅以内存/stdin交付，不进代码、argv/env或日志。
 
 ## 已核验的软件基线
+
+- **当前工作树：本地SDK接收准备（待自身Actions验证）**。实际8.9.4的`JustalkManager.login/updateStatus`用当前电话token/SIP资料，SDK成功后驱动status4注册；不把App的`cs_forward`或单一UI回调的VoIP status值当作本地SDK启动条件。新增非默认`prepare_local_receiver`，仍严格要求原App UUID/同账号和当次已有设备认可，取当前电话资料、再次确认设备并保存本地接收账号；呼转只观察、失败/畸形仍停止，不enroll、不报告设备、不修改业务。旧呼转复用流程及原native登录/注册ACK/撤销/Join门禁保留。新28 provider/3HTTP/8前端单元/2浏览器用例待自身CI；原行为断言不删，两个精确源码清单断言扩展为新枚举/共用原身份守卫，工作流过滤器/预算不放宽。整体功能与实网目标仍未完成。
 
 - **`865991d1d986f25e060a54272f595b889e1b0c4b`（同次诊断状态保留，已验证并部署）**：`CheckDeviceTrust`保存原来已发出的那一次`getCallStatus`授权码及`localCsForward`，不增加请求/重试、不改变原UUID、HTTP wire或复用门禁。旧记录不回填；复用/诊断形状分别校验，原2KiB上限保持。Build43549614252 / Beta43549614209首轮success，各1418精确provider（1406旧+12新）、26HTTP与原registry/Trunk/通知/DNS/矩阵通过；各82前端单元、4浏览器、12图及双ABI各29成员/20前端文件的官方digest/全CRC/SHA/meta/ELF已核。本机231静态通过，旧断言/工作流/前端/API/依赖与预算保持。410已仅核心升级到本SHA/PID26706，历史/身份/配置/辅助服务保护通过，无回滚备份。证据`.local/jegotrip/diagnostic-status-20261114/`；完整托管仍未完成。
 
@@ -110,11 +112,11 @@
 - 已进一步配置接收前置：通过管理API的版本守卫，将有效安装上下文从`legacy_file/revision0`写入独立数据库配置`revision1`，仅开启已验证的`native_receivers`原空deny-list、`client_ex`及`offline_reception`。HTTP/SDK/TLS/身份/其他配置、旧安装文件及账号历史未变，没有启动接收器或请求运营商服务。页面现在能投影短信/来电对象“已配置”，但原生账号仍为0、接收未激活；来电控制及媒体配置尚缺，不能猜路由/证书/SDP补齐。
 - **程序、网络和接收前置已部署，不等于完整模块收件或接听成功。** 当前阻碍已转为复用流程的最新设备认可拒绝；通话控制、媒体及其余原生装配也尚待完成。需在合法本次门禁通过后验证外来SMS、来电接听/媒体及清理/时延，不从配置投影推导成功。
 
-私有证据：新源码/双Actions/制品/部署、`same-response-diagnostic-request.json`及`final-device-readback-*.json`在`.local/jegotrip/diagnostic-status-20261114/`；原版交叉核对在`.local/jegotrip/official-app-context-20261114/`。旧部署/官方App刷新后复用请求、RAM网络恢复在`.local/jegotrip/deploy-readiness-20261113/`，失败记录不覆盖。独立读回脚本首轮误索引timer的MainPID，已按实际systemd属性区分timer/正PID服务，仅重做读回，没有重放部署/Provider请求。当前IDA MCP连接10061，未擅自启动或加载库。
+私有证据：新源码/双Actions/制品/部署、`same-response-diagnostic-request.json`及`final-device-readback-*.json`在`.local/jegotrip/diagnostic-status-20261114/`；原版交叉核对在`.local/jegotrip/official-app-context-20261114/`。旧部署/官方App刷新后复用请求、RAM网络恢复在`.local/jegotrip/deploy-readiness-20261113/`，失败记录不覆盖。独立读回脚本首轮误索引timer的MainPID，已按实际systemd属性区分timer/正PID服务，仅重做读回，没有重放部署/Provider请求。当前IDA原库/MCP已恢复，并核对metadata、base0及磁盘原SHA；旧10061不再作为当前阻碍，仍不写或保存IDB。
 
 ## 接下来按顺序
 
-1. 同次诊断修复已交付，不重复审计已验旧包或重发终态请求。继续核对“已有设备认可→原设备信息同步→当前业务读回”这一原App分支；服务端写范围未明确前不执行同步，不把existing_device1覆盖getCallStatus2，也不再次要求用户登录、授信或提供密码。需要原IDA时由用户手动恢复原库/MCP后先核metadata。
+1. 按最新完整复刻目标继续实现与测试，当前优先验证独立的本地SDK接收准备路径；不能因App呼转状态false就认定本地SDK失败，也不把设备同步当作必需修复。新代码先过自身双Actions/制品，再在明确原UUID/同账号与一次性请求下推进实际SDK验证。旧诊断/部署/网络请求不重放，已给的授信/凭据不重复索取。随后继续独立Alive、原生通知关联、动态通话控制/媒体等全部未完项。
 2. 在原App UUID/同账号上下文中取得本次明确认可和业务读回，补正确接收、通话控制与媒体配置后启动；验收外来SMS落库/原回执、来电接听/双向媒体、断连、stop→logoutSession→Join与持续时延。若需新代码，仍先过自身双Actions再保护性升级；不能用核心health替代终点。
 3. 授信TTL/撤销/替换与服务端积压重放规则不可由客户端fixture证明。不用新VTD/UUID、缓存授权、收费外发或设备变更补造成功。**完整用户目标仍未完成。**
 
