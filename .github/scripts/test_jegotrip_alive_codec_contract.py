@@ -27,11 +27,14 @@ class PassiveAliveContracts(unittest.TestCase):
             self.assertNotIn(forbidden, text)
         self.assertIn("RegisterAliveArguments(<redacted>)", text)
         self.assertIn("RawRegisterAliveResult(<redacted>)", text)
-    def test_no_runtime_consumer_or_check_alive_upgrade_is_added(self):
+    def test_runtime_consumer_requires_original_binding_and_codec_alone_cannot_upgrade_check_alive(self):
+        allowed={"mod.rs", "rpc_alive.rs", "rpc_alive_tests.rs", "alive_session.rs", "runtime_alive_tests.rs", "alive_session_tests.rs", "alive_io_tests.rs"}
         for path in MODULE.rglob("*.rs"):
-            if path.name not in {"mod.rs", "rpc_alive.rs", "rpc_alive_tests.rs"}:
+            if path.name not in allowed:
                 self.assertNotIn("rpc_alive", path.read_text(encoding="utf-8"), str(path.relative_to(ROOT)))
-        self.assertIn("ClientExKind::CheckAlive => false", source("rpc_client_ex.rs"))
+        self.assertIn("ClientExKind::CheckAlive => alive.0", source("rpc_client_ex.rs"))
+        self.assertIn("map_or((false,0),|alive|alive.check(&self.owner,&self.scope,&self.token", source("rpc_client_ex.rs"))
+        self.assertIn('state.phase!="registered"', source("alive_session.rs"))
         self.assertIn("else { Self::Unsupported }", source("runtime_provision.rs"))
         self.assertIn("pub(crate) mod rpc_alive;", source("mod.rs"))
     def test_independent_fixtures_and_authenticated_but_unregistered_negative_case_are_retained(self):

@@ -20,7 +20,8 @@ class NotificationReliabilityContracts(unittest.TestCase):
         helper=text[text.index('fn recognized_notification_command'):text.index('pub(super) enum ClientExControl')]
         for forbidden in ['parse::<','from_utf8','TcpStream','Sqlite','insert_sms','Command::new','SystemTime','Instant::']:
             self.assertNotIn(forbidden,helper)
-        self.assertIn('ClientExKind::CheckAlive => false',text)
+        self.assertIn('ClientExKind::CheckAlive => alive.0',text)
+        self.assertIn('map_or((false,0),|alive|alive.check(&self.owner,&self.scope,&self.token',text)
         self.assertIn('self.scope.mark_session_revoked()',text)
         self.assertIn('if !properties.is_empty()',text)
         self.assertIn('nonempty_notification_hook_map_is_rejected_not_swallowed_as_a_successful_hint',source('rpc_client_ex_tests.rs'))

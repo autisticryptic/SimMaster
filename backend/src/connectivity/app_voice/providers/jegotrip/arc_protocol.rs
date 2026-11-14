@@ -208,6 +208,7 @@ impl ArcProtocol {
         self.client_ex.as_ref().map(super::rpc_client_ex::ClientExDispatcher::captured_copy)
     }
 
+    pub(super) fn alive_link(&self)->std::sync::Arc<super::alive_session::AliveLink>{self.rpc.alive_link()}
     pub(super) fn configure_call_control(&mut self,routing:&[RpcProperty<'_>])->Result<(),ProtocolError>{Ok(self.rpc.configure_call_control(routing)?)}
     pub(super) fn register_call_notice(&mut self,notice:&super::call_binding::OwnedCallNotice)->Result<Option<CallControlTicket>,ProtocolError>{Ok(self.rpc.register_call_notice(notice)?)}
     pub(super) fn call_acknowledged(&mut self,ticket:&CallControlTicket,accepted:bool)->Result<(),ProtocolError>{Ok(self.rpc.call_acknowledged(ticket,accepted)?)}

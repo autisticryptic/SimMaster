@@ -77,7 +77,8 @@ class NativeReceiverContracts(unittest.TestCase):
         self.assertIn("original_native_binding", backend)
         self.assertIn("(self.profile.call_incoming.is_some() || self.profile.native_receivers.is_some()) && (self.profile.call_control.is_some() || self.profile.native_call_control)", backend)
         self.assertIn("if self.common.is_none()||self.native_receivers.is_none()||self.call_incoming.is_some()||self.call_control.is_some()||self.native_call_control", backend)
-        self.assertIn("ClientExKind::CheckAlive => false", source("rpc_client_ex.rs"))
+        self.assertIn("ClientExKind::CheckAlive => alive.0", source("rpc_client_ex.rs"))
+        self.assertIn("map_or((false,0),|alive|alive.check(&self.owner,&self.scope,&self.token", source("rpc_client_ex.rs"))
     def test_session_revocation_retires_logical_media_while_only_original_control_writer_can_finish(self):
         scope = source("rpc_pending.rs")
         revoked = scope[scope.index("pub(super) fn mark_session_revoked"):scope.index("pub(super) fn matches")]

@@ -77,6 +77,7 @@ pub struct ArcRpcSession {
     packet_transport_taken: bool,
     common_transport_claimed:bool,common_identity:Option<Vec<u8>>,main_account:Option<Zeroizing<Vec<u8>>>,
     call_book:CallBook,
+    alive:Arc<super::alive_session::AliveLink>,
 }
 
 impl fmt::Debug for ArcRpcSession {
@@ -182,12 +183,14 @@ impl fmt::Debug for ArcReply<'_> {
 impl ArcRpcSession {
     pub fn new(owner: AttemptOwner) -> Self {
         let connection=RpcConnectionScope::fresh();let call_book=CallBook::new(owner.clone(),connection.clone());
+        let alive=super::alive_session::AliveLink::original(owner.clone(),connection.clone());
         Self { owner, connection, phase: ArcPhase::Initial,
             next_id: Some(1), pending: BTreeMap::new(), authentication: None, hosting_tracker_taken: false,
-            batch_scheduler_taken: false, packet_transport_taken: false,common_transport_claimed:false,common_identity:None,main_account:None,call_book }
+            batch_scheduler_taken: false, packet_transport_taken: false,common_transport_claimed:false,common_identity:None,main_account:None,call_book,alive }
     }
 
     pub fn connection_scope(&self) -> RpcConnectionScope { self.connection.clone() }
+    pub(super) fn alive_link(&self)->Arc<super::alive_session::AliveLink>{self.alive.clone()}
     pub fn phase(&self) -> ArcPhase {
         if self.connection.is_open() { self.phase } else { ArcPhase::Closed }
     }
@@ -271,7 +274,7 @@ impl ArcRpcSession {
     pub(super) fn native_client_ex_dispatcher(&self, policy: Arc<super::native_receiver::NativeReceiverPolicy>) -> Result<super::rpc_client_ex::ClientExDispatcher, CodecError> {
         if !self.native_receiver_scope() { return Err(CodecError::InvalidField); }
         let authentication = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
-        super::rpc_client_ex::ClientExDispatcher::for_native_client(self.owner.clone(), self.connection.clone(), policy, &authentication.token)
+        super::rpc_client_ex::ClientExDispatcher::for_native_client(self.owner.clone(), self.connection.clone(), policy, &authentication.token)?.with_alive(self.alive.clone())
     }
     pub(super) fn can_arm_native_receivers(&self) -> bool {
         self.common_transport_claimed && self.phase() == ArcPhase::Initial && self.pending.is_empty()
@@ -281,7 +284,7 @@ impl ArcRpcSession {
         -> Result<super::rpc_client_ex::ClientExDispatcher, CodecError> {
         if self.phase() != ArcPhase::Authenticated || self.connection.session_revoked() { return Err(CodecError::InvalidField); }
         let authentication = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
-        super::rpc_client_ex::ClientExDispatcher::for_arc_session(self.owner.clone(), self.connection.clone(), binding, &authentication.token)
+        super::rpc_client_ex::ClientExDispatcher::for_arc_session(self.owner.clone(), self.connection.clone(), binding, &authentication.token)?.with_alive(self.alive.clone())
     }
 
     pub fn incoming_call_dispatcher(&self,binding:super::call_binding::CallIncomingBinding<'_>)
@@ -405,7 +408,7 @@ impl ArcRpcSession {
         let mut metadata = self.account_metadata(routing,self.common_identity.as_deref())?; metadata.push(RpcProperty { key: b"token", value: &auth.token });
         let bytes = encode_request(self.next_id.ok_or(CodecError::InvalidCallId)?, &metadata, LOGOUT_SESSION_METHOD.as_bytes(), arguments.expose_to_transport())?;
         let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
-        self.next_id = id.checked_add(1); self.pending.clear();self.call_book.close();
+        self.next_id = id.checked_add(1); self.pending.clear();self.call_book.close();self.alive.close();
         self.pending.insert(id, PendingRpc { kind: PendingKind::Logout, selected_session_id: None, scheduler: None,call:None });
         self.phase = ArcPhase::LogoutPending; Ok((id, bytes))
     }
@@ -476,7 +479,7 @@ impl ArcRpcSession {
         self.authentication = None;
         if let Some(identity)=&mut self.common_identity{identity.zeroize();}self.common_identity=None;
         if let Some(account)=&mut self.main_account{account.zeroize();}self.main_account=None;
-        self.pending.clear();self.call_book.close();
+        self.pending.clear();self.call_book.close();self.alive.close();
     }
 
     pub fn accepts_scope(&self, owner: &AttemptOwner, connection: &RpcConnectionScope) -> bool {
@@ -541,6 +544,7 @@ impl ArcRpcSession {
                     }
                     if let Some(account) = result.main_account { self.main_account = Some(Zeroizing::new(account.to_vec())); }
                     let Some(selected_session_id) = pending.selected_session_id.take() else { return Ok(Some(self.failure())); };
+                    self.alive.bind_authenticated(&self.owner,&self.connection,result.user_id,&selected_session_id,result.session_token,self.main_account.as_deref().map(|v|v.as_slice()))?;
                     self.authentication = Some(ArcAuthentication { user_id: result.user_id.to_vec(),
                         selected_session_id, token: result.session_token.to_vec() });
                     self.phase = ArcPhase::Authenticated;

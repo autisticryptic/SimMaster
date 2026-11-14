@@ -88,7 +88,7 @@ class LocalReceiverContracts(unittest.TestCase):
 
     def test_existing_and_new_ui_suites_run_in_the_original_actions_without_budget_changes(self):
         config=source('frontend/playwright.jegotrip.config.ts')
-        self.assertIn("testMatch: ['jegotrip-device-identity.spec.ts', 'jegotrip-local-receiver.spec.ts', 'jegotrip-startup-diagnostics.spec.ts']",config)
+        self.assertIn("testMatch: ['jegotrip-device-identity.spec.ts', 'jegotrip-local-receiver.spec.ts', 'jegotrip-startup-diagnostics.spec.ts', 'jegotrip-alive-status.spec.ts']",config)
         self.assertIn('timeout: 45_000',config);self.assertIn('workers: 1',config);self.assertIn('retries: 0',config)
         self.assertEqual(source('frontend/e2e/jegotrip-device-identity.spec.ts').count("test('"),4)
         e2e=source('frontend/e2e/jegotrip-local-receiver.spec.ts')

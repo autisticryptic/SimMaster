@@ -3,9 +3,9 @@
 //! These are control notifications, not SMS/call payloads or readiness grants.
 //! Keep the existing explicit object/domain subset; native default adapters and
 //! their separate DIRECT/batch domain policies are not inferred here. Positive
-//! checkAlive requires an independently matched AccountAlive registration, which
-//! is not installed by this component. An SDK/HostingAck therefore returns false
-//! with interval zero, never a fabricated alive lease.
+//! checkAlive requires the optional original-bound AccountAlive runtime's
+//! current registration. Without it, SDK/HostingAck alone still returns false
+//! with interval zero; a true Alive result never marks SMS/call/media ready.
 use super::{
     batch_scheduler::IncomingBatchRequest,
     rpc_incoming::IncomingBinding,
@@ -107,6 +107,7 @@ pub(super) struct ClientExDispatcher {
     domain: Zeroizing<Vec<u8>>,
     token: Zeroizing<Vec<u8>>,
     native: Option<super::native_receiver::NativeReceiverBinding>,
+    alive:Option<std::sync::Arc<super::alive_session::AliveLink>>,
 }
 impl fmt::Debug for ClientExDispatcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("ClientExDispatcher(<redacted>)") }
@@ -127,21 +128,25 @@ impl ClientExDispatcher {
             return Err(CodecError::TooLarge);
         }
         Ok(Self { owner, scope, object: Zeroizing::new(binding.object_id.to_vec()),
-            domain: Zeroizing::new(binding.domain.to_vec()), token: Zeroizing::new(token.to_vec()), native: None })
+            domain: Zeroizing::new(binding.domain.to_vec()), token: Zeroizing::new(token.to_vec()), native: None,alive:None })
     }
     pub(super) fn for_native_client(owner: AttemptOwner, scope: RpcConnectionScope, policy: std::sync::Arc<super::native_receiver::NativeReceiverPolicy>, token: &[u8])
         -> Result<Self, CodecError> {
         if token.is_empty() || token.len() > MAX_FIELD_BYTES { return Err(CodecError::InvalidField); }
         let native = super::native_receiver::NativeReceiverBinding::original(owner.clone(), scope.clone(), policy)?;
         Ok(Self { owner, scope, object: Zeroizing::new(super::native_receiver::MESSAGE_OBJECT.to_vec()), domain: Zeroizing::new(Vec::new()),
-            token: Zeroizing::new(token.to_vec()), native: Some(native) })
+            token: Zeroizing::new(token.to_vec()), native: Some(native),alive:None })
+    }
+    pub(super) fn with_alive(mut self,alive:std::sync::Arc<super::alive_session::AliveLink>)->Result<Self,CodecError>{
+        if self.alive.is_some()||!alive.matches(&self.owner,&self.scope)||!alive.current_token(&self.token){return Err(CodecError::InvalidField);}
+        self.alive=Some(alive);Ok(self)
     }
     pub(super) fn matches_binding(&self, binding: &IncomingBinding<'_>) -> bool {
         self.native.is_none() && self.object.as_slice() == binding.object_id && self.domain.as_slice() == binding.domain
     }
     pub(super) fn captured_copy(&self) -> Self {
         Self { owner: self.owner.clone(), scope: self.scope.clone(), object: Zeroizing::new(self.object.to_vec()),
-            domain: Zeroizing::new(self.domain.to_vec()), token: Zeroizing::new(self.token.to_vec()), native: self.native.clone() }
+            domain: Zeroizing::new(self.domain.to_vec()), token: Zeroizing::new(self.token.to_vec()), native: self.native.clone(),alive:self.alive.clone() }
     }
     pub(super) fn on_direct(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, request: &RpcRequest<'_>)
         -> Result<Option<ClientExAction>, CodecError> {
@@ -185,13 +190,14 @@ impl ClientExDispatcher {
         };
         reader.finish()?;
         if !self.scope.is_open() || self.scope.session_revoked() { return Ok(None); }
+        let alive=if kind==ClientExKind::CheckAlive{self.alive.as_ref().map_or((false,0),|alive|alive.check(&self.owner,&self.scope,&self.token,std::time::Instant::now()))}else{(false,0)};
         let accepted = match kind {
-            ClientExKind::CheckAlive => false,
+            ClientExKind::CheckAlive => alive.0,
             ClientExKind::NotifyCalls => notify_accepted,
             ClientExKind::NotifyDisconnect => property(b"token") == Some(self.token.as_slice()),
         };
-        let result = encode_result(kind, accepted, 0)?;
-        let notice = if accepted {
+        let result = encode_result(kind, accepted, alive.1)?;
+        let notice = if accepted && control.is_some() {
             let control = control.ok_or(CodecError::InvalidField)?;
             if matches!(control, ClientExControl::Revoked { .. }) {
                 // Sticky ORIGINAL-scope revocation precedes every reply write,

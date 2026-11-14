@@ -89,7 +89,7 @@ fn fixture(root: &str) -> AccountConfig {
         client_ex: false,
         native_receivers: None,
         bootstrap_via_router: None,
-        call_incoming:None,call_control:None,native_call_control:false,
+        call_incoming:None,call_control:None,native_call_control:false,account_alive:None,
         connect_timeout_ms: 1000, handshake_timeout_ms: 3000, partial_timeout_ms: 300,
         io_timeout_ms: 2000, rpc_timeout_ms: 2000,
     } }

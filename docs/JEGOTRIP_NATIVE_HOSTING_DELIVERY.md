@@ -116,6 +116,16 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 原Accept结果启动周期，真实MediaReady后通知保活任务发送一次`RseEx.AcceptDuration/RseEx.ConnDuration`毫秒耗时。部署实现使用单调elapsed避免壁钟回拨伪造负数；周期不因即时连接报告或一次RPC耗时重新开始，漏tick只合并、不突发补发。拥有者保留任务句柄；停止先撤销call/media资格，再按原RPC期限Join已有工作，不脱离、不重试未知结果。新增19项回归覆盖纯时钟、关联、配置和真实隔离Router/TLS/Common、独立Mpath/PCMA双向传输、负回执及挂断等待。5676a6a自身Build43588312755/Beta43588312821各1504 provider/29HTTP、95前端单元/7浏览器16图及双ABI完整官方工件已核，262本机静态通过；旧行为断言、工作流过滤器、标准栈/超时和依赖不变。首510两个Actions的7个新计时夹具提前丢弃RPC对象，原scope因此正确关闭；只保留`_rpc`变量到测试末尾，未放宽任何生产守卫或断言，同名双CI通过后关闭失败并保留原工件。该源码没有部署或再次进行Provider/SDK操作，410仍保留上一次df2。独立Alive、其他媒体/通信分支及真实收件验收仍未完成。
 
+## 1.9 独立 AccountAlive 运行时（新增，待自身验证）
+
+安装侧可选 `profile.account_alive` 包含 `allow_legacy_stcp`、`interval_seconds`（默认180；0关闭，启用范围60..600）及明确批准的 `endpoints:[{host,port}]`。只允许原Router/Common bootstrap与native接收器/ClientEx配置。返回引用必须为本次匹配bootstrap的单一未限定`AccountAlive:stcp`、host/port精确匹配；不把tls/其他引用降为stcp，不从SDK标识、DomainName或旧缓存猜端点。
+
+**stcp的原seeded-XOR只是旧式封装，不是TLS认证。** `allow_legacy_stcp=false`会显示blocked且不打开DNS/TCP；缺省未配置保持原unsupported行为。代码/隔离测试支持这种兼容路径，不等于本次已获准对真实账号启用它。本轮不修改410、不重放SDK启动，也不改变原Router TLS/SAN校验。
+
+原SDK登录的当前UID/selector/token、可选mainAccount经原ArcRpcSession私有绑定传入独立agent；只有其当前物理scope和匹配RPC结果才能变为registered。`checkAlive`返回配置的秒数并记录活动时间，不是服务器过期时刻；主连接和独立连接的回复均不制造SMS/来电就绪或poll hint。独立连接上的重复检查只回原缓存，不刷新活动期限；错误、部分帧、关闭或另一个agent不能恢复状态。
+
+刷新保持原2×interval与6s..600s退避，同一健康socket保留编码状态/递增RPC序号，失败重连使用新物理scope而不重新登录主SDK。每个socket poll经过主/独立scope门，整个输入组先验证；主会话撤销或token/session错误使对应状态失效，不自动争抢重连。停止先禁止新注册，再取消独立IO并Join拥有的任务；没有编造unregisterAlive。新增27项Rust覆盖纯归属/配置/时序、真实隔离TCP/Common、匹配bootstrap→主SDK→独立注册/双侧checkAlive→stop/Join与未批准0连接；新增3单元/1浏览器展示状态与非TLS边界。尚待自身两Actions/全正式制品核验，真实端点、其它通信功能及实网验收仍不据此完成。
+
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 
 原 App 并未依赖公共 CA：`assets/app2.cer` 就是服务端叶子证书

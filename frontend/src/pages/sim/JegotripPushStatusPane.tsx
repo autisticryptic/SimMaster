@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Alert, Button, Stack, Typography } from '@mui/material'
 import { api, type JegotripPushStatus } from '../../api/current'
-import { appLoginError, startupFailureLabel } from '../../policies/appLogin'
+import { appLoginError, startupFailureLabel, accountAliveLabel } from '../../policies/appLogin'
 
 const warningLabels: Record<string, string> = {
   login_manager_uninitialized: '登录管理器未初始化',
@@ -14,6 +14,9 @@ const warningLabels: Record<string, string> = {
   no_armed_sms_receiver: '当前没有已武装的在线短信接收器',
   no_armed_call_receiver: '当前没有已武装的在线来电接收器',
   account_alive_unimplemented: '服务端返回了尚未实现的 AccountAlive 通道',
+  account_alive_transport_not_approved: '独立Alive需要明确批准旧式非TLS传输；当前未连接',
+  account_alive_endpoint_unapproved: '独立Alive返回的端点不在已批准范围；当前未连接',
+  account_alive_retrying: '独立Alive正在按有限退避等待注册，不代表收件就绪',
   platform_offline_wakeup_unimplemented: 'Android 厂商离线唤醒尚未实现',
   call_notifications_unimplemented: '来电的第三方通知转发尚未接线',
 }
@@ -48,7 +51,7 @@ export default function JegotripPushStatusPane({ open, refreshKey }: { open: boo
       <Typography variant="caption" color="text.secondary">历史无忧行短信 {count(view.stored_observations.app_sms_records)} · 历史无忧行来电 {count(view.stored_observations.app_call_records)} · 待处理短信通知 {count(view.stored_observations.pending_sms_notifications)}。历史记录不会自动证明当前链路可用。</Typography>
       {view.native_accounts.map((account) => <Typography key={account.line_id} variant="caption" sx={{ overflowWrap: 'anywhere' }}>
         {account.line_id} · {account.phase} · 短信{account.incoming_message_ready ? '已武装，需收件测试' : '未武装'} · 来电{account.incoming_call_ready ? '已武装，需来电测试' : '未武装'}
-        {account.account_alive_state && ` · AccountAlive：${account.account_alive_state}（仅匹配回复的观察，不代表已注册）`}
+        {account.account_alive_state && ` · AccountAlive：${accountAliveLabel(account.account_alive_state)}`}
         {account.startup_failure && <span> · 启动连接诊断：{startupFailureLabel(account.startup_failure)}</span>}
       </Typography>)}
       {view.warnings.length > 0 && <Alert severity="warning">{view.warnings.map((code) => <Typography key={code} variant="body2">• {warningLabels[code] ?? '有未支持或未验证的推送条件'}</Typography>)}</Alert>}

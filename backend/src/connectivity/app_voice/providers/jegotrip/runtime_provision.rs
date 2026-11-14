@@ -117,7 +117,7 @@ impl ProvisionedLogin {
 ///but use still requires the pre-created ORIGINAL destination scope.
 pub(super) struct ProvisionedCommonLogin{
     owner:AttemptOwner,source:RpcConnectionScope,destination:RpcConnectionScope,policy:super::router_connector::RouterPolicyIdentity,call_id:i32,account_alive:AccountAliveState,
-    entry:super::object_reference::ObjectReference,domain_name:Zeroizing<Vec<u8>>,domain_id:Zeroizing<Vec<u8>>,app_id:Zeroizing<Vec<u8>>,cc:Zeroizing<Vec<u8>>,
+    entry:super::object_reference::ObjectReference,alive_reference:Zeroizing<Vec<u8>>,domain_name:Zeroizing<Vec<u8>>,domain_id:Zeroizing<Vec<u8>>,app_id:Zeroizing<Vec<u8>>,cc:Zeroizing<Vec<u8>>,
 }
 impl fmt::Debug for ProvisionedCommonLogin{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ProvisionedCommonLogin(<redacted>)")}}
 impl ProvisionedCommonLogin{
@@ -140,11 +140,17 @@ impl ProvisionedCommonLogin{
         let domain=decoded(b"DomainId")?.ok_or(ProvisionError::MissingProperty)?;let domain_id=field(domain.expose_to_backend(),false,&mut total)?;
         let app=decoded(b"AppId")?.ok_or(ProvisionError::MissingProperty)?;let app_id=field(app.expose_to_backend(),false,&mut total)?;
         let cc=decoded(b"CC")?;let cc=field(cc.as_ref().map_or(b"".as_slice(),|value|value.expose_to_backend()),true,&mut total)?;
+        let alive=deployment.auxiliary_references_for(owner,source).ok_or(ProvisionError::Scope)?.0;
+        if alive.len()>MAX_FIELD_BYTES||total.checked_add(alive.len()).is_none_or(|n|n>128*1024){return Err(ProvisionError::ResourceLimit);}
+        let alive_reference=Zeroizing::new(alive.to_vec());
         Ok(Self{owner:reply.owner().clone(),source:source.clone(),destination:destination.clone(),policy:router.original_identity(),call_id:reply.call_id(),
-            account_alive:deployment.account_alive_state_for(owner,source).map_err(|_|ProvisionError::Configuration)?,entry,domain_name,domain_id,app_id,cc})
+            account_alive:deployment.account_alive_state_for(owner,source).map_err(|_|ProvisionError::Configuration)?,entry,alive_reference,domain_name,domain_id,app_id,cc})
     }
     fn matches(&self,owner:&AttemptOwner,destination:&RpcConnectionScope,router:&super::router_connector::RouterPolicy)->bool{
         &self.owner==owner&&self.destination.matches(destination)&&destination.is_open()&&self.policy.matches(router)
+    }
+    pub fn alive_reference_for(&self,owner:&AttemptOwner,destination:&RpcConnectionScope,router:&super::router_connector::RouterPolicy)->Result<&[u8],ProvisionError>{
+        if !self.matches(owner,destination,router){return Err(ProvisionError::Scope);}Ok(&self.alive_reference)
     }
     pub fn entry_for(&self,owner:&AttemptOwner,destination:&RpcConnectionScope,router:&super::router_connector::RouterPolicy)->Result<&super::object_reference::ObjectReference,ProvisionError>{
         if !self.matches(owner,destination,router){return Err(ProvisionError::Scope);}Ok(&self.entry)

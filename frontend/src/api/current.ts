@@ -360,7 +360,7 @@ export interface AppAccountView {
   incoming_message_ready: boolean
   outbound_authorized: boolean
   last_error?: string
-  account_alive_state?: 'absent' | 'disabled' | 'unsupported'
+  account_alive_state?: 'absent' | 'disabled' | 'unsupported' | 'starting' | 'registering' | 'registered' | 'retrying' | 'blocked' | 'unapproved' | 'session_invalid' | 'stopped'
   startup_failure?: JegotripStartupFailure
 }
 

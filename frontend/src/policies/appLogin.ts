@@ -157,6 +157,17 @@ export function localReceiverTaskLabel(attempt: AppLoginAttempt): string {
   return attempt.line_id ? '本地接收账号已准备；SDK与收件状态请查看独立账号' : '本地接收任务已结束，未建立接收账号'
 }
 
+export function accountAliveLabel(value: unknown): string {
+  const labels: Record<string, string> = {
+    absent: '未返回独立通道', disabled: '独立通道已禁用', unsupported: '未配置受支持的独立通道',
+    starting: '独立通道准备中', registering: '等待独立注册回复', registered: '独立注册已确认（旧式stcp，非TLS）',
+    retrying: '独立注册失败，按原退避等待', blocked: '未批准旧式stcp传输，未连接', unapproved: '返回的独立端点未获准，未连接',
+    session_invalid: '本次原生会话已失效', stopped: '独立通道已停止',
+  }
+  const label = typeof value === 'string' && Object.prototype.hasOwnProperty.call(labels, value) ? labels[value] : '独立通道状态未知'
+  return `${label}；不代表短信、来电或媒体就绪`
+}
+
 export function startupFailureLabel(failure: unknown): string {
   const fields = typeof failure === 'object' && failure !== null ? failure as Partial<JegotripStartupFailure> : {}
   const own = (values: Record<string, string>, key: unknown) => typeof key === 'string' && Object.prototype.hasOwnProperty.call(values, key) ? values[key] : undefined

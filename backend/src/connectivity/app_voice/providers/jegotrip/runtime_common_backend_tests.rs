@@ -15,6 +15,8 @@ mod client_ex;
 mod native_receivers;
 #[path = "runtime_startup_diagnostics_tests.rs"]
 mod startup_diagnostics;
+#[path="runtime_alive_tests.rs"]
+mod alive_registration;
 const BOOTSTRAP_SDK:&str="BootEntry:sarc -h 42.7 -p 98;";
 const DESTINATION:&str="DestEntry:sarc -h 42.7 -p 98;";
 fn bootstrap_inputs()->RuntimeProfileInputs<'static>{RuntimeProfileInputs{domain_name:"",domain_id:"",application_id:"",device_info_cc:"",gateway_uri:"",..inputs()}}

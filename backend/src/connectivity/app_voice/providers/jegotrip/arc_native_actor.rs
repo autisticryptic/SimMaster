@@ -31,6 +31,7 @@ pub(crate) fn prepare_common(owner:AttemptOwner,policy:RuntimePolicy,attempt_end
 impl PreparedCommonRuntime{
     pub fn connection_scope(&self)->RpcConnectionScope{self.scope.clone()}
     pub(crate) fn startup_trace(&self)->Arc<StartupTrace>{self.startup_trace.clone()}
+    pub(crate) fn alive_link(&self)->Arc<super::super::alive_session::AliveLink>{self.backend.as_ref().expect("original prepared backend").alive_link()}
     /// No actor is spawned here. The caller first acquires its owning-handle
     ///slot, then consumes ConnectedCommonRuntime::attach with no await gap.
     pub async fn connect(mut self,router_policy:&RouterPolicy,access:&[RpcProperty<'_>],identity:&[u8],endpoint:&ReferenceEndpoint,index:usize,

@@ -31,6 +31,8 @@ use super::{
     transport_actor::{self, RuntimeCommands, RuntimeError, RuntimeEvent, RuntimeHandle, RuntimePolicy, RuntimeReceipt},
 };
 use ring::rand::{SecureRandom, SystemRandom};
+#[path="runtime_alive.rs"]
+mod alive;
 use std::{fmt, sync::{Arc, Mutex, MutexGuard}, time::{Duration, Instant}};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use zeroize::{Zeroize, Zeroizing};
@@ -205,6 +207,7 @@ pub struct RuntimeProfile {
     poll_routing: Vec<Property>, logout_routing: Vec<Property>, incoming: Option<Binding>, offline_reception: bool, client_ex: bool,
     native_receivers: Option<Arc<super::native_receiver::NativeReceiverPolicy>>,
     reference_decode_key: Option<ConfigDecodeKey>, handshake_timeout: Duration, partial_timeout: Duration,
+    account_alive:Option<super::alive_profile::AlivePolicy>,
     io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>,native_call_control:bool,byte_length:usize,
 }
 impl fmt::Debug for RuntimeProfile {
@@ -260,6 +263,12 @@ impl RuntimeProfile {
         }
         add_bytes(&mut self.byte_length,super::call_control::NATIVE_CONTROL_BYTES)?;
         self.native_call_control=true;Ok(self)
+    }
+    pub(super) fn with_account_alive(mut self,config:Option<&super::alive_profile::AccountAliveConfig>)->Result<Self,ProfileError>{
+        let Some(config)=config else{return Ok(self);};
+        if self.common_bootstrap.is_none()||self.native_receivers.is_none()||!self.client_ex||self.account_alive.is_some(){return Err(ProfileError::InvalidConfiguration);}
+        let policy=super::alive_profile::AlivePolicy::capture(config).map_err(|_|ProfileError::InvalidConfiguration)?;
+        add_bytes(&mut self.byte_length,policy.bytes())?;self.account_alive=Some(policy);Ok(self)
     }
     pub fn supplied(input: RuntimeProfileInputs<'_>) -> Result<Self, ProfileError> { Self::capture(input,None,None,None) }
     pub fn supplied_common(input:RuntimeProfileInputs<'_>,common:RuntimeCommonInputs<'_>)->Result<Self,ProfileError>{Self::capture(input,None,Some(common),None)}
@@ -371,7 +380,7 @@ impl RuntimeProfile {
             poll_routing, logout_routing, incoming, offline_reception: false, client_ex: false, reference_decode_key: input.reference_decode_key,
             native_receivers: None,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
-            io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
+            account_alive:None,io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
         })
     }
 }
@@ -467,6 +476,7 @@ struct AttemptState {
     logout_started: bool, logout_result: Option<Result<(), BackendFailure>>, released: bool,
     /// Matched bootstrap observation only; never an armed keepalive or grant.
     account_alive:Option<super::runtime_provision::AccountAliveState>,
+    alive_reference:Option<Zeroizing<Vec<u8>>>,alive_stopping:bool,
     #[cfg(test)]
     polls_paused: bool,
 }
@@ -485,6 +495,8 @@ struct Attempt {
     // Diagnostic-only handles preserve their original source/destination
     // identities after an error closes the scope. They never own IO or grants.
     startup_traces: Option<(Arc<StartupTrace>,Option<Arc<StartupTrace>>)>,
+    alive_link:Option<Arc<super::alive_session::AliveLink>>,
+    alive_handle:AsyncMutex<Option<super::alive_runtime::AliveRun>>,
     // Serializes login/attach and controller commands with resource cleanup.
     // The independent event pump polls/configures without a controller lock.
     work: AsyncMutex<()>,
@@ -544,6 +556,7 @@ impl NativeHostingBackend {
     pub(super) fn account_alive_observation(&self,owner:&AttemptOwner)->Option<&'static str> {
         let attempt=self.original(owner).ok()?;
         let observation=lock(&attempt.state).account_alive;
+        if let Some(link)=&attempt.alive_link{if link.claimed(){return Some(link.label());}}
         observation.map(super::runtime_provision::AccountAliveState::label)
     }
     pub(super) fn startup_failure_observation(&self,owner:&AttemptOwner)->Option<StartupFailure> {
@@ -668,6 +681,7 @@ impl NativeHostingBackend {
         if bootstrap.as_ref().is_some_and(|bootstrap|bootstrap.connection_scope().matches(&destination.connection_scope())){return Err(BackendFailure::Unavailable);}
         let bootstrap_scope=bootstrap.as_ref().map(|bootstrap|bootstrap.connection_scope());
         let startup_traces=Some((destination.startup_trace(),bootstrap.as_ref().map(|prepared|prepared.startup_trace())));
+        let alive_link=Some(destination.alive_link());
         let attempt={
             let mut state=lock(&self.state);
             if state.slot.as_ref().is_some_and(|a|!lock(&a.state).released)||state.owners.iter().any(|old|old==&owner)||state.owners.len()>=MAX_ATTEMPTS{return Err(BackendFailure::Unavailable);}
@@ -676,14 +690,17 @@ impl NativeHostingBackend {
                 if value!=0&&!state.incarnations.contains(&value){incarnation=Some(value);break;}}
             let incarnation=incarnation.ok_or(BackendFailure::Unavailable)?;
             let attempt=Arc::new(Attempt{owner:owner.clone(),scope:destination.connection_scope(),incarnation,state:Mutex::new(AttemptState::default()),commands:Mutex::new(None),
-                handle:AsyncMutex::new(None),session_uri:Mutex::new(None),bootstrap_scope,bootstrap_handle:AsyncMutex::new(None),startup_traces,work:AsyncMutex::new(()),poll_work:AsyncMutex::new(())});
+                handle:AsyncMutex::new(None),session_uri:Mutex::new(None),bootstrap_scope,bootstrap_handle:AsyncMutex::new(None),startup_traces,alive_link,alive_handle:AsyncMutex::new(None),work:AsyncMutex::new(()),poll_work:AsyncMutex::new(())});
             state.owners.push(owner);state.incarnations.push(incarnation);state.slot=Some(attempt.clone());attempt
         };
         let mut retirement=Retirement::new(attempt.clone());let _work=attempt.work.lock().await;
         let operation=async{
             if !attempt.scope.is_open()||lock(&attempt.state).retired{return Err(BackendFailure::Disconnected);}
             let plan=match bootstrap{Some(bootstrap)=>Some(self.bootstrap_common_original(&attempt,&captured,bootstrap).await?),None=>None};
-            if let Some(plan)=&plan {lock(&attempt.state).account_alive=Some(plan.account_alive());}
+            if let Some(plan)=&plan {
+                let reference=if self.profile.account_alive.is_some(){Some(Zeroizing::new(plan.alive_reference_for(&attempt.owner,&attempt.scope,&common.router).map_err(|_|BackendFailure::Unavailable)?.to_vec()))}else{None};
+                let mut state=lock(&attempt.state);state.account_alive=Some(plan.account_alive());state.alive_reference=reference;
+            }
             // Only a matched bootstrap may supply the logical entry. Directly
             //supplied Common profiles keep their own single captured entry.
             let(resolved,entry,endpoint)=match &plan{
@@ -826,7 +843,7 @@ impl NativeHostingBackend {
                 RuntimePolicy{io_timeout:self.profile.io_timeout,rpc_timeout:self.profile.rpc_timeout},None).map_err(|_|BackendFailure::Unavailable)?)}else{None};
             attempt = Arc::new(Attempt { owner: owner.clone(), scope: prepared.connection_scope(), incarnation,
                 state: Mutex::new(AttemptState::default()), commands: Mutex::new(None), handle: AsyncMutex::new(None),session_uri:Mutex::new(None),
-                bootstrap_scope:bootstrap_prepared.as_ref().map(|prepared|prepared.connection_scope()),bootstrap_handle:AsyncMutex::new(None),startup_traces:None,
+                bootstrap_scope:bootstrap_prepared.as_ref().map(|prepared|prepared.connection_scope()),bootstrap_handle:AsyncMutex::new(None),startup_traces:None,alive_link:None,alive_handle:AsyncMutex::new(None),
                 work: AsyncMutex::new(()), poll_work: AsyncMutex::new(()) });
             state.owners.push(owner); state.incarnations.push(incarnation); state.slot = Some(attempt.clone());
         }
@@ -966,7 +983,7 @@ impl NativeHostingBackend {
         let commands = attempt.commands(&owner, &attempt.scope).map_err(|_| BackendFailure::Disconnected)?;
         let routing = borrowed(&self.profile.poll_routing); let metadata = borrowed(&self.profile.gateway_metadata);
         let mut retirement = Retirement::new(attempt.clone());
-        if status == STATUS_UNREGISTER { lock(&attempt.state).unregister_started = true; }
+        if status == STATUS_UNREGISTER { lock(&attempt.state).unregister_started = true; attempt.stop_alive().await?; }
         let uri=match &self.profile.gateway_uri{
             Some(uri)=>uri.clone(),
             // No derived session URI may be fabricated: hosting needs the URI of
@@ -985,6 +1002,7 @@ impl NativeHostingBackend {
         let _work = attempt.work.lock().await;
         if lock(&attempt.state).released { return Ok(()); }
         let mut retirement = Retirement::new(attempt.clone());
+        attempt.stop_alive().await?;
         let mut bootstrap=attempt.bootstrap_handle.lock().await;
         if let Some(handle)=bootstrap.as_mut(){
             let released=handle.close().await;
@@ -1175,6 +1193,9 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                                     _ => { terminal(&sender, &attempt, BackendFailure::Disconnected); return; }
                                 }
                                 }
+                            }
+                            if callback.callback == (Callback::SdkLogin { success: true }) && attempt.start_alive(&profile).await.is_err(){
+                                terminal(&sender,&attempt,BackendFailure::Disconnected);return;
                             }
                             if matches!(callback.callback, Callback::Channels { .. }) {
                                 terminal(&sender, &attempt, BackendFailure::Disconnected); return;

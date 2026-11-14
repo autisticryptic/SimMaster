@@ -67,6 +67,9 @@ impl PushStatusView {
         if !native_accounts.iter().any(|a|a.incoming_message_ready) {warnings.push("no_armed_sms_receiver");}
         if !native_accounts.iter().any(|a|a.incoming_call_ready) {warnings.push("no_armed_call_receiver");}
         if native_accounts.iter().any(|a|a.account_alive_state==Some("unsupported")) {warnings.push("account_alive_unimplemented");}
+        if native_accounts.iter().any(|a|a.account_alive_state==Some("blocked")) {warnings.push("account_alive_transport_not_approved");}
+        if native_accounts.iter().any(|a|a.account_alive_state==Some("unapproved")) {warnings.push("account_alive_endpoint_unapproved");}
+        if native_accounts.iter().any(|a|a.account_alive_state==Some("retrying")) {warnings.push("account_alive_retrying");}
         warnings.push("platform_offline_wakeup_unimplemented");warnings.push("call_notifications_unimplemented");
         Self {initialized,observed_at_unix_seconds:at,configuration,native_accounts,stored_observations,warnings,
             implementation:PushImplementation {online_native_sms:true,online_native_calls:true,browser_event_stream:true,

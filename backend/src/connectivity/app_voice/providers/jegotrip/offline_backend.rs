@@ -101,6 +101,7 @@ impl OfflineBackend {
         for packet in packets { events.extend(self.on_plaintext_packet(owner, scope, packet.expose_to_transport(), now_ms)?); }
         Ok(events)
     }
+    pub(super) fn alive_link(&self)->std::sync::Arc<super::alive_session::AliveLink>{self.protocol.alive_link()}
     pub(super) fn claim_common_transport(&mut self)->Result<(),ProtocolError>{self.protocol.claim_common_transport()}
     pub(super) fn bind_common_identity(&mut self,identity:&[u8])->Result<(),ProtocolError>{self.protocol.bind_common_identity(identity)}
     /// Only original CommonPath-produced groups enter this bridge. Normalising
