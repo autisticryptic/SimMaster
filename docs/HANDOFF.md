@@ -14,7 +14,7 @@
 
 ## 已核验的软件基线
 
-- **新增待自身验证：独立AccountAlive运行时**。可选`profile.account_alive`仅接收本次原bootstrap返回的单一stcp引用，并必须匹配明确批准的host/port；缺省不安装，未批准legacy传输不连接。原SDK登录后捕获同owner/scope的UID、selector、实际native token及mainAccount，独立agent/物理scope/请求序号与主连接分开；匹配registerAlive后才允许主ClientEx或独立连接checkAlive正向并返回interval秒数/更新原活动时间。原2×interval、6s..600s退避、同连接刷新、错误/截断/撤销/取消及真实Join已接线；token/session失效不重登录争抢。新增31 Rust、3前端单元、1浏览器用例尚待自身Actions；首4aef0ce缺结束括号已修，ac9已编译但两个新账号夹具漏主连接原`__magic`、一个新map期望误用字典序，现补原魔术去重字段并按native长度优先排序核验，旧断言和主连接门禁保持。另补同scope拒绝、同socket刷新和异常/取消Join消费回归，失败工件保留待关闭。stcp/XOR不是TLS，本轮没有批准或运行真实弱通道、没有操作410或手机。完整R01–R14仍未完成。
+- **`1d67e35b45dd4b2278657332792cf5ef55dde7d1`（独立AccountAlive运行时，软件已验证、未部署）**。可选`profile.account_alive`仅用本次原bootstrap单一stcp引用和精确批准host/port，缺省不安装、未批准不连接；UID/selector/native token/mainAccount来自同owner/scope实际SDK登录，独立agent/物理scope/RPC与主连接分开。匹配registerAlive后才允许双侧checkAlive正向、返回interval秒数并更新活动时间；原2×interval、6s..600s退避、同socket刷新、去重/过期/撤销/取消/Join及session错误不争抢已接线。自身Build43609509067/Beta43609508998各1535 provider（1504旧＋31新）、29HTTP、98前端单元/8浏览器18图及双ABI各29成员20www全官方digest/CRC/SHA/meta/ELF通过，270本机静态通过。首4aef语法、ac9新DIRECT漏magic/map期望失败均保留并关闭，原主门禁/length-first codec/栈预算不改；同scope拒绝、同socket/cipher刷新、异常/取消Join新回归通过。下载中断按同一official artifact续读副本后全校验，不重跑CI。**本轮未部署/操作410、手机或Provider，也未批准真实非TLS通道；不是整体接收验收。**
 
 - **`5676a6a59e73b8ca51fa4c83519c91b056f91124`（原生内置音频生命周期，软件已验证、未部署）**。显式`call_media.native_lifecycle.session_timer_seconds`与独立Alive分开，仅允许native默认控制及受支持的明确媒体配置；新增内置单音频Accept的SDP/mediaType/keepAlive/SDK.IsNew、单pending KeepAlive原inform RPC、一次性耗时、零周期/漏tick合并/撤销/Join。自身Build43588312755/Beta43588312821各1504 provider（1485旧＋19新）、29HTTP、95前端单元/7浏览器16图及双ABI29成员20www的官方digest/全CRC/全部SHA/meta/ELF通过，262本机静态通过。3个新隔离端到端用例实际走Router/TLS/Common、独立TLS/Mpath、PCMA双向数据、负保活及挂断等待；不是实网。首510的7个新时序夹具用`_`提前Drop RPC，现仅改为`_rpc`持有到断言结束，原全部断言/标准栈/预算/生产守卫保持，双CI同名通过后关闭失败。当前410仍是上一部署df2，未改配置、身份/TLS或再启SDK；完整R01–R14仍未完成。
 
@@ -130,7 +130,7 @@
 
 ## 接下来按顺序
 
-1. 分层诊断、默认CallServerEx与显式内置音频生命周期软件已验证；尚不是完整媒体/通信复刻或实网接收。继续正确Router身份绑定，不能关闭SAN、凭所见证书猜authority或重放结束的SDK启动。继续独立Alive原agent/token/传输注册与刷新/Join、动态媒体端点及独立信任和未覆盖变体、Message/Invite业务关联/第三方通知，以及R11其余通信API。实际8.9.4的7个剩余通信方法（queryDialProfile、query/setPhoneService、setJegoMStatus、setVoipProfile、closeVoipForward、logOut）已新增只读调用目录，普通请求/加密请求和调用方提供URL须区分，未执行业务写。
+1. 分层诊断、默认CallServerEx、内置音频生命周期和显式独立Alive软件已验证；真实Router身份、其余媒体/通知/通信API及实网验收仍未完成。不得关闭SAN、从证书猜authority、启用未批准非TLS或重放旧SDK启停。继续完整Message/Invite业务关联与第三方通知，以及R11的普通/加密通信操作、原attempt/CAS/不确定写防重放与UI。实际8.9.4新10方法精确请求形状见私有`communication-apis/REQUEST_SHAPES_AND_NEXT.md`：PhoneService query type1/write type2+phoneServerStatus数字，VoipProfile cs_forward字符串，CloseForward mobile/countryCode，JegoM三个字符串；App logout仍须核调用方URL。不要把已恢复字段当作API实现，也不把App业务操作当本地SDK启停。
 2. 在原App UUID/同账号上下文中取得本次明确认可和业务读回，补正确接收、通话控制与媒体配置后启动；验收外来SMS落库/原回执、来电接听/双向媒体、断连、stop→logoutSession→Join与持续时延。若需新代码，仍先过自身双Actions再保护性升级；不能用核心health替代终点。
 3. 授信TTL/撤销/替换与服务端积压重放规则不可由客户端fixture证明。不用新VTD/UUID、缓存授权、收费外发或设备变更补造成功。**完整用户目标仍未完成。**
 
