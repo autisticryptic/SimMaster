@@ -34,7 +34,7 @@ fn decoded_positive_alive_bit_or_main_sdk_login_never_registers_the_independent_
 fn alive_request_uses_actual_uid_selector_token_main_account_and_full_wall_timestamp(){
     let(_rpc,owner,scope,link)=authenticated();link.claim(&owner,&scope,60).unwrap();let mut agent=link.agent().unwrap();let now=Instant::now();let bytes=agent.prepare(u64::MAX,now,now+Duration::from_secs(2)).unwrap();
     let request=decode_request(bytes.expose_to_transport()).unwrap();assert_eq!(request.call_id,1);assert_eq!(request.method,n::rpc_alive::REGISTER_ALIVE_METHOD.as_bytes());
-    assert_eq!(request.metadata.iter().map(|p|p.key).collect::<Vec<_>>(),vec![b"id".as_slice(),b"mainAccount",b"token"]);
+    assert_eq!(request.metadata.iter().map(|p|p.key).collect::<Vec<_>>(),vec![b"id".as_slice(),b"token",b"mainAccount"]);
     assert_eq!(request.metadata.iter().find(|p|p.key==b"token").unwrap().value,b"fixture-alive-token");assert_eq!(request.metadata.iter().find(|p|p.key==b"mainAccount").unwrap().value,b"fixture-main-account");
     assert!(!request.metadata.iter().any(|p|p.key==b"pwd"||p.key==b"domain"));let args=n::rpc_alive::decode_register_alive_arguments(request.arguments).unwrap();
     assert_eq!(args.user_id,b"fixture-alive-user");assert_eq!(args.selected_session_id,b"fixture-alive-selector");assert_eq!(args.request_timestamp_ms,u64::MAX);assert_eq!(args.interval_seconds,60);

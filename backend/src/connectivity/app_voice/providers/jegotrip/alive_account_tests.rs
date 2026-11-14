@@ -7,6 +7,12 @@ fn config(root:&str,port:u16,alive_port:u16,approved:bool)->AccountConfig{
     let mut config=bootstrap_account_config(root,port);config.profile.incoming=None;config.profile.native_receivers=Some(NativeReceiverConfig{direct_domains:None});config.profile.client_ex=true;
     config.profile.account_alive=Some(policy_config(alive_port,approved));config
 }
+fn main_check_request(id:i32)->Vec<u8>{
+    let arguments=Writer::versioned().unwrap().finish();let magic=id.to_be_bytes();
+    // The main ARC DIRECT transport retains its original binary dedup key.
+    // This is distinct from an independent agent callback's private history.
+    encode_request(id,&[RpcProperty{key:b"id",value:b"MessageReceiver"},RpcProperty{key:b"__magic",value:&magic}],CHECK_ALIVE_METHOD.as_bytes(),arguments.expose_to_transport()).unwrap().expose_to_transport().to_vec()
+}
 async fn check_reply(peer:&mut CommonPeer,id:i32)->Vec<u8>{loop{
     let bytes=peer.next().await.unwrap();if bytes[0]==1{let reply=decode_reply(&bytes[1..]).unwrap();assert_eq!(reply.call_id,id);return reply.result_stream.to_vec();}
     let request=decode_request(&bytes[1..]).unwrap();assert_eq!(request.method,n::rpc_batch::SWAP_CALLS_METHOD.as_bytes());let mut r=Reader::versioned(request.arguments).unwrap();
@@ -38,9 +44,9 @@ async fn account_flow(approved:bool){
     }}).await;});
     let main=tokio::spawn(async move{bounded(async move{
         let mut peer=CommonPeer::open(destination,tls).await;let packet=peer.next().await.unwrap();let login=decode_request(&packet[1..]).unwrap();
-        let mut check=vec![0];check.extend_from_slice(&check_request(11));peer.send(&[reply(login.call_id,&login_result_for_account()),check]).await;
+        let mut check=vec![0];check.extend_from_slice(&main_check_request(11));peer.send(&[reply(login.call_id,&login_result_for_account()),check]).await;
         assert_eq!(check_reply(&mut peer,11).await,[0;10]);early.send(()).unwrap();let(_,flag)=hosting_call(&mut peer).await;assert_eq!(flag,b"4");after_registered.await.unwrap();
-        let mut check=vec![0];check.extend_from_slice(&check_request(12));peer.send(&[check]).await;
+        let mut check=vec![0];check.extend_from_slice(&main_check_request(12));peer.send(&[check]).await;
         let bytes=check_reply(&mut peer,12).await;let mut r=Reader::new(&bytes).unwrap();assert_eq!(r.boolean().unwrap(),approved);assert_eq!(r.u32().unwrap(),if approved{60}else{0});ready.send(()).unwrap();
         // This owning stop waits for the independent socket to be closed,
         // followed by real status3 and the original SDK logout/EOF.

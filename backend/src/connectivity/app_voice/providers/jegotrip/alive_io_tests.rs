@@ -63,3 +63,39 @@ async fn token_error_from_matching_alive_agent_revokes_the_main_scope_and_joins(
     let(_rpc,owner,scope,link)=authenticated();let cfg=AlivePolicy::capture(&policy_config(port,true)).unwrap();let reference=format!("AccountAlive:stcp -h 127.0.0.1 -p {port};");let mut run=AliveRun::start(link.clone(),&owner,&scope,reference.as_bytes(),&cfg,receiver(),budgets()).unwrap();
     wait(async{while !scope.session_revoked(){tokio::task::yield_now().await;}}).await;run.close().await.unwrap();wait(server).await.unwrap();assert_eq!(link.check(&owner,&scope,b"fixture-alive-token",Instant::now()),(false,0));
 }
+#[tokio::test]
+async fn same_main_and_independent_scope_is_rejected_before_socket_poll_or_mutex_reentry(){
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();let(_rpc,_owner,scope,_link)=authenticated();
+    let endpoint=AccountAliveEndpoint{host:"127.0.0.1".into(),port};let now=Instant::now();
+    assert_eq!(n::alive_io::AliveIo::connect(&endpoint,scope.clone(),scope.clone(),now+Duration::from_secs(1),budgets().partial,budgets().io).await.err(),Some("app_account_alive_io_failed"));
+    assert!(scope.is_open());assert!(tokio::time::timeout(Duration::from_millis(30),listener.accept()).await.is_err());
+}
+#[tokio::test]
+async fn independent_same_socket_refresh_preserves_cipher_and_rpc_ids_without_sdk_reauthentication(){
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
+    let server=tokio::spawn(async move{wait(async move{let mut peer=Peer::accept(listener).await;for expected in [1,2]{
+        let(kind,bytes)=peer.next().await;assert_eq!(kind,CallKind::Request);let id=assert_registration(&bytes,b"fixture-alive-user",b"fixture-alive-selector",b"fixture-alive-token");assert_eq!(id,expected);
+        peer.send(CallKind::Reply,&alive_reply(id,true,b"")).await;
+    }peer.eof().await;}).await;});
+    let(_rpc,owner,scope,link)=authenticated();link.claim(&owner,&scope,60).unwrap();let mut agent=link.agent().unwrap();let agent_scope=agent.scope();
+    let endpoint=AccountAliveEndpoint{host:"127.0.0.1".into(),port};let bounds=budgets();let mut io=wait(n::alive_io::AliveIo::connect(&endpoint,scope.clone(),agent_scope.clone(),Instant::now()+bounds.connect,bounds.partial,bounds.io)).await.unwrap();
+    for timestamp in [1700000000124,1700000000125]{let now=Instant::now();let deadline=now+bounds.rpc;let request=agent.prepare(timestamp,now,deadline).unwrap();io.send(CallKind::Request,request.expose_to_transport(),deadline).await.unwrap();
+        let calls=wait(async{loop{if let Some(calls)=io.receive(deadline).await.unwrap(){if !calls.is_empty(){break calls;}}}}).await;assert_eq!(calls.len(),1);
+        assert!(matches!(agent.response(calls[0].payload.expose_to_transport(),Instant::now()).unwrap(),Some(AliveResult::Accepted)));assert!(agent.scope().matches(&agent_scope));
+        assert_eq!(link.check(&owner,&scope,b"fixture-alive-token",Instant::now()),(true,60));
+    }
+    drop(io);drop(agent);wait(server).await.unwrap();assert!(scope.is_open());assert_eq!(link.check(&owner,&scope,b"fixture-alive-token",Instant::now()),(false,0));
+}
+#[tokio::test]
+async fn consumed_panicked_alive_join_is_not_repolled_on_cleanup_retry(){
+    let(_rpc,_owner,scope,link)=authenticated();let task=tokio::spawn(async{panic!("synthetic original Alive task failure");});
+    let mut run=AliveRun::with_task_for_test(link.clone(),task);assert_eq!(wait(run.close()).await.err(),Some("app_account_alive_cleanup_unconfirmed"));
+    wait(run.close()).await.unwrap();assert!(scope.is_open());assert_eq!(link.label(),"stopped");
+}
+#[tokio::test]
+async fn cancelled_alive_join_remains_owned_until_the_same_task_finishes_once(){
+    let(_rpc,_owner,scope,link)=authenticated();let(resume,wait_resume)=tokio::sync::oneshot::channel();let finishes=Arc::new(std::sync::atomic::AtomicUsize::new(0));let counted=finishes.clone();
+    let task=tokio::spawn(async move{wait_resume.await.unwrap();counted.fetch_add(1,std::sync::atomic::Ordering::SeqCst);});let mut run=AliveRun::with_task_for_test(link,task);
+    assert!(tokio::time::timeout(Duration::from_millis(30),run.close()).await.is_err());assert_eq!(finishes.load(std::sync::atomic::Ordering::SeqCst),0);
+    resume.send(()).unwrap();wait(run.close()).await.unwrap();wait(run.close()).await.unwrap();assert_eq!(finishes.load(std::sync::atomic::Ordering::SeqCst),1);assert!(scope.is_open());
+}

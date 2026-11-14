@@ -124,7 +124,7 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 原SDK登录的当前UID/selector/token、可选mainAccount经原ArcRpcSession私有绑定传入独立agent；只有其当前物理scope和匹配RPC结果才能变为registered。`checkAlive`返回配置的秒数并记录活动时间，不是服务器过期时刻；主连接和独立连接的回复均不制造SMS/来电就绪或poll hint。独立连接上的重复检查只回原缓存，不刷新活动期限；错误、部分帧、关闭或另一个agent不能恢复状态。
 
-刷新保持原2×interval与6s..600s退避，同一健康socket保留编码状态/递增RPC序号，失败重连使用新物理scope而不重新登录主SDK。每个socket poll经过主/独立scope门，整个输入组先验证；主会话撤销或token/session错误使对应状态失效，不自动争抢重连。停止先禁止新注册，再取消独立IO并Join拥有的任务；没有编造unregisterAlive。新增27项Rust覆盖纯归属/配置/时序、真实隔离TCP/Common、匹配bootstrap→主SDK→独立注册/双侧checkAlive→stop/Join与未批准0连接；新增3单元/1浏览器展示状态与非TLS边界。尚待自身两Actions/全正式制品核验，真实端点、其它通信功能及实网验收仍不据此完成。
+刷新保持原2×interval与6s..600s退避，同一健康socket保留编码状态/递增RPC序号，失败重连使用新物理scope而不重新登录主SDK。每个socket poll经过主/独立scope门，整个输入组先验证；主会话撤销或token/session错误使对应状态失效，不自动争抢重连。停止先禁止新注册，再取消独立IO并Join拥有的任务；没有编造unregisterAlive。新增31项Rust覆盖纯归属/配置/时序、真实隔离TCP/Common、同socket刷新/序号与cipher、同scope拒绝、异常/取消Join，以及匹配bootstrap→主SDK→独立注册/双侧checkAlive→stop/Join与未批准0连接；新增3单元/1浏览器展示状态与非TLS边界。尚待自身两Actions/全正式制品核验，真实端点、其它通信功能及实网验收仍不据此完成。
 
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 

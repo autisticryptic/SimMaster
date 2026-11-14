@@ -15,7 +15,7 @@ pub(super) struct AliveIo{socket:TcpStream,main:RpcConnectionScope,scope:RpcConn
 impl Drop for AliveIo{fn drop(&mut self){self.scope.close();}}
 impl AliveIo{
     pub(super) async fn connect(endpoint:&AccountAliveEndpoint,main:RpcConnectionScope,scope:RpcConnectionScope,deadline:Instant,partial:Duration,io:Duration)->Result<Self,&'static str>{
-        if !main.is_open()||main.session_revoked()||!scope.is_open(){return Err(IO);}
+        if main.matches(&scope)||!main.is_open()||main.session_revoked()||!scope.is_open(){return Err(IO);}
         let connecting=async{
             let lookup=crate::platform::dns::prepare_socket_addrs(&endpoint.host,endpoint.port).map_err(|_|IO)?;
             let addresses=lookup.resolve().await.map_err(|_|IO)?;

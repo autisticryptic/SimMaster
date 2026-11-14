@@ -19,8 +19,14 @@ impl AliveRun{
     }
     pub(super) async fn close(&mut self)->Result<(),&'static str>{
         self.stop.close();self.link.close();
-        if let Some(task)=self.task.as_mut(){task.await.map_err(|_|"app_account_alive_cleanup_unconfirmed")?;}
-        self.task=None;Ok(())
+        let joined=if let Some(task)=self.task.as_mut(){task.await.map_err(|_|"app_account_alive_cleanup_unconfirmed")}else{Ok(())};
+        // Commit consumption even when Join returns a panic. Cancellation
+        // BEFORE it returns still retains this original, unfinished handle.
+        self.task=None;joined
+    }
+    #[cfg(test)]
+    pub(super) fn with_task_for_test(link:Arc<AliveLink>,task:JoinHandle<()>)->Self{
+        Self{link,stop:RpcConnectionScope::fresh(),task:Some(task)}
     }
 }
 impl Drop for AliveRun{fn drop(&mut self){self.stop.close();self.link.close();}}

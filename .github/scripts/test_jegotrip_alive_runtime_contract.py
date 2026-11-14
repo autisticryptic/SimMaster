@@ -49,11 +49,17 @@ class AccountAliveRuntimeContracts(unittest.TestCase):
         for forbidden in ['backend.login(', 'unregisterAlive', '.abort()', 'forget(']:self.assertNotIn(forbidden,worker)
         self.assertIn('alive_stopping=true',runtime);self.assertIn('state.alive_stopping',runtime)
         self.assertIn('run.close().await',runtime)
+        self.assertIn('self.task=None;joined',worker)
+        self.assertIn('if main.matches(&scope)',src('alive_io.rs'))
         self.assertIn('unregister_started = true; attempt.stop_alive().await?',src('runtime_backend.rs'))
     def test_all_new_behavior_tests_run_under_existing_actions_filter(self):
         names=[]
-        for name,count in [('alive_session_tests.rs',18),('alive_io_tests.rs',6),('alive_account_tests.rs',3)]:
-            text=src(name);found=re.findall(r'#\[(?:tokio::)?test\]\s*(?:async\s+)?fn\s+(\w+)',text);self.assertEqual(len(found),count);names+=found;self.assertNotIn('#[ignore',text)
+        for name,count in [('alive_session_tests.rs',18),('alive_io_tests.rs',10),('alive_account_tests.rs',3)]:
+            text=src(name);found=re.findall(r'#\[(?:tokio::)?test\]\s*(?:async\s+)?fn\s+(\w+)',text)
+            if name=='alive_io_tests.rs':
+                self.assertIn('consumed_panicked_alive_join_is_not_repolled_on_cleanup_retry',found)
+                self.assertIn('cancelled_alive_join_remains_owned_until_the_same_task_finishes_once',found)
+            self.assertEqual(len(found),count);names+=found;self.assertNotIn('#[ignore',text)
         self.assertEqual(len(names),len(set(names)))
         self.assertIn('native_bootstrap_independent_alive_main_and_agent_checks_and_stop_join_keep_original_account',names)
         self.assertIn('runtime_alive_tests.rs',src('runtime_common_backend_tests.rs'))
