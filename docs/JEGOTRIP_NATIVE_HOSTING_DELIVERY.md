@@ -108,6 +108,14 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 **完整Accept参数装配（mediaType、keepAlive、SDK.IsNew等原条件）、媒体信任/传输、独立Alive与通知及真实接听仍未完成，不是整体目标完成。** Alive默认180/启用夹到60..600、epoch wire时间与独立调度时钟已新增只读依据；Call keepAlive则来自另一CALL设置，尚未装配，不能混用。权威软件证据在`.local/jegotrip/goal-replication-20261114/native-call/`，部署/本次唯一启停在`deploy-native-df2ef9d/`。
 
+## 1.8 原生内置音频 Accept 与通话保活（新增，待自身验证）
+
+高级媒体配置可显式提供 `"native_lifecycle":{"session_timer_seconds":30}`；单位为秒，按原协议转成有符号32位可表示的毫秒，0关闭周期保活。此值是明确的部署侧Call设置，不是假定手机当前值，也不是AccountAlive间隔。缺省None时旧Accept与旧私有v1配置保持；只有`native_call_control`及受支持的明确媒体配置可启用。
+
+该路径针对无外接CallI stream的内置单音频引擎：使用原SDP封装与协商payload，发送`mediaType=audio`、`keepAlive`及`SDK.IsNew=1`；不伪造IoT、crypto、直连地址或服务器认证。新增KeepAlive本地操作仍编码为原`inform.CallServerEx.CallEx`，不混淆首次存在性Inform；匹配Accept后才允许，使用原per-call对象、token和RPC关联，单pending，迟到结果不恢复已释放呼叫。
+
+原Accept结果启动周期，真实MediaReady后通知保活任务发送一次`RseEx.AcceptDuration/RseEx.ConnDuration`毫秒耗时。部署实现使用单调elapsed避免壁钟回拨伪造负数；周期不因即时连接报告或一次RPC耗时重新开始，漏tick只合并、不突发补发。拥有者保留任务句柄；停止先撤销call/media资格，再按原RPC期限Join已有工作，不脱离、不重试未知结果。新增19项回归覆盖纯时钟、关联、配置和真实隔离Router/TLS/Common、独立Mpath/PCMA双向传输、负回执及挂断等待。尚待自身双Actions/正式制品；不表示实际410已接听或独立Alive已完成。
+
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 
 原 App 并未依赖公共 CA：`assets/app2.cer` 就是服务端叶子证书

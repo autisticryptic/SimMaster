@@ -201,6 +201,8 @@ pub struct CallMediaConfig {
     pub routing: Vec<ProfileProperty>, pub features: Vec<ProfileBytes>, pub properties: Vec<ProfileProperty>,
     pub reference_decode_key: Option<Secret>, pub audio_bind_ip: IpAddr, pub allow_plain_media: bool,
     pub trunk: Option<crate::platform::config::TrunkProfileConfig>,
+    #[serde(default)]
+    pub native_lifecycle:Option<super::native_call_lifecycle::NativeCallLifecycleConfig>,
 }
 impl fmt::Debug for CallMediaConfig { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("CallMediaConfig(<redacted>)") } }
 impl Drop for CallMediaConfig { fn drop(&mut self) { if let Some(trunk) = &mut self.trunk { trunk.secret.zeroize(); } } }
@@ -315,6 +317,7 @@ impl AccountConfig {
 
     pub(super) fn runtime_calls(&self) -> Result<Option<super::call_settings::CallSettings>, &'static str> {
         let Some(media) = &self.call_media else { return Ok(None); };
+        if media.native_lifecycle.is_some() && !self.profile.native_call_control {return Err(INVALID);}
         if self.profile.native_receivers.is_none() {
             if self.profile.call_incoming.is_none() || self.profile.call_control.is_none() { return Err(INVALID); }
         } else if self.profile.call_control.is_none() && !self.profile.native_call_control { return Err(INVALID); }
@@ -327,7 +330,7 @@ impl AccountConfig {
             connect_timeout: Duration::from_millis(self.profile.connect_timeout_ms), handshake_timeout: Duration::from_millis(self.profile.handshake_timeout_ms),
             partial_timeout: Duration::from_millis(self.profile.partial_timeout_ms), io_timeout: Duration::from_millis(self.profile.io_timeout_ms),
             rpc_timeout: Duration::from_millis(self.profile.rpc_timeout_ms), bind_ip: media.audio_bind_ip, allow_plain_media: media.allow_plain_media,
-            trunk: media.trunk.as_ref(),
+            trunk: media.trunk.as_ref(),native_lifecycle:media.native_lifecycle,
         }).map(Some)
     }
 
@@ -429,7 +432,10 @@ struct PrivateConfigRef<'a> { credentials: PrivateCredentialsRef<'a>, profile: P
 #[derive(Serialize)]
 pub(super) struct PrivateCallMediaRef<'a> { authority: &'a str, root_der_base64: &'a str, enable_sni: bool,
     routing: PrivateProperties<'a>, features: PrivateFeatures<'a>, properties: PrivateProperties<'a>, reference_decode_key: Option<&'a str>,
-    audio_bind_ip: IpAddr, allow_plain_media: bool, trunk: Option<&'a crate::platform::config::TrunkProfileConfig> }
+    audio_bind_ip: IpAddr, allow_plain_media: bool, trunk: Option<&'a crate::platform::config::TrunkProfileConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_lifecycle:Option<super::native_call_lifecycle::NativeCallLifecycleConfig>,
+}
 #[derive(Serialize)]
 struct PrivateFeatureRef<'a> { value: &'a [u8] }
 struct PrivateFeatures<'a>(&'a [ProfileBytes]);
@@ -580,7 +586,7 @@ impl<'a> PrivateConfigRef<'a> {
                 root_der_base64: media.root_der_base64.expose_to_backend(), enable_sni: media.enable_sni,
                 routing: PrivateProperties(&media.routing), features: PrivateFeatures(&media.features), properties: PrivateProperties(&media.properties),
                 reference_decode_key: exposed(&media.reference_decode_key), audio_bind_ip: media.audio_bind_ip, allow_plain_media: media.allow_plain_media,
-                trunk: media.trunk.as_ref() }),
+                trunk: media.trunk.as_ref(),native_lifecycle:media.native_lifecycle }),
             bootstrap:config.bootstrap.as_ref().map(|b|PrivateBootstrapRef{account_authority:b.account_authority.expose_to_backend(),
                 account_root_der_base64:b.account_root_der_base64.expose_to_backend(),account_enable_sni:b.account_enable_sni,
                 routing:private_properties(&b.routing),handoff_timeout_ms:b.handoff_timeout_ms}),
@@ -620,7 +626,7 @@ pub(super) fn private_bootstrap_ref(b: &BootstrapConfig) -> PrivateBootstrapRef<
 pub(super) fn private_call_media_ref(m: &CallMediaConfig) -> PrivateCallMediaRef<'_> {
     PrivateCallMediaRef { authority: m.authority.expose_to_backend(), root_der_base64: m.root_der_base64.expose_to_backend(), enable_sni: m.enable_sni,
         routing: PrivateProperties(&m.routing), features: PrivateFeatures(&m.features), properties: PrivateProperties(&m.properties),
-        reference_decode_key: exposed(&m.reference_decode_key), audio_bind_ip: m.audio_bind_ip, allow_plain_media: m.allow_plain_media, trunk: m.trunk.as_ref() }
+        reference_decode_key: exposed(&m.reference_decode_key), audio_bind_ip: m.audio_bind_ip, allow_plain_media: m.allow_plain_media, trunk: m.trunk.as_ref(),native_lifecycle:m.native_lifecycle }
 }
 
 #[cfg(test)]

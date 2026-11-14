@@ -15,9 +15,9 @@ pub const RELEASED_METHOD: &str = "onReleased.CallClientEx.CallEx";
 pub const ACCEPTED_METHOD: &str = "onAccepted.CallClientEx.CallEx";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CallOperation { Inform, Accept, Release }
+pub enum CallOperation { Inform, Accept, Release, KeepAlive }
 impl CallOperation {
-    pub fn method(self) -> &'static str { match self { Self::Inform=>INFORM_METHOD, Self::Accept=>ACCEPT_METHOD, Self::Release=>RELEASE_METHOD } }
+    pub fn method(self) -> &'static str { match self { Self::Inform|Self::KeepAlive=>INFORM_METHOD, Self::Accept=>ACCEPT_METHOD, Self::Release=>RELEASE_METHOD } }
 }
 
 /// A value, not an original-call capability or a remote delivery identifier.

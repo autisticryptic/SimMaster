@@ -16,6 +16,8 @@ const SCOPE: &str = "app_account_call_scope_invalid";
 const UNAVAILABLE: &str = "app_account_call_runtime_unavailable";
 const MAX_CALLS: usize = 128;
 const MAX_ACTIVE: usize = 16;
+#[path="account_call_maintenance.rs"]
+mod maintenance;
 fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { value.lock().unwrap_or_else(|poison| poison.into_inner()) }
 fn call_error(error:RuntimeError)->&'static str{match error{
     RuntimeError::CallRejected=>"app_account_call_rejected",RuntimeError::CallNotReady=>"app_account_call_not_ready",
@@ -27,7 +29,8 @@ enum Phase { Checking, Ringing, Accepting, Connected, Ending, Ended, Failed }
 impl Phase { fn name(self) -> &'static str { match self { Self::Checking=>"checking",Self::Ringing=>"ringing",Self::Accepting=>"accepting",Self::Connected=>"connected",Self::Ending=>"ending",Self::Ended=>"ended",Self::Failed=>"failed" } } }
 struct State { phase: Phase, error: Option<&'static str>, socket: Option<BoundAudioSocket>, local:Option<std::net::SocketAddr>, media: Option<Arc<AudioHandle>>, connected: Option<Instant>, release_attempted:bool, accept_queued:bool, end_queued:bool }
 struct Call { id: String, ticket: CallControlTicket, offer: PlainAudioOffer, caller: String, history: HistoryTicket,
-    received: u64, cancelled: AtomicBool, changed: tokio::sync::Notify, operation: AsyncMutex<()>, state: Mutex<State>, watch: AsyncMutex<Option<JoinHandle<()>>> }
+    received: u64, cancelled: AtomicBool, changed: tokio::sync::Notify, operation: AsyncMutex<()>, state: Mutex<State>, watch: AsyncMutex<Option<JoinHandle<()>>>,
+    native_timing:Mutex<Option<super::native_call_lifecycle::NativeCallTiming>>,keepalive:AsyncMutex<Option<JoinHandle<()>>> }
 impl Call {
     fn retire(&self) { self.cancelled.store(true,Ordering::SeqCst); self.ticket.revoke(); let mut state=lock(&self.state);
         state.socket.take(); if let Some(media)=&state.media { media.retire(); } }
@@ -153,8 +156,10 @@ impl CallService {
                     self.backend.complete_call(owner,&scope,incoming.ticket(),false,&[]).await.map_err(|_|SCOPE)?;return Ok(());
                 }
                 let history=history::insert(&self.database,&self.run,&id,&caller)?;
+                let native_timing=self.settings.native_lifecycle.map(|policy|policy.bind(ticket));
                 let call=Arc::new(Call{id:id.clone(),ticket:ticket.captured_copy(),offer,caller,history,received:super::account_runtime::unix_now(),cancelled:AtomicBool::new(false),changed:tokio::sync::Notify::new(),
-                    operation:AsyncMutex::new(()),state:Mutex::new(State{phase:Phase::Checking,error:None,socket:None,local:None,media:None,connected:None,release_attempted:false,accept_queued:false,end_queued:false}),watch:AsyncMutex::new(None)});
+                    operation:AsyncMutex::new(()),state:Mutex::new(State{phase:Phase::Checking,error:None,socket:None,local:None,media:None,connected:None,release_attempted:false,accept_queued:false,end_queued:false}),watch:AsyncMutex::new(None),
+                    native_timing:Mutex::new(native_timing),keepalive:AsyncMutex::new(None)});
                 self.watch_original(&call);
                 lock(&self.calls).insert(id,call.clone());
                 if self.backend.complete_call(owner,&scope,incoming.ticket(),true,&[]).await.is_err(){call.retire();return Err(SCOPE);}
@@ -253,7 +258,9 @@ impl CallService {
         if !self.active(call){return Err(SCOPE);}let socket={let mut state=lock(&call.state);
             if state.phase!=Phase::Ringing{return Err(SCOPE);}state.phase=Phase::Accepting;state.socket.take().ok_or(SCOPE)?};
         let address=socket.address(&call.ticket).ok_or(SCOPE)?;let body=call.offer.native_answer(&answer,&call.ticket,address).map_err(|error|error.code())?;
-        let scope=call.ticket.connection_scope();let result=self.backend.call(call.ticket.owner(),&scope,&call.ticket,CallOperation::Accept,&[RpcProperty{key:b"RseEx.SDP",value:&body}]).await.map_err(call_error)?;
+        let scope=call.ticket.connection_scope();
+        let result=if self.settings.native_lifecycle.is_some(){self.accept_control(call,&body).await?}
+            else{self.backend.call(call.ticket.owner(),&scope,&call.ticket,CallOperation::Accept,&[RpcProperty{key:b"RseEx.SDP",value:&body}]).await.map_err(call_error)?};
         if !result.accepted()||!self.active(call){return Err("app_account_call_rejected");}
         let plan=MediaEndpointPlan::prepare_mpath(&result,&call.ticket,self.settings.profile.clone()).map_err(|error|error.code())?;
         let relay=socket.for_peer(&call.ticket,&call.offer,&answer,Some(self.operator.media_metrics())).map_err(|error|error.code())?;
@@ -265,6 +272,7 @@ impl CallService {
         self.publish_state(call,|state|{state.phase=Phase::Connected;state.connected=Some(Instant::now());}).await?;
         history::connected(&self.database,&call.history)?;
         call.ticket.with_media_gate(||self.operator.send_event(OperatorEvent::Connected{call_id:call.id.clone()})).ok_or(SCOPE)?;
+        self.native_media_connected(call)?;
         Ok(())
     }
     pub(super) async fn hangup(self:&Arc<Self>,id:&str)->Result<OperationWaiter,&'static str>{
@@ -284,6 +292,7 @@ impl CallService {
             let answered=state.connected.is_some();let duration=state.connected.map(|at|at.elapsed().as_secs().min(i64::MAX as u64)as i64).unwrap_or(0);
             state.phase=Phase::Ending;state.socket.take();(state.media.clone(),answered,duration)};
         call.ticket.revoke();
+        self.join_native_keepalive(call).await?;
         if let Some(media)=media{let closed=media.close().await;if !closed.io_released{return Err("app_account_call_cleanup_unconfirmed");}}
         let scope=call.ticket.connection_scope();let mut failed=None;
         let attempt_release={let mut state=lock(&call.state);let attempt=release&&scope.is_open()&&!call.ticket.remote_released()&&!state.release_attempted;

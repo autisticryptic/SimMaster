@@ -82,7 +82,7 @@ impl CallControlTicket{
 }
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum Phase{Received,Admitted,Checking,Checked,Accepting,Accepted,Releasing,Ended,Failed}
-struct Slot{ticket:CallControlTicket,phase:Phase,override_id:Option<Zeroizing<Vec<u8>>>}
+struct Slot{ticket:CallControlTicket,phase:Phase,override_id:Option<Zeroizing<Vec<u8>>>,keepalive_pending:bool}
 enum CallRouting { Explicit(Vec<Property>), NativeDefault }
 pub(super) struct CallBook{owner:AttemptOwner,scope:RpcConnectionScope,routing:Option<CallRouting>,calls:BTreeMap<u64,Slot>,retired:VecDeque<u64>}
 impl CallBook{
@@ -107,6 +107,18 @@ impl CallBook{
             // supplied generalInfo/keepAlive operation or a new retry.
             if !properties.is_empty(){return Err(CodecError::InvalidField);}
             return super::rpc_calls::encode_operation(operation,ticket.native_id(),&[RpcProperty{key:b"RseEx.Info",value:EXISTENCE_INFO}]);
+        }
+        if operation==CallOperation::KeepAlive{
+            self.slot(ticket)?;
+            if !matches!(self.routing.as_ref(),Some(CallRouting::NativeDefault))||properties.is_empty()||properties.len()>3{return Err(CodecError::InvalidField);}
+            capture(properties)?;
+            if !properties.iter().any(|p|p.key==b"keepAlive"){return Err(CodecError::InvalidField);}
+            for property in properties{
+                if !matches!(property.key,b"keepAlive"|b"RseEx.AcceptDuration"|b"RseEx.ConnDuration")||property.value.is_empty()||property.value.len()>20
+                    ||!property.value.iter().all(u8::is_ascii_digit){return Err(CodecError::InvalidField);}
+                let value=std::str::from_utf8(property.value).ok().and_then(|v|v.parse::<u64>().ok()).ok_or(CodecError::InvalidField)?;
+                if value>i64::MAX as u64||(property.key==b"keepAlive"&&value>i32::MAX as u64){return Err(CodecError::InvalidField);}
+            }
         }
         super::rpc_calls::encode_operation(operation,ticket.native_id(),properties)
     }
@@ -142,7 +154,7 @@ impl CallBook{
             Some(CallRouting::NativeDefault)=>!valid_native_identifier(value),_=>!valid_identifier(value),
         }){return Err(CodecError::InvalidField);}
         let ticket=CallControlTicket{owner:self.owner.clone(),scope:self.scope.clone(),native_id:notice.native_id(),identity:Arc::new(CallIdentity{live:AtomicBool::new(true),media_started:AtomicBool::new(false),remote_released:AtomicBool::new(false),gate:Mutex::new(()),changed:tokio::sync::Notify::new()})};
-        self.calls.insert(id,Slot{ticket:ticket.captured_copy(),phase:Phase::Received,override_id:override_id.map(|v|Zeroizing::new(v.to_vec()))});Ok(Some(ticket))
+        self.calls.insert(id,Slot{ticket:ticket.captured_copy(),phase:Phase::Received,override_id:override_id.map(|v|Zeroizing::new(v.to_vec())),keepalive_pending:false});Ok(Some(ticket))
     }
     fn slot(&self,ticket:&CallControlTicket)->Result<&Slot,CodecError>{
         if !ticket.matches(&self.owner,&self.scope){return Err(CodecError::InvalidField);}
@@ -158,6 +170,7 @@ impl CallBook{
         let allowed=match operation{
             CallOperation::Inform=>slot.phase==Phase::Admitted&&ticket.is_live(),
             CallOperation::Accept=>slot.phase==Phase::Checked&&ticket.is_live(),
+            CallOperation::KeepAlive=>matches!(self.routing.as_ref(),Some(CallRouting::NativeDefault))&&slot.phase==Phase::Accepted&&ticket.is_live()&&!slot.keepalive_pending,
             CallOperation::Release=>matches!(slot.phase,Phase::Received|Phase::Admitted|Phase::Checking|Phase::Checked|Phase::Accepting|Phase::Accepted|Phase::Failed),
         };
         if !allowed{return Err(CodecError::InvalidField);}
@@ -172,11 +185,17 @@ impl CallBook{
     }
     pub(super) fn submitted(&mut self,ticket:&CallControlTicket,operation:CallOperation)->Result<(),CodecError>{
         self.prepare(ticket,operation)?;let slot=self.calls.get_mut(&ticket.native_id.expose_to_backend()).ok_or(CodecError::InvalidField)?;
-        slot.phase=match operation{CallOperation::Inform=>Phase::Checking,CallOperation::Accept=>Phase::Accepting,CallOperation::Release=>{slot.ticket.revoke();Phase::Releasing}};Ok(())
+        slot.phase=match operation{CallOperation::Inform=>Phase::Checking,CallOperation::Accept=>Phase::Accepting,
+            CallOperation::KeepAlive=>{slot.keepalive_pending=true;Phase::Accepted},CallOperation::Release=>{slot.ticket.revoke();Phase::Releasing}};Ok(())
     }
     pub(super) fn result(&mut self,ticket:&CallControlTicket,operation:CallOperation,accepted:bool)->bool{
         let Ok(slot)=self.slot(ticket)else{return false;};
-        let expected=match operation{CallOperation::Inform=>Phase::Checking,CallOperation::Accept=>Phase::Accepting,CallOperation::Release=>Phase::Releasing};
+        if operation==CallOperation::KeepAlive{
+            if slot.phase!=Phase::Accepted||!slot.keepalive_pending{return false;}
+            let live=ticket.is_live();let Some(slot)=self.calls.get_mut(&ticket.native_id.expose_to_backend())else{return false;};
+            slot.keepalive_pending=false;if !accepted||!live{slot.ticket.revoke();slot.phase=Phase::Failed;}return live;
+        }
+        let expected=match operation{CallOperation::Inform=>Phase::Checking,CallOperation::Accept=>Phase::Accepting,CallOperation::Release=>Phase::Releasing,CallOperation::KeepAlive=>return false};
         if slot.phase!=expected{return false;}
         if operation!=CallOperation::Release && !ticket.is_live(){
             if let Some(slot)=self.calls.get_mut(&ticket.native_id.expose_to_backend()){slot.ticket.revoke();slot.phase=Phase::Failed;}
@@ -184,7 +203,7 @@ impl CallBook{
         }
         let Some(slot)=self.calls.get_mut(&ticket.native_id.expose_to_backend())else{return false;};
         if !accepted{slot.ticket.revoke();slot.phase=Phase::Failed;return true;}
-        slot.phase=match operation{CallOperation::Inform=>Phase::Checked,CallOperation::Accept=>Phase::Accepted,CallOperation::Release=>Phase::Ended};true
+        slot.phase=match operation{CallOperation::Inform=>Phase::Checked,CallOperation::Accept=>Phase::Accepted,CallOperation::Release=>Phase::Ended,CallOperation::KeepAlive=>return false};true
     }
     pub(super) fn close(&mut self){for slot in self.calls.values(){slot.ticket.revoke();}self.calls.clear();self.retired.clear();self.routing=None;}
 }

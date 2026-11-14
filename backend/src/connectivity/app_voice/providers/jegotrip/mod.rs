@@ -73,6 +73,7 @@ pub(crate) mod router_connector;
 pub(crate) mod router_runtime;
 pub mod runtime_provision;
 pub mod startup_diagnostics;
+pub(crate) mod native_call_lifecycle;
 pub mod runtime_backend;
 pub mod legacy_config;
 pub mod object_reference;

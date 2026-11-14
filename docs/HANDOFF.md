@@ -14,6 +14,8 @@
 
 ## 已核验的软件基线
 
+- **新增待自身验证：显式原生内置音频生命周期**。`call_media.native_lifecycle.session_timer_seconds`与独立Alive参数分开；仅native默认控制及现有明确媒体配置允许。新路径组装SDP/mediaType/audio、keepAlive毫秒和内置无外接stream的SDK.IsNew；原legacy Accept不变。独立KeepAlive操作仍发原inform方法，使用本次per-call id/token/序号，单pending、原RPC期限、不补发；从匹配Accept后计时，实际媒体连接后发一次耗时字段，支持零周期、漏tick合并、撤销及真实Join。新增16项纯时序/归属/配置、3项Router/Common＋独立TLS/Mpath＋PCMA/挂断回归尚待Actions；没有修改410或重放上次SDK运行。完整R01–R14仍未完成。
+
 - **`df2ef9d50e1f395b6a6e65c74707f7c938d24459`（原生默认来电控制，已验证并部署核心）**。显式`profile.native_call_control=true`仅允许原Router/Common＋native接收器，与旧`call_control`数组互斥；旧id+domain保护不变。默认`#CallServerEx`、精确存在性Inform及随后原邀请per-call oid的Accept/Release已接线，不降级endpoint/facet/adapter引用。自身Build43580577473/Beta43580577469首轮均success，各1485 provider（1461旧＋24新）、29HTTP、95前端单元/7浏览器/16图及双ABI官方digest/全CRC/29成员20www/meta/ELF全核；254本机静态通过。已单次核心升级410到本SHA/PID127787，原配置/身份/历史/辅助服务保护通过，不备份、不启用新call_control或猜媒体参数。**完整通话、Accept附加参数/保活、媒体/Alive/通知与真实收件仍未完成。**
 
 - **原生启动分层诊断（818d139软件已验证，失败已关闭）**。仅为原bootstrap/账号连接保留首个有限`phase/stage/code`；错误映射、TLS/精确SAN、Router选择、重试与ready门禁不变，整体超时不猜网络阶段。自身Build43577807064/Beta43577807069各1461 provider/29HTTP、95单元/7浏览器/16图、双ABI完整工件通过。cb6的导入/工厂名编译错误、919两个Actions原同名Common bootstrap栈溢出均保留原日志/ZIP/注解；移除新增async/Result大future嵌套恢复原单层状态机，原测试/标准栈/预算未改，同名回归通过。metadata403已按reset恢复并完成审计，私有`startup-diagnostics/VERIFIED_818d139.json`关闭该失败。诊断随df2部署后已实际定位到bootstrap Router TLS失败，详见下节，不冒称授信/SDK或收件成功。
