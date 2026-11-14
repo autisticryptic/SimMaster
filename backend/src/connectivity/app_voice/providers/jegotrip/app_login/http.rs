@@ -223,6 +223,9 @@ pub(super) struct AppClient { config:HttpDeployment, transport:Arc<dyn Transport
     /// cannot be supplied by a response or persisted diagnostic observation.
     local_receiver:bool,
     communication:Option<super::communication::CommunicationOperation>,
+    /// Actions-only deterministic public-version fixture, never App/SDK I/O.
+    #[cfg(test)]
+    pub(super) version_lookup:Option<Arc<dyn Fn(&str)->Option<Vec<u8>>+Send+Sync>>,
     trusted_reuse:bool,
     trusted_reuse_write_started:std::sync::atomic::AtomicBool,
     version_cache:std::sync::Mutex<Option<(String,&'static str,std::time::Instant)>> }
@@ -276,7 +279,7 @@ impl AppClient {
         hash.update(&[0]);hash.update(&request.identity_key());
         Ok(hash.finish().as_ref().to_vec())
     }
-    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_store:None,enroll_id:std::sync::Mutex::new(None),device_id_override:None,local_receiver:false,communication:None,trusted_reuse:false,trusted_reuse_write_started:std::sync::atomic::AtomicBool::new(false),version_cache:std::sync::Mutex::new(None)}) }
+    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_store:None,enroll_id:std::sync::Mutex::new(None),device_id_override:None,local_receiver:false,communication:None,trusted_reuse:false,trusted_reuse_write_started:std::sync::atomic::AtomicBool::new(false),version_cache:std::sync::Mutex::new(None),#[cfg(test)] version_lookup:None}) }
     pub(super) fn with_trusted_reuse(mut self)->Result<Self,Error> {
         // A private extra field must not sneak a stale enrolment, carrier
         // credential or a different report owner into this explicit policy.
@@ -414,6 +417,8 @@ impl AppClient {
     /// Fetch a discovery URL with public roots (not the pinned App leaf),
     /// bounded body/time, no redirects; only the version literal is kept.
     async fn fetch_text(&self,url:&str)->Option<Vec<u8>> {
+        #[cfg(test)]
+        if let Some(lookup)=&self.version_lookup{return lookup(url).filter(|bytes|bytes.len()<=524_288);}
         // Shared factory keeps the project's DNS boundary (no ad-hoc clients).
         let builder=crate::platform::dns::http_client_builder()
             .timeout(std::time::Duration::from_secs(8))

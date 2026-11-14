@@ -7,6 +7,13 @@ const UUID:&str="D5C0199B-1644-4D33-8912-B8BD5AB49224";
 mod https;
 struct CommScript{steps:Mutex<VecDeque<Step>>,seen:Mutex<Vec<Recorded>>,protection:Option<config::BodyProtection>}
 impl CommScript{
+    fn lookup(&self,text:&str)->Option<Vec<u8>>{
+        let url=reqwest::Url::parse(text).unwrap();assert_eq!(url.scheme(),"https");assert_eq!(url.host_str(),Some("itunes.apple.com"));assert_eq!(url.path(),"/lookup");
+        let query:BTreeMap<String,String>=url.query_pairs().map(|(k,v)|(k.into_owned(),v.into_owned())).collect();assert!(!query.contains_key("token")&&!query.contains_key("n_token"));
+        lock(&self.seen).push(Recorded{path:url.path().to_owned(),query,body:Value::Null,wire:Value::Null});
+        let step=lock(&self.steps).pop_front().expect("unexpected public-version lookup");
+        match step{Step::Reply(path,200,body)=>{assert_eq!(path,url.path());Some(serde_json::to_vec(&body).unwrap())},_=>panic!("unexpected public-version fixture")}
+    }
     fn paths(&self)->Vec<String>{lock(&self.seen).iter().map(|r|r.path.clone()).collect()}
 }
 impl Transport for CommScript{
@@ -39,7 +46,9 @@ impl Transport for CommScript{
     })}
 }
 struct CommFactory(Arc<CommScript>);
-impl TransportFactory for CommFactory{fn build(&self,c:&HttpDeployment)->Result<AppClient,Error>{AppClient::new(c.clone(),self.0.clone())}}
+impl TransportFactory for CommFactory{fn build(&self,c:&HttpDeployment)->Result<AppClient,Error>{
+    let mut client=AppClient::new(c.clone(),self.0.clone())?;let script=self.0.clone();client.version_lookup=Some(Arc::new(move|url|script.lookup(url)));Ok(client)
+}}
 fn configuration(f:&Fixture,writes:bool)->DatabaseConfiguration{
     let mut value=database_configuration(f,false);value.http.communication=Some(serde_json::from_value(json!({"allow_business_writes":writes,
         "profile":"profile","phone_service":"phone-service","display_status":"display","set_voip_profile":"set-voip","close_forward":"close","jego_m_status":"jego","logout":"logout"})).unwrap());
@@ -73,7 +82,7 @@ fn communication_configuration_is_optional_default_denied_and_byte_stable_when_a
     let f=Fixture::new(Vec::new(),false);let old=database_configuration(&f,false);let bytes=old.encode_private().unwrap();let value:Value=serde_json::from_slice(&bytes).unwrap();assert!(value["http"].get("communication").is_none());
     let old=DatabaseConfiguration::decode_private(&bytes).unwrap();assert!(old.http.communication.is_none());assert_eq!(&*bytes,&*old.encode_private().unwrap());
     let config=configuration(&f,false);let api=config.http.communication.as_ref().unwrap();assert_eq!(api.available(),[Action::QueryProfile,Action::QueryPhoneService,Action::QueryDisplayStatus,Action::QueryForwardingState]);
-    assert_eq!(api.preflight(&Op::Logout).unwrap_err().code,"app_login_communication_writes_disabled");
+    assert_eq!(api.preflight(&Op::Logout{}).unwrap_err().code,"app_login_communication_writes_disabled");
 }
 #[test]
 fn communication_configuration_rejects_foreign_plain_and_ambiguous_origins(){
@@ -116,7 +125,7 @@ fn communication_status_canonical_types_and_masking_never_reflect_credentials(){
 #[test]
 fn communication_observation_storage_is_owner_phase_and_immutable_context_cas_guarded(){
     let c=rusqlite::Connection::open_in_memory().unwrap();store::initialize(&c,"owner",1).unwrap();let task=id();store::insert_with_intent(&c,&task,"owner",LoginIntent::Communication,1).unwrap();
-    let mut obs=CommunicationObservation::initial(&Op::QueryPhoneService,1,&id(),4,2);obs.state=State::RequestUncertain;
+    let mut obs=CommunicationObservation::initial(&Op::QueryPhoneService{},1,&id(),4,2);obs.state=State::RequestUncertain;
     assert!(store::set_communication(&c,&task,"owner",&obs,2).is_err());store::step(&c,&task,"owner","communication_request",None,2).unwrap();
     assert!(store::set_communication(&c,&task,"foreign",&obs,2).is_err());store::set_communication(&c,&task,"owner",&obs,2).unwrap();
     for field in 0..3{let mut bad=obs.clone();match field{0=>bad.device_identity_id=id(),1=>bad.configuration_revision=2,_=>bad.action=Action::QueryProfile};assert!(store::set_communication(&c,&task,"owner",&bad,3).is_err());}
@@ -127,7 +136,7 @@ fn communication_observation_storage_is_owner_phase_and_immutable_context_cas_gu
 #[test]
 fn communication_unresolved_write_survives_restart_and_never_reinitializes_a_nonce(){
     let c=rusqlite::Connection::open_in_memory().unwrap();store::initialize(&c,"old",1).unwrap();let task=id();let device=id();store::insert_with_intent(&c,&task,"old",LoginIntent::Communication,1).unwrap();store::step(&c,&task,"old","communication_request",None,2).unwrap();
-    let mut obs=CommunicationObservation::initial(&Op::Logout,1,&device,4,2);obs.state=State::RequestUncertain;store::set_communication(&c,&task,"old",&obs,2).unwrap();assert!(store::set_communication(&c,&task,"old",&obs,2).is_err());
+    let mut obs=CommunicationObservation::initial(&Op::Logout{},1,&device,4,2);obs.state=State::RequestUncertain;store::set_communication(&c,&task,"old",&obs,2).unwrap();assert!(store::set_communication(&c,&task,"old",&obs,2).is_err());
     store::initialize(&c,"new",3).unwrap();let row=store::get(&c,&task).unwrap().unwrap();assert!(row.completed);assert_eq!(row.phase,"interrupted");assert_eq!(row.communication.unwrap().state,State::RequestUncertain);assert!(store::communication_write_unresolved(&c,&device).unwrap());assert!(!store::communication_write_unresolved(&c,&id()).unwrap());assert!(store::insert_with_intent(&c,&task,"new",LoginIntent::Communication,4).is_err());
 }
 #[test]

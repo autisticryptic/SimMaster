@@ -10,16 +10,18 @@ impl CommunicationAction{
     pub(super) fn writes(self)->bool{!matches!(self,Self::QueryProfile|Self::QueryPhoneService|Self::QueryDisplayStatus|Self::QueryForwardingState)}
 }
 #[derive(Clone,Deserialize)]
+// Empty struct variants are intentional: internally tagged unit variants can
+// silently discard fields despite deny_unknown_fields.
 #[serde(tag="kind",rename_all="snake_case",deny_unknown_fields)]
 pub enum CommunicationOperation{
-    QueryProfile,QueryPhoneService,QueryDisplayStatus,QueryForwardingState,
-    SetPhoneService{status:i32},SetVoipProfile{cs_forward:String},CloseForward,
-    SetJegoMStatus{jegom_status:String,region_code:String,country_code:String},Logout,
+    QueryProfile{},QueryPhoneService{},QueryDisplayStatus{},QueryForwardingState{},
+    SetPhoneService{status:i32},SetVoipProfile{cs_forward:String},CloseForward{},
+    SetJegoMStatus{jegom_status:String,region_code:String,country_code:String},Logout{},
 }
 impl fmt::Debug for CommunicationOperation{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("CommunicationOperation(<redacted>)")}}
 impl CommunicationOperation{
-    pub(super) fn action(&self)->CommunicationAction{match self{Self::QueryProfile=>CommunicationAction::QueryProfile,Self::QueryPhoneService=>CommunicationAction::QueryPhoneService,Self::QueryDisplayStatus=>CommunicationAction::QueryDisplayStatus,Self::QueryForwardingState=>CommunicationAction::QueryForwardingState,
-        Self::SetPhoneService{..}=>CommunicationAction::SetPhoneService,Self::SetVoipProfile{..}=>CommunicationAction::SetVoipProfile,Self::CloseForward=>CommunicationAction::CloseForward,Self::SetJegoMStatus{..}=>CommunicationAction::SetJegoMStatus,Self::Logout=>CommunicationAction::Logout}}
+    pub(super) fn action(&self)->CommunicationAction{match self{Self::QueryProfile{}=>CommunicationAction::QueryProfile,Self::QueryPhoneService{}=>CommunicationAction::QueryPhoneService,Self::QueryDisplayStatus{}=>CommunicationAction::QueryDisplayStatus,Self::QueryForwardingState{}=>CommunicationAction::QueryForwardingState,
+        Self::SetPhoneService{..}=>CommunicationAction::SetPhoneService,Self::SetVoipProfile{..}=>CommunicationAction::SetVoipProfile,Self::CloseForward{}=>CommunicationAction::CloseForward,Self::SetJegoMStatus{..}=>CommunicationAction::SetJegoMStatus,Self::Logout{}=>CommunicationAction::Logout}}
     pub(super) fn validate(&self)->Result<(),Error>{
         let invalid=||Error::new("app_login_request_invalid");
         match self{
