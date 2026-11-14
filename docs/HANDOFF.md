@@ -14,11 +14,11 @@
 
 ## 已核验的软件基线
 
-- **当前追加待验证：原生默认来电控制**。显式`profile.native_call_control=true`仅允许原Router/Common＋native接收器，与旧`call_control`数组互斥，旧id+domain保护不变。原同scope激活`#CallServerEx`，第一条Inform固定`RseEx.Info="Invited callId is exist?"`，后续Accept/Release才使用原邀请的per-call oid；不把endpoint/facet/adapter引用降成裸id。新增24项Rust codec/原包/真实Common peer/账号就绪边界回归，尚未执行新源码自身Actions。此部分不是完整通话：Accept的mediaType/keepAlive/SDK.IsNew条件、独立媒体/Alive/通知及真实410仍待补齐。
+- **`df2ef9d50e1f395b6a6e65c74707f7c938d24459`（原生默认来电控制，已验证并部署核心）**。显式`profile.native_call_control=true`仅允许原Router/Common＋native接收器，与旧`call_control`数组互斥；旧id+domain保护不变。默认`#CallServerEx`、精确存在性Inform及随后原邀请per-call oid的Accept/Release已接线，不降级endpoint/facet/adapter引用。自身Build43580577473/Beta43580577469首轮均success，各1485 provider（1461旧＋24新）、29HTTP、95前端单元/7浏览器/16图及双ABI官方digest/全CRC/29成员20www/meta/ELF全核；254本机静态通过。已单次核心升级410到本SHA/PID127787，原配置/身份/历史/辅助服务保护通过，不备份、不启用新call_control或猜媒体参数。**完整通话、Accept附加参数/保活、媒体/Alive/通知与真实收件仍未完成。**
 
-- **原生启动分层诊断（818d139双Actions状态success，工件审计中）**。仅给原Common启动的bootstrap/账号连接保留首个有限`phase/stage/code`，旧失败映射、TLS/精确SAN、Router选择、重试与ready门禁不变；整体超时不猜具体网络阶段。`AccountView`/推送面板只显示同一owner/scope的观察，停止后不回填旧诊断。新增15项Rust隔离peer/归属/取消/账号清理回归、5项前端单元和1项桌面/手机浏览器用例；`818d139`已收到Build43577807064/Beta43577807069状态success，但正式工件/精确测试审计遇GitHub metadata配额403，按Reset1794648849后续接；不借2b或919前端旧绿。首`cb6f697`两个Actions的新增`Arc`导入/测试工厂名编译错误已由`919fd64`修正；但919的Beta在原Common bootstrap回归栈溢出。本次移除诊断引入的额外async/Result大future嵌套，恢复原单层启动状态机，只在原错误出口记录有限观察；全部新旧测试和标准栈/超时保留。原失败工件均保留，仍待818正式工件审计关闭失败。246项本机Python静态/备份/假ADB检查通过。没有部署、重启SDK或重发App登录；真实TLS绑定和完整接收/电话/媒体仍未解决。
+- **原生启动分层诊断（818d139软件已验证，失败已关闭）**。仅为原bootstrap/账号连接保留首个有限`phase/stage/code`；错误映射、TLS/精确SAN、Router选择、重试与ready门禁不变，整体超时不猜网络阶段。自身Build43577807064/Beta43577807069各1461 provider/29HTTP、95单元/7浏览器/16图、双ABI完整工件通过。cb6的导入/工厂名编译错误、919两个Actions原同名Common bootstrap栈溢出均保留原日志/ZIP/注解；移除新增async/Result大future嵌套恢复原单层状态机，原测试/标准栈/预算未改，同名回归通过。metadata403已按reset恢复并完成审计，私有`startup-diagnostics/VERIFIED_818d139.json`关闭该失败。诊断随df2部署后已实际定位到bootstrap Router TLS失败，详见下节，不冒称授信/SDK或收件成功。
 
-- **`2b8555acc03319cacd1055f15e9a8ae7ed1ad448`（本地SDK接收准备，已验证并部署）**：实际8.9.4核心登录/注册使用当前电话token/SIP资料，不把App的`cs_forward`或某个UI回调的VoIP status当通用SDK门禁。新增非默认`prepare_local_receiver`，原UUID/同账号、当前已有设备认可、当前电话资料和再次认可后才准备本地账号，呼转只观察，不enroll/同步设备/修改业务；旧呼转复用和native ACK/撤销/Join保护保持。Build43563389936 / Beta43563389938均success，各1446 provider（1418旧+28新）、29HTTP（26旧+3新）、90前端单元/6浏览器/14图及双ABI官方digest/全CRC/29成员20www/meta/ELF已核，本机239静态通过。首a23仅新增UUID冲突测试误配普通认证的可选enroll前置，已仅修夹具、原断言/生产路径/预算不改并关闭失败留证。410已运行本SHA/PID75130；实际SDK首启仍断连，详见下节，完整目标未完成。
+- **`2b8555acc03319cacd1055f15e9a8ae7ed1ad448`（本地SDK接收准备，已验证并部署）**：实际8.9.4核心登录/注册使用当前电话token/SIP资料，不把App的`cs_forward`或某个UI回调的VoIP status当通用SDK门禁。新增非默认`prepare_local_receiver`，原UUID/同账号、当前已有设备认可、当前电话资料和再次认可后才准备本地账号，呼转只观察，不enroll/同步设备/修改业务；旧呼转复用和native ACK/撤销/Join保护保持。Build43563389936 / Beta43563389938均success，各1446 provider（1418旧+28新）、29HTTP（26旧+3新）、90前端单元/6浏览器/14图及双ABI官方digest/全CRC/29成员20www/meta/ELF已核，本机239静态通过。首a23仅新增UUID冲突测试误配普通认证的可选enroll前置，已仅修夹具、原断言/生产路径/预算不改并关闭失败留证。410当时运行本SHA/PID75130（现已升级df2）；实际SDK首启仍断连，详见下节，完整目标未完成。
 
 - **`865991d1d986f25e060a54272f595b889e1b0c4b`（同次诊断状态保留，已验证并部署）**：`CheckDeviceTrust`保存原来已发出的那一次`getCallStatus`授权码及`localCsForward`，不增加请求/重试、不改变原UUID、HTTP wire或复用门禁。旧记录不回填；复用/诊断形状分别校验，原2KiB上限保持。Build43549614252 / Beta43549614209首轮success，各1418精确provider（1406旧+12新）、26HTTP与原registry/Trunk/通知/DNS/矩阵通过；各82前端单元、4浏览器、12图及双ABI各29成员/20前端文件的官方digest/全CRC/SHA/meta/ELF已核。本机231静态通过，旧断言/工作流/前端/API/依赖与预算保持。410已仅核心升级到本SHA/PID26706，历史/身份/配置/辅助服务保护通过，无回滚备份。证据`.local/jegotrip/diagnostic-status-20261114/`；完整托管仍未完成。
 
@@ -37,7 +37,7 @@
 - `profile.offline_reception` 默认false，必须已有原receiver绑定。signed64初值-1/limit100、本次UID/selector/token取件；原包、支持SMS、通知/事件/cursor同事务提交才继续。未知type2隔离不推进，删除不复活；原行ID、自增水位、索引、容量与无进展保护保持。
 - 快捷 `scripts/Export-JegotripTrust.ps1` / `jegotrip_root_trust.py` 已有19假ADB与既有普通ZIP离线验证，App/SDK双读、符号链接/混根/超限拒绝、私有DACL写前复核、不覆盖旧输出，不读取密码/token或写手机。新脚本尚无本轮手机在线实测。
 - 权威证据：`.local/jegotrip/resume-20261112-1631/{DELIVERY_0c4c1c4.md,FINAL_STATUS_0c4c1c4.json,verification-readback-0c4c1c4.json}`及`.local/jegotrip/verified-native-0c4c1c4.json`。不能借这些旧绿结果验证下面的新源码。
-- 410已先从11月4日`6f85149`升级到`e227996`、`865991d`，当前进一步部署经自身验证的`2b8555a`。均只更新核心且保护历史/配置，不是接收验收。最新部署/SDK首次尝试及停止清理在`.local/jegotrip/goal-replication-20261114/deploy-local-2b8555a/`；以前所有部署请求均已终态，不得重放。
+- 410已从`6f85149`依次升级e227、865、2b，当前正式核心为**df2ef9d/PID127787**。均只更新核心、保护原历史/配置且无备份，不是接收验收。最新`.local/jegotrip/goal-replication-20261114/deploy-native-df2ef9d/`保留部署、保留账号的唯一分层SDK启动/按run_nonce守卫停止及独立读回；旧`deploy-local-2b8555a/`保持，不重放任何终态请求。
 
 ## 本次恢复与已验证的 ClientEx 子集
 
@@ -117,13 +117,16 @@
 - 2b已单次保护性部署，原UUID rev4/安装配置rev1及旧历史保持。新的**唯一一次**`prepare_local_receiver`使用当前明确凭据，通过已有设备认可/电话资料获取，并创建第1个native账号；随后SDK连接为`disconnected/app_account_disconnected`，尚无匹配bootstrap的Alive观察，短信/来电均未ready。不是App门禁继续阻止，更不是把getCallStatus2改成1。
 - 已仅对这一次失败运行提交stop，HTTP200、`stopped`、own/global lease0、活动App登录0，保留账号/凭据与失败记录，不删除后重建或重发登录。独立读回当前2b/PID75130、attempt50、native1、SMS39/call0、配置和6保护文件/辅助服务未变。
 - 对该账号冻结配置中的两个Router端点做无App/SDK凭据的TLS诊断：TCP与所配CA链通过，但同SNI下开启SAN主机名校验（无CN回退）均返回verify_code62。这是当前身份绑定问题的证据，仍不是已捕获的Rust具体失败阶段；不关闭TLS校验、不从证书猜新host/authority、不盲目重启SDK。首诊断脚本误把versioned private envelope当裸config，错误发生在连接前且已留证，后续按原格式解析。
+- **最新df2真实诊断**：以自身验证包完成核心升级后，仅对保留native账号启动一次，不进行App登录/创建账号或修改业务/身份/TLS。实际返回503/app_account_disconnected，原进程的有限观察明确为`bootstrap / router_tls / jegotrip_tls_handshake_failed`。这已证明实际失败层，而不是仅凭旧探测猜测；TLS码本身仍不证明唯一证书根因，正确authority来源尚未解决。
+- 已用本次run_nonce摘要守卫只停止该失败运行，HTTP200；随后独立SQL/进程/文件和API只读确认：df2/PID127787、native1/stopped、own/global lease0、App attempt50/active0、SMS39/call0、数据库ok，私有账号配置、原UUID rev4、安装rev1和6保护文件/辅助服务保持；部署子任务已退出。只读续接明确`start_replay_refused=true`，没有第二次启动。当前SDK未登录成功、未收真实Jegotrip短信/电话/媒体。
+- 本轮原库进一步核实：Alive构造默认interval180，setAliveEnable启用时夹到60..600、禁用为0；wire时间是epoch毫秒，调度时间则为独立clamped accumulator。Call keepAlive来自另一CALL配置+28（缺配置才回退30秒），不能用Alive间隔代替。详见私有`native-call/TIMER_FACTS.md`；尚未实现这些运行时，不把研究当验证成功。
 - **程序和本地准备已部署，不等于完整模块收件或接听成功。** 当前重点是正确Router身份/连接阶段，以及独立Alive、通知业务关联和电话/媒体装配；不能用核心health、配置投影或模拟peer代替真实SMS/接听与清理/时延证据。
 
-私有证据：最新`.local/jegotrip/goal-replication-20261114/`含完整目标清单、2b自身软件/失败关闭证明、39条本轮只读IDA结果；`deploy-local-2b8555a/`含部署、唯一SDK尝试/stop、独立读回及零凭据Router诊断。原865证据在`diagnostic-status-20261114/`，旧部署/Wi-Fi请求在`deploy-readiness-20261113/`，不重放。IDA原库已恢复并核metadata/base/原SHA，未写/保存IDB，未加载或执行原Android SDK/SO。
+私有证据：`.local/jegotrip/goal-replication-20261114/`保留完整R01–R14目标；`startup-diagnostics/`含818自身验证与两轮失败关闭，`native-call/`含df2自身1485回归/全工件及新通话/时钟只读依据（80条累计可归属IDA记录，不是80项独立新发现）；`deploy-native-df2ef9d/`含本次保护部署、保留账号唯一SDK诊断/守卫stop/独立读回。旧2b、865及Wi-Fi/Provider请求保持且不重放。IDA原库metadata/base/原SHA再核，未写/保存IDB，未加载或执行原Android SDK/SO。
 
 ## 接下来按顺序
 
-1. 本地路径代码/测试已交付且真正触及原生连接；下一步从原App/可信安装材料确认Router身份绑定，并补必要的原生分层失败诊断，不能关闭名称/证书校验或重放旧SDK启动。保留已创建的账号；若需要新尝试，必须有新依据、明确原运行已清理，不删除历史或重做App登录来绕过。并行继续原库已确认的`#CallServerEx`默认逻辑Agent、per-call oid和`RseEx.Info`存在性查询参数，补独立Alive/通知/电话媒体全部未完项。
+1. 分层诊断及原生默认CallServerEx软件已验证，当前实际原生失败明确在bootstrap Router TLS。继续从原App/可信安装材料确认正确身份绑定；不能关闭SAN、凭所见证书猜authority或重放已结束SDK启动。保留原账号，下一次操作仍须新依据和确认原运行已清理。继续完整Accept参数/通话保活、媒体endpoint动态装配及独立信任、Alive原agent/token注册与回调、Message/Invite业务通知/R11通信API，而不是再把已完成默认路由或诊断当整体终点。
 2. 在原App UUID/同账号上下文中取得本次明确认可和业务读回，补正确接收、通话控制与媒体配置后启动；验收外来SMS落库/原回执、来电接听/双向媒体、断连、stop→logoutSession→Join与持续时延。若需新代码，仍先过自身双Actions再保护性升级；不能用核心health替代终点。
 3. 授信TTL/撤销/替换与服务端积压重放规则不可由客户端fixture证明。不用新VTD/UUID、缓存授权、收费外发或设备变更补造成功。**完整用户目标仍未完成。**
 
