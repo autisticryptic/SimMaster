@@ -1,4 +1,5 @@
-import type { AppLoginAttempt, AppLoginInput, JegotripLoginInput, JegotripLoginIntent, JegotripTrustQueryObservation, JegotripDeviceSyncObservation, JegotripStartupFailure } from '../api/current'
+import type { AppLoginAttempt, AppLoginInput, JegotripLoginInput, JegotripLoginIntent, JegotripTrustQueryObservation, JegotripDeviceSyncObservation, JegotripStartupFailure, JegotripCommunicationOperation } from '../api/current'
+import { validCommunicationOperation, communicationWrites } from './communicationOps.ts'
 
 export type AppLoginMode = 'account' | 'phone'
 export interface AppLoginDraft {
@@ -11,6 +12,9 @@ export interface AppLoginDraft {
   intent?: JegotripLoginIntent
   deviceMode?: 'auto' | 'manual' | 'phone_app'
   deviceId?: string
+  communicationOperation?: JegotripCommunicationOperation
+  writeConsent?: boolean
+  configurationRevision?: number
 }
 
 export function emptyAppLoginDraft(): AppLoginDraft {
@@ -51,13 +55,17 @@ export function canSubmitJegotripLogin(draft: AppLoginDraft): boolean {
   const deviceMode = draft.deviceMode ?? 'auto'
   const reusing = intent === 'reuse_hosting' || intent === 'enable_trusted_hosting'
   const localReceiver = intent === 'prepare_local_receiver'
+  const communication = intent === 'communication'
+  if (communication && (deviceMode !== 'phone_app' || draft.startReceiver || !validCommunicationOperation(draft.communicationOperation)
+    || !Number.isSafeInteger(draft.configurationRevision) || (draft.configurationRevision ?? -1) < 0
+    || (communicationWrites(draft.communicationOperation?.kind) && !draft.writeConsent))) return false
   return canSubmitAppLogin(draft)
     && (deviceMode === 'auto' || (deviceMode === 'manual' && validJegotripDeviceId(draft.deviceId ?? ''))
       || (deviceMode === 'phone_app' && validPhoneAppUuid(draft.deviceId ?? '')))
     && (!reusing || deviceMode === 'phone_app')
     && (!localReceiver || deviceMode === 'phone_app')
-    && (deviceMode !== 'phone_app' || reusing || localReceiver || intent === 'authenticate' || intent === 'check_device_trust')
-    && (reusing || localReceiver || intent === 'enable_hosting' || intent === 'attach_hosting'
+    && (deviceMode !== 'phone_app' || reusing || localReceiver || communication || intent === 'authenticate' || intent === 'check_device_trust')
+    && (communication || reusing || localReceiver || intent === 'enable_hosting' || intent === 'attach_hosting'
       || ((intent === 'authenticate' || intent === 'check_device_trust') && !draft.startReceiver))
 }
 
@@ -68,6 +76,8 @@ export function jegotripLoginInput(attemptId: string, draft: AppLoginDraft): Jeg
     country_code: draft.mode === 'phone' ? draft.country.trim().replace(/^\+/, '') : null,
     intent: draft.intent ?? 'enable_hosting', consent: draft.consent, start_receiver: draft.startReceiver,
     ...(draft.deviceMode === 'manual' || draft.deviceMode === 'phone_app' ? { device_id: (draft.deviceId ?? '').trim() } : {}),
+    ...(draft.intent === 'communication' ? { communication_operation: draft.communicationOperation, write_consent: communicationWrites(draft.communicationOperation?.kind) && draft.writeConsent === true,
+      expected_configuration_revision: draft.configurationRevision } : {}),
   }
 }
 
@@ -94,6 +104,10 @@ const errors: Record<string, string> = {
   app_login_account_creation_failed: '本地账号保存失败；请先核对任务中的远端业务结果。',
   app_login_receiver_start_failed: '账号已保存，但接收器启动失败；请查看独立账号状态。',
   app_login_receiver_device_check_missing: '本地接收准备需要已有设备查询端点；当前未配置，未请求电话资料或启动SDK。',
+  app_login_communication_not_configured: '本次通信操作端点未配置；需要数据库安装配置，不会猜测地址。',
+  app_login_communication_writes_disabled: '安装侧未批准业务写操作；未发送请求。',
+  app_login_communication_unconfirmed: '请求已被接受但未确认原状态；不会自动重发或启动SDK。',
+  app_login_communication_unresolved: '该原设备有尚未确认的业务写任务，只允许查询；请先核对原任务，不会换任务标识重放。',
   app_login_version_discovery_failed: '未能从 App Store 或官方页面取得版本号；请手工填写后保存。',
   app_login_device_identity_conflict: '该标识已分配或保留给另一身份，或与本账号现有标识不一致。请勿复用他人标识；更换现有标识请使用下方设备标识管理。',
   app_login_device_identity_revision_conflict: '设备标识已被其他操作修改，请刷新后再保存。',
@@ -130,6 +144,7 @@ export function appLoginPhase(phase: string): string {
   return ({ queued: '已入队', authenticating: '登录 App 账号', reading_bound_number: '核对绑定号码', fetching_credentials: '后台取得通话凭据',
     saving_app_account: '保存最近 App 认证摘要', checking_device_trust: '查询该 UUID 的服务器授信状态', syncing_device: '同步已明确配置的本人手机设备资料',
     checking_business: '查询托管业务', enabling_business: '提交开通请求', confirming_business: '确认业务状态', creating_account: '保存独立账号',
+    communication_request: '执行本次通信操作', communication_confirm: '读回本次通信状态',
     starting_receiver: '提交接收器启动', completed: '登录配置任务完成', failed: '任务失败', interrupted: '任务中断' } as Record<string, string>)[phase] ?? '未知任务状态'
 }
 export function appLoginNeedsPolling(attempt: AppLoginAttempt): boolean { return !attempt.completed && !attempt.error }

@@ -10,6 +10,10 @@ mod device_sync;
 mod trusted_reuse;
 mod local_receiver;
 mod push_status;
+mod communication;
+mod communication_profile;
+#[path="communication_flow.rs"]
+mod communication_flow;
 mod store;
 mod settings;
 mod accounts;
@@ -23,6 +27,7 @@ pub(crate) use push_status::PushStatusView;
 pub use accounts::JegotripAccountView;
 pub use device_trust::DeviceTrustObservation;
 pub use device_sync::{DeviceSyncObservation,DeviceSyncState};
+pub use communication::{CommunicationOperation,CommunicationObservation,CommunicationAction};
 use super::{account_runtime::AccountManager, account_config::AccountConfig};
 use futures_util::FutureExt;
 use crate::platform::db::Database;
@@ -47,6 +52,8 @@ const ERRORS: &[&str] = &[
     "app_login_session_revoked", "app_login_service_maintenance", "app_login_phone_binding_required",
     "app_login_identity_mismatch", "app_login_native_configuration_invalid", "app_login_business_unconfirmed",
     "app_login_account_creation_failed", "app_login_receiver_start_failed", "app_login_internal_failed",
+    "app_login_communication_unresolved",
+    "app_login_communication_not_configured", "app_login_communication_writes_disabled", "app_login_communication_unconfirmed",
     "app_login_receiver_device_check_missing",
 ];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,13 +66,13 @@ pub(crate) fn valid_attempt_id(s: &str) -> bool { s.len() == 32 && s.bytes().all
 
 #[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
 #[serde(rename_all="snake_case")]
-pub enum LoginIntent { Authenticate, #[default] EnableHosting, AttachHosting, CheckDeviceTrust, ReuseHosting, EnableTrustedHosting, PrepareLocalReceiver }
+pub enum LoginIntent { Authenticate, #[default] EnableHosting, AttachHosting, CheckDeviceTrust, ReuseHosting, EnableTrustedHosting, PrepareLocalReceiver, Communication }
 impl LoginIntent {
-    fn as_str(self)->&'static str {match self {Self::Authenticate=>"authenticate",Self::EnableHosting=>"enable_hosting",Self::AttachHosting=>"attach_hosting",Self::CheckDeviceTrust=>"check_device_trust",Self::ReuseHosting=>"reuse_hosting",Self::EnableTrustedHosting=>"enable_trusted_hosting",Self::PrepareLocalReceiver=>"prepare_local_receiver"}}
-    fn parse(value:&str)->Option<Self> {match value {"authenticate"=>Some(Self::Authenticate),"enable_hosting"=>Some(Self::EnableHosting),"attach_hosting"=>Some(Self::AttachHosting),"check_device_trust"=>Some(Self::CheckDeviceTrust),"reuse_hosting"=>Some(Self::ReuseHosting),"enable_trusted_hosting"=>Some(Self::EnableTrustedHosting),"prepare_local_receiver"=>Some(Self::PrepareLocalReceiver),_=>None}}
+    fn as_str(self)->&'static str {match self {Self::Authenticate=>"authenticate",Self::EnableHosting=>"enable_hosting",Self::AttachHosting=>"attach_hosting",Self::CheckDeviceTrust=>"check_device_trust",Self::ReuseHosting=>"reuse_hosting",Self::EnableTrustedHosting=>"enable_trusted_hosting",Self::PrepareLocalReceiver=>"prepare_local_receiver",Self::Communication=>"communication"}}
+    fn parse(value:&str)->Option<Self> {match value {"authenticate"=>Some(Self::Authenticate),"enable_hosting"=>Some(Self::EnableHosting),"attach_hosting"=>Some(Self::AttachHosting),"check_device_trust"=>Some(Self::CheckDeviceTrust),"reuse_hosting"=>Some(Self::ReuseHosting),"enable_trusted_hosting"=>Some(Self::EnableTrustedHosting),"prepare_local_receiver"=>Some(Self::PrepareLocalReceiver),"communication"=>Some(Self::Communication),_=>None}}
     fn needs_native(self)->bool {matches!(self,Self::EnableHosting|Self::AttachHosting|Self::ReuseHosting|Self::EnableTrustedHosting|Self::PrepareLocalReceiver)}
     fn reuses_trusted_device(self)->bool {matches!(self,Self::ReuseHosting|Self::EnableTrustedHosting)}
-    fn requires_original_device(self)->bool {self.reuses_trusted_device() || self==Self::PrepareLocalReceiver}
+    fn requires_original_device(self)->bool {self.reuses_trusted_device() || matches!(self,Self::PrepareLocalReceiver|Self::Communication)}
 }
 
 /// Historical API contract: explicit consent to the complete hosting operation.
@@ -117,6 +124,9 @@ pub struct JegotripLoginRequest {
     /// Optional explicit App identity for a new login alias; not a trust token.
     /// Existing identities can only be changed through the revision-guarded API.
     #[serde(default)] pub device_id:Option<Secret>,
+    #[serde(default)] pub communication_operation:Option<CommunicationOperation>,
+    #[serde(default)] pub write_consent:bool,
+    #[serde(default)] pub expected_configuration_revision:Option<u64>,
 }
 impl fmt::Debug for JegotripLoginRequest {fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {f.write_str("JegotripLoginRequest(<redacted>)")}}
 #[derive(Deserialize)]
@@ -143,6 +153,8 @@ pub struct ConfigurationView {
     pub configuration_source:&'static str, pub revision:u64, pub initialized:bool,
     pub http_configured:bool, pub native_configured:bool,
     pub accepting_authenticate:bool, pub accepting_enable_hosting:bool, pub accepting_local_receiver:bool,
+    #[serde(skip_serializing_if="Vec::is_empty")]
+    pub communication_actions:Vec<CommunicationAction>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -154,6 +166,8 @@ pub struct AttemptView {
     pub intent:LoginIntent, pub account_id:Option<String>,
     /// 本次原设备查询的历史状态，不作为托管/接收授权或永久授信缓存。
     pub device_trust:Option<DeviceTrustObservation>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub communication:Option<CommunicationObservation>,
 }
 #[derive(Debug, Serialize)]
 pub struct LoginSetup {
@@ -163,6 +177,8 @@ pub struct LoginSetup {
     pub configuration_source:&'static str, pub configuration_revision:u64,
     pub configuration_error:Option<&'static str>,
     pub accepting_local_receiver:bool,
+    #[serde(skip_serializing_if="Vec::is_empty")]
+    pub communication_actions:Vec<CommunicationAction>,
 }
 #[derive(Default)]
 struct Admissions { aliases:BTreeSet<Vec<u8>>, devices:BTreeSet<String> }
@@ -225,7 +241,8 @@ impl AppLoginManager {
         let existing_device=configuration.as_ref().is_some_and(|c|c.http.endpoints.verification_trustful_device.is_some());
         Ok(ConfigurationView {configuration_source:source,revision,initialized,http_configured:http,native_configured:native,
             accepting_authenticate:open&&http,accepting_enable_hosting:open&&http&&native,
-            accepting_local_receiver:open&&http&&native&&existing_device})
+            accepting_local_receiver:open&&http&&native&&existing_device,
+            communication_actions:if open&&source=="database"{configuration.as_ref().and_then(|c|c.http.communication.as_ref()).map(|v|v.available()).unwrap_or_default()}else{Vec::new()}})
     }
     pub(crate) fn configure(&self,request:ConfigurationWriteRequest)->Result<ConfigurationView,Error> {
         if lock(&self.owner).is_none() {return Err(Error::new("app_login_unavailable"));}
@@ -247,10 +264,10 @@ impl AppLoginManager {
             Ok(view)=>LoginSetup {implemented:true,deployment_present:view.http_configured,accepting:view.accepting_enable_hosting,
                 manual_sdk_credentials_required:false,accepting_authenticate:view.accepting_authenticate,native_configured:view.native_configured,
                 configuration_source:view.configuration_source,configuration_revision:view.revision,configuration_error:None,
-                accepting_local_receiver:view.accepting_local_receiver},
+                accepting_local_receiver:view.accepting_local_receiver,communication_actions:view.communication_actions},
             Err(code)=>LoginSetup {implemented:true,deployment_present:false,accepting:false,manual_sdk_credentials_required:false,
                 accepting_authenticate:false,native_configured:false,configuration_source:"invalid",configuration_revision:0,configuration_error:Some(code),
-                accepting_local_receiver:false},
+                accepting_local_receiver:false,communication_actions:Vec::new()},
         }
     }
     pub fn app_accounts(&self)->Result<Vec<JegotripAccountView>,&'static str> {
@@ -355,26 +372,37 @@ impl AppLoginManager {
         request.validate()?;self.submit_internal(request,LoginIntent::EnableHosting,None)
     }
     pub(crate) fn submit_jegotrip(self:&Arc<Self>,request:JegotripLoginRequest)->Result<AttemptView,Error> {
-        if !request.consent || (matches!(request.intent,LoginIntent::Authenticate|LoginIntent::CheckDeviceTrust) && request.start_receiver) {return Err(Error::new("app_login_request_invalid"));}
+        if !request.consent || (matches!(request.intent,LoginIntent::Authenticate|LoginIntent::CheckDeviceTrust|LoginIntent::Communication) && request.start_receiver) {return Err(Error::new("app_login_request_invalid"));}
+        if (request.intent==LoginIntent::Communication)!=request.communication_operation.is_some()
+            ||(request.intent==LoginIntent::Communication&&(request.expected_configuration_revision.is_none()||request.communication_operation.as_ref().is_some_and(|v|v.action().writes())&&!request.write_consent))
+            ||(request.intent!=LoginIntent::Communication&&(request.write_consent||request.expected_configuration_revision.is_some())){return Err(Error::new("app_login_request_invalid"));}
         let intent=request.intent;
         let common=LoginRequest {attempt_id:request.attempt_id,username:request.username,password:request.password,country_code:request.country_code,
             enable_hosting:matches!(intent,LoginIntent::EnableHosting|LoginIntent::EnableTrustedHosting),start_receiver:request.start_receiver};
         let preferred=request.device_id;
         if preferred.as_ref().is_some_and(|v| !device_identity::valid_device_id(v.expose_to_backend().trim())) {return Err(Error::new("app_login_request_invalid"));}
-        if (intent.reuses_trusted_device() || intent==LoginIntent::PrepareLocalReceiver) && !preferred.as_ref().is_some_and(|v|device_identity::valid_phone_app_uuid(v.expose_to_backend().trim())) {
+        if (intent.reuses_trusted_device() || matches!(intent,LoginIntent::PrepareLocalReceiver|LoginIntent::Communication)) && !preferred.as_ref().is_some_and(|v|device_identity::valid_phone_app_uuid(v.expose_to_backend().trim())) {
             return Err(Error::new("app_login_request_invalid"));
         }
-        common.validate_identity()?;self.submit_internal(common,intent,preferred)
+        common.validate_identity()?;
+        self.submit_internal_operation(common,intent,preferred,request.communication_operation,request.expected_configuration_revision)
     }
     fn submit_internal(self:&Arc<Self>,request:LoginRequest,intent:LoginIntent,preferred:Option<Secret>)->Result<AttemptView,Error> {
+        self.submit_internal_operation(request,intent,preferred,None,None)
+    }
+    fn submit_internal_operation(self:&Arc<Self>,request:LoginRequest,intent:LoginIntent,preferred:Option<Secret>,operation:Option<CommunicationOperation>,expected:Option<u64>)->Result<AttemptView,Error> {
         if self.closed.load(Ordering::SeqCst) { return Err(Error::new("app_login_shutting_down")); }
         let owner=lock(&self.owner).clone().ok_or(Error::new("app_login_unavailable"))?;
         if self.database.with_conn(|c|store::get(c,&request.attempt_id)).map_err(Error::new)?.is_some() {return Err(Error::new("app_login_attempt_exists"));}
-        let (_,revision,configuration)=self.selected_configuration().map_err(Error::new)?;
+        let (source,revision,configuration)=self.selected_configuration().map_err(Error::new)?;
         let configuration=configuration.ok_or(Error::new("app_login_deployment_missing"))?;
+        if intent==LoginIntent::Communication&&source!="database"{return Err(Error::new("app_login_communication_not_configured"));}
         if intent.needs_native() && configuration.runtime.is_none() {return Err(Error::new("app_login_native_configuration_missing"));}
+        if intent==LoginIntent::Communication && operation.is_none(){return Err(Error::new("app_login_request_invalid"));}
         let mut client=self.factory.build(&configuration.http)?;
-        if intent==LoginIntent::PrepareLocalReceiver {client=client.with_local_receiver()?;}
+        if let Some(expected)=expected{if expected!=revision{return Err(Error::new("app_login_configuration_revision_conflict"));}}
+        if let Some(operation)=operation{client=client.with_communication(operation)?;}
+        else if intent==LoginIntent::PrepareLocalReceiver {client=client.with_local_receiver()?;}
         else if intent.reuses_trusted_device() { client=client.with_trusted_reuse()?; }
         let accounts=self.accounts.upgrade().ok_or(Error::new("app_login_unavailable"))?;
         if intent.needs_native() {accounts.login_preflight_create().map_err(|_|Error::new("app_login_account_creation_failed"))?;}
@@ -391,6 +419,7 @@ impl AppLoginManager {
                 device_identity::resolve_reuse(&tx,&alias,explicit.ok_or("app_login_request_invalid")?,now()).map_err(|e|e.code)?
             } else {device_identity::resolve(&tx,&alias,explicit,Some(configuration.http.device_id.expose_to_backend()),now()).map_err(|e|e.code)?};
             if admissions.devices.contains(&snapshot.id) {return Err("app_login_busy");}
+            if client.communication_operation().is_some_and(|operation|operation.action().writes())&&store::communication_write_unresolved(&tx,&snapshot.id)?{return Err("app_login_communication_unresolved");}
             let view=store::insert_admitted(&tx,&request.attempt_id,&owner,intent,now())?;
             tx.commit().map_err(|_|"app_login_storage_failed")?;
             Ok((view,snapshot))
@@ -504,6 +533,7 @@ impl AppLoginManager {
         // An App-only login does not consume SDK materials, enable a service,
         // retain the App token or fabricate a native account/configuration.
         if intent==LoginIntent::Authenticate {return Ok(());}
+        if intent==LoginIntent::Communication{return self.run_communication(owner,id,revision,client,guard,&bound).await;}
         if intent==LoginIntent::CheckDeviceTrust {
             // 手机授信迁移后的显式只读核验：不 enroll、不取电话凭据、
             // 不创建原生账号、不写业务、不把历史观察当作授权。

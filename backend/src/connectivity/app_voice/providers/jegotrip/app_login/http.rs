@@ -8,6 +8,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use url::Url;
 use zeroize::Zeroizing;
+#[path="communication_http.rs"]
+mod communication_ops;
 
 pub(super) struct WireRequest { pub url: Url, pub body: Zeroizing<Vec<u8>>, pub headers: Vec<(String, String)> }
 pub(super) struct WireResponse { pub status: u16, pub body: Zeroizing<Vec<u8>> }
@@ -220,6 +222,7 @@ pub(super) struct AppClient { config:HttpDeployment, transport:Arc<dyn Transport
     /// Separate local SDK preparation policy. This flag is never a grant and
     /// cannot be supplied by a response or persisted diagnostic observation.
     local_receiver:bool,
+    communication:Option<super::communication::CommunicationOperation>,
     trusted_reuse:bool,
     trusted_reuse_write_started:std::sync::atomic::AtomicBool,
     version_cache:std::sync::Mutex<Option<(String,&'static str,std::time::Instant)>> }
@@ -273,7 +276,7 @@ impl AppClient {
         hash.update(&[0]);hash.update(&request.identity_key());
         Ok(hash.finish().as_ref().to_vec())
     }
-    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_store:None,enroll_id:std::sync::Mutex::new(None),device_id_override:None,local_receiver:false,trusted_reuse:false,trusted_reuse_write_started:std::sync::atomic::AtomicBool::new(false),version_cache:std::sync::Mutex::new(None)}) }
+    pub fn new(config:HttpDeployment,transport:Arc<dyn Transport>)->Result<Self,Error> { config.validate()?;Ok(Self {config,transport,session:None,version_store:None,enroll_id:std::sync::Mutex::new(None),device_id_override:None,local_receiver:false,communication:None,trusted_reuse:false,trusted_reuse_write_started:std::sync::atomic::AtomicBool::new(false),version_cache:std::sync::Mutex::new(None)}) }
     pub(super) fn with_trusted_reuse(mut self)->Result<Self,Error> {
         // A private extra field must not sneak a stale enrolment, carrier
         // credential or a different report owner into this explicit policy.

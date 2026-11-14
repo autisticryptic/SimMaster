@@ -79,13 +79,14 @@ fn no_store(mut response: Response) -> Response {
 }
 fn error_status(code: &str) -> StatusCode {
     match code {
-        "app_login_attempt_exists" | "app_login_configuration_revision_conflict" | "app_login_migration_conflict"
+        "app_login_communication_unresolved" | "app_login_attempt_exists" | "app_login_configuration_revision_conflict" | "app_login_migration_conflict"
             | "app_login_device_identity_conflict" | "app_login_device_identity_revision_conflict" | "app_login_device_identity_in_use" => StatusCode::CONFLICT,
         "app_login_busy" | "app_login_attempt_limit" | "app_login_account_limit" | "app_login_rate_limited" | "app_login_device_identity_limit" => StatusCode::TOO_MANY_REQUESTS,
         "app_login_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_login_unavailable" | "app_login_deployment_missing" | "app_login_deployment_invalid"
             | "app_login_native_configuration_missing" | "app_login_shutting_down" | "app_login_entropy_failed"
-            | "app_login_receiver_device_check_missing" => StatusCode::SERVICE_UNAVAILABLE,
+            | "app_login_receiver_device_check_missing" | "app_login_communication_not_configured" => StatusCode::SERVICE_UNAVAILABLE,
+        "app_login_communication_writes_disabled" => StatusCode::FORBIDDEN,
         "app_account_not_found" | "app_account_call_not_found" | "app_login_device_identity_not_found" => StatusCode::NOT_FOUND,
         "app_account_revision_conflict" | "app_account_stop_before_replace" | "app_account_call_operation_pending" => StatusCode::CONFLICT,
         "app_account_provider_unsupported" | "app_account_outbound_unsupported" => StatusCode::NOT_IMPLEMENTED,

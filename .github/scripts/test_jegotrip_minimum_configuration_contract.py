@@ -119,7 +119,7 @@ class JegotripMinimumConfigurationContracts(unittest.TestCase):
         for forbidden in ['accounts.create', 'client.phone_credentials', 'client.enroll_device', 'client.enable_business', 'accounts.start']:
             self.assertNotIn(forbidden, check)
         self.assertLess(backend.index('self.confirm_device_identity(guard,&key,intent.requires_original_device())'), backend.index('if intent==LoginIntent::CheckDeviceTrust {'))
-        self.assertIn('fn requires_original_device(self)->bool {self.reuses_trusted_device() || self==Self::PrepareLocalReceiver}', backend)
+        self.assertIn('fn requires_original_device(self)->bool {self.reuses_trusted_device() || matches!(self,Self::PrepareLocalReceiver|Self::Communication)}', backend)
         self.assertIn('device_identity::confirm_reuse(&tx,&guard.alias,&guard.snapshot,key,now())', backend)
         self.assertIn('if !intent.reuses_trusted_device() {', backend)
 

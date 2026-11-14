@@ -12,10 +12,10 @@ class LocalReceiverContracts(unittest.TestCase):
         text=login('mod.rs')
         self.assertIn('#[default] EnableHosting',text)
         self.assertIn('Self::PrepareLocalReceiver=>"prepare_local_receiver"',text)
-        self.assertIn('fn requires_original_device(self)->bool {self.reuses_trusted_device() || self==Self::PrepareLocalReceiver}',text)
+        self.assertIn('fn requires_original_device(self)->bool {self.reuses_trusted_device() || matches!(self,Self::PrepareLocalReceiver|Self::Communication)}',text)
         self.assertIn('let snapshot=if intent.requires_original_device()',text)
         self.assertIn('self.confirm_device_identity(guard,&key,intent.requires_original_device())',text)
-        self.assertIn('if (intent.reuses_trusted_device() || intent==LoginIntent::PrepareLocalReceiver)',text)
+        self.assertIn('if (intent.reuses_trusted_device() || matches!(intent,LoginIntent::PrepareLocalReceiver|LoginIntent::Communication))',text)
         self.assertIn('if !request.consent',text)
         self.assertIn('return self.run_local_receiver(owner,request,configuration,client,guard,&bound).await;',text)
 
@@ -88,7 +88,7 @@ class LocalReceiverContracts(unittest.TestCase):
 
     def test_existing_and_new_ui_suites_run_in_the_original_actions_without_budget_changes(self):
         config=source('frontend/playwright.jegotrip.config.ts')
-        self.assertIn("testMatch: ['jegotrip-device-identity.spec.ts', 'jegotrip-local-receiver.spec.ts', 'jegotrip-startup-diagnostics.spec.ts', 'jegotrip-alive-status.spec.ts']",config)
+        self.assertIn("testMatch: ['jegotrip-device-identity.spec.ts', 'jegotrip-local-receiver.spec.ts', 'jegotrip-startup-diagnostics.spec.ts', 'jegotrip-alive-status.spec.ts', 'jegotrip-communication.spec.ts']",config)
         self.assertIn('timeout: 45_000',config);self.assertIn('workers: 1',config);self.assertIn('retries: 0',config)
         self.assertEqual(source('frontend/e2e/jegotrip-device-identity.spec.ts').count("test('"),4)
         e2e=source('frontend/e2e/jegotrip-local-receiver.spec.ts')

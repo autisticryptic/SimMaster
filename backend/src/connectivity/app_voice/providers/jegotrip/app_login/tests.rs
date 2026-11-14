@@ -1340,3 +1340,6 @@ mod diagnostic_status;
 
 #[path = "local_receiver_tests.rs"]
 mod local_receiver;
+
+#[path = "communication_tests.rs"]
+mod communication;

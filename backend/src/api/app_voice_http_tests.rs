@@ -31,6 +31,8 @@ mod app_voice_accounts {
         assert!(account_store::valid_line_id(&id)); id
     }
 
+    include!("app_voice_communication_http_tests.rs");
+
     #[tokio::test]
     async fn push_status_is_authenticated_read_only_and_reports_unconfigured_receivers_without_secret_export() {
         let state=build_test_router().await.expect("Actions private D-Bus required; no skip");let served=serve(state.router.clone()).await;

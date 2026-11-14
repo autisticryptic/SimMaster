@@ -198,9 +198,10 @@ export interface AppLoginSetup {
   configuration_revision?: number
   configuration_error?: string | null
   accepting_local_receiver?: boolean
+  communication_actions?: JegotripCommunicationAction[]
 }
 
-export type JegotripLoginIntent = 'authenticate' | 'enable_hosting' | 'attach_hosting' | 'check_device_trust' | 'reuse_hosting' | 'enable_trusted_hosting' | 'prepare_local_receiver'
+export type JegotripLoginIntent = 'authenticate' | 'enable_hosting' | 'attach_hosting' | 'check_device_trust' | 'reuse_hosting' | 'enable_trusted_hosting' | 'prepare_local_receiver' | 'communication'
 export interface JegotripTrustQueryObservation {
   state: 'not_configured' | 'not_requested' | 'observed' | 'failed'
   authentication_code: number | null
@@ -301,6 +302,24 @@ export interface JegotripDeviceIdentityInput {
   account_id: string | null
   device_id: string | null
 }
+export type JegotripCommunicationAction = 'query_profile' | 'query_phone_service' | 'query_display_status' | 'query_forwarding_state' | 'set_phone_service' | 'set_voip_profile' | 'close_forward' | 'set_jego_m_status' | 'logout'
+export type JegotripCommunicationOperation = { kind: 'query_profile' | 'query_phone_service' | 'query_display_status' | 'query_forwarding_state' | 'close_forward' | 'logout' }
+  | { kind: 'set_phone_service'; status: number } | { kind: 'set_voip_profile'; cs_forward: string }
+  | { kind: 'set_jego_m_status'; jegom_status: string; region_code: string; country_code: string }
+export interface JegotripCommunicationObservation {
+  action: JegotripCommunicationAction
+  state: 'not_requested' | 'request_uncertain' | 'accepted_unconfirmed' | 'acknowledged' | 'observed' | 'confirmed' | 'rejected'
+  configuration_revision: number
+  device_identity_id: string
+  device_identity_revision: number
+  observed_at: number
+  status: { phone_server_status: number | null; cs_forward: number | null; jegom_status: number | null;
+    profile?: { allow_mo_voice: number | null; allow_mt_voice: number | null; mo_voice_limit: number | null; mt_voice_limit: number | null;
+      forbidden_countries: { country_code: string; region_id: string | null }[]; answer_forbidden_countries: { country_code: string; region_id: string | null }[] } | null;
+    region_code?: string | null; masked_jegom_phone?: string | null } | null
+  error: string | null
+  server_code: number | null
+}
 export interface JegotripLoginInput {
   attempt_id: string
   username: string
@@ -310,6 +329,9 @@ export interface JegotripLoginInput {
   consent: boolean
   start_receiver: boolean
   device_id?: string
+  communication_operation?: JegotripCommunicationOperation
+  write_consent?: boolean
+  expected_configuration_revision?: number
 }
 export interface JegotripAccountView {
   account_id: string
@@ -343,6 +365,7 @@ export interface AppLoginAttempt {
   intent?: JegotripLoginIntent
   account_id?: string | null
   device_trust?: JegotripDeviceTrustObservation | null
+  communication?: JegotripCommunicationObservation
 }
 
 export interface JegotripStartupFailure {

@@ -126,6 +126,8 @@ pub(super) struct HttpDeployment {
     pub device_id: Secret,
     pub endpoints: Endpoints,
     /// None is the original non-encrypted AppConfig branch, not a TLS downgrade.
+    #[serde(default)]
+    pub communication:Option<super::communication::CommunicationEndpoints>,
     pub body_protection: Option<BodyProtection>,
     pub root_der_base64: Option<Secret>,
     /// Exact end-entity certificate pin (the App bundles one such leaf in
@@ -222,6 +224,7 @@ impl HttpDeployment {
         }
         for p in [&self.endpoints.login,&self.endpoints.user_info,&self.endpoints.phone_token,&self.endpoints.voip_status,&self.endpoints.call_status,&self.endpoints.enable_hosting] { self.endpoint(p)?; }
         if let Some(p)=&self.endpoints.verification_trustful_device { self.endpoint(p)?; }
+        if let Some(communication)=&self.communication{communication.validate(self)?;}
         for optional in [&self.endpoints.device_enroll,&self.endpoints.security_verify,&self.endpoints.device_sync].into_iter().flatten() { self.endpoint(optional)?; }
         if let Some(profile)=&self.device_sync_profile {
             profile.validate()?;
@@ -344,6 +347,8 @@ impl Serialize for PrivateHttpPairs<'_> {
 struct PrivateHttpRef<'a> {
     base_url: &'a str, anonymous_token: &'a str, signature_salt: &'a str, password_salt: &'a str,
     sip_password_key: &'a str, device_id: &'a str, endpoints: &'a Endpoints,
+    #[serde(skip_serializing_if="Option::is_none")]
+    communication:Option<&'a super::communication::CommunicationEndpoints>,
     body_protection: Option<PrivateBodyProtectionRef<'a>>, root_der_base64: Option<&'a str>,
     pinned_server_certificate_der_base64: Option<&'a str>,
     pinned_server_public_key_der_base64: Option<&'a str>,
@@ -358,7 +363,7 @@ impl<'a> PrivateHttpRef<'a> {
     fn new(h: &'a HttpDeployment) -> Self {
         Self { base_url: h.base_url.expose_to_backend(), anonymous_token: h.anonymous_token.expose_to_backend(),
             signature_salt: h.signature_salt.expose_to_backend(), password_salt: h.password_salt.expose_to_backend(),
-            sip_password_key: h.sip_password_key.expose_to_backend(), device_id: h.device_id.expose_to_backend(), endpoints: &h.endpoints,
+            sip_password_key: h.sip_password_key.expose_to_backend(), device_id: h.device_id.expose_to_backend(), endpoints: &h.endpoints,communication:h.communication.as_ref(),
             body_protection: h.body_protection.as_ref().map(|b| PrivateBodyProtectionRef { secret_id: b.secret_id.expose_to_backend(), secret_value: b.secret_value.expose_to_backend() }),
             root_der_base64: h.root_der_base64.as_ref().map(Secret::expose_to_backend),
             pinned_server_certificate_der_base64: h.pinned_server_certificate_der_base64.as_ref().map(Secret::expose_to_backend),
