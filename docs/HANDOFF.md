@@ -14,7 +14,9 @@
 
 ## 已核验的软件基线
 
-- **当前追加待验证：原生启动分层诊断**。仅给原Common启动的bootstrap/账号连接保留首个有限`phase/stage/code`，旧失败映射、TLS/精确SAN、Router选择、重试与ready门禁不变；整体超时不猜具体网络阶段。`AccountView`/推送面板只显示同一owner/scope的观察，停止后不回填旧诊断。新增15项Rust隔离peer/归属/取消/账号清理回归、5项前端单元和1项桌面/手机浏览器用例；尚待本SHA自身双Actions和正式制品审计，不借2b旧绿。首`cb6f697`两个Actions的新增`Arc`导入/测试工厂名编译错误已由`919fd64`修正；但919的Beta在原Common bootstrap回归栈溢出。本次移除诊断引入的额外async/Result大future嵌套，恢复原单层启动状态机，只在原错误出口记录有限观察；全部新旧测试和标准栈/超时保留。原失败工件均保留，仍待自身双Actions关闭失败。246项本机Python静态/备份/假ADB检查通过。没有部署、重启SDK或重发App登录；真实TLS绑定和完整接收/电话/媒体仍未解决。
+- **当前追加待验证：原生默认来电控制**。显式`profile.native_call_control=true`仅允许原Router/Common＋native接收器，与旧`call_control`数组互斥，旧id+domain保护不变。原同scope激活`#CallServerEx`，第一条Inform固定`RseEx.Info="Invited callId is exist?"`，后续Accept/Release才使用原邀请的per-call oid；不把endpoint/facet/adapter引用降成裸id。新增24项Rust codec/原包/真实Common peer/账号就绪边界回归，尚未执行新源码自身Actions。此部分不是完整通话：Accept的mediaType/keepAlive/SDK.IsNew条件、独立媒体/Alive/通知及真实410仍待补齐。
+
+- **原生启动分层诊断（818d139双Actions状态success，工件审计中）**。仅给原Common启动的bootstrap/账号连接保留首个有限`phase/stage/code`，旧失败映射、TLS/精确SAN、Router选择、重试与ready门禁不变；整体超时不猜具体网络阶段。`AccountView`/推送面板只显示同一owner/scope的观察，停止后不回填旧诊断。新增15项Rust隔离peer/归属/取消/账号清理回归、5项前端单元和1项桌面/手机浏览器用例；`818d139`已收到Build43577807064/Beta43577807069状态success，但正式工件/精确测试审计遇GitHub metadata配额403，按Reset1794648849后续接；不借2b或919前端旧绿。首`cb6f697`两个Actions的新增`Arc`导入/测试工厂名编译错误已由`919fd64`修正；但919的Beta在原Common bootstrap回归栈溢出。本次移除诊断引入的额外async/Result大future嵌套，恢复原单层启动状态机，只在原错误出口记录有限观察；全部新旧测试和标准栈/超时保留。原失败工件均保留，仍待818正式工件审计关闭失败。246项本机Python静态/备份/假ADB检查通过。没有部署、重启SDK或重发App登录；真实TLS绑定和完整接收/电话/媒体仍未解决。
 
 - **`2b8555acc03319cacd1055f15e9a8ae7ed1ad448`（本地SDK接收准备，已验证并部署）**：实际8.9.4核心登录/注册使用当前电话token/SIP资料，不把App的`cs_forward`或某个UI回调的VoIP status当通用SDK门禁。新增非默认`prepare_local_receiver`，原UUID/同账号、当前已有设备认可、当前电话资料和再次认可后才准备本地账号，呼转只观察，不enroll/同步设备/修改业务；旧呼转复用和native ACK/撤销/Join保护保持。Build43563389936 / Beta43563389938均success，各1446 provider（1418旧+28新）、29HTTP（26旧+3新）、90前端单元/6浏览器/14图及双ABI官方digest/全CRC/29成员20www/meta/ELF已核，本机239静态通过。首a23仅新增UUID冲突测试误配普通认证的可选enroll前置，已仅修夹具、原断言/生产路径/预算不改并关闭失败留证。410已运行本SHA/PID75130；实际SDK首启仍断连，详见下节，完整目标未完成。
 

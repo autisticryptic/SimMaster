@@ -87,6 +87,7 @@ impl ReceiverObject {
 pub(super) struct NativeReceiverSetup {
     pub(super) policy: Arc<NativeReceiverPolicy>,
     pub(super) client_ex: bool,
+    pub(super) native_call_control: bool,
     control: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     bytes: usize,
 }
@@ -100,7 +101,12 @@ impl NativeReceiverSetup {
             for p in routing { bytes = bytes.checked_add(p.key.len()).and_then(|n| n.checked_add(p.value.len())).ok_or(CodecError::TooLarge)?; }
         }
         if bytes > MAX_STREAM_BYTES { return Err(CodecError::TooLarge); }
-        Ok(Arc::new(Self { policy, client_ex, control: routing.map(|routing| routing.iter().map(|p| (p.key.to_vec(), p.value.to_vec())).collect()), bytes }))
+        Ok(Arc::new(Self { policy, client_ex, native_call_control:false, control: routing.map(|routing| routing.iter().map(|p| (p.key.to_vec(), p.value.to_vec())).collect()), bytes }))
+    }
+    pub(super) fn capture_native_control(policy:Arc<NativeReceiverPolicy>,client_ex:bool)->Result<Arc<Self>,CodecError>{
+        let bytes=policy.retained_bytes().checked_add(super::call_control::NATIVE_CONTROL_BYTES).ok_or(CodecError::TooLarge)?;
+        if bytes>MAX_STREAM_BYTES{return Err(CodecError::TooLarge);}
+        Ok(Arc::new(Self{policy,client_ex,native_call_control:true,control:None,bytes}))
     }
     pub(super) fn retained_bytes(&self) -> usize { self.bytes }
     pub(super) fn control(&self) -> Option<Vec<RpcProperty<'_>>> {

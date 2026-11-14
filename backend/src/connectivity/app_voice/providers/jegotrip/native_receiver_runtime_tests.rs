@@ -4,6 +4,8 @@ use crate::connectivity::app_voice::providers::jegotrip as n;
 use n::native_receiver::{NativeReceiverConfig, DirectDomainConfig, DomainMode};
 #[path = "native_receiver_account_tests.rs"]
 mod account;
+#[path = "native_call_runtime_tests.rs"]
+mod default_calls;
 fn config() -> NativeReceiverConfig { NativeReceiverConfig { direct_domains: None } }
 fn native_profile(root: &str, port: u16, filter: &NativeReceiverConfig) -> RuntimeProfile {
     RuntimeProfile::supplied_common(inputs(), common(root, port)).unwrap().with_native_receivers(Some(filter)).unwrap().with_client_ex(true).unwrap()

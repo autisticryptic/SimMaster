@@ -11,7 +11,7 @@ use super::{
     controller::Callback,
     call_control::{CallBook,CallControlTicket,OwnedCallOperationReply},
     call_binding::OwnedCallNotice,
-    rpc_calls::{CallOperation,encode_operation,decode_operation_result},
+    rpc_calls::{CallOperation,decode_operation_result},
     rpc_batch::{decode_swap_calls_reply, encode_swap_calls, BatchPayload, BatchReply, SWAP_CALLS_METHOD},
     rpc_bootstrap::{decode_get_app_configs_result, encode_get_app_configs, AppConfigsResult, GET_APP_CONFIGS_METHOD},
     rpc_envelope::{decode_reply, encode_request},
@@ -294,6 +294,10 @@ impl ArcRpcSession {
         if self.phase()!=ArcPhase::Authenticated || self.connection.session_revoked(){return Err(CodecError::InvalidField);}
         self.call_book.configure(routing)
     }
+    pub(super) fn configure_native_call_control(&mut self)->Result<(),CodecError>{
+        if self.phase()!=ArcPhase::Authenticated||!self.common_transport_claimed||self.connection.session_revoked(){return Err(CodecError::InvalidField);}
+        self.call_book.configure_native()
+    }
     pub(super) fn register_call_notice(&mut self,notice:&OwnedCallNotice)->Result<Option<CallControlTicket>,CodecError>{
         if self.phase()!=ArcPhase::Authenticated||!notice.matches(&self.owner,&self.connection){return Err(CodecError::InvalidField);}
         if self.call_book.is_configured(){self.call_book.register(notice)}else{Ok(None)}
@@ -303,7 +307,7 @@ impl ArcRpcSession {
     pub(super) fn prepare_call(&mut self,ticket:&CallControlTicket,operation:CallOperation,properties:&[RpcProperty<'_>])->Result<(i32,RpcBytes),CodecError>{
         if self.phase()!=ArcPhase::Authenticated || self.connection.session_revoked() || !ticket.matches(&self.owner,&self.connection){return Err(CodecError::InvalidField);}
         if self.pending.len()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
-        let id=self.next_id.ok_or(CodecError::InvalidCallId)?;let arguments=encode_operation(operation,ticket.native_id(),properties)?;
+        let id=self.next_id.ok_or(CodecError::InvalidCallId)?;let arguments=self.call_book.arguments(ticket,operation,properties)?;
         let bytes={
             let mut metadata=self.call_book.prepare(ticket,operation)?;let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
             metadata.push(RpcProperty{key:b"token",value:&auth.token});encode_request(id,&metadata,operation.method().as_bytes(),arguments.expose_to_transport())?

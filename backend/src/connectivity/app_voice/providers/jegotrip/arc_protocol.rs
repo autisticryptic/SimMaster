@@ -185,7 +185,8 @@ impl ArcProtocol {
         self.incoming = Some(self.rpc.incoming_native_dispatcher(setup.policy.clone())?);
         self.call_incoming = Some(self.rpc.native_call_dispatcher(setup.policy.clone())?);
         if setup.client_ex { self.client_ex = Some(self.rpc.native_client_ex_dispatcher(setup.policy.clone())?); }
-        if let Some(routing) = setup.control() { self.rpc.configure_call_control(&routing)?; }
+        if setup.native_call_control { self.rpc.configure_native_call_control()?; }
+        else if let Some(routing) = setup.control() { self.rpc.configure_call_control(&routing)?; }
         Ok(())
     }
 

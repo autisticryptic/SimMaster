@@ -1,4 +1,6 @@
 //! Original-scope native adapter through the actual ARC/direct/batch codecs.
+#[path = "native_call_protocol_tests.rs"]
+mod default_calls;
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip as n;
 use n::{arc_session::{ArcLoginInputs, ArcPhase}, offline_backend::{OfflineBackend, OfflineEvent},

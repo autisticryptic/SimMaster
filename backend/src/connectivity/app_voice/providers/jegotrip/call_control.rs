@@ -7,6 +7,9 @@ use std::{collections::{BTreeMap,VecDeque},fmt,sync::{Arc,Mutex,atomic::{AtomicB
 use zeroize::Zeroizing;
 
 const MAX_CALL_HISTORY:usize=128;
+pub(super) const NATIVE_CALL_OBJECT:&[u8]=b"#CallServerEx";
+pub(super) const EXISTENCE_INFO:&[u8]=b"Invited callId is exist?";
+pub(super) const NATIVE_CONTROL_BYTES:usize=b"id".len()+NATIVE_CALL_OBJECT.len()+b"RseEx.Info".len()+EXISTENCE_INFO.len();
 struct Property{key:Zeroizing<Vec<u8>>,value:Zeroizing<Vec<u8>>}
 fn capture(input:&[RpcProperty<'_>])->Result<Vec<Property>,CodecError>{
     if input.len()>MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
@@ -22,6 +25,14 @@ fn borrowed(input:&[Property])->Vec<RpcProperty<'_>>{input.iter().map(|p|RpcProp
 fn valid_identifier(value:&[u8])->bool{
     !value.is_empty()&&value.len()<=MAX_FIELD_BYTES&&std::str::from_utf8(value).is_ok()&&!value.iter().any(u8::is_ascii_control)&&!value.iter().any(u8::is_ascii_whitespace)
         &&!value.iter().any(|b|matches!(b,b':'|b';'|b'@'|b'$'|b'*'))&&!value.windows(4).any(|w|w==b"ENC(")
+}
+fn valid_native_identifier(value:&[u8])->bool{
+    // This path is the original ClientI's unqualified logical Agent, not a
+    // resolver for endpoint/facet/adapter/cloud references.
+    if !valid_identifier(value)||value.iter().any(|b|matches!(b,b'/'|b'['|b']'|b'{'|b'}'|b'<'|b'>')){return false;}
+    super::object_reference::parse_object_reference(value).is_ok_and(|reference|
+        matches!(reference.target(),super::object_reference::ReferenceTarget::IdentityOnly)
+        &&reference.components().len()==1&&reference.identity()==value)
 }
 pub(super) fn validate_routing(routing:&[RpcProperty<'_>])->Result<(),CodecError>{
     if routing.iter().any(|p|p.key==b"pwd"||p.key==b"token"){return Err(CodecError::InvalidField);}
@@ -72,7 +83,8 @@ impl CallControlTicket{
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum Phase{Received,Admitted,Checking,Checked,Accepting,Accepted,Releasing,Ended,Failed}
 struct Slot{ticket:CallControlTicket,phase:Phase,override_id:Option<Zeroizing<Vec<u8>>>}
-pub(super) struct CallBook{owner:AttemptOwner,scope:RpcConnectionScope,routing:Option<Vec<Property>>,calls:BTreeMap<u64,Slot>,retired:VecDeque<u64>}
+enum CallRouting { Explicit(Vec<Property>), NativeDefault }
+pub(super) struct CallBook{owner:AttemptOwner,scope:RpcConnectionScope,routing:Option<CallRouting>,calls:BTreeMap<u64,Slot>,retired:VecDeque<u64>}
 impl CallBook{
     pub(super) fn new(owner:AttemptOwner,scope:RpcConnectionScope)->Self{Self{owner,scope,routing:None,calls:BTreeMap::new(),retired:VecDeque::new()}}
     pub(super) fn is_configured(&self)->bool{self.routing.is_some()}
@@ -82,7 +94,21 @@ impl CallBook{
     pub(super) fn configure(&mut self,routing:&[RpcProperty<'_>])->Result<(),CodecError>{
         if self.routing.is_some()||!self.scope.is_open(){return Err(CodecError::InvalidField);}
         validate_routing(routing)?;
-        self.routing=Some(capture(routing)?);Ok(())
+        self.routing=Some(CallRouting::Explicit(capture(routing)?));Ok(())
+    }
+    pub(super) fn configure_native(&mut self)->Result<(),CodecError>{
+        if self.routing.is_some()||!self.scope.is_open()||self.scope.session_revoked(){return Err(CodecError::InvalidField);}
+        self.routing=Some(CallRouting::NativeDefault);Ok(())
+    }
+    pub(super) fn arguments(&self,ticket:&CallControlTicket,operation:CallOperation,properties:&[RpcProperty<'_>])->Result<super::rpc_stream::RpcBytes,CodecError>{
+        if matches!(self.routing.as_ref(),Some(CallRouting::NativeDefault))&&operation==CallOperation::Inform{
+            self.slot(ticket)?;
+            // This first Inform is the SDK's existence check, not a caller-
+            // supplied generalInfo/keepAlive operation or a new retry.
+            if !properties.is_empty(){return Err(CodecError::InvalidField);}
+            return super::rpc_calls::encode_operation(operation,ticket.native_id(),&[RpcProperty{key:b"RseEx.Info",value:EXISTENCE_INFO}]);
+        }
+        super::rpc_calls::encode_operation(operation,ticket.native_id(),properties)
     }
     /// Duplicate invitations are not a new call/action capability. Remote
     /// release revokes the original identity before any queued command poll.
@@ -112,7 +138,9 @@ impl CallBook{
         if self.calls.len()>=MAX_CALL_HISTORY{return Err(CodecError::InvalidCallId);}
         let data=notice.data_for(&self.owner,&self.scope).ok_or(CodecError::InvalidField)?;
         let override_id=data.properties.iter().find(|p|p.key==b"callServerEx.oid").map(|p|p.value);
-        if override_id.is_some_and(|value|!valid_identifier(value)){return Err(CodecError::InvalidField);}
+        if override_id.is_some_and(|value|match self.routing.as_ref(){
+            Some(CallRouting::NativeDefault)=>!valid_native_identifier(value),_=>!valid_identifier(value),
+        }){return Err(CodecError::InvalidField);}
         let ticket=CallControlTicket{owner:self.owner.clone(),scope:self.scope.clone(),native_id:notice.native_id(),identity:Arc::new(CallIdentity{live:AtomicBool::new(true),media_started:AtomicBool::new(false),remote_released:AtomicBool::new(false),gate:Mutex::new(()),changed:tokio::sync::Notify::new()})};
         self.calls.insert(id,Slot{ticket:ticket.captured_copy(),phase:Phase::Received,override_id:override_id.map(|v|Zeroizing::new(v.to_vec()))});Ok(Some(ticket))
     }
@@ -133,7 +161,10 @@ impl CallBook{
             CallOperation::Release=>matches!(slot.phase,Phase::Received|Phase::Admitted|Phase::Checking|Phase::Checked|Phase::Accepting|Phase::Accepted|Phase::Failed),
         };
         if !allowed{return Err(CodecError::InvalidField);}
-        let mut routing=borrowed(self.routing.as_ref().ok_or(CodecError::InvalidField)?);
+        let mut routing=match self.routing.as_ref().ok_or(CodecError::InvalidField)?{
+            CallRouting::Explicit(properties)=>borrowed(properties),
+            CallRouting::NativeDefault=>vec![RpcProperty{key:b"id",value:NATIVE_CALL_OBJECT}],
+        };
         // Native duplicate/existence Inform precedes the returned per-call oid
         // handoff. Accept/release retain the actual original override when set.
         if operation!=CallOperation::Inform{if let Some(id)=&slot.override_id{routing.retain(|p|p.key!=b"id");routing.push(RpcProperty{key:b"id",value:id});}}

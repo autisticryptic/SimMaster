@@ -175,6 +175,9 @@ pub struct ProfileConfig {
     pub bootstrap_via_router: Option<RouterBootstrapConfig>,
     pub call_incoming:Option<CallIncomingConfig>,
     pub call_control:Option<Vec<ProfileProperty>>,
+    /// Original ClientI default #CallServerEx route, only with native receivers.
+    #[serde(default)]
+    pub native_call_control:bool,
     pub connect_timeout_ms: u64,
     pub handshake_timeout_ms: u64,
     pub partial_timeout_ms: u64,
@@ -306,14 +309,15 @@ impl AccountConfig {
         let profile=profile.with_offline_reception(p.offline_reception).map_err(|_|INVALID)?;
         let profile=profile.with_client_ex(p.client_ex).map_err(|_|INVALID)?;
         let profile=profile.with_call_receiver(p.call_incoming.as_ref().map(|binding|super::call_binding::CallIncomingBinding{object_id:&binding.object_id,domain:&binding.domain})).map_err(|_|INVALID)?;
-        if let Some(properties)=&p.call_control{profile.with_call_control(&borrowed(properties)?).map_err(|_|INVALID)}else{Ok(profile)}
+        let profile=if let Some(properties)=&p.call_control{profile.with_call_control(&borrowed(properties)?).map_err(|_|INVALID)?}else{profile};
+        if p.native_call_control{profile.with_native_call_control().map_err(|_|INVALID)}else{Ok(profile)}
     }
 
     pub(super) fn runtime_calls(&self) -> Result<Option<super::call_settings::CallSettings>, &'static str> {
         let Some(media) = &self.call_media else { return Ok(None); };
         if self.profile.native_receivers.is_none() {
             if self.profile.call_incoming.is_none() || self.profile.call_control.is_none() { return Err(INVALID); }
-        } else if self.profile.call_control.is_none() { return Err(INVALID); }
+        } else if self.profile.call_control.is_none() && !self.profile.native_call_control { return Err(INVALID); }
         let routing = borrowed(&media.routing)?; let properties = borrowed(&media.properties)?;
         let features = media.features.iter().map(|feature| feature.value.as_slice()).collect::<Vec<_>>();
         let key = media.reference_decode_key.as_ref().map(|key| ConfigDecodeKey::supplied(key.expose_to_backend().as_bytes()).map_err(|_| INVALID)).transpose()?;
@@ -519,6 +523,8 @@ pub(super) struct PrivateProfileRef<'a> {
     native_receivers: Option<PrivateNativeReceivers<'a>>,
     bootstrap_via_router: Option<PrivateRouterBootstrapRef<'a>>,
     call_incoming:Option<PrivateCallIncomingRef<'a>>,call_control:Option<PrivateProperties<'a>>,
+    #[serde(skip_serializing_if = "offline_disabled")]
+    native_call_control:bool,
     connect_timeout_ms: u64, handshake_timeout_ms: u64, partial_timeout_ms: u64,
     io_timeout_ms: u64, rpc_timeout_ms: u64,
 }
@@ -564,6 +570,7 @@ impl<'a> PrivateConfigRef<'a> {
                 bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
                 call_incoming:p.call_incoming.as_ref().map(|binding|PrivateCallIncomingRef{object_id:&binding.object_id,domain:&binding.domain}),
                 call_control:p.call_control.as_ref().map(|properties|PrivateProperties(properties)),
+                native_call_control:p.native_call_control,
                 connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
                 partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
             },
@@ -601,6 +608,7 @@ pub(super) fn private_profile_ref(p: &ProfileConfig) -> PrivateProfileRef<'_> {
         bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
         call_incoming: p.call_incoming.as_ref().map(|b| PrivateCallIncomingRef { object_id: &b.object_id, domain: &b.domain }),
         call_control: p.call_control.as_deref().map(private_properties),
+        native_call_control:p.native_call_control,
         connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
         partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
     }

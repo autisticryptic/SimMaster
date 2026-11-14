@@ -88,13 +88,21 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 410已单次核心升级到本SHA，当前原UUID/同账号的首次本地准备取得电话资料、创建native账号，随后原生连接断开，尚未收件。已只停止此失败运行并验证lease释放，保留账号和原失败attempt；没有开启呼转、同步设备或新授信。独立无凭据TLS诊断发现配置Router的CA链可通过而SAN名称校验不通过，仍需正确身份绑定/原生阶段诊断，不能关闭校验或从证书猜地址。完整通知、独立Alive、动态通话/媒体和真实接收验收仍在当前目标中，本节不是整体完成。
 
-## 1.6 原生启动分层观察（新增代码，待自身Actions验证）
+## 1.6 原生启动分层观察（818d139双Actions状态success，工件审计中）
 
 原Router连接、TLS、控制注册、逻辑通道与Common准备的错误原来最终可能合并为`app_account_disconnected`。新增`startup_failure`只保存首个固定阶段/错误码，区分原bootstrap与账号连接，不输出URL、证书、token、UUID或原始异常；整体超时只标记启动流程，不能凭它猜TLS/SAN根因。
 
 同一owner与同一物理scope才可记录/读回，原scope关闭后允许读取失败历史，但它不能建立IO、续期、授予接收或恢复媒体。停止后的普通账号投影不回填旧观察。前端固定字典对未知/畸形/原型属性输入只显示未知，不回显私有字符串，也不触发登录、SDK重试或业务写入。没有观察不代表连接成功；TLS握手失败也不单独证明具体证书问题。
 
-新增15项Rust、5项前端单元、1项桌面/手机浏览器回归，保留原1446 provider/29HTTP/90单元/6浏览器的行为与预算；新用例仅追加到原两个Actions的既有过滤器和选择器。当前只有246项本机Python静态/备份/假ADB检查已通过，新源码还须自身双Actions/双ABI正式工件验证。**本轮没有再次启动410 SDK；仍待可信Router身份绑定、独立Alive、业务通知、通话与双向媒体及真实收件验收。**
+新增15项Rust、5项前端单元、1项桌面/手机浏览器回归，保留原1446 provider/29HTTP/90单元/6浏览器的行为与预算；新用例仅追加到原两个Actions的既有过滤器和选择器。当前246项本机Python静态/备份/假ADB检查已通过；`818d139`的Build43577807064/Beta43577807069状态均success，精确测试/双ABI正式工件审计遇官方metadata403配额，按重置时间续接。此前cb6新增导入/测试工厂名编译错误、919额外async大future引起的原Common bootstrap栈溢出均保留失败工件；818移除额外嵌套、保留原状态机/标准栈/全部测试，尚待正式审计关闭。**本轮没有再次启动410 SDK；仍待可信Router身份绑定、独立Alive、业务通知、通话与双向媒体及真实收件验收。**
+
+## 1.7 原生默认 CallServerEx 装配（新增代码，待自身验证）
+
+显式`profile.native_call_control=true`复现当前ClientI上的未限定逻辑Agent；仅允许Router/Common的`native_receivers`，缺省false，与旧显式`call_control`数组互斥。旧非空id/domain及认证token保护保持，false省略的私有v1配置不改写历史。
+
+匹配SDK登录才激活默认`#CallServerEx`，覆盖同批早到邀请。保持原完整call id、邀请ACK、pending RPC及owner/scope；存在性Inform只发原`RseEx.Info="Invited callId is exist?"`，不允许调用方替换。原邀请的`callServerEx.oid`仅供之后的Accept/Release，不从Inform回复猜路由；仅支持未限定id，endpoint/facet/adapter/cloud引用仍须独立实现，不能降成裸id或伪造domain。原只读链已核`604070→612690→607888→604524→613E2C→613140`与回调vtable字节。
+
+新增24项Rust回归包含固定字段/范围、跨owner/scope、重复/拒绝/撤销、同批DIRECT、batch ACK门禁、真实Router/TLS/Common默认与per-call控制，以及有控制但缺媒体时仍不得answer-ready或制造来电历史。尚待本源码自身双Actions及官方工件；旧1461 provider/29HTTP/95单元/7浏览器行为与预算保留。**完整Accept参数装配（mediaType、keepAlive、SDK.IsNew等原条件）、媒体信任/传输与真实接听仍未完成；此项不触发新410 SDK或业务写入，不是整体目标完成。**
 
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 

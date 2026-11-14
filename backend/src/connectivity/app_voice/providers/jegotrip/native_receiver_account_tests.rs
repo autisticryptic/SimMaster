@@ -1,4 +1,6 @@
 //! Actions-only real account persistence/ACK/cleanup using native receiver mode.
+#[path = "native_call_account_tests.rs"]
+mod default_calls;
 use super::*;
 use n::{account_config::AccountConfig, account_runtime::AccountManager, account_test_support::{config_json, TempDatabase}};
 fn account_config(root: &str, port: u16, offline: bool) -> AccountConfig {

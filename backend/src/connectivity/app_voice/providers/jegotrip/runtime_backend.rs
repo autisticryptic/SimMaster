@@ -205,7 +205,7 @@ pub struct RuntimeProfile {
     poll_routing: Vec<Property>, logout_routing: Vec<Property>, incoming: Option<Binding>, offline_reception: bool, client_ex: bool,
     native_receivers: Option<Arc<super::native_receiver::NativeReceiverPolicy>>,
     reference_decode_key: Option<ConfigDecodeKey>, handshake_timeout: Duration, partial_timeout: Duration,
-    io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>, byte_length:usize,
+    io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>,native_call_control:bool,byte_length:usize,
 }
 impl fmt::Debug for RuntimeProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RuntimeProfile(<redacted>)") }
@@ -250,9 +250,16 @@ impl RuntimeProfile {
         Ok(self)
     }
     pub fn with_call_control(mut self,routing:&[RpcProperty<'_>])->Result<Self,ProfileError>{
-        if (self.call_incoming.is_none() && self.native_receivers.is_none()) || self.call_control.is_some(){return Err(ProfileError::InvalidConfiguration);}
+        if (self.call_incoming.is_none() && self.native_receivers.is_none()) || self.call_control.is_some() || self.native_call_control{return Err(ProfileError::InvalidConfiguration);}
         super::call_control::validate_routing(routing).map_err(|_|ProfileError::InvalidConfiguration)?;
         self.call_control=Some(properties(routing,&mut self.byte_length)?);Ok(self)
+    }
+    pub(super) fn with_native_call_control(mut self)->Result<Self,ProfileError>{
+        if self.common.is_none()||self.native_receivers.is_none()||self.call_incoming.is_some()||self.call_control.is_some()||self.native_call_control{
+            return Err(ProfileError::InvalidConfiguration);
+        }
+        add_bytes(&mut self.byte_length,super::call_control::NATIVE_CONTROL_BYTES)?;
+        self.native_call_control=true;Ok(self)
     }
     pub fn supplied(input: RuntimeProfileInputs<'_>) -> Result<Self, ProfileError> { Self::capture(input,None,None,None) }
     pub fn supplied_common(input:RuntimeProfileInputs<'_>,common:RuntimeCommonInputs<'_>)->Result<Self,ProfileError>{Self::capture(input,None,Some(common),None)}
@@ -364,7 +371,7 @@ impl RuntimeProfile {
             poll_routing, logout_routing, incoming, offline_reception: false, client_ex: false, reference_decode_key: input.reference_decode_key,
             native_receivers: None,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
-            io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,byte_length:total,
+            io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
         })
     }
 }
@@ -565,7 +572,7 @@ impl NativeHostingBackend {
     pub(super) fn original_call_receiver_ready(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> bool {
         let Ok(attempt) = self.original(owner) else { return false; };
         attempt.scope.matches(scope) && scope.is_open() && !scope.session_revoked() && lock(&attempt.state).configured
-            && (self.profile.call_incoming.is_some() || self.profile.native_receivers.is_some()) && self.profile.call_control.is_some()
+            && (self.profile.call_incoming.is_some() || self.profile.native_receivers.is_some()) && (self.profile.call_control.is_some() || self.profile.native_call_control)
     }
     #[cfg(test)]
     pub(super) fn pause_original_polls_for_test(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, paused: bool) -> Result<(), RuntimeError> {
@@ -588,8 +595,11 @@ impl NativeHostingBackend {
     async fn arm_original_client_ex(&self, attempt: &Attempt, commands: &RuntimeCommands) -> Result<(), BackendFailure> {
         if let Some(policy) = &self.profile.native_receivers {
             let routing = self.profile.call_control.as_deref().map(borrowed);
-            let setup = super::native_receiver::NativeReceiverSetup::capture(policy.clone(), self.profile.client_ex, routing.as_deref())
-                .map_err(|_| BackendFailure::Unavailable)?;
+            let setup = if self.profile.native_call_control {
+                super::native_receiver::NativeReceiverSetup::capture_native_control(policy.clone(),self.profile.client_ex)
+            } else {
+                super::native_receiver::NativeReceiverSetup::capture(policy.clone(), self.profile.client_ex, routing.as_deref())
+            }.map_err(|_| BackendFailure::Unavailable)?;
             let receipt = commands.arm_native_receivers(&attempt.owner, &attempt.scope, setup).await.map_err(|_| BackendFailure::Disconnected)?;
             if !receipt.matches(&attempt.owner, &attempt.scope) { return Err(BackendFailure::Disconnected); }
             return Ok(());
