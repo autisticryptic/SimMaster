@@ -126,6 +126,18 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 刷新保持原2×interval与6s..600s退避，同一健康socket保留编码状态/递增RPC序号，失败重连使用新物理scope而不重新登录主SDK。每个socket poll经过主/独立scope门，整个输入组先验证；主会话撤销或token/session错误使对应状态失效，不自动争抢重连。停止先禁止新注册，再取消独立IO并Join拥有的任务；没有编造unregisterAlive。新增31项Rust覆盖纯归属/配置/时序、真实隔离TCP/Common、同socket刷新/序号与cipher、同scope拒绝、异常/取消Join，以及匹配bootstrap→主SDK→独立注册/双侧checkAlive→stop/Join与未批准0连接；新增3单元/1浏览器展示状态与非TLS边界。1d67e35自身Build43609509067/Beta43609508998各1535 provider/29HTTP、98单元/8浏览器18图及双ABI完整正式工件已核，270本机静态通过。首4aef语法和ac9两个主DIRECT夹具漏`__magic`、一个length-first map期望错误均留证；仅补精确原字段/期望，未放宽主门禁或codec。异常/取消Join消费、同scope拒绝和同socket/cipher刷新4项新增覆盖也通过。下载超时保留partial、在副本续读同official ID并全digest/CRC校验后完成，未重跑CI。**本轮源码未部署，真实legacy许可仍未给予；原410 Router TLS身份、完整通知/R11及剩余媒体与实际收件仍需继续，不能据此完成整体目标。**
 
+## 1.10 原App通信操作与持久防重放（46e47cd软件已验证，未部署）
+
+显式`intent=communication`仅使用原App UUID、当前认证的本人账号/绑定号码和数据库安装revision；不隐式启动SDK、取电话token/SIP资料、enroll、设备报告或创建native账号。9种有界类型化操作分离Profile/PhoneService/来显/呼转状态查询、PhoneService/cs_forward/JegoM设置、原关闭呼转ACK与App会话退出。公共请求没有URL、token、授信或任意字段；配置只接受经原HTTP同源验证的相对端点，写请求必须安装侧批准及额外写同意。
+
+- 原8.9.4证据区分`getProfile`的`body.list[0]`与`getCallStatus`；保留呼叫限制数字/国家代码和完整signed64 region ID（十进制字符串），不输出任意服务文本或未掩码来显号码。
+- `queryShowPhoneInfo`原独立加密空体用于JegoM读回；setter的code0或本地输入状态不能冒充已确认的当前来显状态。普通请求和requestWithEncrypt逐操作保持。
+- `closeVoipForward`只使用当前认证号码/区号，其原回调code0/body.cs_forward2记为该接口ACK，不混成getCallStatus1、不宣称托管已关闭。App logout的空体原请求只清本次App会话，不替代原native注销/logout/Join。
+- owner、phase、原身份和配置CAS贯穿持久记录；写I/O前保存不确定状态。丢失响应/取消/accepted-unconfirmed不自动重放，即使换nonce也阻止同原设备的后续业务写，仍允许显式查询。原一次性版本恢复仅用于尚未写入的读请求。
+- 带标签unit的Serde解码可能忽略额外字段，当前使用empty struct变体保留拒绝断言；公共版本抓取走原独立DNS/HTTPS边界，新确定性版本夹具仅在cfg(test)编译，生产路径、524288B界限、栈与超时不改。
+
+`46e47cd1806068ed86e0eb08adb26bb6eef39de3`自身Build43626724729/Beta43626724712全success，各1563 provider/32HTTP、106单元/10浏览器22图和ARM64/AMD64各29成员20www的官方digest/全CRC/全部SHA/meta/ELF已核。282本机Python静态通过；8188/40546原4失败ZIP与日志、注解保留，同失败名双CI通过后关闭。权威私有证据`communication-apis/SOFTWARE_VERIFIED_46e47cd.json`、`verified-native-46e47cd.json`。**这是9操作的软件验证，不是全部R11、完整SDK、实网接收、来电或媒体验收；未部署，也未执行真实业务写。** Message/Invite延迟原票据关联、call/platform通知、其余适用发送/外呼/动态媒体和可信Router及410验收仍须继续；既有安全默认拒绝不等于这些剩余功能完成。
+
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 
 原 App 并未依赖公共 CA：`assets/app2.cer` 就是服务端叶子证书
