@@ -138,6 +138,14 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 `46e47cd1806068ed86e0eb08adb26bb6eef39de3`自身Build43626724729/Beta43626724712全success，各1563 provider/32HTTP、106单元/10浏览器22图和ARM64/AMD64各29成员20www的官方digest/全CRC/全部SHA/meta/ELF已核。282本机Python静态通过；8188/40546原4失败ZIP与日志、注解保留，同失败名双CI通过后关闭。权威私有证据`communication-apis/SOFTWARE_VERIFIED_46e47cd.json`、`verified-native-46e47cd.json`。**这是9操作的软件验证，不是全部R11、完整SDK、实网接收、来电或媒体验收；未部署，也未执行真实业务写。** Message/Invite延迟原票据关联、call/platform通知、其余适用发送/外呼/动态媒体和可信Router及410验收仍须继续；既有安全默认拒绝不等于这些剩余功能完成。
 
+## 1.11 原ringing来电渠道通知（e20cea8软件已验证，未部署）
+
+显式`call_media.call_notifications=true`仅打开原来电的第三方通知计划，不修改SDK登录、邀请ACK、Inform/Accept、媒体或托管业务。匹配原邀请与Inform后进入ringing才捕获Call规则和渠道，使用原HistoryTicket/通话token、line/run/revision的独立任务表；不伪造短信行或modem身份，不从Notify.CallId推测路由。受界模板保留原CallRecord字段；来电规则/渠道快照及目的地fingerprint在发送前再核，同渠道与SMS互斥并共享原4发送槽。Call队列新增512项/4MiB及固定最多30s窗口，旧SMS队列/TTL/5次显式失败策略不变。
+
+接听排队、结束、删除、撤销、配置或原run变化会停止原任务；已sending结果不确定，保留uncertain、不另起nonce重发。只有原call的真实worker持有原ticket并按固定deadline运行，scope撤销先取消再Join，不以abort/detach假报清理。API仅输出任务/原通话记录id和有限结果；界面按原账号隔离，不反射渠道私值，明确渠道已送达不等于电话已接听或媒体可用。该软件也不构成原Message/Invite的IM/deferred业务消费者，不把这个独立转发组件当完整R05/R09终点。
+
+`e20cea8fdb2e40fe53b1ebdad44f2936de2ca776`自身Build43640096342/Beta43640096297全success，各1579精确provider/34HTTP、原通知服务＋8新计划回归、110unit/11browser24图及双ABI官方digest/ZIP全CRC/29成员20www全SHA/meta1.1.5/ELF已核，293本机Python静态通过。首d216的6编译问题与frontend2错误/2warnings，bba唯一新expansion夹具在config前置即超128KiB，全部失败officialartifact/CRC/digest/log/annotations保留；后者仅把输入改为120000B仍超原输出128KiB，不削断言、生产边界或栈/超时。权威私有`call-notifications/SOFTWARE_VERIFIED_e20cea8.json`、`verified-native-e20cea8.json`。**未部署、未实际外发通知、未操作410/Provider/SDK/手机。** 完整Message/Invite关联、其他通信/动态媒体/可信Router与实际SMS、接听、双向媒体及stop及时性仍须继续。
+
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 
 原 App 并未依赖公共 CA：`assets/app2.cer` 就是服务端叶子证书
