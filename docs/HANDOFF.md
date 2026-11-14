@@ -14,9 +14,9 @@
 
 ## 已核验的软件基线
 
-- **当前工作树待验证：同次诊断状态保留**。`CheckDeviceTrust`把原来已发出的那一次`getCallStatus`授权码及`localCsForward`一并保存，不增加请求/重试、不改变原UUID、复用门禁、enroll/VTD/业务或SDK行为。旧记录不回填；复用与诊断形状分开校验，原2KiB上限保持。新增12项Rust行为回归与6项静态契约，须自身双Actions与正式制品通过才可部署；目前不能称新二进制已验证或410已更新。
+- **`865991d1d986f25e060a54272f595b889e1b0c4b`（同次诊断状态保留，已验证并部署）**：`CheckDeviceTrust`保存原来已发出的那一次`getCallStatus`授权码及`localCsForward`，不增加请求/重试、不改变原UUID、HTTP wire或复用门禁。旧记录不回填；复用/诊断形状分别校验，原2KiB上限保持。Build43549614252 / Beta43549614209首轮success，各1418精确provider（1406旧+12新）、26HTTP与原registry/Trunk/通知/DNS/矩阵通过；各82前端单元、4浏览器、12图及双ABI各29成员/20前端文件的官方digest/全CRC/SHA/meta/ELF已核。本机231静态通过，旧断言/工作流/前端/API/依赖与预算保持。410已仅核心升级到本SHA/PID26706，历史/身份/配置/辅助服务保护通过，无回滚备份。证据`.local/jegotrip/diagnostic-status-20261114/`；完整托管仍未完成。
 
-- **`e2279969654c3530f6214b80137b7211253b1acf`（最新通知可靠性修复）**：已识别但未完整承接的Message/Invite三键通知返回明确false，不因这种语义拒绝关闭整条连接、不产生成功事件；通知worker拥有者等待超时/取消保留uncertain，防止将可能已送达的工作自动重排。Build43389164094 / Beta43389164174均success，各1406精确provider回归（原1386+新20）、26HTTP、原registry/Trunk/通知/DNS/矩阵，以及各82前端单元/4浏览器/12图、自身SHA-run/官方digest/全CRC通过；双ABI各29校验成员/20前端全SHA、meta/ELF已核。225本机静态检查通过。证据`.local/jegotrip/notification-reliability-20261113/`及`.local/jegotrip/verified-native-e227996.json`。本组件不是完整SDK/OEM通知业务关联；目前已完成410核心部署，接收验收与当前网络阻碍见下节。
+- **`e2279969654c3530f6214b80137b7211253b1acf`（通知可靠性修复）**：已识别但未完整承接的Message/Invite三键通知返回明确false，不因这种语义拒绝关闭整条连接、不产生成功事件；通知worker拥有者等待超时/取消保留uncertain，防止将可能已送达的工作自动重排。Build43389164094 / Beta43389164174均success，各1406精确provider回归（原1386+新20）、26HTTP、原registry/Trunk/通知/DNS/矩阵，以及各82前端单元/4浏览器/12图、自身SHA-run/官方digest/全CRC通过；双ABI各29校验成员/20前端全SHA、meta/ELF已核。225本机静态检查通过。证据`.local/jegotrip/notification-reliability-20261113/`及`.local/jegotrip/verified-native-e227996.json`。本组件不是完整SDK/OEM通知业务关联；目前组件已交付，当前核心版本与接收验收状态见下节。
 
 - **`ed4bc650bb981cd02790c2fa8713b0a79c2e894d`（最新纯编解码前置）**：无网络AccountAlive参数/结果codec，既有运行时、TLS、配置和checkAlive行为逐字保持。Build43368280015 / Beta43368280032均success；各1386精确provider回归（原1370+新16）、26HTTP及原registry/Trunk/通知/DNS/矩阵通过，各82前端单元/4浏览器/12图SHA-run/官方digest/全CRC与两ABI完整包成员/meta/ELF已核。本机219静态检查通过。源码与核验在`.local/jegotrip/alive-codec-20261113/`及`.local/jegotrip/verified-native-ed4bc65.json`；未新增或启用任何通道，不能把这个前置组件称作Alive注册成功。
 
@@ -31,7 +31,7 @@
 - `profile.offline_reception` 默认false，必须已有原receiver绑定。signed64初值-1/limit100、本次UID/selector/token取件；原包、支持SMS、通知/事件/cursor同事务提交才继续。未知type2隔离不推进，删除不复活；原行ID、自增水位、索引、容量与无进展保护保持。
 - 快捷 `scripts/Export-JegotripTrust.ps1` / `jegotrip_root_trust.py` 已有19假ADB与既有普通ZIP离线验证，App/SDK双读、符号链接/混根/超限拒绝、私有DACL写前复核、不覆盖旧输出，不读取密码/token或写手机。新脚本尚无本轮手机在线实测。
 - 权威证据：`.local/jegotrip/resume-20261112-1631/{DELIVERY_0c4c1c4.md,FINAL_STATUS_0c4c1c4.json,verification-readback-0c4c1c4.json}`及`.local/jegotrip/verified-native-0c4c1c4.json`。不能借这些旧绿结果验证下面的新源码。
-- 410现已从11月4日`6f85149`升级为正式`e227996`，运行二进制哈希与HTTP健康已读回；核心部署保护检查通过，但实际接收/接听仍未验收。新的唯一部署请求及状态位于`.local/jegotrip/deploy-readiness-20261113/`，不能重放旧部署脚本。
+- 410已先从11月4日`6f85149`升级到`e227996`，现在已进一步部署经自身验证的`865991d`。两次均只更新核心且保护历史/配置，不能把核心健康当接收验收；新部署请求在`.local/jegotrip/diagnostic-status-20261114/`，旧`.local/jegotrip/deploy-readiness-20261113/`的部署请求已完成，均不得重放。
 
 ## 本次恢复与已验证的 ClientEx 子集
 
@@ -104,15 +104,17 @@
 - 用户随后已确认官方App重新登录后可直接开启托管。按此新条件已另做一次独立`official-app-refresh-reuse`，仍auth2/业务false/local1。该请求已终态，不能因Retry再发；后续只读确认同账号/原UUID rev4、配置rev1，native/租约/活动登录均0。用户确认已收到，不再重复要求登录、授信或索要密码。
 - 对实际手机8.9.4.0 APK核验原UUID getter、单一device_id普通JSON后，进一步核到同origin、8项配置接口、HTTP匿名参数/签名盐/正文保护和原leaf均与410一致。原`UserCallAssetsEntity`读同名授权/业务字段，页面仍exact auth1后才报告设备；无依据放宽门禁。**8.9.4密码登录模型没有8.9.7的enrollId字段**，不能借旧版本路径擅自补enroll。配置快照来自11月12日，不等于手机当前wire。
 - 续接时发现主服务PID已为490且临时上行已丢失（两种默认路由0/NTPfalse）；随后以新状态守卫、原授权网络和最后英文密码**单次恢复RAM Wi-Fi**。IPv4/DNS/NTP/时差0、Unsaved true已核；同boot前后服务状态/保存profiles/6保护文件与USB管理保持，没有重启MM/NM、持久化PSK或重发Provider登录。此前PID519899与上行读回不再当作当前状态。
-- 新定位到旧诊断仅保存`getCallStatus`业务布尔、丢弃同次授权码/本地业务码；因此不能从早前existing_device1/业务true补推该次getCallStatus为1。当前工作树只修这处观察丢失，原复用门禁不变，实网拒绝原因仍未证实。
+- 已修复旧诊断仅保存`getCallStatus`业务布尔而丢弃同次授权码/本地业务码的问题；865已完成自身验证与保护性部署，HTTP200、实际运行哈希/PID26706、旧历史列投影（含数据库配置）与6保护文件/辅助服务均核对通过，部署子任务已退出。原复用门禁未变。
+- 新版仅执行一次独立设备诊断（当前明确账号/原UUID，不enroll、不取新运营商令牌、不写业务、不取电话凭据、不启动SDK）：**同一次流程中security_verify2、existing_device1，随后getCallStatus仍2/业务false/local1**。读回确认同账号/同身份rev4、配置rev1未变，native/lease/active0，短信39/通话0；旧诊断与失败attempt未覆盖。差异不只是换了登录会话，也不能据此说手机授信过期。
+- 原8.9.4还存在`receiveFail→querySafeDevice("")→$2`路径，其**已有设备查询自身auth1**后报告`updateDeviceId`并进入`verSuccess`；不是先把getCallStatus2改成1。这证明不同接口分支，不证明报告必然修复当前拒绝。410尚未执行此设备上下文同步；它是服务端写操作，须明确范围和本人原资料、当次账号关联后才可另行实现/验证，不能擅自强报或放宽SDK门禁。
 - 已进一步配置接收前置：通过管理API的版本守卫，将有效安装上下文从`legacy_file/revision0`写入独立数据库配置`revision1`，仅开启已验证的`native_receivers`原空deny-list、`client_ex`及`offline_reception`。HTTP/SDK/TLS/身份/其他配置、旧安装文件及账号历史未变，没有启动接收器或请求运营商服务。页面现在能投影短信/来电对象“已配置”，但原生账号仍为0、接收未激活；来电控制及媒体配置尚缺，不能猜路由/证书/SDP补齐。
 - **程序、网络和接收前置已部署，不等于完整模块收件或接听成功。** 当前阻碍已转为复用流程的最新设备认可拒绝；通话控制、媒体及其余原生装配也尚待完成。需在合法本次门禁通过后验证外来SMS、来电接听/媒体及清理/时延，不从配置投影推导成功。
 
-私有证据：`.local/jegotrip/deploy-readiness-20261113/`的部署/身份/接收及独立请求读回，最新`official-app-refresh-reuse-request.json`、`official-app-attempt-readback-*.json`、`wifi-resume-after-restart-request.json`与恢复回执；原版交叉核对在`.local/jegotrip/official-app-context-20261114/`，新源码待验在`.local/jegotrip/diagnostic-status-20261114/`。旧凭据刷新与全部失败记录保留。重试先读已有请求，不重复部署、身份、配置或已提交登录。
+私有证据：新源码/双Actions/制品/部署、`same-response-diagnostic-request.json`及`final-device-readback-*.json`在`.local/jegotrip/diagnostic-status-20261114/`；原版交叉核对在`.local/jegotrip/official-app-context-20261114/`。旧部署/官方App刷新后复用请求、RAM网络恢复在`.local/jegotrip/deploy-readiness-20261113/`，失败记录不覆盖。独立读回脚本首轮误索引timer的MainPID，已按实际systemd属性区分timer/正PID服务，仅重做读回，没有重放部署/Provider请求。当前IDA MCP连接10061，未擅自启动或加载库。
 
 ## 接下来按顺序
 
-1. 先完成同次诊断状态修复的自身双Actions/制品核验，保留原1406 provider断言与预算，验证前不部署。官方App刷新确认和新的独立复用查询均已完成，不重复询问；继续定位真实会话差异，不把诊断的其他字段冒当getCallStatus许可。后续任何新请求必须有新依据、独立一次性记录并保留原UUID/同账号。
+1. 同次诊断修复已交付，不重复审计已验旧包或重发终态请求。继续核对“已有设备认可→原设备信息同步→当前业务读回”这一原App分支；服务端写范围未明确前不执行同步，不把existing_device1覆盖getCallStatus2，也不再次要求用户登录、授信或提供密码。需要原IDA时由用户手动恢复原库/MCP后先核metadata。
 2. 在原App UUID/同账号上下文中取得本次明确认可和业务读回，补正确接收、通话控制与媒体配置后启动；验收外来SMS落库/原回执、来电接听/双向媒体、断连、stop→logoutSession→Join与持续时延。若需新代码，仍先过自身双Actions再保护性升级；不能用核心health替代终点。
 3. 授信TTL/撤销/替换与服务端积压重放规则不可由客户端fixture证明。不用新VTD/UUID、缓存授权、收费外发或设备变更补造成功。**完整用户目标仍未完成。**
 
