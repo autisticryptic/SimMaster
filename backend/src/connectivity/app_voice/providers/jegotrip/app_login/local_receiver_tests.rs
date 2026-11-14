@@ -226,7 +226,12 @@ async fn old_positive_diagnostic_cannot_authorize_a_new_local_receiver_attempt()
 
 #[tokio::test]
 async fn local_receiver_cannot_replace_an_existing_accounts_original_uuid() {
-    let f=Fixture::new(app_only_steps(),false);configure(&f);let first=id();let mut auth=app_only_request(&first);
+    let f=Fixture::new(app_only_steps(),false);let mut initial=configuration(&f);
+    // This prerequisite is a non-enrolling ordinary App authentication, not
+    // the local receiver operation being tested after its canonical binding.
+    initial.http.endpoints.device_enroll=None;initial.http.enroll_id=None;
+    f.manager.configure(ConfigurationWriteRequest {expected_revision:0,configuration:initial}).unwrap();
+    let first=id();let mut auth=app_only_request(&first);
     auth.device_id=Some(Secret::from_owned(UUID.into()));f.manager.submit_jegotrip(auth).unwrap();
     let view=terminal(&f.manager,&first).await;assert_eq!(view.phase,"completed");idle(&f).await;
     let mut next=request(&id());next.device_id=Some(Secret::from_owned(OTHER_UUID.into()));

@@ -14,7 +14,7 @@
 
 ## 已核验的软件基线
 
-- **当前工作树：本地SDK接收准备（待自身Actions验证）**。实际8.9.4的`JustalkManager.login/updateStatus`用当前电话token/SIP资料，SDK成功后驱动status4注册；不把App的`cs_forward`或单一UI回调的VoIP status值当作本地SDK启动条件。新增非默认`prepare_local_receiver`，仍严格要求原App UUID/同账号和当次已有设备认可，取当前电话资料、再次确认设备并保存本地接收账号；呼转只观察、失败/畸形仍停止，不enroll、不报告设备、不修改业务。旧呼转复用流程及原native登录/注册ACK/撤销/Join门禁保留。新28 provider/3HTTP/8前端单元/2浏览器用例待自身CI；原行为断言不删，两个精确源码清单断言扩展为新枚举/共用原身份守卫，工作流过滤器/预算不放宽。整体功能与实网目标仍未完成。
+- **当前工作树：本地SDK接收准备（待自身Actions验证）**。实际8.9.4的`JustalkManager.login/updateStatus`用当前电话token/SIP资料，SDK成功后驱动status4注册；不把App的`cs_forward`或单一UI回调的VoIP status值当作本地SDK启动条件。新增非默认`prepare_local_receiver`，仍严格要求原App UUID/同账号和当次已有设备认可，取当前电话资料、再次确认设备并保存本地接收账号；呼转只观察、失败/畸形仍停止，不enroll、不报告设备、不修改业务。旧呼转复用流程及原native登录/注册ACK/撤销/Join门禁保留。新28 provider/3HTTP/8前端单元/2浏览器用例待自身CI；原行为断言不删，两个精确源码清单断言扩展为新枚举/共用原身份守卫，工作流过滤器/预算不放宽。首a23d924两Actions仅新增UUID冲突用例的普通认证前置夹具误配了enroll端点，已保留官方失败digest/CRC/log/annotations并仅修正该夹具配置，原断言和生产路径不改，须新SHA双验。整体功能与实网目标仍未完成。
 
 - **`865991d1d986f25e060a54272f595b889e1b0c4b`（同次诊断状态保留，已验证并部署）**：`CheckDeviceTrust`保存原来已发出的那一次`getCallStatus`授权码及`localCsForward`，不增加请求/重试、不改变原UUID、HTTP wire或复用门禁。旧记录不回填；复用/诊断形状分别校验，原2KiB上限保持。Build43549614252 / Beta43549614209首轮success，各1418精确provider（1406旧+12新）、26HTTP与原registry/Trunk/通知/DNS/矩阵通过；各82前端单元、4浏览器、12图及双ABI各29成员/20前端文件的官方digest/全CRC/SHA/meta/ELF已核。本机231静态通过，旧断言/工作流/前端/API/依赖与预算保持。410已仅核心升级到本SHA/PID26706，历史/身份/配置/辅助服务保护通过，无回滚备份。证据`.local/jegotrip/diagnostic-status-20261114/`；完整托管仍未完成。
 
