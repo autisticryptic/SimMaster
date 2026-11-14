@@ -3,17 +3,17 @@ import { Alert, Stack, Typography } from '@mui/material'
 import { api, type AppCallNotificationStatus } from '../../api/current'
 import { callNotificationLabel } from '../../policies/callNotifications'
 export default function AppCallNotificationsPane({ lineId }: { lineId: string }) {
-  const [rows, setRows] = useState<AppCallNotificationStatus[]>([])
-  const [error, setError] = useState(false)
+  const [loaded, setLoaded] = useState<{ line: string; rows: AppCallNotificationStatus[]; error: boolean } | null>(null)
+  const rows = loaded?.line === lineId ? loaded.rows : []
+  const error = loaded?.line === lineId && loaded.error
   useEffect(() => {
     let active = true; let timer: ReturnType<typeof setTimeout> | undefined
-    setRows([]); setError(false)
     const read = async () => {
       try {
         const response = await api.getAppCallNotifications(lineId)
         if (!active) return
-        setRows(Array.isArray(response.data) ? response.data.slice(0, 16) : []); setError(false)
-      } catch { if (active) setError(true) }
+        setLoaded({ line: lineId, rows: Array.isArray(response.data) ? response.data.slice(0, 16) : [], error: false })
+      } catch { if (active) setLoaded({ line: lineId, rows: [], error: true }) }
       if (active) timer = setTimeout(() => { void read() }, 5000)
     }
     void read()

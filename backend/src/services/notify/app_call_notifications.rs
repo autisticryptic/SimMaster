@@ -47,11 +47,11 @@ impl NotificationSender{
         let Some(rule)=config.rules.iter().find(|r|r.enabled&&r.id==work.rule_id&&r.event_type==NotificationEventType::Call
             &&r.channel_ids.iter().any(|id|id==&work.channel_id)&&(r.sim_channel_ids.is_empty()||r.sim_channel_ids.iter().any(|id|id==&work.line_id)))else{return CallNoticeOutcome::TargetChanged;};
         let Some(channel)=config.channels.iter().find(|c|c.enabled&&c.id==work.channel_id)else{return CallNoticeOutcome::TargetChanged;};
-        match pair_fingerprint(rule,channel){Ok(value)if value==work.fingerprint=>{},_=>return CallNoticeOutcome::TargetChanged;}
+        match pair_fingerprint(rule,channel){Ok(value)if value==work.fingerprint=>{},_=>return CallNoticeOutcome::TargetChanged,}
         if quiet_hours_active(&rule.quiet_hours){return CallNoticeOutcome::Deferred(Duration::from_secs(5));}
         match self.rate_limit_reason(channel){Ok(None)=>{},Ok(Some(reason))=>{drop(Zeroizing::new(reason));return CallNoticeOutcome::Deferred(Duration::from_secs(u64::from(channel.rate_limit.window_seconds).clamp(1,30)));},Err(error)=>{drop(Zeroizing::new(error));return CallNoticeOutcome::Failed;}}
         match self.send_text_to_channel(channel,work.title.as_str(),work.body.as_str()).await{
-            Ok(())=>CallNoticeOutcome::Delivered,
+            Ok(receipt)=>{drop(Zeroizing::new(receipt));CallNoticeOutcome::Delivered},
             // A transport/channel error may follow actual remote acceptance.
             // Do not requeue a possibly delivered call alert on another nonce.
             Err(error)=>{drop(Zeroizing::new(error));CallNoticeOutcome::Uncertain},

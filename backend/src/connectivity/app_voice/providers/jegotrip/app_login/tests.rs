@@ -1059,7 +1059,7 @@ fn push_diagnostics_do_not_promote_retained_history_or_configuration_to_live_del
     let observations=push_status::PushStoredObservations {app_sms_records:Some(300),app_call_records:Some(4),
         retained_inbox_records:Some(20),pending_sms_notifications:Some(2)};
     let template=push_status::PushTemplateStatus {runtime_template_present:true,sms_receiver_present:true,sip_request_receiver_selected:true,
-        call_receiver_present:true,call_control_present:true,call_media_present:true,reconnect_configured:true};
+        call_receiver_present:true,call_control_present:true,call_media_present:true,reconnect_configured:true,call_notifications_enabled:false};
     let report=PushStatusView::assembled(true,100,template,Vec::new(),observations);
     assert!(report.warnings.contains(&"no_armed_sms_receiver"));assert!(report.warnings.contains(&"no_armed_call_receiver"));
     assert!(report.warnings.contains(&"native_accounts_absent"));

@@ -21,7 +21,7 @@ fn app_call_other_line_outgoing_answered_or_ended_records_never_become_incoming_
 fn app_call_disabled_quiet_and_duplicate_channel_references_remain_pure_no_send(){
     let mut c=call_config();c.rules[0].enabled=false;assert!(call_targets(c,&record()).is_empty());
     let mut c=call_config();c.rules[0].quiet_hours=vec![all_day_quiet()];assert!(call_targets(c,&record()).is_empty());
-    let mut c=call_config();c.rules[0].channel_ids.push(c.rules[0].channel_ids[0].clone());assert_eq!(call_targets(c,&record()).len(),1);
+    let mut c=call_config();let duplicate=c.rules[0].channel_ids[0].clone();c.rules[0].channel_ids.push(duplicate);assert_eq!(call_targets(c,&record()).len(),1);
 }
 #[test]
 fn app_call_bounded_renderer_preserves_literal_tokens_without_recursive_replacement(){

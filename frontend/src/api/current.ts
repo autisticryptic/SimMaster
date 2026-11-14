@@ -1125,7 +1125,7 @@ class SimAdminCurrentAPI {
 
   async getAppCallNotifications(lineId: string) {
     return request<ApiResponse<AppCallNotificationStatus[]>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/call-notifications?limit=16`)
-  },
+  }
   async getAppAccounts() {
     return request<ApiResponse<AppAccountView[]>>('/non-3gpp/accounts')
   }
