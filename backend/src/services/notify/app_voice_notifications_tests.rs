@@ -2,6 +2,8 @@
 use super::*;
 use crate::platform::config::{DeviceStatusSchedule, RuleMatcher};
 
+#[path="app_call_notification_plan_tests.rs"]
+mod calls;
 const LINE: &str = "app-account-0123456789abcdef0123456789abcdef";
 const OTHER_LINE: &str = "app-account-fedcba9876543210fedcba9876543210";
 

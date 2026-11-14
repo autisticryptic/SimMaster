@@ -7,6 +7,7 @@ use std::{fmt, net::IpAddr, sync::Arc, time::Duration};
 pub(super) struct CallSettings {
     pub profile: Arc<MediaEndpointProfile>, pub connector: Arc<dyn RuntimeConnector>, pub bind_ip: IpAddr, pub trunk: Option<TrunkProfileConfig>,
     pub native_lifecycle:Option<super::native_call_lifecycle::NativeCallPolicy>,
+    pub call_notifications:bool,
 }
 impl fmt::Debug for CallSettings { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("CallSettings(<redacted>)") } }
 impl Drop for CallSettings { fn drop(&mut self) { use zeroize::Zeroize; if let Some(trunk) = &mut self.trunk { trunk.secret.zeroize(); } } }
@@ -16,6 +17,7 @@ pub(super) struct Inputs<'a> {
     pub connect_timeout: Duration, pub handshake_timeout: Duration, pub partial_timeout: Duration, pub io_timeout: Duration, pub rpc_timeout: Duration,
     pub bind_ip: IpAddr, pub allow_plain_media: bool, pub trunk: Option<&'a TrunkProfileConfig>,
     pub native_lifecycle:Option<super::native_call_lifecycle::NativeCallLifecycleConfig>,
+    pub call_notifications:bool,
 }
 impl CallSettings {
     pub(super) fn supplied(input: Inputs<'_>) -> Result<Self, &'static str> {
@@ -39,6 +41,6 @@ impl CallSettings {
             io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout }).map_err(|_| INVALID)?);
         let connector = Arc::new(TcpRuntimeConnector::new(input.connect_timeout).map_err(|_| INVALID)?);
         let native_lifecycle=input.native_lifecycle.map(super::native_call_lifecycle::NativeCallPolicy::capture).transpose()?;
-        Ok(Self { profile, connector, bind_ip: input.bind_ip, trunk: input.trunk.cloned(),native_lifecycle })
+        Ok(Self { profile, connector, bind_ip: input.bind_ip, trunk: input.trunk.cloned(),native_lifecycle,call_notifications:input.call_notifications })
     }
 }

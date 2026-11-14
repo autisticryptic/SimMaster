@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Alert, Box, Button, Chip, Paper, Stack, Typography } from '@mui/material'
 import { api, type AppAccountView, type AppLoginAttempt, type JegotripAccountView, type JegotripConfigurationView } from '../../api/current'
+import AppCallNotificationsPane from './AppCallNotificationsPane'
 import JegotripConfigurationDialog from './JegotripConfigurationDialog'
 import { appBusinessLabel, appLoginError, appLoginPhase } from '../../policies/appLogin'
 
@@ -84,6 +85,7 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
                 <Typography variant="body2">{attempt?.masked_number ?? '应用账号'} · {account.line_id.slice(-8)}</Typography>
                 <Typography variant="caption" color="text.secondary">SDK：{account.phase}{attempt ? ` · ${appBusinessLabel(attempt.business_state)}` : ''}</Typography>
                 {account.last_error && <Typography variant="caption" display="block" color="warning.main">{appLoginError(account.last_error)}</Typography>}
+                <AppCallNotificationsPane lineId={account.line_id} />
               </Box>
               <Chip size="small" color={account.incoming_message_ready ? 'success' : 'default'} label={account.incoming_message_ready ? '短信就绪' : '短信未就绪'} />
               <Chip size="small" color={account.incoming_call_ready ? 'success' : 'default'} label={account.incoming_call_ready ? '来电就绪' : '来电未就绪'} />

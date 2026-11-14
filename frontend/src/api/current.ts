@@ -258,6 +258,7 @@ export interface JegotripPushStatus {
     call_control_present: boolean
     call_media_present: boolean
     reconnect_configured: boolean
+    call_notifications_enabled?: boolean
   }
   implementation: {
     online_native_sms: boolean
@@ -372,6 +373,13 @@ export interface JegotripStartupFailure {
   phase: 'bootstrap' | 'account'
   stage: 'preparation' | 'attempt' | 'router_connect' | 'router_tls' | 'router_control' | 'router_io' | 'logical_channel' | 'common_framing'
   code: string
+}
+export interface AppCallNotificationStatus {
+  id: number
+  call_history_id: number
+  state: 'pending' | 'sending' | 'delivered' | 'failed' | 'cancelled' | 'uncertain' | 'expired'
+  attempts: number
+  expires_at: number
 }
 export interface AppAccountView {
   line_id: string
@@ -1115,6 +1123,9 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<AppLoginAttempt[]>>('/non-3gpp/app-login/attempts')
   }
 
+  async getAppCallNotifications(lineId: string) {
+    return request<ApiResponse<AppCallNotificationStatus[]>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/call-notifications?limit=16`)
+  },
   async getAppAccounts() {
     return request<ApiResponse<AppAccountView[]>>('/non-3gpp/accounts')
   }

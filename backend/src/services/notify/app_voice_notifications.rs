@@ -17,6 +17,8 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Write};
 use zeroize::Zeroizing;
+#[path="app_call_notifications.rs"]
+mod calls;
 
 const MAX_CONFIG_ITEMS: usize = 128;
 const MAX_TARGETS: usize = 8;
@@ -144,6 +146,12 @@ impl NoticePlanner for NotificationSender {
         // The caller captures before entering the SQLite admission transaction.
         // get_config returns an owned clone; plan never consults the sender.
         Ok(Box::new(AppVoiceNotificationSnapshot::new(self.get_config())?))
+    }
+    fn capture_calls(&self)->Result<Option<Box<dyn crate::connectivity::app_voice::providers::jegotrip::account_call_notifications::CallNoticeSnapshot>>,&'static str>{
+        Ok(Some(Box::new(AppVoiceNotificationSnapshot::new(self.get_config())?)))
+    }
+    fn deliver_call<'a>(&'a self,work:&'a crate::connectivity::app_voice::providers::jegotrip::account_call_notifications::CallNoticeWork)->crate::connectivity::app_voice::providers::jegotrip::account_call_notifications::CallNoticeFuture<'a>{
+        self.deliver_app_call(work)
     }
 }
 

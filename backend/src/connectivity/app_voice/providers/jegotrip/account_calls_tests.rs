@@ -144,3 +144,5 @@ mod lifecycle;
 mod admission;
 #[path="account_calls_retirement_tests.rs"]
 mod retirement;
+#[path="account_call_notifications_tests.rs"]
+mod notifications;

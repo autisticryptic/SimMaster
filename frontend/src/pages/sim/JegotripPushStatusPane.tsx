@@ -46,6 +46,7 @@ export default function JegotripPushStatusPane({ open, refreshKey }: { open: boo
       <Button size="small" disabled={busy} onClick={() => setRefresh((value) => value + 1)}>刷新推送状态</Button>
     </Stack>
     <Alert severity="info">本诊断只读取当前运行和历史记录，不登录无忧行、不修改授信或托管开关。接收器已武装、历史落库、本次真实收到短信 / 来电是不同证据；仍须本人号码的外部收件测试。</Alert>
+    {view?.configuration.call_notifications_enabled && <Alert severity="info">安装侧已启用原来电通知转发；仍需本人通话规则/渠道。仅原ringing窗口发送，渠道结果不代表已接听、媒体或实网验收。</Alert>}
     {view && <>
       <Typography variant="body2">原生接收账号：{view.native_accounts.length} · 在线短信接收器：{view.native_accounts.filter((a) => a.incoming_message_ready).length} · 在线来电接收器：{view.native_accounts.filter((a) => a.incoming_call_ready).length}</Typography>
       <Typography variant="caption" color="text.secondary">历史无忧行短信 {count(view.stored_observations.app_sms_records)} · 历史无忧行来电 {count(view.stored_observations.app_call_records)} · 待处理短信通知 {count(view.stored_observations.pending_sms_notifications)}。历史记录不会自动证明当前链路可用。</Typography>

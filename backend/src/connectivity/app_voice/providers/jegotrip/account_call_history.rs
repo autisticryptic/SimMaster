@@ -8,7 +8,15 @@ const STORAGE: &str = "app_account_call_storage_failed";
 const SCOPE: &str = "app_account_call_scope_invalid";
 pub(super) struct HistoryTicket { id: i64, line: String, token: String }
 impl fmt::Debug for HistoryTicket { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("AppCallHistoryTicket(<redacted>)") } }
-impl HistoryTicket { pub(super) fn id(&self) -> i64 { self.id } }
+impl HistoryTicket { pub(super) fn id(&self) -> i64 { self.id }
+    pub(super) fn line(&self)->&str{&self.line}
+    pub(super) fn token(&self)->&str{&self.token}
+}
+pub(super) fn notification_record(db:&Database,ticket:&HistoryTicket)->Result<crate::platform::db::CallRecord,&'static str>{
+    db.with_conn(|conn|conn.query_row("SELECT phone_number,start_time FROM call_history WHERE id=?1 AND line_id=?2 AND app_call_token=?3 AND direction='incoming' AND answered=0 AND end_time IS NULL AND typeof(phone_number)='text' AND length(CAST(phone_number AS BLOB))<=128 AND typeof(start_time)='text' AND length(CAST(start_time AS BLOB))<=64",
+        params![ticket.id,ticket.line,ticket.token],|row|Ok(crate::platform::db::CallRecord{id:ticket.id,line_id:Some(ticket.line.clone()),direction:"incoming".into(),phone_number:row.get(0)?,duration:0,start_time:row.get(1)?,end_time:None,answered:false,
+            sip_status:None,failure_code:None,failure_category:None,q850_cause:None,failure_retryable:None,retry_after_seconds:None,carrier_reason:None})).map_err(|_|STORAGE))
+}
 pub fn initialize_schema(conn: &Connection) -> Result<(), &'static str> {
     let exists = {
         let mut query = conn.prepare("PRAGMA table_info(call_history)").map_err(|_| STORAGE)?;

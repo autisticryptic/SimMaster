@@ -22,6 +22,7 @@ pub mod account_runtime;
 pub(crate) mod app_login;
 pub mod account_runs;
 pub mod account_notifications;
+pub mod account_call_notifications;
 pub(crate) mod call_settings;
 pub(crate) mod account_calls;
 pub mod account_call_history;

@@ -8,6 +8,8 @@ use std::sync::{Mutex,atomic::{AtomicUsize,Ordering}};
 
 #[path = "account_notification_deadline_tests.rs"]
 mod deadline;
+#[path="account_call_notification_queue_tests.rs"]
+mod calls;
 
 struct FixedPlan {targets:usize}
 impl NoticeSnapshot for FixedPlan {

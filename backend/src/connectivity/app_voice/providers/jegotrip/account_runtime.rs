@@ -302,6 +302,7 @@ impl AccountManager {
             let legacy: i64 = tx.query_row("SELECT COUNT(*) FROM app_voice_runtime_leases WHERE holder IS NULL", [], |row| row.get(0))
                 .map_err(|_| "app_account_run_storage_failed")?;
             let uncertain = super::account_notifications::recover_orphaned_sending(&tx)?;
+            super::account_call_notifications::recover(&tx)?;
             tx.commit().map_err(|_| "app_account_run_storage_failed")?;
             Ok((RecoveryReport { recovered_runs: leases.len(), uncertain_notifications: uncertain, legacy_unconfirmed_leases: legacy as usize }, events))
         })?;
@@ -494,6 +495,9 @@ impl AccountManager {
         self.metadata(line_id)?;
         self.database.with_conn(|conn|super::account_notifications::metadata(conn,line_id,limit))
     }
+    pub fn call_notification_status(&self,line_id:&str,limit:usize)->Result<Vec<super::account_call_notifications::CallNoticeStatus>,&'static str>{
+        self.metadata(line_id)?;self.database.with_conn(|conn|super::account_call_notifications::metadata(conn,line_id,limit))
+    }
     pub async fn create(&self, config: AccountConfig, now: u64) -> Result<AccountView, &'static str> {
         config.validate(now)?;
         // Local random ID never embeds a phone number/token/ICCID or claims to
@@ -578,7 +582,7 @@ impl AccountManager {
         controller.import(config.credentials, now).map_err(controller_error)?;
         let holder = lock(&self.claim).as_ref().map(|claim| claim.instance.clone());
         let run_token=Arc::new(self.database.with_conn(|conn|account_runs::register_runtime_held(conn,line_id,metadata.revision,&inbox_nonce,holder.as_deref()))?);
-        let calls = call_settings.map(|settings| CallService::new(self.database.clone(),run_token.clone(),backend.clone(),settings,credential_expiry));
+        let calls = call_settings.map(|settings| CallService::new(self.database.clone(),run_token.clone(),backend.clone(),settings,credential_expiry).with_notifications(self.notifications.clone()));
         let run = Arc::new(ManagedRun { line_id: line_id.to_owned(), database: self.database.clone(), revision: metadata.revision,
             inbox_nonce, run_token, finalized: AtomicBool::new(false), notifications:self.notifications.clone(),
             sms_supported, credential_expiry, cleanup_on_disconnect,

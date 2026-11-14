@@ -63,6 +63,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/inbox", get(get_inbox))
         .route("/api/non-3gpp/accounts/{line_id}/messages", get(get_messages))
         .route("/api/non-3gpp/accounts/{line_id}/notifications", get(get_notifications))
+        .route("/api/non-3gpp/accounts/{line_id}/call-notifications", get(get_call_notifications))
         .route("/api/non-3gpp/accounts/{line_id}/calls", get(get_calls))
         .route("/api/non-3gpp/accounts/{line_id}/calls/{call_id}", get(get_call))
         .route("/api/non-3gpp/accounts/{line_id}/calls/{call_id}/answer", post(answer_call))
@@ -229,6 +230,11 @@ pub async fn get_notifications(State(manager):State<Arc<AccountManager>>,Path(li
     success(StatusCode::OK,manager.notification_status(&line_id,request.limit))
 }
 
+pub async fn get_call_notifications(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Query<InboxQuery>,QueryRejection>)->Response{
+    let Ok(Query(request))=request else{return failure("app_account_request_invalid");};
+    if !(1..=128).contains(&request.limit){return failure("app_account_request_invalid");}
+    success(StatusCode::OK,manager.call_notification_status(&line_id,request.limit))
+}
 fn call_id_valid(value: &str) -> bool { value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) }
 pub async fn get_calls(State(manager): State<Arc<AccountManager>>, Path(line_id): Path<String>) -> Response {
     success(StatusCode::OK, manager.calls(&line_id).await)

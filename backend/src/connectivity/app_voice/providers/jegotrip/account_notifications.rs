@@ -18,7 +18,11 @@ const TTL:i64=24*60*60;
 const WORKERS:usize=4;
 const ATTEMPT_TIMEOUT:Duration=Duration::from_secs(30);
 
-pub(crate) trait NoticePlanner:Send+Sync {fn capture(&self)->Result<Box<dyn NoticeSnapshot>,&'static str>;}
+pub(crate) trait NoticePlanner:Send+Sync {
+    fn capture(&self)->Result<Box<dyn NoticeSnapshot>,&'static str>;
+    fn capture_calls(&self)->Result<Option<Box<dyn super::account_call_notifications::CallNoticeSnapshot>>,&'static str>{Ok(None)}
+    fn deliver_call<'a>(&'a self,_work:&'a super::account_call_notifications::CallNoticeWork)->super::account_call_notifications::CallNoticeFuture<'a>{Box::pin(async{super::account_call_notifications::CallNoticeOutcome::TargetChanged})}
+}
 pub(crate) trait NoticeSnapshot:Send+Sync {fn plan(&self,message:&SmsMessage)->Result<NoticePlan,&'static str>;}
 pub(crate) struct NoticeTarget {pub rule_id:String,pub channel_id:String,pub fingerprint:String,pub title:String,pub body:String}
 impl Drop for NoticeTarget {fn drop(&mut self){self.title.zeroize();self.body.zeroize();}}
@@ -39,6 +43,7 @@ impl NoticePlan {
         Ok(Self{targets})
     }
     pub(crate) fn is_empty(&self)->bool{self.targets.is_empty()}
+    pub(crate) fn targets(&self)->&[NoticeTarget]{&self.targets}
 }
 impl fmt::Debug for NoticePlan {fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("NoticePlan(<redacted>)")}}
 
@@ -65,7 +70,8 @@ pub fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
         expires_at INTEGER NOT NULL,created_at INTEGER NOT NULL,
         UNIQUE(sms_id,rule_id,channel_id));
         CREATE INDEX IF NOT EXISTS idx_app_voice_notification_due ON app_voice_notification_jobs(state,not_before,id);")
-        .map_err(|_|STORAGE)
+        .map_err(|_|STORAGE)?;
+    super::account_call_notifications::initialize_schema(conn)
 }
 fn now()->i64{chrono::Utc::now().timestamp()}
 fn is_terminal(state:&str)->bool{matches!(state,"delivered"|"failed"|"cancelled"|"uncertain"|"expired")}
@@ -116,6 +122,7 @@ fn claim_next(database:&Database,at:i64)->Result<Option<NoticeWork>,&'static str
         for (sms,line) in expired {aggregate_sms(&tx,sms,&line)?;}
         prune_terminal(&tx)?;
         let active:i64=tx.query_row("SELECT COUNT(*) FROM app_voice_notification_jobs WHERE state='sending'",[],|r|r.get(0)).map_err(|_|STORAGE)?;
+        let active=active+super::account_call_notifications::sending_count(&tx)?;
         if active>=WORKERS as i64 {tx.commit().map_err(|_|STORAGE)?;return Ok(None);}
         let row:Option<(i64,i64,String,String,String,String,String,String,i64,i64)>=tx.query_row(
             "SELECT j.id,j.sms_id,j.line_id,j.rule_id,j.channel_id,j.fingerprint,j.title,j.body,j.attempts,j.expires_at
@@ -126,6 +133,7 @@ fn claim_next(database:&Database,at:i64)->Result<Option<NoticeWork>,&'static str
             ORDER BY j.id LIMIT 1",[at],
             |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional().map_err(|_|STORAGE)?;
         let Some((id,sms_id,line_id,rule_id,channel_id,fingerprint,title,body,attempt,expires))=row else{tx.commit().map_err(|_|STORAGE)?;return Ok(None);};
+        if super::account_call_notifications::channel_sending(&tx,&channel_id)?{tx.commit().map_err(|_|STORAGE)?;return Ok(None);}
         let claim=super::account_runtime::local_nonce()?;
         let changed=tx.execute("UPDATE app_voice_notification_jobs SET state='sending',claim=?1,attempts=attempts+1 WHERE id=?2 AND state='pending'",params![claim,id]).map_err(|_|STORAGE)?;
         if changed!=1{return Err(STORAGE);}
@@ -245,6 +253,7 @@ pub(super) fn recover_orphaned_sending(conn:&Connection)->Result<usize,&'static 
 }
 
 pub(super) fn cancel_account(conn:&Connection,line:&str)->Result<(),&'static str>{
+    super::account_call_notifications::cancel_account(conn,line)?;
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_voice_notification_jobs')",[],|r|r.get(0)).map_err(|_|STORAGE)?;
     if exists{
         let mut query=conn.prepare("SELECT DISTINCT sms_id FROM app_voice_notification_jobs WHERE line_id=?1 AND state IN ('pending','sending')").map_err(|_|STORAGE)?;

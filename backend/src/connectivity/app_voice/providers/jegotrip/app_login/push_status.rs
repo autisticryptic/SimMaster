@@ -11,6 +11,8 @@ pub(crate) struct PushTemplateStatus {
     pub sms_receiver_present:bool, pub sip_request_receiver_selected:bool,
     pub call_receiver_present:bool, pub call_control_present:bool, pub call_media_present:bool,
     pub reconnect_configured:bool,
+    #[serde(skip_serializing_if="std::ops::Not::not")]
+    pub call_notifications_enabled:bool,
 }
 impl PushTemplateStatus {
     pub(super) fn inspect(template:Option<&RuntimeTemplate>)->Self {
@@ -19,7 +21,7 @@ impl PushTemplateStatus {
         Self {runtime_template_present:true,sms_receiver_present:p.incoming.is_some() || p.native_receivers.is_some(),
             sip_request_receiver_selected:p.native_receivers.is_some() || p.incoming.as_ref().is_some_and(|b|b.receiver_kind.as_slice()==b"Sip.Request"),
             call_receiver_present:p.call_incoming.is_some() || p.native_receivers.is_some(),call_control_present:p.call_control.is_some() || p.native_call_control,
-            call_media_present:template.call_media.is_some(),reconnect_configured:template.reconnect.is_some()}
+            call_media_present:template.call_media.is_some(),reconnect_configured:template.reconnect.is_some(),call_notifications_enabled:template.call_media.as_ref().is_some_and(|m|m.call_notifications)}
     }
 }
 #[derive(Default,Serialize)]
@@ -70,10 +72,12 @@ impl PushStatusView {
         if native_accounts.iter().any(|a|a.account_alive_state==Some("blocked")) {warnings.push("account_alive_transport_not_approved");}
         if native_accounts.iter().any(|a|a.account_alive_state==Some("unapproved")) {warnings.push("account_alive_endpoint_unapproved");}
         if native_accounts.iter().any(|a|a.account_alive_state==Some("retrying")) {warnings.push("account_alive_retrying");}
-        warnings.push("platform_offline_wakeup_unimplemented");warnings.push("call_notifications_unimplemented");
+        warnings.push("platform_offline_wakeup_unimplemented");
+        if !configuration.call_notifications_enabled{warnings.push("call_notifications_unimplemented");}
+        let call_notification_forwarding=configuration.call_notifications_enabled;
         Self {initialized,observed_at_unix_seconds:at,configuration,native_accounts,stored_observations,warnings,
             implementation:PushImplementation {online_native_sms:true,online_native_calls:true,browser_event_stream:true,
-                platform_offline_wakeup:false,sms_notification_forwarding:true,call_notification_forwarding:false},
+                platform_offline_wakeup:false,sms_notification_forwarding:true,call_notification_forwarding},
             receiver_namespace_verification:"requires_original_binding_evidence",
             external_delivery_verification:"requires_external_sms_call_test"}
     }
