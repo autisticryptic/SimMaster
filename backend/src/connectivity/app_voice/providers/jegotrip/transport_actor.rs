@@ -847,6 +847,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             Err(_) => { let _ = command.completion.send(Err(RuntimeError::Protocol)); return Ok(()); }
         };
         if is_logout { self.pending.retain(|id, _| self.backend.is_pending(*id)); }
+        // Keep one heap-owned transport future, not two large inline copies
+        // in the new guarded/legacy branches. Standard test stack and all IO
+        // deadlines/gates remain unchanged, including when Invite is absent.
+        let mut sending = Box::pin(self.send_packets(&packets.packets,Some(&mut command.completion),native_deadline));
         let sent = if !invite_claims.is_empty() {
             let cancelled = async {
                 use futures_util::StreamExt;
@@ -856,9 +860,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             };
             tokio::select! { biased;
                 _ = cancelled => Err(RuntimeError::Cancelled),
-                result = self.send_packets(&packets.packets,Some(&mut command.completion),native_deadline) => result,
+                result = sending.as_mut() => result,
             }
-        } else { self.send_packets(&packets.packets,Some(&mut command.completion),native_deadline).await };
+        } else { sending.as_mut().await };
+        drop(sending);
         if let Err(error) = sent {
             self.backend.retire_request(packets.call_id); let _ = command.completion.send(Err(error)); return Err(error);
         }
