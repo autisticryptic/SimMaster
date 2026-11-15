@@ -1,6 +1,8 @@
 //! Actions-only original default CallServerEx path. Legacy assertions stay separate.
 #[path="native_call_lifecycle_tests.rs"]
 mod lifecycle;
+#[path="native_invite_liveness_tests.rs"]
+mod invite_liveness;
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip as n;
 use n::{native_receiver::{NativeReceiverConfig,NativeReceiverPolicy,NativeReceiverSetup},rpc_stream::Reader};

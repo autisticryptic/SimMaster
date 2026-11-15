@@ -48,9 +48,15 @@ impl InviteQueue {
         group.changed.notify_waiters(); Ok((group,start))
     }
     fn pop(&mut self, group: &Group) -> Option<RetainedInvite> {
+        // This is called under the queue lock, shared with admission. Commit
+        // the idle transition atomically with observing an empty queue so a
+        // newly arriving holder cannot see a worker that has already exited.
+        let mut state = lock(&group.state);
+        let incoming = state.holders.pop_front();
+        if incoming.is_none() { state.running = false; }
         // Moving to IO does not refund the budget: the zeroizing DATA and
         // original ticket remain charged until the actual in-flight drop.
-        lock(&group.state).holders.pop_front()
+        incoming
     }
 }
 impl Drop for InviteQueue { fn drop(&mut self) { self.retire(); } }
@@ -88,7 +94,7 @@ impl CallService {
                 || Instant::now() >= group.deadline { return Err(INVALID); }
             super::super::native_invite_receipts::consume(&self.database,&self.run,&call.history,group.notification_id,&group.fingerprint)
         }).ok_or(INVALID)??;
-        if !self.active(&call) || !group.claim.confirm(&receipt) || Instant::now() >= group.deadline { group.claim.cancel(); return Ok(Some(false)); }
+        if !self.active(&call) || !group.claim.confirm(&receipt,&call.ticket) || Instant::now() >= group.deadline { group.claim.cancel(); return Ok(Some(false)); }
         call.invite_consumed.store(true,Ordering::SeqCst);
         Ok(Some(true))
     }
@@ -113,7 +119,7 @@ async fn run_group(weak: Weak<CallService>, group: Arc<Group>) {
         if let Some(terminal) = terminal {
             { let mut state = lock(&group.state); if state.terminal.is_none() || !terminal { state.terminal = Some(terminal); } }
             let incoming = lock(&service.invites).pop(&group);
-            let Some(incoming) = incoming else { lock(&group.state).running = false; return; };
+            let Some(incoming) = incoming else { return; };
             let accepted = terminal && group.claim.is_live() && Instant::now() < group.deadline;
             let ticket = incoming.ticket().clipped_to(group.deadline,&group.claim);
             let backend = service.backend.clone(); drop(service);

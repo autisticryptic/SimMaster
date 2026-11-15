@@ -36,6 +36,7 @@ pub(in super::super) fn case(number:u8){
         9=>{let(group,_)=queue.admit(fixture.direct(1,1,b"v")).unwrap();let end=group.deadline;let first=queue.pop(&group).unwrap();drop(first);{let mut state=lock(&group.state);state.terminal=Some(true);state.running=false;}let(again,start)=queue.admit(fixture.direct(2,1,b"v")).unwrap();assert!(start);assert!(Arc::ptr_eq(&group,&again));assert_eq!(again.deadline,end);assert_eq!(lock(&again.state).terminal,Some(true));},
         10=>{let incoming=fixture.direct(1,1,b"v");fixture.scope.close();assert_eq!(queue.admit(incoming).err(),Some(INVALID));assert_eq!(budget(&queue),(0,0));assert!(queue.groups.is_empty());},
         11=>{let incoming=fixture.direct(1,1,b"v");fixture.scope.mark_session_revoked();assert_eq!(queue.admit(incoming).err(),Some(INVALID));assert_eq!(budget(&queue),(0,0));assert!(queue.groups.is_empty());},
+        12=>{let(group,_)=queue.admit(fixture.direct(1,1,b"v")).unwrap();let held=queue.pop(&group).unwrap();drop(held);assert!(lock(&group.state).running);assert!(queue.pop(&group).is_none());assert!(!lock(&group.state).running);let(again,start)=queue.admit(fixture.direct(2,1,b"v")).unwrap();assert!(start);assert!(Arc::ptr_eq(&group,&again));assert_eq!(budget(&queue).0,1);},
         _=>panic!("no unselected queue case"),
     }
 }

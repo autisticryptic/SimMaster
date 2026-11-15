@@ -12,3 +12,4 @@ use super::super::invites::queue_tests;
 #[test] fn invite_queue_terminal_duplicate_restarts_only_receipt_worker_not_consumer_deadline(){queue_tests::case(9);}
 #[test] fn invite_queue_closed_scope_cannot_admit_even_previously_captured_data(){queue_tests::case(10);}
 #[test] fn invite_queue_session_revocation_rejects_before_budget_or_group_mutation(){queue_tests::case(11);}
+#[test] fn invite_queue_empty_to_idle_is_atomic_with_new_holder_admission(){queue_tests::case(12);}

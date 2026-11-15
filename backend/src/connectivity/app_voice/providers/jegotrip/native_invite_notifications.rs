@@ -75,29 +75,50 @@ impl InviteData {
 /// Local consumer cancellation brand, never serializable or caller-supplied.
 /// Retiring the original consumer synchronously revokes queued positive work.
 pub(super) struct ConsumerClaim { owner: AttemptOwner, scope: RpcConnectionScope, notification_id: u64, fingerprint: [u8;32], deadline: Instant,
-    live: AtomicBool, consumed: AtomicBool, changed: tokio::sync::Notify }
+    live: AtomicBool, consumed: AtomicBool, call: std::sync::Mutex<Option<super::call_control::CallControlTicket>>, changed: tokio::sync::Notify,
+    #[cfg(test)] component: AtomicBool,
+}
 impl ConsumerClaim {
     pub(super) fn new(owner: &AttemptOwner, scope: &RpcConnectionScope, notification_id: u64, fingerprint: [u8;32], deadline: Instant) -> Arc<Self> {
         Arc::new(Self { owner: owner.clone(), scope: scope.clone(), notification_id, fingerprint, deadline,
-            live: AtomicBool::new(true), consumed: AtomicBool::new(false), changed: tokio::sync::Notify::new() })
+            live: AtomicBool::new(true), consumed: AtomicBool::new(false), call: std::sync::Mutex::new(None), changed: tokio::sync::Notify::new(),
+            #[cfg(test)] component: AtomicBool::new(false), })
     }
-    pub(super) fn confirm(&self, receipt: &super::native_invite_receipts::InviteConsumptionReceipt) -> bool {
+    pub(super) fn confirm(&self, receipt: &super::native_invite_receipts::InviteConsumptionReceipt, call: &super::call_control::CallControlTicket) -> bool {
         if !self.is_live() || !self.scope.is_open() || self.scope.session_revoked() || Instant::now() >= self.deadline
-            || !receipt.matches(self.notification_id,&self.fingerprint) { return false; }
-        self.consumed.store(true,Ordering::SeqCst); self.is_live()
+            || !receipt.matches(self.notification_id,&self.fingerprint) || !call.matches(&self.owner,&self.scope)
+            || call.native_id().expose_to_backend() != self.notification_id || !call.is_live() { return false; }
+        {
+            let mut captured = self.call.lock().unwrap_or_else(|poison| poison.into_inner());
+            if captured.as_ref().is_some_and(|original| !original.same_call(call)) { return false; }
+            if captured.is_none() { *captured = Some(call.captured_copy()); }
+        }
+        self.consumed.store(true,Ordering::SeqCst); self.changed.notify_waiters(); self.is_live()
     }
     #[cfg(test)]
     pub(super) fn fixture_consumed(owner: &AttemptOwner, scope: &RpcConnectionScope, notification_id: u64, fingerprint: [u8;32], deadline: Instant) -> Arc<Self> {
-        let claim = Self::new(owner,scope,notification_id,fingerprint,deadline); claim.consumed.store(true,Ordering::SeqCst); claim
+        let claim = Self::new(owner,scope,notification_id,fingerprint,deadline); claim.component.store(true,Ordering::SeqCst); claim.consumed.store(true,Ordering::SeqCst); claim
     }
     pub(super) fn cancel(&self) { self.live.store(false, Ordering::SeqCst); self.changed.notify_waiters(); }
-    pub(super) fn is_live(&self) -> bool { self.live.load(Ordering::SeqCst) }
+    pub(super) fn is_live(&self) -> bool {
+        self.live.load(Ordering::SeqCst) && self.call.lock().unwrap_or_else(|poison| poison.into_inner()).as_ref().is_none_or(|call| call.is_live())
+    }
     fn may_ack(&self, notification_id: u64, fingerprint: &[u8;32]) -> bool {
-        self.is_live() && self.consumed.load(Ordering::SeqCst) && self.scope.is_open() && !self.scope.session_revoked()
+        let bound = self.call.lock().unwrap_or_else(|poison| poison.into_inner()).is_some();
+        #[cfg(test)] let bound = bound || self.component.load(Ordering::SeqCst);
+        bound && self.is_live() && self.consumed.load(Ordering::SeqCst) && self.scope.is_open() && !self.scope.session_revoked()
             && notification_id == self.notification_id && fingerprint == &self.fingerprint && Instant::now() < self.deadline
     }
     pub(super) async fn cancelled(&self) {
-        loop { let wake = self.changed.notified(); tokio::pin!(wake); wake.as_mut().enable(); if !self.is_live() { return; } wake.await; }
+        loop {
+            let wake = self.changed.notified(); tokio::pin!(wake); wake.as_mut().enable(); if !self.is_live() { return; }
+            let call = self.call.lock().unwrap_or_else(|poison| poison.into_inner()).as_ref().map(|call| call.captured_copy());
+            tokio::select! { biased;
+                _ = self.scope.session_ended() => return,
+                _ = async { if let Some(call) = &call { call.revoked().await; } else { std::future::pending::<()>().await; } } => return,
+                _ = wake => {},
+            }
+        }
     }
 }
 impl fmt::Debug for ConsumerClaim { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("InviteConsumerClaim(<redacted>)") } }

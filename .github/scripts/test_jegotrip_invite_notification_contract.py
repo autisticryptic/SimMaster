@@ -52,8 +52,8 @@ class InviteNotificationContracts(unittest.TestCase):
         consumer=src('account_invite_notifications.rs');self.assertIn('call.ticket.native_id().expose_to_backend() == group.notification_id',consumer)
         self.assertIn('if phase == Phase::Checking { return Ok(None); }',consumer)
         self.assertIn('Phase::Ringing|Phase::Accepting|Phase::Connected',consumer)
-        self.assertLess(consumer.index('native_invite_receipts::consume'),consumer.index('group.claim.confirm(&receipt)'))
-        self.assertLess(consumer.index('group.claim.confirm(&receipt)'),consumer.index('call.invite_consumed.store(true'))
+        self.assertLess(consumer.index('native_invite_receipts::consume'),consumer.index('group.claim.confirm(&receipt,&call.ticket)'))
+        self.assertLess(consumer.index('group.claim.confirm(&receipt,&call.ticket)'),consumer.index('call.invite_consumed.store(true'))
         calls=src('account_calls.rs');part=calls.split('async fn ring(',1)[1].split('pub(super) async fn accept',1)[0]
         self.assertLess(part.index('result.accepted()'),part.index('state.phase=Phase::Ringing'))
         self.assertLess(part.index('OperatorEvent::Incoming'),part.index('lock(&self.invites).wake()'))
@@ -85,6 +85,17 @@ class InviteNotificationContracts(unittest.TestCase):
         calls=src('account_calls.rs');self.assertIn('sdk_invite_notification:self.invite_consumed.load(Ordering::SeqCst).then_some("consumed")',calls)
         for name in ['native_invite_notifications.rs','native_invite_receipts.rs','account_invite_notifications.rs']:
             text=src(name);self.assertNotIn('Phase::Hosted',text);self.assertNotIn('state.phase=Phase::Connected',text);self.assertNotIn('CallOperation::Accept',text)
+    def test_call_revocation_and_idle_admission_cannot_leave_live_claim_or_stranded_holder(self):
+        data=src('native_invite_notifications.rs')
+        self.assertIn('!call.matches(&self.owner,&self.scope)',data)
+        self.assertIn('call.native_id().expose_to_backend() != self.notification_id || !call.is_live()',data)
+        self.assertIn('if let Some(call) = &call { call.revoked().await; }',data)
+        self.assertIn('self.changed.notify_waiters(); self.is_live()',data)
+        queue=src('account_invite_notifications.rs')
+        self.assertIn('if incoming.is_none() { state.running = false; }',queue)
+        self.assertIn('let Some(incoming) = incoming else { return; };',queue)
+        self.assertIn('native_invite_liveness_tests.rs',src('native_call_control_tests.rs'))
+        self.assertIn('invite_queue_empty_to_idle_is_atomic_with_new_holder_admission',src('account_invite_queue_filter_tests.rs'))
     def test_invite_ui_uses_existing_auth_calls_read_only_with_no_answer_or_token_render(self):
         api=(R/'frontend/src/api/current.ts').read_text(encoding='utf-8')
         self.assertIn('async getAppCalls(lineId: string)',api)
