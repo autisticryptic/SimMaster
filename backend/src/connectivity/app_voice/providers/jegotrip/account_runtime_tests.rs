@@ -11,6 +11,8 @@ use tokio::sync::oneshot;
 
 #[path = "account_inbox_native_tests.rs"]
 mod inbox_native;
+#[path = "account_start_future_tests.rs"]
+mod startup_frame;
 #[path = "account_smgw_native_tests.rs"]
 mod smgw_native;
 #[path = "account_maintenance_native_tests.rs"]

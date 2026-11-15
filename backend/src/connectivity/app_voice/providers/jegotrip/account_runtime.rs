@@ -544,7 +544,9 @@ impl AccountManager {
         Ok(())
     }
     pub async fn start(&self, line_id: &str, expected_revision: u64, now: u64) -> Result<AccountView, &'static str> {
-        self.start_with(line_id, expected_revision, now, None).await
+        // Keep the manager-owned startup state out of caller join/select
+        // frames. This does not change original-run admission or IO budgets.
+        Box::pin(self.start_with(line_id, expected_revision, now, None)).await
     }
     /// `previous` is only the supervisor's own retired run: the fresh start is
     /// abandoned if the user stopped/replaced/deleted it, or another run exists.
