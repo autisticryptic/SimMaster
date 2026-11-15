@@ -146,6 +146,18 @@ artifact SHA-256、精确测试数与失败证据都保留在 `.local/jegotrip/`
 
 `e20cea8fdb2e40fe53b1ebdad44f2936de2ca776`自身Build43640096342/Beta43640096297全success，各1579精确provider/34HTTP、原通知服务＋8新计划回归、110unit/11browser24图及双ABI官方digest/ZIP全CRC/29成员20www全SHA/meta1.1.5/ELF已核，293本机Python静态通过。首d216的6编译问题与frontend2错误/2warnings，bba唯一新expansion夹具在config前置即超128KiB，全部失败officialartifact/CRC/digest/log/annotations保留；后者仅把输入改为120000B仍超原输出128KiB，不削断言、生产边界或栈/超时。权威私有`call-notifications/SOFTWARE_VERIFIED_e20cea8.json`、`verified-native-e20cea8.json`。**未部署、未实际外发通知、未操作410/Provider/SDK/手机。** 完整Message/Invite关联、其他通信/动态媒体/可信Router与实际SMS、接听、双向媒体及stop及时性仍须继续。
 
+## 1.12 原 Invite 业务消费与延迟回执（b6b2e71软件已验证，未部署）
+
+安装侧显式`profile.native_receivers.invite_notifications={"timeout_ms":3000}`选择有界本地等待策略（100..30000ms，并非猜测的SDK固定计时）。必须已有原Common/native接收器、ClientEx、native CallServerEx和完整独立call_media；缺省不装，原已识别但未安装消费者的NACK行为保持。Message仍未安装IM消费者，不把它转成Sip.Request短信、空map hint或来电。
+
+原静态链`600E5C→5FF60C`以通知ID查既有call容器+16；`612690`将原onInvited完整BE64 ID存入该槽。因此相等位仅作为**同owner/scope的原通话查找键**，不是新通话、路由、接听或媒体授权。`Notify.CallId/Caller`只保留有界私有DATA与fingerprint，绝不覆盖原邀请peer/oid/SDP。真正的消费必须等匹配Inform、本地来电指示、原CallControlTicket与同run/revision/history token事务关联提交；仅该私有消费凭证可确认原claim。
+
+DIRECT和batch原回复票据分别保留，首次deadline不随duplicate延长；同通知ID聚合异步holder且不重复消费。新增64组、256holder、1MiB含inflight DATA界限，拒绝压力或冲突不遗忘原关联。队列空闲切换和新准入在同锁下提交，避免退出worker留下待处理holder。取消/配置变化/通话或会话撤销禁止正向IO，原owner任务保留并Join；不abort/detach、换nonce或重登录补造成功。batchQueued不是已送达，正向结果保持claim/期限直至原结果epoch获确认，未知结果不替换为新请求。没有新增notifyEnd出站RPC。
+
+新可选`sdk_invite_notification=consumed`只说明原Invite本地消费历史；UI通过已有认证、no-store通话列表只读获取，16行/有限字典/按账号隔离，不输出私有通知ID/Caller/SDP，不宣称渠道已送达、来电已接听、媒体或设备授信成功。
+
+`b6b2e71f0ba166c9dfd5eff4f0e238737e18b46e`自身Build43679425165/Beta43679425171均success，各1638精确provider（旧1579＋59新：28协议/claim、13队列、5SQLite、7真实隔离Common账号、5通话存活、1startup描述符）、36HTTP、113单元/12浏览器26图及双ABI官方digest/全ZIPCRC/各29成员20www全SHA/meta1.1.5/ELF已核，309本机Python静态过。首5e编译/lint、e6/15/dc的同一个旧Common bootstrap标准栈失败保留；最终通过生产入口堆持有启动状态而非增栈/改旧测试解决。4ab新batch夹具把原incarnation9误写99、d461新HTTP夹具把既有200空列表误期望503均仅修新夹具，所有原保护断言保持并由本SHA同名通过。12个失败run的工件/摘要/CRC/日志/注解保留，权威私有`business-notifications/SOFTWARE_VERIFIED_b6b2e71.json`。**未部署、没有410/Provider/SDK/手机或真实通知动作；完整Message IM/其他通信媒体/可信Router和实网验收仍必须继续，不能以此完成整体目标。**
+
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 
 原 App 并未依赖公共 CA：`assets/app2.cer` 就是服务端叶子证书
