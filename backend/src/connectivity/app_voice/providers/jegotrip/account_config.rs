@@ -313,6 +313,7 @@ impl AccountConfig {
         }else{RuntimeProfile::supplied(inputs).map_err(|_|INVALID)?};
         if p.native_receivers.as_ref().is_some_and(|receiver| receiver.invite_notifications.is_some())
             && (!p.client_ex || !p.native_call_control || self.call_media.is_none()) { return Err(INVALID); }
+        if p.native_receivers.as_ref().is_some_and(|receiver| receiver.im_messages.is_some()) && !p.client_ex { return Err(INVALID); }
         let profile=profile.with_native_receivers(p.native_receivers.as_ref()).map_err(|_|INVALID)?;
         let profile=profile.with_offline_reception(p.offline_reception).map_err(|_|INVALID)?;
         let profile=profile.with_client_ex(p.client_ex).map_err(|_|INVALID)?;
@@ -519,11 +520,13 @@ struct PrivateDomainFilter<'a> { mode: &'static str, values: &'a [Vec<u8>] }
 struct PrivateNativeReceivers<'a> { direct_domains: Option<PrivateDomainFilter<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     invite_notifications: Option<&'a super::native_invite_notifications::NativeInviteConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    im_messages: Option<&'a super::im_delivery::NativeImConfig>,
 }
 fn private_native_receivers(config: &Option<super::native_receiver::NativeReceiverConfig>) -> Option<PrivateNativeReceivers<'_>> {
     config.as_ref().map(|config| PrivateNativeReceivers { direct_domains: config.direct_domains.as_ref().map(|filter| PrivateDomainFilter {
         mode: match filter.mode { super::native_receiver::DomainMode::DenyList => "deny_list", super::native_receiver::DomainMode::AllowList => "allow_list" }, values: &filter.values,
-    }), invite_notifications: config.invite_notifications.as_ref() })
+    }), invite_notifications: config.invite_notifications.as_ref(), im_messages: config.im_messages.as_ref() })
 }
 #[derive(Serialize)]
 pub(super) struct PrivateProfileRef<'a> {

@@ -4,7 +4,7 @@ use n::{account_runtime::AccountManager,account_test_support::TempDatabase,accou
 use super::io::Peer;
 async fn bounded<F:std::future::Future>(future:F)->F::Output{tokio::time::timeout(Duration::from_secs(12),future).await.expect("original account Alive fixture budget")}
 fn config(root:&str,port:u16,alive_port:u16,approved:bool)->AccountConfig{
-    let mut config=bootstrap_account_config(root,port);config.profile.incoming=None;config.profile.native_receivers=Some(NativeReceiverConfig{direct_domains:None,invite_notifications:None});config.profile.client_ex=true;
+    let mut config=bootstrap_account_config(root,port);config.profile.incoming=None;config.profile.native_receivers=Some(NativeReceiverConfig{im_messages:None,direct_domains:None,invite_notifications:None});config.profile.client_ex=true;
     config.profile.account_alive=Some(policy_config(alive_port,approved));config
 }
 fn main_check_request(id:i32)->Vec<u8>{

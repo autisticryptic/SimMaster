@@ -13,6 +13,8 @@ use super::super::{
 mod notification_rejection;
 #[path = "native_invite_protocol_tests.rs"]
 mod native_invites;
+#[path = "im_protocol_tests.rs"]
+mod im_runtime;
 
 fn owner() -> AttemptOwner {
     let mut session = HostingSession::new("fixture-client-ex-line".into());

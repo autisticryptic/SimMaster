@@ -100,7 +100,7 @@ impl ClientExRegistration {
 }
 
 pub(super) struct ClientExAction { pub result: RpcBytes, pub notice: Option<OwnedClientExNotice>,
-    pub invite: Option<super::native_invite_notifications::InviteData> }
+    pub invite: Option<super::native_invite_notifications::InviteData>, pub im: Option<Box<super::im_delivery::ImNotice>> }
 pub(super) struct ClientExDispatcher {
     owner: AttemptOwner,
     scope: RpcConnectionScope,
@@ -109,6 +109,7 @@ pub(super) struct ClientExDispatcher {
     token: Zeroizing<Vec<u8>>,
     native: Option<super::native_receiver::NativeReceiverBinding>,
     alive:Option<std::sync::Arc<super::alive_session::AliveLink>>,
+    im:Option<std::sync::Arc<super::im_delivery::ImBinding>>,
 }
 impl fmt::Debug for ClientExDispatcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("ClientExDispatcher(<redacted>)") }
@@ -129,25 +130,29 @@ impl ClientExDispatcher {
             return Err(CodecError::TooLarge);
         }
         Ok(Self { owner, scope, object: Zeroizing::new(binding.object_id.to_vec()),
-            domain: Zeroizing::new(binding.domain.to_vec()), token: Zeroizing::new(token.to_vec()), native: None,alive:None })
+            domain: Zeroizing::new(binding.domain.to_vec()), token: Zeroizing::new(token.to_vec()), native: None,alive:None,im:None })
     }
     pub(super) fn for_native_client(owner: AttemptOwner, scope: RpcConnectionScope, policy: std::sync::Arc<super::native_receiver::NativeReceiverPolicy>, token: &[u8])
         -> Result<Self, CodecError> {
         if token.is_empty() || token.len() > MAX_FIELD_BYTES { return Err(CodecError::InvalidField); }
         let native = super::native_receiver::NativeReceiverBinding::original(owner.clone(), scope.clone(), policy)?;
         Ok(Self { owner, scope, object: Zeroizing::new(super::native_receiver::MESSAGE_OBJECT.to_vec()), domain: Zeroizing::new(Vec::new()),
-            token: Zeroizing::new(token.to_vec()), native: Some(native),alive:None })
+            token: Zeroizing::new(token.to_vec()), native: Some(native),alive:None,im:None })
     }
     pub(super) fn with_alive(mut self,alive:std::sync::Arc<super::alive_session::AliveLink>)->Result<Self,CodecError>{
         if self.alive.is_some()||!alive.matches(&self.owner,&self.scope)||!alive.current_token(&self.token){return Err(CodecError::InvalidField);}
         self.alive=Some(alive);Ok(self)
+    }
+    pub(super) fn with_im(mut self,im:Option<std::sync::Arc<super::im_delivery::ImBinding>>)->Result<Self,CodecError>{
+        if self.im.is_some()||im.as_ref().is_some_and(|binding|self.native.is_none()||!binding.matches(&self.owner,&self.scope)){return Err(CodecError::InvalidField);}
+        self.im=im;Ok(self)
     }
     pub(super) fn matches_binding(&self, binding: &IncomingBinding<'_>) -> bool {
         self.native.is_none() && self.object.as_slice() == binding.object_id && self.domain.as_slice() == binding.domain
     }
     pub(super) fn captured_copy(&self) -> Self {
         Self { owner: self.owner.clone(), scope: self.scope.clone(), object: Zeroizing::new(self.object.to_vec()),
-            domain: Zeroizing::new(self.domain.to_vec()), token: Zeroizing::new(self.token.to_vec()), native: self.native.clone(),alive:self.alive.clone() }
+            domain: Zeroizing::new(self.domain.to_vec()), token: Zeroizing::new(self.token.to_vec()), native: self.native.clone(),alive:self.alive.clone(),im:self.im.clone() }
     }
     pub(super) fn on_direct(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, request: &RpcRequest<'_>)
         -> Result<Option<ClientExAction>, CodecError> {
@@ -171,6 +176,7 @@ impl ClientExDispatcher {
         let mut reader = Reader::versioned(arguments)?;
         let mut notify_accepted = true;
         let mut invite = None;
+        let mut im = None;
         let control = match kind {
             ClientExKind::CheckAlive => None,
             ClientExKind::NotifyCalls => {
@@ -182,10 +188,14 @@ impl ClientExDispatcher {
                     // an explicit negative result, not a successful poll hint,
                     // fabricated user event, or loss of the authenticated link.
                     notify_accepted = false;
-                    // Only explicitly installed native Invite handling retains
-                    // the original RPC reply for the actual call consumer.
-                    // Message remains on the legacy NACK path until its IM
-                    // box/payload consumer exists. No command becomes a hint.
+                    // Explicit native consumers retain original replies; no
+                    // supported business command becomes a poll/readiness hint.
+                    if properties.iter().any(|p| p.key == b"Notify.Command" && p.value == b"Message")
+                        && property(b"token") == Some(self.token.as_slice()) {
+                        if let Some(binding)=&self.im {
+                            im=Some(Box::new(super::im_delivery::ImNotice::notification(binding.clone(),notification_id,&properties,std::time::Instant::now())?));
+                        }
+                    }
                     if properties.iter().any(|p| p.key == b"Notify.Command" && p.value == b"Invite")
                         && property(b"token") == Some(self.token.as_slice()) {
                         if let Some(config) = self.native.as_ref().and_then(|native| native.policy().invite_notifications()) {
@@ -220,7 +230,7 @@ impl ClientExDispatcher {
             }
             Some(OwnedClientExNotice { owner: self.owner.clone(), scope: self.scope.clone(), control })
         } else { None };
-        Ok(Some(ClientExAction { result, notice, invite }))
+        Ok(Some(ClientExAction { result, notice, invite, im }))
     }
 }
 fn validate_metadata(metadata: &[RpcProperty<'_>]) -> Result<(), CodecError> {

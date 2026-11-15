@@ -167,6 +167,7 @@ struct ManagedRun {
     calls: Option<Arc<CallService>>,
     controller: AsyncMutex<HostingController>,
     backend: Arc<NativeHostingBackend>,
+    im_gate: Arc<super::im_inbox::ImReceiptGate>,
     accepting: AtomicBool,
     stopping: AtomicBool,
     error: Mutex<Option<&'static str>>,
@@ -213,6 +214,7 @@ impl ManagedRun {
     }
     fn retire(&self) {
         self.accepting.store(false, Ordering::SeqCst);
+        self.im_gate.retire();
         self.cleanup_changed.notify_waiters();
         *lock(&self.messaging_readiness) = None;
         if let Some(calls) = &self.calls { calls.retire(); }
@@ -495,6 +497,12 @@ impl AccountManager {
         self.metadata(line_id)?;
         self.database.with_conn(|conn|super::account_notifications::metadata(conn,line_id,limit))
     }
+    pub fn im_messages(&self,line_id:&str,limit:usize)->Result<Vec<super::im_inbox::ImMessageView>,&'static str>{
+        self.database.with_conn(|conn|super::im_inbox::list(conn,line_id,limit))
+    }
+    pub fn delete_im_message(&self,line_id:&str,id:i64)->Result<bool,&'static str>{
+        self.database.with_conn(|conn|super::im_inbox::delete(conn,line_id,id))
+    }
     pub fn call_notification_status(&self,line_id:&str,limit:usize)->Result<Vec<super::account_call_notifications::CallNoticeStatus>,&'static str>{
         self.metadata(line_id)?;self.database.with_conn(|conn|super::account_call_notifications::metadata(conn,line_id,limit))
     }
@@ -593,6 +601,7 @@ impl AccountManager {
             cleanup_work: AsyncMutex::new(()), cleanup_changed: tokio::sync::Notify::new(), cleanup_task: AsyncMutex::new(None),
             manual_cleanup: AtomicBool::new(false), terminal_observation: Mutex::new(None), cleanup_error: Mutex::new(None),
             messaging_readiness: Mutex::new(None), calls, controller: AsyncMutex::new(controller), backend,
+            im_gate:super::im_inbox::ImReceiptGate::fresh(),
             accepting: AtomicBool::new(true), stopping: AtomicBool::new(false), error: Mutex::new(None), task: AsyncMutex::new(None) });
         // Retain the owning backend BEFORE any await that can create IO. A
         // cancelled HTTP future leaves this same run available for stop/retry.
@@ -654,6 +663,7 @@ impl AccountManager {
         // Original retained resource owner, not current database configuration.
         run.stopping.store(true, Ordering::SeqCst);
         run.accepting.store(false, Ordering::SeqCst);
+        run.im_gate.retire();
         run.cleanup_changed.notify_waiters();
         let mut retirement = Retirement::new(run.clone());
         let calls_error = if let Some(calls) = &run.calls { calls.close().await.err() } else { None };
@@ -879,6 +889,7 @@ async fn handle_message(run: &ManagedRun, controller: &mut HostingController, de
 async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Receiver<BackendEvent>) {
     let mut pending = VecDeque::new();
     let mut offline = offline_reception::State::default();
+    let mut im = im::State::default();
     let mut timer = tokio::time::interval(Duration::from_millis(250));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -920,10 +931,15 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                                 if let Some(calls) = &run.calls { if let Err(code) = calls.start(&owner,&scope).await { *lock(&run.error)=Some(code);run.retire(); } }
                                 offline.hosted(&run);
                                 offline_reception::drive(&run, &controller, &mut offline).await;
+                                if let Err(code)=im::drive(&run,controller.phase(),&mut im).await{*lock(&run.error)=Some(code);run.retire();}
                             },
                             Ok(_) => {},
                             Err(reason) => { *lock(&run.error) = Some(controller_error(reason)); run.retire(); }
                         }
+                    }
+                    BackendEventPayload::Im(delivery)=>{
+                        controller.tick(unix_now(),Instant::now());
+                        if let Err(code)=im::delivery(&run,controller.phase(),&mut im,delivery).await{*lock(&run.error)=Some(code);run.retire();}
                     }
                     BackendEventPayload::InviteNotification(invite) => {
                         controller.tick(unix_now(), Instant::now());
@@ -994,7 +1010,7 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
             }
             _ = timer.tick() => {
                 let Some(run) = run.upgrade() else { return; };
-                if !run.accepting.load(Ordering::SeqCst) { pending.clear(); offline.clear(); continue; }
+                if !run.accepting.load(Ordering::SeqCst) { pending.clear(); offline.clear(); im.clear(); continue; }
                 let mut controller = run.controller.lock().await;
                 if run.accepting.load(Ordering::SeqCst) {
                     if let Err(code) = run.configuration_current() {
@@ -1006,13 +1022,16 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                     if run.accepting.load(Ordering::SeqCst) {
                         if let Some(message) = pending.pop_front() { handle_message(&run, &mut controller, message, &mut pending).await; }
                         offline_reception::drive(&run, &controller, &mut offline).await;
-                    } else { pending.clear(); offline.clear(); }
+                        if let Err(code)=im::drive(&run,controller.phase(),&mut im).await{*lock(&run.error)=Some(code);run.retire();}
+                    } else { pending.clear(); offline.clear(); im.clear(); }
                 }
             }
         }
     }
 }
 
+#[path = "account_im.rs"]
+mod im;
 #[path = "offline_reception.rs"]
 mod offline_reception;
 

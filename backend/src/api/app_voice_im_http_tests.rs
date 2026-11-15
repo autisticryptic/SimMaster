@@ -1,0 +1,30 @@
+// Actions-only IM API authentication/metadata/delete; no SDK or modem actions.
+fn im_runtime_config_json(root:&str)->serde_json::Value{
+    use crate::connectivity::app_voice::providers::jegotrip as n;
+    let mut cfg=n::account_config::tests::native_fixture(root,"127.0.0.1",1);cfg.credentials.sdk.expires_at_unix_seconds=None;cfg.profile.incoming=None;cfg.profile.client_ex=true;
+    cfg.profile.native_receivers=Some(n::native_receiver::NativeReceiverConfig{direct_domains:None,invite_notifications:None,im_messages:Some(n::im_delivery::NativeImConfig{notification_timeout_ms:3000})});
+    serde_json::from_slice::<serde_json::Value>(&cfg.encode_private().unwrap()).unwrap()["config"].clone()
+}
+#[tokio::test]
+async fn im_message_routes_require_auth_and_strict_bounded_inputs_without_echo_or_sdk_start(){
+    let state=build_test_router().await.expect("Actions private D-Bus required; no skip");let served=serve(state.router.clone()).await;let base="/api/non-3gpp/accounts/app-account-0123456789abcdef0123456789abcdef/im-messages";
+    for(method,path)in[(reqwest::Method::GET,base.to_owned()),(reqwest::Method::DELETE,format!("{base}/1"))]{let(status,_,body)=account_request(&served,method,&path,None,None).await;assert_eq!(status,StatusCode::UNAUTHORIZED);no_secrets(&body);}
+    let cookie=authenticate(&served).await;for tail in ["?limit=0","?limit=129","?limit=1&token=fixture-must-not-echo"]{let(status,headers,body)=account_request(&served,reqwest::Method::GET,&format!("{base}{tail}"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);}
+    for id in ["0","-1","9223372036854775808","fixture-must-not-echo","01"]{let(status,headers,body)=account_request(&served,reqwest::Method::DELETE,&format!("{base}/{id}"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);assert!(!body.contains("fixture-must-not-echo"));}
+    assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+}
+#[tokio::test]
+async fn im_configuration_requires_native_clientex_but_not_call_media_or_an_implicit_business_write(){
+    let state=build_test_router().await.expect("Actions private D-Bus required; no skip");let served=serve(state.router.clone()).await;let cookie=authenticate(&served).await;let cert=Certificates::generate("IP:127.0.0.1");let good=im_runtime_config_json(&cert.root);let mut bad=good.clone();bad["profile"]["client_ex"]=serde_json::json!(false);
+    let(status,headers,body)=account_request(&served,reqwest::Method::POST,"/api/non-3gpp/accounts",Some(serde_json::json!({"provider_id":"app_voice","config":bad})),Some(&cookie)).await;assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);
+    let(status,headers,body)=account_request(&served,reqwest::Method::POST,"/api/non-3gpp/accounts",Some(serde_json::json!({"provider_id":"app_voice","config":good})),Some(&cookie)).await;assert_eq!(status,StatusCode::CREATED);no_store(&headers);no_secrets(&body);let line=created_line(&body);let account=state.app.app_accounts.get(&line,100).await.unwrap();assert!(!account.incoming_call_ready&&!account.incoming_message_ready&&!account.outbound_authorized&&!account.io_cleanup_required);
+    let(status,headers,body)=account_request(&served,reqwest::Method::GET,&format!("/api/non-3gpp/accounts/{line}/im-messages?limit=16"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);no_store(&headers);no_secrets(&body);assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"],serde_json::json!([]));
+}
+#[tokio::test]
+async fn im_http_projection_is_distinct_from_sms_and_delete_keeps_only_private_receipt_tombstone(){
+    let state=build_test_router().await.expect("Actions private D-Bus required; no skip");let served=serve(state.router.clone()).await;let cookie=authenticate(&served).await;let cert=Certificates::generate("IP:127.0.0.1");let(status,_,body)=account_request(&served,reqwest::Method::POST,"/api/non-3gpp/accounts",Some(serde_json::json!({"provider_id":"app_voice","config":im_runtime_config_json(&cert.root)})),Some(&cookie)).await;assert_eq!(status,StatusCode::CREATED);let line=created_line(&body);
+    let id=state.app.database.with_conn(|conn|{conn.execute("INSERT INTO app_voice_im_messages(line_id,revision,identity_key,box_id,box_kind,message_index,fingerprint,original_time,body,text,sender,attachment_count,created_at) VALUES(?1,1,?2,?3,'p2p',?4,?5,0,?6,'visible IM text',?7,1,'2026-01-01T00:00:00Z')",rusqlite::params![line,vec![7u8;32],b"P2P/1_2".as_slice(),i64::MAX,vec![8u8;32],b"private-raw".as_slice(),b"private-sender".as_slice()]).map_err(|_|"fixture")?;Ok(conn.last_insert_rowid())}).unwrap();
+    let path=format!("/api/non-3gpp/accounts/{line}/im-messages");let(status,headers,body)=account_request(&served,reqwest::Method::GET,&path,None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);no_store(&headers);let json:serde_json::Value=serde_json::from_str(&body).unwrap();assert_eq!(json["data"][0]["text"],"visible IM text");assert_eq!(json["data"][0]["message_index"],"9223372036854775807");for hidden in ["private-raw","private-sender","P2P/1_2","identity_key","fingerprint"]{assert!(!body.contains(hidden));}
+    let(status,headers,body)=account_request(&served,reqwest::Method::DELETE,&format!("{path}/{id}"),None,Some(&cookie)).await;assert_eq!(status,StatusCode::OK);no_store(&headers);assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"],true);let(_,_,body)=account_request(&served,reqwest::Method::GET,&path,None,Some(&cookie)).await;assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"],serde_json::json!([]));
+    let remaining:(i64,i64,i64)=state.app.database.with_conn(|conn|conn.query_row("SELECT deleted,length(body)+length(text)+length(sender),length(fingerprint) FROM app_voice_im_messages WHERE id=?1",[id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|_|"fixture")).unwrap();assert_eq!(remaining,(1,0,32));assert!(state.app.app_accounts.messages(&line,16).unwrap().is_empty());
+}

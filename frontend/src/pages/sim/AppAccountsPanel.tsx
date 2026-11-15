@@ -3,6 +3,7 @@ import { Alert, Box, Button, Chip, Paper, Stack, Typography } from '@mui/materia
 import { api, type AppAccountView, type AppLoginAttempt, type JegotripAccountView, type JegotripConfigurationView } from '../../api/current'
 import AppCallNotificationsPane from './AppCallNotificationsPane'
 import AppInviteNotificationsPane from './AppInviteNotificationsPane'
+import AppImMessagesPane from './AppImMessagesPane'
 import JegotripConfigurationDialog from './JegotripConfigurationDialog'
 import { appBusinessLabel, appLoginError, appLoginPhase } from '../../policies/appLogin'
 
@@ -88,6 +89,7 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
                 {account.last_error && <Typography variant="caption" display="block" color="warning.main">{appLoginError(account.last_error)}</Typography>}
                 <AppCallNotificationsPane lineId={account.line_id} />
                 <AppInviteNotificationsPane lineId={account.line_id} enabled={account.incoming_call_ready} />
+                <AppImMessagesPane lineId={account.line_id} />
               </Box>
               <Chip size="small" color={account.incoming_message_ready ? 'success' : 'default'} label={account.incoming_message_ready ? '短信就绪' : '短信未就绪'} />
               <Chip size="small" color={account.incoming_call_ready ? 'success' : 'default'} label={account.incoming_call_ready ? '来电就绪' : '来电未就绪'} />

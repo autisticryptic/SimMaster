@@ -24,6 +24,9 @@ pub struct NativeReceiverConfig {
     /// Explicit original Invite consumer; absent retains the old known NACK.
     #[serde(default)]
     pub invite_notifications: Option<super::native_invite_notifications::NativeInviteConfig>,
+    /// Opt-in original IM reception, distinct from Sip.Request SMS.
+    #[serde(default)]
+    pub im_messages: Option<super::im_delivery::NativeImConfig>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,7 +43,8 @@ impl fmt::Debug for DirectDomainConfig {
 }
 
 pub(super) struct NativeReceiverPolicy { mode: DomainMode, domains: Vec<Vec<u8>>, retained: usize,
-    invite_notifications: Option<super::native_invite_notifications::NativeInviteConfig> }
+    invite_notifications: Option<super::native_invite_notifications::NativeInviteConfig>,
+    im_messages: Option<super::im_delivery::NativeImConfig> }
 impl Drop for NativeReceiverPolicy { fn drop(&mut self) { self.domains.zeroize(); } }
 impl fmt::Debug for NativeReceiverPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("NativeReceiverPolicy(<redacted>)") }
@@ -61,10 +65,12 @@ impl NativeReceiverPolicy {
             if values[..index].contains(value) { return Err(CodecError::DuplicateKey); }
         }
         if let Some(invites) = config.invite_notifications { invites.timeout()?; retained = retained.checked_add(8).ok_or(CodecError::TooLarge)?; }
+        if let Some(im) = config.im_messages { im.timeout()?; retained = retained.checked_add(8).ok_or(CodecError::TooLarge)?; }
         if retained > MAX_STREAM_BYTES { return Err(CodecError::TooLarge); }
-        Ok(Arc::new(Self { mode, domains: values.to_vec(), retained, invite_notifications: config.invite_notifications }))
+        Ok(Arc::new(Self { mode, domains: values.to_vec(), retained, invite_notifications: config.invite_notifications, im_messages: config.im_messages }))
     }
     pub(super) fn invite_notifications(&self) -> Option<super::native_invite_notifications::NativeInviteConfig> { self.invite_notifications }
+    pub(super) fn im_messages(&self) -> Option<super::im_delivery::NativeImConfig> { self.im_messages }
     pub(super) fn retained_bytes(&self) -> usize { self.retained }
     /// The caller must first check its private original-scope request brand.
     /// No raw HTTP/notification payload or bare decoder can mint that brand.
@@ -103,6 +109,7 @@ impl fmt::Debug for NativeReceiverSetup { fn fmt(&self, f: &mut fmt::Formatter<'
 impl NativeReceiverSetup {
     pub(super) fn capture(policy: Arc<NativeReceiverPolicy>, client_ex: bool, routing: Option<&[RpcProperty<'_>]>) -> Result<Arc<Self>, CodecError> {
         if policy.invite_notifications().is_some() { return Err(CodecError::InvalidField); }
+        if policy.im_messages().is_some() && !client_ex { return Err(CodecError::InvalidField); }
         let mut bytes = policy.retained_bytes();
         if let Some(routing) = routing {
             super::call_control::validate_routing(routing)?;
@@ -113,6 +120,7 @@ impl NativeReceiverSetup {
     }
     pub(super) fn capture_native_control(policy:Arc<NativeReceiverPolicy>,client_ex:bool)->Result<Arc<Self>,CodecError>{
         if policy.invite_notifications().is_some() && !client_ex { return Err(CodecError::InvalidField); }
+        if policy.im_messages().is_some() && !client_ex { return Err(CodecError::InvalidField); }
         let bytes=policy.retained_bytes().checked_add(super::call_control::NATIVE_CONTROL_BYTES).ok_or(CodecError::TooLarge)?;
         if bytes>MAX_STREAM_BYTES{return Err(CodecError::TooLarge);}
         Ok(Arc::new(Self{policy,client_ex,native_call_control:true,control:None,bytes}))

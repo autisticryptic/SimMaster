@@ -6,7 +6,7 @@ use n::native_receiver::{NativeReceiverConfig, DirectDomainConfig, DomainMode};
 mod account;
 #[path = "native_call_runtime_tests.rs"]
 mod default_calls;
-fn config() -> NativeReceiverConfig { NativeReceiverConfig { direct_domains: None, invite_notifications: None } }
+fn config() -> NativeReceiverConfig { NativeReceiverConfig { im_messages: None, direct_domains: None, invite_notifications: None } }
 fn native_profile(root: &str, port: u16, filter: &NativeReceiverConfig) -> RuntimeProfile {
     RuntimeProfile::supplied_common(inputs(), common(root, port)).unwrap().with_native_receivers(Some(filter)).unwrap().with_client_ex(true).unwrap()
 }
@@ -67,7 +67,7 @@ async fn authenticated_native_batch_without_domain_keeps_direct_allowlist_separa
         }
         acked.send(()).unwrap(); while peer.next().await.is_some() {}
     });
-    let filter = NativeReceiverConfig { direct_domains: Some(DirectDomainConfig { mode: DomainMode::AllowList, values: vec![b"only-direct-domain".to_vec()] }), invite_notifications: None };
+    let filter = NativeReceiverConfig { im_messages: None, direct_domains: Some(DirectDomainConfig { mode: DomainMode::AllowList, values: vec![b"only-direct-domain".to_vec()] }), invite_notifications: None };
     let (backend, mut events) = NativeHostingBackend::new(native_profile(&cert.root, port, &filter), Arc::new(LegacyDenied { calls: AtomicUsize::new(0) }));
     let original = owner(); backend.login(original.clone(), request(&cert.root)).await.unwrap(); assert!(matches!(event(&mut events).await.payload, BackendEventPayload::Callback(_)));
     let scope = backend.original_scope(&original).unwrap(); let message = event(&mut events).await;
@@ -83,7 +83,7 @@ async fn native_direct_allowlist_rejection_closes_original_peer_without_sms_or_t
         wait.await.unwrap(); peer.send(&[direct(1, n::rpc_incoming::ONLINE_MESSAGE_METHOD.as_bytes(), &sms_args(), b"MessageReceiver", None)]).await;
         while let Some(packet) = peer.next().await { assert_ne!(packet[0], 1, "no fabricated accepted SMS reply"); }
     });
-    let filter = NativeReceiverConfig { direct_domains: Some(DirectDomainConfig { mode: DomainMode::AllowList, values: vec![b"required".to_vec()] }), invite_notifications: None };
+    let filter = NativeReceiverConfig { im_messages: None, direct_domains: Some(DirectDomainConfig { mode: DomainMode::AllowList, values: vec![b"required".to_vec()] }), invite_notifications: None };
     let legacy = Arc::new(LegacyDenied { calls: AtomicUsize::new(0) }); let (backend, mut events) = NativeHostingBackend::new(native_profile(&cert.root, port, &filter), legacy.clone());
     let original = owner(); backend.login(original.clone(), request(&cert.root)).await.unwrap(); event(&mut events).await; go.send(()).unwrap();
     assert!(matches!(event(&mut events).await.payload, BackendEventPayload::Terminal(_)));

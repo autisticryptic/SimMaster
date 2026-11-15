@@ -271,10 +271,17 @@ impl ArcRpcSession {
         if !self.native_receiver_scope() { return Err(CodecError::InvalidField); }
         super::call_binding::CallDispatcher::for_native_client(self.owner.clone(), self.connection.clone(), policy)
     }
+    pub(super) fn native_im_binding(&self, policy: Arc<super::native_receiver::NativeReceiverPolicy>) -> Result<Option<Arc<super::im_delivery::ImBinding>>, CodecError> {
+        if !self.native_receiver_scope() { return Err(CodecError::InvalidField); }
+        if policy.im_messages().is_none() { return Ok(None); }
+        let authentication = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
+        super::im_delivery::ImBinding::authenticated(self.owner.clone(),self.connection.clone(),policy,&authentication.user_id,&authentication.selected_session_id).map(Some)
+    }
     pub(super) fn native_client_ex_dispatcher(&self, policy: Arc<super::native_receiver::NativeReceiverPolicy>) -> Result<super::rpc_client_ex::ClientExDispatcher, CodecError> {
         if !self.native_receiver_scope() { return Err(CodecError::InvalidField); }
         let authentication = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
-        super::rpc_client_ex::ClientExDispatcher::for_native_client(self.owner.clone(), self.connection.clone(), policy, &authentication.token)?.with_alive(self.alive.clone())
+        let im = self.native_im_binding(policy.clone())?;
+        super::rpc_client_ex::ClientExDispatcher::for_native_client(self.owner.clone(), self.connection.clone(), policy, &authentication.token)?.with_alive(self.alive.clone())?.with_im(im)
     }
     pub(super) fn can_arm_native_receivers(&self) -> bool {
         self.common_transport_claimed && self.phase() == ArcPhase::Initial && self.pending.is_empty()

@@ -46,6 +46,7 @@ pub enum OfflineEvent {
     BatchRetirement(super::batch_scheduler::BatchReplayRetirement),
     Call(IncomingCallDelivery),
     InviteNotification(Box<super::native_invite_notifications::IncomingInviteNotification>),
+    Im(Box<super::im_delivery::IncomingImDelivery>),
     CallOperation(OwnedCallOperationReply),
     Outgoing(OwnedCallPackets),
     Control(super::transport_packets::CallKind),
@@ -64,6 +65,9 @@ pub struct OfflineBackend {
     dispatcher: Option<IncomingDispatcher>,
     call_dispatcher:Option<CallDispatcher>,
     client_ex: Option<super::rpc_client_ex::ClientExDispatcher>,
+    im_binding: Option<std::sync::Arc<super::im_delivery::ImBinding>>,
+    im_pending:BTreeMap<(u32,i32),([u8;32],std::time::Instant)>,
+    im_completed:BTreeMap<(u32,i32),(super::im_delivery::ImReplyTicket,super::im_inbox::CommittedIm)>,
     call_pending:BTreeMap<(u32,i32),(CallNoticeKind,NativeCallId)>,
     invite_pending:BTreeMap<(u32,i32),(u64,[u8;32],std::time::Instant)>,
     invite_completed:BTreeMap<(u32,i32),super::native_invite_notifications::InviteReplyTicket>,
@@ -83,7 +87,7 @@ impl OfflineBackend {
     pub fn new(owner: AttemptOwner) -> Self {
         let mut protocol = ArcProtocol::new(owner);
         let tracker = protocol.take_hosting_tracker().expect("fresh ARC tracker");
-        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,client_ex:None,call_pending:BTreeMap::new(),invite_pending:BTreeMap::new(),invite_completed:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new() }
+        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,client_ex:None,im_binding:None,im_pending:BTreeMap::new(),im_completed:BTreeMap::new(),call_pending:BTreeMap::new(),invite_pending:BTreeMap::new(),invite_completed:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new() }
     }
     pub fn phase(&self) -> ArcPhase { self.protocol.phase() }
     pub(super) fn is_pending(&self, id: i32) -> bool { self.protocol.is_pending(id) }
@@ -127,7 +131,7 @@ impl OfflineBackend {
         self.protocol.close(); if let Some(s) = &mut self.scheduler { s.close(); }
         self.tracker.retire_all();
         self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.invite_pending.clear();self.invite_completed.clear();self.call_acks.clear();self.offline_hints.clear();
-        self.swaps.clear();self.dispatcher=None;
+        self.swaps.clear();self.dispatcher=None;self.im_binding=None;self.im_pending.clear();self.im_completed.clear();
     }
     pub(super) fn configure_call_control(&mut self,routing:&[RpcProperty<'_>])->Result<(),ProtocolError>{
         if self.call_dispatcher.is_none()||self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField.into());}
@@ -138,7 +142,7 @@ impl OfflineBackend {
     pub fn prepare_login(&mut self, inputs: ArcLoginInputs<'_>, routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_login(inputs, routing) }
     pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
-        let packets=self.protocol.prepare_logout(routing)?;self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.invite_pending.clear();self.invite_completed.clear();self.call_acks.clear();self.offline_hints.clear();Ok(packets)
+        let packets=self.protocol.prepare_logout(routing)?;self.im_binding=None;self.im_pending.clear();self.im_completed.clear();self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.invite_pending.clear();self.invite_completed.clear();self.call_acks.clear();self.offline_hints.clear();Ok(packets)
     }
     pub fn prepare_bootstrap(&mut self, key: &[u8], routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_bootstrap(key, routing) }
@@ -176,6 +180,7 @@ impl OfflineBackend {
         self.dispatcher = Some(self.protocol.native_message_dispatcher()?);
         self.call_dispatcher = Some(self.protocol.native_call_dispatcher()?);
         self.client_ex = self.protocol.captured_client_ex();
+        self.im_binding = self.protocol.captured_im_binding();
         self.scheduler = Some(self.protocol.take_batch_scheduler(incarnation)?);
         Ok(())
     }
@@ -214,7 +219,13 @@ impl OfflineBackend {
         let deadline = self.invite_completed.values().map(|ticket| ticket.completion_deadline()).min();
         (claims, deadline)
     }
+    pub(super) fn im_write_guard(&self)->(Vec<std::sync::Arc<super::im_inbox::ImReceiptGate>>,Option<std::time::Instant>){
+        (self.im_completed.values().map(|(_,proof)|proof.gate()).collect(),self.im_completed.values().map(|(ticket,_)|ticket.completion_deadline()).min())
+    }
     pub fn prepare_swap(&mut self, now_ms: u64, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
+        if self.im_completed.values().any(|(ticket,proof)|!proof.authorizes(ticket,std::time::Instant::now())){
+            self.close();return Err(CodecError::InvalidField.into());
+        }
         // A queued positive result is not a peer ACK. Keep its ORIGINAL
         // consumer/deadline until exact result-bearing epoch retirement. Never
         // replace an unknown submitted positive with a new negative result.
@@ -262,6 +273,7 @@ impl OfflineBackend {
         let client_ex = &self.client_ex;
         let invite_pending = &mut self.invite_pending;
         let invite_completed = &mut self.invite_completed;
+        let im_binding=&self.im_binding;let im_pending=&mut self.im_pending;let im_completed=&mut self.im_completed;
         let result = self.protocol.on_plaintext_packet(owner, scope, packet, |event| {
             match event {
                 ProtocolEvent::Reply(ArcReply::Login(callback)) | ProtocolEvent::Reply(ArcReply::Failure(callback)) =>
@@ -282,6 +294,15 @@ impl OfflineBackend {
                                 Ok(Some(Some(action))) => action,
                                 _ => { processing_error = Some(CodecError::InvalidField.into()); return; }
                             };
+                            if let Some(notice)=action.im{
+                                let key=(incoming.ticket().peer_incarnation(),incoming.ticket().sequence());
+                                if im_pending.len()>=super::rpc_stream::MAX_MAP_ENTRIES||im_pending.contains_key(&key){processing_error=Some(CodecError::TooLarge.into());return;}
+                                let delivery=match super::im_delivery::IncomingImDelivery::batch(*notice,incoming.into_ticket()){
+                                    Ok(delivery)=>delivery,Err(error)=>{processing_error=Some(error.into());return;}
+                                };
+                                im_pending.insert(key,(*delivery.ticket().fingerprint(),delivery.ticket().deadline()));
+                                events.push(OfflineEvent::Im(Box::new(delivery)));continue;
+                            }
                             if let Some(data) = action.invite {
                                 let key = (incoming.ticket().peer_incarnation(), incoming.ticket().sequence());
                                 if invite_pending.len() >= super::native_invite_notifications::MAX_INVITE_HOLDERS || invite_pending.contains_key(&key) {
@@ -343,6 +364,18 @@ impl OfflineBackend {
                             processing_error = Some(super::transport_packets::TransportError::UnsupportedKind.into());
                             return;
                         }
+                        if let Some(binding)=im_binding{
+                            let notice=match super::im_delivery::batch_message(binding,&incoming){Ok(notice)=>notice,Err(error)=>{processing_error=Some(error.into());return;}};
+                            if let Some(notice)=notice{
+                                let key=(incoming.ticket().peer_incarnation(),incoming.ticket().sequence());
+                                if im_pending.len()>=super::rpc_stream::MAX_MAP_ENTRIES||im_pending.contains_key(&key){processing_error=Some(CodecError::TooLarge.into());return;}
+                                let delivery=match super::im_delivery::IncomingImDelivery::batch(notice,incoming.into_ticket()){
+                                    Ok(delivery)=>delivery,Err(error)=>{processing_error=Some(error.into());return;}
+                                };
+                                im_pending.insert(key,(*delivery.ticket().fingerprint(),delivery.ticket().deadline()));
+                                events.push(OfflineEvent::Im(Box::new(delivery)));continue;
+                            }
+                        }
                         let message = match dispatcher.as_ref().map(|d| d.on_batch_request(&incoming)).transpose() {
                             Ok(Some(value)) => value, Ok(None) => None,
                             Err(error) => { processing_error = Some(error.into()); return; }
@@ -358,7 +391,7 @@ impl OfflineBackend {
                         }
                     }
                     if let Some(retirement) = retirement {
-                        for sequence in retirement.acknowledged() { invite_completed.remove(&(retirement.peer_incarnation(), *sequence)); }
+                        for sequence in retirement.acknowledged() { invite_completed.remove(&(retirement.peer_incarnation(), *sequence)); im_completed.remove(&(retirement.peer_incarnation(),*sequence)); }
                         events.push(OfflineEvent::BatchRetirement(retirement));
                     }
                 }
@@ -371,6 +404,7 @@ impl OfflineBackend {
                 ProtocolEvent::Incoming(message) => events.push(OfflineEvent::DirectMessage(message)),
                 ProtocolEvent::IncomingCall(call)=>events.push(OfflineEvent::Call(call)),
                 ProtocolEvent::InviteNotification(invite)=>events.push(OfflineEvent::InviteNotification(invite)),
+                ProtocolEvent::Im(delivery)=>events.push(OfflineEvent::Im(delivery)),
                 ProtocolEvent::ClientEx { reply, notice } => {
                     events.push(OfflineEvent::Outgoing(reply));
                     if let Some(notice) = notice { events.push(OfflineEvent::ClientEx(notice)); }
@@ -393,7 +427,7 @@ impl OfflineBackend {
     }
 
     pub fn complete_message(&mut self, ticket: &ServerRequestTicket, accepted: bool) -> Result<bool, ProtocolError> {
-        if self.call_pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())) || self.offline_hints.contains(&(ticket.peer_incarnation(),ticket.sequence())) || self.invite_pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())) {return Err(CodecError::InvalidField.into());}
+        if self.call_pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())) || self.offline_hints.contains(&(ticket.peer_incarnation(),ticket.sequence())) || self.invite_pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())) || self.im_pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())) {return Err(CodecError::InvalidField.into());}
         let bytes = encode_online_message_result(accepted)?;
         let result = self.scheduler.as_mut().ok_or(CodecError::InvalidField)?
             .complete_server_request(ticket, 0, bytes.expose_to_transport());
@@ -424,6 +458,25 @@ impl OfflineBackend {
     }
     pub fn complete_direct_message(&mut self, ticket: &super::arc_protocol::DirectReplyTicket, accepted: bool)
         -> Result<Option<OwnedCallPackets>, ProtocolError> { self.protocol.complete_incoming(ticket, accepted) }
+    pub(super) fn complete_im(&mut self,ticket:&super::im_delivery::ImReplyTicket,proof:Option<&super::im_inbox::CommittedIm>)->Result<Option<CallCompletion>,ProtocolError>{
+        let scope=self.protocol.connection_scope();if self.phase()!=ArcPhase::Authenticated||!scope.is_open()||scope.session_revoked(){return Ok(None);}
+        if !ticket.matches(&self.tracker.batch_owner()?,&scope){return Ok(None);}
+        if proof.is_some_and(|proof|!proof.authorizes(ticket,std::time::Instant::now())){return Err(CodecError::InvalidField.into());}
+        match ticket.source(){
+            super::im_delivery::ImReplySource::Direct(_)=>self.protocol.complete_im(ticket,proof).map(|reply|reply.map(CallCompletion::Direct)),
+            super::im_delivery::ImReplySource::Batch(inner)=>{
+                let key=(inner.peer_incarnation(),inner.sequence());
+                if self.im_pending.get(&key)!=Some(&(*ticket.fingerprint(),ticket.deadline())){return Ok(None);}
+                if proof.is_some()&&self.im_completed.len()>=super::rpc_stream::MAX_MAP_ENTRIES{return Err(CodecError::TooLarge.into());}
+                let result=encode_online_message_result(proof.is_some())?;
+                if self.scheduler.as_mut().ok_or(CodecError::InvalidField)?.complete_server_request(inner,0,result.expose_to_transport())?{
+                    self.im_pending.remove(&key);if let Some(proof)=proof{self.im_completed.insert(key,(ticket.captured_copy(),proof.captured_copy()));}
+                    Ok(Some(CallCompletion::BatchQueued))
+                }else{Ok(None)}
+            }
+        }
+    }
+
     pub(super) fn complete_invite_notification(&mut self, ticket: &super::native_invite_notifications::InviteReplyTicket, accepted: bool)
         -> Result<Option<CallCompletion>, ProtocolError> {
         let scope = self.protocol.connection_scope();

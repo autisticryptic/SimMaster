@@ -1123,6 +1123,13 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<AppLoginAttempt[]>>('/non-3gpp/app-login/attempts')
   }
 
+  async getAppImMessages(lineId: string) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-messages?limit=16`, { cache: 'no-store', timeoutMs: 10000 })
+  }
+  async deleteAppImMessage(lineId: string, id: number) {
+    return request<ApiResponse<boolean>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-messages/${id}`, { method: 'DELETE', timeoutMs: 10000 })
+  }
+
   async getAppCalls(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/calls`, { cache: 'no-store', timeoutMs: 10000 })
   }

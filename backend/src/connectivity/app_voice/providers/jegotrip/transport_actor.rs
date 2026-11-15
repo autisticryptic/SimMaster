@@ -146,6 +146,7 @@ enum Operation {
     Login(Login, Vec<Property>), Bootstrap(Zeroizing<Vec<u8>>, Vec<Property>), Configure(u32, Option<Binding>), ArmClientEx(Binding), ConfigureClientEx, ConfigureCalls(CallBinding), Logout(Vec<Property>),
     Swap(Vec<Property>, Option<Gateway>), CompleteBatch(ServerRequestTicket, bool), CompleteDirect(DirectReplyTicket, bool), CompleteCall(CallReplyTicket,bool,Vec<Property>),
     CompleteInvite(super::native_invite_notifications::InviteReplyTicket, bool),
+    CompleteIm(Box<(super::im_delivery::ImReplyTicket,Option<super::im_inbox::CommittedIm>)>),
     ArmNativeReceivers(std::sync::Arc<super::native_receiver::NativeReceiverSetup>), ConfigureNativeReceivers(u32),
     GetOffline(i64, Vec<Property>), CompleteOfflineHint(super::rpc_offline::IncomingOfflineHint, bool),
     ConfigureCallControl(Vec<Property>),Call(CallControlTicket,CallOperation,Vec<Property>,oneshot::Sender<Result<OwnedCallOperationReply,RuntimeError>>),
@@ -162,7 +163,7 @@ impl Operation {
             Self::Swap(routing, gateway) => routing.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()
                 + gateway.as_ref().map_or(0, |g| g.uri.len() + g.prefix.len() + g.channel.len() + g.int_code.len() + g.number.len() + g.password.len()
                     + g.metadata.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()),
-            Self::ConfigureClientEx | Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) | Self::CompleteOfflineHint(_, _) | Self::CompleteInvite(_, _) => 0,
+            Self::ConfigureClientEx | Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) | Self::CompleteOfflineHint(_, _) | Self::CompleteInvite(_, _) | Self::CompleteIm(_) => 0,
             Self::ConfigureCalls(binding)=>binding.object.len()+binding.domain.len(),
             Self::ConfigureNativeReceivers(_) => 0,
             Self::ArmNativeReceivers(setup) => setup.retained_bytes(),
@@ -332,6 +333,10 @@ impl RuntimeCommands {
     pub async fn complete_direct(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, ticket: &DirectReplyTicket, accepted: bool) -> Result<RuntimeReceipt, RuntimeError> {
         if !self.accepts(owner, scope) || !ticket.matches(owner, scope) { return Err(RuntimeError::Scope); }
         self.submit(owner, scope, Operation::CompleteDirect(ticket.captured_copy(), accepted)).await
+    }
+    pub(super) async fn complete_im(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,ticket:&super::im_delivery::ImReplyTicket,proof:Option<&super::im_inbox::CommittedIm>)->Result<RuntimeReceipt,RuntimeError>{
+        if !self.accepts(owner,scope)||!ticket.matches(owner,scope)||proof.is_some_and(|proof|!proof.authorizes(ticket,Instant::now())){return Err(RuntimeError::Scope);}
+        self.submit(owner,scope,Operation::CompleteIm(Box::new((ticket.captured_copy(),proof.map(|proof|proof.captured_copy()))))).await
     }
     pub(super) async fn complete_invite_notification(&self, owner: &AttemptOwner, scope: &RpcConnectionScope,
         ticket: &super::native_invite_notifications::InviteReplyTicket, accepted: bool) -> Result<RuntimeReceipt, RuntimeError> {
@@ -689,10 +694,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             let _ = command.completion.send(Err(RuntimeError::Timeout));
             return Err(RuntimeError::Timeout);
         }
-        if self.unhosting_pending.is_some() && matches!(&command.operation, Operation::CompleteInvite(_, true)) {
+        if self.unhosting_pending.is_some() && (matches!(&command.operation, Operation::CompleteInvite(_, true))||matches!(&command.operation,Operation::CompleteIm(data) if data.1.is_some())) {
             let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
         }
-        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _)) {
+        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_)) {
             let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
         }
         if !matches!(&command.operation, Operation::ArmClientEx(_) | Operation::ArmNativeReceivers(_)) && self.common.is_none() && self.tls.as_ref().is_none_or(|tls|tls.phase()!=TlsPhase::Verified) {
@@ -703,7 +708,14 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             ticket.consumer_claim().into_iter().collect::<Vec<_>>()
         }, _ => Vec::new() };
         let mut invite_deadline = match &command.operation { Operation::CompleteInvite(ticket, true) => Some(ticket.completion_deadline()), _ => None };
+        let mut im_gates=Vec::new();
+        if let Operation::CompleteIm(data)=&command.operation{if let Some(proof)=&data.1{
+            if !proof.authorizes(&data.0,now){let _=command.completion.send(Err(RuntimeError::Scope));return Ok(());}
+            im_gates.push(proof.gate());let end=data.0.completion_deadline();invite_deadline=Some(invite_deadline.map_or(end,|original|original.min(end)));
+        }}
         if matches!(&command.operation, Operation::Swap(_, _)) {
+            let (gates,deadline)=self.backend.im_write_guard();im_gates.extend(gates);
+            if let Some(deadline)=deadline{invite_deadline=Some(invite_deadline.map_or(deadline,|original|original.min(deadline)));}
             let (claims, deadline) = self.backend.invite_write_guard(); invite_claims.extend(claims);
             if let Some(deadline) = deadline { invite_deadline = Some(invite_deadline.map_or(deadline, |original| original.min(deadline))); }
         }
@@ -720,7 +732,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
-        let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _));
+        let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_));
         let is_logout = matches!(&command.operation, Operation::Logout(_));
         let mut unhosting_sequence = None;let mut call_wait=None;
         let elapsed_ms = self.elapsed_ms(now);
@@ -788,6 +800,15 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                     _=>{let _=command.completion.send(Err(RuntimeError::Protocol));return Ok(());}
                 }
             }
+            Operation::CompleteIm(data)=>{
+                match self.backend.complete_im(&data.0,data.1.as_ref()){
+                    Ok(Some(super::offline_backend::CallCompletion::Direct(packets)))=>Ok(packets),
+                    Ok(Some(super::offline_backend::CallCompletion::BatchQueued))=>{
+                        if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),None))).is_err(){return Err(RuntimeError::Cancelled);}return Ok(());
+                    }
+                    _=>{let _=command.completion.send(Err(RuntimeError::Protocol));return Ok(());}
+                }
+            }
             Operation::CompleteInvite(ticket, accepted) => {
                 match self.backend.complete_invite_notification(&ticket, accepted) {
                     Ok(Some(super::offline_backend::CallCompletion::Direct(packets))) => Ok(packets),
@@ -851,12 +872,14 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         // in the new guarded/legacy branches. Standard test stack and all IO
         // deadlines/gates remain unchanged, including when Invite is absent.
         let mut sending = Box::pin(self.send_packets(&packets.packets,Some(&mut command.completion),native_deadline));
-        let sent = if !invite_claims.is_empty() {
+        let sent = if !invite_claims.is_empty() || !im_gates.is_empty() {
             let cancelled = async {
                 use futures_util::StreamExt;
                 let mut waiting = futures_util::stream::FuturesUnordered::new();
+                let mut im_waiting=futures_util::stream::FuturesUnordered::new();
                 for claim in &invite_claims { waiting.push(claim.cancelled()); }
-                let _ = waiting.next().await;
+                for gate in &im_gates { im_waiting.push(gate.retired()); }
+                tokio::select!{biased;_=waiting.next(),if !waiting.is_empty()=>{},_=im_waiting.next(),if !im_waiting.is_empty()=>{}}
             };
             tokio::select! { biased;
                 _ = cancelled => Err(RuntimeError::Cancelled),

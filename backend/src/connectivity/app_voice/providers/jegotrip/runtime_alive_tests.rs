@@ -11,7 +11,7 @@ mod io;
 #[path="alive_account_tests.rs"]
 mod account;
 fn policy_config(port:u16,approved:bool)->AccountAliveConfig{AccountAliveConfig{allow_legacy_stcp:approved,interval_seconds:60,endpoints:vec![AccountAliveEndpoint{host:"127.0.0.1".into(),port}]}}
-fn receiver()->Arc<NativeReceiverPolicy>{NativeReceiverPolicy::capture(&NativeReceiverConfig{direct_domains:None,invite_notifications:None}).unwrap()}
+fn receiver()->Arc<NativeReceiverPolicy>{NativeReceiverPolicy::capture(&NativeReceiverConfig{im_messages:None,direct_domains:None,invite_notifications:None}).unwrap()}
 fn authenticated()->(ArcRpcSession,AttemptOwner,RpcConnectionScope,Arc<AliveLink>){
     let original=owner();let mut rpc=ArcRpcSession::new(original.clone());rpc.claim_common_transport().unwrap();rpc.bind_common_identity(b"AccountEntry").unwrap();let scope=rpc.connection_scope();
     let(id,_)=rpc.prepare_login(ArcLoginInputs{typed_identity:b"username:fixture",domain_name:b"fixture.invalid",selected_session_id:b"fixture-alive-selector",

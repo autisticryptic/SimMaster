@@ -58,6 +58,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), &'static str> {
         if !columns.iter().any(|existing| existing == column) { conn.execute(statement, []).map_err(|_| STORAGE)?; }
     }
     super::offline_inbox::initialize_schema(conn)?;
+    super::im_inbox::initialize_schema(conn)?;
     super::batch_retention::initialize_schema(conn)
 }
 fn valid_nonce(nonce: &str) -> bool {

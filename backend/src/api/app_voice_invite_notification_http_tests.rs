@@ -3,7 +3,7 @@ fn invite_config_json(root:&str)->serde_json::Value{
     use crate::connectivity::app_voice::providers::jegotrip as n;
     let mut config=n::account_config::tests::native_fixture(root,"127.0.0.1",1);config.credentials.sdk.expires_at_unix_seconds=None;
     config.profile.incoming=None;config.profile.client_ex=true;config.profile.native_call_control=true;
-    config.profile.native_receivers=Some(n::native_receiver::NativeReceiverConfig{direct_domains:None,invite_notifications:Some(n::native_invite_notifications::NativeInviteConfig{timeout_ms:1000})});
+    config.profile.native_receivers=Some(n::native_receiver::NativeReceiverConfig{im_messages:None,direct_domains:None,invite_notifications:Some(n::native_invite_notifications::NativeInviteConfig{timeout_ms:1000})});
     config.call_media=n::account_call_test_support::call_config(root,root).call_media;
     serde_json::from_slice::<serde_json::Value>(&config.encode_private().unwrap()).unwrap()["config"].clone()
 }

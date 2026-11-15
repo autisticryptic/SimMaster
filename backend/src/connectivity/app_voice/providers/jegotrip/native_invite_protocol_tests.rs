@@ -14,7 +14,7 @@ fn props<'a>(call:&'a[u8],caller:&'a[u8])->Vec<RpcProperty<'a>>{vec![RpcProperty
 fn args(id:u64,properties:&[RpcProperty<'_>])->Vec<u8>{let mut w=Writer::versioned().unwrap();w.u64(id).unwrap();w.properties(properties).unwrap();w.finish().expose_to_transport().to_vec()}
 fn context(enabled:bool)->(AttemptOwner,RpcConnectionScope,OfflineBackend){
     let original=owner();let mut backend=OfflineBackend::new(original.clone());backend.claim_common_transport().unwrap();backend.bind_common_identity(b"AccountEntry").unwrap();let scope=backend.connection_scope();
-    let policy=NativeReceiverPolicy::capture(&NativeReceiverConfig{direct_domains:None,invite_notifications:enabled.then_some(NativeInviteConfig{timeout_ms:30000})}).unwrap();
+    let policy=NativeReceiverPolicy::capture(&NativeReceiverConfig{im_messages:None,direct_domains:None,invite_notifications:enabled.then_some(NativeInviteConfig{timeout_ms:30000})}).unwrap();
     backend.arm_native_receivers(NativeReceiverSetup::capture_native_control(policy,true).unwrap()).unwrap();
     let login=backend.prepare_login(login(),&[]).unwrap();backend.on_plaintext_packet(&original,&scope,&reply_packet(login.call_id,&login_result()),0).unwrap();backend.configure_native_receivers(7).unwrap();
     (original,scope,backend)
@@ -133,7 +133,7 @@ fn invite_policy_requires_explicit_bounded_timeout_and_rejects_unknown_fields(){
 }
 #[test]
 fn invite_setup_cannot_be_armed_on_legacy_control_or_disabled_clientex(){
-    let policy=NativeReceiverPolicy::capture(&NativeReceiverConfig{direct_domains:None,invite_notifications:Some(NativeInviteConfig{timeout_ms:1000})}).unwrap();assert!(NativeReceiverSetup::capture(policy.clone(),true,None).is_err());assert!(NativeReceiverSetup::capture_native_control(policy.clone(),false).is_err());assert!(NativeReceiverSetup::capture_native_control(policy,true).is_ok());
+    let policy=NativeReceiverPolicy::capture(&NativeReceiverConfig{im_messages:None,direct_domains:None,invite_notifications:Some(NativeInviteConfig{timeout_ms:1000})}).unwrap();assert!(NativeReceiverSetup::capture(policy.clone(),true,None).is_err());assert!(NativeReceiverSetup::capture_native_control(policy.clone(),false).is_err());assert!(NativeReceiverSetup::capture_native_control(policy,true).is_ok());
 }
 #[test]
 fn invite_debug_and_fingerprint_do_not_reflect_private_business_values(){

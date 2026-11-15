@@ -4,8 +4,8 @@ use crate::connectivity::app_voice::providers::jegotrip::{session::HostingSessio
 #[path = "native_receiver_protocol_tests.rs"]
 mod protocol;
 fn owner() -> AttemptOwner { let mut s = HostingSession::new("fixture-native-receiver".into()); s.import(imported(), 100).unwrap(); s.begin_login(100).unwrap() }
-fn default_policy() -> Arc<NativeReceiverPolicy> { NativeReceiverPolicy::capture(&NativeReceiverConfig { direct_domains: None, invite_notifications: None }).unwrap() }
-fn policy(mode: DomainMode) -> Arc<NativeReceiverPolicy> { NativeReceiverPolicy::capture(&NativeReceiverConfig { direct_domains: Some(DirectDomainConfig { mode, values: vec![b"listed".to_vec()] }), invite_notifications: None }).unwrap() }
+fn default_policy() -> Arc<NativeReceiverPolicy> { NativeReceiverPolicy::capture(&NativeReceiverConfig { im_messages: None, direct_domains: None, invite_notifications: None }).unwrap() }
+fn policy(mode: DomainMode) -> Arc<NativeReceiverPolicy> { NativeReceiverPolicy::capture(&NativeReceiverConfig { im_messages: None, direct_domains: Some(DirectDomainConfig { mode, values: vec![b"listed".to_vec()] }), invite_notifications: None }).unwrap() }
 fn metadata(object: ReceiverObject, domain: Option<&[u8]>) -> Vec<RpcProperty<'_>> {
     let mut fields = vec![RpcProperty { key: b"id", value: object.identity() }];
     if let Some(value) = domain { fields.push(RpcProperty { key: b"domain", value }); }
@@ -60,7 +60,7 @@ fn native_policy_never_accepts_duplicate_oversize_or_unbounded_metadata_before_d
 #[test]
 fn native_domain_configuration_rejects_duplicate_empty_control_and_unresolved_values() {
     for values in [vec![b"".to_vec()], vec![b"a\0b".to_vec()], vec![b"ENC(unresolved)".to_vec()], vec![b"listed".to_vec(), b"listed".to_vec()], vec![vec![1; MAX_FIELD_BYTES + 1]]] {
-        let config = NativeReceiverConfig { direct_domains: Some(DirectDomainConfig { mode: DomainMode::AllowList, values }), invite_notifications: None };
+        let config = NativeReceiverConfig { im_messages: None, direct_domains: Some(DirectDomainConfig { mode: DomainMode::AllowList, values }), invite_notifications: None };
         assert!(NativeReceiverPolicy::capture(&config).is_err());
     }
     assert!(serde_json::from_str::<NativeReceiverConfig>(r#"{"unsafe_accept_all":true}"#).is_err());
@@ -69,7 +69,7 @@ fn native_domain_configuration_rejects_duplicate_empty_control_and_unresolved_va
 }
 #[test]
 fn empty_allow_list_denies_direct_without_changing_authenticated_batch_object_checks() {
-    let p = NativeReceiverPolicy::capture(&NativeReceiverConfig { direct_domains: Some(DirectDomainConfig { mode: DomainMode::AllowList, values: vec![] }), invite_notifications: None }).unwrap();
+    let p = NativeReceiverPolicy::capture(&NativeReceiverConfig { im_messages: None, direct_domains: Some(DirectDomainConfig { mode: DomainMode::AllowList, values: vec![] }), invite_notifications: None }).unwrap();
     let fields = metadata(ReceiverObject::Message, None);
     assert!(p.validate(ReceiverObject::Message, &fields, ReceiverTransport::Direct).is_err());
     assert!(p.validate(ReceiverObject::Message, &fields, ReceiverTransport::Batch).is_ok());
@@ -88,7 +88,7 @@ fn native_receiver_option_roundtrips_without_fake_receiver_domain_or_legacy_chan
     use crate::connectivity::app_voice::providers::jegotrip::{account_config::{self, AccountConfig}, tls_engine::tests::Certificates};
     let cert = Certificates::generate("DNS:fixture.invalid"); let mut config = account_config::tests::native_fixture(&cert.root, "fixture.invalid", 443);
     assert!(config.profile.native_receivers.is_none()); let old = config.encode_private().unwrap(); assert!(!std::str::from_utf8(&old).unwrap().contains("native_receivers"));
-    config.profile.incoming = None; config.profile.native_receivers = Some(NativeReceiverConfig { direct_domains: None, invite_notifications: None });
+    config.profile.incoming = None; config.profile.native_receivers = Some(NativeReceiverConfig { im_messages: None, direct_domains: None, invite_notifications: None });
     config.profile.client_ex = true; config.profile.offline_reception = true;
     assert!(config.validate(100).is_ok()); let encoded = config.encode_private().unwrap(); let restored = AccountConfig::decode_private(&encoded).unwrap();
     assert!(restored.profile.incoming.is_none()); assert!(restored.profile.native_receivers.is_some()); assert!(restored.runtime_profile().is_ok());
@@ -99,7 +99,7 @@ fn native_receiver_option_roundtrips_without_fake_receiver_domain_or_legacy_chan
 fn native_option_cannot_replace_a_legacy_receiver_or_run_on_the_wrong_transport() {
     use crate::connectivity::app_voice::providers::jegotrip::{account_config::{self, ProfileRoute}, tls_engine::tests::Certificates};
     let cert = Certificates::generate("DNS:fixture.invalid"); let mut config = account_config::tests::native_fixture(&cert.root, "fixture.invalid", 443);
-    config.profile.native_receivers = Some(NativeReceiverConfig { direct_domains: None, invite_notifications: None });
+    config.profile.native_receivers = Some(NativeReceiverConfig { im_messages: None, direct_domains: None, invite_notifications: None });
     assert!(config.runtime_profile().is_err(), "legacy explicit incoming cannot be silently replaced");
     config.profile.incoming = None; assert!(config.runtime_profile().is_ok());
     config.profile.route = ProfileRoute::DirectTlsCarrier; assert!(config.runtime_profile().is_err());
