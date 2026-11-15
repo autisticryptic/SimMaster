@@ -49,9 +49,11 @@ class ImRuntimeContracts(unittest.TestCase):
     def test_fixed_deadlines_and_byte_budgets_survive_early_queue_and_pending_notification_drain(self):
         consumer=src('account_im.rs')
         for value in ['MAX_GROUPS:usize=64','MAX_HOLDERS:usize=256','MAX_BYTES:usize=1024*1024','MAX_EARLY:usize=16','Phase::HostingPending',
-                      'state.early.push_back','complete(run,delivery,proof,group.deadline).await?','state.holders.checked_sub(1)']:
+                      'state.early.push_back','complete(run,delivery,proof,deadline).await?','state.holders.checked_sub(1)']:
             self.assertIn(value,consumer)
-        self.assertLess(consumer.index('complete(run,delivery,proof,group.deadline).await?'),consumer.index('group.holders.pop_front()'))
+        self.assertLess(consumer.index('complete(run,delivery,proof,deadline).await?'),consumer.index('group.holders.pop_front()'))
+        self.assertIn('if proof.is_some(){delivery.ticket().deadline()}else{group.deadline}',consumer)
+        self.assertIn('if Instant::now()>=group.deadline&&group.outcome.is_none(){group.outcome=Some(None);}',consumer)
         self.assertIn('ticket.completion_deadline=ticket.completion_deadline.min(deadline)',src('im_delivery.rs'))
     def test_parent_stop_retirement_revokes_queued_im_io_before_cleanup_and_uses_owned_consumer(self):
         account=src('account_runtime.rs');self.assertIn('im_gate:super::im_inbox::ImReceiptGate::fresh()',account)

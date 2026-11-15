@@ -8,6 +8,8 @@ use n::{native_receiver::{NativeReceiverConfig,NativeReceiverPolicy,NativeReceiv
 use std::time::{Duration,Instant};
 #[path="native_invite_claim_tests.rs"]
 mod claims;
+#[path="native_invite_duplicate_claim_tests.rs"]
+mod duplicate_windows;
 const ID:u64=0xf123_4567_89ab_cdef;
 fn component_claim(invite:&IncomingInviteNotification)->std::sync::Arc<ConsumerClaim>{ConsumerClaim::fixture_consumed(invite.owner(),&invite.connection_scope(),invite.notification_id(),invite.fingerprint(),invite.deadline())}
 fn props<'a>(call:&'a[u8],caller:&'a[u8])->Vec<RpcProperty<'a>>{vec![RpcProperty{key:b"Notify.Command",value:b"Invite"},RpcProperty{key:b"Notify.CallId",value:call},RpcProperty{key:b"Notify.Caller",value:caller}]}

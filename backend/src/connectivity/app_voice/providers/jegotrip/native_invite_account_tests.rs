@@ -3,6 +3,8 @@
 use super::*;
 use n::{native_invite_notifications::NativeInviteConfig,account_call_test_support::{call_config,sdp,NATIVE_ID},rpc_calls::CallOperation};
 use std::{future::Future,time::Duration};
+#[path="native_invite_duplicate_account_tests.rs"]
+mod duplicate_windows;
 async fn bounded<F:Future>(future:F)->F::Output{tokio::time::timeout(Duration::from_secs(8),future).await.expect("original native Invite fixture budget")}
 fn config(root:&str,port:u16,timeout_ms:u64)->AccountConfig{
     let mut cfg=account_config(root,port,false);cfg.profile.native_call_control=true;cfg.call_media=call_config(root,root).call_media;

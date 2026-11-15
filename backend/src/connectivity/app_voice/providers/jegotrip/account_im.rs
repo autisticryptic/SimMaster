@@ -33,7 +33,12 @@ async fn drain(run:&ManagedRun,state:&mut State)->Result<(),&'static str>{
         // The data/ticket remains charged while its actual completion awaits.
         while let Some(delivery)=group.holders.front(){
             let proof=group.outcome.as_ref().and_then(|value|value.as_ref());
-            complete(run,delivery,proof,group.deadline).await?;
+            // 581648 answers a duplicate true when the original holder was
+            // already consumed. That is replay of a proven result, not an
+            // extension/revival of an expired UNCONSUMED notification. Each
+            // original RPC still has its own unchanged response deadline.
+            let deadline=if proof.is_some(){delivery.ticket().deadline()}else{group.deadline};
+            complete(run,delivery,proof,deadline).await?;
             let bytes=delivery.bytes();group.holders.pop_front();
             state.holders=state.holders.checked_sub(1).ok_or(INVALID)?;state.bytes=state.bytes.checked_sub(bytes).ok_or(INVALID)?;
         }
@@ -49,7 +54,10 @@ async fn consume(run:&ManagedRun,state:&mut State,delivery:Box<IncomingImDeliver
             if group.fingerprint!=delivery.notice().fingerprint()||group.key!=*delivery.notice().key().digest(){return Err(INVALID);}
         }else{
             if state.groups.len()>=MAX_GROUPS{return Err(FULL);}
-            let outcome=if Instant::now()>=delivery.ticket().deadline(){Some(None)}else{scope.lookup(&run.database,&delivery)?.map(|proof|Some(proof))};
+            let outcome=if Instant::now()>=delivery.ticket().deadline(){Some(None)}else{
+                let proof=scope.lookup(&run.database,&delivery)?;
+                if Instant::now()>=delivery.ticket().deadline(){Some(None)}else{proof.map(Some)}
+            };
             state.groups.insert(id,Group{fingerprint:delivery.notice().fingerprint(),key:*delivery.notice().key().digest(),deadline:delivery.ticket().deadline(),holders:VecDeque::new(),outcome});
         }
         state.groups.get_mut(&id).ok_or(INVALID)?.holders.push_back(delivery);state.holders+=1;state.bytes=total;

@@ -76,8 +76,10 @@ impl CallService {
     }
     fn consume_invite(&self, group: &Group) -> Result<Option<bool>, &'static str> {
         if !self.accepting.load(Ordering::SeqCst) || !self.matches(&group.owner,&group.scope) { return Err(INVALID); }
+        // A consumed native holder replays true for a new original reply
+        // (581648); pending/expired-unconsumed work is never given a new lease.
+        if let Some(terminal) = lock(&group.state).terminal { return Ok(Some(terminal && group.claim.is_live())); }
         if Instant::now() >= group.deadline { group.claim.cancel(); return Ok(Some(false)); }
-        if let Some(terminal) = lock(&group.state).terminal { return Ok(Some(terminal)); }
         // Native ID bits only locate an EXISTING original call. The notification
         // never constructs or replaces its call/agent/control/offer/history.
         let call = lock(&self.calls).values().find(|call|
@@ -124,8 +126,9 @@ async fn run_group(weak: Weak<CallService>, group: Arc<Group>) {
             { let mut state = lock(&group.state); if state.terminal.is_none() || !terminal { state.terminal = Some(terminal); } }
             let incoming = lock(&service.invites).pop(&group);
             let Some(incoming) = incoming else { return; };
-            let accepted = terminal && group.claim.is_live() && Instant::now() < group.deadline;
-            let ticket = incoming.ticket().clipped_to(group.deadline,&group.claim);
+            let response_deadline = if terminal { incoming.deadline() } else { group.deadline };
+            let accepted = terminal && group.claim.is_live() && Instant::now() < response_deadline;
+            let ticket = incoming.ticket().clipped_to(response_deadline,&group.claim);
             let backend = service.backend.clone(); drop(service);
             // The claim/deadline also reaches the IO actor. Cancelling this
             // wait cannot requeue an unknown write; the original actor observes

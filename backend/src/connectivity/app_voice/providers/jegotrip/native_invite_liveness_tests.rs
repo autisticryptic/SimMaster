@@ -37,3 +37,8 @@ async fn unconfirmed_waiter_rechecks_new_original_call_binding_and_then_revocati
     let(mut rpc,owner,scope,dispatcher)=native_context();let ticket=native_ticket(&mut rpc,&owner,&scope,&dispatcher,None);let fingerprint=[7;32];let claim=ConsumerClaim::new(&owner,&scope,ID,fingerprint,Instant::now()+Duration::from_secs(1));let cancelled=claim.cancelled();tokio::pin!(cancelled);
     tokio::select!{_=cancelled.as_mut()=>panic!("not cancelled"),_=tokio::time::sleep(Duration::from_millis(1))=>{}}assert!(claim.confirm(&receipt(ID,fingerprint),&ticket));ticket.revoke();tokio::time::timeout(Duration::from_secs(1),cancelled).await.unwrap();
 }
+#[test]
+fn expired_unconsumed_sql_receipt_cannot_confirm_an_original_live_call_or_acquire_replay_permission(){
+    let(mut rpc,owner,scope,dispatcher)=native_context();let ticket=native_ticket(&mut rpc,&owner,&scope,&dispatcher,None);let fingerprint=[7;32];let claim=ConsumerClaim::new(&owner,&scope,ID,fingerprint,Instant::now()-Duration::from_millis(1));let proof=receipt(ID,fingerprint);
+    assert!(proof.matches(ID,&fingerprint));assert!(ticket.is_live());assert!(!claim.confirm(&proof,&ticket));assert!(claim.is_live());assert!(scope.is_open());
+}

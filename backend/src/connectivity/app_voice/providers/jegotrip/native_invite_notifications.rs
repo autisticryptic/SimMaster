@@ -107,7 +107,7 @@ impl ConsumerClaim {
         let bound = self.call.lock().unwrap_or_else(|poison| poison.into_inner()).is_some();
         #[cfg(test)] let bound = bound || self.component.load(Ordering::SeqCst);
         bound && self.is_live() && self.consumed.load(Ordering::SeqCst) && self.scope.is_open() && !self.scope.session_revoked()
-            && notification_id == self.notification_id && fingerprint == &self.fingerprint && Instant::now() < self.deadline
+            && notification_id == self.notification_id && fingerprint == &self.fingerprint
     }
     pub(super) async fn cancelled(&self) {
         loop {
@@ -143,7 +143,7 @@ impl InviteReplyTicket {
     pub(super) fn deadline(&self) -> Instant { self.deadline }
     pub(super) fn completion_deadline(&self) -> Instant { self.completion_deadline }
     pub(super) fn clipped_to(&self, deadline: Instant, claim: &Arc<ConsumerClaim>) -> Self {
-        let mut ticket = self.captured_copy(); ticket.completion_deadline = ticket.completion_deadline.min(deadline).min(claim.deadline);
+        let mut ticket = self.captured_copy(); ticket.completion_deadline = ticket.completion_deadline.min(deadline);
         if ticket.claim.as_ref().is_none_or(|original| Arc::ptr_eq(original,claim)) { ticket.claim = Some(claim.clone()); } ticket
     }
     pub(super) fn positive_is_current(&self) -> bool {

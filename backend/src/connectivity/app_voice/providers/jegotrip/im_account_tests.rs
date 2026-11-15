@@ -58,11 +58,28 @@ async fn im_account_authenticated_batch_persists_both_original_results_before_tr
             let hint_packet=hint(91,99,7);let message_packet=message(92,7,true);let hint=decode_request(&hint_packet[1..]).unwrap();let message=decode_request(&message_packet[1..]).unwrap();let mut w=Writer::new();w.boolean(true).unwrap();for value in [9,1,1,payload.fields[0],payload.fields[1],payload.fields[2]]{w.u32(value).unwrap();}w.u32(2).unwrap();
             for(seq,request)in[(1,&hint),(2,&message)]{w.i32(seq).unwrap();w.bytes(request.method).unwrap();w.bytes(request.arguments).unwrap();w.properties(&[RpcProperty{key:b"id",value:b"MessageReceiver"},RpcProperty{key:b"token",value:b"fixture-auth"}]).unwrap();}w.u32(0).unwrap();w.properties(&[]).unwrap();w.bytes(b"").unwrap();peer.send(&[reply(swap.call_id,w.finish().expose_to_transport())]).await;
             let mut seen=std::collections::BTreeSet::new();while seen.len()<2{let p=peer.next().await.unwrap();assert_eq!(p[0],0);let swap=decode_request(&p[1..]).unwrap();assert_eq!(swap.method,n::rpc_batch::SWAP_CALLS_METHOD.as_bytes());let mut r=Reader::versioned(swap.arguments).unwrap();assert_eq!(r.bytes().unwrap(),b"fixture-user");assert_eq!(r.bytes().unwrap(),b"fixture-original-selector");let payload=n::rpc_batch::read_payload(&mut r).unwrap();for(seq,result)in &payload.results{assert!([1,2].contains(seq));assert_eq!(result.result_stream,[0,1,0,0,0,0]);assert_eq!(count(&db),1);seen.insert(*seq);}peer.send(&[reply(swap.call_id,&n::runtime_backend::tests::swap_result(None,true,payload.fields))]).await;}
+            // A peer write is not the actor's processed epoch ACK. A fresh
+            // original DIRECT response on this same stream is the barrier:
+            // it follows the ACK in receive order and still commits no new row.
+            peer.send(&[message(95,7,true)]).await;next_reply(&mut peer,95,true).await;assert_eq!(count(&db),1);
             done.send(()).unwrap();finish_account(&mut peer).await;
         }).await});
         bounded(manager.start(&account.line_id,account.revision,100)).await.unwrap();bounded(async{while !manager.get(&account.line_id,100).await.unwrap().incoming_message_ready{tokio::task::yield_now().await;}}).await;go.send(()).unwrap();bounded(observed).await.unwrap();assert_eq!(manager.im_messages(&account.line_id,16).unwrap().len(),1);assert!(manager.messages(&account.line_id,16).unwrap().is_empty());bounded(manager.stop(&account.line_id,account.revision,100)).await.unwrap();bounded(serving).await.unwrap();
     }).await;
 }
+async fn duplicate_after_deadline(consumed_before:bool){
+    let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let port=listener.local_addr().unwrap().port();let server=cert.server_config(&TLS13);let temp=TempDatabase::new();let manager=AccountManager::new(temp.database.clone());let account=manager.create(config(&cert.root,port,500),100).await.unwrap().account;let(go,wait)=tokio::sync::oneshot::channel();let(done,observed)=tokio::sync::oneshot::channel();
+    let serving=tokio::spawn(async move{bounded(async move{
+        let mut peer=CommonPeer::open(listener,server).await;let p=peer.next().await.unwrap();let login=decode_request(&p[1..]).unwrap();peer.send(&[reply(login.call_id,&login_result())]).await;let(_,flag)=hosting_call(&mut peer).await;assert_eq!(flag,b"4");wait.await.unwrap();peer.send(&[hint(91,99,7)]).await;
+        if consumed_before{peer.send(&[message(92,7,true)]).await;next_reply(&mut peer,92,true).await;}next_reply(&mut peer,91,consumed_before).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        if !consumed_before{peer.send(&[message(92,7,true)]).await;next_reply(&mut peer,92,true).await;}
+        peer.send(&[hint(93,99,7)]).await;next_reply(&mut peer,93,consumed_before).await;done.send(()).unwrap();finish_account(&mut peer).await;
+    }).await});
+    bounded(manager.start(&account.line_id,account.revision,100)).await.unwrap();bounded(async{while !manager.get(&account.line_id,100).await.unwrap().incoming_message_ready{tokio::task::yield_now().await;}}).await;go.send(()).unwrap();bounded(observed).await.unwrap();assert_eq!(manager.im_messages(&account.line_id,16).unwrap().len(),1);assert_eq!(temp.database.get_recent_app_events(Some(&account.line_id),16).unwrap().iter().filter(|event|event.event_type=="im.received").count(),1);bounded(manager.stop(&account.line_id,account.revision,100)).await.unwrap();bounded(serving).await.unwrap();
+}
+#[tokio::test] async fn im_account_duplicate_after_consumed_window_replays_proven_result_on_its_own_original_ticket(){Box::pin(duplicate_after_deadline(true)).await;}
+#[tokio::test] async fn im_account_expired_unconsumed_notification_is_not_revived_by_later_message_or_new_rpc(){Box::pin(duplicate_after_deadline(false)).await;}
 #[tokio::test]
 async fn im_account_stop_drops_unconsumed_notification_without_positive_reply_and_joins_original_sdk(){
     Box::pin(async{
