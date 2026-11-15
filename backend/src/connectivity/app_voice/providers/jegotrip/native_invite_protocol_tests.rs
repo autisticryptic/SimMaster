@@ -23,7 +23,7 @@ fn packet(id:i32,body:&[u8],token:Option<&[u8]>,magic:&[u8])->Vec<u8>{
     let mut metadata=vec![RpcProperty{key:b"id",value:b"MessageReceiver"},RpcProperty{key:b"__magic",value:magic}];if let Some(token)=token{metadata.push(RpcProperty{key:b"token",value:token});}
     let request=encode_request(id,&metadata,NOTIFY_CALLS_METHOD.as_bytes(),body).unwrap();let mut p=vec![0];p.extend_from_slice(request.expose_to_transport());p
 }
-fn take(events:Vec<OfflineEvent>)->IncomingInviteNotification{assert_eq!(events.len(),1);match events.into_iter().next().unwrap(){OfflineEvent::InviteNotification(invite)=>invite,_=>panic!("original deferred Invite only")}}
+fn take(events:Vec<OfflineEvent>)->IncomingInviteNotification{assert_eq!(events.len(),1);match events.into_iter().next().unwrap(){OfflineEvent::InviteNotification(invite)=>*invite,_=>panic!("original deferred Invite only")}}
 fn incoming(backend:&mut OfflineBackend,owner:&AttemptOwner,scope:&RpcConnectionScope,rpc:i32,id:u64)->IncomingInviteNotification{
     take(backend.on_plaintext_packet(owner,scope,&packet(rpc,&args(id,&props(b"opaque-call",b"opaque-caller")),Some(b"fixture-auth"),&rpc.to_be_bytes()),rpc as u64).unwrap())
 }
@@ -36,7 +36,7 @@ fn batch_packet(outer:&OwnedCallPackets,arguments:&[u8])->Vec<u8>{
 fn batch_incoming(backend:&mut OfflineBackend,owner:&AttemptOwner,scope:&RpcConnectionScope)->IncomingInviteNotification{
     let outer=backend.prepare_swap(0,&[]).unwrap();let events=backend.on_plaintext_packet(owner,scope,&batch_packet(&outer,&args(ID,&props(b"opaque-call",b"opaque-caller"))),1).unwrap();
     assert!(!events.iter().any(|e|matches!(e,OfflineEvent::Outgoing(_)|OfflineEvent::ClientEx(_)|OfflineEvent::Message(_)|OfflineEvent::Call(_))));
-    events.into_iter().find_map(|e|if let OfflineEvent::InviteNotification(invite)=e{Some(invite)}else{None}).unwrap()
+    events.into_iter().find_map(|e|if let OfflineEvent::InviteNotification(invite)=e{Some(*invite)}else{None}).unwrap()
 }
 #[test]
 fn explicit_invite_retains_direct_receipt_without_immediate_ack_call_hint_or_media(){

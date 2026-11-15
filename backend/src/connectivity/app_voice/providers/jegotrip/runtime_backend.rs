@@ -456,7 +456,7 @@ pub enum BackendEventPayload {
     OfflinePage(super::rpc_offline::OwnedOfflinePage),
     BatchRetirement(super::batch_scheduler::BatchReplayRetirement),
     Call(IncomingCallDelivery),
-    InviteNotification(super::native_invite_notifications::IncomingInviteNotification),
+    InviteNotification(Box<super::native_invite_notifications::IncomingInviteNotification>),
     Terminal(BackendFailure),
 }
 impl BackendEvent {
@@ -738,7 +738,7 @@ impl NativeHostingBackend {
             if !attempt.scope.is_open()||lock(&attempt.state).retired{return Err(BackendFailure::Disconnected);}
             let(handle,runtime_events)=connected.attach().map_err(|_|BackendFailure::Disconnected)?;
             let commands=handle.command_handle();*owning=Some(handle);drop(owning);*lock(&attempt.commands)=Some(commands.clone());
-            tokio::spawn(event_pump(attempt.clone(),self.profile.clone(),self.events.clone(),runtime_events));
+            tokio::spawn(Box::pin(event_pump(attempt.clone(),self.profile.clone(),self.events.clone(),runtime_events)));
             let mut client=borrowed(&self.profile.client_properties);
             if self.profile.include_device_id{if let Some(device)=&captured.device{client.push(RpcProperty{key:b"DeviceId",value:device.as_bytes()});}}
             let routing=borrowed(&self.profile.login_routing);
@@ -892,7 +892,7 @@ impl NativeHostingBackend {
         let (handle, runtime_events) = prepared.attach(io).map_err(|_| BackendFailure::Disconnected)?;
         let commands = handle.command_handle(); *owning = Some(handle); drop(owning);
         *lock(&attempt.commands) = Some(commands.clone());
-        tokio::spawn(event_pump(attempt.clone(), self.profile.clone(), self.events.clone(), runtime_events));
+        tokio::spawn(Box::pin(event_pump(attempt.clone(), self.profile.clone(), self.events.clone(), runtime_events)));
         let mut client = borrowed(&self.profile.client_properties);
         if self.profile.include_device_id {
             if let Some(device) = &captured.device { client.push(RpcProperty { key: b"DeviceId", value: device.as_bytes() }); }

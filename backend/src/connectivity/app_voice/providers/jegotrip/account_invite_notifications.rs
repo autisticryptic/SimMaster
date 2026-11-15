@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 const INVALID: &str = "app_account_invite_notification_scope_invalid";
 const BACKPRESSURE: &str = "app_account_invite_notification_backpressure";
 struct Budget { holders: usize, bytes: usize }
-struct RetainedInvite { incoming: IncomingInviteNotification, budget: Arc<Mutex<Budget>>, bytes: usize }
+struct RetainedInvite { incoming: Box<IncomingInviteNotification>, budget: Arc<Mutex<Budget>>, bytes: usize }
 impl std::ops::Deref for RetainedInvite { type Target = IncomingInviteNotification; fn deref(&self) -> &Self::Target { &self.incoming } }
 impl Drop for RetainedInvite { fn drop(&mut self) {
     let mut budget = lock(&self.budget);
@@ -25,7 +25,7 @@ impl InviteQueue {
     pub(super) fn retire(&mut self) {
         for group in self.groups.values() { group.claim.cancel(); lock(&group.state).holders.clear(); group.changed.notify_waiters(); }
     }
-    fn admit(&mut self, incoming: IncomingInviteNotification) -> Result<(Arc<Group>,bool), &'static str> {
+    fn admit(&mut self, incoming: Box<IncomingInviteNotification>) -> Result<(Arc<Group>,bool), &'static str> {
         if !incoming.matches(incoming.owner(),&incoming.connection_scope()) { return Err(INVALID); }
         let retained = incoming.retained_bytes();
         let mut budget = lock(&self.budget);
@@ -56,7 +56,7 @@ impl InviteQueue {
 impl Drop for InviteQueue { fn drop(&mut self) { self.retire(); } }
 
 impl CallService {
-    pub(in super::super) async fn invite_notification(self: &Arc<Self>, incoming: IncomingInviteNotification) -> Result<(), &'static str> {
+    pub(in super::super) async fn invite_notification(self: &Arc<Self>, incoming: Box<IncomingInviteNotification>) -> Result<(), &'static str> {
         let scope = incoming.connection_scope();
         if !self.backend.invite_notifications_enabled() || !incoming.matches(incoming.owner(),&scope)
             || !self.matches(incoming.owner(),&scope) || !self.accepting.load(Ordering::SeqCst) { return Err(INVALID); }

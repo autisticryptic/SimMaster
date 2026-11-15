@@ -598,7 +598,7 @@ impl AccountManager {
         let mut retirement = Retirement::new(run.clone());
         let weak = Arc::downgrade(&run);
         let mut task_slot = run.task.try_lock().expect("new original event consumer");
-        *task_slot = Some(tokio::spawn(consume_events(weak, events)));
+        *task_slot = Some(tokio::spawn(Box::pin(consume_events(weak, events))));
         drop(task_slot);
         if run.cleanup_on_disconnect {
             // This fresh slot has not escaped to a cleanup caller. Retain the

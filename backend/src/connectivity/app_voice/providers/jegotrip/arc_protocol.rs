@@ -45,7 +45,7 @@ pub enum ProtocolEvent<'a> {
     Control(CallKind),
     Incoming(IncomingProtocolMessage),
     IncomingCall(IncomingCallDelivery),
-    InviteNotification(super::native_invite_notifications::IncomingInviteNotification),
+    InviteNotification(Box<super::native_invite_notifications::IncomingInviteNotification>),
     OfflineHint(super::rpc_offline::IncomingOfflineHint),
     ClientEx { reply: OwnedCallPackets, notice: Option<super::rpc_client_ex::OwnedClientExNotice> },
     OutgoingReply(OwnedCallPackets),
@@ -360,7 +360,7 @@ impl ArcProtocol {
                 self.direct_pending.insert(request.call_id, PendingDirect { magic: magic.to_vec(), response: DirectResponse::Invite {
                     notification_id: incoming.notification_id(), fingerprint: incoming.fingerprint(), deadline: incoming.deadline(),
                 } });
-                deliver(ProtocolEvent::InviteNotification(incoming));
+                deliver(ProtocolEvent::InviteNotification(Box::new(incoming)));
                 return Ok(true);
             }
             let reply = encode_reply(request.call_id, 0, action.result.expose_to_transport())?;

@@ -45,7 +45,7 @@ pub enum OfflineEvent {
     ClientEx(super::rpc_client_ex::OwnedClientExNotice),
     BatchRetirement(super::batch_scheduler::BatchReplayRetirement),
     Call(IncomingCallDelivery),
-    InviteNotification(super::native_invite_notifications::IncomingInviteNotification),
+    InviteNotification(Box<super::native_invite_notifications::IncomingInviteNotification>),
     CallOperation(OwnedCallOperationReply),
     Outgoing(OwnedCallPackets),
     Control(super::transport_packets::CallKind),
@@ -291,7 +291,7 @@ impl OfflineBackend {
                                     Ok(delivery) => delivery, Err(error) => { processing_error = Some(error.into()); return; }
                                 };
                                 invite_pending.insert(key, (delivery.notification_id(), delivery.fingerprint(), delivery.deadline()));
-                                events.push(OfflineEvent::InviteNotification(delivery));
+                                events.push(OfflineEvent::InviteNotification(Box::new(delivery)));
                                 continue;
                             }
                             // Control-result queuing is not a SMS/call consumer
