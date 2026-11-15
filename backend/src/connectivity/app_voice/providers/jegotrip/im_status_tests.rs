@@ -1,5 +1,7 @@
 //! Actions-only independently assembled original Group status DATA fixtures.
 use crate::connectivity::app_voice::providers::jegotrip::{im_status as s,rpc_stream::{CodecError,RpcProperty}};
+#[path="im_receive_state_tests.rs"]
+mod receive_state;
 fn string(out:&mut Vec<u8>,bytes:&[u8]){out.extend_from_slice(&(bytes.len()as u32).to_be_bytes());out.extend_from_slice(bytes);}
 fn map(out:&mut Vec<u8>,fields:&[(&[u8],&[u8])]){out.extend_from_slice(&(fields.len()as u32).to_be_bytes());for(key,value)in fields{string(out,key);string(out,value);}}
 fn result(fields:&[(&[u8],&[u8])],time:i64,accepted:bool)->Vec<u8>{let mut out=vec![0,u8::from(accepted)];out.extend_from_slice(&1u32.to_be_bytes());string(&mut out,b"1_2");map(&mut out,fields);out.extend_from_slice(&time.to_be_bytes());string(&mut out,b"");out}
