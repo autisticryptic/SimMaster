@@ -1,5 +1,7 @@
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip::{rpc_stream::Writer, session::HostingSession, tests::imported};
+#[path = "im_data_tests.rs"]
+mod im_data;
 
 fn owner() -> AttemptOwner {
     let mut s = HostingSession::new("line-a".into()); s.import(imported(), 100).unwrap(); s.begin_login(100).unwrap()

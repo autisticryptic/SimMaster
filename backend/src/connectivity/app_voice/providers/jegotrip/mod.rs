@@ -41,6 +41,7 @@ pub mod native_events;
 pub(crate) mod native_receiver;
 pub(crate) mod native_invite_notifications;
 pub(crate) mod native_invite_receipts;
+pub(crate) mod im_data;
 pub mod rpc_arguments;
 pub mod rpc_calls;
 pub mod call_binding;
