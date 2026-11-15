@@ -62,7 +62,10 @@ async fn consume(run:&ManagedRun,state:&mut State,delivery:Box<IncomingImDeliver
         // refresh/gap IO is pending. All bytes/inflight share the old budget.
         let bytes=state.bytes.checked_add(delivery.bytes()).ok_or(FULL)?;
         if state.holders>=MAX_HOLDERS||bytes>MAX_BYTES{return Err(FULL);}
-        state.ordered.push_back(delivery);state.holders+=1;state.bytes=bytes;return drain(run,state).await;
+        state.ordered.push_back(delivery);state.holders+=1;state.bytes=bytes;
+        #[cfg(test)]
+        run.im_original_queue_admissions.fetch_add(1,Ordering::SeqCst);
+        return drain(run,state).await;
     }
     if let Some(id)=delivery.notice().notification_id(){
         let bytes=delivery.bytes();let total=state.bytes.checked_add(bytes).ok_or(FULL)?;

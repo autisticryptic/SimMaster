@@ -168,6 +168,8 @@ struct ManagedRun {
     controller: AsyncMutex<HostingController>,
     backend: Arc<NativeHostingBackend>,
     im_gate: Arc<super::im_inbox::ImReceiptGate>,
+    #[cfg(test)]
+    im_original_queue_admissions:std::sync::atomic::AtomicUsize,
     accepting: AtomicBool,
     stopping: AtomicBool,
     error: Mutex<Option<&'static str>>,
@@ -326,6 +328,11 @@ impl AccountManager {
     fn metadata(&self, line_id: &str) -> Result<AccountMetadata, &'static str> {
         if !account_store::valid_line_id(line_id) { return Err("app_account_line_invalid"); }
         self.database.with_conn(|conn| account_store::metadata(conn, line_id))?.ok_or("app_account_not_found")
+    }
+    #[cfg(test)]
+    pub(crate) fn im_original_queue_admissions(&self,line_id:&str)->Result<usize,&'static str>{
+        let slot=self.slot(line_id)?;let run=lock(&slot.run).clone().ok_or("app_account_not_running")?;
+        Ok(run.im_original_queue_admissions.load(Ordering::SeqCst))
     }
     fn slot(&self, line_id: &str) -> Result<Arc<AccountSlot>, &'static str> {
         // Unknown IDs must not allocate unbounded runtime map entries.
@@ -602,6 +609,8 @@ impl AccountManager {
             manual_cleanup: AtomicBool::new(false), terminal_observation: Mutex::new(None), cleanup_error: Mutex::new(None),
             messaging_readiness: Mutex::new(None), calls, controller: AsyncMutex::new(controller), backend,
             im_gate:super::im_inbox::ImReceiptGate::fresh(),
+            #[cfg(test)]
+            im_original_queue_admissions:std::sync::atomic::AtomicUsize::new(0),
             accepting: AtomicBool::new(true), stopping: AtomicBool::new(false), error: Mutex::new(None), task: AsyncMutex::new(None) });
         // Retain the owning backend BEFORE any await that can create IO. A
         // cancelled HTTP future leaves this same run available for stop/retry.
