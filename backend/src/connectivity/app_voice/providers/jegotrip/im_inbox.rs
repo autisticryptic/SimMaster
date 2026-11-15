@@ -7,6 +7,7 @@ use crate::platform::db::{Database,insert_app_event_for_conn};
 use rusqlite::{params,Connection,OptionalExtension,Transaction,TransactionBehavior};
 use serde::Serialize;
 use std::{fmt,sync::{Arc,atomic::{AtomicBool,Ordering}},time::Instant};
+use zeroize::Zeroizing;
 const STORAGE:&str="app_account_im_storage_failed";
 const SCOPE:&str="app_account_im_scope_invalid";
 const INVALID:&str="app_account_im_message_invalid";
@@ -14,6 +15,10 @@ const FULL:&str="app_account_im_inbox_full";
 const MAX_PER_ACCOUNT:i64=1024;
 const MAX_TOTAL:i64=4096;
 const MAX_TOTAL_BYTES:i64=16*1024*1024;
+#[path="im_associations.rs"]
+mod associations;
+pub(super) use associations::{AssociationAdmission,ImPendingAssociation};
+pub(super) use associations::{retire_run_associations,delete_account};
 
 pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
     conn.execute_batch("CREATE TABLE IF NOT EXISTS app_voice_im_messages(
@@ -29,7 +34,8 @@ pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
         deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)),created_at TEXT NOT NULL,
         UNIQUE(line_id,revision,identity_key,box_id,message_index));
         CREATE INDEX IF NOT EXISTS idx_app_voice_im_messages_line ON app_voice_im_messages(line_id,id);")
-        .map_err(|_|STORAGE)
+        .map_err(|_|STORAGE)?;
+    associations::initialize_schema(conn)
 }
 
 pub(super) struct ImReceiptGate{live:AtomicBool,changed:tokio::sync::Notify}
@@ -56,9 +62,10 @@ impl ImInboxScope{
     fn matches(&self,delivery:&IncomingImDelivery)->bool{
         self.gate.live()&&delivery.matches(self.binding.owner(),&self.binding.scope())
             &&delivery.notice().binding().identity()==self.binding.identity()
+            &&delivery.notice().binding().receipt_epoch()==self.binding.receipt_epoch()
     }
     fn permit(&self,key:&Arc<ImKey>,fingerprint:[u8;32],id:i64)->CommittedIm{
-        CommittedIm{owner:self.binding.owner().clone(),scope:self.binding.scope(),identity:*self.binding.identity(),key:key.clone(),fingerprint,id,gate:self.gate.clone()}
+        CommittedIm{owner:self.binding.owner().clone(),scope:self.binding.scope(),identity:*self.binding.identity(),receipt_epoch:Zeroizing::new(self.binding.receipt_epoch().to_owned()),key:key.clone(),fingerprint,id,gate:self.gate.clone()}
     }
     pub(super) fn commit(&self,db:&Database,delivery:&IncomingImDelivery)->Result<Option<CommittedIm>,&'static str>{
         if !self.matches(delivery)||delivery.notice().notification_id().is_some(){return Err(SCOPE);}
@@ -106,15 +113,15 @@ impl ImInboxScope{
     }
 }
 
-pub struct CommittedIm{owner:AttemptOwner,scope:RpcConnectionScope,identity:[u8;32],key:Arc<ImKey>,fingerprint:[u8;32],id:i64,gate:Arc<ImReceiptGate>}
+pub struct CommittedIm{owner:AttemptOwner,scope:RpcConnectionScope,identity:[u8;32],receipt_epoch:Zeroizing<String>,key:Arc<ImKey>,fingerprint:[u8;32],id:i64,gate:Arc<ImReceiptGate>}
 impl fmt::Debug for CommittedIm{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("CommittedIm(<redacted>)")}}
 impl CommittedIm{
     pub(super) fn authorizes(&self,ticket:&ImReplyTicket,now:Instant)->bool{
-        self.gate.live()&&self.id>0&&ticket.matches(&self.owner,&self.scope)&&ticket.binding().identity()==&self.identity&&ticket.key().digest()==self.key.digest()
+        self.gate.live()&&self.id>0&&ticket.matches(&self.owner,&self.scope)&&ticket.binding().identity()==&self.identity&&ticket.binding().receipt_epoch()==self.receipt_epoch.as_str()&&ticket.key().digest()==self.key.digest()
             &&(!ticket.is_message()||ticket.fingerprint()==&self.fingerprint)&&now<ticket.completion_deadline()
     }
     pub(super) fn gate(&self)->Arc<ImReceiptGate>{self.gate.clone()}
-    pub(super) fn captured_copy(&self)->Self{Self{owner:self.owner.clone(),scope:self.scope.clone(),identity:self.identity,key:self.key.clone(),fingerprint:self.fingerprint,id:self.id,gate:self.gate.clone()}}
+    pub(super) fn captured_copy(&self)->Self{Self{owner:self.owner.clone(),scope:self.scope.clone(),identity:self.identity,receipt_epoch:self.receipt_epoch.clone(),key:self.key.clone(),fingerprint:self.fingerprint,id:self.id,gate:self.gate.clone()}}
 }
 #[derive(Serialize)]
 pub struct ImMessageView{pub id:i64,pub box_kind:&'static str,pub message_index:String,pub text:String,pub attachment_count:u32,pub received_at:String}

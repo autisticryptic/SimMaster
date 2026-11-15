@@ -4,6 +4,8 @@ use crate::connectivity::app_voice::providers::jegotrip as n;
 use n::{im_delivery::{NativeImConfig,IncomingImDelivery,ImReplySource},im_inbox::{ImInboxScope,ImReceiptGate},native_receiver::{NativeReceiverConfig,NativeReceiverPolicy,NativeReceiverSetup},
     account_test_support::TempDatabase,account_runtime::local_nonce,account_runs,account_store};
 use std::{sync::Arc,time::{Duration,Instant}};
+#[path="im_association_tests.rs"]
+mod associations;
 struct Fixture{owner:AttemptOwner,scope:RpcConnectionScope,backend:OfflineBackend,temp:TempDatabase,run:Arc<account_runs::RunToken>,gate:Arc<ImReceiptGate>}
 impl Fixture{
     fn new(enabled:bool)->Self{

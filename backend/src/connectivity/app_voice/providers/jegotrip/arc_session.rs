@@ -280,8 +280,9 @@ impl ArcRpcSession {
     pub(super) fn native_client_ex_dispatcher(&self, policy: Arc<super::native_receiver::NativeReceiverPolicy>) -> Result<super::rpc_client_ex::ClientExDispatcher, CodecError> {
         if !self.native_receiver_scope() { return Err(CodecError::InvalidField); }
         let authentication = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
-        let im = self.native_im_binding(policy.clone())?;
-        super::rpc_client_ex::ClientExDispatcher::for_native_client(self.owner.clone(), self.connection.clone(), policy, &authentication.token)?.with_alive(self.alive.clone())?.with_im(im)
+        // ArcProtocol attaches its single captured IM binding to this
+        // dispatcher. Do not mint a second SQL receipt epoch for ClientEx.
+        super::rpc_client_ex::ClientExDispatcher::for_native_client(self.owner.clone(), self.connection.clone(), policy, &authentication.token)?.with_alive(self.alive.clone())
     }
     pub(super) fn can_arm_native_receivers(&self) -> bool {
         self.common_transport_claimed && self.phase() == ArcPhase::Initial && self.pending.is_empty()

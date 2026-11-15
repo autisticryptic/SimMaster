@@ -53,7 +53,10 @@ class ImRuntimeContracts(unittest.TestCase):
             self.assertIn(value,consumer)
         self.assertLess(consumer.index('complete(run,delivery,proof,deadline).await?'),consumer.index('group.holders.pop_front()'))
         self.assertIn('if proof.is_some(){delivery.ticket().deadline()}else{group.deadline}',consumer)
-        self.assertIn('if Instant::now()>=group.deadline&&group.outcome.is_none(){group.outcome=Some(None);}',consumer)
+        self.assertIn('if Instant::now()>=group.deadline&&group.outcome.is_none(){settle(run,group,None)?;}',consumer)
+        self.assertIn('group.context.finish_association(&run.database,pending,proof)?',consumer)
+        self.assertIn('scope.open_association(&run.database,&delivery)?',consumer)
+        self.assertIn('AssociationAdmission::Replay(proof)=>(None,Some(proof))',consumer)
         self.assertIn('ticket.completion_deadline=ticket.completion_deadline.min(deadline)',src('im_delivery.rs'))
     def test_parent_stop_retirement_revokes_queued_im_io_before_cleanup_and_uses_owned_consumer(self):
         account=src('account_runtime.rs');self.assertIn('im_gate:super::im_inbox::ImReceiptGate::fresh()',account)

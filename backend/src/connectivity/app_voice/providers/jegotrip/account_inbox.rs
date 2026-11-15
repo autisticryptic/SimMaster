@@ -341,6 +341,7 @@ pub(super) fn delete_private_for_account(conn:&Connection,line:&str)->Result<(),
         conn.execute("DELETE FROM app_voice_inbox WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;
     }
     super::offline_inbox::delete_account(conn, line)?;
+    super::im_inbox::delete_account(conn, line)?;
     account_notifications::cancel_account(conn,line)?;
     account_runs::delete_account_state(conn,line)?;
     Ok(())

@@ -21,7 +21,7 @@ impl NativeImConfig{
 }
 fn digest(parts:&[&[u8]])->[u8;32]{let mut hash=Context::new(&SHA256);for part in parts{hash.update(&(part.len()as u64).to_be_bytes());hash.update(part);}let mut out=[0;32];out.copy_from_slice(hash.finish().as_ref());out}
 
-pub(super) struct ImBinding{native:NativeReceiverBinding,owner:AttemptOwner,scope:RpcConnectionScope,identity:[u8;32],config:NativeImConfig}
+pub(super) struct ImBinding{native:NativeReceiverBinding,owner:AttemptOwner,scope:RpcConnectionScope,identity:[u8;32],receipt_epoch:Zeroizing<String>,config:NativeImConfig}
 impl fmt::Debug for ImBinding{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ImBinding(<redacted>)")}}
 impl ImBinding{
     /// Called only by ArcRpcSession after its original matched native login.
@@ -31,12 +31,17 @@ impl ImBinding{
         let config=policy.im_messages().ok_or(CodecError::InvalidField)?;config.timeout()?;
         let native=NativeReceiverBinding::original(owner.clone(),scope.clone(),policy)?;
         let identity=digest(&[b"jegotrip-native-im-context-v1\0",uid,selector]);
-        Ok(Arc::new(Self{native,owner,scope,identity,config}))
+        // A private local SQL association namespace for this ORIGINAL login
+        // binding. It never changes any App/SDK UUID, selector or wire field.
+        // A new physical login cannot redeem an old scope's notification row.
+        let receipt_epoch=Zeroizing::new(super::account_runtime::local_nonce().map_err(|_|CodecError::InvalidField)?);
+        Ok(Arc::new(Self{native,owner,scope,identity,receipt_epoch,config}))
     }
     pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{self.native.matches(owner,scope)&&&self.owner==owner&&self.scope.matches(scope)}
     pub(super) fn owner(&self)->&AttemptOwner{&self.owner}
     pub(super) fn scope(&self)->RpcConnectionScope{self.scope.clone()}
     pub(super) fn identity(&self)->&[u8;32]{&self.identity}
+    pub(super) fn receipt_epoch(&self)->&str{self.receipt_epoch.as_str()}
     pub(super) fn policy(&self)->&Arc<NativeReceiverPolicy>{self.native.policy()}
 }
 

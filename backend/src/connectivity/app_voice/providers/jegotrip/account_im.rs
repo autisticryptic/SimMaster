@@ -1,7 +1,7 @@
 //! Original-run Message IM consumer. Shares the existing owned account event
 //! task/Join, never an SDK/phone process, SMS projection or detached worker.
 use super::*;
-use super::super::{im_delivery::IncomingImDelivery,im_inbox::{ImInboxScope,CommittedIm}};
+use super::super::{im_delivery::IncomingImDelivery,im_inbox::{ImInboxScope,CommittedIm,AssociationAdmission,ImPendingAssociation}};
 use std::collections::BTreeMap;
 const MAX_GROUPS:usize=64;
 const MAX_HOLDERS:usize=256;
@@ -9,7 +9,7 @@ const MAX_BYTES:usize=1024*1024;
 const MAX_EARLY:usize=16;
 const INVALID:&str="app_account_im_scope_invalid";
 const FULL:&str="app_account_im_backpressure";
-struct Group{fingerprint:[u8;32],key:[u8;32],deadline:Instant,holders:VecDeque<Box<IncomingImDelivery>>,outcome:Option<Option<CommittedIm>>}
+struct Group{fingerprint:[u8;32],key:[u8;32],deadline:Instant,context:ImInboxScope,pending:Option<ImPendingAssociation>,holders:VecDeque<Box<IncomingImDelivery>>,outcome:Option<Option<CommittedIm>>}
 pub(super) struct State{early:VecDeque<Box<IncomingImDelivery>>,early_bytes:usize,groups:BTreeMap<u64,Group>,holders:usize,bytes:usize}
 impl Default for State{fn default()->Self{Self{early:VecDeque::new(),early_bytes:0,groups:BTreeMap::new(),holders:0,bytes:0}}}
 impl State{pub(super) fn clear(&mut self){self.early.clear();self.early_bytes=0;self.groups.clear();self.holders=0;self.bytes=0;}}
@@ -26,9 +26,15 @@ async fn complete(run:&ManagedRun,delivery:&IncomingImDelivery,proof:Option<&Com
     let receipt=run.backend.complete_im(delivery.owner(),&delivery.scope(),&ticket,proof).await.map_err(|_|INVALID)?;
     if !receipt.matches(delivery.owner(),&delivery.scope()){return Err(INVALID);}Ok(())
 }
+fn settle(run:&ManagedRun,group:&mut Group,proof:Option<&CommittedIm>)->Result<(),&'static str>{
+    if group.outcome.is_some(){return Ok(());}
+    let pending=group.pending.as_ref().ok_or(INVALID)?;
+    let result=group.context.finish_association(&run.database,pending,proof)?;
+    group.pending=None;group.outcome=Some(result);Ok(())
+}
 async fn drain(run:&ManagedRun,state:&mut State)->Result<(),&'static str>{
     for group in state.groups.values_mut(){
-        if Instant::now()>=group.deadline&&group.outcome.is_none(){group.outcome=Some(None);}
+        if Instant::now()>=group.deadline&&group.outcome.is_none(){settle(run,group,None)?;}
         if group.outcome.is_none(){continue;}
         // The data/ticket remains charged while its actual completion awaits.
         while let Some(delivery)=group.holders.front(){
@@ -43,6 +49,10 @@ async fn drain(run:&ManagedRun,state:&mut State)->Result<(),&'static str>{
             state.holders=state.holders.checked_sub(1).ok_or(INVALID)?;state.bytes=state.bytes.checked_sub(bytes).ok_or(INVALID)?;
         }
     }
+    // Completed associations stay in bounded private SQLite, not this live
+    // budget. The actor separately retains BatchQueued proofs until the exact
+    // peer epoch ACK. Removing a queue entry is never transport retirement.
+    state.groups.retain(|_,group|group.outcome.is_none()||!group.holders.is_empty());
     Ok(())
 }
 async fn consume(run:&ManagedRun,state:&mut State,delivery:Box<IncomingImDelivery>)->Result<(),&'static str>{
@@ -54,11 +64,17 @@ async fn consume(run:&ManagedRun,state:&mut State,delivery:Box<IncomingImDeliver
             if group.fingerprint!=delivery.notice().fingerprint()||group.key!=*delivery.notice().key().digest(){return Err(INVALID);}
         }else{
             if state.groups.len()>=MAX_GROUPS{return Err(FULL);}
-            let outcome=if Instant::now()>=delivery.ticket().deadline(){Some(None)}else{
-                let proof=scope.lookup(&run.database,&delivery)?;
-                if Instant::now()>=delivery.ticket().deadline(){Some(None)}else{proof.map(Some)}
+            let (pending,outcome)=match scope.open_association(&run.database,&delivery)?{
+                AssociationAdmission::Fresh(pending)=>{
+                    let expired=Instant::now()>=delivery.ticket().deadline();
+                    let proof=if expired{None}else{scope.lookup(&run.database,&delivery)?};
+                    if expired||proof.is_some(){
+                        let result=scope.finish_association(&run.database,&pending,proof.as_ref())?;(None,Some(result))
+                    }else{(Some(pending),None)}
+                },
+                AssociationAdmission::Replay(proof)=>(None,Some(proof)),
             };
-            state.groups.insert(id,Group{fingerprint:delivery.notice().fingerprint(),key:*delivery.notice().key().digest(),deadline:delivery.ticket().deadline(),holders:VecDeque::new(),outcome});
+            state.groups.insert(id,Group{fingerprint:delivery.notice().fingerprint(),key:*delivery.notice().key().digest(),deadline:delivery.ticket().deadline(),context:scope,pending,holders:VecDeque::new(),outcome});
         }
         state.groups.get_mut(&id).ok_or(INVALID)?.holders.push_back(delivery);state.holders+=1;state.bytes=total;
         drain(run,state).await
@@ -70,7 +86,7 @@ async fn consume(run:&ManagedRun,state:&mut State,delivery:Box<IncomingImDeliver
         if let Some(proof)=proof{
             for group in state.groups.values_mut(){
                 if group.outcome.is_none()&&group.key==*delivery.notice().key().digest(){
-                    group.outcome=Some(if Instant::now()<group.deadline{Some(proof.captured_copy())}else{None});
+                    settle(run,group,Some(&proof))?;
                 }
             }
         }
