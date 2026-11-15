@@ -43,6 +43,7 @@ pub(crate) mod native_invite_notifications;
 pub(crate) mod native_invite_receipts;
 pub(crate) mod im_data;
 pub(crate) mod im_text;
+pub(crate) mod im_status;
 pub(crate) mod im_delivery;
 pub(crate) mod im_inbox;
 pub mod rpc_arguments;

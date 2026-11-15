@@ -4,6 +4,8 @@ use super::*;
 use super::super::super::im_data::*;
 #[path="im_text_tests.rs"]
 mod text;
+#[path="im_status_tests.rs"]
+mod status;
 fn bytes(out:&mut Vec<u8>,value:&[u8]){out.extend_from_slice(&(value.len() as u32).to_be_bytes());out.extend_from_slice(value);}
 fn map(out:&mut Vec<u8>,fields:&[(&[u8],&[u8])]){out.extend_from_slice(&(fields.len() as u32).to_be_bytes());for(key,value)in fields{bytes(out,key);bytes(out,value);}}
 fn record(index:i64,time:i64,kind:&[u8],body:&[u8])->Vec<u8>{
