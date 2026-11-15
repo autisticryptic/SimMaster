@@ -41,6 +41,7 @@ impl ImBinding{
     pub(super) fn owner(&self)->&AttemptOwner{&self.owner}
     pub(super) fn scope(&self)->RpcConnectionScope{self.scope.clone()}
     pub(super) fn identity(&self)->&[u8;32]{&self.identity}
+    pub(super) fn authenticates(&self,uid:&[u8],selector:&[u8])->bool{self.identity==digest(&[b"jegotrip-native-im-context-v1\0",uid,selector])}
     pub(super) fn receipt_epoch(&self)->&str{self.receipt_epoch.as_str()}
     pub(super) fn policy(&self)->&Arc<NativeReceiverPolicy>{self.native.policy()}
 }

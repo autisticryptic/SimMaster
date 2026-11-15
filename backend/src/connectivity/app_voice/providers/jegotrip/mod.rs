@@ -45,6 +45,7 @@ pub(crate) mod im_data;
 pub(crate) mod im_text;
 pub(crate) mod im_status;
 pub(crate) mod im_receive_state;
+pub(crate) mod rpc_im;
 pub(crate) mod im_delivery;
 pub(crate) mod im_inbox;
 pub mod rpc_arguments;

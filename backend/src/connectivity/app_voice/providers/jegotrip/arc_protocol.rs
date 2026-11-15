@@ -255,6 +255,11 @@ impl ArcProtocol {
         self.packets(id, bytes.expose_to_transport())
     }
 
+    pub(super) fn prepare_im_read(&mut self,query:std::sync::Arc<super::rpc_im::ImQuery>,gate:std::sync::Arc<super::im_inbox::ImReceiptGate>,deadline:Instant)->Result<OwnedCallPackets,ProtocolError>{
+        let binding=self.im_binding.as_ref().ok_or(CodecError::InvalidField)?.clone();let(id,bytes)=self.rpc.prepare_im_read(binding,query,gate,deadline)?;self.packets(id,bytes.expose_to_transport())
+    }
+    pub(super) fn take_im_replies(&mut self)->Vec<super::rpc_im::OwnedImReply>{self.rpc.take_im_replies()}
+
     pub(super) fn prepare_offline(&mut self, position: i64, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
         if self.incoming.is_none() { return Err(CodecError::InvalidField.into()); }
         let (id, bytes) = self.rpc.prepare_offline(position, routing)?;

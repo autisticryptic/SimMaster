@@ -6,6 +6,8 @@ use n::{im_delivery::{NativeImConfig,IncomingImDelivery,ImReplySource},im_inbox:
 use std::{sync::Arc,time::{Duration,Instant}};
 #[path="im_association_tests.rs"]
 mod associations;
+#[path="im_rpc_read_tests.rs"]
+mod rpc_reads;
 struct Fixture{owner:AttemptOwner,scope:RpcConnectionScope,backend:OfflineBackend,temp:TempDatabase,run:Arc<account_runs::RunToken>,gate:Arc<ImReceiptGate>}
 impl Fixture{
     fn new(enabled:bool)->Self{

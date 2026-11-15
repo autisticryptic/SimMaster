@@ -147,6 +147,12 @@ impl OfflineBackend {
     pub fn prepare_bootstrap(&mut self, key: &[u8], routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_bootstrap(key, routing) }
 
+    pub(super) fn prepare_im_read(&mut self,query:std::sync::Arc<super::rpc_im::ImQuery>,gate:std::sync::Arc<super::im_inbox::ImReceiptGate>,deadline:std::time::Instant)->Result<OwnedCallPackets,ProtocolError>{
+        if self.im_binding.is_none()||self.scheduler.is_none()||self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField.into());}
+        self.protocol.prepare_im_read(query,gate,deadline)
+    }
+    pub(super) fn take_im_replies(&mut self)->Vec<super::rpc_im::OwnedImReply>{self.protocol.take_im_replies()}
+
     pub(super) fn prepare_offline(&mut self, position: i64, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
         if self.dispatcher.is_none() || self.scheduler.is_none() { return Err(CodecError::InvalidField.into()); }
         self.protocol.prepare_offline(position, routing)
