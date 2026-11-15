@@ -890,9 +890,11 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
     let mut pending = VecDeque::new();
     let mut offline = offline_reception::State::default();
     let mut im = im::State::default();
+    let mut im_sync = im_sync::State::default();
     let mut timer = tokio::time::interval(Duration::from_millis(250));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        let im_read_pending=im_sync.pending();
         tokio::select! {
             event = events.recv() => {
                 let Some(run) = run.upgrade() else { return; };
@@ -932,6 +934,7 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                                 offline.hosted(&run);
                                 offline_reception::drive(&run, &controller, &mut offline).await;
                                 if let Err(code)=im::drive(&run,controller.phase(),&mut im).await{*lock(&run.error)=Some(code);run.retire();}
+                                if let Err(code)=im_sync.drive(&run,&controller,&mut im).await{*lock(&run.error)=Some(code);run.retire();}
                             },
                             Ok(_) => {},
                             Err(reason) => { *lock(&run.error) = Some(controller_error(reason)); run.retire(); }
@@ -940,6 +943,7 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                     BackendEventPayload::Im(delivery)=>{
                         controller.tick(unix_now(),Instant::now());
                         if let Err(code)=im::delivery(&run,controller.phase(),&mut im,delivery).await{*lock(&run.error)=Some(code);run.retire();}
+                        if let Err(code)=im_sync.drive(&run,&controller,&mut im).await{*lock(&run.error)=Some(code);run.retire();}
                     }
                     BackendEventPayload::InviteNotification(invite) => {
                         controller.tick(unix_now(), Instant::now());
@@ -1008,9 +1012,18 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                     }
                 }
             }
+            result = im_sync.next(), if im_read_pending => {
+                let Some(run)=run.upgrade()else{return;};
+                // Read waiting never owns the controller lock. Stop/callbacks
+                // are free to invalidate this same run before SQL consumption.
+                let phase={let controller=run.controller.lock().await;controller.phase()};
+                if let Err(code)=im_sync.received(&run,phase,&mut im,result).await{*lock(&run.error)=Some(code);run.retire();}
+                let controller=run.controller.lock().await;
+                if let Err(code)=im_sync.drive(&run,&controller,&mut im).await{*lock(&run.error)=Some(code);run.retire();}
+            }
             _ = timer.tick() => {
                 let Some(run) = run.upgrade() else { return; };
-                if !run.accepting.load(Ordering::SeqCst) { pending.clear(); offline.clear(); im.clear(); continue; }
+                if !run.accepting.load(Ordering::SeqCst) { pending.clear(); offline.clear(); im.clear(); im_sync.clear(); continue; }
                 let mut controller = run.controller.lock().await;
                 if run.accepting.load(Ordering::SeqCst) {
                     if let Err(code) = run.configuration_current() {
@@ -1023,7 +1036,8 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                         if let Some(message) = pending.pop_front() { handle_message(&run, &mut controller, message, &mut pending).await; }
                         offline_reception::drive(&run, &controller, &mut offline).await;
                         if let Err(code)=im::drive(&run,controller.phase(),&mut im).await{*lock(&run.error)=Some(code);run.retire();}
-                    } else { pending.clear(); offline.clear(); im.clear(); }
+                        if let Err(code)=im_sync.drive(&run,&controller,&mut im).await{*lock(&run.error)=Some(code);run.retire();}
+                    } else { pending.clear(); offline.clear(); im.clear(); im_sync.clear(); }
                 }
             }
         }
@@ -1032,6 +1046,8 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
 
 #[path = "account_im.rs"]
 mod im;
+#[path = "account_im_sync.rs"]
+mod im_sync;
 #[path = "offline_reception.rs"]
 mod offline_reception;
 

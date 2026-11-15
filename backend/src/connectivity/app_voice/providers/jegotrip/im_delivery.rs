@@ -49,12 +49,13 @@ impl ImBinding{
 pub(super) struct ImKey{box_id:Zeroizing<Vec<u8>>,index:i64,digest:[u8;32]}
 impl fmt::Debug for ImKey{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("OwnedImKey(<redacted>)")}}
 impl ImKey{
-    fn capture(binding:&ImBinding,box_id:ImBox<'_>,index:i64)->Arc<Self>{
+    pub(super) fn capture(binding:&ImBinding,box_id:ImBox<'_>,index:i64)->Arc<Self>{
         Arc::new(Self{box_id:Zeroizing::new(box_id.bytes().to_vec()),index,digest:digest(&[b"jegotrip-native-im-key-v1\0",binding.identity(),box_id.bytes(),&index.to_be_bytes()])})
     }
     pub(super) fn box_id(&self)->ImBox<'_>{ImBox::parse(&self.box_id).expect("captured original IM box")}
     pub(super) fn index(&self)->i64{self.index}
     pub(super) fn digest(&self)->&[u8;32]{&self.digest}
+    pub(super) fn message_fingerprint(&self,raw:&[u8])->[u8;32]{digest(&[b"jegotrip-native-im-message-v1\0",self.digest(),raw])}
     pub(super) fn bytes(&self)->usize{self.box_id.len()+40}
 }
 
@@ -68,7 +69,7 @@ impl ImNotice{
         let Some(decoded)=im_data::decode_more_message(kind,properties,body)? else{return Ok(None);};
         let key=ImKey::capture(&binding,decoded.box_id,decoded.message.index);
         let canonical=decoded.message.encode()?;let raw=Zeroizing::new(canonical.expose_to_transport().to_vec());
-        let fingerprint=digest(&[b"jegotrip-native-im-message-v1\0",key.digest(),&raw]);
+        let fingerprint=key.message_fingerprint(&raw);
         let deadline=now.checked_add(binding.config.timeout()?).ok_or(CodecError::InvalidField)?;
         Ok(Some(Self{binding,key,payload:ImPayload::Message{raw,fingerprint},deadline}))
     }

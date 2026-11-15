@@ -113,5 +113,6 @@ pub(in super::super) fn delete_account(conn:&Connection,line:&str)->Result<(),&'
     if account_store::metadata(conn,line)?.is_some(){return Err(SCOPE);}
     if table_exists(conn,"app_voice_im_notifications")?{conn.execute("DELETE FROM app_voice_im_notifications WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;}
     if table_exists(conn,"app_voice_im_messages")?{conn.execute("DELETE FROM app_voice_im_messages WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;}
+    super::cursor::delete_account(conn,line)?;
     Ok(())
 }

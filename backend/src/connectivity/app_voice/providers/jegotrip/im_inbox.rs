@@ -19,6 +19,9 @@ const MAX_TOTAL_BYTES:i64=16*1024*1024;
 mod associations;
 pub(super) use associations::{AssociationAdmission,ImPendingAssociation};
 pub(super) use associations::{retire_run_associations,delete_account};
+#[path="im_cursor.rs"]
+mod cursor;
+pub(super) use cursor::{CursorSession,GapPlan,GapCommitted,OnlinePosition};
 
 pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
     conn.execute_batch("CREATE TABLE IF NOT EXISTS app_voice_im_messages(
@@ -35,7 +38,8 @@ pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
         UNIQUE(line_id,revision,identity_key,box_id,message_index));
         CREATE INDEX IF NOT EXISTS idx_app_voice_im_messages_line ON app_voice_im_messages(line_id,id);")
         .map_err(|_|STORAGE)?;
-    associations::initialize_schema(conn)
+    associations::initialize_schema(conn)?;
+    cursor::initialize_schema(conn)
 }
 
 pub(super) struct ImReceiptGate{live:AtomicBool,changed:tokio::sync::Notify}
@@ -121,6 +125,7 @@ impl CommittedIm{
             &&(!ticket.is_message()||ticket.fingerprint()==&self.fingerprint)&&now<ticket.completion_deadline()
     }
     pub(super) fn gate(&self)->Arc<ImReceiptGate>{self.gate.clone()}
+    pub(super) fn key_digest(&self)->&[u8;32]{self.key.digest()}
     pub(super) fn captured_copy(&self)->Self{Self{owner:self.owner.clone(),scope:self.scope.clone(),identity:self.identity,receipt_epoch:self.receipt_epoch.clone(),key:self.key.clone(),fingerprint:self.fingerprint,id:self.id,gate:self.gate.clone()}}
 }
 #[derive(Serialize)]
