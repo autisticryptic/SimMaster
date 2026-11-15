@@ -99,7 +99,8 @@ impl ClientExRegistration {
     }
 }
 
-pub(super) struct ClientExAction { pub result: RpcBytes, pub notice: Option<OwnedClientExNotice> }
+pub(super) struct ClientExAction { pub result: RpcBytes, pub notice: Option<OwnedClientExNotice>,
+    pub invite: Option<super::native_invite_notifications::InviteData> }
 pub(super) struct ClientExDispatcher {
     owner: AttemptOwner,
     scope: RpcConnectionScope,
@@ -169,6 +170,7 @@ impl ClientExDispatcher {
         }
         let mut reader = Reader::versioned(arguments)?;
         let mut notify_accepted = true;
+        let mut invite = None;
         let control = match kind {
             ClientExKind::CheckAlive => None,
             ClientExKind::NotifyCalls => {
@@ -180,6 +182,17 @@ impl ClientExDispatcher {
                     // an explicit negative result, not a successful poll hint,
                     // fabricated user event, or loss of the authenticated link.
                     notify_accepted = false;
+                    // Only explicitly installed native Invite handling retains
+                    // the original RPC reply for the actual call consumer.
+                    // Message remains on the legacy NACK path until its IM
+                    // box/payload consumer exists. No command becomes a hint.
+                    if properties.iter().any(|p| p.key == b"Notify.Command" && p.value == b"Invite")
+                        && property(b"token") == Some(self.token.as_slice()) {
+                        if let Some(config) = self.native.as_ref().and_then(|native| native.policy().invite_notifications()) {
+                            invite = Some(super::native_invite_notifications::InviteData::capture(
+                                &self.owner, &self.scope, notification_id, &properties, config, std::time::Instant::now())?);
+                        }
+                    }
                 }
                 Some(ClientExControl::PollHint { notification_id })
             }
@@ -207,7 +220,7 @@ impl ClientExDispatcher {
             }
             Some(OwnedClientExNotice { owner: self.owner.clone(), scope: self.scope.clone(), control })
         } else { None };
-        Ok(Some(ClientExAction { result, notice }))
+        Ok(Some(ClientExAction { result, notice, invite }))
     }
 }
 fn validate_metadata(metadata: &[RpcProperty<'_>]) -> Result<(), CodecError> {

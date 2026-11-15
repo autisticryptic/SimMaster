@@ -21,6 +21,9 @@ pub struct NativeReceiverConfig {
     /// local reception policy, not a token, service grant or TLS trust anchor.
     #[serde(default)]
     pub direct_domains: Option<DirectDomainConfig>,
+    /// Explicit original Invite consumer; absent retains the old known NACK.
+    #[serde(default)]
+    pub invite_notifications: Option<super::native_invite_notifications::NativeInviteConfig>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,7 +39,8 @@ impl fmt::Debug for DirectDomainConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("DirectDomainConfig(<redacted>)") }
 }
 
-pub(super) struct NativeReceiverPolicy { mode: DomainMode, domains: Vec<Vec<u8>>, retained: usize }
+pub(super) struct NativeReceiverPolicy { mode: DomainMode, domains: Vec<Vec<u8>>, retained: usize,
+    invite_notifications: Option<super::native_invite_notifications::NativeInviteConfig> }
 impl Drop for NativeReceiverPolicy { fn drop(&mut self) { self.domains.zeroize(); } }
 impl fmt::Debug for NativeReceiverPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("NativeReceiverPolicy(<redacted>)") }
@@ -56,8 +60,11 @@ impl NativeReceiverPolicy {
             if retained > MAX_STREAM_BYTES { return Err(CodecError::TooLarge); }
             if values[..index].contains(value) { return Err(CodecError::DuplicateKey); }
         }
-        Ok(Arc::new(Self { mode, domains: values.to_vec(), retained }))
+        if let Some(invites) = config.invite_notifications { invites.timeout()?; retained = retained.checked_add(8).ok_or(CodecError::TooLarge)?; }
+        if retained > MAX_STREAM_BYTES { return Err(CodecError::TooLarge); }
+        Ok(Arc::new(Self { mode, domains: values.to_vec(), retained, invite_notifications: config.invite_notifications }))
     }
+    pub(super) fn invite_notifications(&self) -> Option<super::native_invite_notifications::NativeInviteConfig> { self.invite_notifications }
     pub(super) fn retained_bytes(&self) -> usize { self.retained }
     /// The caller must first check its private original-scope request brand.
     /// No raw HTTP/notification payload or bare decoder can mint that brand.
@@ -95,6 +102,7 @@ impl Drop for NativeReceiverSetup { fn drop(&mut self) { if let Some(control) = 
 impl fmt::Debug for NativeReceiverSetup { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("NativeReceiverSetup(<redacted>)") } }
 impl NativeReceiverSetup {
     pub(super) fn capture(policy: Arc<NativeReceiverPolicy>, client_ex: bool, routing: Option<&[RpcProperty<'_>]>) -> Result<Arc<Self>, CodecError> {
+        if policy.invite_notifications().is_some() { return Err(CodecError::InvalidField); }
         let mut bytes = policy.retained_bytes();
         if let Some(routing) = routing {
             super::call_control::validate_routing(routing)?;
@@ -104,6 +112,7 @@ impl NativeReceiverSetup {
         Ok(Arc::new(Self { policy, client_ex, native_call_control:false, control: routing.map(|routing| routing.iter().map(|p| (p.key.to_vec(), p.value.to_vec())).collect()), bytes }))
     }
     pub(super) fn capture_native_control(policy:Arc<NativeReceiverPolicy>,client_ex:bool)->Result<Arc<Self>,CodecError>{
+        if policy.invite_notifications().is_some() && !client_ex { return Err(CodecError::InvalidField); }
         let bytes=policy.retained_bytes().checked_add(super::call_control::NATIVE_CONTROL_BYTES).ok_or(CodecError::TooLarge)?;
         if bytes>MAX_STREAM_BYTES{return Err(CodecError::TooLarge);}
         Ok(Arc::new(Self{policy,client_ex,native_call_control:true,control:None,bytes}))

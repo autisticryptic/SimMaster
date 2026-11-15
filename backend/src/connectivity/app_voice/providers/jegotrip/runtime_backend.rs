@@ -394,6 +394,8 @@ impl fmt::Debug for LoginCapture {
 }
 impl LoginCapture {
     fn capture(request: SdkLoginRequest<'_>, profile: &RuntimeProfile) -> Result<Self, BackendFailure> {
+        if profile.native_receivers.as_ref().is_some_and(|policy| policy.invite_notifications().is_some())
+            && (!profile.client_ex || !profile.native_call_control) { return Err(BackendFailure::Unavailable); }
         if !request.tls_only || request.account_identity.bytes().any(|b| matches!(b, b':' | b'[' | b']' | b'@'))
             || request.device_id.is_some() && !profile.include_device_id {
             return Err(BackendFailure::Unavailable);
@@ -454,6 +456,7 @@ pub enum BackendEventPayload {
     OfflinePage(super::rpc_offline::OwnedOfflinePage),
     BatchRetirement(super::batch_scheduler::BatchReplayRetirement),
     Call(IncomingCallDelivery),
+    InviteNotification(super::native_invite_notifications::IncomingInviteNotification),
     Terminal(BackendFailure),
 }
 impl BackendEvent {
@@ -642,6 +645,20 @@ impl NativeHostingBackend {
         hint: &super::rpc_offline::IncomingOfflineHint, accepted: bool) -> Result<RuntimeReceipt, RuntimeError> {
         let attempt = self.original(owner).map_err(|_| RuntimeError::Scope)?;
         attempt.commands(owner, scope)?.complete_offline_hint(owner, scope, hint, accepted).await
+    }
+
+    pub(super) fn invite_notifications_enabled(&self) -> bool {
+        self.profile.client_ex && self.profile.native_call_control
+            && self.profile.native_receivers.as_ref().is_some_and(|policy| policy.invite_notifications().is_some())
+    }
+    pub(super) async fn complete_invite_notification(&self, owner: &AttemptOwner, scope: &RpcConnectionScope,
+        ticket: &super::native_invite_notifications::InviteReplyTicket, accepted: bool) -> Result<RuntimeReceipt, RuntimeError> {
+        let attempt = self.original(owner).map_err(|_| RuntimeError::Scope)?;
+        {
+            let state = lock(&attempt.state);
+            if state.retired || state.logout_started || state.unregister_started || !state.configured || !self.invite_notifications_enabled() { return Err(RuntimeError::Closed); }
+        }
+        attempt.commands(owner, scope)?.complete_invite_notification(owner, scope, ticket, accepted).await
     }
 
     pub async fn complete_batch(&self, owner: &AttemptOwner, scope: &RpcConnectionScope,
@@ -1233,6 +1250,13 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                                 terminal(&sender, &attempt, BackendFailure::Disconnected); return;
                             }
                             BackendEventPayload::DirectMessage(message)
+                        }
+                        OfflineEvent::InviteNotification(invite) => {
+                            if !invite.matches(&attempt.owner, &attempt.scope) || !profile.native_call_control
+                                || profile.native_receivers.as_ref().is_none_or(|policy| policy.invite_notifications().is_none()) {
+                                terminal(&sender, &attempt, BackendFailure::Disconnected); return;
+                            }
+                            BackendEventPayload::InviteNotification(invite)
                         }
                         OfflineEvent::Call(call)=>{
                             if call.owner()!=&attempt.owner||!call.ticket().matches(&attempt.owner,&attempt.scope){terminal(&sender,&attempt,BackendFailure::Disconnected);return;}

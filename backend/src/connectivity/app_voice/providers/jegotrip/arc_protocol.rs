@@ -45,6 +45,7 @@ pub enum ProtocolEvent<'a> {
     Control(CallKind),
     Incoming(IncomingProtocolMessage),
     IncomingCall(IncomingCallDelivery),
+    InviteNotification(super::native_invite_notifications::IncomingInviteNotification),
     OfflineHint(super::rpc_offline::IncomingOfflineHint),
     ClientEx { reply: OwnedCallPackets, notice: Option<super::rpc_client_ex::OwnedClientExNotice> },
     OutgoingReply(OwnedCallPackets),
@@ -87,7 +88,8 @@ impl fmt::Debug for IncomingProtocolMessage {
 }
 
 #[derive(Clone,Copy)]
-enum DirectResponse{Message,OfflineHint,Call{kind:CallNoticeKind,native_id:NativeCallId}}
+enum DirectResponse{Message,OfflineHint,Call{kind:CallNoticeKind,native_id:NativeCallId},
+    Invite{notification_id:u64,fingerprint:[u8;32],deadline:Instant}}
 struct PendingDirect { magic: Vec<u8>, response:DirectResponse }
 
 /// Private protocol replay boundary, NOT a server ACK, channel or new owner.
@@ -350,6 +352,17 @@ impl ArcProtocol {
         if client_ex {
             let dispatcher = self.client_ex.as_ref().ok_or(CodecError::InvalidField)?;
             let action = dispatcher.on_direct(owner, scope, &request)?.ok_or(CodecError::InvalidField)?;
+            if let Some(data) = action.invite {
+                let original = self.rpc.owner().clone();
+                let ticket = DirectReplyTicket { owner: original, connection: self.rpc.connection_scope(), call_id: request.call_id };
+                let incoming = super::native_invite_notifications::IncomingInviteNotification::from_direct(data, ticket)?;
+                self.direct_last_id = request.call_id;
+                self.direct_pending.insert(request.call_id, PendingDirect { magic: magic.to_vec(), response: DirectResponse::Invite {
+                    notification_id: incoming.notification_id(), fingerprint: incoming.fingerprint(), deadline: incoming.deadline(),
+                } });
+                deliver(ProtocolEvent::InviteNotification(incoming));
+                return Ok(true);
+            }
             let reply = encode_reply(request.call_id, 0, action.result.expose_to_transport())?;
             let packets = encode_call_packets(CallKind::Reply, reply.expose_to_transport(), TLS_FRAGMENT_THRESHOLD)?;
             self.direct_last_id = request.call_id;
@@ -413,6 +426,22 @@ impl ArcProtocol {
         let through = self.direct_pending.keys().next().map_or(self.direct_last_id, |pending| pending.saturating_sub(1))
             .min(self.direct_last_id);
         (through > 0).then(|| DirectReplayFrontier { owner: self.rpc.owner().clone(), scope: self.rpc.connection_scope(), through })
+    }
+
+    pub(super) fn complete_invite_notification(&mut self, ticket: &super::native_invite_notifications::InviteReplyTicket, accepted: bool)
+        -> Result<Option<OwnedCallPackets>, ProtocolError> {
+        let super::native_invite_notifications::InviteReplySource::Direct(inner) = ticket.source() else { return Err(CodecError::InvalidField.into()); };
+        if !ticket.matches(self.rpc.owner(), &self.rpc.connection_scope()) || !self.rpc.accepts_scope(&inner.owner, &inner.connection) { return Ok(None); }
+        let Some(pending) = self.direct_pending.get(&inner.call_id) else { return Ok(None); };
+        let DirectResponse::Invite { notification_id, fingerprint, deadline } = pending.response else { return Err(CodecError::InvalidField.into()); };
+        if notification_id != ticket.notification_id() || &fingerprint != ticket.fingerprint() || deadline != ticket.deadline()
+            || accepted && !ticket.positive_is_current() { return Err(CodecError::InvalidField.into()); }
+        let result = super::native_invite_notifications::encode_completion(accepted)?;
+        let reply = encode_reply(inner.call_id, 0, result.expose_to_transport())?;
+        let packets = encode_call_packets(CallKind::Reply, reply.expose_to_transport(), TLS_FRAGMENT_THRESHOLD)?;
+        let pending = self.direct_pending.remove(&inner.call_id).ok_or(CodecError::InvalidField)?;
+        self.record_direct(inner.call_id, pending.magic);
+        Ok(Some(OwnedCallPackets { call_id: inner.call_id, packets }))
     }
 
     pub fn complete_incoming(&mut self, ticket: &DirectReplyTicket, accepted: bool)

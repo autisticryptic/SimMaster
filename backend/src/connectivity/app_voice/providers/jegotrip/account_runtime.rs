@@ -923,6 +923,24 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                             Err(reason) => { *lock(&run.error) = Some(controller_error(reason)); run.retire(); }
                         }
                     }
+                    BackendEventPayload::InviteNotification(invite) => {
+                        controller.tick(unix_now(), Instant::now());
+                        let ticket = invite.ticket().captured_copy();
+                        if controller.phase() == Phase::Hosted && run.accepting.load(Ordering::SeqCst) {
+                            if let Some(calls) = &run.calls {
+                                if let Err(code) = calls.invite_notification(invite).await {
+                                    *lock(&run.error) = Some(code);
+                                    let _ = run.backend.complete_invite_notification(&owner,&scope,&ticket,false).await;
+                                    run.retire();
+                                }
+                                continue;
+                            }
+                        }
+                        // No installed/current call consumer: preserve explicit
+                        // negative completion, never convert an Invite to SMS,
+                        // a poll hint, a call/answer or media readiness.
+                        if run.backend.complete_invite_notification(&owner,&scope,&ticket,false).await.is_err() { run.retire(); }
+                    }
                     BackendEventPayload::Call(call)=>{
                         controller.tick(unix_now(), Instant::now());
                         if controller.phase() == Phase::Hosted && run.accepting.load(Ordering::SeqCst) {

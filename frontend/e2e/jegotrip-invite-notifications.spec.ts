@@ -1,0 +1,25 @@
+import { test, expect } from '@playwright/test'
+test('original Invite status is bounded read-only metadata and not channel answer media or trust success', async ({ page }) => {
+  const writes: string[] = []; const errors: string[] = []; page.on('pageerror', (error) => errors.push(error.message))
+  await page.route((url) => url.pathname.startsWith('/api/'), async (route) => {
+    const request = route.request(); if (request.method() !== 'GET') writes.push(request.method())
+    const path = new URL(request.url()).pathname; expect(path.endsWith('/calls')).toBe(true)
+    const old = path.includes('0123456789abcdef0123456789abcdef')
+    await route.fulfill({ json: { status: 'ok', data: [{ history_id: old ? 91 : 92, sdk_invite_notification: old ? 'consumed' : undefined, peer: 'private-peer', sdp: 'private-sdp' },
+      { history_id: 93, sdk_invite_notification: 'private-token' }, { history_id: '94', sdk_invite_notification: 'consumed' }] } })
+  })
+  await page.setViewportSize({ width: 1280, height: 1000 }); await page.goto('/e2e/fixtures/app-invite-notifications.html')
+  await expect(page.getByText(/原通话记录 91.*原 SDK Invite 已消费并持久保存/)).toBeVisible()
+  await expect(page.getByText(/不代表渠道送达、来电已接听或媒体就绪/)).toBeVisible()
+  for (const value of ['private-peer', 'private-sdp', 'private-token', '原通话记录 94']) await expect(page.getByText(value, { exact: false })).toHaveCount(0)
+  await page.screenshot({ path: 'test-results/jegotrip-device-ui/invite-notifications-desktop.png', fullPage: true, animations: 'disabled' })
+  await page.getByRole('button', { name: '切换原账号' }).click(); await page.setViewportSize({ width: 390, height: 844 })
+  await expect(page.getByText(/原通话记录 92.*未观察到原 SDK Invite 的已消费记录/)).toBeVisible()
+  await expect(page.getByText(/原通话记录 91/)).toHaveCount(0)
+  await expect(page.getByText(/Message IM 消费器尚未装配/)).toBeVisible()
+  expect(writes).toEqual([]); expect(errors).toEqual([])
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
+  await page.screenshot({ path: 'test-results/jegotrip-device-ui/invite-notifications-mobile.png', fullPage: true, animations: 'disabled' })
+  await page.getByRole('button', { name: '停止本地状态读取' }).click()
+  await expect(page.getByText(/原通话记录 92/)).toHaveCount(0)
+})

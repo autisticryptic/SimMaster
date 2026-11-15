@@ -11,6 +11,8 @@ use super::super::{
 
 #[path = "client_ex_notification_tests.rs"]
 mod notification_rejection;
+#[path = "native_invite_protocol_tests.rs"]
+mod native_invites;
 
 fn owner() -> AttemptOwner {
     let mut session = HostingSession::new("fixture-client-ex-line".into());

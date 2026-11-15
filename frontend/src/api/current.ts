@@ -1123,6 +1123,10 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<AppLoginAttempt[]>>('/non-3gpp/app-login/attempts')
   }
 
+  async getAppCalls(lineId: string) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/calls`, { cache: 'no-store', timeoutMs: 10000 })
+  }
+
   async getAppCallNotifications(lineId: string) {
     return request<ApiResponse<AppCallNotificationStatus[]>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/call-notifications?limit=16`)
   }

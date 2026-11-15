@@ -145,6 +145,7 @@ impl Gateway {
 enum Operation {
     Login(Login, Vec<Property>), Bootstrap(Zeroizing<Vec<u8>>, Vec<Property>), Configure(u32, Option<Binding>), ArmClientEx(Binding), ConfigureClientEx, ConfigureCalls(CallBinding), Logout(Vec<Property>),
     Swap(Vec<Property>, Option<Gateway>), CompleteBatch(ServerRequestTicket, bool), CompleteDirect(DirectReplyTicket, bool), CompleteCall(CallReplyTicket,bool,Vec<Property>),
+    CompleteInvite(super::native_invite_notifications::InviteReplyTicket, bool),
     ArmNativeReceivers(std::sync::Arc<super::native_receiver::NativeReceiverSetup>), ConfigureNativeReceivers(u32),
     GetOffline(i64, Vec<Property>), CompleteOfflineHint(super::rpc_offline::IncomingOfflineHint, bool),
     ConfigureCallControl(Vec<Property>),Call(CallControlTicket,CallOperation,Vec<Property>,oneshot::Sender<Result<OwnedCallOperationReply,RuntimeError>>),
@@ -161,7 +162,7 @@ impl Operation {
             Self::Swap(routing, gateway) => routing.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()
                 + gateway.as_ref().map_or(0, |g| g.uri.len() + g.prefix.len() + g.channel.len() + g.int_code.len() + g.number.len() + g.password.len()
                     + g.metadata.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()),
-            Self::ConfigureClientEx | Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) | Self::CompleteOfflineHint(_, _) => 0,
+            Self::ConfigureClientEx | Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) | Self::CompleteOfflineHint(_, _) | Self::CompleteInvite(_, _) => 0,
             Self::ConfigureCalls(binding)=>binding.object.len()+binding.domain.len(),
             Self::ConfigureNativeReceivers(_) => 0,
             Self::ArmNativeReceivers(setup) => setup.retained_bytes(),
@@ -332,6 +333,13 @@ impl RuntimeCommands {
         if !self.accepts(owner, scope) || !ticket.matches(owner, scope) { return Err(RuntimeError::Scope); }
         self.submit(owner, scope, Operation::CompleteDirect(ticket.captured_copy(), accepted)).await
     }
+    pub(super) async fn complete_invite_notification(&self, owner: &AttemptOwner, scope: &RpcConnectionScope,
+        ticket: &super::native_invite_notifications::InviteReplyTicket, accepted: bool) -> Result<RuntimeReceipt, RuntimeError> {
+        if !self.accepts(owner, scope) || !ticket.matches(owner, scope) { return Err(RuntimeError::Scope); }
+        if accepted && !ticket.positive_is_current() { return Err(RuntimeError::Timeout); }
+        self.submit(owner, scope, Operation::CompleteInvite(ticket.captured_copy(), accepted)).await
+    }
+
     pub(super) async fn arm_native_receivers(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, setup: std::sync::Arc<super::native_receiver::NativeReceiverSetup>)
         -> Result<RuntimeReceipt, RuntimeError> {
         if !self.accepts(owner, scope) { return Err(RuntimeError::Scope); }
@@ -681,11 +689,23 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             let _ = command.completion.send(Err(RuntimeError::Timeout));
             return Err(RuntimeError::Timeout);
         }
-        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _)) {
+        if self.unhosting_pending.is_some() && matches!(&command.operation, Operation::CompleteInvite(_, true)) {
+            let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
+        }
+        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _)) {
             let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
         }
         if !matches!(&command.operation, Operation::ArmClientEx(_) | Operation::ArmNativeReceivers(_)) && self.common.is_none() && self.tls.as_ref().is_none_or(|tls|tls.phase()!=TlsPhase::Verified) {
             let _ = command.completion.send(Err(RuntimeError::Tls(TlsError::NotReady))); return Ok(());
+        }
+        let mut invite_claims = match &command.operation { Operation::CompleteInvite(ticket, true) => {
+            if !ticket.positive_is_current() { let _ = command.completion.send(Err(RuntimeError::Timeout)); return Ok(()); }
+            ticket.consumer_claim().into_iter().collect::<Vec<_>>()
+        }, _ => Vec::new() };
+        let mut invite_deadline = match &command.operation { Operation::CompleteInvite(ticket, true) => Some(ticket.completion_deadline()), _ => None };
+        if matches!(&command.operation, Operation::Swap(_, _)) {
+            let (claims, deadline) = self.backend.invite_write_guard(); invite_claims.extend(claims);
+            if let Some(deadline) = deadline { invite_deadline = Some(invite_deadline.map_or(deadline, |original| original.min(deadline))); }
         }
         let native_deadline=if self.common.is_some(){
             let wait=if matches!(&command.operation,Operation::Login(..)){Duration::from_secs(90)}else{self.policy.rpc_timeout};
@@ -693,10 +713,14 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             if self.backend.phase()!=ArcPhase::Authenticated{if let Some(attempt)=self.native_attempt_end{end=end.min(attempt);}}
             if now>=end{let _=command.completion.send(Err(RuntimeError::Timeout));return Err(RuntimeError::Timeout);}Some(end)
         }else{None};
+        let native_deadline = match (native_deadline, invite_deadline) {
+            (Some(original), Some(invite)) => Some(original.min(invite)), (None, Some(invite)) => Some(invite), (original, None) => original,
+        };
+        if native_deadline.is_some_and(|deadline| now >= deadline) { let _ = command.completion.send(Err(RuntimeError::Timeout)); return Ok(()); }
         if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
-        let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _));
+        let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _));
         let is_logout = matches!(&command.operation, Operation::Logout(_));
         let mut unhosting_sequence = None;let mut call_wait=None;
         let elapsed_ms = self.elapsed_ms(now);
@@ -764,6 +788,16 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                     _=>{let _=command.completion.send(Err(RuntimeError::Protocol));return Ok(());}
                 }
             }
+            Operation::CompleteInvite(ticket, accepted) => {
+                match self.backend.complete_invite_notification(&ticket, accepted) {
+                    Ok(Some(super::offline_backend::CallCompletion::Direct(packets))) => Ok(packets),
+                    Ok(Some(super::offline_backend::CallCompletion::BatchQueued)) => {
+                        if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), None))).is_err() { return Err(RuntimeError::Cancelled); }
+                        return Ok(());
+                    }
+                    _ => { let _ = command.completion.send(Err(RuntimeError::Protocol)); return Ok(()); }
+                }
+            }
             Operation::CompleteBatch(ticket, accepted) => {
                 let result = self.backend.complete_message(&ticket, accepted).and_then(|completed| {
                     if completed { Ok(()) } else { Err(super::arc_protocol::ProtocolError::Rpc(super::rpc_stream::CodecError::InvalidField)) }
@@ -813,7 +847,19 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             Err(_) => { let _ = command.completion.send(Err(RuntimeError::Protocol)); return Ok(()); }
         };
         if is_logout { self.pending.retain(|id, _| self.backend.is_pending(*id)); }
-        if let Err(error) = self.send_packets(&packets.packets,Some(&mut command.completion),native_deadline).await {
+        let sent = if !invite_claims.is_empty() {
+            let cancelled = async {
+                use futures_util::StreamExt;
+                let mut waiting = futures_util::stream::FuturesUnordered::new();
+                for claim in &invite_claims { waiting.push(claim.cancelled()); }
+                let _ = waiting.next().await;
+            };
+            tokio::select! { biased;
+                _ = cancelled => Err(RuntimeError::Cancelled),
+                result = self.send_packets(&packets.packets,Some(&mut command.completion),native_deadline) => result,
+            }
+        } else { self.send_packets(&packets.packets,Some(&mut command.completion),native_deadline).await };
+        if let Err(error) = sent {
             self.backend.retire_request(packets.call_id); let _ = command.completion.send(Err(error)); return Err(error);
         }
         let rpc_deadline=native_deadline.unwrap_or(Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?);

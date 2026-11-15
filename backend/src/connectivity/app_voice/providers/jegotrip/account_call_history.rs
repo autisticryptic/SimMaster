@@ -24,7 +24,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), &'static str> {
         names.iter().any(|name| name == "app_call_token")
     };
     if !exists { conn.execute_batch("ALTER TABLE call_history ADD COLUMN app_call_token TEXT").map_err(|_| STORAGE)?; }
-    Ok(())
+    super::native_invite_receipts::initialize_schema(conn)
 }
 pub(super) fn insert(db: &Database, run: &RunToken, local_id: &str, caller: &str) -> Result<HistoryTicket, &'static str> {
     if !account_store::valid_line_id(run.line_id()) || local_id.len() != 32 || !local_id.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err(SCOPE); }

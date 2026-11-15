@@ -13,7 +13,7 @@ fn native_context()->(ArcRpcSession,AttemptOwner,RpcConnectionScope,CallDispatch
     let mut result=Writer::new();result.boolean(true).unwrap();result.bytes(b"fixture-user").unwrap();result.bytes(b"fixture-auth-token").unwrap();result.properties(&[]).unwrap();result.bytes(b"").unwrap();
     let reply=encode_reply(id,0,result.finish().expose_to_transport()).unwrap();
     assert!(matches!(rpc.on_reply(&original,&scope,reply.expose_to_transport()).unwrap(),Some(ArcReply::Login(_))));
-    rpc.configure_native_call_control().unwrap();let policy=NativeReceiverPolicy::capture(&NativeReceiverConfig{direct_domains:None}).unwrap();
+    rpc.configure_native_call_control().unwrap();let policy=NativeReceiverPolicy::capture(&NativeReceiverConfig{direct_domains:None,invite_notifications:None}).unwrap();
     let dispatcher=rpc.native_call_dispatcher(policy).unwrap();(rpc,original,scope,dispatcher)
 }
 fn native_notice(d:&CallDispatcher,original:&AttemptOwner,scope:&RpcConnectionScope,kind:CallNoticeKind,id:u64,oid:Option<&[u8]>)->OwnedCallNotice{
@@ -123,16 +123,16 @@ fn native_rejection_ack_and_closed_scope_do_not_allow_call_control_or_restore_ol
 }
 #[test]
 fn native_default_setup_is_bounded_prelogin_data_not_a_scope_or_ready_proof(){
-    let policy=NativeReceiverPolicy::capture(&NativeReceiverConfig{direct_domains:None}).unwrap();
+    let policy=NativeReceiverPolicy::capture(&NativeReceiverConfig{direct_domains:None,invite_notifications:None}).unwrap();
     let setup=NativeReceiverSetup::capture_native_control(policy,false).unwrap();assert!(setup.native_call_control);assert!(setup.control().is_none());
     assert_eq!(setup.retained_bytes(),NATIVE_CONTROL_BYTES);assert_eq!(format!("{setup:?}"),"NativeReceiverSetup(<redacted>)");
-    let legacy=NativeReceiverSetup::capture(NativeReceiverPolicy::capture(&NativeReceiverConfig{direct_domains:None}).unwrap(),false,None).unwrap();assert!(!legacy.native_call_control);
+    let legacy=NativeReceiverSetup::capture(NativeReceiverPolicy::capture(&NativeReceiverConfig{direct_domains:None,invite_notifications:None}).unwrap(),false,None).unwrap();assert!(!legacy.native_call_control);
 }
 
 fn native_account_config()->n::account_config::AccountConfig{
     let certificate=n::tls_engine::tests::Certificates::generate("IP:127.0.0.1");
     let mut config=n::account_config::tests::native_fixture(&certificate.root,"127.0.0.1",12345);
-    config.profile.incoming=None;config.profile.native_receivers=Some(NativeReceiverConfig{direct_domains:None});config
+    config.profile.incoming=None;config.profile.native_receivers=Some(NativeReceiverConfig{direct_domains:None,invite_notifications:None});config
 }
 #[test]
 fn native_call_control_config_defaults_off_and_does_not_change_old_private_envelopes(){

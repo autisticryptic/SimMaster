@@ -37,7 +37,8 @@ class NativeCallLifecycleContracts(unittest.TestCase):
         self.assertIn('get(b"domain").is_some_and(valid_identifier)',calls)
     def test_worker_retains_join_and_uses_existing_original_runtime_deadline(self):
         owner=src('account_calls.rs');worker=src('account_call_maintenance.rs')
-        self.assertIn('call.ticket.revoke();\n        self.join_call_notifications(call).await?;\n        self.join_native_keepalive(call).await?',owner)
+        self.assertIn('call.ticket.revoke(); lock(&self.invites).wake();\n        self.join_call_notifications(call).await?;\n        self.join_native_keepalive(call).await?',owner)
+        self.assertIn('lock(&self.invites).retire();',owner)
         self.assertIn('*slot=Some(tokio::spawn',worker)
         self.assertIn('task.await',worker);self.assertIn('slot.take();result',worker)
         self.assertIn('CallOperation::KeepAlive,&properties',worker)

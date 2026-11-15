@@ -1,6 +1,8 @@
 //! Actions-only SQLite original app-call history identity/transaction tests.
 use super::*;
 use super::super::{account_store,account_test_support::{TempDatabase,config},account_runtime::local_nonce,tls_engine::tests::Certificates};
+#[path="native_invite_receipts_tests.rs"]
+mod invite_notifications;
 fn fixture()->(TempDatabase,RunToken){let temp=TempDatabase::new();let cert=Certificates::generate("DNS:fixture.invalid");
     let line=format!("app-account-{}",local_nonce().unwrap());temp.database.with_conn(|conn|account_store::create(conn,&line,&config(&cert.root),100)).unwrap();
     let run=temp.database.with_conn(|conn|account_runs::register_runtime(conn,&line,1,&local_nonce().unwrap())).unwrap();(temp,run)}

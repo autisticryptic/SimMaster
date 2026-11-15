@@ -20,6 +20,8 @@ const MAX_ACTIVE: usize = 16;
 mod maintenance;
 #[path="account_call_notification_runtime.rs"]
 mod notifications;
+#[path="account_invite_notifications.rs"]
+mod invites;
 fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { value.lock().unwrap_or_else(|poison| poison.into_inner()) }
 fn call_error(error:RuntimeError)->&'static str{match error{
     RuntimeError::CallRejected=>"app_account_call_rejected",RuntimeError::CallNotReady=>"app_account_call_not_ready",
@@ -34,7 +36,7 @@ struct Call { id: String, ticket: CallControlTicket, offer: PlainAudioOffer, cal
     received: u64, cancelled: AtomicBool, changed: tokio::sync::Notify, operation: AsyncMutex<()>, state: Mutex<State>, watch: AsyncMutex<Option<JoinHandle<()>>>,
     native_timing:Mutex<Option<super::native_call_lifecycle::NativeCallTiming>>,keepalive:AsyncMutex<Option<JoinHandle<()>>>,
     notice_snapshot:Mutex<Option<Result<Option<Box<dyn super::account_call_notifications::CallNoticeSnapshot>>,&'static str>>>,
-    notice_task:AsyncMutex<Option<JoinHandle<()>>>,notice_error:Mutex<Option<&'static str>> }
+    notice_task:AsyncMutex<Option<JoinHandle<()>>>,notice_error:Mutex<Option<&'static str>>,invite_consumed:AtomicBool }
 impl Call {
     fn retire(&self) { self.cancelled.store(true,Ordering::SeqCst); self.ticket.revoke(); let mut state=lock(&self.state);
         state.socket.take(); if let Some(media)=&state.media { media.retire(); } }
@@ -45,27 +47,30 @@ impl Call {
         // admission. Read-only polling cannot reject a legitimate answer.
         let sdp=local.and_then(|local|self.offer.with_local_endpoint(&self.ticket,local).ok()).and_then(|body|std::str::from_utf8(&body).ok().map(str::to_owned));
         CallView{id:self.id.clone(),history_id:self.history.id(),phase:phase.name(),received_at_unix_seconds:self.received,peer:self.caller.clone(),peer_source:"native_invitation_peer",
-            media_active:media_active&&self.ticket.is_live(),sdp,last_error:error,notification_error:*lock(&self.notice_error)}
+            media_active:media_active&&self.ticket.is_live(),sdp,last_error:error,notification_error:*lock(&self.notice_error),
+            sdk_invite_notification:self.invite_consumed.load(Ordering::SeqCst).then_some("consumed")}
     }
 }
 #[derive(Clone, Serialize)]
 pub struct CallView { pub id:String,pub history_id:i64,pub phase:&'static str,pub received_at_unix_seconds:u64,pub peer:String,
     pub peer_source:&'static str,pub media_active:bool,pub sdp:Option<String>,pub last_error:Option<&'static str>,
     #[serde(skip_serializing_if="Option::is_none")]
-    pub notification_error:Option<&'static str> }
+    pub notification_error:Option<&'static str>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub sdk_invite_notification:Option<&'static str> }
 impl fmt::Debug for CallView { fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {f.write_str("AppCallView(<redacted>)")} }
 struct Binding { owner:AttemptOwner,scope:RpcConnectionScope }
 pub(super) struct CallService { database:Arc<Database>,run:Arc<RunToken>,backend:Arc<NativeHostingBackend>,settings:CallSettings,expiry:Option<u64>,
     bound:Mutex<Option<Binding>>,accepting:AtomicBool,quiescent:AtomicBool,changed:tokio::sync::Notify,calls:Mutex<BTreeMap<String,Arc<Call>>>,
     tasks:AsyncMutex<Vec<JoinHandle<()>>>,commands:AsyncMutex<Option<JoinHandle<()>>>,operator:OperatorLink,trunk:TrunkRuntime,
-    notice_planner:Option<Arc<dyn super::account_notifications::NoticePlanner>> }
+    notice_planner:Option<Arc<dyn super::account_notifications::NoticePlanner>>,invites:Mutex<invites::InviteQueue> }
 impl fmt::Debug for CallService { fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {f.write_str("CallService(<redacted>)")} }
 impl CallService {
     pub(super) fn new(database:Arc<Database>,run:Arc<RunToken>,backend:Arc<NativeHostingBackend>,settings:CallSettings,expiry:Option<u64>)->Arc<Self> {
         let operator=OperatorLink::default();operator.set_ready(false);
         let trunk=TrunkRuntime::with_operator(operator.clone());
         Arc::new(Self {database,run,backend,settings,expiry,bound:Mutex::new(None),accepting:AtomicBool::new(false),quiescent:AtomicBool::new(false),changed:tokio::sync::Notify::new(),
-            calls:Mutex::new(BTreeMap::new()),tasks:AsyncMutex::new(Vec::new()),commands:AsyncMutex::new(None),operator,trunk,notice_planner:None})
+            calls:Mutex::new(BTreeMap::new()),tasks:AsyncMutex::new(Vec::new()),commands:AsyncMutex::new(None),operator,trunk,notice_planner:None,invites:Mutex::new(invites::InviteQueue::default())})
     }
     pub(super) fn with_notifications(mut self:Arc<Self>,planner:Option<Arc<dyn super::account_notifications::NoticePlanner>>)->Arc<Self>{
         Arc::get_mut(&mut self).expect("unpublished call service").notice_planner=planner;self
@@ -97,6 +102,7 @@ impl CallService {
         self.accepting.store(true,Ordering::SeqCst);self.operator.set_ready(true);Ok(())
     }
     pub(super) fn retire(&self) { self.accepting.store(false,Ordering::SeqCst);self.changed.notify_waiters();self.operator.set_ready(false);
+        lock(&self.invites).retire();
         for call in lock(&self.calls).values(){call.retire();} }
     async fn stopped(&self){loop{let wake=self.changed.notified();tokio::pin!(wake);wake.as_mut().enable();if !self.accepting.load(Ordering::SeqCst){return;}wake.await;}}
     fn find(&self,id:&str)->Result<Arc<Call>,&'static str>{lock(&self.calls).get(id).cloned().ok_or("app_account_call_not_found")}
@@ -105,6 +111,8 @@ impl CallService {
     pub(super) fn list(&self)->Result<Vec<CallView>,&'static str>{if !self.configuration_current(){return Err(SCOPE);}Ok(lock(&self.calls).values().map(|call|call.view()).collect())}
     pub(super) fn get(&self,id:&str)->Result<CallView,&'static str>{if !self.configuration_current(){return Err(SCOPE);}Ok(self.find(id)?.view())}
     pub(super) fn operator(&self)->OperatorLink{self.operator.clone()}
+    #[cfg(test)]
+    pub(super) fn invite_holders_for_test(&self)->usize{lock(&self.invites).retained_holders()}
     pub(super) async fn trunk_status(&self)->crate::services::trunk::runtime::TrunkRuntimeStatus{self.trunk.status().await}
     /// Install once, before publishing the call. Ringing has no media actor yet,
     /// but still owns history/Trunk state which must end with its original scope.
@@ -172,9 +180,9 @@ impl CallService {
                 let native_timing=self.settings.native_lifecycle.map(|policy|policy.bind(ticket));
                 let call=Arc::new(Call{id:id.clone(),ticket:ticket.captured_copy(),offer,caller,history,received:super::account_runtime::unix_now(),cancelled:AtomicBool::new(false),changed:tokio::sync::Notify::new(),
                     operation:AsyncMutex::new(()),state:Mutex::new(State{phase:Phase::Checking,error:None,socket:None,local:None,media:None,connected:None,release_attempted:false,accept_queued:false,end_queued:false}),watch:AsyncMutex::new(None),
-                    native_timing:Mutex::new(native_timing),keepalive:AsyncMutex::new(None),notice_snapshot:Mutex::new(Some(notice_snapshot)),notice_task:AsyncMutex::new(None),notice_error:Mutex::new(None)});
+                    native_timing:Mutex::new(native_timing),keepalive:AsyncMutex::new(None),notice_snapshot:Mutex::new(Some(notice_snapshot)),notice_task:AsyncMutex::new(None),notice_error:Mutex::new(None),invite_consumed:AtomicBool::new(false)});
                 self.watch_original(&call);
-                lock(&self.calls).insert(id,call.clone());
+                lock(&self.calls).insert(id,call.clone()); lock(&self.invites).wake();
                 if self.backend.complete_call(owner,&scope,incoming.ticket(),true,&[]).await.is_err(){call.retire();return Err(SCOPE);}
                 let weak=Arc::downgrade(self);let admitted=self.spawn_task(async move{if let Some(service)=weak.upgrade(){
                     let _guard=call.operation.lock().await;if let Err(code)=service.ring(&call).await{lock(&call.state).error=Some(code);let _=service.finish(&call,true).await;}
@@ -250,7 +258,8 @@ impl CallService {
         let mut socket=Some(socket);
         self.publish_state(call,|state|{state.socket=socket.take();state.local=Some(address);state.phase=Phase::Ringing;}).await?;
         self.start_call_notifications(call);
-        call.ticket.with_media_gate(||self.operator.send_event(OperatorEvent::Incoming{call_id:call.id.clone(),caller:format!("sip:{}@app-account.invalid",if call.caller.is_empty(){"unknown"}else{call.caller.as_str()}),body:body.to_vec()})).ok_or(SCOPE)?;Ok(())
+        call.ticket.with_media_gate(||self.operator.send_event(OperatorEvent::Incoming{call_id:call.id.clone(),caller:format!("sip:{}@app-account.invalid",if call.caller.is_empty(){"unknown"}else{call.caller.as_str()}),body:body.to_vec()})).ok_or(SCOPE)?;
+        lock(&self.invites).wake(); Ok(())
     }
     pub(super) async fn accept(self:&Arc<Self>,id:&str,body:Vec<u8>)->Result<OperationWaiter,&'static str>{
         let call=self.find(id)?;if !self.active(&call)||lock(&call.state).phase!=Phase::Ringing{return Err(SCOPE);}
@@ -309,7 +318,7 @@ impl CallService {
         let(media,answered,duration)={let mut state=lock(&call.state);if state.phase==Phase::Ended{return Ok(());}
             let answered=state.connected.is_some();let duration=state.connected.map(|at|at.elapsed().as_secs().min(i64::MAX as u64)as i64).unwrap_or(0);
             state.phase=Phase::Ending;state.socket.take();(state.media.clone(),answered,duration)};
-        call.ticket.revoke();
+        call.ticket.revoke(); lock(&self.invites).wake();
         self.join_call_notifications(call).await?;
         self.join_native_keepalive(call).await?;
         if let Some(media)=media{let closed=media.close().await;if !closed.io_released{return Err("app_account_call_cleanup_unconfirmed");}}

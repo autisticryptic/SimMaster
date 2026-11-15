@@ -125,7 +125,7 @@ fn native_lifecycle_config_requires_native_control_and_keeps_old_private_seriali
 #[test]
 fn native_lifecycle_config_roundtrips_explicit_timer_without_replacing_media_tls_or_enabling_cellular(){
     let sdk=n::tls_engine::tests::Certificates::generate("IP:127.0.0.1");let mut config=n::account_config::tests::native_fixture(&sdk.root,"127.0.0.1",12345);
-    config.profile.incoming=None;config.profile.native_receivers=Some(NativeReceiverConfig{direct_domains:None});config.profile.native_call_control=true;
+    config.profile.incoming=None;config.profile.native_receivers=Some(NativeReceiverConfig{direct_domains:None,invite_notifications:None});config.profile.native_call_control=true;
     config.call_media=n::account_call_test_support::call_config(&sdk.root,&sdk.root).call_media;
     config.call_media.as_mut().unwrap().native_lifecycle=Some(NativeCallLifecycleConfig{session_timer_seconds:30});config.validate(100).unwrap();
     let raw=config.encode_private().unwrap();let restored=n::account_config::AccountConfig::decode_private(&raw).unwrap();

@@ -3,6 +3,8 @@
 mod default_calls;
 #[path="native_call_lifecycle_account_tests.rs"]
 mod lifecycle;
+#[path="native_invite_account_tests.rs"]
+mod invite_notifications;
 use super::*;
 use n::{account_config::AccountConfig, account_runtime::AccountManager, account_test_support::{config_json, TempDatabase}};
 fn account_config(root: &str, port: u16, offline: bool) -> AccountConfig {

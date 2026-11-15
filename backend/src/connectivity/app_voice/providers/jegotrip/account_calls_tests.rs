@@ -146,3 +146,5 @@ mod admission;
 mod retirement;
 #[path="account_call_notifications_tests.rs"]
 mod notifications;
+#[path="account_invite_queue_filter_tests.rs"]
+mod invite_queue;

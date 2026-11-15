@@ -1,0 +1,41 @@
+//! Pure Actions-only queue cases. The selected account_calls::tests wrappers
+//! invoke these assertions; no native target, tool installation or device IO.
+use super::*;
+use super::super::super::{arc_session::ArcLoginInputs,offline_backend::{OfflineBackend,OfflineEvent},native_receiver::{NativeReceiverConfig,NativeReceiverPolicy,NativeReceiverSetup},
+    native_invite_notifications::{NativeInviteConfig,InviteReplySource},rpc_envelope::{encode_request,encode_reply,decode_request},rpc_stream::{Reader,Writer,RpcProperty},session::HostingSession,tests::imported};
+struct Fixture { owner: AttemptOwner, scope: RpcConnectionScope, backend: OfflineBackend }
+impl Fixture {
+    fn new() -> Self {
+        let mut session=HostingSession::new("fixture-invite-queue".into());session.import(imported(),100).unwrap();let owner=session.begin_login(100).unwrap();let mut backend=OfflineBackend::new(owner.clone());backend.claim_common_transport().unwrap();backend.bind_common_identity(b"AccountEntry").unwrap();let scope=backend.connection_scope();
+        let policy=NativeReceiverPolicy::capture(&NativeReceiverConfig{direct_domains:None,invite_notifications:Some(NativeInviteConfig{timeout_ms:30000})}).unwrap();backend.arm_native_receivers(NativeReceiverSetup::capture_native_control(policy,true).unwrap()).unwrap();
+        let login=backend.prepare_login(ArcLoginInputs{typed_identity:b"username:fixture",domain_name:b"fixture.invalid",selected_session_id:b"fixture-selector",phone_login_token:b"fixture-phone",application_key:b"fixture-key",domain_id:b"fixture-domain",application_id:b"fixture-app",device_info_cc:b"",client_properties:&[]},&[]).unwrap();
+        let mut result=Writer::new();result.boolean(true).unwrap();result.bytes(b"fixture-user").unwrap();result.bytes(b"fixture-token").unwrap();result.properties(&[]).unwrap();result.bytes(b"").unwrap();let reply=encode_reply(login.call_id,0,result.finish().expose_to_transport()).unwrap();let mut packet=vec![1];packet.extend_from_slice(reply.expose_to_transport());backend.on_plaintext_packet(&owner,&scope,&packet,0).unwrap();backend.configure_native_receivers(7).unwrap();Self{owner,scope,backend}
+    }
+    fn arguments(id:u64,value:&[u8])->Vec<u8>{let mut w=Writer::versioned().unwrap();w.u64(id).unwrap();w.properties(&[RpcProperty{key:b"Notify.Command",value:b"Invite"},RpcProperty{key:b"Notify.CallId",value},RpcProperty{key:b"Notify.Caller",value}]).unwrap();w.finish().expose_to_transport().to_vec()}
+    fn direct(&mut self,rpc:i32,id:u64,value:&[u8])->IncomingInviteNotification{
+        let args=Self::arguments(id,value);let magic=rpc.to_be_bytes();let raw=encode_request(rpc,&[RpcProperty{key:b"id",value:b"MessageReceiver"},RpcProperty{key:b"token",value:b"fixture-token"},RpcProperty{key:b"__magic",value:&magic}],super::super::super::rpc_client_ex::NOTIFY_CALLS_METHOD.as_bytes(),&args).unwrap();let mut packet=vec![0];packet.extend_from_slice(raw.expose_to_transport());let events=self.backend.on_plaintext_packet(&self.owner,&self.scope,&packet,1).unwrap();assert_eq!(events.len(),1);match events.into_iter().next().unwrap(){OfflineEvent::InviteNotification(invite)=>invite,_=>panic!("original Invite")}
+    }
+    fn batch(&mut self,count:u32)->Vec<IncomingInviteNotification>{
+        let outer=self.backend.prepare_swap(0,&[]).unwrap();let request=decode_request(&outer.packets[0].expose_to_transport()[1..]).unwrap();let mut r=Reader::versioned(request.arguments).unwrap();r.bytes().unwrap();r.bytes().unwrap();let data=super::super::super::rpc_batch::read_payload(&mut r).unwrap();
+        let mut w=Writer::new();w.boolean(true).unwrap();for word in [99,1,1,data.fields[0],data.fields[1],data.fields[2]]{w.u32(word).unwrap();}w.u32(count).unwrap();for seq in 1..=count{w.i32(seq as i32).unwrap();w.bytes(super::super::super::rpc_client_ex::NOTIFY_CALLS_METHOD.as_bytes()).unwrap();w.bytes(&Self::arguments(1,b"v")).unwrap();w.properties(&[RpcProperty{key:b"id",value:b"MessageReceiver"},RpcProperty{key:b"token",value:b"fixture-token"}]).unwrap();}w.u32(0).unwrap();w.properties(&[]).unwrap();w.bytes(b"").unwrap();let reply=encode_reply(request.call_id,0,w.finish().expose_to_transport()).unwrap();let mut packet=vec![1];packet.extend_from_slice(reply.expose_to_transport());self.backend.on_plaintext_packet(&self.owner,&self.scope,&packet,1).unwrap().into_iter().filter_map(|event|match event{OfflineEvent::InviteNotification(invite)=>Some(invite),_=>None}).collect()
+    }
+}
+fn budget(queue:&InviteQueue)->(usize,usize){let b=lock(&queue.budget);(b.holders,b.bytes)}
+pub(in super::super) fn case(number:u8){
+    let mut fixture=Fixture::new();let mut queue=InviteQueue::default();
+    match number {
+        0=>{let(first,start)=queue.admit(fixture.direct(1,1,b"v")).unwrap();assert!(start);let(second,start)=queue.admit(fixture.direct(2,1,b"v")).unwrap();assert!(!start);assert!(Arc::ptr_eq(&first,&second));assert_eq!(queue.groups.len(),1);assert_eq!(budget(&queue).0,2);},
+        1=>{let(first,_)=queue.admit(fixture.direct(1,1,b"v")).unwrap();let end=first.deadline;let incoming=fixture.direct(2,1,b"v");assert!(incoming.deadline()>=end);queue.admit(incoming).unwrap();assert_eq!(first.deadline,end);},
+        2=>{queue.admit(fixture.direct(1,1,b"v")).unwrap();let mut other=Fixture::new();assert_eq!(queue.admit(other.direct(1,1,b"v")).err(),Some(INVALID));assert_eq!(budget(&queue).0,1);},
+        3=>{queue.admit(fixture.direct(1,1,b"v")).unwrap();assert_eq!(queue.admit(fixture.direct(2,1,b"other")).err(),Some(INVALID));assert_eq!(budget(&queue).0,1);},
+        4=>{for id in 1..=invite::MAX_INVITE_GROUPS{queue.admit(fixture.direct(id as i32,id as u64,b"v")).unwrap();}assert_eq!(queue.groups.len(),invite::MAX_INVITE_GROUPS);assert_eq!(queue.admit(fixture.direct(65,65,b"v")).err(),Some(BACKPRESSURE));assert_eq!(budget(&queue).0,64);},
+        5=>{for rpc in 1..=128{queue.admit(fixture.direct(rpc,1,b"v")).unwrap();}let batch=fixture.batch(128);assert_eq!(batch.len(),128);for incoming in batch{queue.admit(incoming).unwrap();}assert_eq!(budget(&queue).0,invite::MAX_INVITE_HOLDERS);let group=queue.groups[&1].clone();let ticket=lock(&group.state).holders.front().unwrap().ticket().captured_copy();assert!(matches!(ticket.source(),InviteReplySource::Direct(_)));fixture.backend.complete_invite_notification(&ticket,false).unwrap();assert_eq!(queue.admit(fixture.direct(129,1,b"v")).err(),Some(BACKPRESSURE));},
+        6=>{let value=vec![0xff;invite::MAX_INVITE_VALUE_BYTES];let one=128+value.len()*2;let count=invite::MAX_INVITE_RETAINED_BYTES/one;for rpc in 1..=count{queue.admit(fixture.direct(rpc as i32,1,&value)).unwrap();}assert_eq!(budget(&queue),(count,count*one));assert_eq!(queue.admit(fixture.direct((count+1)as i32,1,&value)).err(),Some(BACKPRESSURE));assert_eq!(budget(&queue),(count,count*one));},
+        7=>{let(group,_)=queue.admit(fixture.direct(1,1,b"v")).unwrap();let held=queue.pop(&group).unwrap();assert_eq!(budget(&queue).0,1);queue.retire();assert_eq!(budget(&queue).0,1);drop(held);assert_eq!(budget(&queue),(0,0));},
+        8=>{let(group,_)=queue.admit(fixture.direct(1,1,b"v")).unwrap();queue.admit(fixture.direct(2,1,b"v")).unwrap();assert!(group.claim.is_live());queue.retire();assert!(!group.claim.is_live());assert_eq!(budget(&queue),(0,0));assert!(lock(&group.state).holders.is_empty());},
+        9=>{let(group,_)=queue.admit(fixture.direct(1,1,b"v")).unwrap();let end=group.deadline;let first=queue.pop(&group).unwrap();drop(first);{let mut state=lock(&group.state);state.terminal=Some(true);state.running=false;}let(again,start)=queue.admit(fixture.direct(2,1,b"v")).unwrap();assert!(start);assert!(Arc::ptr_eq(&group,&again));assert_eq!(again.deadline,end);assert_eq!(lock(&again.state).terminal,Some(true));},
+        10=>{let incoming=fixture.direct(1,1,b"v");fixture.scope.close();assert_eq!(queue.admit(incoming).err(),Some(INVALID));assert_eq!(budget(&queue),(0,0));assert!(queue.groups.is_empty());},
+        11=>{let incoming=fixture.direct(1,1,b"v");fixture.scope.mark_session_revoked();assert_eq!(queue.admit(incoming).err(),Some(INVALID));assert_eq!(budget(&queue),(0,0));assert!(queue.groups.is_empty());},
+        _=>panic!("no unselected queue case"),
+    }
+}

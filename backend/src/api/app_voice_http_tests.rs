@@ -33,6 +33,7 @@ mod app_voice_accounts {
 
     include!("app_voice_communication_http_tests.rs");
     include!("app_voice_call_notification_http_tests.rs");
+    include!("app_voice_invite_notification_http_tests.rs");
 
     #[tokio::test]
     async fn push_status_is_authenticated_read_only_and_reports_unconfigured_receivers_without_secret_export() {
