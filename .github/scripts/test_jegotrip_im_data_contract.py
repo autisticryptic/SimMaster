@@ -46,6 +46,21 @@ class ImDataContracts(unittest.TestCase):
         self.assertIn('p.key == b"Notify.Command" && p.value == b"Invite"',data)
         self.assertNotIn('decode_more_message',data)
         dispatcher=src('rpc_incoming.rs');self.assertIn('if message.receiver_kind != self.receiver_kind { return Ok(None); }',dispatcher)
+    def test_structured_text_uses_original_keys_and_preserves_nonauthorizing_metadata(self):
+        text=src('im_text.rs')
+        self.assertIn('matches!(message.kind,b"Text"|b"System.Text")',text)
+        for key in ['text','imdnId','csnId','displayName','userData','OnlineMsg']:self.assertIn('"'+key+'"',text)
+        self.assertIn('map.next_value::<String>()?',text);self.assertIn('ImText(<redacted>)',text)
+        self.assertIn('Option<Zeroizing<String>>;6',text)
+        self.assertNotIn('Serialize',text);self.assertNotIn('Callback::Channels',text);self.assertNotIn('std::fs',text)
+    def test_text_checks_fixed_bytes_depth_duplicates_and_required_text_before_use(self):
+        text=src('im_text.rs');self.assertIn('MAX_JSON_DEPTH:usize=32',text)
+        self.assertLess(text.index('if !bounded_json(message.content)'),text.index('serde_json::from_slice(message.content)'))
+        self.assertIn('keys.len()>=MAX_MAP_ENTRIES',text);self.assertIn('prior.as_str()==key.as_str()',text)
+        self.assertIn("value.contains('\\0')",text);self.assertIn('fields[TextField::Text.index()].is_none()',text)
+        self.assertIn('map.next_value::<de::IgnoredAny>()?',text)
+        names=re.findall(r'#\[(?:tokio::)?test\]\s*(?:async\s+)?fn\s+(\w+)',src('im_text_tests.rs'));self.assertEqual(len(names),10)
+        self.assertIn('im_text_tests.rs',src('im_data_tests.rs'))
     def test_exact_new_cases_are_selected_without_modifying_workflow_or_budgets(self):
         tests=src('im_data_tests.rs');names=re.findall(r'#\[(?:tokio::)?test\]\s*(?:async\s+)?fn\s+(\w+)',tests)
         self.assertEqual(len(names),20);self.assertEqual(len(set(names)),20);self.assertNotIn('#[ignore',tests)
