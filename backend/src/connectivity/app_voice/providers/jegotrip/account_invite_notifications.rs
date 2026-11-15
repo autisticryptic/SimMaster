@@ -87,13 +87,17 @@ impl CallService {
         let phase = lock(&call.state).phase;
         if phase == Phase::Checking { return Ok(None); }
         if !matches!(phase,Phase::Ringing|Phase::Accepting|Phase::Connected) { return Ok(Some(false)); }
-        let receipt = call.ticket.with_media_gate(|| {
+        {
             let state = lock(&call.state);
             if !matches!(state.phase,Phase::Ringing|Phase::Accepting|Phase::Connected)
                 || call.cancelled.load(Ordering::SeqCst) || !self.accepting.load(Ordering::SeqCst) || !group.claim.is_live()
-                || Instant::now() >= group.deadline { return Err(INVALID); }
-            super::super::native_invite_receipts::consume(&self.database,&self.run,&call.history,group.notification_id,&group.fingerprint)
-        }).ok_or(INVALID)??;
+                || !call.ticket.is_live() || Instant::now() >= group.deadline { return Err(INVALID); }
+        }
+        // Like the original inbox, SQLite is NOT performed under the
+        // nonblocking scope/media IO gate. A concurrent revoke may leave a
+        // historical committed record, but cannot confirm the following claim
+        // or authorize the actor's positive reply on the retired call/scope.
+        let receipt = super::super::native_invite_receipts::consume(&self.database,&self.run,&call.history,group.notification_id,&group.fingerprint)?;
         if !self.active(&call) || !group.claim.confirm(&receipt,&call.ticket) || Instant::now() >= group.deadline { group.claim.cancel(); return Ok(Some(false)); }
         call.invite_consumed.store(true,Ordering::SeqCst);
         Ok(Some(true))

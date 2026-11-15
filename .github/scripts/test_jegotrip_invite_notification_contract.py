@@ -85,6 +85,12 @@ class InviteNotificationContracts(unittest.TestCase):
         calls=src('account_calls.rs');self.assertIn('sdk_invite_notification:self.invite_consumed.load(Ordering::SeqCst).then_some("consumed")',calls)
         for name in ['native_invite_notifications.rs','native_invite_receipts.rs','account_invite_notifications.rs']:
             text=src(name);self.assertNotIn('Phase::Hosted',text);self.assertNotIn('state.phase=Phase::Connected',text);self.assertNotIn('CallOperation::Accept',text)
+    def test_invite_sqlite_commit_never_holds_nonblocking_io_gate_and_late_receipt_is_not_a_grant(self):
+        text=src('account_invite_notifications.rs')
+        consume=text.split('fn consume_invite(',1)[1].split('#[cfg(test)]',1)[0]
+        self.assertNotIn('with_media_gate(',consume);self.assertNotIn('with_io_gate(',consume)
+        self.assertLess(consume.index('native_invite_receipts::consume'),consume.index('!group.claim.confirm(&receipt,&call.ticket)'))
+        self.assertIn('historical_sqlite_receipt_after_call_revocation_cannot_confirm_original_invite_claim',src('native_invite_liveness_tests.rs'))
     def test_call_revocation_and_idle_admission_cannot_leave_live_claim_or_stranded_holder(self):
         data=src('native_invite_notifications.rs')
         self.assertIn('!call.matches(&self.owner,&self.scope)',data)

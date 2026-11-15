@@ -13,6 +13,11 @@ fn committed_invite_claim_binds_original_live_call_and_cannot_survive_release(){
     assert!(claim.confirm(&proof,&ticket));assert!(claim.is_live());ticket.revoke();assert!(!claim.is_live());assert!(!claim.confirm(&proof,&ticket));
 }
 #[test]
+fn historical_sqlite_receipt_after_call_revocation_cannot_confirm_original_invite_claim(){
+    let(mut rpc,owner,scope,dispatcher)=native_context();let ticket=native_ticket(&mut rpc,&owner,&scope,&dispatcher,None);let fingerprint=[7;32];let claim=ConsumerClaim::new(&owner,&scope,ID,fingerprint,Instant::now()+Duration::from_secs(1));
+    ticket.revoke();let proof=receipt(ID,fingerprint);assert!(proof.matches(ID,&fingerprint));assert!(!claim.confirm(&proof,&ticket));assert!(scope.is_open());
+}
+#[test]
 fn committed_invite_claim_rejects_wrong_call_bits_before_confirming_a_group(){
     let(mut rpc,owner,scope,dispatcher)=native_context();let ticket=native_ticket(&mut rpc,&owner,&scope,&dispatcher,None);let fingerprint=[7;32];let claim=ConsumerClaim::new(&owner,&scope,ID+1,fingerprint,Instant::now()+Duration::from_secs(1));
     assert!(!claim.confirm(&receipt(ID+1,fingerprint),&ticket));assert!(ticket.is_live());
