@@ -7,7 +7,7 @@
 use super::{arc_protocol::DirectReplyTicket, batch_scheduler::ServerRequestTicket,
     rpc_calls::NativeCallId, rpc_pending::RpcConnectionScope, rpc_stream::{CodecError, RpcProperty}, session::AttemptOwner};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use ring::digest::{Context, SHA256};
 use std::{fmt, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use zeroize::Zeroizing;
 
@@ -63,12 +63,12 @@ impl InviteData {
         &self.owner == owner && self.scope.matches(scope) && scope.is_open() && !scope.session_revoked()
     }
     fn fingerprint(&self) -> [u8; 32] {
-        let mut hash = Sha256::new(); hash.update(b"jegotrip-invite-association-v1\0");
-        hash.update(self.notification_id.to_be_bytes());
+        let mut hash = Context::new(&SHA256); hash.update(b"jegotrip-invite-association-v1\0");
+        hash.update(&self.notification_id.to_be_bytes());
         for value in [&self.call_id, &self.caller] {
-            hash.update((value.len() as u32).to_be_bytes()); hash.update(value.as_slice());
+            hash.update(&(value.len() as u32).to_be_bytes()); hash.update(value.as_slice());
         }
-        hash.finalize().into()
+        let digest = hash.finish(); let mut fingerprint = [0;32]; fingerprint.copy_from_slice(digest.as_ref()); fingerprint
     }
 }
 

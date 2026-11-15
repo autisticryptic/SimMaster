@@ -56,7 +56,7 @@ impl InviteQueue {
 impl Drop for InviteQueue { fn drop(&mut self) { self.retire(); } }
 
 impl CallService {
-    pub(super) async fn invite_notification(self: &Arc<Self>, incoming: IncomingInviteNotification) -> Result<(), &'static str> {
+    pub(in super::super) async fn invite_notification(self: &Arc<Self>, incoming: IncomingInviteNotification) -> Result<(), &'static str> {
         let scope = incoming.connection_scope();
         if !self.backend.invite_notifications_enabled() || !incoming.matches(incoming.owner(),&scope)
             || !self.matches(incoming.owner(),&scope) || !self.accepting.load(Ordering::SeqCst) { return Err(INVALID); }
