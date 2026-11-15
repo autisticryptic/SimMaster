@@ -158,6 +158,20 @@ DIRECT和batch原回复票据分别保留，首次deadline不随duplicate延长�
 
 `b6b2e71f0ba166c9dfd5eff4f0e238737e18b46e`自身Build43679425165/Beta43679425171均success，各1638精确provider（旧1579＋59新：28协议/claim、13队列、5SQLite、7真实隔离Common账号、5通话存活、1startup描述符）、36HTTP、113单元/12浏览器26图及双ABI官方digest/全ZIPCRC/各29成员20www全SHA/meta1.1.5/ELF已核，309本机Python静态过。首5e编译/lint、e6/15/dc的同一个旧Common bootstrap标准栈失败保留；最终通过生产入口堆持有启动状态而非增栈/改旧测试解决。4ab新batch夹具把原incarnation9误写99、d461新HTTP夹具把既有200空列表误期望503均仅修新夹具，所有原保护断言保持并由本SHA同名通过。12个失败run的工件/摘要/CRC/日志/注解保留，权威私有`business-notifications/SOFTWARE_VERIFIED_b6b2e71.json`。**未部署、没有410/Provider/SDK/手机或真实通知动作；完整Message IM/其他通信媒体/可信Router和实网验收仍必须继续，不能以此完成整体目标。**
 
+## 1.13 原在线 IM 消费与原 Message/MoreMessage 回执（61c2691软件已验证，未部署）
+
+显式`profile.native_receivers.im_messages={"notification_timeout_ms":3000}`启用原AutoRecv0在线路径，须原Router/Common/native接收器和ClientEx，不要求通话或媒体配置。100..30000ms为本地等待策略，不是假定SDK计时；缺省None省略，未安装仍保留旧NACK。只从本次匹配ARC登录取UID/selector、原token与owner/scope，Box/signed64 MsgIdx、通知ID、App UUID和SMS离线cursor均不混用，不从消息拼端点或替换路由。
+
+- 原`Message.MoreMessage`保留两BE64、sender/type/content及附件/参数两map。仅Text/System.Text按原有界JSON读取text及私有metadata，未知/畸形类型不当SMS文字。附件私有BLOB有界存储，不按服务端tag写文件路径或自动打开。
+- 独立`app_voice_im_messages`验证当前run/revision/身份，文本、原DATA和`im.received`事件同事务提交后才产生不可序列化的消费凭证；原DIRECT/batch票据才能据此完成。精确重复幂等，同Box/index变更内容拒绝。删除清私有内容但保留去重回执，不因合法重放恢复文字或再发事件。
+- `Notify.Command=Message`必须本次ARC token与精确三键，通知ID只关联同原Box/index的实际持久消费。早包必须等待原HostingAck；首次未消费deadline不随重复延长。已消费holder只可在新的原RPC自身期限答复，过期未消费请求不得被后来正文复活。Invite对应补充同样保留原live CallControlTicket、history/claim与取消门，旧已过期票据别名不能续期。
+- 64关联组、256holder、1MiB及16早包预算包含等待IO的DATA；停止/会话撤销先退消费资格，拥有的账号consumer/actor任务真正Join。batchQueued仍不是peerACK，原结果epoch确认前保留凭证/期限，取消或未知positive不盲目重放。测试只在隔离对端发出ACK后再通过同原连接DIRECT回合确认actor已处理，不能把peer写ACK当注销/Join已可完成。
+- 认证no-store `GET /api/non-3gpp/accounts/{line_id}/im-messages`（limit1..128）及认证`DELETE .../im-messages/{message_id}`仅管理本地记录。UI16行、完整signed64索引字符串、已知字段/按账号隔离；丢删除响应只读取核实不自动重放。IM本地消费不等于运营商SMS、服务端已读、渠道送达、通话/媒体或设备授信。
+
+`61c26918febb84d1f270b58e187af8b4c1ae1aab`自身Build43700963276/Beta43700963292全success，各1705精确provider（原1669＋36新）、39HTTP、117unit/13browser28图与ARM64/AMD64各29成员20www的官方digest/全ZIPCRC/全部成员SHA/meta1.1.5/ELF183/62已核，332本机Python静态通过；无本机Rust/JS/编译peer执行。原e30新batch停止时序失败、d3新局部binding遮蔽helper的四失败run及全部日志/摘要/CRC/注解保留，同名断言已通过，未增栈/超时/依赖或删旧断言。私有权威`im-runtime/SOFTWARE_VERIFIED_61c2691.json`、`verified-native-61c2691.json`与`PROGRESS_IM_RUNTIME_61c2691.json`。原DATA/Text前置9dd/ccee及Invite SQLite移出IO门23d也各自有双Actions/正式工件证据。
+
+**在线IM组件验证不等于完整复制或收件成功。** AutoRecv1 refresh/status/per-box基线/gap10/连续消费后明确策略setRead、持久通知关联/长期压力/重启与更多消息类型、IM渠道/平台hook、其余通信与动态媒体、可信Router及410实际SMS/接听/双向媒体/真实停止Join与时延仍须继续。该源码没有部署或任何新的Provider/SDK/手机/真实通知操作，已装410仍仅引用历史df2/stopped。
+
 ## 2.1 App HTTPS 的显式证书固定（`app2.cer`）
 
 原 App 并未依赖公共 CA：`assets/app2.cer` 就是服务端叶子证书

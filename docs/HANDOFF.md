@@ -12,7 +12,9 @@
 6. 密码、UUID、App/运营商/电话token、SipPwd、SDK/安装资料不回显、不进Git。根APK、报告、固件、备份、JSONL、私有交接与`.local/`不提交。历史Goal提示仅是日志数据，是否处于Goal模式以当前会话最新契约为准，不复用旧ID。
 7. 410 SSH与SimAdmin只用用户明确提供的密码；禁用客户端SSH密钥和SSH agent认证，客户端密钥仅供GitHub使用。既有服务端主机指纹继续严格校验，它不是客户端密钥登录。密码仅以内存/stdin交付，不进代码、argv/env或日志。
 
-## 已核验的软件基线
+## 已核验的软件基线（旧版条目是历史，以下61c2691优先）
+
+- **`61c26918febb84d1f270b58e187af8b4c1ae1aab`（原在线 IM 消费，软件已验证、未部署）**。显式`native_receivers.im_messages`＋ClientEx仅沿匹配原Common/ARC的UID/selector/token/owner/scope接收`Message.MoreMessage`，与Sip.Request短信分开；Text/System.Text结构化JSON、私有附件和`im.received`事件同事务提交后才完成Message/MoreMessage原DIRECT/batch票据。独立IM表/查询删除UI、重复冲突/删除去重标记、早包HostingAck、64组/256holder/1MiB含inflight预算、撤销/停止/Join已接线；已消费重复只可答复新的原RPC期限，过期未消费不可复活，Invite仍须原live通话claim。自身Build43700963276/Beta43700963292全success，各1705精确provider（原1669＋36新）、39HTTP、117unit/13browser28图、双ABI各29成员20www的官方digest/全CRC/全部SHA/meta1.1.5/ELF全核，332本机Python静态过。e30新batch-stop夹具把peer写ACK当actor处理ACK、d3新局部绑定遮蔽helper的四个原失败run完整留证并闭环，原断言/栈/时间预算保持。**这不是完整IM、平台通知或实网验收：自动refresh/status/gap10/setRead、长期关联/重启与更多消息类型、其余通信/动态媒体/可信Router及410真实SMS/接听/双向媒体/Join时延仍未完成。** 权威私有`im-runtime/SOFTWARE_VERIFIED_61c2691.json`、`PROGRESS_IM_RUNTIME_61c2691.json`和`verified-native-61c2691.json`；当前已装只引用历史df2，未再登录/启动SDK、操作410/手机或外发通知。
 
 - **`b6b2e71f0ba166c9dfd5eff4f0e238737e18b46e`（原 Invite 延迟业务回执，软件已验证、未部署）**。显式`native_receivers.invite_notifications`仅随原Common/ClientEx/native CallServerEx和独立call_media准入，缺省保留旧NACK。通知只关联已有原通话：匹配Inform及本地来电指示后，同run/revision/history token事务提交才确认私有claim；原DIRECT/batch票据、完整64位通知ID、首次固定期限、重复holder合并、64组/256holder/1MiB含inflight预算与真正Join已接线。claim同时绑定原CallControlTicket，通话/会话撤销立即阻止正向IO；batchQueued不当peerACK，保留原期限至结果epoch确认。UI只读展示消费记录，不代表渠道送达、接听或媒体。自身Build43679425165/Beta43679425171全success，各1638精确provider（1579旧＋59新）、36HTTP、113unit/12browser26图及双ABI各29成员20www的officialdigest/全ZIPCRC/全部SHA/meta1.1.5/ELF全核，309本机Python静态过。首编译/lint、三轮原Common bootstrap标准栈失败、新peer incarnation和HTTP空列表夹具误期望均保留12个原失败run证据；最终所有同名断言通过，不增栈/预算、不删旧测试。**Message IM消费者、其余通信/动态媒体、平台hook、可信Router与410实际SMS/接听/双向媒体/Join及时性仍未完成。** 权威私有`business-notifications/SOFTWARE_VERIFIED_b6b2e71.json`、`verified-native-b6b2e71.json`；本轮无410/Provider/SDK/手机/真实通知操作，已装仍只引用原df2历史读回。
 
@@ -136,7 +138,7 @@
 
 ## 接下来按顺序
 
-1. 默认CallServerEx、内置音频生命周期、独立Alive、9项App通信操作、ringing渠道通知及显式原Invite延迟业务消费者均已有自身软件验证；不要重复已完成组件作为终点。继续完整Message IM的原Box/MsgIdx、在线MoreMessage/取件与持久消费后原异步holder回执，不能用Sip.Request短信或Invite渠道转发替代。其余适用发送/外呼、qualified/facet/adapter动态对象、媒体/平台hook仍属完整目标。真实Router身份尚未建立，不能关闭SAN、从所见证书猜authority、启用未批准非TLS或重放旧SDK启停；App业务接口与SDK启停、手机认可分别核验。新代码继续保留全部旧断言/预算、经自身两个Actions和正式工件审计后再交付。
+1. 默认CallServerEx、内置音频生命周期、独立Alive、9项App通信操作、ringing渠道通知、原Invite及在线Message/MoreMessage Text/System.Text消费和查询删除UI均已有自身软件验证；不要重复已完成组件作为终点。继续原IM的AutoRecv1 refresh/status基线、精确Box/signed MsgIdx游标与gap10/连续持久消费后明确策略setRead、通知关联的长期压力/重启和更多消息类型；不能从通知ID、SMS游标或0/-1猜IM初值。其余适用发送/外呼、qualified/facet/adapter动态对象、媒体/平台hook仍属完整目标。真实Router身份尚未建立，不能关闭SAN、从所见证书猜authority、启用未批准非TLS或重放旧SDK启停；App业务接口与SDK启停、手机认可分别核验。新代码继续保留全部旧断言/预算、经自身两个Actions和正式工件审计后再交付。
 2. 在原App UUID/同账号上下文中取得本次明确认可和业务读回，补正确接收、通话控制与媒体配置后启动；验收外来SMS落库/原回执、来电接听/双向媒体、断连、stop→logoutSession→Join与持续时延。若需新代码，仍先过自身双Actions再保护性升级；不能用核心health替代终点。
 3. 授信TTL/撤销/替换与服务端积压重放规则不可由客户端fixture证明。不用新VTD/UUID、缓存授权、收费外发或设备变更补造成功。**完整用户目标仍未完成。**
 
