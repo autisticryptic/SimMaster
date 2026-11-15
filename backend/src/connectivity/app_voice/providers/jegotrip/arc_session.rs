@@ -312,6 +312,9 @@ impl ArcRpcSession {
         self.next_id=id.checked_add(1);self.pending.insert(id,PendingRpc{kind:PendingKind::ImRead,selected_session_id:None,scheduler:None,call:None,im:Some(request)});Ok((id,bytes))
     }
     pub(super) fn take_im_replies(&mut self)->Vec<super::rpc_im::OwnedImReply>{std::mem::take(&mut self.im_replies)}
+    pub(super) fn retire_im_read(&mut self,id:i32){
+        if self.pending.get(&id).is_some_and(|p|matches!(p.kind,PendingKind::ImRead)){self.pending.remove(&id);}
+    }
 
     pub fn incoming_call_dispatcher(&self,binding:super::call_binding::CallIncomingBinding<'_>)
         ->Result<super::call_binding::CallDispatcher,CodecError>{
@@ -534,7 +537,11 @@ impl ArcRpcSession {
         let result = match pending.kind {
             PendingKind::ImRead=>{
                 let Some(request)=pending.im.take()else{self.close();return Err(CodecError::InvalidField);};
-                if self.phase()!=ArcPhase::Authenticated||!request.matches(owner,connection){self.close();return Err(CodecError::InvalidField);}
+                // A fully submitted READ has no durable remote write to
+                // replay. Late/cancelled interest is retired, not rebound or
+                // allowed to break otherwise healthy SDK logout. No read data
+                // escapes; write operations do not use this branch.
+                if self.phase()!=ArcPhase::Authenticated||!request.matches(owner,connection){return Ok(None);}
                 let result=match super::rpc_im::OwnedImReply::original(request,reply.result_code,reply.result_stream){Ok(result)=>result,Err(error)=>{self.close();return Err(error);}};
                 let retained=self.im_replies.iter().map(|r|r.retained_bytes()).sum::<usize>();
                 if self.im_replies.len()>=MAX_MAP_ENTRIES||retained.checked_add(result.retained_bytes()).is_none_or(|n|n>super::rpc_stream::MAX_STREAM_BYTES){self.close();return Err(CodecError::TooLarge);}

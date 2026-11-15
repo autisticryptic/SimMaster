@@ -78,7 +78,7 @@ impl ConnectedCommonRuntime{
         if !common.is_open_for(&owner,&scope)||!backend.connection_scope().matches(&scope){return Err(RuntimeError::Scope);}
         let(commands_tx,commands_rx)=mpsc::channel(MAX_COMMANDS);let(events_tx,events_rx)=mpsc::channel(MAX_EVENTS);
         let actor:Actor<super::super::runtime_connector::BoxRuntimeIo>=Actor{io:None,owner:owner.clone(),scope:scope.clone(),backend,tls:None,common:Some(common),native_attempt_end:Some(self.attempt_end),
-            commands:commands_rx,events:events_tx,policy,timing:None,start:self.start,pending:std::collections::BTreeMap::new(),logout_pending:None,unhosting_pending:None,call_pending:std::collections::BTreeMap::new()};
+            commands:commands_rx,events:events_tx,policy,timing:None,start:self.start,pending:std::collections::BTreeMap::new(),logout_pending:None,unhosting_pending:None,call_pending:std::collections::BTreeMap::new(),im_pending:std::collections::BTreeMap::new()};
         self.attached=true;let task=tokio::spawn(actor.run());
         Ok((RuntimeHandle{owner,scope,commands:commands_tx,task:Some(task)},events_rx))
     }
@@ -103,7 +103,7 @@ fn common_error(error:CommonIoError)->RuntimeError{match error{
 impl<I:AsyncRead+AsyncWrite+Unpin+Send+'static> Actor<I>{
     fn common_io_end(&self,extra:Option<Instant>)->Result<Instant,RuntimeError>{
         let mut end=Instant::now().checked_add(self.policy.io_timeout).ok_or(RuntimeError::Timeout)?;
-        for value in self.pending.values().copied().chain(extra).chain(self.unhosting_pending.as_ref().map(|pending|pending.deadline))
+        for value in self.pending.iter().filter(|(id,_)|!self.im_pending.contains_key(*id)).map(|(_,end)|*end).chain(extra).chain(self.unhosting_pending.as_ref().map(|pending|pending.deadline))
             .chain(self.call_pending.values().map(|pending|pending.deadline)).chain(self.common.as_ref().and_then(CommonPath::next_deadline)){
             end=end.min(value);
         }
@@ -113,7 +113,7 @@ impl<I:AsyncRead+AsyncWrite+Unpin+Send+'static> Actor<I>{
     fn common_tick(&mut self)->Result<(),RuntimeError>{
         if self.scope.session_revoked(){return Err(RuntimeError::SessionRevoked);}
         if !self.scope.is_open(){return Err(RuntimeError::Closed);}
-        let now=Instant::now();self.pending.retain(|id,_|self.backend.is_pending(*id));
+        let now=Instant::now();self.retire_im_reads(now);self.pending.retain(|id,_|self.backend.is_pending(*id));
         if self.logout_pending.as_ref().is_some_and(|p|p.completion.is_closed())
             ||self.unhosting_pending.as_ref().is_some_and(|p|p.completion.is_closed())
             ||self.call_pending.values().any(|p|p.completion.is_closed()){return Err(RuntimeError::Cancelled);}
@@ -156,6 +156,7 @@ impl<I:AsyncRead+AsyncWrite+Unpin+Send+'static> Actor<I>{
             result=common.try_receive_calls(&owner,&scope,end)=>result.map_err(common_error)?,
         };
         if let Some(input)=input{
+            self.retire_im_reads(Instant::now());
             let elapsed=self.elapsed_ms(Instant::now());
             let events=self.backend.on_common_calls(&owner,&scope,self.common.as_ref().ok_or(RuntimeError::Closed)?,&input,elapsed).map_err(|_|RuntimeError::Protocol)?;
             if Instant::now()>=end{return Err(RuntimeError::Timeout);}

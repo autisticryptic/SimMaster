@@ -152,6 +152,7 @@ impl OfflineBackend {
         self.protocol.prepare_im_read(query,gate,deadline)
     }
     pub(super) fn take_im_replies(&mut self)->Vec<super::rpc_im::OwnedImReply>{self.protocol.take_im_replies()}
+    pub(super) fn retire_im_read(&mut self,id:i32){self.protocol.retire_im_read(id);}
 
     pub(super) fn prepare_offline(&mut self, position: i64, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
         if self.dispatcher.is_none() || self.scheduler.is_none() { return Err(CodecError::InvalidField.into()); }

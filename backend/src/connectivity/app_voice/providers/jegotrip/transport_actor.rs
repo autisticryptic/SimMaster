@@ -20,8 +20,11 @@ use super::{
     tls_engine::{TlsEngine, TlsError, TlsParameters, TlsPhase},
     batch_scheduler::ServerRequestTicket,
     arc_protocol::DirectReplyTicket,
+    rpc_im::{ImQuery,ImOperation,OwnedImReply},
+    im_inbox::ImReceiptGate,
+    im_read_interest::{ImReadInterest,ImReadWait},
 };
-use std::{fmt, future::poll_fn, io, pin::Pin, task::Poll, time::{Duration, Instant}};
+use std::{fmt, future::poll_fn, io, pin::Pin, sync::Arc, task::Poll, time::{Duration, Instant}};
 use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite}, sync::{mpsc, oneshot}, task::JoinHandle};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -147,6 +150,7 @@ enum Operation {
     Swap(Vec<Property>, Option<Gateway>), CompleteBatch(ServerRequestTicket, bool), CompleteDirect(DirectReplyTicket, bool), CompleteCall(CallReplyTicket,bool,Vec<Property>),
     CompleteInvite(super::native_invite_notifications::InviteReplyTicket, bool),
     CompleteIm(Box<(super::im_delivery::ImReplyTicket,Option<super::im_inbox::CommittedIm>)>),
+    ImRead(Box<ImReadWork>),
     ArmNativeReceivers(std::sync::Arc<super::native_receiver::NativeReceiverSetup>), ConfigureNativeReceivers(u32),
     GetOffline(i64, Vec<Property>), CompleteOfflineHint(super::rpc_offline::IncomingOfflineHint, bool),
     ConfigureCallControl(Vec<Property>),Call(CallControlTicket,CallOperation,Vec<Property>,oneshot::Sender<Result<OwnedCallOperationReply,RuntimeError>>),
@@ -167,11 +171,14 @@ impl Operation {
             Self::ConfigureCalls(binding)=>binding.object.len()+binding.domain.len(),
             Self::ConfigureNativeReceivers(_) => 0,
             Self::ArmNativeReceivers(setup) => setup.retained_bytes(),
+            Self::ImRead(work)=>work.query.retained_bytes(),
             Self::ArmClientEx(binding)=>binding.object.len()+binding.domain.len()+binding.receiver.len(),
             Self::CompleteCall(_,_,properties)|Self::ConfigureCallControl(properties)|Self::Call(_,_,properties,_)=>properties.iter().map(|p|p.key.len()+p.value.len()).sum(),
         }
     }
 }
+struct ImReadWork{query:Arc<ImQuery>,gate:Arc<ImReceiptGate>,interest:Arc<ImReadInterest>,reply:oneshot::Sender<Result<OwnedImReply,RuntimeError>>}
+struct ImReadPending{query:Arc<ImQuery>,gate:Arc<ImReceiptGate>,interest:Arc<ImReadInterest>,deadline:Instant,reply:oneshot::Sender<Result<OwnedImReply,RuntimeError>>}
 struct Command { operation: Operation, completion: oneshot::Sender<Result<RuntimeReceipt, RuntimeError>>, admitted: Instant }
 struct CallPending{ticket:CallControlTicket,operation:CallOperation,deadline:Instant,completion:oneshot::Sender<Result<OwnedCallOperationReply,RuntimeError>>}
 struct CallRetirement{scope:RpcConnectionScope,ticket:CallControlTicket,done:bool}
@@ -338,6 +345,17 @@ impl RuntimeCommands {
         if !self.accepts(owner,scope)||!ticket.matches(owner,scope)||proof.is_some_and(|proof|!proof.authorizes(ticket,Instant::now())){return Err(RuntimeError::Scope);}
         self.submit(owner,scope,Operation::CompleteIm(Box::new((ticket.captured_copy(),proof.map(|proof|proof.captured_copy()))))).await
     }
+    pub(super) async fn read_im(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,query:Arc<ImQuery>,gate:Arc<ImReceiptGate>)->Result<OwnedImReply,RuntimeError>{
+        if !self.accepts(owner,scope)||!gate.live(){return Err(RuntimeError::Scope);}
+        if query.operation()==ImOperation::SetReceived{return Err(RuntimeError::InvalidConfiguration);}
+        let interest=ImReadInterest::original(scope);let(reply,result)=oneshot::channel();
+        let completion=self.enqueue(owner,scope,Operation::ImRead(Box::new(ImReadWork{query,gate:gate.clone(),interest:interest.clone(),reply})))?;
+        let _wait=ImReadWait::original(interest);
+        completion.await.map_err(|_|RuntimeError::Closed)??;
+        let data=result.await.map_err(|_|RuntimeError::Closed)??;
+        if !data.matches(owner,scope)||!gate.live(){return Err(RuntimeError::Cancelled);}Ok(data)
+    }
+
     pub(super) async fn complete_invite_notification(&self, owner: &AttemptOwner, scope: &RpcConnectionScope,
         ticket: &super::native_invite_notifications::InviteReplyTicket, accepted: bool) -> Result<RuntimeReceipt, RuntimeError> {
         if !self.accepts(owner, scope) || !ticket.matches(owner, scope) { return Err(RuntimeError::Scope); }
@@ -509,7 +527,7 @@ impl PreparedRuntime {
         let owner = self.owner.clone(); let scope = self.scope.clone();
         let actor = Actor { io: Some(io), owner: owner.clone(), scope: scope.clone(), backend, tls:Some(tls), common:None, native_attempt_end:None, commands: commands_rx,
             events: events_tx, policy, timing: self.timing, start: self.start, pending: std::collections::BTreeMap::new(),
-            logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new() };
+            logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new(),im_pending:std::collections::BTreeMap::new() };
         self.attached = true;
         let task = tokio::spawn(actor.run());
         Ok((RuntimeHandle { owner, scope, commands: commands_tx, task: Some(task) }, events_rx))
@@ -538,6 +556,7 @@ struct Actor<I> {
     commands: mpsc::Receiver<Command>, events: mpsc::Sender<RuntimeEvent>, policy: RuntimePolicy,
     timing: Option<RouterTiming>, start: Instant, pending: std::collections::BTreeMap<i32, Instant>, logout_pending: Option<LogoutPending>, unhosting_pending: Option<UnhostingPending>,
     call_pending:std::collections::BTreeMap<i32,CallPending>,
+    im_pending:std::collections::BTreeMap<i32,ImReadPending>,
 }
 impl<I> Drop for Actor<I> {
     fn drop(&mut self) {
@@ -553,6 +572,15 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if let Some(common)=&mut self.common{common.close();}self.common=None;self.io = None; self.commands.close();
         while let Ok(command) = self.commands.try_recv() { let _ = command.completion.send(Err(RuntimeError::Closed)); }
         result
+    }
+    fn retire_im_reads(&mut self,now:Instant){
+        let retired=self.im_pending.iter().filter_map(|(&id,p)|{
+            if p.interest.is_retired()||p.reply.is_closed()||!p.gate.live(){Some((id,RuntimeError::Cancelled))}
+            else if now>=p.deadline{Some((id,RuntimeError::Timeout))}else{None}
+        }).collect::<Vec<_>>();
+        for(id,reason)in retired{if let Some(p)=self.im_pending.remove(&id){
+            self.backend.retire_im_read(id);self.pending.remove(&id);p.interest.cancel();let _=p.reply.send(Err(reason));
+        }}
     }
     fn elapsed_ms(&self, now: Instant) -> u64 { now.saturating_duration_since(self.start).as_millis().min(u64::MAX as u128) as u64 }
     async fn loop_run(&mut self) -> RuntimeError {
@@ -572,6 +600,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 _ = self.events.closed() => return RuntimeError::Closed,
                 _ = timer.tick() => {
                     let now = Instant::now();
+                    self.retire_im_reads(now);
                     if let Err(error) = self.tls.as_mut().expect("original TLS mode").tick(&self.owner, &self.scope, now) { return error.into(); }
                     self.pending.retain(|id, _| self.backend.is_pending(*id));
                     if self.logout_pending.as_ref().is_some_and(|pending| pending.completion.is_closed()) { return RuntimeError::Cancelled; }
@@ -591,6 +620,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                     };
                     if let Err(error) = self.send_wire(&progress.wire, None).await { return error; }
                     let elapsed_ms = self.elapsed_ms(now);
+                    self.retire_im_reads(now);
                     let events = match self.backend.on_verified_plaintext(&self.owner, &self.scope, progress.plaintext, elapsed_ms) {
                         Ok(events) => events, Err(_) => return RuntimeError::Protocol,
                     };
@@ -615,6 +645,15 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             if Instant::now()>=pending.deadline||!self.scope.is_open(){let _=pending.completion.send(Err(RuntimeError::Timeout));return Err(RuntimeError::Timeout);}
             let result=outcome.and_then(|()|if reply.accepted(){Ok(reply)}else{Err(RuntimeError::CallRejected)});
             if pending.completion.send(result).is_err(){return Err(RuntimeError::Cancelled);}
+        }
+        for reply in self.backend.take_im_replies(){
+            let id=reply.request().call_id();let Some(pending)=self.im_pending.remove(&id)else{continue;};self.pending.remove(&id);
+            if pending.interest.is_retired()||pending.reply.is_closed()||!pending.gate.live(){pending.interest.cancel();let _=pending.reply.send(Err(RuntimeError::Cancelled));continue;}
+            if Instant::now()>=pending.deadline{pending.interest.cancel();let _=pending.reply.send(Err(RuntimeError::Timeout));continue;}
+            if !reply.matches(&self.owner,&self.scope)||!Arc::ptr_eq(&pending.gate,&reply.request().gate())||!Arc::ptr_eq(&pending.query,reply.request().query_arc()){
+                let _=pending.reply.send(Err(RuntimeError::Protocol));return Err(RuntimeError::Protocol);
+            }
+            let result=outcome.map(|()|reply);pending.interest.cancel();let _=pending.reply.send(result);
         }
         // Keep the original wait (and its deadline) installed while every
         // outgoing reply and visible event from this delivery can still fail.
@@ -689,6 +728,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     async fn command(&mut self, mut command: Command) -> Result<(), RuntimeError> {
         if self.scope.session_revoked() { let _ = command.completion.send(Err(RuntimeError::SessionRevoked)); return Err(RuntimeError::SessionRevoked); }
         if !self.scope.is_open() { let _ = command.completion.send(Err(RuntimeError::Closed)); return Err(RuntimeError::Closed); }
+        self.retire_im_reads(Instant::now());
         let now = Instant::now();
         if self.unhosting_pending.as_ref().is_some_and(|pending| now >= pending.deadline) {
             let _ = command.completion.send(Err(RuntimeError::Timeout));
@@ -729,12 +769,12 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             (Some(original), Some(invite)) => Some(original.min(invite)), (None, Some(invite)) => Some(invite), (original, None) => original,
         };
         if native_deadline.is_some_and(|deadline| now >= deadline) { let _ = command.completion.send(Err(RuntimeError::Timeout)); return Ok(()); }
-        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _)) {
+        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _) | Operation::ImRead(_)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
         let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_));
         let is_logout = matches!(&command.operation, Operation::Logout(_));
-        let mut unhosting_sequence = None;let mut call_wait=None;
+        let mut unhosting_sequence = None;let mut call_wait=None;let mut im_wait=None;
         let elapsed_ms = self.elapsed_ms(now);
         let prepared = match command.operation {
             Operation::Configure(epoch, incoming) => {
@@ -783,6 +823,18 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 match self.backend.prepare_call(&ticket,operation,&borrowed(&properties)){
                     Ok(packets)=>{call_wait=Some((ticket,operation,reply));Ok(packets)}
                     Err(_)=>{let _=reply.send(Err(RuntimeError::InvalidConfiguration));let _=command.completion.send(Err(RuntimeError::InvalidConfiguration));return Ok(());}
+                }
+            }
+            Operation::ImRead(work)=>{
+                if self.common.is_none()||work.query.operation()==ImOperation::SetReceived{
+                    let _=work.reply.send(Err(RuntimeError::InvalidConfiguration));let _=command.completion.send(Err(RuntimeError::InvalidConfiguration));return Ok(());
+                }
+                if !work.gate.live()||work.interest.is_retired(){
+                    work.interest.cancel();let _=work.reply.send(Err(RuntimeError::Cancelled));let _=command.completion.send(Err(RuntimeError::Cancelled));return Ok(());
+                }
+                match self.backend.prepare_im_read(work.query.clone(),work.gate.clone(),native_deadline.ok_or(RuntimeError::Timeout)?){
+                    Ok(packets)=>{im_wait=Some(*work);Ok(packets)}
+                    Err(_)=>{let _=work.reply.send(Err(RuntimeError::InvalidConfiguration));let _=command.completion.send(Err(RuntimeError::InvalidConfiguration));return Ok(());}
                 }
             }
             Operation::ConfigureCalls(binding)=>{
@@ -867,6 +919,11 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             Ok(packets) => packets,
             Err(_) => { let _ = command.completion.send(Err(RuntimeError::Protocol)); return Ok(()); }
         };
+        if let Some(work)=&im_wait{
+            if !work.interest.begin_write(&work.gate){self.backend.retire_im_read(packets.call_id);let _=command.completion.send(Err(RuntimeError::Cancelled));return Ok(());}
+            im_gates.push(work.gate.clone());
+        }
+        let read_interest=im_wait.as_ref().map(|work|work.interest.clone());
         if is_logout { self.pending.retain(|id, _| self.backend.is_pending(*id)); }
         // Keep one heap-owned transport future, not two large inline copies
         // in the new guarded/legacy branches. Standard test stack and all IO
@@ -879,7 +936,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 let mut im_waiting=futures_util::stream::FuturesUnordered::new();
                 for claim in &invite_claims { waiting.push(claim.cancelled()); }
                 for gate in &im_gates { im_waiting.push(gate.retired()); }
-                tokio::select!{biased;_=waiting.next(),if !waiting.is_empty()=>{},_=im_waiting.next(),if !im_waiting.is_empty()=>{}}
+                tokio::select!{biased;
+                    _=waiting.next(),if !waiting.is_empty()=>{},_=im_waiting.next(),if !im_waiting.is_empty()=>{},
+                    _=async{if let Some(interest)=&read_interest{interest.retired().await;}else{std::future::pending::<()>().await;}},if read_interest.is_some()=>{},
+                }
             };
             tokio::select! { biased;
                 _ = cancelled => Err(RuntimeError::Cancelled),
@@ -891,6 +951,19 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             self.backend.retire_request(packets.call_id); let _ = command.completion.send(Err(error)); return Err(error);
         }
         let rpc_deadline=native_deadline.unwrap_or(Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?);
+        if let Some(work)=im_wait{
+            if !work.interest.submitted(){self.backend.retire_im_read(packets.call_id);let _=command.completion.send(Err(RuntimeError::Cancelled));return Err(RuntimeError::Cancelled);}
+            if !work.gate.live()||work.interest.is_retired()||work.reply.is_closed()||Instant::now()>=rpc_deadline{
+                let reason=if Instant::now()>=rpc_deadline{RuntimeError::Timeout}else{RuntimeError::Cancelled};self.backend.retire_im_read(packets.call_id);work.interest.cancel();let _=work.reply.send(Err(reason));let _=command.completion.send(Err(reason));return Ok(());
+            }
+            self.pending.insert(packets.call_id,rpc_deadline);
+            self.im_pending.insert(packets.call_id,ImReadPending{query:work.query,gate:work.gate,interest:work.interest,deadline:rpc_deadline,reply:work.reply});
+            // Receipt says only that this READ frame was fully submitted. A
+            // cancelled result wait now retires interest without replaying or
+            // closing healthy SDK unregister/logout. It is not a peer ACK.
+            if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),Some(packets.call_id)))).is_err(){self.retire_im_reads(Instant::now());}
+            return Ok(());
+        }
         if !is_response { self.pending.insert(packets.call_id,rpc_deadline); }
         if let Some((ticket,operation,completion))=call_wait{
             self.call_pending.insert(packets.call_id,CallPending{ticket,operation,deadline:rpc_deadline,completion});

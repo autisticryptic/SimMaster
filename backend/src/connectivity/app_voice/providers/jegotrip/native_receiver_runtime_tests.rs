@@ -6,6 +6,8 @@ use n::native_receiver::{NativeReceiverConfig, DirectDomainConfig, DomainMode};
 mod account;
 #[path = "native_call_runtime_tests.rs"]
 mod default_calls;
+#[path="im_read_backend_tests.rs"]
+mod im_reads;
 fn config() -> NativeReceiverConfig { NativeReceiverConfig { im_messages: None, direct_domains: None, invite_notifications: None } }
 fn native_profile(root: &str, port: u16, filter: &NativeReceiverConfig) -> RuntimeProfile {
     RuntimeProfile::supplied_common(inputs(), common(root, port)).unwrap().with_native_receivers(Some(filter)).unwrap().with_client_ex(true).unwrap()

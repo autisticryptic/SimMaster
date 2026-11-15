@@ -27,10 +27,12 @@ class ImRpcReadContracts(unittest.TestCase):
   s=src('rpc_im.rs')
   for text in ['result.messages.len()>*count as usize','m.index<*start||m.index>end','result.messages[..i].iter().any(|p|p.index==m.index)','start.checked_add(i64::from(*count)-1)']:
    self.assertIn(text,s)
- def test_original_protocol_is_still_not_installed_as_a_current_actor_or_consumer(self):
+ def test_original_protocol_uses_owned_actor_and_explicit_sync_policy_not_incoming_permission(self):
   self.assertIn('self.rpc.prepare_im_read(binding,query,gate,deadline)?',src('arc_protocol.rs'));self.assertIn('self.protocol.prepare_im_read(query,gate,deadline)',src('offline_backend.rs'))
-  for name in ['transport_actor.rs','runtime_backend.rs','account_im.rs']:
-   self.assertNotIn('prepare_im_read(',src(name))
+  self.assertIn('Operation::ImRead(work)',src('transport_actor.rs'))
+  self.assertIn('self.backend.prepare_im_read(work.query.clone(),work.gate.clone()',src('transport_actor.rs'))
+  self.assertIn('!self.im_sync_enabled()',src('runtime_backend.rs'))
+  self.assertNotIn('prepare_im_read(',src('account_im.rs'))
   self.assertIn('self.pending.clear();self.im_replies.clear()',src('arc_session.rs'))
  def test_new_rust_suite_preserves_existing_filter_and_does_not_skip(self):
   self.assertIn('im_rpc_read_tests.rs',src('im_protocol_tests.rs'));self.assertNotIn('#[ignore',src('im_rpc_read_tests.rs'))

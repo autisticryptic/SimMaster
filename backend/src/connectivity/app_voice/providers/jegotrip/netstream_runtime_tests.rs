@@ -253,6 +253,9 @@ async fn blocked_first_write_cannot_outlive_original_record_deadline(){blocked_w
 #[tokio::test]
 async fn blocked_retry_cannot_borrow_the_newer_receive_call_deadline(){blocked_write_deadline(true).await;}
 
+pub(crate) fn gate_im_read_write(path:&mut NetstreamPath,blocked:std::sync::Arc<std::sync::atomic::AtomicBool>)->std::sync::Arc<std::sync::atomic::AtomicUsize>{
+ super::super::router_runtime::tests::gate_original_write(&mut path.router,blocked)
+}
 pub(crate) fn delay_original_stream_write(path:&mut NetstreamPath,delay:Duration,skip:usize)->std::sync::Arc<std::sync::atomic::AtomicUsize>{
  super::super::router_runtime::tests::delay_original_io_after(&mut path.router,super::super::router_runtime::tests::DelayPoint::Write,delay,skip)
 }

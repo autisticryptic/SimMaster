@@ -53,6 +53,7 @@ impl ImRequest{
     pub(super) fn binding(&self)->&Arc<ImBinding>{&self.binding}
     pub(super) fn gate(&self)->Arc<ImReceiptGate>{self.gate.clone()}
     pub(super) fn query(&self)->&ImQuery{&self.query}
+    pub(super) fn query_arc(&self)->&Arc<ImQuery>{&self.query}
     pub(super) fn decode<'a>(&self,code:u32,bytes:&'a[u8])->Result<ImReplyData<'a>,CodecError>{
         if !self.active(){return Err(CodecError::InvalidField);}
         match self.query.as_ref(){

@@ -1,0 +1,37 @@
+//! Actions-only explicit profile -> same original NativeHostingBackend/actor
+//! read IO. A read is not a SMS, notice ACK, gateway hosting or media grant.
+use super::*;
+use n::{rpc_im::{ImQuery,ImReplyData},im_inbox::ImReceiptGate,im_delivery::NativeImConfig,im_sync_policy::NativeImSyncConfig};
+async fn bounded<F:std::future::Future>(f:F)->F::Output{tokio::time::timeout(Duration::from_secs(12),f).await.expect("original native IM backend budget")}
+fn profile(root:&str,port:u16,enabled:bool)->RuntimeProfile{let mut cfg=config();cfg.im_messages=Some(NativeImConfig{notification_timeout_ms:3000});native_profile(root,port,&cfg).with_im_sync(enabled.then_some(&NativeImSyncConfig{receive:true})).unwrap()}
+fn refresh()->Arc<ImQuery>{Arc::new(ImQuery::refresh(&[],-1).unwrap())}
+fn status()->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.u32(0).unwrap();w.i64(7).unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}
+async fn logout(peer:&mut CommonPeer){loop{let packet=peer.next().await.unwrap();let request=decode_request(&packet[1..]).unwrap();if request.method==n::rpc_logout::LOGOUT_SESSION_METHOD.as_bytes(){peer.send(&[reply(request.call_id,&[0,1,0,0,0,0])]).await;break;}assert_eq!(request.method,n::rpc_batch::SWAP_CALLS_METHOD.as_bytes());let mut r=Reader::versioned(request.arguments).unwrap();assert_eq!(r.bytes().unwrap(),b"fixture-user");assert_eq!(r.bytes().unwrap(),b"fixture-selected-session");let p=n::rpc_batch::read_payload(&mut r).unwrap();peer.send(&[reply(request.call_id,&super::super::super::tests::swap_result(None,true,p.fields))]).await;}assert!(peer.next().await.is_none());}
+#[tokio::test]
+async fn im_backend_explicit_sync_policy_reads_same_original_sdk_context_without_fake_events(){Box::pin(async{
+    let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let port=listener.local_addr().unwrap().port();let server=cert.server_config(&TLS13);let serving=tokio::spawn(async move{bounded(async move{
+        let mut peer=CommonPeer::open(listener,server).await;let packet=peer.next().await.unwrap();let login=decode_request(&packet[1..]).unwrap();peer.send(&[reply(login.call_id,&login_result())]).await;
+        loop{let packet=peer.next().await.unwrap();let request=decode_request(&packet[1..]).unwrap();if request.method==n::im_status::REFRESH_METHOD.as_bytes(){assert_eq!(request.metadata.len(),2);assert_eq!(request.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"#Group");assert_eq!(request.metadata.iter().find(|p|p.key==b"token").unwrap().value,b"fixture-auth");let mut r=Reader::versioned(request.arguments).unwrap();assert_eq!(r.bytes().unwrap(),b"fixture-user");peer.send(&[reply(request.call_id,&status())]).await;break;}assert_eq!(request.method,n::rpc_batch::SWAP_CALLS_METHOD.as_bytes());let mut r=Reader::versioned(request.arguments).unwrap();r.bytes().unwrap();r.bytes().unwrap();let p=n::rpc_batch::read_payload(&mut r).unwrap();peer.send(&[reply(request.call_id,&super::super::super::tests::swap_result(None,true,p.fields))]).await;}
+        logout(&mut peer).await;
+    }).await});
+    let legacy=Arc::new(LegacyDenied{calls:AtomicUsize::new(0)});let(backend,mut events)=NativeHostingBackend::new(profile(&cert.root,port,true),legacy.clone());let original=owner();bounded(backend.login(original.clone(),request(&cert.root))).await.unwrap();let login=event(&mut events).await;assert!(matches!(login.payload,BackendEventPayload::Callback(c)if c.callback==(Callback::SdkLogin{success:true})));let scope=backend.original_scope(&original).unwrap();
+    let response=bounded(backend.read_im(&original,&scope,refresh(),ImReceiptGate::fresh())).await.unwrap();let ImReplyData::Refresh(result)=response.result().unwrap()else{panic!("refresh")};assert_eq!(result.update_time,7);assert!(result.accepted);assert!(events.try_recv().is_err());assert_eq!(legacy.calls.load(Ordering::SeqCst),0);bounded(backend.logout(original)).await.unwrap();bounded(serving).await.unwrap();
+}).await;}
+#[tokio::test]
+async fn im_backend_incoming_installation_does_not_grant_sync_reads_or_change_default_io(){Box::pin(async{
+    let cert=Certificates::generate("IP:127.0.0.1");let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let port=listener.local_addr().unwrap().port();let server=cert.server_config(&TLS13);let serving=tokio::spawn(async move{bounded(async move{let mut peer=CommonPeer::open(listener,server).await;let packet=peer.next().await.unwrap();let login=decode_request(&packet[1..]).unwrap();peer.send(&[reply(login.call_id,&login_result())]).await;logout(&mut peer).await;}).await});
+    let(backend,mut events)=NativeHostingBackend::new(profile(&cert.root,port,false),Arc::new(LegacyDenied{calls:AtomicUsize::new(0)}));let original=owner();bounded(backend.login(original.clone(),request(&cert.root))).await.unwrap();event(&mut events).await;let scope=backend.original_scope(&original).unwrap();assert!(backend.im_messages_enabled());assert!(!backend.im_sync_enabled());assert_eq!(backend.read_im(&original,&scope,refresh(),ImReceiptGate::fresh()).await.err(),Some(RuntimeError::Closed));assert_eq!(backend.read_im(&owner(),&scope,refresh(),ImReceiptGate::fresh()).await.err(),Some(RuntimeError::Scope));assert!(scope.is_open());bounded(backend.logout(original)).await.unwrap();bounded(serving).await.unwrap();
+}).await;}
+#[test]
+fn im_sync_policy_is_opt_in_strict_and_never_includes_an_endpoint_or_write_grant(){
+    for value in [r#"{}"#,r#"{"receive":false}"#,r#"{"receive":true,"token":"forged"}"#,r#"{"receive":true,"setRead":true}"#]{assert!(serde_json::from_str::<NativeImSyncConfig>(value).is_err()||serde_json::from_str::<NativeImSyncConfig>(value).unwrap().validate().is_err());}
+    let yes:NativeImSyncConfig=serde_json::from_str(r#"{"receive":true}"#).unwrap();assert!(yes.validate().is_ok());assert_eq!(format!("{yes:?}"),"NativeImSyncConfig(<redacted>)");
+}
+#[test]
+fn im_sync_private_configuration_omits_absence_and_requires_native_im_clientex_not_media(){
+    let cert=Certificates::generate("IP:127.0.0.1");let mut cfg=n::account_config::tests::native_fixture(&cert.root,"127.0.0.1",1);cfg.profile.incoming=None;cfg.profile.call_incoming=None;cfg.profile.client_ex=true;cfg.profile.native_receivers=Some(config());assert!(!String::from_utf8(cfg.encode_private().unwrap().to_vec()).unwrap().contains("im_sync"));cfg.profile.im_sync=Some(NativeImSyncConfig{receive:true});assert!(cfg.validate(100).is_err());cfg.profile.native_receivers.as_mut().unwrap().im_messages=Some(NativeImConfig{notification_timeout_ms:3000});assert!(cfg.validate(100).is_ok());assert!(cfg.call_media.is_none());let encoded=cfg.encode_private().unwrap();let copied=n::account_config::AccountConfig::decode_private(&encoded).unwrap();assert!(copied.profile.im_sync.unwrap().receive);cfg.profile.client_ex=false;assert!(cfg.validate(100).is_err());
+}
+#[test]
+fn im_sync_runtime_profile_cannot_bypass_explicit_common_native_receiver_requirements(){
+    let cert=Certificates::generate("IP:127.0.0.1");assert!(RuntimeProfile::supplied_common(inputs(),common(&cert.root,1)).unwrap().with_im_sync(Some(&NativeImSyncConfig{receive:true})).is_err());let mut receiver=config();receiver.im_messages=Some(NativeImConfig{notification_timeout_ms:3000});let p=native_profile(&cert.root,1,&receiver).with_im_sync(Some(&NativeImSyncConfig{receive:true})).unwrap();assert!(p.with_im_sync(Some(&NativeImSyncConfig{receive:true})).is_err());
+}

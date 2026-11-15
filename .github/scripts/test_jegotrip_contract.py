@@ -458,7 +458,10 @@ class JegotripContract(unittest.TestCase):
         self.assertIn('common.try_receive_calls', source)
         self.assertIn('self.backend.on_common_calls', source)
         self.assertIn('common.send_prepared_packets', source)
-        self.assertIn('self.pending.values().copied().chain(extra)', source)
+        self.assertIn('self.pending.iter().filter(|(id,_)|!self.im_pending.contains_key(*id)).map(|(_,end)|*end).chain(extra)', source)
+        self.assertIn('self.retire_im_reads(now);self.pending.retain(|id,_|self.backend.is_pending(*id))', source)
+        self.assertIn('.chain(self.call_pending.values().map(|pending|pending.deadline))', source)
+        self.assertIn('self.unhosting_pending.as_ref().map(|pending|pending.deadline)', source)
         self.assertIn('match self.commands.try_recv()', source)
         self.assertIn('self.native_attempt_end=None', source)
         for forbidden in ['TlsEngine::for_', 'VerifiedPlaintextPackets::', 'RpcConnectionScope::fresh', 'Callback::SdkLogin { success: true }']:

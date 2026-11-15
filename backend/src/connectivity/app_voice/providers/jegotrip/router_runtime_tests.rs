@@ -248,6 +248,9 @@ async fn production_router_echo_and_delay_measurements_come_from_original_tls_he
 //creates a socket nor changes its scope/trust; exercised only in Actions.
 #[derive(Clone,Copy,PartialEq,Eq)]
 pub(crate) enum DelayPoint{Write,Flush}
+#[path="im_io_test_gate.rs"]
+mod im_io_gate;
+pub(crate) use im_io_gate::gate_original_write;
 struct SlowOriginalIo{inner:BoxRuntimeIo,point:DelayPoint,delay:Duration,sleep:Option<std::pin::Pin<Box<tokio::time::Sleep>>>,waited:bool,
  skip:usize,pauses:std::sync::Arc<std::sync::atomic::AtomicUsize>}
 impl SlowOriginalIo{
