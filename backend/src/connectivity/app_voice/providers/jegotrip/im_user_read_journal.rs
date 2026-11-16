@@ -4,7 +4,7 @@
 use super::*;
 use super::super::{im_data::{ImBox,BoxKind},im_status::StatusLabel,rpc_im::{ImQuery,ImReplyData,OwnedImReply},im_user_read_rpc::OwnedUserReadReply};
 use std::sync::{Mutex,Weak,atomic::{AtomicU8,Ordering}};
-const QUEUED:u8=0;const WRITING:u8=1;const SUBMITTED:u8=2;const RESOLVED:u8=3;const RETIRED:u8=4;
+const QUEUED:u8=0;const WRITING:u8=1;const SUBMITTED:u8=2;const RESOLVED:u8=3;const RETIRED:u8=4;const CLOSED_WRITE:u8=5;
 const UNCERTAIN:&str="app_account_im_user_read_uncertain";
 const MAX_LOCAL:i64=128;const MAX_GLOBAL:i64=4096;
 fn lock<T>(m:&Mutex<T>)->std::sync::MutexGuard<'_,T>{m.lock().unwrap_or_else(|e|e.into_inner())}
@@ -145,9 +145,12 @@ impl UserReadPermit{
     #[cfg(test)]
     pub(in super::super) fn write_was_submitted(&self)->bool{self.phase.load(Ordering::SeqCst)==SUBMITTED}
     pub(in super::super) fn submitted(&self)->bool{self.phase.compare_exchange(WRITING,SUBMITTED,Ordering::SeqCst,Ordering::SeqCst).is_ok()}
-    pub(in super::super) fn retired(&self)->bool{self.phase.load(Ordering::SeqCst)==RETIRED}
+    pub(in super::super) fn retired(&self)->bool{self.phase.load(Ordering::SeqCst)>=RETIRED}
+    /// Only an original possibly submitted WRITE cancellation retires IO;
+    /// queued no-IO cancellation must not alter a later healthy close reason.
+    pub(in super::super) fn closed_original_io(&self)->bool{self.phase.load(Ordering::SeqCst)==CLOSED_WRITE}
     pub(in super::super) fn cancel(&self){
-        let before=loop{let p=self.phase.load(Ordering::SeqCst);if p>=RESOLVED{return;}if self.phase.compare_exchange(p,RETIRED,Ordering::SeqCst,Ordering::SeqCst).is_ok(){break p;}};
+        let before=loop{let p=self.phase.load(Ordering::SeqCst);if p>=RESOLVED{return;}let retired=if p==QUEUED{RETIRED}else{CLOSED_WRITE};if self.phase.compare_exchange(p,retired,Ordering::SeqCst,Ordering::SeqCst).is_ok(){break p;}};
         if before==QUEUED{let _=self.context.action.database.with_conn(|c|c.execute("UPDATE app_voice_im_user_reads SET state=3,updated_at=?3 WHERE id=?1 AND user_nonce=?2 AND state=0",params![self.row,self.context.action.nonce.as_str(),chrono::Utc::now().to_rfc3339()]).map_err(|_|STORAGE));}
         else if matches!(before,WRITING|SUBMITTED){self.context.action.scope.close();}self.changed.notify_waiters();
     }

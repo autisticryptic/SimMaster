@@ -25,9 +25,14 @@ impl RuntimeCommands{
     }
 }
 impl<I:AsyncRead+AsyncWrite+Unpin+Send+'static> Actor<I>{
+    /// Preserve the original WRITE retirement cause across a generic scope
+    /// closed exit; no past queued/read cancellation or non-close error maps.
+    pub(super) fn user_write_close_reason(&self)->Option<RuntimeError>{
+        self.user_write_retirement.or_else(||self.user_read_pending.values().find_map(|p|p.permit.closed_original_io().then_some(RuntimeError::Cancelled)))
+    }
     pub(super) fn retire_user_read_writes(&mut self,now:Instant){
         let ids=self.user_read_pending.iter().filter_map(|(&id,p)|{if p.permit.retired()||p.reply.is_closed()||!p.permit.gate().live()||!p.permit.parent_gate().live(){Some((id,RuntimeError::Cancelled))}else if now>=p.deadline{Some((id,RuntimeError::Timeout))}else{None}}).collect::<Vec<_>>();
-        for(id,e)in ids{if let Some(p)=self.user_read_pending.remove(&id){p.permit.cancel();self.backend.retire_user_read_write(id);self.pending.remove(&id);let _=p.reply.send(Err(e));}}
+        for(id,e)in ids{if let Some(p)=self.user_read_pending.remove(&id){p.permit.cancel();if p.permit.closed_original_io(){self.user_write_retirement.get_or_insert(e);}self.backend.retire_user_read_write(id);self.pending.remove(&id);let _=p.reply.send(Err(e));}}
     }
     pub(super) fn deliver_user_read_replies(&mut self,outcome:Result<(),RuntimeError>)->Result<(),RuntimeError>{
         for r in self.backend.take_user_read_replies(){let id=r.request().id();let Some(p)=self.user_read_pending.remove(&id)else{continue;};self.pending.remove(&id);

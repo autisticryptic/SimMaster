@@ -94,3 +94,5 @@ fn user_read_scope_revision_change_and_changed_message_fingerprint_prevent_posit
 fn user_read_debug_and_metadata_do_not_export_box_uid_token_nonce_or_sdk_scope(){
     let mut f=Fixture::new(true);let id=message_id(&mut f,1,7);let a=action(&f,id,&"a".repeat(32));let p=checked(&mut f,&a,Some(9),true).unwrap();let text=format!("{a:?} {p:?}");for hidden in ["1_2","fixture","nonce","token"]{assert!(!text.contains(hidden));}let rows=f.temp.database.with_conn(|c|n::im_inbox::user_read_history(c,f.run.line_id(),16)).unwrap();let text=serde_json::to_string(&rows).unwrap();for hidden in ["box_id","1_2","identity_key","scope_epoch","user_nonce","run_nonce","request_id"]{assert!(!text.contains(hidden));}
 }
+#[path="im_user_read_retirement_reason_tests.rs"]
+mod retirement_reason;

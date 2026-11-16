@@ -23,4 +23,12 @@ class UserReadHardeningContracts(unittest.TestCase):
   for k in ['setDefaultTimeout','chromium.launch','localhost:12345','retries:']:self.assertNotIn(k,s)
   p=text('frontend/playwright.jegotrip.config.ts')
   for k in ['timeout: 45_000','timeout: 10_000','workers: 1','retries: 0','timeout: 120_000']:self.assertIn(k,p)
+ def test_write_retirement_provenance_distinguishes_queued_no_io_from_scope_closed_write(self):
+  s=text('backend/src/connectivity/app_voice/providers/jegotrip/im_user_read_journal.rs');self.assertIn('const CLOSED_WRITE:u8=5',s);self.assertIn('if p==QUEUED{RETIRED}else{CLOSED_WRITE}',s);self.assertIn('fn closed_original_io(&self)->bool{self.phase.load(Ordering::SeqCst)==CLOSED_WRITE}',s);self.assertIn('fn retired(&self)->bool{self.phase.load(Ordering::SeqCst)>=RETIRED}',s)
+ def test_only_generic_closed_exit_uses_original_user_write_cause_and_revocation_stays_first(self):
+  s=text('backend/src/connectivity/app_voice/providers/jegotrip/transport_actor.rs');mapping='if result==RuntimeError::Closed{self.user_write_close_reason().unwrap_or(result)}else{result}';revoked='if self.scope.session_revoked() { RuntimeError::SessionRevoked } else { result }';self.assertIn(mapping,s);self.assertIn(revoked,s);self.assertLess(s.index(mapping),s.index(revoked));self.assertIn('user_write_retirement:Option<RuntimeError>',s)
+ def test_cause_survives_original_pending_removal_but_never_queued_cancellation(self):
+  s=text('backend/src/connectivity/app_voice/providers/jegotrip/im_user_read_actor.rs');self.assertIn('if p.permit.closed_original_io(){self.user_write_retirement.get_or_insert(e);}',s);self.assertIn('self.user_write_retirement.or_else',s);self.assertIn('p.permit.closed_original_io().then_some(RuntimeError::Cancelled)',s)
+ def test_original_cancelled_reason_assertions_remain_strict_and_extra_phase_cases_are_mounted(self):
+  s=text('backend/src/connectivity/app_voice/providers/jegotrip/im_user_read_lifecycle_io_tests.rs');self.assertIn('assert_eq!(closed.reason,reason)',s);self.assertIn('Ending::WaitDrop=>{drop(release);drop(writing);RuntimeError::Cancelled}',s);s=text('backend/src/connectivity/app_voice/providers/jegotrip/im_user_read_protocol_tests.rs');self.assertIn('#[path="im_user_read_retirement_reason_tests.rs"]\nmod retirement_reason;',s)
 if __name__=='__main__':unittest.main()
