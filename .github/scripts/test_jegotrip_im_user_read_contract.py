@@ -33,7 +33,8 @@ class UserReadContracts(unittest.TestCase):
  def test_api_body_contains_only_revision_consent_nonce_and_local_id(self):
   s=(R/'backend/src/api/app_voice.rs').read_text(encoding='utf-8');self.assertIn('struct ImUserReadRequest{expected_revision:u64,nonce:String,consent:bool}',s);self.assertIn('/mark-read",post(mark_im_user_read)',s);self.assertIn('id.to_string()!=message_id',s)
  def test_frontend_requires_explicit_confirmation_new_nonce_and_unknown_query_only(self):
-  s=(R/'frontend/src/pages/sim/AppImMessagesPane.tsx').read_text(encoding='utf-8');self.assertIn('window.confirm',s);self.assertIn('crypto.randomUUID()',s);self.assertIn('userUncertain',s);self.assertIn('row.id > old.after',s);self.assertIn('active.current.generation !== original.generation',s);self.assertNotIn('dangerouslySetInnerHTML',s)
+  s=(R/'frontend/src/pages/sim/AppImMessagesPane.tsx').read_text(encoding='utf-8');self.assertIn('window.confirm',s);self.assertIn('crypto.randomUUID()',s);self.assertIn('userUncertain',s);self.assertIn('userReadBaselineReady(userOutcomes, lineId, active.current.generation)',s);self.assertIn('userReadUnknownResolved(old, snapshot, lineId, generation)',s);self.assertIn('active.current.generation !== original.generation',s);self.assertNotIn('dangerouslySetInnerHTML',s)
+  state=(R/'frontend/src/policies/imUserReadState.ts').read_text(encoding='utf-8');self.assertIn('row.id > unknown.after',state);self.assertIn('userReadKnownUnknown(snapshot, line, generation, unknown.id, unknown.index)',state);self.assertIn('snapshot.generation === generation',state)
  def test_no_original_budgets_or_action_filters_are_extended_by_user_read_suite(self):
   p=(R/'frontend/playwright.jegotrip.config.ts').read_text(encoding='utf-8')
   for k in ['timeout: 45_000','timeout: 10_000','workers: 1','retries: 0','timeout: 120_000']:self.assertIn(k,p)

@@ -142,6 +142,8 @@ impl UserReadPermit{
     }
     pub(in super::super) fn current(&self,id:i32)->bool{self.context.action.live()&&lock(&self.request).as_ref().is_some_and(|r|r.id==id&&Instant::now()<r.deadline)}
     pub(in super::super) fn begin_write(&self,id:i32)->bool{self.current(id)&&self.phase.compare_exchange(QUEUED,WRITING,Ordering::SeqCst,Ordering::SeqCst).is_ok()}
+    #[cfg(test)]
+    pub(in super::super) fn write_was_submitted(&self)->bool{self.phase.load(Ordering::SeqCst)==SUBMITTED}
     pub(in super::super) fn submitted(&self)->bool{self.phase.compare_exchange(WRITING,SUBMITTED,Ordering::SeqCst,Ordering::SeqCst).is_ok()}
     pub(in super::super) fn retired(&self)->bool{self.phase.load(Ordering::SeqCst)==RETIRED}
     pub(in super::super) fn cancel(&self){
