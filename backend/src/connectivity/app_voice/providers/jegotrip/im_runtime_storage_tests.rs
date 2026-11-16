@@ -2,6 +2,10 @@
 //! No socket, SDK/authentication or new background worker is created here.
 use super::*;
 #[test]
+fn original_status_entries_are_heap_descriptors_without_new_task_stack_or_startup_poll(){
+    crate::connectivity::app_voice::providers::jegotrip::account_runtime::test_im_status_entry_descriptors();
+}
+#[test]
 fn common_original_pre_network_engine_is_heap_owned_and_cannot_restore_auth_or_readiness(){
     let prepared=prepare_common(owner(),rpc_policy(),Instant::now()+Duration::from_secs(5)).unwrap();
     let engine:&Box<OfflineBackend>=prepared.backend.as_ref().unwrap();

@@ -1059,6 +1059,8 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
 
 #[path = "account_im.rs"]
 mod im;
+#[cfg(test)]
+pub(crate) fn test_im_status_entry_descriptors(){im::test_entry_descriptors();}
 #[path = "account_im_sync.rs"]
 mod im_sync;
 #[path = "offline_reception.rs"]

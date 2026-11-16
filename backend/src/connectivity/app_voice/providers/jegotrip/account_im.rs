@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 #[path="account_im_status.rs"]
 mod statuses;
 pub(super) use statuses::delivery as status_delivery;
+#[cfg(test)]
+pub(super) use statuses::test_entry_descriptors;
 const MAX_GROUPS:usize=64;
 const MAX_HOLDERS:usize=256;
 const MAX_BYTES:usize=1024*1024;

@@ -28,4 +28,8 @@ class StatusConsumerContracts(unittest.TestCase):
   self.assertIn('im_status_protocol_tests.rs',src('im_protocol_tests.rs'));self.assertIn('im_status_account_tests.rs',src('im_account_tests.rs'))
   for file in ['im_status_protocol_tests.rs','im_status_account_tests.rs']:
    s=src(file);self.assertNotIn('#[ignore',s);self.assertNotIn('dlopen',s);self.assertNotIn('Command::new("adb")',s)
+ def test_status_entry_descriptor_regression_is_in_existing_native_actions_filter(self):
+  s=src('im_runtime_storage_tests.rs');self.assertIn('fn original_status_entries_are_heap_descriptors_without_new_task_stack_or_startup_poll()',s);self.assertIn('test_im_status_entry_descriptors()',s);self.assertIn('test_entry_descriptors()',src('account_runtime.rs'));self.assertNotIn('#[test]',src('account_im_status.rs'))
+  for name in ['build-release.yml','beta-validation.yml']:
+   self.assertIn('connectivity::app_voice::providers::jegotrip::transport_actor::native::tests',(R/'.github/workflows'/name).read_text(encoding='utf-8'))
 if __name__=='__main__':unittest.main()

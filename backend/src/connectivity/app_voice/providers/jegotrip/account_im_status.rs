@@ -45,14 +45,10 @@ pub(super) fn drive<'a>(run:&'a ManagedRun,state:&'a mut State)->StatusFuture<'a
     })
 }
 #[cfg(test)]
-mod tests{
-    use super::*;
-    #[test]
-    fn original_status_entries_are_heap_descriptors_without_new_task_stack_or_startup_poll(){
-        // Function types (not merely an alias) ensure both original entrypoints
-        // return the heap-owned descriptor without constructing/polling a run.
-        let _:for<'a>fn(&'a ManagedRun,Phase,&'a mut State,Box<IncomingImStatus>)->StatusFuture<'a>=delivery;
-        let _:for<'a>fn(&'a ManagedRun,&'a mut State)->StatusFuture<'a>=drive;
-        assert!(std::mem::size_of::<StatusFuture<'static>>()<=32);
-    }
+pub(in super::super) fn test_entry_descriptors(){
+    // Called by a test mounted in the retained native actor Actions filter.
+    // Both actual entry types, not just the alias, remain heap descriptors.
+    let _:for<'a>fn(&'a ManagedRun,Phase,&'a mut State,Box<IncomingImStatus>)->StatusFuture<'a>=delivery;
+    let _:for<'a>fn(&'a ManagedRun,&'a mut State)->StatusFuture<'a>=drive;
+    assert!(std::mem::size_of::<StatusFuture<'static>>()<=32);
 }
