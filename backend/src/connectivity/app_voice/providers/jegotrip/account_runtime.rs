@@ -507,6 +507,9 @@ impl AccountManager {
     pub fn im_messages(&self,line_id:&str,limit:usize)->Result<Vec<super::im_inbox::ImMessageView>,&'static str>{
         self.database.with_conn(|conn|super::im_inbox::list(conn,line_id,limit))
     }
+    pub fn im_received_receipts(&self,line_id:&str,limit:usize)->Result<Vec<super::im_inbox::ReceivedReceiptView>,&'static str>{
+        self.database.with_conn(|conn|super::im_inbox::received_receipts(conn,line_id,limit))
+    }
     pub fn delete_im_message(&self,line_id:&str,id:i64)->Result<bool,&'static str>{
         self.database.with_conn(|conn|super::im_inbox::delete(conn,line_id,id))
     }
@@ -1030,7 +1033,10 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                 // Read waiting never owns the controller lock. Stop/callbacks
                 // are free to invalidate this same run before SQL consumption.
                 let phase={let controller=run.controller.lock().await;controller.phase()};
-                if let Err(code)=im_sync.received(&run,phase,&mut im,result).await{*lock(&run.error)=Some(code);run.retire();}
+                match result{
+                    im_sync::Completion::Read(result)=>if let Err(code)=im_sync.received(&run,phase,&mut im,result).await{*lock(&run.error)=Some(code);run.retire();},
+                    im_sync::Completion::Write(result)=>if let Err(code)=im_sync.received_write(&run,phase,result,&mut im){*lock(&run.error)=Some(code);run.retire();},
+                }
                 let controller=run.controller.lock().await;
                 if let Err(code)=im_sync.drive(&run,&controller,&mut im).await{*lock(&run.error)=Some(code);run.retire();}
             }

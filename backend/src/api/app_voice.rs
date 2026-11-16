@@ -65,6 +65,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/notifications", get(get_notifications))
         .route("/api/non-3gpp/accounts/{line_id}/call-notifications", get(get_call_notifications))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages", get(get_im_messages))
+        .route("/api/non-3gpp/accounts/{line_id}/im-receipts", get(get_im_receipts))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}", delete(delete_im_message))
         .route("/api/non-3gpp/accounts/{line_id}/calls", get(get_calls))
         .route("/api/non-3gpp/accounts/{line_id}/calls/{call_id}", get(get_call))
@@ -236,6 +237,11 @@ pub async fn get_im_messages(State(manager):State<Arc<AccountManager>>,Path(line
     let Ok(Query(request))=request else{return failure("app_account_request_invalid");};
     if !(1..=128).contains(&request.limit){return failure("app_account_request_invalid");}
     success(StatusCode::OK,manager.im_messages(&line_id,request.limit))
+}
+pub async fn get_im_receipts(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Query<InboxQuery>,QueryRejection>)->Response{
+    let Ok(Query(request))=request else{return failure("app_account_request_invalid");};
+    if !(1..=128).contains(&request.limit){return failure("app_account_request_invalid");}
+    success(StatusCode::OK,manager.im_received_receipts(&line_id,request.limit))
 }
 pub async fn delete_im_message(State(manager):State<Arc<AccountManager>>,Path((line_id,message_id)):Path<(String,String)>)->Response{
     let Ok(id)=message_id.parse::<i64>()else{return failure("app_account_request_invalid");};

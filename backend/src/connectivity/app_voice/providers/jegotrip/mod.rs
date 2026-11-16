@@ -49,6 +49,8 @@ pub(crate) mod im_receive_state;
 pub(crate) mod rpc_im;
 mod im_read_interest;
 pub(crate) mod im_sync_policy;
+mod im_receipt_policy;
+mod rpc_im_received;
 pub(crate) mod im_delivery;
 pub(crate) mod im_inbox;
 pub mod rpc_arguments;

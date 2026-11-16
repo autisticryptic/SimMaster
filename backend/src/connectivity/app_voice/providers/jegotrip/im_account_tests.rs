@@ -9,6 +9,8 @@ mod retention;
 mod synchronization;
 #[path="im_status_account_tests.rs"]
 mod status_consumer;
+#[path="im_received_account_tests.rs"]
+mod received_writes;
 async fn bounded<F:Future>(future:F)->F::Output{tokio::time::timeout(Duration::from_secs(12),future).await.expect("original IM account fixture deadline")}
 fn config(root:&str,port:u16,timeout:u64)->AccountConfig{let mut cfg=account_config(root,port,false);cfg.profile.native_receivers.as_mut().unwrap().im_messages=Some(NativeImConfig{notification_timeout_ms:timeout});cfg}
 fn hint(rpc:i32,id:u64,index:i64)->Vec<u8>{let idx=index.to_string();let mut w=Writer::versioned().unwrap();w.u64(id).unwrap();w.properties(&[RpcProperty{key:b"Notify.Command",value:b"Message"},RpcProperty{key:b"Notify.Box",value:b"P2P/1_2"},RpcProperty{key:b"Notify.MsgIdx",value:idx.as_bytes()}]).unwrap();let args=w.finish();let magic=rpc.to_be_bytes();let raw=encode_request(rpc,&[RpcProperty{key:b"id",value:b"MessageReceiver"},RpcProperty{key:b"token",value:b"fixture-auth"},RpcProperty{key:b"__magic",value:&magic}],n::rpc_client_ex::NOTIFY_CALLS_METHOD.as_bytes(),args.expose_to_transport()).unwrap();let mut p=vec![0];p.extend_from_slice(raw.expose_to_transport());p}

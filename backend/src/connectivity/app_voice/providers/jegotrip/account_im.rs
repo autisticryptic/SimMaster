@@ -15,9 +15,12 @@ const MAX_EARLY:usize=16;
 const INVALID:&str="app_account_im_scope_invalid";
 const FULL:&str="app_account_im_backpressure";
 struct Group{fingerprint:[u8;32],key:[u8;32],deadline:Instant,context:ImInboxScope,pending:Option<ImPendingAssociation>,holders:VecDeque<Box<IncomingImDelivery>>,outcome:Option<Option<CommittedIm>>}
-pub(super) struct State{early:VecDeque<Box<IncomingImDelivery>>,early_status:VecDeque<Box<super::super::im_status_delivery::IncomingImStatus>>,early_bytes:usize,ordered:VecDeque<Box<IncomingImDelivery>>,groups:BTreeMap<u64,Group>,holders:usize,bytes:usize}
-impl Default for State{fn default()->Self{Self{early:VecDeque::new(),early_status:VecDeque::new(),early_bytes:0,ordered:VecDeque::new(),groups:BTreeMap::new(),holders:0,bytes:0}}}
-impl State{pub(super) fn clear(&mut self){self.early.clear();self.early_status.clear();self.early_bytes=0;self.ordered.clear();self.groups.clear();self.holders=0;self.bytes=0;}}
+pub(super) struct State{early:VecDeque<Box<IncomingImDelivery>>,early_status:VecDeque<Box<super::super::im_status_delivery::IncomingImStatus>>,early_bytes:usize,ordered:VecDeque<Box<IncomingImDelivery>>,received_spans:VecDeque<super::super::im_inbox::GapCommitted>,groups:BTreeMap<u64,Group>,holders:usize,bytes:usize}
+impl Default for State{fn default()->Self{Self{early:VecDeque::new(),early_status:VecDeque::new(),early_bytes:0,ordered:VecDeque::new(),received_spans:VecDeque::new(),groups:BTreeMap::new(),holders:0,bytes:0}}}
+impl State{pub(super) fn clear(&mut self){self.early.clear();self.early_status.clear();self.early_bytes=0;self.ordered.clear();self.received_spans.clear();self.groups.clear();self.holders=0;self.bytes=0;}
+    pub(super) fn next_received_span(&mut self)->Option<super::super::im_inbox::GapCommitted>{self.received_spans.pop_front()}
+    pub(super) fn clear_received_spans(&mut self){self.received_spans.clear();}
+}
 fn context(run:&ManagedRun,delivery:&IncomingImDelivery)->Result<ImInboxScope,&'static str>{
     if !run.accepting.load(Ordering::SeqCst)||!run.im_gate.live()||!run.backend.im_messages_enabled(){return Err(INVALID);}
     run.configuration_current()?;
@@ -144,7 +147,7 @@ fn release_ordered(state:&mut State,bytes:usize)->Result<(),&'static str>{
 }
 /// Rotate a bounded current queue once. A receive in flight may observe new
 /// targets but cannot be overlapped with another cursor advance for that box.
-pub(super) async fn ordered(run:&ManagedRun,state:&mut State,cursor:Option<&super::super::im_inbox::CursorSession>,blocked_box:Option<&[u8]>)->Result<(),&'static str>{
+pub(super) async fn ordered(run:&ManagedRun,state:&mut State,cursor:Option<&super::super::im_inbox::CursorSession>,blocked_box:Option<&[u8]>,write_enabled:bool)->Result<(),&'static str>{
     use super::super::im_inbox::OnlinePosition;
     let count=state.ordered.len();
     for _ in 0..count{
@@ -165,6 +168,16 @@ pub(super) async fn ordered(run:&ManagedRun,state:&mut State,cursor:Option<&supe
             if sent.is_err(){state.ordered.push_front(delivery);return Err(INVALID);}
             drop(delivery);release_ordered(state,bytes)?;return Err(code);
         }};
+        if write_enabled{if let Some(proof)=&proof{
+            if let Some(span)=cursor.received_span_for_online(&run.database,&delivery,proof)?{
+                // Only a current committed body/span is queued. Coalesce DATA
+                // before admission; an already-submitted permit is never replaced.
+                if let Some(i)=state.received_spans.iter().position(|p|p.box_bytes()==span.box_bytes()){state.received_spans.remove(i);}
+                let bytes=state.received_spans.iter().map(|p|p.retained_bytes()).sum::<usize>();
+                if state.received_spans.len()>=MAX_GROUPS||bytes.checked_add(span.retained_bytes()).is_none_or(|b|b>MAX_BYTES){return Err(FULL);}
+                state.received_spans.push_back(span);
+            }
+        }}
         let sent=complete(run,&delivery,proof.as_ref(),delivery.ticket().deadline()).await;
         if let Err(code)=sent{state.ordered.push_front(delivery);return Err(code);}
         drop(delivery);release_ordered(state,bytes)?;

@@ -5,6 +5,8 @@ use crate::connectivity::app_voice::providers::jegotrip as n;
 use n::{native_receiver::{NativeReceiverConfig,NativeReceiverPolicy,NativeReceiverSetup},im_delivery::NativeImConfig,
     rpc_im::{ImQuery,ImReplyData},im_data::ImBox,im_inbox::ImReceiptGate};
 use std::sync::atomic::{AtomicBool,Ordering};
+#[path="im_received_io_tests.rs"]
+mod received_writes;
 async fn bounded<F:std::future::Future>(f:F)->F::Output{tokio::time::timeout(Duration::from_secs(12),f).await.expect("original IM IO fixture budget")}
 fn refresh()->Arc<ImQuery>{Arc::new(ImQuery::refresh(&[],-1).unwrap())}
 fn config(enabled:bool)->NativeReceiverConfig{NativeReceiverConfig{direct_domains:None,invite_notifications:None,im_messages:enabled.then_some(NativeImConfig{notification_timeout_ms:3000})}}

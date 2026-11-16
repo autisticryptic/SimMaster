@@ -53,6 +53,10 @@ impl fmt::Debug for GapCommitted{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::R
 impl GapCommitted{
     pub(in super::super) fn proofs(&self)->&[CommittedIm]{&self.proofs}
     pub(in super::super) fn end(&self)->i64{self.end}
+    pub(in super::super) fn box_bytes(&self)->&[u8]{&self.box_id}
+    pub(in super::super) fn receipt_context(&self)->ImInboxScope{ImInboxScope{run:self.run.clone(),binding:self.binding.clone(),gate:self.gate.clone()}}
+    pub(in super::super) fn receipt_span(&self)->(&[u8],i64,[u8;32]){(&self.box_id,self.end,self.span_hash)}
+    pub(in super::super) fn retained_bytes(&self)->usize{self.box_id.len()+256+self.proofs.iter().map(|p|p.key.bytes()+160).sum::<usize>()}
     /// Current scoped evidence only. This is not yet an installed SetReceived
     /// IO capability; a later write journal must recheck these durable facts.
     pub(in super::super) fn is_current(&self,db:&Database)->bool{
@@ -163,6 +167,13 @@ impl CursorSession{
                 params![self.context.run.line_id(),self.context.run.revision()as i64,self.context.binding.identity().as_slice(),box_id.bytes(),base,index,self.since,self.context.run.nonce(),self.context.binding.receipt_epoch()]).map_err(|_|STORAGE)?;base};
             let position=if index<=consumed{let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_im_messages WHERE line_id=?1 AND revision=?2 AND identity_key=?3 AND box_id=?4 AND message_index=?5)",params![self.context.run.line_id(),self.context.run.revision()as i64,self.context.binding.identity().as_slice(),box_id.bytes(),index],|r|r.get(0)).map_err(|_|STORAGE)?;if exists{OnlinePosition::Replay}else{OnlinePosition::MissingOlder}}
                 else if consumed.checked_add(1)==Some(index){OnlinePosition::Next}else{OnlinePosition::Pending};tx.commit().map_err(|_|STORAGE)?;Ok(position)})
+    }
+    pub(in super::super) fn received_span_for_online(&self,db:&Database,delivery:&IncomingImDelivery,proof:&CommittedIm)->Result<Option<GapCommitted>,&'static str>{
+        if !self.initial||!self.context.matches(delivery)||delivery.notice().notification_id().is_some()||!proof.authorizes(delivery.ticket(),Instant::now()){return Err(SCOPE);}
+        let key=delivery.notice().key();if key.index()<0{return Ok(None);}
+        let span:Option<(i64,i64,Vec<u8>)>=db.with_conn(|conn|{self.context.validate(conn)?;conn.query_row("SELECT last_span_start,last_span_end,last_span_hash FROM app_voice_im_receive_cursors WHERE line_id=?1 AND revision=?2 AND identity_key=?3 AND box_id=?4 AND consumed=?5 AND last_span_end=?5 AND observed_run=?6 AND observed_epoch=?7 AND last_span_hash IS NOT NULL",
+            params![self.context.run.line_id(),self.context.run.revision()as i64,self.context.binding.identity().as_slice(),key.box_id().bytes(),key.index(),self.context.run.nonce(),self.context.binding.receipt_epoch()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_|STORAGE)})?;
+        span.map(|(start,end,hash)|{let span_hash=hash.try_into().map_err(|_|STORAGE)?;Ok(GapCommitted{binding:self.context.binding.clone(),gate:self.context.gate.clone(),run:self.context.run.clone(),box_id:Zeroizing::new(key.box_id().bytes().to_vec()),start,end,span_hash,proofs:vec![proof.captured_copy()]})}).transpose()
     }
     pub(in super::super) fn commit_online(&self,db:&Database,delivery:&IncomingImDelivery)->Result<Option<CommittedIm>,&'static str>{
         if !self.context.matches(delivery)||!self.initial||delivery.notice().notification_id().is_some(){return Err(SCOPE);}

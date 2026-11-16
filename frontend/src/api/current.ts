@@ -1126,6 +1126,9 @@ class SimAdminCurrentAPI {
   async getAppImMessages(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-messages?limit=16`, { cache: 'no-store', timeoutMs: 10000 })
   }
+  async getAppImReceipts(lineId: string) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-receipts?limit=16`, { cache: 'no-store', timeoutMs: 10000 })
+  }
   async deleteAppImMessage(lineId: string, id: number) {
     return request<ApiResponse<boolean>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-messages/${id}`, { method: 'DELETE', timeoutMs: 10000 })
   }

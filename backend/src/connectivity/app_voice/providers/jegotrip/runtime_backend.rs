@@ -209,6 +209,7 @@ pub struct RuntimeProfile {
     reference_decode_key: Option<ConfigDecodeKey>, handshake_timeout: Duration, partial_timeout: Duration,
     account_alive:Option<super::alive_profile::AlivePolicy>,
     im_sync:Option<super::im_sync_policy::NativeImSyncConfig>,
+    im_receipts:Option<super::im_receipt_policy::NativeImReceiptConfig>,
     io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>,native_call_control:bool,byte_length:usize,
 }
 impl fmt::Debug for RuntimeProfile {
@@ -275,6 +276,11 @@ impl RuntimeProfile {
         let Some(config)=config else{return Ok(self);};config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;
         if self.im_sync.is_some()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}
         add_bytes(&mut self.byte_length,16)?;self.im_sync=Some(*config);Ok(self)
+    }
+    pub(super) fn with_im_receipts(mut self,config:Option<&super::im_receipt_policy::NativeImReceiptConfig>)->Result<Self,ProfileError>{
+        let Some(config)=config else{return Ok(self);};config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;
+        if self.im_receipts.is_some()||self.im_sync.is_none()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}
+        add_bytes(&mut self.byte_length,16)?;self.im_receipts=Some(*config);Ok(self)
     }
     pub fn supplied(input: RuntimeProfileInputs<'_>) -> Result<Self, ProfileError> { Self::capture(input,None,None,None) }
     pub fn supplied_common(input:RuntimeProfileInputs<'_>,common:RuntimeCommonInputs<'_>)->Result<Self,ProfileError>{Self::capture(input,None,Some(common),None)}
@@ -386,7 +392,7 @@ impl RuntimeProfile {
             poll_routing, logout_routing, incoming, offline_reception: false, client_ex: false, reference_decode_key: input.reference_decode_key,
             native_receivers: None,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
-            account_alive:None,im_sync:None,io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
+            account_alive:None,im_sync:None,im_receipts:None,io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
         })
     }
 }
@@ -660,6 +666,13 @@ impl NativeHostingBackend {
         self.profile.client_ex&&self.profile.native_receivers.as_ref().is_some_and(|policy|policy.im_messages().is_some())
     }
     pub(super) fn im_sync_enabled(&self)->bool{self.profile.im_sync.is_some()&&self.im_messages_enabled()}
+    pub(super) fn im_receipt_policy(&self)->Option<super::im_receipt_policy::NativeImReceiptConfig>{self.profile.im_receipts.filter(|_|self.im_sync_enabled())}
+    pub(super) async fn write_received(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,permit:Arc<super::im_inbox::ReceivedWritePermit>)->Result<super::rpc_im_received::OwnedReceivedReply,RuntimeError>{
+        let _no_io_wait=super::im_inbox::ReceivedWait::original(permit.clone());
+        let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;
+        {let state=lock(&attempt.state);if !state.configured||state.retired||state.logout_started||state.unregister_started||self.im_receipt_policy().is_none(){return Err(RuntimeError::Closed);}}
+        attempt.commands(owner,scope)?.write_received(owner,scope,permit).await
+    }
     pub(super) async fn read_im(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,query:Arc<super::rpc_im::ImQuery>,gate:Arc<super::im_inbox::ImReceiptGate>)->Result<super::rpc_im::OwnedImReply,RuntimeError>{
         let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;
         {let state=lock(&attempt.state);if !state.configured||state.retired||state.logout_started||state.unregister_started||!self.im_sync_enabled(){return Err(RuntimeError::Closed);}}

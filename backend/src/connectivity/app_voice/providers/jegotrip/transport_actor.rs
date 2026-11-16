@@ -24,6 +24,9 @@ use super::{
     im_inbox::ImReceiptGate,
     im_read_interest::{ImReadInterest,ImReadWait},
 };
+#[path="im_received_actor.rs"]
+mod received;
+use received::{ReceivedWork,ReceivedPending};
 use std::{fmt, future::poll_fn, io, pin::Pin, sync::Arc, task::Poll, time::{Duration, Instant}};
 use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite}, sync::{mpsc, oneshot}, task::JoinHandle};
 use zeroize::{Zeroize, Zeroizing};
@@ -152,6 +155,7 @@ enum Operation {
     CompleteIm(Box<(super::im_delivery::ImReplyTicket,Option<super::im_inbox::CommittedIm>)>),
     CompleteImStatus(Box<(super::im_status_delivery::ImStatusTicket,Option<super::im_inbox::CommittedImStatus>)>),
     ImRead(Box<ImReadWork>),
+    WriteReceived(Box<ReceivedWork>),
     ArmNativeReceivers(std::sync::Arc<super::native_receiver::NativeReceiverSetup>), ConfigureNativeReceivers(u32),
     GetOffline(i64, Vec<Property>), CompleteOfflineHint(super::rpc_offline::IncomingOfflineHint, bool),
     ConfigureCallControl(Vec<Property>),Call(CallControlTicket,CallOperation,Vec<Property>,oneshot::Sender<Result<OwnedCallOperationReply,RuntimeError>>),
@@ -173,6 +177,7 @@ impl Operation {
             Self::ConfigureNativeReceivers(_) => 0,
             Self::ArmNativeReceivers(setup) => setup.retained_bytes(),
             Self::ImRead(work)=>work.query.retained_bytes(),
+            Self::WriteReceived(work)=>work.permit.query().retained_bytes(),
             Self::ArmClientEx(binding)=>binding.object.len()+binding.domain.len()+binding.receiver.len(),
             Self::CompleteCall(_,_,properties)|Self::ConfigureCallControl(properties)|Self::Call(_,_,properties,_)=>properties.iter().map(|p|p.key.len()+p.value.len()).sum(),
         }
@@ -532,7 +537,7 @@ impl PreparedRuntime {
         let owner = self.owner.clone(); let scope = self.scope.clone();
         let actor = Actor { io: Some(io), owner: owner.clone(), scope: scope.clone(), backend, tls:Some(tls), common:None, native_attempt_end:None, commands: commands_rx,
             events: events_tx, policy, timing: self.timing, start: self.start, pending: std::collections::BTreeMap::new(),
-            logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new(),im_pending:std::collections::BTreeMap::new() };
+            logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new(),im_pending:std::collections::BTreeMap::new(),received_pending:std::collections::BTreeMap::new() };
         self.attached = true;
         let task = tokio::spawn(actor.run());
         Ok((RuntimeHandle { owner, scope, commands: commands_tx, task: Some(task) }, events_rx))
@@ -564,6 +569,7 @@ struct Actor<I> {
     timing: Option<RouterTiming>, start: Instant, pending: std::collections::BTreeMap<i32, Instant>, logout_pending: Option<LogoutPending>, unhosting_pending: Option<UnhostingPending>,
     call_pending:std::collections::BTreeMap<i32,CallPending>,
     im_pending:std::collections::BTreeMap<i32,ImReadPending>,
+    received_pending:std::collections::BTreeMap<i32,ReceivedPending>,
 }
 impl<I> Drop for Actor<I> {
     fn drop(&mut self) {
@@ -581,6 +587,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         result
     }
     fn retire_im_reads(&mut self,now:Instant){
+        self.retire_received_writes(now);
         let retired=self.im_pending.iter().filter_map(|(&id,p)|{
             if p.interest.is_retired()||p.reply.is_closed()||!p.gate.live(){Some((id,RuntimeError::Cancelled))}
             else if now>=p.deadline{Some((id,RuntimeError::Timeout))}else{None}
@@ -662,6 +669,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             }
             let result=outcome.map(|()|reply);pending.interest.cancel();let _=pending.reply.send(result);
         }
+        self.deliver_received_replies(outcome)?;
         // Keep the original wait (and its deadline) installed while every
         // outgoing reply and visible event from this delivery can still fail.
         // A semantic true followed by an IO/queue error is not an open-IO
@@ -783,12 +791,12 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             (Some(original), Some(invite)) => Some(original.min(invite)), (None, Some(invite)) => Some(invite), (original, None) => original,
         };
         if native_deadline.is_some_and(|deadline| now >= deadline) { let _ = command.completion.send(Err(RuntimeError::Timeout)); return Ok(()); }
-        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _) | Operation::ImRead(_)) {
+        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _) | Operation::ImRead(_) | Operation::WriteReceived(_)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
         let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_) | Operation::CompleteImStatus(_));
         let is_logout = matches!(&command.operation, Operation::Logout(_));
-        let mut unhosting_sequence = None;let mut call_wait=None;let mut im_wait=None;
+        let mut unhosting_sequence = None;let mut call_wait=None;let mut im_wait=None;let mut received_wait=None;
         let elapsed_ms = self.elapsed_ms(now);
         let prepared = match command.operation {
             Operation::Configure(epoch, incoming) => {
@@ -849,6 +857,15 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 match self.backend.prepare_im_read(work.query.clone(),work.gate.clone(),native_deadline.ok_or(RuntimeError::Timeout)?){
                     Ok(packets)=>{im_wait=Some(*work);Ok(packets)}
                     Err(_)=>{let _=work.reply.send(Err(RuntimeError::InvalidConfiguration));let _=command.completion.send(Err(RuntimeError::InvalidConfiguration));return Ok(());}
+                }
+            }
+            Operation::WriteReceived(work)=>{
+                if self.common.is_none()||!work.permit.matches(&self.owner,&self.scope)||work.reply.is_closed(){
+                    work.permit.cancel();let _=work.reply.send(Err(RuntimeError::Scope));let _=command.completion.send(Err(RuntimeError::Scope));return Ok(());
+                }
+                match self.backend.prepare_received_write(work.permit.clone(),native_deadline.ok_or(RuntimeError::Timeout)?){
+                    Ok(packets)=>{received_wait=Some(*work);Ok(packets)}
+                    Err(_)=>{work.permit.cancel();let _=work.reply.send(Err(RuntimeError::InvalidConfiguration));let _=command.completion.send(Err(RuntimeError::InvalidConfiguration));return Ok(());}
                 }
             }
             Operation::ConfigureCalls(binding)=>{
@@ -947,6 +964,11 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             im_gates.push(work.gate.clone());
         }
         let read_interest=im_wait.as_ref().map(|work|work.interest.clone());
+        if let Some(work)=&received_wait{
+            if !work.permit.begin_write(packets.call_id){work.permit.cancel();self.backend.retire_received_write(packets.call_id);let _=command.completion.send(Err(RuntimeError::Cancelled));return Ok(());}
+            im_gates.push(work.permit.gate());
+        }
+        let received_interest=received_wait.as_ref().map(|work|work.permit.clone());
         if is_logout { self.pending.retain(|id, _| self.backend.is_pending(*id)); }
         // Keep one heap-owned transport future, not two large inline copies
         // in the new guarded/legacy branches. Standard test stack and all IO
@@ -962,6 +984,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 tokio::select!{biased;
                     _=waiting.next(),if !waiting.is_empty()=>{},_=im_waiting.next(),if !im_waiting.is_empty()=>{},
                     _=async{if let Some(interest)=&read_interest{interest.retired().await;}else{std::future::pending::<()>().await;}},if read_interest.is_some()=>{},
+                    _=async{if let Some(permit)=&received_interest{permit.cancelled().await;}else{std::future::pending::<()>().await;}},if received_interest.is_some()=>{},
                 }
             };
             tokio::select! { biased;
@@ -971,6 +994,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         } else { sending.as_mut().await };
         drop(sending);
         if let Err(error) = sent {
+            if let Some(work)=&received_wait{work.permit.cancel();}
             self.backend.retire_request(packets.call_id); let _ = command.completion.send(Err(error)); return Err(error);
         }
         let rpc_deadline=native_deadline.unwrap_or(Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?);
@@ -986,6 +1010,14 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             // closing healthy SDK unregister/logout. It is not a peer ACK.
             if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),Some(packets.call_id)))).is_err(){self.retire_im_reads(Instant::now());}
             return Ok(());
+        }
+        if let Some(work)=received_wait{
+            if !work.permit.submitted()||!work.permit.request_is_current(packets.call_id)||work.reply.is_closed(){
+                let reason=if Instant::now()>=rpc_deadline{RuntimeError::Timeout}else{RuntimeError::Cancelled};work.permit.cancel();self.backend.retire_received_write(packets.call_id);let _=work.reply.send(Err(reason));let _=command.completion.send(Err(reason));return Err(reason);
+            }
+            self.pending.insert(packets.call_id,rpc_deadline);
+            self.received_pending.insert(packets.call_id,ReceivedPending{permit:work.permit,deadline:rpc_deadline,reply:work.reply});
+            if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),Some(packets.call_id)))).is_err(){self.retire_received_writes(Instant::now());return Err(RuntimeError::Cancelled);}return Ok(());
         }
         if !is_response { self.pending.insert(packets.call_id,rpc_deadline); }
         if let Some((ticket,operation,completion))=call_wait{

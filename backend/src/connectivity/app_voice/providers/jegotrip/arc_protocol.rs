@@ -261,6 +261,11 @@ impl ArcProtocol {
     }
     pub(super) fn take_im_replies(&mut self)->Vec<super::rpc_im::OwnedImReply>{self.rpc.take_im_replies()}
     pub(super) fn retire_im_read(&mut self,id:i32){self.rpc.retire_im_read(id);}
+    pub(super) fn prepare_received_write(&mut self,permit:std::sync::Arc<super::im_inbox::ReceivedWritePermit>,deadline:Instant)->Result<OwnedCallPackets,ProtocolError>{
+        let binding=self.im_binding.as_ref().ok_or(CodecError::InvalidField)?.clone();let(id,bytes)=self.rpc.prepare_received_write(binding,permit,deadline)?;self.packets(id,bytes.expose_to_transport())
+    }
+    pub(super) fn take_received_replies(&mut self)->Vec<super::rpc_im_received::OwnedReceivedReply>{self.rpc.take_received_replies()}
+    pub(super) fn retire_received_write(&mut self,id:i32){self.rpc.retire_received_write(id);}
 
     pub(super) fn prepare_offline(&mut self, position: i64, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
         if self.incoming.is_none() { return Err(CodecError::InvalidField.into()); }
