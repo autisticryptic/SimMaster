@@ -83,7 +83,7 @@ export default function AppImMessagesPane({ lineId, userRead }: { lineId: string
       <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{row.text}</Typography>
       {!!row.attachments && <Typography variant="caption">私有附件 {row.attachments} 项；不会按服务端文件名写入路径或自动打开。</Typography>}
       {userRead?.installed && row.kind === 'p2p' && !row.index.startsWith('-') && <Button size="small" disabled={busy || !userRead.hosted || userUncertain?.line === lineId && userUncertain.id === row.id} onClick={() => { void markRead(row) }}>明确标记原消息已读</Button>}
-      {userOutcomes?.line === lineId && userOutcomes.rows.filter((result) => result.messageId === row.id).slice(0, 1).map((result) => <Typography key={result.id} variant="caption">{userReadLabel(result.state)}</Typography>)}}
+      {userOutcomes?.line === lineId && userOutcomes.rows.filter((result) => result.messageId === row.id).slice(0, 1).map((result) => <Typography key={result.id} variant="caption">{userReadLabel(result.state)}</Typography>)}
       <Button size="small" color="warning" disabled={busy || (uncertain?.line === lineId && uncertain.id === row.id)} onClick={() => { void remove(row) }}>删除本地 IM 文本</Button>
     </Stack>)}
   </Stack>
