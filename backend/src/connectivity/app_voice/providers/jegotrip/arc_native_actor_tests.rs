@@ -3,6 +3,8 @@
 mod startup_diagnostics;
 #[path="im_read_actor_tests.rs"]
 mod im_reads;
+#[path="im_runtime_storage_tests.rs"]
+mod storage_layout;
 
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip::{common_runtime::tests::CommonPeer,

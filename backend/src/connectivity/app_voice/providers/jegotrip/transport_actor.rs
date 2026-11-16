@@ -508,7 +508,7 @@ impl Drop for RuntimeHandle { fn drop(&mut self) { self.scope.close(); } }
 /// same one later attached to the IO actor; cancellation cannot mint a new
 /// actor scope or leave a detached connection/login waiting in the background.
 pub struct PreparedRuntime {
-    owner: AttemptOwner, scope: RpcConnectionScope, backend: Option<OfflineBackend>, tls: Option<TlsEngine>,
+    owner: AttemptOwner, scope: RpcConnectionScope, backend: Option<Box<OfflineBackend>>, tls: Option<TlsEngine>,
     policy: Option<RuntimePolicy>, timing: Option<RouterTiming>, start: Instant, attached: bool,
 }
 impl fmt::Debug for PreparedRuntime {
@@ -542,7 +542,7 @@ impl PreparedRuntime {
 pub fn prepare(owner: AttemptOwner, route: PacketRoute<'_>, tls_parameters: TlsParameters<'_>,
     policy: RuntimePolicy, timing: Option<RouterTiming>) -> Result<PreparedRuntime, RuntimeError> {
     if !policy.valid() { return Err(RuntimeError::InvalidConfiguration); }
-    let start = Instant::now(); let mut backend = OfflineBackend::new(owner.clone()); let scope = backend.connection_scope();
+    let start = Instant::now(); let mut backend = Box::new(OfflineBackend::new(owner.clone())); let scope = backend.connection_scope();
     let tls = backend.take_tls_engine(route, tls_parameters, start)?;
     Ok(PreparedRuntime { owner, scope, backend: Some(backend), tls: Some(tls), policy: Some(policy), timing, start, attached: false })
 }
@@ -556,7 +556,9 @@ pub fn start<I>(io: I, owner: AttemptOwner, route: PacketRoute<'_>, tls_paramete
 }
 
 struct Actor<I> {
-    io: Option<I>, owner: AttemptOwner, scope: RpcConnectionScope, backend: OfflineBackend, tls: Option<TlsEngine>,
+    // Retain the original engine allocation across prepared/connected/actor
+    // handoff; boxing does not spawn an owner, reauthenticate or change IO.
+    io: Option<I>, owner: AttemptOwner, scope: RpcConnectionScope, backend: Box<OfflineBackend>, tls: Option<TlsEngine>,
     common: Option<super::common_runtime::CommonPath>, native_attempt_end:Option<Instant>,
     commands: mpsc::Receiver<Command>, events: mpsc::Sender<RuntimeEvent>, policy: RuntimePolicy,
     timing: Option<RouterTiming>, start: Instant, pending: std::collections::BTreeMap<i32, Instant>, logout_pending: Option<LogoutPending>, unhosting_pending: Option<UnhostingPending>,

@@ -189,7 +189,7 @@ async fn cancelled_initial_write_close_confirmed_after_actor_drops_original_io_a
 
 #[tokio::test]
 async fn cancelling_original_command_during_send_terminates_and_releases_actor_io() {
-    let cert = Certificates::generate("DNS:fixture.invalid"); let original = owner(); let mut backend = OfflineBackend::new(original.clone());
+    let cert = Certificates::generate("DNS:fixture.invalid"); let original = owner(); let mut backend = Box::new(OfflineBackend::new(original.clone()));
     let scope = backend.connection_scope(); let now = Instant::now();
     let mut tls = backend.take_tls_engine(PacketRoute::DirectTlsCarrier, parameters(&cert.root), now).unwrap();
     let wire = tls.take_wire_output(&original, &scope, None, now).unwrap();
@@ -478,7 +478,7 @@ async fn unregistration_and_logout_queue_rejection_do_not_arm_cancellation_guard
 
 fn unhosting_actor_fixture(root: &str, original: AttemptOwner, blocked: bool)
     -> (Actor<PollIo>, Vec<OwnedWireFrames>, Arc<Mutex<Vec<u8>>>, mpsc::Receiver<RuntimeEvent>) {
-    let mut backend = OfflineBackend::new(original.clone()); let scope = backend.connection_scope(); let now = Instant::now();
+    let mut backend = Box::new(OfflineBackend::new(original.clone())); let scope = backend.connection_scope(); let now = Instant::now();
     let mut tls = backend.take_tls_engine(PacketRoute::DirectTlsCarrier, parameters(root), now).unwrap();
     let wire = tls.take_wire_output(&original, &scope, None, now).unwrap();
     let (io, bytes, _, _, _) = poll_io(blocked);
@@ -554,7 +554,7 @@ async fn accepted_unregistration_with_same_delivery_event_backpressure_never_rep
 #[tokio::test]
 async fn accepted_unregistration_followed_by_same_delivery_io_failure_never_reports_success() {
     let cert = Certificates::generate("DNS:fixture.invalid"); let original = owner(); let now = Instant::now();
-    let mut backend = OfflineBackend::new(original.clone()); let scope = backend.connection_scope();
+    let mut backend = Box::new(OfflineBackend::new(original.clone())); let scope = backend.connection_scope();
     let mut tls = backend.take_tls_engine(PacketRoute::DirectTlsCarrier, parameters(&cert.root), now).unwrap();
     let mut peer = cert.server(&rustls::version::TLS13);
     super::super::tls_engine::tests::handshake(&mut tls, &original, &scope, &mut peer, now).unwrap();

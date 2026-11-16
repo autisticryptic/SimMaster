@@ -8,13 +8,13 @@ use super::super::{common_runtime::{CommonPath,CommonIoError},common_packets::Co
     startup_diagnostics::StartupTrace};
 
 pub(crate) struct PreparedCommonRuntime{
-    owner:AttemptOwner,scope:RpcConnectionScope,backend:Option<OfflineBackend>,policy:Option<RuntimePolicy>,
+    owner:AttemptOwner,scope:RpcConnectionScope,backend:Option<Box<OfflineBackend>>,policy:Option<RuntimePolicy>,
     startup_trace:Arc<StartupTrace>,start:Instant,attempt_end:Instant,transferred:bool,
 }
 impl fmt::Debug for PreparedCommonRuntime{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("PreparedCommonRuntime(<redacted>)")}}
 impl Drop for PreparedCommonRuntime{fn drop(&mut self){if !self.transferred{self.scope.close();}}}
 pub(crate) struct ConnectedCommonRuntime{
-    owner:AttemptOwner,scope:RpcConnectionScope,backend:Option<OfflineBackend>,common:Option<CommonPath>,policy:Option<RuntimePolicy>,
+    owner:AttemptOwner,scope:RpcConnectionScope,backend:Option<Box<OfflineBackend>>,common:Option<CommonPath>,policy:Option<RuntimePolicy>,
     start:Instant,attempt_end:Instant,attached:bool,
 }
 impl fmt::Debug for ConnectedCommonRuntime{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ConnectedCommonRuntime(<redacted>)")}}
@@ -23,7 +23,9 @@ impl Drop for ConnectedCommonRuntime{fn drop(&mut self){if !self.attached{self.s
 pub(crate) fn prepare_common(owner:AttemptOwner,policy:RuntimePolicy,attempt_end:Instant)->Result<PreparedCommonRuntime,RuntimeError>{
     let start=Instant::now();
     if !policy.valid()||attempt_end.checked_duration_since(start).is_none_or(|left|left.is_zero()||left>Duration::from_secs(120)){return Err(RuntimeError::InvalidConfiguration);}
-    let mut backend=OfflineBackend::new(owner.clone());backend.claim_common_transport().map_err(|_|RuntimeError::InvalidConfiguration)?;
+    // One original heap owner moves from pre-network preparation to attach.
+    // New receiver ledgers must not grow every inline Common startup carrier.
+    let mut backend=Box::new(OfflineBackend::new(owner.clone()));backend.claim_common_transport().map_err(|_|RuntimeError::InvalidConfiguration)?;
     let scope=backend.connection_scope();
     let startup_trace=Arc::new(StartupTrace::original(owner.clone(),scope.clone()));
     Ok(PreparedCommonRuntime{owner,scope,backend:Some(backend),policy:Some(policy),startup_trace,start,attempt_end,transferred:false})
