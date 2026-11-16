@@ -150,6 +150,7 @@ enum Operation {
     Swap(Vec<Property>, Option<Gateway>), CompleteBatch(ServerRequestTicket, bool), CompleteDirect(DirectReplyTicket, bool), CompleteCall(CallReplyTicket,bool,Vec<Property>),
     CompleteInvite(super::native_invite_notifications::InviteReplyTicket, bool),
     CompleteIm(Box<(super::im_delivery::ImReplyTicket,Option<super::im_inbox::CommittedIm>)>),
+    CompleteImStatus(Box<(super::im_status_delivery::ImStatusTicket,Option<super::im_inbox::CommittedImStatus>)>),
     ImRead(Box<ImReadWork>),
     ArmNativeReceivers(std::sync::Arc<super::native_receiver::NativeReceiverSetup>), ConfigureNativeReceivers(u32),
     GetOffline(i64, Vec<Property>), CompleteOfflineHint(super::rpc_offline::IncomingOfflineHint, bool),
@@ -167,7 +168,7 @@ impl Operation {
             Self::Swap(routing, gateway) => routing.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()
                 + gateway.as_ref().map_or(0, |g| g.uri.len() + g.prefix.len() + g.channel.len() + g.int_code.len() + g.number.len() + g.password.len()
                     + g.metadata.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()),
-            Self::ConfigureClientEx | Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) | Self::CompleteOfflineHint(_, _) | Self::CompleteInvite(_, _) | Self::CompleteIm(_) => 0,
+            Self::ConfigureClientEx | Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) | Self::CompleteOfflineHint(_, _) | Self::CompleteInvite(_, _) | Self::CompleteIm(_) | Self::CompleteImStatus(_) => 0,
             Self::ConfigureCalls(binding)=>binding.object.len()+binding.domain.len(),
             Self::ConfigureNativeReceivers(_) => 0,
             Self::ArmNativeReceivers(setup) => setup.retained_bytes(),
@@ -344,6 +345,10 @@ impl RuntimeCommands {
     pub(super) async fn complete_im(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,ticket:&super::im_delivery::ImReplyTicket,proof:Option<&super::im_inbox::CommittedIm>)->Result<RuntimeReceipt,RuntimeError>{
         if !self.accepts(owner,scope)||!ticket.matches(owner,scope)||proof.is_some_and(|proof|!proof.authorizes(ticket,Instant::now())){return Err(RuntimeError::Scope);}
         self.submit(owner,scope,Operation::CompleteIm(Box::new((ticket.captured_copy(),proof.map(|proof|proof.captured_copy()))))).await
+    }
+    pub(super) async fn complete_im_status(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,ticket:&super::im_status_delivery::ImStatusTicket,proof:Option<&super::im_inbox::CommittedImStatus>)->Result<RuntimeReceipt,RuntimeError>{
+        if !self.accepts(owner,scope)||!ticket.matches(owner,scope)||proof.is_some_and(|proof|!proof.authorizes(ticket,Instant::now())){return Err(RuntimeError::Scope);}
+        self.submit(owner,scope,Operation::CompleteImStatus(Box::new((ticket.captured_copy(),proof.map(|proof|proof.captured_copy()))))).await
     }
     pub(super) async fn read_im(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,query:Arc<ImQuery>,gate:Arc<ImReceiptGate>)->Result<OwnedImReply,RuntimeError>{
         if !self.accepts(owner,scope)||!gate.live(){return Err(RuntimeError::Scope);}
@@ -737,7 +742,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if self.unhosting_pending.is_some() && (matches!(&command.operation, Operation::CompleteInvite(_, true))||matches!(&command.operation,Operation::CompleteIm(data) if data.1.is_some())) {
             let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
         }
-        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_)) {
+        if self.unhosting_pending.is_some() && matches!(&command.operation,Operation::CompleteImStatus(data) if data.1.is_some()){
+            let _=command.completion.send(Err(RuntimeError::Closed));return Ok(());
+        }
+        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_) | Operation::CompleteImStatus(_)) {
             let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
         }
         if !matches!(&command.operation, Operation::ArmClientEx(_) | Operation::ArmNativeReceivers(_)) && self.common.is_none() && self.tls.as_ref().is_none_or(|tls|tls.phase()!=TlsPhase::Verified) {
@@ -752,6 +760,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if let Operation::CompleteIm(data)=&command.operation{if let Some(proof)=&data.1{
             if !proof.authorizes(&data.0,now){let _=command.completion.send(Err(RuntimeError::Scope));return Ok(());}
             im_gates.push(proof.gate());let end=data.0.completion_deadline();invite_deadline=Some(invite_deadline.map_or(end,|original|original.min(end)));
+        }}
+        if let Operation::CompleteImStatus(data)=&command.operation{if let Some(proof)=&data.1{
+            if !proof.authorizes(&data.0,now){let _=command.completion.send(Err(RuntimeError::Scope));return Ok(());}
+            im_gates.push(proof.gate());let end=data.0.deadline();invite_deadline=Some(invite_deadline.map_or(end,|original|original.min(end)));
         }}
         if matches!(&command.operation, Operation::Swap(_, _)) {
             let (gates,deadline)=self.backend.im_write_guard();im_gates.extend(gates);
@@ -772,7 +784,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _) | Operation::ImRead(_)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
-        let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_));
+        let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_) | Operation::CompleteImStatus(_));
         let is_logout = matches!(&command.operation, Operation::Logout(_));
         let mut unhosting_sequence = None;let mut call_wait=None;let mut im_wait=None;
         let elapsed_ms = self.elapsed_ms(now);
@@ -854,6 +866,15 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             }
             Operation::CompleteIm(data)=>{
                 match self.backend.complete_im(&data.0,data.1.as_ref()){
+                    Ok(Some(super::offline_backend::CallCompletion::Direct(packets)))=>Ok(packets),
+                    Ok(Some(super::offline_backend::CallCompletion::BatchQueued))=>{
+                        if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),None))).is_err(){return Err(RuntimeError::Cancelled);}return Ok(());
+                    }
+                    _=>{let _=command.completion.send(Err(RuntimeError::Protocol));return Ok(());}
+                }
+            }
+            Operation::CompleteImStatus(data)=>{
+                match self.backend.complete_im_status(&data.0,data.1.as_ref()){
                     Ok(Some(super::offline_backend::CallCompletion::Direct(packets)))=>Ok(packets),
                     Ok(Some(super::offline_backend::CallCompletion::BatchQueued))=>{
                         if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),None))).is_err(){return Err(RuntimeError::Cancelled);}return Ok(());

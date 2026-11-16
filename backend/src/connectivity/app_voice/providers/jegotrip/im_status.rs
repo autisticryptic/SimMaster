@@ -43,6 +43,9 @@ impl<'a>StatusEntry<'a>{
     fn capture(label:StatusLabel<'a>,properties:Vec<RpcProperty<'a>>)->Result<Self,CodecError>{
         let get=|key:&[u8]|properties.iter().find(|p|p.key==key).map(|p|p.value);
         let latest=index(get(LATEST))?;let peer_read=index(get(PEER_READ))?;let last_received=index(get(LAST_RECEIVED))?;let last_read=index(get(LAST_READ))?;
+        // The peer-read notification is a separate native status key; validate
+        // its signed index without treating it as LAST_READ or local receipt.
+        index(get(PEER_READ_NOTIFICATION))?;
         Ok(Self{label,latest,peer_read,last_received,last_read,properties})
     }
     /// Native5C92D0 seeds current from peer-read and target from latest, clipping
@@ -74,6 +77,10 @@ pub(super) fn encode_refresh(uid:&[u8],labels:&[StatusLabel<'_>],since:i64)->Res
 /// 5BD4CC requires Group.GroupId/Group.UpdateTime and one type0 property map.
 pub(super) struct StatusUpdate<'a>{pub(super) entry:StatusEntry<'a>,pub(super) update_time:i64}
 impl fmt::Debug for StatusUpdate<'_>{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ImStatusUpdate(<redacted>)")}}
+pub(super) fn decode_owned_status<'a>(label:&'a[u8],update_time:i64,body:&'a[u8])->Result<StatusUpdate<'a>,CodecError>{
+    if update_time< -1{return Err(CodecError::InvalidField);}let label=StatusLabel::parse(label)?;let mut r=Reader::new(body)?;let properties=r.properties()?;r.finish()?;
+    Ok(StatusUpdate{entry:StatusEntry::capture(label,properties)?,update_time})
+}
 pub(super) fn decode_status_update<'a>(kind:&[u8],header:&[RpcProperty<'a>],body:&'a[u8])->Result<Option<StatusUpdate<'a>>,CodecError>{
     if kind!=STATUS_KIND{return Ok(None);}
     if header.len()>MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}for(i,p)in header.iter().enumerate(){if header[..i].iter().any(|other|other.key==p.key){return Err(CodecError::DuplicateKey);}if p.key.len()>MAX_FIELD_BYTES||p.value.len()>MAX_FIELD_BYTES{return Err(CodecError::TooLarge);}}

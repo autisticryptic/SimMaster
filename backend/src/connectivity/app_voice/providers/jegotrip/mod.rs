@@ -44,6 +44,7 @@ pub(crate) mod native_invite_receipts;
 pub(crate) mod im_data;
 pub(crate) mod im_text;
 pub(crate) mod im_status;
+mod im_status_delivery;
 pub(crate) mod im_receive_state;
 pub(crate) mod rpc_im;
 mod im_read_interest;

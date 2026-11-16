@@ -22,6 +22,9 @@ pub(super) use associations::{retire_run_associations,delete_account};
 #[path="im_cursor.rs"]
 mod cursor;
 pub(super) use cursor::{CursorSession,GapPlan,GapCommitted,OnlinePosition};
+#[path="im_status_inbox.rs"]
+mod statuses;
+pub(super) use statuses::CommittedImStatus;
 
 pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
     conn.execute_batch("CREATE TABLE IF NOT EXISTS app_voice_im_messages(
@@ -39,7 +42,8 @@ pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
         CREATE INDEX IF NOT EXISTS idx_app_voice_im_messages_line ON app_voice_im_messages(line_id,id);")
         .map_err(|_|STORAGE)?;
     associations::initialize_schema(conn)?;
-    cursor::initialize_schema(conn)
+    cursor::initialize_schema(conn)?;
+    statuses::initialize_schema(conn)
 }
 
 pub(super) struct ImReceiptGate{live:AtomicBool,changed:tokio::sync::Notify}

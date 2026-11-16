@@ -43,6 +43,7 @@ impl ImBinding{
     pub(super) fn identity(&self)->&[u8;32]{&self.identity}
     pub(super) fn authenticates(&self,uid:&[u8],selector:&[u8])->bool{self.identity==digest(&[b"jegotrip-native-im-context-v1\0",uid,selector])}
     pub(super) fn receipt_epoch(&self)->&str{self.receipt_epoch.as_str()}
+    pub(super) fn deadline(&self,now:Instant)->Result<Instant,CodecError>{now.checked_add(self.config.timeout()?).ok_or(CodecError::InvalidField)}
     pub(super) fn policy(&self)->&Arc<NativeReceiverPolicy>{self.native.policy()}
 }
 

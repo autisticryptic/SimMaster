@@ -47,6 +47,7 @@ pub enum ProtocolEvent<'a> {
     IncomingCall(IncomingCallDelivery),
     InviteNotification(Box<super::native_invite_notifications::IncomingInviteNotification>),
     Im(Box<super::im_delivery::IncomingImDelivery>),
+    ImStatus(Box<super::im_status_delivery::IncomingImStatus>),
     OfflineHint(super::rpc_offline::IncomingOfflineHint),
     ClientEx { reply: OwnedCallPackets, notice: Option<super::rpc_client_ex::OwnedClientExNotice> },
     OutgoingReply(OwnedCallPackets),
@@ -90,7 +91,7 @@ impl fmt::Debug for IncomingProtocolMessage {
 
 #[derive(Clone,Copy)]
 enum DirectResponse{Message,OfflineHint,Call{kind:CallNoticeKind,native_id:NativeCallId},
-    Invite{notification_id:u64,fingerprint:[u8;32],deadline:Instant},Im{fingerprint:[u8;32],deadline:Instant}}
+    Invite{notification_id:u64,fingerprint:[u8;32],deadline:Instant},Im{fingerprint:[u8;32],deadline:Instant},ImStatus{fingerprint:[u8;32],deadline:Instant}}
 struct PendingDirect { magic: Vec<u8>, response:DirectResponse }
 
 /// Private protocol replay boundary, NOT a server ACK, channel or new owner.
@@ -418,6 +419,10 @@ impl ArcProtocol {
                 let incoming=self.capture_im(notice,request.call_id,magic)?;
                 deliver(ProtocolEvent::Im(Box::new(incoming)));return Ok(true);
             }
+            if let Some(notice)=super::im_status_delivery::direct(binding,owner,scope,&request)?{
+                let incoming=self.capture_im_status(notice,request.call_id,magic)?;
+                deliver(ProtocolEvent::ImStatus(Box::new(incoming)));return Ok(true);
+            }
         }
         let decoded = match self.incoming.as_ref().ok_or(CodecError::InvalidField)?.on_direct_request(owner, scope, &request) {
             Ok(value) => value, Err(error) => { self.close(); return Err(error.into()); }
@@ -457,6 +462,21 @@ impl ArcProtocol {
         Ok(Some(OwnedCallPackets{call_id:inner.call_id,packets}))
     }
 
+    fn capture_im_status(&mut self,notice:super::im_status_delivery::ImStatusNotice,id:i32,magic:&[u8])->Result<super::im_status_delivery::IncomingImStatus,ProtocolError>{
+        let ticket=DirectReplyTicket{owner:self.rpc.owner().clone(),connection:self.rpc.connection_scope(),call_id:id};
+        let incoming=super::im_status_delivery::IncomingImStatus::direct(notice,ticket)?;
+        self.direct_last_id=id;self.direct_pending.insert(id,PendingDirect{magic:magic.to_vec(),response:DirectResponse::ImStatus{fingerprint:*incoming.ticket().fingerprint(),deadline:incoming.ticket().deadline()}});Ok(incoming)
+    }
+    pub(super) fn complete_im_status(&mut self,ticket:&super::im_status_delivery::ImStatusTicket,proof:Option<&super::im_inbox::CommittedImStatus>)->Result<Option<OwnedCallPackets>,ProtocolError>{
+        let scope=self.rpc.connection_scope();if self.phase()!=ArcPhase::Authenticated||!ticket.matches(self.rpc.owner(),&scope){return Ok(None);}
+        let super::im_delivery::ImReplySource::Direct(inner)=ticket.source()else{return Err(CodecError::InvalidField.into());};
+        let Some(pending)=self.direct_pending.get(&inner.call_id)else{return Ok(None);};
+        let DirectResponse::ImStatus{fingerprint,deadline}=pending.response else{return Err(CodecError::InvalidField.into());};
+        if &fingerprint!=ticket.fingerprint()||deadline!=ticket.deadline()||proof.is_some_and(|p|!p.authorizes(ticket,Instant::now())){return Err(CodecError::InvalidField.into());}
+        let result=encode_online_message_result(proof.is_some())?;let reply=encode_reply(inner.call_id,0,result.expose_to_transport())?;
+        let packets=encode_call_packets(CallKind::Reply,reply.expose_to_transport(),TLS_FRAGMENT_THRESHOLD)?;
+        let pending=self.direct_pending.remove(&inner.call_id).ok_or(CodecError::InvalidField)?;self.record_direct(inner.call_id,pending.magic);Ok(Some(OwnedCallPackets{call_id:inner.call_id,packets}))
+    }
     fn record_direct(&mut self, id: i32, magic: Vec<u8>) {
         self.direct_seen.record(id, magic);
     }

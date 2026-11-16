@@ -3,6 +3,9 @@
 use super::*;
 use super::super::{im_delivery::IncomingImDelivery,im_inbox::{ImInboxScope,CommittedIm,AssociationAdmission,ImPendingAssociation}};
 use std::collections::BTreeMap;
+#[path="account_im_status.rs"]
+mod statuses;
+pub(super) use statuses::delivery as status_delivery;
 const MAX_GROUPS:usize=64;
 const MAX_HOLDERS:usize=256;
 const MAX_BYTES:usize=1024*1024;
@@ -10,9 +13,9 @@ const MAX_EARLY:usize=16;
 const INVALID:&str="app_account_im_scope_invalid";
 const FULL:&str="app_account_im_backpressure";
 struct Group{fingerprint:[u8;32],key:[u8;32],deadline:Instant,context:ImInboxScope,pending:Option<ImPendingAssociation>,holders:VecDeque<Box<IncomingImDelivery>>,outcome:Option<Option<CommittedIm>>}
-pub(super) struct State{early:VecDeque<Box<IncomingImDelivery>>,early_bytes:usize,ordered:VecDeque<Box<IncomingImDelivery>>,groups:BTreeMap<u64,Group>,holders:usize,bytes:usize}
-impl Default for State{fn default()->Self{Self{early:VecDeque::new(),early_bytes:0,ordered:VecDeque::new(),groups:BTreeMap::new(),holders:0,bytes:0}}}
-impl State{pub(super) fn clear(&mut self){self.early.clear();self.early_bytes=0;self.ordered.clear();self.groups.clear();self.holders=0;self.bytes=0;}}
+pub(super) struct State{early:VecDeque<Box<IncomingImDelivery>>,early_status:VecDeque<Box<super::super::im_status_delivery::IncomingImStatus>>,early_bytes:usize,ordered:VecDeque<Box<IncomingImDelivery>>,groups:BTreeMap<u64,Group>,holders:usize,bytes:usize}
+impl Default for State{fn default()->Self{Self{early:VecDeque::new(),early_status:VecDeque::new(),early_bytes:0,ordered:VecDeque::new(),groups:BTreeMap::new(),holders:0,bytes:0}}}
+impl State{pub(super) fn clear(&mut self){self.early.clear();self.early_status.clear();self.early_bytes=0;self.ordered.clear();self.groups.clear();self.holders=0;self.bytes=0;}}
 fn context(run:&ManagedRun,delivery:&IncomingImDelivery)->Result<ImInboxScope,&'static str>{
     if !run.accepting.load(Ordering::SeqCst)||!run.im_gate.live()||!run.backend.im_messages_enabled(){return Err(INVALID);}
     run.configuration_current()?;
@@ -109,7 +112,7 @@ pub(super) async fn delivery(run:&ManagedRun,phase:Phase,state:&mut State,delive
     if !run.accepting.load(Ordering::SeqCst)||!run.backend.im_messages_enabled(){return Err(INVALID);}
     if phase==Phase::HostingPending{
         let bytes=state.early_bytes.checked_add(delivery.bytes()).ok_or(FULL)?;
-        if state.early.len()>=MAX_EARLY||bytes>MAX_BYTES{return Err(FULL);}
+        if state.early.len()+state.early_status.len()>=MAX_EARLY||bytes>MAX_BYTES{return Err(FULL);}
         state.early.push_back(delivery);state.early_bytes=bytes;return Ok(());
     }
     if phase!=Phase::Hosted{return complete(run,&delivery,None,delivery.ticket().deadline()).await;}
@@ -121,6 +124,7 @@ pub(super) async fn drive(run:&ManagedRun,phase:Phase,state:&mut State)->Result<
     while let Some(delivery)=state.early.pop_front(){
         let bytes=delivery.bytes();consume(run,state,delivery).await?;state.early_bytes=state.early_bytes.checked_sub(bytes).ok_or(INVALID)?;
     }
+    statuses::drive(run,state).await?;
     drain(run,state).await
 }
 /// Read records settle only matching already-admitted original notifications.

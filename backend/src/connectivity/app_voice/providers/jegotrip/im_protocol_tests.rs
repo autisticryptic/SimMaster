@@ -10,6 +10,8 @@ mod associations;
 mod rpc_reads;
 #[path="im_cursor_tests.rs"]
 mod cursors;
+#[path="im_status_protocol_tests.rs"]
+mod status_consumer;
 struct Fixture{owner:AttemptOwner,scope:RpcConnectionScope,backend:OfflineBackend,temp:TempDatabase,run:Arc<account_runs::RunToken>,gate:Arc<ImReceiptGate>}
 impl Fixture{
     fn new(enabled:bool)->Self{

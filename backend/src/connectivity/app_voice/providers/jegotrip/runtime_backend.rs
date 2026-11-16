@@ -465,6 +465,7 @@ pub enum BackendEventPayload {
     Call(IncomingCallDelivery),
     InviteNotification(Box<super::native_invite_notifications::IncomingInviteNotification>),
     Im(Box<super::im_delivery::IncomingImDelivery>),
+    ImStatus(Box<super::im_status_delivery::IncomingImStatus>),
     Terminal(BackendFailure),
 }
 impl BackendEvent {
@@ -668,6 +669,11 @@ impl NativeHostingBackend {
         let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;
         {let state=lock(&attempt.state);if !state.configured||state.retired||state.logout_started||state.unregister_started||!self.im_messages_enabled(){return Err(RuntimeError::Closed);}}
         attempt.commands(owner,scope)?.complete_im(owner,scope,ticket,proof).await
+    }
+    pub(super) async fn complete_im_status(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,ticket:&super::im_status_delivery::ImStatusTicket,proof:Option<&super::im_inbox::CommittedImStatus>)->Result<RuntimeReceipt,RuntimeError>{
+        let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;
+        {let state=lock(&attempt.state);if !state.configured||state.retired||state.logout_started||state.unregister_started||!self.im_messages_enabled(){return Err(RuntimeError::Closed);}}
+        attempt.commands(owner,scope)?.complete_im_status(owner,scope,ticket,proof).await
     }
     pub(super) fn invite_notifications_enabled(&self) -> bool {
         self.profile.client_ex && self.profile.native_call_control
@@ -1278,6 +1284,12 @@ async fn event_pump(attempt: Arc<Attempt>, profile: Arc<RuntimeProfile>, sender:
                                 terminal(&sender,&attempt,BackendFailure::Disconnected);return;
                             }
                             BackendEventPayload::Im(delivery)
+                        }
+                        OfflineEvent::ImStatus(delivery)=>{
+                            if !delivery.matches(&attempt.owner,&attempt.scope)||!profile.client_ex||profile.native_receivers.as_ref().is_none_or(|policy|policy.im_messages().is_none()){
+                                terminal(&sender,&attempt,BackendFailure::Disconnected);return;
+                            }
+                            BackendEventPayload::ImStatus(delivery)
                         }
                         OfflineEvent::InviteNotification(invite) => {
                             if !invite.matches(&attempt.owner, &attempt.scope) || !profile.native_call_control

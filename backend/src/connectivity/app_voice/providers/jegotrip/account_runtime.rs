@@ -954,6 +954,10 @@ async fn consume_events(run: std::sync::Weak<ManagedRun>, mut events: mpsc::Rece
                         if let Err(code)=im::delivery(&run,controller.phase(),&mut im,delivery).await{*lock(&run.error)=Some(code);run.retire();}
                         if let Err(code)=im_sync.drive(&run,&controller,&mut im).await{*lock(&run.error)=Some(code);run.retire();}
                     }
+                    BackendEventPayload::ImStatus(delivery)=>{
+                        controller.tick(unix_now(),Instant::now());
+                        if let Err(code)=im::status_delivery(&run,controller.phase(),&mut im,delivery).await{*lock(&run.error)=Some(code);run.retire();}
+                    }
                     BackendEventPayload::InviteNotification(invite) => {
                         controller.tick(unix_now(), Instant::now());
                         let ticket = invite.ticket().captured_copy();
