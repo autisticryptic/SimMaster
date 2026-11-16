@@ -116,5 +116,6 @@ pub(in super::super) fn delete_account(conn:&Connection,line:&str)->Result<(),&'
     super::cursor::delete_account(conn,line)?;
     super::statuses::delete_account(conn,line)?;
     super::receipts::delete_account(conn,line)?;
+    super::user_reads::delete_account(conn,line)?;
     Ok(())
 }

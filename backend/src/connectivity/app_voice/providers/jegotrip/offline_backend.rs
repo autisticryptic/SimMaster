@@ -162,6 +162,14 @@ impl OfflineBackend {
     }
     pub(super) fn take_received_replies(&mut self)->Vec<super::rpc_im_received::OwnedReceivedReply>{self.protocol.take_received_replies()}
     pub(super) fn retire_received_write(&mut self,id:i32){self.protocol.retire_received_write(id);}
+    pub(super) fn captured_im_binding(&self)->Option<std::sync::Arc<super::im_delivery::ImBinding>>{
+        if self.phase()!=ArcPhase::Authenticated{return None;}self.im_binding.clone()
+    }
+    pub(super) fn prepare_user_read_write(&mut self,permit:std::sync::Arc<super::im_inbox::UserReadPermit>,deadline:std::time::Instant)->Result<OwnedCallPackets,ProtocolError>{
+        if self.im_binding.is_none()||self.scheduler.is_none()||self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField.into());}self.protocol.prepare_user_read_write(permit,deadline)
+    }
+    pub(super) fn take_user_read_replies(&mut self)->Vec<super::im_user_read_rpc::OwnedUserReadReply>{self.protocol.take_user_read_replies()}
+    pub(super) fn retire_user_read_write(&mut self,id:i32){self.protocol.retire_user_read_write(id);}
 
     pub(super) fn prepare_offline(&mut self, position: i64, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
         if self.dispatcher.is_none() || self.scheduler.is_none() { return Err(CodecError::InvalidField.into()); }

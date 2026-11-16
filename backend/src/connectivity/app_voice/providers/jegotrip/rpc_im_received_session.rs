@@ -6,7 +6,7 @@ impl ArcRpcSession{
     pub(in super::super) fn prepare_received_write(&mut self,binding:Arc<super::super::im_delivery::ImBinding>,permit:Arc<ReceivedWritePermit>,deadline:std::time::Instant)->Result<(i32,RpcBytes),CodecError>{
         if !self.native_receiver_scope()||!binding.matches(&self.owner,&self.connection)||!permit.matches(&self.owner,&self.connection)
             ||!Arc::ptr_eq(&binding,permit.binding())||std::time::Instant::now()>=deadline{return Err(CodecError::InvalidField);}
-        if self.pending.len()>=MAX_MAP_ENTRIES||self.im_replies.len()+self.received_replies.len()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
+        if self.pending.len()>=MAX_MAP_ENTRIES||self.im_reply_count()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
         let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
         if !binding.authenticates(&auth.user_id,&auth.selected_session_id){return Err(CodecError::InvalidField);}
         let query=permit.query();if query.operation()!=super::super::rpc_im::ImOperation::SetReceived{return Err(CodecError::InvalidField);}
@@ -17,7 +17,7 @@ impl ArcRpcSession{
         // following local scope check fails. IDs are never reused for a retry.
         self.next_id=id.checked_add(1);
         let received=ReceivedRpcRequest::original(permit,id)?;
-        self.pending.insert(id,PendingRpc{kind:PendingKind::ImWrite,selected_session_id:None,scheduler:None,call:None,im:None,received:Some(received)});Ok((id,bytes))
+        self.pending.insert(id,PendingRpc{kind:PendingKind::ImWrite,selected_session_id:None,scheduler:None,call:None,im:None,received:Some(received),user_read:None});Ok((id,bytes))
     }
     pub(in super::super) fn take_received_replies(&mut self)->Vec<OwnedReceivedReply>{std::mem::take(&mut self.received_replies)}
     pub(in super::super) fn retire_received_write(&mut self,id:i32){
@@ -28,8 +28,8 @@ impl ArcRpcSession{
         // NOT use the readonly late-interest Ok(None)/healthy SDK rule.
         if self.phase()!=ArcPhase::Authenticated||!request.matches(owner,scope){self.close();return Err(CodecError::InvalidField);}
         let reply=match OwnedReceivedReply::original(request,code,bytes){Ok(r)=>r,Err(e)=>{self.close();return Err(e);}};
-        let retained=self.im_replies.iter().map(|r|r.retained_bytes()).chain(self.received_replies.iter().map(|r|r.retained_bytes())).sum::<usize>();
-        if self.im_replies.len()+self.received_replies.len()>=MAX_MAP_ENTRIES||retained.checked_add(reply.retained_bytes()).is_none_or(|n|n>super::super::rpc_stream::MAX_STREAM_BYTES){self.close();return Err(CodecError::TooLarge);}
+        let retained=self.im_reply_bytes();
+        if self.im_reply_count()>=MAX_MAP_ENTRIES||retained.checked_add(reply.retained_bytes()).is_none_or(|n|n>super::super::rpc_stream::MAX_STREAM_BYTES){self.close();return Err(CodecError::TooLarge);}
         self.received_replies.push(reply);Ok(())
     }
 }

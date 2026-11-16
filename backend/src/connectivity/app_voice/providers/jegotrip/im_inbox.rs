@@ -28,6 +28,9 @@ pub(super) use statuses::CommittedImStatus;
 #[path="im_received_journal.rs"]
 mod receipts;
 pub(super) use receipts::{ReceivedWritePermit,ReceivedWait,ReceivedAdmission,ReceivedReceiptView,begin_received,metadata as received_receipts};
+#[path="im_user_read_journal.rs"]
+mod user_reads;
+pub(super) use user_reads::{UserReadAction,UserReadWait,UserReadPermit,UserReadPermitWait,UserReadView,BoundUserRead,metadata as user_read_history};
 
 pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
     conn.execute_batch("CREATE TABLE IF NOT EXISTS app_voice_im_messages(
@@ -47,7 +50,8 @@ pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
     associations::initialize_schema(conn)?;
     cursor::initialize_schema(conn)?;
     statuses::initialize_schema(conn)?;
-    receipts::initialize_schema(conn)
+    receipts::initialize_schema(conn)?;
+    user_reads::initialize_schema(conn)
 }
 
 pub(super) struct ImReceiptGate{live:AtomicBool,changed:tokio::sync::Notify}

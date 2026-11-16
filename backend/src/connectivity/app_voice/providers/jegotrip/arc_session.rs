@@ -53,13 +53,14 @@ impl Drop for ArcAuthentication {
 }
 
 #[derive(Clone, Copy)]
-enum PendingKind { Bootstrap, Login, Swap, Logout, Call, ImRead, ImWrite, Offline { position: i64 } }
+enum PendingKind { Bootstrap, Login, Swap, Logout, Call, ImRead, ImWrite, UserRead, Offline { position: i64 } }
 struct PendingCall{ticket:CallControlTicket,operation:CallOperation}
 
 struct PendingRpc {
     kind: PendingKind, selected_session_id: Option<Vec<u8>>, scheduler: Option<Arc<()>>,call:Option<PendingCall>,
     im:Option<Arc<super::rpc_im::ImRequest>>,
     received:Option<Arc<super::rpc_im_received::ReceivedRpcRequest>>,
+    user_read:Option<Arc<super::im_user_read_rpc::UserReadRpcRequest>>,
 }
 impl Drop for PendingRpc {
     fn drop(&mut self) { if let Some(selector) = &mut self.selected_session_id { selector.zeroize(); } }
@@ -82,6 +83,7 @@ pub struct ArcRpcSession {
     alive:Arc<super::alive_session::AliveLink>,
     im_replies:Vec<super::rpc_im::OwnedImReply>,
     received_replies:Vec<super::rpc_im_received::OwnedReceivedReply>,
+    user_read_replies:Vec<super::im_user_read_rpc::OwnedUserReadReply>,
 }
 
 impl fmt::Debug for ArcRpcSession {
@@ -190,7 +192,7 @@ impl ArcRpcSession {
         let alive=super::alive_session::AliveLink::original(owner.clone(),connection.clone());
         Self { owner, connection, phase: ArcPhase::Initial,
             next_id: Some(1), pending: BTreeMap::new(), authentication: None, hosting_tracker_taken: false,
-            batch_scheduler_taken: false, packet_transport_taken: false,common_transport_claimed:false,common_identity:None,main_account:None,call_book,alive,im_replies:Vec::new(),received_replies:Vec::new() }
+            batch_scheduler_taken: false, packet_transport_taken: false,common_transport_claimed:false,common_identity:None,main_account:None,call_book,alive,im_replies:Vec::new(),received_replies:Vec::new(),user_read_replies:Vec::new() }
     }
 
     pub fn connection_scope(&self) -> RpcConnectionScope { self.connection.clone() }
@@ -302,7 +304,7 @@ impl ArcRpcSession {
     pub(super) fn prepare_im_read(&mut self,binding:Arc<super::im_delivery::ImBinding>,query:Arc<super::rpc_im::ImQuery>,gate:Arc<super::im_inbox::ImReceiptGate>,deadline:std::time::Instant)->Result<(i32,RpcBytes),CodecError>{
         if !self.native_receiver_scope()||!binding.matches(&self.owner,&self.connection)||!gate.live()||std::time::Instant::now()>=deadline
             ||query.operation()==super::rpc_im::ImOperation::SetReceived{return Err(CodecError::InvalidField);}
-        if self.pending.len()>=MAX_MAP_ENTRIES||self.im_replies.len()+self.received_replies.len()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
+        if self.pending.len()>=MAX_MAP_ENTRIES||self.im_reply_count()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
         let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
         if !binding.authenticates(&auth.user_id,&auth.selected_session_id){return Err(CodecError::InvalidField);}
         let arguments=query.arguments(&auth.user_id)?;let id=self.next_id.ok_or(CodecError::InvalidCallId)?;
@@ -311,7 +313,7 @@ impl ArcRpcSession {
         // installs exactly that field as id. #Group is not AccountEntry and is
         // never an endpoint/facet fallback. The token is this matched login.
         let bytes=encode_request(id,&[RpcProperty{key:b"id",value:super::rpc_im::GROUP_OBJECT},RpcProperty{key:b"token",value:&auth.token}],query.method().as_bytes(),arguments.expose_to_transport())?;
-        self.next_id=id.checked_add(1);self.pending.insert(id,PendingRpc{kind:PendingKind::ImRead,selected_session_id:None,scheduler:None,call:None,im:Some(request),received:None});Ok((id,bytes))
+        self.next_id=id.checked_add(1);self.pending.insert(id,PendingRpc{kind:PendingKind::ImRead,selected_session_id:None,scheduler:None,call:None,im:Some(request),received:None,user_read:None});Ok((id,bytes))
     }
     pub(super) fn take_im_replies(&mut self)->Vec<super::rpc_im::OwnedImReply>{std::mem::take(&mut self.im_replies)}
     pub(super) fn retire_im_read(&mut self,id:i32){
@@ -347,7 +349,7 @@ impl ArcRpcSession {
             metadata.push(RpcProperty{key:b"token",value:&auth.token});encode_request(id,&metadata,operation.method().as_bytes(),arguments.expose_to_transport())?
         };
         self.next_id=id.checked_add(1);
-        self.pending.insert(id,PendingRpc{kind:PendingKind::Call,selected_session_id:None,scheduler:None,call:Some(PendingCall{ticket:ticket.captured_copy(),operation}),im:None,received:None});
+        self.pending.insert(id,PendingRpc{kind:PendingKind::Call,selected_session_id:None,scheduler:None,call:Some(PendingCall{ticket:ticket.captured_copy(),operation}),im:None,received:None,user_read:None});
         if let Err(error)=self.call_book.submitted(ticket,operation){self.pending.remove(&id);return Err(error);}
         Ok((id,bytes))
     }
@@ -383,7 +385,7 @@ impl ArcRpcSession {
         reject_auth_keys(routing)?;
         let arguments = encode_get_app_configs(application_key)?;
         self.allocate(routing, GET_APP_CONFIGS_METHOD.as_bytes(), arguments.expose_to_transport(),
-            PendingRpc { kind: PendingKind::Bootstrap, selected_session_id: None, scheduler: None,call:None,im:None,received:None })
+            PendingRpc { kind: PendingKind::Bootstrap, selected_session_id: None, scheduler: None,call:None,im:None,received:None,user_read:None })
     }
 
     /// The imported phone token is per-call metadata `pwd`, not a method string
@@ -423,7 +425,7 @@ impl ArcRpcSession {
         metadata.push(RpcProperty { key: b"pwd", value: inputs.phone_login_token });
         let selected_session_id = inputs.selected_session_id.to_vec();
         let prepared = self.allocate(&metadata, LOGIN_SESSION_METHOD.as_bytes(), arguments.expose_to_transport(),
-            PendingRpc { kind: PendingKind::Login, selected_session_id: Some(selected_session_id), scheduler: None,call:None,im:None,received:None })?;
+            PendingRpc { kind: PendingKind::Login, selected_session_id: Some(selected_session_id), scheduler: None,call:None,im:None,received:None,user_read:None })?;
         self.phase = ArcPhase::LoginPending;
         Ok(prepared)
     }
@@ -440,8 +442,8 @@ impl ArcRpcSession {
         let bytes = encode_request(self.next_id.ok_or(CodecError::InvalidCallId)?, &metadata, LOGOUT_SESSION_METHOD.as_bytes(), arguments.expose_to_transport())?;
         let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
         self.next_id = id.checked_add(1); self.pending.clear();self.call_book.close();self.alive.close();
-        self.pending.insert(id, PendingRpc { kind: PendingKind::Logout, selected_session_id: None, scheduler: None,call:None,im:None,received:None });
-        self.im_replies.clear();self.received_replies.clear();
+        self.pending.insert(id, PendingRpc { kind: PendingKind::Logout, selected_session_id: None, scheduler: None,call:None,im:None,received:None,user_read:None });
+        self.im_replies.clear();self.received_replies.clear();self.user_read_replies.clear();
         self.phase = ArcPhase::LogoutPending; Ok((id, bytes))
     }
 
@@ -474,7 +476,7 @@ impl ArcRpcSession {
         if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
         let bytes = encode_request(id, &metadata, SWAP_CALLS_METHOD.as_bytes(), arguments.expose_to_transport())?;
         self.next_id = id.checked_add(1);
-        self.pending.insert(id, PendingRpc { kind: PendingKind::Swap, selected_session_id: None, scheduler,call:None,im:None,received:None });
+        self.pending.insert(id, PendingRpc { kind: PendingKind::Swap, selected_session_id: None, scheduler,call:None,im:None,received:None,user_read:None });
         Ok((id, bytes))
     }
 
@@ -493,7 +495,7 @@ impl ArcRpcSession {
         metadata.push(RpcProperty { key: b"token", value: &auth.token });
         let bytes = encode_request(id, &metadata, super::rpc_offline::GET_OFFLINE_METHOD.as_bytes(), arguments.expose_to_transport())?;
         self.next_id = id.checked_add(1);
-        self.pending.insert(id, PendingRpc { kind: PendingKind::Offline { position }, selected_session_id: None, scheduler: None, call: None, im:None,received:None });
+        self.pending.insert(id, PendingRpc { kind: PendingKind::Offline { position }, selected_session_id: None, scheduler: None, call: None, im:None,received:None,user_read:None });
         Ok((id, bytes))
     }
 
@@ -511,7 +513,7 @@ impl ArcRpcSession {
         self.authentication = None;
         if let Some(identity)=&mut self.common_identity{identity.zeroize();}self.common_identity=None;
         if let Some(account)=&mut self.main_account{account.zeroize();}self.main_account=None;
-        self.pending.clear();self.im_replies.clear();self.received_replies.clear();self.call_book.close();self.alive.close();
+        self.pending.clear();self.im_replies.clear();self.received_replies.clear();self.user_read_replies.clear();self.call_book.close();self.alive.close();
     }
 
     pub fn accepts_scope(&self, owner: &AttemptOwner, connection: &RpcConnectionScope) -> bool {
@@ -545,13 +547,17 @@ impl ArcRpcSession {
                 // escapes; write operations do not use this branch.
                 if self.phase()!=ArcPhase::Authenticated||!request.matches(owner,connection){return Ok(None);}
                 let result=match super::rpc_im::OwnedImReply::original(request,reply.result_code,reply.result_stream){Ok(result)=>result,Err(error)=>{self.close();return Err(error);}};
-                let retained=self.im_replies.iter().map(|r|r.retained_bytes()).chain(self.received_replies.iter().map(|r|r.retained_bytes())).sum::<usize>();
-                if self.im_replies.len()+self.received_replies.len()>=MAX_MAP_ENTRIES||retained.checked_add(result.retained_bytes()).is_none_or(|n|n>super::rpc_stream::MAX_STREAM_BYTES){self.close();return Err(CodecError::TooLarge);}
+                let retained=self.im_reply_bytes();
+                if self.im_reply_count()>=MAX_MAP_ENTRIES||retained.checked_add(result.retained_bytes()).is_none_or(|n|n>super::rpc_stream::MAX_STREAM_BYTES){self.close();return Err(CodecError::TooLarge);}
                 self.im_replies.push(result);return Ok(None);
             },
             PendingKind::ImWrite=>{
                 let Some(request)=pending.received.take()else{self.close();return Err(CodecError::InvalidField);};
                 self.captured_received_reply(request,owner,connection,reply.result_code,reply.result_stream)?;return Ok(None);
+            },
+            PendingKind::UserRead=>{
+                let Some(request)=pending.user_read.take()else{self.close();return Err(CodecError::InvalidField);};
+                self.captured_user_read_reply(request,owner,connection,reply.result_code,reply.result_stream)?;return Ok(None);
             },
             PendingKind::Offline { position } => {
                 if self.phase() != ArcPhase::Authenticated || reply.result_code != 0 { self.close(); return Err(CodecError::RemoteFailure); }
@@ -653,6 +659,8 @@ mod offline_tests;
 
 #[path="rpc_im_received_session.rs"]
 mod received;
+#[path="rpc_user_read_session.rs"]
+mod user_read;
 #[cfg(test)]
 #[path = "arc_session_tests.rs"]
 mod tests;

@@ -90,7 +90,7 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
                 {account.last_error && <Typography variant="caption" display="block" color="warning.main">{appLoginError(account.last_error)}</Typography>}
                 <AppCallNotificationsPane lineId={account.line_id} />
                 <AppInviteNotificationsPane lineId={account.line_id} enabled={account.incoming_call_ready} />
-                <AppImMessagesPane lineId={account.line_id} />
+                <AppImMessagesPane lineId={account.line_id} userRead={{ revision: account.revision, installed: account.im_user_read_supported === true, hosted: account.phase === 'hosted' }} />
                 <AppImReceiptsPane lineId={account.line_id} />
               </Box>
               <Chip size="small" color={account.incoming_message_ready ? 'success' : 'default'} label={account.incoming_message_ready ? '短信就绪' : '短信未就绪'} />

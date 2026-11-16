@@ -38,6 +38,9 @@ pub struct OutboundMessageRequest { expected_revision: u64, target: String, body
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InboxQuery { #[serde(default = "default_inbox_limit")] limit: usize }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImUserReadRequest{expected_revision:u64,nonce:String,consent:bool}
 fn default_inbox_limit() -> usize { 50 }
 
 /// Merged into main's protected routes BEFORE its existing auth middleware.
@@ -66,6 +69,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/call-notifications", get(get_call_notifications))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages", get(get_im_messages))
         .route("/api/non-3gpp/accounts/{line_id}/im-receipts", get(get_im_receipts))
+        .route("/api/non-3gpp/accounts/{line_id}/im-user-reads",get(get_im_user_reads))
+        .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}/mark-read",post(mark_im_user_read))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}", delete(delete_im_message))
         .route("/api/non-3gpp/accounts/{line_id}/calls", get(get_calls))
         .route("/api/non-3gpp/accounts/{line_id}/calls/{call_id}", get(get_call))
@@ -101,6 +106,12 @@ fn error_status(code: &str) -> StatusCode {
             | "app_account_operation_timeout" | "app_account_shutting_down" | "app_account_cleanup_unconfirmed"
             | "app_account_call_runtime_unavailable" | "app_account_call_cleanup_unconfirmed"
             | "app_account_call_trunk_delivery_unconfirmed" => StatusCode::SERVICE_UNAVAILABLE,
+        "app_account_im_user_read_nonce_conflict" | "app_account_im_user_read_uncertain" | "app_account_im_user_read_target_unconfirmed" | "app_account_im_user_read_message_conflict" => StatusCode::CONFLICT,
+        "app_account_im_user_read_consent_required" | "app_account_im_user_read_not_installed" => StatusCode::FORBIDDEN,
+        "app_account_im_user_read_message_missing" => StatusCode::NOT_FOUND,
+        "app_account_im_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
+        "app_account_im_user_read_full" => StatusCode::TOO_MANY_REQUESTS,
+        "app_account_im_user_read_operation_timeout" | "app_account_im_scope_invalid" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
     }
 }
@@ -242,6 +253,14 @@ pub async fn get_im_receipts(State(manager):State<Arc<AccountManager>>,Path(line
     let Ok(Query(request))=request else{return failure("app_account_request_invalid");};
     if !(1..=128).contains(&request.limit){return failure("app_account_request_invalid");}
     success(StatusCode::OK,manager.im_received_receipts(&line_id,request.limit))
+}
+pub async fn get_im_user_reads(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Query<InboxQuery>,QueryRejection>)->Response{
+    let Ok(Query(request))=request else{return failure("app_account_request_invalid");};if !(1..=128).contains(&request.limit){return failure("app_account_request_invalid");}success(StatusCode::OK,manager.im_user_read_history(&line_id,request.limit))
+}
+pub async fn mark_im_user_read(State(manager):State<Arc<AccountManager>>,Path((line_id,message_id)):Path<(String,String)>,request:Result<Json<ImUserReadRequest>,JsonRejection>)->Response{
+    let Ok(Json(request))=request else{return failure("app_account_request_invalid");};let Ok(id)=message_id.parse::<i64>()else{return failure("app_account_request_invalid");};
+    if id<=0||id.to_string()!=message_id||request.nonce.len()!=32||!request.nonce.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)){return failure("app_account_request_invalid");}
+    success(StatusCode::OK,manager.mark_im_user_read(&line_id,request.expected_revision,id,&request.nonce,request.consent).await)
 }
 pub async fn delete_im_message(State(manager):State<Arc<AccountManager>>,Path((line_id,message_id)):Path<(String,String)>)->Response{
     let Ok(id)=message_id.parse::<i64>()else{return failure("app_account_request_invalid");};

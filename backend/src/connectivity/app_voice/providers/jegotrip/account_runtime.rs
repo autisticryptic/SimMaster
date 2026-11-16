@@ -75,6 +75,9 @@ pub struct AccountView {
     /// No raw TLS/Router error, endpoint, certificate or credential is exposed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_failure:Option<super::startup_diagnostics::StartupFailure>,
+    /// Installed runtime operation only, not a user-read or SDK authorization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub im_user_read_supported:Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<&'static str>,
 }
@@ -84,7 +87,7 @@ fn view(metadata: AccountMetadata, phase: Phase, cleanup: bool, error: Option<&'
         // A hosted SDK acknowledgement is not verified SMS/call/media support.
         incoming_call_ready: false, incoming_message_ready: false, outbound_authorized: false,
         provider_availability: "unsupported", manual_start_required: true, cleanup_on_disconnect: None, cleanup_error: None,
-        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, account_alive_state:None, startup_failure:None, last_error: error }
+        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, account_alive_state:None, startup_failure:None, im_user_read_supported:None, last_error: error }
 }
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
@@ -170,6 +173,8 @@ struct ManagedRun {
     im_gate: Arc<super::im_inbox::ImReceiptGate>,
     #[cfg(test)]
     im_original_queue_admissions:std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    user_read_action:Mutex<std::sync::Weak<super::im_inbox::UserReadAction>>,
     accepting: AtomicBool,
     stopping: AtomicBool,
     error: Mutex<Option<&'static str>>,
@@ -334,6 +339,11 @@ impl AccountManager {
         let slot=self.slot(line_id)?;let run=lock(&slot.run).clone().ok_or("app_account_not_running")?;
         Ok(run.im_original_queue_admissions.load(Ordering::SeqCst))
     }
+    #[cfg(test)]
+    pub(crate) fn user_read_target_was_submitted(&self,line:&str)->bool{
+        let Some(slot)=lock(&self.slots).get(line).cloned()else{return false;};let Some(run)=lock(&slot.run).clone()else{return false;};
+        let submitted=lock(&run.user_read_action).upgrade().is_some_and(|a|a.target_was_submitted());submitted
+    }
     fn slot(&self, line_id: &str) -> Result<Arc<AccountSlot>, &'static str> {
         // Unknown IDs must not allocate unbounded runtime map entries.
         self.metadata(line_id)?;
@@ -370,6 +380,7 @@ impl AccountManager {
         });
         let mut snapshot = view(metadata, observed_phase, !controller.resources_released() || !run.finalized.load(Ordering::SeqCst), error);
         snapshot.cleanup_on_disconnect = Some(run.cleanup_on_disconnect);
+        snapshot.im_user_read_supported=Some(run.backend.user_read_enabled());
         snapshot.cleanup_error = *lock(&run.cleanup_error);
         if let Some(owner)=controller.resource_owner() {
             snapshot.account_alive_state=run.backend.account_alive_observation(&owner);
@@ -510,6 +521,26 @@ impl AccountManager {
     pub fn im_received_receipts(&self,line_id:&str,limit:usize)->Result<Vec<super::im_inbox::ReceivedReceiptView>,&'static str>{
         self.database.with_conn(|conn|super::im_inbox::received_receipts(conn,line_id,limit))
     }
+    pub fn im_user_read_history(&self,line_id:&str,limit:usize)->Result<Vec<super::im_inbox::UserReadView>,&'static str>{
+        self.database.with_conn(|conn|super::im_inbox::user_read_history(conn,line_id,limit))
+    }
+    pub async fn mark_im_user_read(&self,line_id:&str,revision:u64,message_id:i64,nonce:&str,consent:bool)->Result<super::im_inbox::UserReadView,&'static str>{
+        if !consent{return Err("app_account_im_user_read_consent_required");}self.check_revision(line_id,revision)?;
+        let slot=self.slot(line_id)?;let run=lock(&slot.run).clone().ok_or("app_account_im_scope_invalid")?;
+        if !run.accepting.load(Ordering::SeqCst)||run.stopping.load(Ordering::SeqCst)||!run.im_gate.live()||!run.backend.user_read_enabled(){return Err("app_account_im_user_read_not_installed");}
+        run.configuration_current()?;
+        let controller=run.controller.lock().await;
+        if controller.phase()!=Phase::Hosted{return Err("app_account_im_scope_invalid");}
+        let owner=controller.resource_owner().ok_or("app_account_im_scope_invalid")?;
+        let scope=run.backend.original_scope(&owner).ok_or("app_account_im_scope_invalid")?;
+        let deadline=Instant::now().checked_add(run.backend.user_read_timeout()).ok_or("app_account_im_user_read_operation_timeout")?;
+        let action=super::im_inbox::UserReadAction::original(run.database.clone(),run.run_token.clone(),run.im_gate.clone(),owner,scope,message_id,nonce,deadline)?;
+        // No account operation/controller lock is held while original native
+        // target/read/write data waits; stop and callbacks retain their owner.
+        #[cfg(test)]
+        {*lock(&run.user_read_action)=Arc::downgrade(&action);}
+        drop(controller);run.backend.mark_user_read(action).await
+    }
     pub fn delete_im_message(&self,line_id:&str,id:i64)->Result<bool,&'static str>{
         self.database.with_conn(|conn|super::im_inbox::delete(conn,line_id,id))
     }
@@ -614,6 +645,8 @@ impl AccountManager {
             im_gate:super::im_inbox::ImReceiptGate::fresh(),
             #[cfg(test)]
             im_original_queue_admissions:std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            user_read_action:Mutex::new(std::sync::Weak::new()),
             accepting: AtomicBool::new(true), stopping: AtomicBool::new(false), error: Mutex::new(None), task: AsyncMutex::new(None) });
         // Retain the owning backend BEFORE any await that can create IO. A
         // cancelled HTTP future leaves this same run available for stop/retry.

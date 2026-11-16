@@ -33,6 +33,8 @@ use super::{
 use ring::rand::{SecureRandom, SystemRandom};
 #[path="runtime_alive.rs"]
 mod alive;
+#[path="runtime_user_read.rs"]
+mod user_read;
 use std::{fmt, sync::{Arc, Mutex, MutexGuard}, time::{Duration, Instant}};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use zeroize::{Zeroize, Zeroizing};
@@ -210,6 +212,7 @@ pub struct RuntimeProfile {
     account_alive:Option<super::alive_profile::AlivePolicy>,
     im_sync:Option<super::im_sync_policy::NativeImSyncConfig>,
     im_receipts:Option<super::im_receipt_policy::NativeImReceiptConfig>,
+    im_user_read:Option<super::im_user_read_policy::NativeUserReadConfig>,
     io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>,native_call_control:bool,byte_length:usize,
 }
 impl fmt::Debug for RuntimeProfile {
@@ -281,6 +284,11 @@ impl RuntimeProfile {
         let Some(config)=config else{return Ok(self);};config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;
         if self.im_receipts.is_some()||self.im_sync.is_none()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}
         add_bytes(&mut self.byte_length,16)?;self.im_receipts=Some(*config);Ok(self)
+    }
+    pub(super) fn with_user_read(mut self,config:Option<&super::im_user_read_policy::NativeUserReadConfig>)->Result<Self,ProfileError>{
+        let Some(c)=config else{return Ok(self);};c.validate().map_err(|_|ProfileError::InvalidConfiguration)?;
+        if self.im_user_read.is_some()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}
+        add_bytes(&mut self.byte_length,16)?;self.im_user_read=Some(*c);Ok(self)
     }
     pub fn supplied(input: RuntimeProfileInputs<'_>) -> Result<Self, ProfileError> { Self::capture(input,None,None,None) }
     pub fn supplied_common(input:RuntimeProfileInputs<'_>,common:RuntimeCommonInputs<'_>)->Result<Self,ProfileError>{Self::capture(input,None,Some(common),None)}
@@ -392,7 +400,7 @@ impl RuntimeProfile {
             poll_routing, logout_routing, incoming, offline_reception: false, client_ex: false, reference_decode_key: input.reference_decode_key,
             native_receivers: None,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
-            account_alive:None,im_sync:None,im_receipts:None,io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
+            account_alive:None,im_sync:None,im_receipts:None,im_user_read:None,io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
         })
     }
 }
