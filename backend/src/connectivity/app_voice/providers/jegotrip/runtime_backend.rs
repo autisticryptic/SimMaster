@@ -35,6 +35,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 mod alive;
 #[path="runtime_user_read.rs"]
 mod user_read;
+#[path="runtime_im_reconciliation.rs"]
+mod reconciliation;
 use std::{fmt, sync::{Arc, Mutex, MutexGuard}, time::{Duration, Instant}};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use zeroize::{Zeroize, Zeroizing};

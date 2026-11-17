@@ -37,6 +37,7 @@ mod app_voice_accounts {
     include!("app_voice_im_http_tests.rs");
     include!("app_voice_im_receipt_http_tests.rs");
     include!("app_voice_im_user_read_http_tests.rs");
+    include!("app_voice_im_reconciliation_http_tests.rs");
 
     #[tokio::test]
     async fn push_status_is_authenticated_read_only_and_reports_unconfigured_receivers_without_secret_export() {

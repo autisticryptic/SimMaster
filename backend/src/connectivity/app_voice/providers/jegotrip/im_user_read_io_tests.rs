@@ -17,3 +17,5 @@ async fn blocked(parent:bool){
 #[tokio::test]async fn user_read_io_parent_retirement_during_write_keeps_unknown_and_all_original_joins(){Box::pin(blocked(true)).await;}
 #[path="im_user_read_lifecycle_io_tests.rs"]
 mod lifecycle;
+#[path="im_reconciliation_io_tests.rs"]
+mod reconciliation;

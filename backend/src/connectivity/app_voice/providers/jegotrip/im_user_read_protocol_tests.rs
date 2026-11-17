@@ -96,3 +96,5 @@ fn user_read_debug_and_metadata_do_not_export_box_uid_token_nonce_or_sdk_scope()
 }
 #[path="im_user_read_retirement_reason_tests.rs"]
 mod retirement_reason;
+#[path="im_reconciliation_protocol_tests.rs"]
+mod reconciliation;

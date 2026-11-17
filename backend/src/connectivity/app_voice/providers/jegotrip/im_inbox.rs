@@ -31,6 +31,9 @@ pub(super) use receipts::{ReceivedWritePermit,ReceivedWait,ReceivedAdmission,Rec
 #[path="im_user_read_journal.rs"]
 mod user_reads;
 pub(super) use user_reads::{UserReadAction,UserReadWait,UserReadPermit,UserReadPermitWait,UserReadView,BoundUserRead,metadata as user_read_history};
+#[path="im_read_reconciliation.rs"]
+mod reconciliation;
+pub(super) use reconciliation::{ImReadObservation,ImReconciliationAction,ImReconciliationWait};
 
 pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
     conn.execute_batch("CREATE TABLE IF NOT EXISTS app_voice_im_messages(

@@ -41,6 +41,9 @@ pub struct InboxQuery { #[serde(default = "default_inbox_limit")] limit: usize }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImUserReadRequest{expected_revision:u64,nonce:String,consent:bool}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImReconciliationRequest { expected_revision: u64, consent: bool }
 fn default_inbox_limit() -> usize { 50 }
 
 /// Merged into main's protected routes BEFORE its existing auth middleware.
@@ -70,6 +73,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/im-messages", get(get_im_messages))
         .route("/api/non-3gpp/accounts/{line_id}/im-receipts", get(get_im_receipts))
         .route("/api/non-3gpp/accounts/{line_id}/im-user-reads",get(get_im_user_reads))
+        .route("/api/non-3gpp/accounts/{line_id}/im-user-reads/{receipt_id}/reconcile",post(reconcile_im_user_read))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}/mark-read",post(mark_im_user_read))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}", delete(delete_im_message))
         .route("/api/non-3gpp/accounts/{line_id}/calls", get(get_calls))
@@ -111,6 +115,10 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_im_user_read_message_missing" => StatusCode::NOT_FOUND,
         "app_account_im_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_account_im_user_read_full" => StatusCode::TOO_MANY_REQUESTS,
+        "app_account_im_reconciliation_consent_required" | "app_account_im_reconciliation_not_installed" => StatusCode::FORBIDDEN,
+        "app_account_im_reconciliation_not_found" => StatusCode::NOT_FOUND,
+        "app_account_im_reconciliation_context_conflict" => StatusCode::CONFLICT,
+        "app_account_im_reconciliation_timeout" | "app_account_im_reconciliation_reply_invalid" => StatusCode::SERVICE_UNAVAILABLE,
         "app_account_im_user_read_operation_timeout" | "app_account_im_scope_invalid" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
     }
@@ -261,6 +269,13 @@ pub async fn mark_im_user_read(State(manager):State<Arc<AccountManager>>,Path((l
     let Ok(Json(request))=request else{return failure("app_account_request_invalid");};let Ok(id)=message_id.parse::<i64>()else{return failure("app_account_request_invalid");};
     if id<=0||id.to_string()!=message_id||request.nonce.len()!=32||!request.nonce.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)){return failure("app_account_request_invalid");}
     success(StatusCode::OK,manager.mark_im_user_read(&line_id,request.expected_revision,id,&request.nonce,request.consent).await)
+}
+pub async fn reconcile_im_user_read(State(manager): State<Arc<AccountManager>>, Path((line_id, receipt_id)): Path<(String,String)>,
+    request: Result<Json<ImReconciliationRequest>, JsonRejection>) -> Response {
+    let Ok(Json(request)) = request else { return failure("app_account_request_invalid"); };
+    let Ok(id) = receipt_id.parse::<i64>() else { return failure("app_account_request_invalid"); };
+    if id <= 0 || id.to_string() != receipt_id { return failure("app_account_request_invalid"); }
+    success(StatusCode::OK, manager.reconcile_im_user_read(&line_id, request.expected_revision, id, request.consent).await)
 }
 pub async fn delete_im_message(State(manager):State<Arc<AccountManager>>,Path((line_id,message_id)):Path<(String,String)>)->Response{
     let Ok(id)=message_id.parse::<i64>()else{return failure("app_account_request_invalid");};
