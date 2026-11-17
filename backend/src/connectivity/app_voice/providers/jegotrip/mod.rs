@@ -59,6 +59,7 @@ mod user_entry_ownership;
 mod user_entry_io;
 mod user_entry_target;
 mod user_entry_rpc;
+mod user_entry_local;
 mod user_entry_action;
 pub use user_entry_action::valid_user_entry_recipient;
 mod rpc_im_received;

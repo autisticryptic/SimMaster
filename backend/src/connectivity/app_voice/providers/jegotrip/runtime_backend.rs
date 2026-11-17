@@ -528,6 +528,7 @@ struct Attempt {
     alive_link:Option<Arc<super::alive_session::AliveLink>>,
     alive_handle:AsyncMutex<Option<super::alive_runtime::AliveRun>>,
     user_entry:Mutex<Result<Option<Arc<super::user_entry_target::UserEntryTarget>>,super::runtime_provision::ProvisionError>>,
+    user_entry_uid_local:Mutex<Result<Option<Arc<super::user_entry_local::UserEntryLocalReference>>,super::runtime_provision::ProvisionError>>,
     user_entries:Arc<super::user_entry_ownership::UserEntryBook>,
     // Serializes login/attach and controller commands with resource cleanup.
     // The independent event pump polls/configures without a controller lock.
@@ -762,7 +763,7 @@ impl NativeHostingBackend {
                 if value!=0&&!state.incarnations.contains(&value){incarnation=Some(value);break;}}
             let incarnation=incarnation.ok_or(BackendFailure::Unavailable)?;
             let attempt=Arc::new(Attempt{owner:owner.clone(),scope:destination.connection_scope(),incarnation,state:Mutex::new(AttemptState::default()),commands:Mutex::new(None),
-                handle:AsyncMutex::new(None),session_uri:Mutex::new(None),bootstrap_scope,bootstrap_handle:AsyncMutex::new(None),startup_traces,alive_link,alive_handle:AsyncMutex::new(None),user_entry:Mutex::new(Ok(None)),user_entries:super::user_entry_ownership::UserEntryBook::original(owner.clone(),destination.connection_scope()),work:AsyncMutex::new(()),poll_work:AsyncMutex::new(())});
+                handle:AsyncMutex::new(None),session_uri:Mutex::new(None),bootstrap_scope,bootstrap_handle:AsyncMutex::new(None),startup_traces,alive_link,alive_handle:AsyncMutex::new(None),user_entry:Mutex::new(Ok(None)),user_entry_uid_local:Mutex::new(Ok(None)),user_entries:super::user_entry_ownership::UserEntryBook::original(owner.clone(),destination.connection_scope()),work:AsyncMutex::new(()),poll_work:AsyncMutex::new(())});
             state.owners.push(owner);state.incarnations.push(incarnation);state.slot=Some(attempt.clone());attempt
         };
         let mut retirement=Retirement::new(attempt.clone());let _work=attempt.work.lock().await;
@@ -771,6 +772,7 @@ impl NativeHostingBackend {
             let plan=match bootstrap{Some(bootstrap)=>Some(self.bootstrap_common_original(&attempt,&captured,bootstrap).await?),None=>None};
             if let Some(plan)=&plan {
                 *lock(&attempt.user_entry)=plan.user_entry_for(&attempt.owner,&attempt.scope,&common.router);
+                *lock(&attempt.user_entry_uid_local)=plan.user_entry_uid_local_for(&attempt.owner,&attempt.scope,&common.router);
                 let reference=if self.profile.account_alive.is_some(){Some(Zeroizing::new(plan.alive_reference_for(&attempt.owner,&attempt.scope,&common.router).map_err(|_|BackendFailure::Unavailable)?.to_vec()))}else{None};
                 let mut state=lock(&attempt.state);state.account_alive=Some(plan.account_alive());state.alive_reference=reference;
             }
@@ -916,7 +918,7 @@ impl NativeHostingBackend {
                 RuntimePolicy{io_timeout:self.profile.io_timeout,rpc_timeout:self.profile.rpc_timeout},None).map_err(|_|BackendFailure::Unavailable)?)}else{None};
             attempt = Arc::new(Attempt { owner: owner.clone(), scope: prepared.connection_scope(), incarnation,
                 state: Mutex::new(AttemptState::default()), commands: Mutex::new(None), handle: AsyncMutex::new(None),session_uri:Mutex::new(None),
-                bootstrap_scope:bootstrap_prepared.as_ref().map(|prepared|prepared.connection_scope()),bootstrap_handle:AsyncMutex::new(None),startup_traces:None,alive_link:None,alive_handle:AsyncMutex::new(None),user_entry:Mutex::new(Ok(None)),user_entries:super::user_entry_ownership::UserEntryBook::original(owner.clone(),prepared.connection_scope()),
+                bootstrap_scope:bootstrap_prepared.as_ref().map(|prepared|prepared.connection_scope()),bootstrap_handle:AsyncMutex::new(None),startup_traces:None,alive_link:None,alive_handle:AsyncMutex::new(None),user_entry:Mutex::new(Ok(None)),user_entry_uid_local:Mutex::new(Ok(None)),user_entries:super::user_entry_ownership::UserEntryBook::original(owner.clone(),prepared.connection_scope()),
                 work: AsyncMutex::new(()), poll_work: AsyncMutex::new(()) });
             state.owners.push(owner); state.incarnations.push(incarnation); state.slot = Some(attempt.clone());
         }

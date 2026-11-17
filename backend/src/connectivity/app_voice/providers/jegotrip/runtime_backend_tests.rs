@@ -698,7 +698,7 @@ fn bounded_backend_queue_reserves_terminal_slot_and_pressure_retires_original_at
         state: Mutex::new(AttemptState::default()), commands: Mutex::new(None), handle: AsyncMutex::new(None),
         session_uri: Mutex::new(None),
         work: AsyncMutex::new(()), poll_work: AsyncMutex::new(()),bootstrap_scope:None,bootstrap_handle:AsyncMutex::new(None),startup_traces:None,alive_link:None,alive_handle:AsyncMutex::new(None),
-        user_entry:Mutex::new(Ok(None)),user_entries:super::super::user_entry_ownership::UserEntryBook::original(original.clone(),scope.clone()) };
+        user_entry:Mutex::new(Ok(None)),user_entry_uid_local:Mutex::new(Ok(None)),user_entries:super::super::user_entry_ownership::UserEntryBook::original(original.clone(),scope.clone()) };
     let (sender, mut receiver) = mpsc::channel(EVENT_CAPACITY);
     for _ in 0..EVENT_CAPACITY - 1 {
         assert!(emit(&sender, &attempt, BackendEventPayload::Callback(OwnedRpcCallback { owner: original.clone(), callback: Callback::Failure(BackendFailure::Disconnected) })));

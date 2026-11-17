@@ -1,5 +1,7 @@
 //! Actions-only original matched current SDK authentication capture (no IO).
 use super::*;
+#[path="user_entry_uid_local_tests.rs"]
+mod uid_local;
 fn current_native()->(ArcRpcSession,AttemptOwner,RpcConnectionScope){
     let who=owner();let mut rpc=ArcRpcSession::new(who.clone());rpc.claim_common_transport().unwrap();rpc.bind_common_identity(b"AccountEntry").unwrap();let parent=rpc.connection_scope();let(id,_)=rpc.prepare_login(inputs(&[]),&[]).unwrap();assert!(matches!(rpc.on_reply(&who,&parent,&reply(id,&login_result(true))).unwrap(),Some(ArcReply::Login(_))));(rpc,who,parent)
 }

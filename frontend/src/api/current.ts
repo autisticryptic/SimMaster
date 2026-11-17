@@ -396,6 +396,7 @@ export interface AppAccountView {
   im_user_read_supported?: boolean
   im_reconciliation_supported?: boolean
   user_entry_supported?: boolean
+  user_entry_uid_local_supported?: boolean
 }
 
 async function request<T>(

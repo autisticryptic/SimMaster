@@ -4,7 +4,7 @@ import { defineConfig, devices } from '@playwright/test'
 // request is proxied to an unused loopback port, never a modem/backend/provider.
 export default defineConfig({
   testDir: './e2e',
-  testMatch: ['jegotrip-device-identity.spec.ts', 'jegotrip-local-receiver.spec.ts', 'jegotrip-startup-diagnostics.spec.ts', 'jegotrip-alive-status.spec.ts', 'jegotrip-communication.spec.ts', 'jegotrip-call-notifications.spec.ts', 'jegotrip-invite-notifications.spec.ts', 'jegotrip-im-messages.spec.ts', 'jegotrip-im-receipts.spec.ts', 'jegotrip-im-user-read.spec.ts', 'jegotrip-im-user-read-state.spec.ts', 'jegotrip-im-reconciliation.spec.ts', 'jegotrip-user-entry.spec.ts'],
+  testMatch: ['jegotrip-device-identity.spec.ts', 'jegotrip-local-receiver.spec.ts', 'jegotrip-startup-diagnostics.spec.ts', 'jegotrip-alive-status.spec.ts', 'jegotrip-communication.spec.ts', 'jegotrip-call-notifications.spec.ts', 'jegotrip-invite-notifications.spec.ts', 'jegotrip-im-messages.spec.ts', 'jegotrip-im-receipts.spec.ts', 'jegotrip-im-user-read.spec.ts', 'jegotrip-im-user-read-state.spec.ts', 'jegotrip-im-reconciliation.spec.ts', 'jegotrip-user-entry.spec.ts', 'jegotrip-uid-local.spec.ts'],
   timeout: 45_000,
   expect: { timeout: 10_000 },
   workers: 1,
