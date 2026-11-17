@@ -11,7 +11,7 @@ impl UserEntryAuth{
     pub(in super::super) fn selector_for(&self,owner:&AttemptOwner,parent:&RpcConnectionScope)->Option<&[u8]>{self.matches(owner,parent).then_some(self.selector.as_slice())}
 }
 impl ArcRpcSession{
-    pub(super) fn user_entry_auth(&self)->Result<Box<UserEntryAuth>,CodecError>{
+    pub(in super::super) fn user_entry_auth(&self)->Result<Box<UserEntryAuth>,CodecError>{
         if !self.common_transport_claimed||self.phase()!=ArcPhase::Authenticated||self.connection.session_revoked(){return Err(CodecError::InvalidField);}
         let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
         validate_bytes(&auth.user_id,true)?;validate_bytes(&auth.selected_session_id,true)?;validate_bytes(&auth.token,true)?;

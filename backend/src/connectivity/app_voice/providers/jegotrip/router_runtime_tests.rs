@@ -297,7 +297,7 @@ async fn original_tls_handshake_deadline_bounds_blocked_first_clienthello_write(
   let original=owner();let scope=RpcConnectionScope::fresh();let tcp=tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST,port)).await.unwrap();let pauses=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
   let io=SlowOriginalIo{inner:Box::new(tcp),point:DelayPoint::Write,delay:Duration::from_millis(300),sleep:None,waited:false,skip:0,pauses:pauses.clone()};
   let connected=ConnectedRouterIo::original(&original,&scope,&p,0,io).unwrap();let now=Instant::now();let mut bounds=timeouts();bounds.handshake=Duration::from_millis(80);
-  assert!(RouterPath::attach(original,scope.clone(),&p,connected,&[],bounds,now,now+Duration::from_secs(2)).await.is_err());
+  assert!(RouterPath::attach(original,scope.clone(),&p,connected,&[],bounds,now,now+Duration::from_secs(2),None).await.is_err());
   assert!(now.elapsed()<Duration::from_secs(1));assert!(!scope.is_open());assert!(pauses.load(std::sync::atomic::Ordering::Acquire)>0);
  };tokio::join!(server,client);
 }
