@@ -109,3 +109,7 @@ fn new_decode_key_imports_are_optional_redacted_bounded_and_not_phone_or_gateway
     credentials.sdk.reference_decode_key = Some(serde_json::from_value(serde_json::json!("x".repeat(4097))).unwrap());
     assert_eq!(credentials.validate(100).err(), Some("jegotrip_config_decode_key_invalid"));
 }
+#[path="user_entry_reference_tests.rs"]
+mod user_entry;
+#[path="user_entry_data_tests.rs"]
+mod recipient_data;

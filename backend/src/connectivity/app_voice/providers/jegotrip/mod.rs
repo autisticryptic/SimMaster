@@ -53,6 +53,8 @@ mod im_receipt_policy;
 mod im_user_read_policy;
 mod im_user_read_data;
 mod im_user_read_rpc;
+mod user_entry_data;
+mod user_entry_reference;
 mod rpc_im_received;
 pub(crate) mod im_delivery;
 pub(crate) mod im_inbox;
