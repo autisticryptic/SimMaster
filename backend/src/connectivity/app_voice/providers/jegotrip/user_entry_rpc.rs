@@ -9,6 +9,11 @@ use std::{fmt,sync::Arc,time::Instant};
 use zeroize::Zeroizing;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(super) enum UserEntryError{Scope,Configuration,Transport,Timeout,Protocol,Rejected,Ambiguous,Capacity,Realm}
+// Preserve an ACTUAL typed original timeout through nested transport layers.
+// A clock value, closed scope or generic IO error is not timeout evidence.
+pub(super) fn router_error(error:super::router_runtime::RouterIoError)->UserEntryError{use super::{router_runtime::RouterIoError as E,runtime_connector::ConnectError,tls_engine::TlsError};match error{E::Timeout|E::Connect(ConnectError::Timeout)|E::Tls(TlsError::Timeout)=>UserEntryError::Timeout,_=>UserEntryError::Transport}}
+pub(super) fn netstream_error(error:super::netstream_runtime::NetstreamError)->UserEntryError{use super::{netstream_runtime::NetstreamError as E,channel_session::SessionError,reliable_channel::ChannelError};match error{E::Timeout|E::Session(SessionError::Channel(ChannelError::Timeout))=>UserEntryError::Timeout,E::Router(error)=>router_error(error),_=>UserEntryError::Transport}}
+pub(super) fn common_error(error:super::common_runtime::CommonIoError)->UserEntryError{use super::common_runtime::CommonIoError as E;match error{E::Timeout=>UserEntryError::Timeout,E::Netstream(error)=>netstream_error(error),_=>UserEntryError::Transport}}
 struct Query{action:Arc<UserEntryAction>,id:i32}
 impl fmt::Debug for Query{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("UserEntryQuery(<redacted>)")}}
 pub(super) struct OwnedUserEntryReply{query:Arc<Query>,accepted:bool,uid:Option<Zeroizing<Vec<u8>>>,observed_at:String}
@@ -46,14 +51,14 @@ pub(super) async fn resolve_original(action:Arc<UserEntryAction>,auth:Box<UserEn
         let metadata=[RpcProperty{key:b"id",value:reference.identity()},RpcProperty{key:b"token",value:token},RpcProperty{key:b"DeviceInfo.CC",value:cc}];
         let rpc=encode_request(query.id,&metadata,user_entry_data::AID_TO_UID_METHOD.as_bytes(),arguments.expose_to_transport()).map_err(|_|UserEntryError::Configuration)?;
         lease.arm(rpc.expose_to_transport().len()).map_err(|_|UserEntryError::Capacity)?;
-        let route=RouterPath::open_user_entry(owner.clone(),child.clone(),&parent,router,access,timeouts,deadline).await.map_err(|_|UserEntryError::Transport)?;
-        let stream=NetstreamPath::open(route,endpoint,0,deadline,timeouts.partial).await.map_err(|_|UserEntryError::Transport)?;
-        let mut path=CommonPath::from_original(stream,timeouts.partial,compress).map_err(|_|UserEntryError::Transport)?;
+        let route=RouterPath::open_user_entry(owner.clone(),child.clone(),&parent,router,access,timeouts,deadline).await.map_err(router_error)?;
+        let stream=NetstreamPath::open(route,endpoint,0,deadline,timeouts.partial).await.map_err(netstream_error)?;
+        let mut path=CommonPath::from_original(stream,timeouts.partial,compress).map_err(common_error)?;
         if !current(){return Err(UserEntryError::Scope);}
-        if !path.send_call(owner,&child,CallKind::Request,rpc.expose_to_transport(),deadline).await.map_err(|_|UserEntryError::Transport)?{return Err(UserEntryError::Scope);}
+        if !path.send_call(owner,&child,CallKind::Request,rpc.expose_to_transport(),deadline).await.map_err(common_error)?{return Err(UserEntryError::Scope);}
         loop{
             if !current(){return Err(UserEntryError::Scope);}
-            let Some(group)=path.receive_calls(owner,&child,deadline).await.map_err(|_|UserEntryError::Transport)?else{return Err(UserEntryError::Scope);};
+            let Some(group)=path.receive_calls(owner,&child,deadline).await.map_err(common_error)?else{return Err(UserEntryError::Scope);};
             let calls=path.calls_for(owner,&child,&group).ok_or(UserEntryError::Scope)?;
             // Check the entire authenticated admitted group before publishing
             // any UID; a malformed later envelope suppresses the whole group.

@@ -48,3 +48,13 @@ async fn user_entry_runtime_parent_close_blocks_all_physical_poll_kinds_without_
 fn user_entry_runtime_debug_never_exports_owner_recipient_reference_or_sdk_material(){
     let who=owner();let parent=RpcConnectionScope::fresh();let gate=n::im_inbox::ImReceiptGate::fresh();let action=n::user_entry_action::UserEntryAction::original(who.clone(),parent.clone(),gate,Instant::now()+Duration::from_secs(30),b"[phone:+12345@fixture.invalid]").unwrap();let book=n::user_entry_ownership::UserEntryBook::original(who.clone(),parent.clone());let lease=book.acquire(&who,&parent,action.deadline()).unwrap();let text=format!("{action:?} {book:?} {lease:?}");for secret in ["fixture","12345","owner","scope"]{assert!(!text.contains(secret));}
 }
+#[test]
+fn user_entry_runtime_typed_original_timeouts_survive_every_transport_error_boundary(){
+    use n::{user_entry_rpc::{self,UserEntryError},common_runtime::CommonIoError,netstream_runtime::NetstreamError,router_runtime::RouterIoError,runtime_connector::ConnectError,tls_engine::TlsError,channel_session::SessionError,reliable_channel::ChannelError};
+    for e in [CommonIoError::Timeout,CommonIoError::Netstream(NetstreamError::Timeout),CommonIoError::Netstream(NetstreamError::Router(RouterIoError::Timeout)),CommonIoError::Netstream(NetstreamError::Router(RouterIoError::Connect(ConnectError::Timeout))),CommonIoError::Netstream(NetstreamError::Router(RouterIoError::Tls(TlsError::Timeout))),CommonIoError::Netstream(NetstreamError::Session(SessionError::Channel(ChannelError::Timeout)))]{assert_eq!(user_entry_rpc::common_error(e),UserEntryError::Timeout);}
+}
+#[test]
+fn user_entry_runtime_io_scope_protocol_or_tls_failure_does_not_become_timeout_or_retry(){
+    use n::{user_entry_rpc::{self,UserEntryError},common_runtime::CommonIoError,netstream_runtime::NetstreamError,router_runtime::RouterIoError,runtime_connector::ConnectError,tls_engine::TlsError};
+    for e in [CommonIoError::Scope,CommonIoError::Configuration,CommonIoError::Netstream(NetstreamError::Router(RouterIoError::Io)),CommonIoError::Netstream(NetstreamError::Router(RouterIoError::Connect(ConnectError::Io))),CommonIoError::Netstream(NetstreamError::Router(RouterIoError::Tls(TlsError::HandshakeFailed)))]{assert_eq!(user_entry_rpc::common_error(e),UserEntryError::Transport);}
+}

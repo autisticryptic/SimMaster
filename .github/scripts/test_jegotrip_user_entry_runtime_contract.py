@@ -21,4 +21,8 @@ class UserEntryRuntimeContract(unittest.TestCase):
   s=(R/'backend/src/api/app_voice.rs').read_text(encoding='utf-8');self.assertIn('pub struct UserEntryLookupRequest{expected_revision:u64,recipient:String,consent:bool}',s);self.assertIn('valid_user_entry_recipient(&request.recipient)',s);self.assertIn('zeroize(&mut self.recipient)',s);self.assertIn('/user-entry/lookup',s)
  def test_ui_only_explicit_query_and_generation_has_no_uid_projection(self):
   s=(R/'frontend/src/pages/sim/AppUserEntryPane.tsx').read_text(encoding='utf-8');self.assertIn('window.confirm',s);self.assertIn('current.current.generation !== original.generation',s);self.assertNotIn('setInterval',s);self.assertNotIn('setTimeout',s);self.assertNotIn('localStorage',s);self.assertNotIn('dangerouslySetInnerHTML',s);self.assertNotIn('nonce',s)
+ def test_actual_typed_timeout_is_not_erased_by_generic_transport_mapping(self):
+  s=text('user_entry_rpc.rs');self.assertIn('E::Timeout|E::Connect(ConnectError::Timeout)|E::Tls(TlsError::Timeout)',s);self.assertIn('E::Netstream(error)=>netstream_error(error)',s);self.assertIn('.await.map_err(common_error)?',s)
+ def test_timeout_cause_fix_does_not_expand_budgets_or_relabel_generic_io(self):
+  s=text('user_entry_rpc.rs');self.assertIn('_=>UserEntryError::Transport',s);self.assertNotIn('saturating_duration_since',s);self.assertNotIn('RUST_MIN_STACK',s);t=text('user_entry_common_tests.rs');self.assertIn('Some("app_account_user_entry_timeout")',t);self.assertIn('Duration::from_secs(3)',t)
 if __name__=='__main__':unittest.main()
