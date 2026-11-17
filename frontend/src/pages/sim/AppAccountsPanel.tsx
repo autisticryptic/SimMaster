@@ -6,6 +6,7 @@ import AppInviteNotificationsPane from './AppInviteNotificationsPane'
 import AppImMessagesPane from './AppImMessagesPane'
 import AppImReceiptsPane from './AppImReceiptsPane'
 import AppImReconciliationPane from './AppImReconciliationPane'
+import AppUserEntryPane from './AppUserEntryPane'
 import JegotripConfigurationDialog from './JegotripConfigurationDialog'
 import { appBusinessLabel, appLoginError, appLoginPhase } from '../../policies/appLogin'
 
@@ -92,6 +93,7 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
                 <AppCallNotificationsPane lineId={account.line_id} />
                 <AppInviteNotificationsPane lineId={account.line_id} enabled={account.incoming_call_ready} />
                 <AppImMessagesPane lineId={account.line_id} userRead={{ revision: account.revision, installed: account.im_user_read_supported === true, hosted: account.phase === 'hosted' }} />
+                <AppUserEntryPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.user_entry_supported === true} />
                 <AppImReceiptsPane lineId={account.line_id} />
                 <AppImReconciliationPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.im_reconciliation_supported === true} />
               </Box>

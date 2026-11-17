@@ -162,6 +162,9 @@ impl OfflineBackend {
     }
     pub(super) fn take_received_replies(&mut self)->Vec<super::rpc_im_received::OwnedReceivedReply>{self.protocol.take_received_replies()}
     pub(super) fn retire_received_write(&mut self,id:i32){self.protocol.retire_received_write(id);}
+    pub(super) fn captured_user_entry_auth(&self)->Result<Box<super::arc_session::UserEntryAuth>,ProtocolError>{
+        if self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField.into());}self.protocol.captured_user_entry_auth().map_err(Into::into)
+    }
     pub(super) fn captured_im_binding(&self)->Option<std::sync::Arc<super::im_delivery::ImBinding>>{
         if self.phase()!=ArcPhase::Authenticated{return None;}self.im_binding.clone()
     }

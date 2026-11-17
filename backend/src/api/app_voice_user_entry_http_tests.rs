@@ -1,0 +1,19 @@
+// Actions-only actual HTTP authentication, exact DTO and no-store/no-secret gates.
+#[tokio::test]
+async fn user_entry_http_authenticated_strict_query_cannot_supply_uid_token_route_status_or_write_nonce(){
+    let state=build_test_router().await.expect("Actions private bus required; no skip");let served=serve(state.router.clone()).await;let path="/api/non-3gpp/accounts/app-account-0123456789abcdef0123456789abcdef/user-entry/lookup";
+    let(status,_,body)=account_request(&served,reqwest::Method::POST,path,None,None).await;assert_eq!(status,StatusCode::UNAUTHORIZED);no_secrets(&body);let cookie=authenticate(&served).await;
+    for field in ["uid","token","url","authority","nonce","confirmed","index","status"]{let mut input=serde_json::json!({"expected_revision":1,"recipient":"[phone:+12345@fixture.invalid]","consent":true});input[field]=serde_json::json!("fixture-private-no-echo");let(status,headers,body)=account_request(&served,reqwest::Method::POST,path,Some(input),Some(&cookie)).await;assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);assert!(!body.contains("12345"));}assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+}
+#[tokio::test]
+async fn user_entry_http_query_requires_read_consent_current_revision_and_running_original_account(){
+    let state=build_test_router().await.expect("Actions private bus required; no skip");let served=serve(state.router.clone()).await;let cookie=authenticate(&served).await;let cert=Certificates::generate("IP:127.0.0.1");let(status,_,body)=account_request(&served,reqwest::Method::POST,"/api/non-3gpp/accounts",Some(serde_json::json!({"provider_id":"app_voice","config":im_runtime_config_json(&cert.root)})),Some(&cookie)).await;assert_eq!(status,StatusCode::CREATED);let line=created_line(&body);let path=format!("/api/non-3gpp/accounts/{line}/user-entry/lookup");
+    for(revision,consent,expected)in [(1,false,StatusCode::FORBIDDEN),(2,true,StatusCode::CONFLICT),(1,true,StatusCode::SERVICE_UNAVAILABLE)]{let(status,headers,body)=account_request(&served,reqwest::Method::POST,&path,Some(serde_json::json!({"expected_revision":revision,"recipient":"[phone:+12345@fixture.invalid]","consent":consent})),Some(&cookie)).await;assert_eq!(status,expected);no_store(&headers);no_secrets(&body);assert!(!body.contains("12345"));}
+    let view=state.app.app_accounts.get(&line,100).await.unwrap();assert_eq!(view.phase,"stopped");assert!(view.user_entry_supported.is_none());assert!(!view.incoming_message_ready&&!view.incoming_call_ready&&!view.outbound_authorized&&!view.io_cleanup_required);
+}
+#[tokio::test]
+async fn user_entry_http_rejects_ambiguous_recipient_missing_boolean_or_oversized_input_before_any_native_work(){
+    let state=build_test_router().await.expect("Actions private bus required; no skip");let served=serve(state.router.clone()).await;let cookie=authenticate(&served).await;let path="/api/non-3gpp/accounts/app-account-0123456789abcdef0123456789abcdef/user-entry/lookup";
+    for recipient in ["12345".to_string(),"fixture@example.invalid".into(),"scheme://fixture.invalid".into(),"[phone:+12345]".into(),"[username:fixture@invalid]".into(),"x".repeat(513)]{let(status,headers,body)=account_request(&served,reqwest::Method::POST,path,Some(serde_json::json!({"expected_revision":1,"recipient":recipient,"consent":true})),Some(&cookie)).await;assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);}
+    for input in [serde_json::json!({"expected_revision":1,"recipient":"7_9"}),serde_json::json!({"expected_revision":1,"recipient":"7_9","consent":"true"}),serde_json::json!({"expected_revision":1,"recipient":null,"consent":true})]{let(status,headers,body)=account_request(&served,reqwest::Method::POST,path,Some(input),Some(&cookie)).await;assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);}assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+}

@@ -1,6 +1,8 @@
 //! Actions-only matched original bootstrap UserEntry reference ownership tests.
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip::user_entry_reference::UserEntryReference;
+#[path="user_entry_target_tests.rs"]
+mod target;
 fn auxiliary(reference:&[u8])->(ArcRpcSession,AttemptOwner,RpcConnectionScope,OwnedBootstrapReply){
     let original=owner();let mut rpc=ArcRpcSession::new(original.clone());let scope=rpc.connection_scope();let(id,_)=rpc.prepare_bootstrap(b"fixture-appkey",&[]).unwrap();let mut w=Writer::new();w.boolean(true).unwrap();w.properties(&[]).unwrap();w.bytes(b"AccountEntry:tcp -h fixture.invalid -p 443;").unwrap();w.bytes(b"").unwrap();w.bytes(reference).unwrap();w.bytes(b"").unwrap();let raw=encode_reply(id,0,w.finish().expose_to_transport()).unwrap();let result=match rpc.on_reply(&original,&scope,raw.expose_to_transport()).unwrap().unwrap(){ArcReply::Bootstrap(reply)=>reply,_=>panic!("matched original bootstrap")};(rpc,original,scope,result)
 }

@@ -45,12 +45,28 @@ impl RouterPath {
         let mut cancelled=CancelGuard{scope:scope.clone(),armed:true};let start=Instant::now();
         let deadline=start.checked_add(timeouts.startup).ok_or(RouterIoError::Configuration)?;
         let connected=RouterTcpConnector::new(timeouts.connect.min(timeouts.startup))?.connect(&owner,&scope,policy).await?;
-        let result=Self::attach(owner,scope,policy,connected,access,timeouts,start,deadline).await;
+        let result=Self::attach(owner,scope,policy,connected,access,timeouts,start,deadline,None).await;
+        if result.is_ok(){cancelled.armed=false;}result
+    }
+    /// Explicit auxiliary transport of one current original account operation.
+    /// Parent and auxiliary poll gates stay independent; no SDK login occurs.
+    pub(super) async fn open_user_entry(owner:AttemptOwner,scope:RpcConnectionScope,parent:&RpcConnectionScope,
+        policy:&RouterPolicy,access:&[RpcProperty<'_>],timeouts:RouterTimeouts,operation_end:Instant)->Result<Self,RouterIoError>{
+        timeouts.validate()?;
+        if parent.matches(&scope)||!parent.is_open()||parent.session_revoked()||!scope.is_open(){return Err(RouterIoError::Scope);}
+        let mut cancelled=CancelGuard{scope:scope.clone(),armed:true};let start=Instant::now();
+        let deadline=start.checked_add(timeouts.startup).ok_or(RouterIoError::Configuration)?.min(operation_end);
+        if start>=deadline{return Err(RouterIoError::Timeout);}
+        let connector=RouterTcpConnector::new(timeouts.connect.min(deadline.duration_since(start)))?;
+        let connecting=connector.connect(&owner,&scope,policy);
+        let connected=tokio::select!{biased;_=parent.session_ended()=>return Err(RouterIoError::Scope),_=scope.closed()=>return Err(RouterIoError::Scope),result=connecting=>result?};
+        let result=Self::attach(owner,scope,policy,connected,access,timeouts,start,deadline,Some((parent,operation_end))).await;
         if result.is_ok(){cancelled.armed=false;}result
     }
     async fn attach(owner:AttemptOwner,scope:RpcConnectionScope,policy:&RouterPolicy,connected:ConnectedRouterIo,
-        access:&[RpcProperty<'_>],timeouts:RouterTimeouts,start:Instant,deadline:Instant)->Result<Self,RouterIoError> {
+        access:&[RpcProperty<'_>],timeouts:RouterTimeouts,start:Instant,deadline:Instant,parent:Option<(&RpcConnectionScope,Instant)>)->Result<Self,RouterIoError> {
         let(index,io)=connected.into_original(&owner,&scope,policy)?;
+        let io:BoxRuntimeIo=if let Some((parent,operation_end))=parent{Box::new(super::user_entry_io::UserEntryIo::original(io,parent.clone(),scope.clone(),operation_end).map_err(|_|RouterIoError::Scope)?)}else{io};
         let mut random=[0u8;6];SystemRandom::new().fill(&mut random).map_err(|_|RouterIoError::Entropy)?;
         let nonce=u32::from_ne_bytes(random[..4].try_into().map_err(|_|RouterIoError::Entropy)?).max(1);
         let sequence=u16::from_ne_bytes(random[4..].try_into().map_err(|_|RouterIoError::Entropy)?);

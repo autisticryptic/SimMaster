@@ -25,6 +25,8 @@ use std::{collections::{BTreeMap, VecDeque}, fmt, sync::{atomic::{AtomicBool, Or
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 #[path="account_im_reconciliation.rs"]
 mod reconciliation;
+#[path="account_user_entry.rs"]
+mod user_entry;
 
 pub trait AccountBackendFactory: Send + Sync {
     /// Construction only. Network work remains inside the original-owned
@@ -83,6 +85,9 @@ pub struct AccountView {
     /// Installed original Group READ support, not a WRITE or runtime grant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub im_reconciliation_supported:Option<bool>,
+    /// Current original auxiliary reference support, never authentication/readiness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_entry_supported:Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<&'static str>,
 }
@@ -92,7 +97,7 @@ fn view(metadata: AccountMetadata, phase: Phase, cleanup: bool, error: Option<&'
         // A hosted SDK acknowledgement is not verified SMS/call/media support.
         incoming_call_ready: false, incoming_message_ready: false, outbound_authorized: false,
         provider_availability: "unsupported", manual_start_required: true, cleanup_on_disconnect: None, cleanup_error: None,
-        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, account_alive_state:None, startup_failure:None, im_user_read_supported:None, im_reconciliation_supported:None, last_error: error }
+        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, account_alive_state:None, startup_failure:None, im_user_read_supported:None, im_reconciliation_supported:None, user_entry_supported:None, last_error: error }
 }
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
@@ -389,6 +394,7 @@ impl AccountManager {
         snapshot.im_reconciliation_supported=Some(run.backend.im_reconciliation_enabled());
         snapshot.cleanup_error = *lock(&run.cleanup_error);
         if let Some(owner)=controller.resource_owner() {
+            snapshot.user_entry_supported=Some(run.backend.user_entry_supported(&owner));
             snapshot.account_alive_state=run.backend.account_alive_observation(&owner);
             snapshot.startup_failure=run.backend.startup_failure_observation(&owner);
         }

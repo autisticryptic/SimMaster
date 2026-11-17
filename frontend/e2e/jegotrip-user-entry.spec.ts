@@ -1,0 +1,25 @@
+import { test, expect } from '@playwright/test'
+test('UserEntry is explicitly consented current-account readonly IO and old account results cannot render or grant replay', async ({ page }) => {
+  const reads: string[] = []; const errors: string[] = []; let consent = false; let release: (() => void) | undefined
+  page.on('pageerror', (error) => errors.push(error.message)); page.on('dialog', (dialog) => { if (consent) { void dialog.accept() } else { void dialog.dismiss() } })
+  await page.route((url) => url.pathname.startsWith('/api/'), async (route) => {
+    const request = route.request(); const path = new URL(request.url()).pathname
+    expect(request.method()).toBe('POST'); expect(path.endsWith('/user-entry/lookup')).toBe(true)
+    expect(request.postDataJSON()).toEqual({ expected_revision: 1, recipient: '[phone:+12345@fixture.invalid]', consent: true }); reads.push(path)
+    if (reads.length === 2) await new Promise<void>((resolve) => { release = resolve })
+    if (reads.length === 3) { await route.abort(); return }
+    await route.fulfill({ json: { status: 'ok', data: { kind: 'phone', report: 'reported', observed_at: '2026-01-01T00:00:00Z', uid: 'private-uid', token: 'private-token' } } })
+  })
+  await page.setViewportSize({ width: 1280, height: 1000 }); await page.goto('/e2e/fixtures/user-entry.html')
+  const button = page.getByRole('button', { name: '只读解析收件人', exact: true }); const input = page.getByLabel('收件人原 URI')
+  await expect(button).toBeDisabled(); await input.fill('[phone:+12345@fixture.invalid]'); await button.click(); expect(reads).toEqual([])
+  consent = true; await button.click(); await expect(page.getByText('本次原服务端报告已解析；不是写入回执或接收就绪。', { exact: true })).toBeVisible()
+  await expect(page.getByText('private-', { exact: false })).toHaveCount(0); expect(reads).toHaveLength(1)
+  await page.screenshot({ path: 'test-results/jegotrip-device-ui/user-entry-desktop.png', fullPage: true, animations: 'disabled' })
+  await button.click(); await expect.poll(() => reads.length).toBe(2); await page.getByRole('button', { name: '切换收件人解析账号' }).click()
+  await expect(input).toHaveValue(''); release?.(); await expect(input).toBeEnabled(); await expect(page.getByText('本次原服务端报告已解析；不是写入回执或接收就绪。', { exact: true })).toHaveCount(0)
+  await input.fill('12345'); await expect(button).toBeDisabled(); await input.fill('[phone:+12345@fixture.invalid]'); await button.click()
+  await expect(page.getByText('本次原解析未完成；不自动重查、重发或重新登录。', { exact: true })).toBeVisible(); expect(reads).toHaveLength(3)
+  await page.setViewportSize({ width: 390, height: 844 }); expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true); expect(errors).toEqual([])
+  await page.screenshot({ path: 'test-results/jegotrip-device-ui/user-entry-mobile.png', fullPage: true, animations: 'disabled' })
+})

@@ -37,6 +37,8 @@ mod alive;
 mod user_read;
 #[path="runtime_im_reconciliation.rs"]
 mod reconciliation;
+#[path="runtime_user_entry.rs"]
+mod user_entry;
 use std::{fmt, sync::{Arc, Mutex, MutexGuard}, time::{Duration, Instant}};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use zeroize::{Zeroize, Zeroizing};
@@ -525,6 +527,8 @@ struct Attempt {
     startup_traces: Option<(Arc<StartupTrace>,Option<Arc<StartupTrace>>)>,
     alive_link:Option<Arc<super::alive_session::AliveLink>>,
     alive_handle:AsyncMutex<Option<super::alive_runtime::AliveRun>>,
+    user_entry:Mutex<Result<Option<Arc<super::user_entry_target::UserEntryTarget>>,super::runtime_provision::ProvisionError>>,
+    user_entries:Arc<super::user_entry_ownership::UserEntryBook>,
     // Serializes login/attach and controller commands with resource cleanup.
     // The independent event pump polls/configures without a controller lock.
     work: AsyncMutex<()>,
@@ -535,7 +539,7 @@ struct Attempt {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> { mutex.lock().unwrap_or_else(|p| p.into_inner()) }
 impl Attempt {
     fn retire(&self) {
-        lock(&self.state).retired = true; self.scope.close();
+        lock(&self.state).retired = true; self.scope.close();self.user_entries.retire();
         if let Some(scope)=&self.bootstrap_scope{scope.close();}
         *lock(&self.session_uri)=None;
     }
@@ -758,7 +762,7 @@ impl NativeHostingBackend {
                 if value!=0&&!state.incarnations.contains(&value){incarnation=Some(value);break;}}
             let incarnation=incarnation.ok_or(BackendFailure::Unavailable)?;
             let attempt=Arc::new(Attempt{owner:owner.clone(),scope:destination.connection_scope(),incarnation,state:Mutex::new(AttemptState::default()),commands:Mutex::new(None),
-                handle:AsyncMutex::new(None),session_uri:Mutex::new(None),bootstrap_scope,bootstrap_handle:AsyncMutex::new(None),startup_traces,alive_link,alive_handle:AsyncMutex::new(None),work:AsyncMutex::new(()),poll_work:AsyncMutex::new(())});
+                handle:AsyncMutex::new(None),session_uri:Mutex::new(None),bootstrap_scope,bootstrap_handle:AsyncMutex::new(None),startup_traces,alive_link,alive_handle:AsyncMutex::new(None),user_entry:Mutex::new(Ok(None)),user_entries:super::user_entry_ownership::UserEntryBook::original(owner.clone(),destination.connection_scope()),work:AsyncMutex::new(()),poll_work:AsyncMutex::new(())});
             state.owners.push(owner);state.incarnations.push(incarnation);state.slot=Some(attempt.clone());attempt
         };
         let mut retirement=Retirement::new(attempt.clone());let _work=attempt.work.lock().await;
@@ -766,6 +770,7 @@ impl NativeHostingBackend {
             if !attempt.scope.is_open()||lock(&attempt.state).retired{return Err(BackendFailure::Disconnected);}
             let plan=match bootstrap{Some(bootstrap)=>Some(self.bootstrap_common_original(&attempt,&captured,bootstrap).await?),None=>None};
             if let Some(plan)=&plan {
+                *lock(&attempt.user_entry)=plan.user_entry_for(&attempt.owner,&attempt.scope,&common.router);
                 let reference=if self.profile.account_alive.is_some(){Some(Zeroizing::new(plan.alive_reference_for(&attempt.owner,&attempt.scope,&common.router).map_err(|_|BackendFailure::Unavailable)?.to_vec()))}else{None};
                 let mut state=lock(&attempt.state);state.account_alive=Some(plan.account_alive());state.alive_reference=reference;
             }
@@ -911,7 +916,7 @@ impl NativeHostingBackend {
                 RuntimePolicy{io_timeout:self.profile.io_timeout,rpc_timeout:self.profile.rpc_timeout},None).map_err(|_|BackendFailure::Unavailable)?)}else{None};
             attempt = Arc::new(Attempt { owner: owner.clone(), scope: prepared.connection_scope(), incarnation,
                 state: Mutex::new(AttemptState::default()), commands: Mutex::new(None), handle: AsyncMutex::new(None),session_uri:Mutex::new(None),
-                bootstrap_scope:bootstrap_prepared.as_ref().map(|prepared|prepared.connection_scope()),bootstrap_handle:AsyncMutex::new(None),startup_traces:None,alive_link:None,alive_handle:AsyncMutex::new(None),
+                bootstrap_scope:bootstrap_prepared.as_ref().map(|prepared|prepared.connection_scope()),bootstrap_handle:AsyncMutex::new(None),startup_traces:None,alive_link:None,alive_handle:AsyncMutex::new(None),user_entry:Mutex::new(Ok(None)),user_entries:super::user_entry_ownership::UserEntryBook::original(owner.clone(),prepared.connection_scope()),
                 work: AsyncMutex::new(()), poll_work: AsyncMutex::new(()) });
             state.owners.push(owner); state.incarnations.push(incarnation); state.slot = Some(attempt.clone());
         }
@@ -1050,8 +1055,10 @@ impl NativeHostingBackend {
         }
         let commands = attempt.commands(&owner, &attempt.scope).map_err(|_| BackendFailure::Disconnected)?;
         let routing = borrowed(&self.profile.poll_routing); let metadata = borrowed(&self.profile.gateway_metadata);
+        if status == STATUS_UNREGISTER { attempt.user_entries.retire(); }
         let mut retirement = Retirement::new(attempt.clone());
         if status == STATUS_UNREGISTER { lock(&attempt.state).unregister_started = true; attempt.stop_alive().await?; }
+        if status == STATUS_UNREGISTER { attempt.user_entries.retired_and_empty().await; }
         let uri=match &self.profile.gateway_uri{
             Some(uri)=>uri.clone(),
             // No derived session URI may be fabricated: hosting needs the URI of
@@ -1069,8 +1076,10 @@ impl NativeHostingBackend {
         let attempt = self.original(&owner)?;
         let _work = attempt.work.lock().await;
         if lock(&attempt.state).released { return Ok(()); }
+        attempt.user_entries.retire();
         let mut retirement = Retirement::new(attempt.clone());
         attempt.stop_alive().await?;
+        attempt.user_entries.retired_and_empty().await;
         let mut bootstrap=attempt.bootstrap_handle.lock().await;
         if let Some(handle)=bootstrap.as_mut(){
             let released=handle.close().await;

@@ -210,6 +210,7 @@ impl ArcProtocol {
         let binding = self.incoming.as_ref().ok_or(CodecError::InvalidField)?.binding();
         self.client_ex = Some(self.rpc.client_ex_dispatcher(binding)?); Ok(())
     }
+    pub(super) fn captured_user_entry_auth(&self)->Result<Box<super::arc_session::UserEntryAuth>,CodecError>{self.rpc.user_entry_auth()}
     pub(super) fn captured_im_binding(&self)->Option<std::sync::Arc<super::im_delivery::ImBinding>>{self.im_binding.clone()}
     pub(super) fn captured_client_ex(&self) -> Option<super::rpc_client_ex::ClientExDispatcher> {
         self.client_ex.as_ref().map(super::rpc_client_ex::ClientExDispatcher::captured_copy)

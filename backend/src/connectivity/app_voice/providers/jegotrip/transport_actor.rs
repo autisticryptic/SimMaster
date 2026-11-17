@@ -30,6 +30,8 @@ use received::{ReceivedWork,ReceivedPending};
 #[path="im_user_read_actor.rs"]
 mod user_read;
 use user_read::{UserReadWork,UserReadPending};
+#[path="user_entry_actor.rs"]
+mod user_entry;
 use std::{fmt, future::poll_fn, io, pin::Pin, sync::Arc, task::Poll, time::{Duration, Instant}};
 use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite}, sync::{mpsc, oneshot}, task::JoinHandle};
 use zeroize::{Zeroize, Zeroizing};
@@ -160,6 +162,7 @@ enum Operation {
     ImRead(Box<ImReadWork>),
     WriteReceived(Box<ReceivedWork>),
     GetImBinding(oneshot::Sender<Option<Arc<super::im_delivery::ImBinding>>>),
+    GetUserEntryAuth(oneshot::Sender<Option<Box<super::arc_session::UserEntryAuth>>>),
     UserMarkRead(Box<UserReadWork>),
     ArmNativeReceivers(std::sync::Arc<super::native_receiver::NativeReceiverSetup>), ConfigureNativeReceivers(u32),
     GetOffline(i64, Vec<Property>), CompleteOfflineHint(super::rpc_offline::IncomingOfflineHint, bool),
@@ -183,7 +186,7 @@ impl Operation {
             Self::ArmNativeReceivers(setup) => setup.retained_bytes(),
             Self::ImRead(work)=>work.query.retained_bytes(),
             Self::WriteReceived(work)=>work.permit.query().retained_bytes(),
-            Self::GetImBinding(_)=>0,
+            Self::GetImBinding(_)|Self::GetUserEntryAuth(_)=>0,
             Self::UserMarkRead(work)=>work.permit.label().len()+96,
             Self::ArmClientEx(binding)=>binding.object.len()+binding.domain.len()+binding.receiver.len(),
             Self::CompleteCall(_,_,properties)|Self::ConfigureCallControl(properties)|Self::Call(_,_,properties,_)=>properties.iter().map(|p|p.key.len()+p.value.len()).sum(),
@@ -879,6 +882,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                     Ok(packets)=>{received_wait=Some(*work);Ok(packets)}
                     Err(_)=>{work.permit.cancel();let _=work.reply.send(Err(RuntimeError::InvalidConfiguration));let _=command.completion.send(Err(RuntimeError::InvalidConfiguration));return Ok(());}
                 }
+            }
+            Operation::GetUserEntryAuth(reply)=>{
+                let auth=if self.common.is_some(){self.backend.captured_user_entry_auth().ok()}else{None};
+                let _=reply.send(auth);let _=command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),None)));return Ok(());
             }
             Operation::GetImBinding(reply)=>{
                 let binding=if self.common.is_some(){self.backend.captured_im_binding()}else{None};

@@ -117,7 +117,7 @@ impl ProvisionedLogin {
 ///but use still requires the pre-created ORIGINAL destination scope.
 pub(super) struct ProvisionedCommonLogin{
     owner:AttemptOwner,source:RpcConnectionScope,destination:RpcConnectionScope,policy:super::router_connector::RouterPolicyIdentity,call_id:i32,account_alive:AccountAliveState,
-    entry:super::object_reference::ObjectReference,alive_reference:Zeroizing<Vec<u8>>,domain_name:Zeroizing<Vec<u8>>,domain_id:Zeroizing<Vec<u8>>,app_id:Zeroizing<Vec<u8>>,cc:Zeroizing<Vec<u8>>,
+    entry:super::object_reference::ObjectReference,alive_reference:Zeroizing<Vec<u8>>,user_entry:Result<Option<Arc<super::user_entry_target::UserEntryTarget>>,ProvisionError>,domain_name:Zeroizing<Vec<u8>>,domain_id:Zeroizing<Vec<u8>>,app_id:Zeroizing<Vec<u8>>,cc:Zeroizing<Vec<u8>>,
 }
 impl fmt::Debug for ProvisionedCommonLogin{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ProvisionedCommonLogin(<redacted>)")}}
 impl ProvisionedCommonLogin{
@@ -143,11 +143,21 @@ impl ProvisionedCommonLogin{
         let alive=deployment.auxiliary_references_for(owner,source).ok_or(ProvisionError::Scope)?.0;
         if alive.len()>MAX_FIELD_BYTES||total.checked_add(alive.len()).is_none_or(|n|n>128*1024){return Err(ProvisionError::ResourceLimit);}
         let alive_reference=Zeroizing::new(alive.to_vec());
+        // Auxiliary decode failure is retained for an explicit lookup; it does
+        // not change successful original SDK bootstrap/default behaviour.
+        let user_entry=super::user_entry_target::UserEntryTarget::from_bootstrap(reply,owner,source,destination,router,reference_key,&domain_name,&cc)
+            .map_err(|_|ProvisionError::UnsupportedReference).and_then(|target|{
+                if target.as_ref().is_some_and(|t|total.checked_add(alive.len()).and_then(|n|n.checked_add(t.retained_bytes())).is_none_or(|n|n>128*1024)){return Err(ProvisionError::ResourceLimit);}
+                Ok(target.map(Arc::from))
+            });
         Ok(Self{owner:reply.owner().clone(),source:source.clone(),destination:destination.clone(),policy:router.original_identity(),call_id:reply.call_id(),
-            account_alive:deployment.account_alive_state_for(owner,source).map_err(|_|ProvisionError::Configuration)?,entry,alive_reference,domain_name,domain_id,app_id,cc})
+            account_alive:deployment.account_alive_state_for(owner,source).map_err(|_|ProvisionError::Configuration)?,entry,alive_reference,user_entry,domain_name,domain_id,app_id,cc})
     }
     fn matches(&self,owner:&AttemptOwner,destination:&RpcConnectionScope,router:&super::router_connector::RouterPolicy)->bool{
         &self.owner==owner&&self.destination.matches(destination)&&destination.is_open()&&self.policy.matches(router)
+    }
+    pub(super) fn user_entry_for(&self,owner:&AttemptOwner,parent:&RpcConnectionScope,router:&super::router_connector::RouterPolicy)->Result<Option<Arc<super::user_entry_target::UserEntryTarget>>,ProvisionError>{
+        if !self.matches(owner,parent,router){return Err(ProvisionError::Scope);}self.user_entry.clone()
     }
     pub fn alive_reference_for(&self,owner:&AttemptOwner,destination:&RpcConnectionScope,router:&super::router_connector::RouterPolicy)->Result<&[u8],ProvisionError>{
         if !self.matches(owner,destination,router){return Err(ProvisionError::Scope);}Ok(&self.alive_reference)

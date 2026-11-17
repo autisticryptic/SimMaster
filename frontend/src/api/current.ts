@@ -395,6 +395,7 @@ export interface AppAccountView {
   startup_failure?: JegotripStartupFailure
   im_user_read_supported?: boolean
   im_reconciliation_supported?: boolean
+  user_entry_supported?: boolean
 }
 
 async function request<T>(
@@ -1139,6 +1140,9 @@ class SimAdminCurrentAPI {
   }
   async reconcileAppImUserRead(lineId: string, receiptId: number, expectedRevision: number) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-user-reads/${receiptId}/reconcile`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, consent: true }), cache: 'no-store', timeoutMs: 10000 })
+  }
+  async lookupAppUserEntry(lineId: string, expectedRevision: number, recipient: string) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/user-entry/lookup`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, recipient, consent: true }), cache: 'no-store', timeoutMs: 10000 })
   }
   async deleteAppImMessage(lineId: string, id: number) {
     return request<ApiResponse<boolean>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-messages/${id}`, { method: 'DELETE', timeoutMs: 10000 })

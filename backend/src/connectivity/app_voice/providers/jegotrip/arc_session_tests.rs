@@ -4,6 +4,8 @@ use crate::connectivity::app_voice::providers::jegotrip::{
     session::{HostingSession, Phase}, tests::imported,
 };
 
+#[path="user_entry_auth_tests.rs"]
+mod user_entry;
 fn owner() -> AttemptOwner {
     let mut session = HostingSession::new("line-a".into());
     session.import(imported(), 100).unwrap();

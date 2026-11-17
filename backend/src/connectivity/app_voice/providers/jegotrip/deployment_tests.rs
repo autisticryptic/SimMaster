@@ -113,3 +113,5 @@ fn new_decode_key_imports_are_optional_redacted_bounded_and_not_phone_or_gateway
 mod user_entry;
 #[path="user_entry_data_tests.rs"]
 mod recipient_data;
+#[path="user_entry_runtime_tests.rs"]
+mod user_entry_runtime;

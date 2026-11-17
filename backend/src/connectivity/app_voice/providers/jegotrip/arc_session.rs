@@ -661,6 +661,9 @@ mod offline_tests;
 mod received;
 #[path="rpc_user_read_session.rs"]
 mod user_read;
+#[path="user_entry_auth.rs"]
+mod user_entry_auth;
+pub(super) use user_entry_auth::UserEntryAuth;
 #[cfg(test)]
 #[path = "arc_session_tests.rs"]
 mod tests;
