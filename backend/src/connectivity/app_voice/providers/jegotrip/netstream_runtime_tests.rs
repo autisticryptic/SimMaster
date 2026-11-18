@@ -78,6 +78,15 @@ impl Peer{
    assert_eq!((header.packet_kind,header.fragment_part),(0,1));let route=native_routing::decode_routing_body(body).unwrap();let packet=frame(route.payload);self.client_high=packet.wire;return Some(packet);
   }
  }
+ pub(crate) async fn read_channel_input_only(&mut self)->Option<Frame>{
+  // A retired peer must not emit Channel ACK/router-alive responses. Keep the
+  // same original FD and strict frame decoder; EOF/reset is a terminal read.
+  loop{let raw=match read_packet(&mut self.tls).await{Ok(Some(raw))=>raw,Ok(None)=>return None,Err(e)if matches!(e.kind(),io::ErrorKind::UnexpectedEof|io::ErrorKind::ConnectionReset)=>return None,Err(e)=>panic!("retired original peer read failed: {e:?}")};let(header,body)=decode_path_header(&raw).unwrap();
+   if header.packet_kind==3{assert_eq!(header.fragment_part,1);assert!(body.is_empty());continue;}
+   if header.packet_kind==0&&header.fragment_part==0{assert!(!body.is_empty());continue;}
+   assert_eq!((header.packet_kind,header.fragment_part),(0,1));let route=native_routing::decode_routing_body(body).unwrap();let packet=frame(route.payload);self.client_high=packet.wire;return Some(packet);
+  }
+ }
  pub(crate) async fn start(&mut self){
   self.write_channel(&channel(self.next_channel,PacketKind::Start,0,self.client_high,self.client_start.wrapping_sub(1),&[])).await;self.next_channel+=1;
   let ack=self.read_channel().await.unwrap();assert_eq!(ack.kind,PacketKind::Probe);assert_eq!(ack.ack,0x9000);assert_eq!(ack.body,[0x89,0x87,0x22,0x83]);self.client_delivered=self.client_start;

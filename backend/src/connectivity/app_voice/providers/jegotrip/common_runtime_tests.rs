@@ -39,6 +39,13 @@ impl CommonPeer{
    self.peer.ack(self.last_client).await;
   }
  }
+ pub(crate) async fn next_input_only(&mut self)->Option<Vec<u8>>{
+  // Decode already buffered original records without sending any ACK after
+  // cancellation. Original active next()/read_channel() behavior is unchanged.
+  loop{if let Some(value)=self.pending.pop_front(){return Some(value);}let frame=self.peer.read_channel_input_only().await?;if frame.kind==PacketKind::Probe{continue;}assert_eq!(frame.kind,PacketKind::Data);
+   if frame.root.wrapping_sub(self.last_client) as i16>0{assert_eq!(frame.previous,Some(self.last_client));for record in self.records.on_payload(&frame.body).unwrap(){self.pending.push_back(self.receiver.decode(record.expose_to_transport()).unwrap().expose_to_transport().to_vec());}self.last_client=frame.root;}
+  }
+ }
  pub(crate) async fn no_more_common(mut self){assert!(self.next().await.is_none(),"unexpected Common control or business replay before EOF");}
 }
 fn reply_packet(payload:&[u8],compressed:bool)->Vec<u8>{
