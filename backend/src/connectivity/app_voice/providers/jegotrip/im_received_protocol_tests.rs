@@ -2,6 +2,8 @@
 //! phase transitions are supplementary; real IO/Joins have separate peer cases.
 use super::*;
 use n::{im_inbox::{CursorSession,GapCommitted,ReceivedAdmission,ReceivedWritePermit},im_receipt_policy::NativeImReceiptConfig,rpc_im::ImQuery};
+#[path="native_rpc_budget_received_tests.rs"]
+mod shared_budget;
 fn status(base:i64,target:i64,time:i64)->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.u32(1).unwrap();w.bytes(b"1_2").unwrap();let b=base.to_string();let t=target.to_string();w.properties(&[RpcProperty{key:n::im_status::PEER_READ,value:b.as_bytes()},RpcProperty{key:n::im_status::LATEST,value:t.as_bytes()}]).unwrap();w.i64(time).unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}
 fn bool_result(value:bool)->Vec<u8>{let mut w=Writer::new();w.boolean(value).unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}
 fn empty()->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.u32(0).unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}

@@ -308,11 +308,13 @@ impl ArcRpcSession {
         let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
         if !binding.authenticates(&auth.user_id,&auth.selected_session_id){return Err(CodecError::InvalidField);}
         let arguments=query.arguments(&auth.user_id)?;let id=self.next_id.ok_or(CodecError::InvalidCallId)?;
-        let request=super::rpc_im::ImRequest::original(binding,query.clone(),gate,deadline,id)?;
         // Native591560 stores the named Agent's original112 field;59994C
         // installs exactly that field as id. #Group is not AccountEntry and is
         // never an endpoint/facet fallback. The token is this matched login.
         let bytes=encode_request(id,&[RpcProperty{key:b"id",value:super::rpc_im::GROUP_OBJECT},RpcProperty{key:b"token",value:&auth.token}],query.method().as_bytes(),arguments.expose_to_transport())?;
+        let retained=bytes.expose_to_transport().len().checked_add(query.retained_bytes()).and_then(|n|n.checked_add(64)).ok_or(CodecError::TooLarge)?;
+        let budget=self.connection.reserve_native_rpc(retained)?;
+        let request=super::rpc_im::ImRequest::original(binding,query.clone(),gate,deadline,id,budget)?;
         self.next_id=id.checked_add(1);self.pending.insert(id,PendingRpc{kind:PendingKind::ImRead,selected_session_id:None,scheduler:None,call:None,im:Some(request),received:None,user_read:None});Ok((id,bytes))
     }
     pub(super) fn take_im_replies(&mut self)->Vec<super::rpc_im::OwnedImReply>{std::mem::take(&mut self.im_replies)}

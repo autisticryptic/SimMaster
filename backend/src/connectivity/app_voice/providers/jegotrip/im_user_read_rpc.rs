@@ -2,10 +2,10 @@
 //! results. No public bool/row/input can construct or resolve this capability.
 use super::{im_inbox::UserReadPermit,im_user_read_data,rpc_pending::RpcConnectionScope,rpc_stream::{CodecError,MAX_STREAM_BYTES},session::AttemptOwner};
 use std::{fmt,sync::Arc};use zeroize::Zeroizing;
-pub(super) struct UserReadRpcRequest{permit:Arc<UserReadPermit>,id:i32}
+pub(super) struct UserReadRpcRequest{permit:Arc<UserReadPermit>,id:i32,budget:Arc<super::native_rpc_budget::NativeRpcReservation>}
 impl fmt::Debug for UserReadRpcRequest{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("OriginalUserReadRpcRequest(<redacted>)")}}
 impl UserReadRpcRequest{
-    pub(super) fn original(permit:Arc<UserReadPermit>,id:i32)->Result<Arc<Self>,CodecError>{if !permit.current(id){return Err(CodecError::InvalidField);}Ok(Arc::new(Self{permit,id}))}
+    pub(super) fn original(permit:Arc<UserReadPermit>,id:i32,budget:Arc<super::native_rpc_budget::NativeRpcReservation>)->Result<Arc<Self>,CodecError>{if !permit.current(id)||!budget.belongs_to(&permit.binding().scope()){return Err(CodecError::InvalidField);}Ok(Arc::new(Self{permit,id,budget}))}
     pub(super) fn id(&self)->i32{self.id}
     pub(super) fn permit(&self)->&Arc<UserReadPermit>{&self.permit}
     pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{self.permit.matches(owner,scope)&&self.permit.current(self.id)}
@@ -16,6 +16,7 @@ impl OwnedUserReadReply{
     pub(super) fn original(request:Arc<UserReadRpcRequest>,code:u32,bytes:&[u8])->Result<Self,CodecError>{
         if !request.permit.current(request.id)||bytes.len()>MAX_STREAM_BYTES{return Err(CodecError::InvalidField);}
         if code==0{im_user_read_data::decode_mark_read_result(code,bytes)?;}
+        request.budget.retain_reply(bytes.len())?;
         Ok(Self{request,code,bytes:Zeroizing::new(bytes.to_vec())})
     }
     pub(super) fn request(&self)->&Arc<UserReadRpcRequest>{&self.request}

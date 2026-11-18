@@ -251,6 +251,8 @@ pub(crate) enum DelayPoint{Write,Flush}
 #[path="im_io_test_gate.rs"]
 mod im_io_gate;
 pub(crate) use im_io_gate::gate_original_write;
+#[path="user_entry_io_test_gate.rs"]
+pub(crate) mod auxiliary_io;
 struct SlowOriginalIo{inner:BoxRuntimeIo,point:DelayPoint,delay:Duration,sleep:Option<std::pin::Pin<Box<tokio::time::Sleep>>>,waited:bool,
  skip:usize,pauses:std::sync::Arc<std::sync::atomic::AtomicUsize>}
 impl SlowOriginalIo{

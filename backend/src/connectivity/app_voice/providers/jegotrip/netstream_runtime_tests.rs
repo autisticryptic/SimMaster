@@ -12,6 +12,7 @@ use tokio_rustls::{rustls::{ServerConfig,version::TLS13},server::TlsStream};
 pub(crate) fn owner()->AttemptOwner{let mut s=HostingSession::new("fixture-native-netstream".into());s.import(imported(),100).unwrap();s.begin_login(100).unwrap()}
 pub(crate) fn policy(root:&str,port:u16)->RouterPolicy{RouterPolicy::supplied(&format!("Router:tls -h 127.0.0.1 -p {port} -ri 12001;"),&[
  RouterAnchor{router_id:12001,host:"127.0.0.1",port,authority:"127.0.0.1",root,enable_sni:false}]).unwrap()}
+pub(crate) fn gate_auxiliary_prefix(path:&mut NetstreamPath,test:Arc<super::super::router_runtime::tests::auxiliary_io::AuxiliaryIoTest>){super::super::router_runtime::tests::auxiliary_io::gate_auxiliary_prefix(&mut path.router,test);}
 pub(crate) fn timeouts()->RouterTimeouts{RouterTimeouts{connect:Duration::from_secs(2),handshake:Duration::from_secs(3),partial:Duration::from_secs(1),io:Duration::from_secs(2),startup:Duration::from_secs(5)}}
 async fn read_packet(tls:&mut TlsStream<TcpStream>)->io::Result<Option<Vec<u8>>>{
  let n=match tls.read_u32().await{Ok(n)=>n as usize,Err(e) if matches!(e.kind(),io::ErrorKind::UnexpectedEof|io::ErrorKind::ConnectionReset)=>return Ok(None),Err(e)=>return Err(e)};

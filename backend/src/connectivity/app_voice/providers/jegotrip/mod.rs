@@ -56,6 +56,7 @@ mod im_user_read_rpc;
 mod user_entry_data;
 mod user_entry_reference;
 mod user_entry_ownership;
+mod native_rpc_budget;
 mod user_entry_io;
 mod user_entry_target;
 mod user_entry_rpc;

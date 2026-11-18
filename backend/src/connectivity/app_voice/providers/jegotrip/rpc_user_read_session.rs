@@ -9,8 +9,10 @@ impl ArcRpcSession{
         let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;if !binding.authenticates(&auth.user_id,&auth.selected_session_id){return Err(CodecError::InvalidField);}
         let args=im_user_read_data::encode_mark_read(StatusLabel::parse(permit.label())?,&auth.user_id,permit.index(),permit.epoch_ms())?;let id=self.next_id.ok_or(CodecError::InvalidCallId)?;
         let bytes=encode_request(id,&[RpcProperty{key:b"id",value:super::super::rpc_im::GROUP_OBJECT},RpcProperty{key:b"token",value:&auth.token}],im_user_read_data::MARK_READ_METHOD.as_bytes(),args.expose_to_transport())?;
+        let retained=bytes.expose_to_transport().len().checked_add(permit.label().len()).and_then(|n|n.checked_add(96)).ok_or(CodecError::TooLarge)?;
+        let budget=self.connection.reserve_native_rpc(retained)?;
         permit.arm(id,deadline).map_err(|_|CodecError::InvalidField)?;self.next_id=id.checked_add(1);
-        self.pending.insert(id,PendingRpc{kind:PendingKind::UserRead,selected_session_id:None,scheduler:None,call:None,im:None,received:None,user_read:Some(UserReadRpcRequest::original(permit,id)?)});Ok((id,bytes))
+        self.pending.insert(id,PendingRpc{kind:PendingKind::UserRead,selected_session_id:None,scheduler:None,call:None,im:None,received:None,user_read:Some(UserReadRpcRequest::original(permit,id,budget)?)});Ok((id,bytes))
     }
     pub(in super::super) fn im_reply_count(&self)->usize{self.im_replies.len()+self.received_replies.len()+self.user_read_replies.len()}
     pub(in super::super) fn im_reply_bytes(&self)->usize{self.im_replies.iter().map(|r|r.retained_bytes()).chain(self.received_replies.iter().map(|r|r.retained_bytes())).chain(self.user_read_replies.iter().map(|r|r.retained_bytes())).sum()}

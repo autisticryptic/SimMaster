@@ -16,7 +16,7 @@ pub(super) fn netstream_error(error:super::netstream_runtime::NetstreamError)->U
 pub(super) fn common_error(error:super::common_runtime::CommonIoError)->UserEntryError{use super::common_runtime::CommonIoError as E;match error{E::Timeout=>UserEntryError::Timeout,E::Netstream(error)=>netstream_error(error),_=>UserEntryError::Transport}}
 struct Query{action:Arc<UserEntryAction>,id:i32}
 impl fmt::Debug for Query{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("UserEntryQuery(<redacted>)")}}
-pub(super) struct OwnedUserEntryReply{query:Arc<Query>,accepted:bool,uid:Option<Zeroizing<Vec<u8>>>,observed_at:String}
+pub(super) struct OwnedUserEntryReply{query:Arc<Query>,accepted:bool,uid:Option<Zeroizing<Vec<u8>>>,observed_at:String,_budget:Arc<super::native_rpc_budget::NativeRpcReservation>}
 impl fmt::Debug for OwnedUserEntryReply{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("OwnedUserEntryReply(<redacted>)")}}
 impl OwnedUserEntryReply{
     pub(super) fn observe(&self,action:&Arc<UserEntryAction>)->Result<UserEntryObservation,UserEntryError>{
@@ -54,6 +54,7 @@ pub(super) async fn resolve_original(action:Arc<UserEntryAction>,auth:Box<UserEn
         let route=RouterPath::open_user_entry(owner.clone(),child.clone(),&parent,router,access,timeouts,deadline).await.map_err(router_error)?;
         let stream=NetstreamPath::open(route,endpoint,0,deadline,timeouts.partial).await.map_err(netstream_error)?;
         let mut path=CommonPath::from_original(stream,timeouts.partial,compress).map_err(common_error)?;
+        #[cfg(test)]if let Some(test)=action.auxiliary_io_test(){super::common_runtime::tests::gate_auxiliary_prefix(&mut path,test);}
         if !current(){return Err(UserEntryError::Scope);}
         if !path.send_call(owner,&child,CallKind::Request,rpc.expose_to_transport(),deadline).await.map_err(common_error)?{return Err(UserEntryError::Scope);}
         loop{
@@ -69,6 +70,7 @@ pub(super) async fn resolve_original(action:Arc<UserEntryAction>,auth:Box<UserEn
                 if reply.call_id==query.id{if matched.is_some(){return Err(UserEntryError::Protocol);}matched=Some(reply);}
             }
             let Some(reply)=matched else{continue;};
+            let budget=lease.retain_reply(reply.result_stream.len()).map_err(|_|UserEntryError::Capacity)?;
             let mut uid=None;let accepted=if reply.result_code!=0{false}else{
                 let data=user_entry_data::decode_aid_to_uid(reply.result_code,reply.result_stream).map_err(|_|UserEntryError::Protocol)?;
                 // A negative reply cannot deliver an otherwise valid UID.
@@ -78,7 +80,7 @@ pub(super) async fn resolve_original(action:Arc<UserEntryAction>,auth:Box<UserEn
                 }}data.accepted
             };
             if !current()||Instant::now()>=deadline{return Err(UserEntryError::Scope);}
-            let result=OwnedUserEntryReply{query:query.clone(),accepted,uid,observed_at:chrono::Utc::now().to_rfc3339()};
+            let result=OwnedUserEntryReply{query:query.clone(),accepted,uid,observed_at:chrono::Utc::now().to_rfc3339(),_budget:budget};
             path.close();return Ok(result);
         }
     });

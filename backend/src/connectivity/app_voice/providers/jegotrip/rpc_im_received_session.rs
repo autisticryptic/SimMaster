@@ -12,11 +12,13 @@ impl ArcRpcSession{
         let query=permit.query();if query.operation()!=super::super::rpc_im::ImOperation::SetReceived{return Err(CodecError::InvalidField);}
         let arguments=query.arguments(&auth.user_id)?;let id=self.next_id.ok_or(CodecError::InvalidCallId)?;
         let bytes=encode_request(id,&[RpcProperty{key:b"id",value:super::super::rpc_im::GROUP_OBJECT},RpcProperty{key:b"token",value:&auth.token}],query.method().as_bytes(),arguments.expose_to_transport())?;
+        let retained=bytes.expose_to_transport().len().checked_add(query.retained_bytes()).and_then(|n|n.checked_add(64)).ok_or(CodecError::TooLarge)?;
+        let budget=self.connection.reserve_native_rpc(retained)?;
         permit.arm_request(id,deadline).map_err(|_|CodecError::InvalidField)?;
         // Once the durable permit names this ID it is consumed even if a
         // following local scope check fails. IDs are never reused for a retry.
         self.next_id=id.checked_add(1);
-        let received=ReceivedRpcRequest::original(permit,id)?;
+        let received=ReceivedRpcRequest::original(permit,id,budget)?;
         self.pending.insert(id,PendingRpc{kind:PendingKind::ImWrite,selected_session_id:None,scheduler:None,call:None,im:None,received:Some(received),user_read:None});Ok((id,bytes))
     }
     pub(in super::super) fn take_received_replies(&mut self)->Vec<OwnedReceivedReply>{std::mem::take(&mut self.received_replies)}

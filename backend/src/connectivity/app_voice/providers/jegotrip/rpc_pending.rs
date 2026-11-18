@@ -16,12 +16,15 @@ use super::{
 use std::{collections::BTreeMap, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
 
 #[derive(Clone)]
-pub struct RpcConnectionScope(Arc<AtomicBool>, Arc<Mutex<()>>, Arc<tokio::sync::Notify>, Arc<AtomicBool>);
+pub struct RpcConnectionScope(Arc<AtomicBool>, Arc<Mutex<()>>, Arc<tokio::sync::Notify>, Arc<AtomicBool>, Arc<super::native_rpc_budget::NativeRpcBudget>);
 
 impl RpcConnectionScope {
     pub(super) fn fresh() -> Self {
-        Self(Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(())), Arc::new(tokio::sync::Notify::new()), Arc::new(AtomicBool::new(false)))
+        Self(Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(())), Arc::new(tokio::sync::Notify::new()), Arc::new(AtomicBool::new(false)),super::native_rpc_budget::NativeRpcBudget::original())
     }
+    pub(super) fn has_rpc_budget(&self,budget:&Arc<super::native_rpc_budget::NativeRpcBudget>)->bool{Arc::ptr_eq(&self.4,budget)}
+    pub(super) fn reserve_native_rpc(&self,bytes:usize)->Result<Arc<super::native_rpc_budget::NativeRpcReservation>,CodecError>{self.4.reserve(self,bytes)}
+    #[cfg(test)]pub(super) fn native_rpc_resources(&self)->(usize,usize){self.4.snapshot()}
     /// Authenticated native session revocation is sticky for THIS scope. It is
     /// not IO closure: the owning actor may still write the one control reply
     /// before closing/Joining, but no new RPC/readiness/reconnect is admitted.

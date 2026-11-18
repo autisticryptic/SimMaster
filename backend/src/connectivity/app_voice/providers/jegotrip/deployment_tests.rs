@@ -115,3 +115,5 @@ mod user_entry;
 mod recipient_data;
 #[path="user_entry_runtime_tests.rs"]
 mod user_entry_runtime;
+#[path="native_rpc_budget_tests.rs"]
+mod native_rpc_budget;

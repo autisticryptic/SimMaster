@@ -39,12 +39,12 @@ impl ImQuery{
 }
 /// A cancellation gate belongs to the parent account run, while binding is the
 /// one authenticated original native receiver. It is never serialized.
-pub(super) struct ImRequest{binding:Arc<ImBinding>,query:Arc<ImQuery>,gate:Arc<ImReceiptGate>,deadline:Instant,call_id:i32}
+pub(super) struct ImRequest{binding:Arc<ImBinding>,query:Arc<ImQuery>,gate:Arc<ImReceiptGate>,deadline:Instant,call_id:i32,budget:Arc<super::native_rpc_budget::NativeRpcReservation>}
 impl fmt::Debug for ImRequest{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("OriginalImRequest(<redacted>)")}}
 impl ImRequest{
-    pub(super) fn original(binding:Arc<ImBinding>,query:Arc<ImQuery>,gate:Arc<ImReceiptGate>,deadline:Instant,call_id:i32)->Result<Arc<Self>,CodecError>{
-        if call_id<=0||Instant::now()>=deadline||!gate.live()||!binding.matches(binding.owner(),&binding.scope()){return Err(CodecError::InvalidField);}
-        Ok(Arc::new(Self{binding,query,gate,deadline,call_id}))
+    pub(super) fn original(binding:Arc<ImBinding>,query:Arc<ImQuery>,gate:Arc<ImReceiptGate>,deadline:Instant,call_id:i32,budget:Arc<super::native_rpc_budget::NativeRpcReservation>)->Result<Arc<Self>,CodecError>{
+        if call_id<=0||Instant::now()>=deadline||!gate.live()||!binding.matches(binding.owner(),&binding.scope())||!budget.belongs_to(&binding.scope()){return Err(CodecError::InvalidField);}
+        Ok(Arc::new(Self{binding,query,gate,deadline,call_id,budget}))
     }
     pub(super) fn active(&self)->bool{self.gate.live()&&Instant::now()<self.deadline&&self.binding.matches(self.binding.owner(),&self.binding.scope())}
     pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{self.active()&&self.binding.matches(owner,scope)}
@@ -73,7 +73,7 @@ impl fmt::Debug for ImReplyData<'_>{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt
 pub struct OwnedImReply{request:Arc<ImRequest>,code:u32,bytes:Zeroizing<Vec<u8>>}
 impl fmt::Debug for OwnedImReply{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("OwnedImReply(<redacted>)")}}
 impl OwnedImReply{
-    pub(super) fn original(request:Arc<ImRequest>,code:u32,bytes:&[u8])->Result<Self,CodecError>{request.decode(code,bytes)?;Ok(Self{request,code,bytes:Zeroizing::new(bytes.to_vec())})}
+    pub(super) fn original(request:Arc<ImRequest>,code:u32,bytes:&[u8])->Result<Self,CodecError>{request.decode(code,bytes)?;request.budget.retain_reply(bytes.len())?;Ok(Self{request,code,bytes:Zeroizing::new(bytes.to_vec())})}
     pub(super) fn request(&self)->&Arc<ImRequest>{&self.request}
     pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{self.request.matches(owner,scope)}
     pub(super) fn result(&self)->Result<ImReplyData<'_>,CodecError>{self.request.decode(self.code,&self.bytes)}

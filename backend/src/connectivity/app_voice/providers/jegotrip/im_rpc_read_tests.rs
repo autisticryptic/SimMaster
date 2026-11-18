@@ -2,6 +2,8 @@
 //! actor/consumer, device/SDK execution, remote write or cursor grant.
 use super::*;
 use n::{rpc_im::{ImQuery,ImReplyData},im_status,im_data::ImBox};
+#[path="native_rpc_budget_im_tests.rs"]
+mod shared_budget;
 fn refresh_result(time:i64,accepted:bool)->Vec<u8>{let mut w=Writer::new();w.boolean(accepted).unwrap();w.u32(0).unwrap();w.i64(time).unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}
 fn receive_result(indices:&[i64])->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.u32(indices.len()as u32).unwrap();for index in indices{w.i64(*index).unwrap();w.i64(7).unwrap();w.bytes(b"private-sender").unwrap();w.bytes(b"Text").unwrap();w.bytes(br#"{"text":"received privately"}"#).unwrap();w.properties(&[]).unwrap();w.properties(&[]).unwrap();}w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}
 fn refresh()->Arc<ImQuery>{Arc::new(ImQuery::refresh(&[],-1).unwrap())}

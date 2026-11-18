@@ -4,14 +4,14 @@ use super::{im_inbox::ReceivedWritePermit,im_data,rpc_im::ImQuery,rpc_pending::R
     rpc_stream::{CodecError,MAX_STREAM_BYTES},session::AttemptOwner};
 use std::{fmt,sync::Arc};
 use zeroize::Zeroizing;
-pub(super) struct ReceivedRpcRequest{permit:Arc<ReceivedWritePermit>,query:Arc<ImQuery>,id:i32}
+pub(super) struct ReceivedRpcRequest{permit:Arc<ReceivedWritePermit>,query:Arc<ImQuery>,id:i32,budget:Arc<super::native_rpc_budget::NativeRpcReservation>}
 impl fmt::Debug for ReceivedRpcRequest{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("OriginalReceivedRpcRequest(<redacted>)")}}
 impl ReceivedRpcRequest{
     /// Only the original ARC pending WRITE allocation calls this constructor;
     /// arming binds one original ID and deadline on the durable permit first.
-    pub(super) fn original(permit:Arc<ReceivedWritePermit>,id:i32)->Result<Arc<Self>,CodecError>{
-        if !permit.request_is_current(id){return Err(CodecError::InvalidField);}
-        Ok(Arc::new(Self{query:permit.query(),permit,id}))
+    pub(super) fn original(permit:Arc<ReceivedWritePermit>,id:i32,budget:Arc<super::native_rpc_budget::NativeRpcReservation>)->Result<Arc<Self>,CodecError>{
+        if !permit.request_is_current(id)||!budget.belongs_to(&permit.binding().scope()){return Err(CodecError::InvalidField);}
+        Ok(Arc::new(Self{query:permit.query(),permit,id,budget}))
     }
     pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{
         self.permit.is_original_for(owner,scope)&&self.permit.request_is_current(self.id)
@@ -28,6 +28,7 @@ impl OwnedReceivedReply{
         if code==0{im_data::decode_set_read_result(code,bytes)?;}
         // A matched native nonzero/version-error result is a negative, not a
         // license to replay the write under a new version or request ID.
+        request.budget.retain_reply(bytes.len())?;
         Ok(Self{request,code,bytes:Zeroizing::new(bytes.to_vec())})
     }
     pub(super) fn request(&self)->&Arc<ReceivedRpcRequest>{&self.request}

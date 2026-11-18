@@ -123,6 +123,7 @@ async fn common_receive_scope_close_drops_original_owner_without_detached_task()
  let cancel=async move{let scope:RpcConnectionScope=rx.await.unwrap();tokio::task::yield_now().await;scope.close();};tokio::join!(server,client,cancel);
 }
 
+pub(crate) fn gate_auxiliary_prefix(path:&mut CommonPath,test:Arc<super::super::router_runtime::tests::auxiliary_io::AuxiliaryIoTest>){super::super::netstream_runtime::tests::gate_auxiliary_prefix(&mut path.stream,test);}
 pub(crate) fn gate_im_read_write(path:&mut CommonPath,blocked:Arc<AtomicBool>)->Arc<std::sync::atomic::AtomicUsize>{
  super::super::netstream_runtime::tests::gate_im_read_write(&mut path.stream,blocked)
 }
