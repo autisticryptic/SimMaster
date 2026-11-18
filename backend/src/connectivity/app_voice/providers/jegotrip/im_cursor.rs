@@ -54,6 +54,13 @@ impl GapCommitted{
     pub(in super::super) fn proofs(&self)->&[CommittedIm]{&self.proofs}
     pub(in super::super) fn end(&self)->i64{self.end}
     pub(in super::super) fn box_bytes(&self)->&[u8]{&self.box_id}
+    pub(in super::super) fn same_captured_span(&self,other:&Self)->bool{Arc::ptr_eq(&self.binding,&other.binding)&&Arc::ptr_eq(&self.gate,&other.gate)&&Arc::ptr_eq(&self.run,&other.run)&&self.box_id.as_slice()==other.box_id.as_slice()&&self.start==other.start&&self.end==other.end&&self.span_hash==other.span_hash}
+    pub(in super::super) fn captured_copy(&self)->Self{Self{binding:self.binding.clone(),gate:self.gate.clone(),run:self.run.clone(),box_id:Zeroizing::new(self.box_id.to_vec()),start:self.start,end:self.end,span_hash:self.span_hash,proofs:self.proofs.iter().map(CommittedIm::captured_copy).collect()}}
+    pub(in super::super) fn validate_current(&self,conn:&Connection)->Result<(),&'static str>{
+        let context=self.receipt_context();context.validate(conn)?;
+        let current:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_im_receive_cursors WHERE line_id=?1 AND revision=?2 AND identity_key=?3 AND box_id=?4 AND last_span_start=?5 AND last_span_end=?6 AND last_span_hash=?7 AND observed_run=?8 AND observed_epoch=?9)",params![self.run.line_id(),self.run.revision()as i64,self.binding.identity().as_slice(),self.box_id.as_slice(),self.start,self.end,self.span_hash.as_slice(),self.run.nonce(),self.binding.receipt_epoch()],|r|r.get(0)).map_err(|_|STORAGE)?;
+        if !current||!self.gate.live()||!self.binding.matches(self.binding.owner(),&self.binding.scope()){return Err(SCOPE);}Ok(())
+    }
     pub(in super::super) fn receipt_context(&self)->ImInboxScope{ImInboxScope{run:self.run.clone(),binding:self.binding.clone(),gate:self.gate.clone()}}
     pub(in super::super) fn receipt_span(&self)->(&[u8],i64,[u8;32]){(&self.box_id,self.end,self.span_hash)}
     pub(in super::super) fn retained_bytes(&self)->usize{self.box_id.len()+256+self.proofs.iter().map(|p|p.key.bytes()+160).sum::<usize>()}

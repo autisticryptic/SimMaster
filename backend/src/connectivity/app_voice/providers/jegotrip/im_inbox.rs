@@ -28,9 +28,14 @@ pub(super) use statuses::CommittedImStatus;
 #[path="im_received_journal.rs"]
 mod receipts;
 pub(super) use receipts::{ReceivedWritePermit,ReceivedWait,ReceivedAdmission,ReceivedReceiptView,begin_received,metadata as received_receipts};
+pub(super) use receipts::{ReadStatusPrepared,begin_read_status};
 #[path="im_user_read_journal.rs"]
 mod user_reads;
 pub(super) use user_reads::{UserReadAction,UserReadWait,UserReadPermit,UserReadPermitWait,UserReadView,BoundUserRead,metadata as user_read_history};
+#[path="im_read_status.rs"]
+mod read_status;
+pub(super) use read_status::{ReadStatusBudget,ReadStatusTargets,ReadStatusAction,ReadStatusWait,ReadStatusTargetView,ReadStatusView,history as read_status_history};
+pub(super) use read_status::{retire_targets as retire_read_status_targets,delete_account as delete_read_status_account};
 #[path="im_read_reconciliation.rs"]
 mod reconciliation;
 pub(super) use reconciliation::{ImReadObservation,ImReconciliationAction,ImReconciliationWait};
@@ -54,7 +59,8 @@ pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
     cursor::initialize_schema(conn)?;
     statuses::initialize_schema(conn)?;
     receipts::initialize_schema(conn)?;
-    user_reads::initialize_schema(conn)
+    user_reads::initialize_schema(conn)?;
+    read_status::initialize_schema(conn)
 }
 
 pub(super) struct ImReceiptGate{live:AtomicBool,changed:tokio::sync::Notify}

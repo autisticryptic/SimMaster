@@ -56,7 +56,7 @@ impl State{
         if !run.accepting.load(Ordering::SeqCst)||!run.im_gate.live(){self.clear();return Ok(());}
         if controller.phase()!=Phase::Hosted{return Ok(());}run.configuration_current()?;
         self.start_received(run,controller,im)?;
-        let write_enabled=!self.receipt_failed&&run.backend.im_receipt_policy().is_some();
+        let write_enabled=!self.receipt_failed&&run.backend.im_receipt_policy().is_some()||run.backend.im_read_status_enabled();
         match super::im::ordered(run,im,if self.failed{None}else{self.cursor.as_ref()},self.blocked_box(),write_enabled).await{
             Ok(())=>{},Err(code @ ("app_account_im_type_unsupported"|"app_account_im_message_invalid"))=>{self.fail(run,code);return Ok(());},Err(code)=>return Err(code),
         }
@@ -83,6 +83,7 @@ impl State{
             let cursor=self.cursor.as_ref().ok_or("app_account_im_cursor_invalid")?;
             match cursor.commit_gap(&run.database,&plan,&reply){
                 Ok(committed)=>{
+                    if let Some(targets)=&run.read_status_targets{targets.observe(&committed)?;}
                     super::im::synchronized(run,im,committed.proofs()).await?;
                     if !self.receipt_failed&&run.backend.im_receipt_policy().is_some(){self.received_span=Some(committed);}
                     Ok(())

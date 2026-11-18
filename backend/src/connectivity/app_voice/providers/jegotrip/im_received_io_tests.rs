@@ -2,6 +2,8 @@
 //! Drop/Join. These low-level IO cases do not create a Hosted/readiness grant.
 use super::*;
 use n::{im_inbox::{CursorSession,ReceivedAdmission},im_receipt_policy::NativeImReceiptConfig,account_test_support::TempDatabase};
+#[path="im_read_status_io_tests.rs"]
+mod manual_read_status;
 fn original(temp:&TempDatabase,root:&str)->(AttemptOwner,Arc<n::account_runs::RunToken>){
     let line="app-account-0123456789abcdef0123456789abcdef";let mut cfg=n::account_config::tests::native_fixture(root,"127.0.0.1",1);cfg.credentials.sdk.expires_at_unix_seconds=None;cfg.profile.incoming=None;cfg.profile.client_ex=true;cfg.profile.native_receivers=Some(super::config(true));temp.database.with_conn(|c|n::account_store::create(c,line,&cfg,100)).unwrap();let run=Arc::new(temp.database.with_conn(|c|n::account_runs::register_runtime(c,line,1,&n::account_runtime::local_nonce().unwrap())).unwrap());let mut s=n::session::HostingSession::new(line.into());s.import(n::tests::imported(),100).unwrap();(s.begin_login(100).unwrap(),run)
 }

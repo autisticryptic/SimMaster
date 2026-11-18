@@ -59,7 +59,7 @@ class ImRuntimeContracts(unittest.TestCase):
         self.assertIn('AssociationAdmission::Replay(proof)=>(None,Some(proof))',consumer)
         self.assertIn('ticket.completion_deadline=ticket.completion_deadline.min(deadline)',src('im_delivery.rs'))
     def test_parent_stop_retirement_revokes_queued_im_io_before_cleanup_and_uses_owned_consumer(self):
-        account=src('account_runtime.rs');self.assertIn('im_gate:super::im_inbox::ImReceiptGate::fresh()',account)
+        account=src('account_runtime.rs');self.assertIn('let im_gate=super::im_inbox::ImReceiptGate::fresh()',account);self.assertIn('im_gate,read_status_targets',account)
         self.assertIn('run.im_gate.retire();',account);self.assertIn('self.im_gate.retire();',account)
         self.assertIn('let mut im = im::State::default()',account);self.assertIn('im::delivery(&run,controller.phase()',account)
         self.assertNotIn('tokio::spawn',src('account_im.rs'));self.assertNotIn('.abort(',src('account_im.rs'))

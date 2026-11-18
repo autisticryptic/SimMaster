@@ -119,6 +119,7 @@ fn release_in(tx:&Transaction<'_>,token:&RunToken)->Result<usize,&'static str> {
     // no other nonce/revision or pending/unknown run is implicitly swept.
     super::batch_retention::delete_run(&tx,&token.line,token.revision,&token.nonce)?;
     super::im_inbox::retire_run_associations(&tx,token)?;
+    super::im_inbox::retire_read_status_targets(&tx,token)?;
     tx.execute("DELETE FROM app_voice_direct_replay_fences WHERE line_id=?1 AND revision=?2 AND run_nonce=?3",
         params![token.line,token.revision as i64,token.nonce]).map_err(|_|STORAGE)?;
     if state.is_none() {return Ok(0);}

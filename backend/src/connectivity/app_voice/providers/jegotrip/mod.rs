@@ -51,6 +51,7 @@ mod im_read_interest;
 pub(crate) mod im_sync_policy;
 mod im_receipt_policy;
 mod im_user_read_policy;
+mod im_read_status_policy;
 mod im_user_read_data;
 mod im_user_read_rpc;
 mod user_entry_data;

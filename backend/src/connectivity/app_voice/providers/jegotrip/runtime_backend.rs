@@ -35,6 +35,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 mod alive;
 #[path="runtime_user_read.rs"]
 mod user_read;
+#[path="runtime_read_status.rs"]
+mod read_status;
 #[path="runtime_user_read_recipient.rs"]
 mod user_read_recipient;
 #[path="runtime_im_reconciliation.rs"]
@@ -219,6 +221,7 @@ pub struct RuntimeProfile {
     im_sync:Option<super::im_sync_policy::NativeImSyncConfig>,
     im_receipts:Option<super::im_receipt_policy::NativeImReceiptConfig>,
     im_user_read:Option<super::im_user_read_policy::NativeUserReadConfig>,
+    im_read_status:Option<super::im_read_status_policy::NativeReadStatusConfig>,
     io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>,native_call_control:bool,byte_length:usize,
 }
 impl fmt::Debug for RuntimeProfile {
@@ -285,6 +288,11 @@ impl RuntimeProfile {
         let Some(config)=config else{return Ok(self);};config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;
         if self.im_sync.is_some()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}
         add_bytes(&mut self.byte_length,16)?;self.im_sync=Some(*config);Ok(self)
+    }
+    pub(super) fn with_im_read_status(mut self,config:Option<&super::im_read_status_policy::NativeReadStatusConfig>)->Result<Self,ProfileError>{
+        let Some(config)=config else{return Ok(self);};config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;
+        if self.im_read_status.is_some()||self.common.is_none()||!self.client_ex||self.im_sync.is_none()||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}
+        add_bytes(&mut self.byte_length,16)?;self.im_read_status=Some(*config);Ok(self)
     }
     pub(super) fn with_im_receipts(mut self,config:Option<&super::im_receipt_policy::NativeImReceiptConfig>)->Result<Self,ProfileError>{
         let Some(config)=config else{return Ok(self);};config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;
@@ -406,7 +414,7 @@ impl RuntimeProfile {
             poll_routing, logout_routing, incoming, offline_reception: false, client_ex: false, reference_decode_key: input.reference_decode_key,
             native_receivers: None,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
-            account_alive:None,im_sync:None,im_receipts:None,im_user_read:None,io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
+            account_alive:None,im_sync:None,im_receipts:None,im_user_read:None,im_read_status:None,io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
         })
     }
 }
@@ -683,6 +691,7 @@ impl NativeHostingBackend {
         self.profile.client_ex&&self.profile.native_receivers.as_ref().is_some_and(|policy|policy.im_messages().is_some())
     }
     pub(super) fn im_sync_enabled(&self)->bool{self.profile.im_sync.is_some()&&self.im_messages_enabled()}
+    pub(super) fn im_read_status_enabled(&self)->bool{self.profile.im_read_status.is_some()&&self.im_messages_enabled()}
     pub(super) fn im_receipt_policy(&self)->Option<super::im_receipt_policy::NativeImReceiptConfig>{self.profile.im_receipts.filter(|_|self.im_sync_enabled())}
     pub(super) async fn write_received(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,permit:Arc<super::im_inbox::ReceivedWritePermit>)->Result<super::rpc_im_received::OwnedReceivedReply,RuntimeError>{
         let _no_io_wait=super::im_inbox::ReceivedWait::original(permit.clone());

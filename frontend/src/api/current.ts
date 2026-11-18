@@ -396,6 +396,7 @@ export interface AppAccountView {
   startup_failure?: JegotripStartupFailure
   im_user_read_supported?: boolean
   im_user_read_recipient_supported?: boolean
+  im_read_status_supported?: boolean
   im_reconciliation_supported?: boolean
   user_entry_supported?: boolean
   user_entry_uid_local_supported?: boolean
@@ -1134,6 +1135,15 @@ class SimAdminCurrentAPI {
   }
   async getAppImReceipts(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-receipts?limit=16`, { cache: 'no-store', timeoutMs: 10000 })
+  }
+  async getAppImReadStatusTargets(lineId: string, revision: number) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-read-status-targets?expected_revision=${revision}`, { cache: 'no-store', timeoutMs: 10000 })
+  }
+  async getAppImReadStatusHistory(lineId: string) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-read-status-actions?limit=128`, { cache: 'no-store', timeoutMs: 10000 })
+  }
+  async setAppImReadStatus(lineId: string, targetId: number, revision: number, index: string, nonce: string) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-read-status-targets/${targetId}/set`, { method: 'POST', body: JSON.stringify({ expected_revision: revision, expected_index: index, nonce, consent: true }), cache: 'no-store', timeoutMs: 10000 })
   }
   async getAppImUserReads(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-user-reads?limit=16`, { cache: 'no-store', timeoutMs: 10000 })

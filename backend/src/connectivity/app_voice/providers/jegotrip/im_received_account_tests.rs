@@ -2,6 +2,8 @@
 //! No original SDK library, device, Provider API or paid traffic is used.
 use super::*;
 use n::{im_sync_policy::NativeImSyncConfig,im_receipt_policy::NativeImReceiptConfig};
+#[path="im_read_status_account_tests.rs"]
+mod manual_read_status;
 fn config(root:&str,port:u16,writes:bool)->AccountConfig{let mut c=super::config(root,port,3000);c.profile.im_sync=Some(NativeImSyncConfig{receive:true});c.profile.im_receipts=writes.then_some(NativeImReceiptConfig{set_received:true});c}
 fn status(target:i64,time:i64)->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.u32(1).unwrap();w.bytes(b"1_2").unwrap();let t=target.to_string();w.properties(&[RpcProperty{key:n::im_status::PEER_READ,value:b"0"},RpcProperty{key:n::im_status::LATEST,value:t.as_bytes()}]).unwrap();w.i64(time).unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}
 fn records(start:i64,count:u32)->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.u32(count).unwrap();for i in start..start+i64::from(count){w.i64(i).unwrap();w.i64(1234567890123).unwrap();w.bytes(b"fixture-private-uid").unwrap();w.bytes(b"Text").unwrap();w.bytes(br#"{"text":"original IM text","userData":"private-not-public"}"#).unwrap();w.properties(&[RpcProperty{key:b"../never-written",value:b"attachment-bytes"}]).unwrap();w.properties(&[]).unwrap();}w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}

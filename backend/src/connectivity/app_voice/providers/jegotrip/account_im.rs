@@ -170,12 +170,15 @@ pub(super) async fn ordered(run:&ManagedRun,state:&mut State,cursor:Option<&supe
         }};
         if write_enabled{if let Some(proof)=&proof{
             if let Some(span)=cursor.received_span_for_online(&run.database,&delivery,proof)?{
-                // Only a current committed body/span is queued. Coalesce DATA
-                // before admission; an already-submitted permit is never replaced.
-                if let Some(i)=state.received_spans.iter().position(|p|p.box_bytes()==span.box_bytes()){state.received_spans.remove(i);}
-                let bytes=state.received_spans.iter().map(|p|p.retained_bytes()).sum::<usize>();
-                if state.received_spans.len()>=MAX_GROUPS||bytes.checked_add(span.retained_bytes()).is_none_or(|b|b>MAX_BYTES){return Err(FULL);}
-                state.received_spans.push_back(span);
+                if let Some(targets)=&run.read_status_targets{targets.observe(&span)?;}
+                if run.backend.im_receipt_policy().is_some(){
+                    // Only a current committed body/span is queued. Coalesce DATA
+                    // before admission; an already-submitted permit is never replaced.
+                    if let Some(i)=state.received_spans.iter().position(|p|p.box_bytes()==span.box_bytes()){state.received_spans.remove(i);}
+                    let bytes=state.received_spans.iter().map(|p|p.retained_bytes()).sum::<usize>();
+                    if state.received_spans.len()>=MAX_GROUPS||bytes.checked_add(span.retained_bytes()).is_none_or(|b|b>MAX_BYTES){return Err(FULL);}
+                    state.received_spans.push_back(span);
+                }
             }
         }}
         let sent=complete(run,&delivery,proof.as_ref(),delivery.ticket().deadline()).await;

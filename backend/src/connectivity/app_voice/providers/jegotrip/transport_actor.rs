@@ -1002,7 +1002,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             im_gates.push(work.permit.gate());im_gates.push(work.permit.parent_gate());
         }
         let user_interest=user_wait.as_ref().map(|work|work.permit.clone());
-        let native_deadline=if let Some(work)=&user_wait{Some(native_deadline.ok_or(RuntimeError::Timeout)?.min(work.permit.deadline()))}else{native_deadline};
+        let native_deadline=if let Some(work)=&received_wait{Some(work.permit.effective_deadline(native_deadline.ok_or(RuntimeError::Timeout)?))}else if let Some(work)=&user_wait{Some(native_deadline.ok_or(RuntimeError::Timeout)?.min(work.permit.deadline()))}else{native_deadline};
         if is_logout { self.pending.retain(|id, _| self.backend.is_pending(*id)); }
         // Keep one heap-owned transport future, not two large inline copies
         // in the new guarded/legacy branches. Standard test stack and all IO
