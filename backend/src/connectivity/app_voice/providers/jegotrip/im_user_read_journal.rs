@@ -128,7 +128,10 @@ impl UserReadContext{
         self.context.validate(conn)?;if !self.action.live(){return Err(SCOPE);}
         let matches:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_im_messages WHERE id=?1 AND line_id=?2 AND revision=?3 AND identity_key=?4 AND box_id=?5 AND message_index=?6 AND fingerprint=?7 AND (?8=0 OR deleted=0))",
             params![self.action.message_id,self.action.run.line_id(),self.action.run.revision()as i64,self.context.binding.identity().as_slice(),self.box_id.as_slice(),self.index,self.fingerprint.as_slice(),i64::from(visible)],|r|r.get(0)).map_err(|_|STORAGE)?;
-        if !matches{return Err("app_account_im_user_read_message_conflict");}Ok(())
+        if !matches{return Err("app_account_im_user_read_message_conflict");}
+        let saved:Option<Option<Vec<u8>>>=conn.query_row("SELECT recipient_hash FROM app_voice_im_user_reads WHERE line_id=?1 AND user_nonce=?2",params![self.action.run.line_id(),self.action.nonce.as_str()],|r|r.get(0)).optional().map_err(|_|STORAGE)?;
+        if let Some(saved)=saved{let expected=self.action.recipient_hash();if saved.as_deref()!=expected.as_ref().map(|h|h.as_slice()){return Err("app_account_im_user_read_nonce_conflict");}}
+        Ok(())
     }
     pub(in super::super) fn admit(self,reply:&OwnedImReply)->Result<Arc<UserReadPermit>,&'static str>{
         if self.action.recipient().is_some()&&!self.recipient_action.as_ref().is_some_and(|action|self.recipient_reply.as_ref().is_some_and(|resolved|resolved.resolved_uid_for(action)==Some(&self.box_id[4..]))){return Err("app_account_im_user_read_recipient_unconfirmed");}

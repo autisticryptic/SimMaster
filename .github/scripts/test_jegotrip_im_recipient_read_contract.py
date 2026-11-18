@@ -16,4 +16,6 @@ class RecipientReadContracts(unittest.TestCase):
   s=(R/'backend/src/api/app_voice.rs').read_text(encoding='utf-8');self.assertIn('pub struct ImUserReadRecipientRequest{expected_revision:u64,nonce:String,recipient:String,consent:bool}',s);self.assertIn('valid_user_read_recipient(&request.recipient)',s);self.assertIn('zeroize(&mut self.recipient)',s)
  def test_ui_nonce_follows_current_baseline_intent_and_both_operations_share_same_serial_lock(self):
   s=(R/'frontend/src/pages/sim/AppImMessagesPane.tsx').read_text(encoding='utf-8');self.assertIn('const markRead = async (row: ImHistoryRow, alias?: string)',s);self.assertIn('userReadBaselineReady',s);self.assertIn('marking.current = true',s);self.assertIn('markAppImUserReadViaRecipient',s);self.assertIn('userReadKnownUnknown',s);self.assertNotIn('dangerouslySetInnerHTML',s);self.assertNotIn("'0'.repeat(32)",s)
+ def test_existing_permit_transaction_verifies_recipient_hash_before_arm_or_resolution(self):
+  s=text('im_user_read_journal.rs').split('fn verify_message',1)[1].split('fn admit',1)[0];self.assertIn('SELECT recipient_hash FROM app_voice_im_user_reads WHERE line_id=?1 AND user_nonce=?2',s);self.assertIn('saved.as_deref()!=expected.as_ref()',s);self.assertIn('app_account_im_user_read_nonce_conflict',s)
 if __name__=='__main__':unittest.main()
