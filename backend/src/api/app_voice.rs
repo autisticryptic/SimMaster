@@ -43,6 +43,10 @@ pub struct InboxQuery { #[serde(default = "default_inbox_limit")] limit: usize }
 pub struct ImUserReadRequest{expected_revision:u64,nonce:String,consent:bool}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ImUserReadRecipientRequest{expected_revision:u64,nonce:String,recipient:String,consent:bool}
+impl Drop for ImUserReadRecipientRequest{fn drop(&mut self){zeroize::Zeroize::zeroize(&mut self.nonce);zeroize::Zeroize::zeroize(&mut self.recipient);}}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImReconciliationRequest { expected_revision: u64, consent: bool }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +84,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/im-user-reads/{receipt_id}/reconcile",post(reconcile_im_user_read))
         .route("/api/non-3gpp/accounts/{line_id}/user-entry/lookup",post(lookup_user_entry))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}/mark-read",post(mark_im_user_read))
+        .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}/mark-read/recipient",post(mark_im_user_read_recipient))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}", delete(delete_im_message))
         .route("/api/non-3gpp/accounts/{line_id}/calls", get(get_calls))
         .route("/api/non-3gpp/accounts/{line_id}/calls/{call_id}", get(get_call))
@@ -116,7 +121,8 @@ fn error_status(code: &str) -> StatusCode {
             | "app_account_call_runtime_unavailable" | "app_account_call_cleanup_unconfirmed"
             | "app_account_call_trunk_delivery_unconfirmed" => StatusCode::SERVICE_UNAVAILABLE,
         "app_account_im_user_read_nonce_conflict" | "app_account_im_user_read_uncertain" | "app_account_im_user_read_target_unconfirmed" | "app_account_im_user_read_message_conflict" => StatusCode::CONFLICT,
-        "app_account_im_user_read_consent_required" | "app_account_im_user_read_not_installed" => StatusCode::FORBIDDEN,
+        "app_account_im_user_read_consent_required" | "app_account_im_user_read_not_installed" | "app_account_im_user_read_recipient_not_installed" => StatusCode::FORBIDDEN,
+        "app_account_im_user_read_recipient_unconfirmed" => StatusCode::CONFLICT,
         "app_account_im_user_read_message_missing" => StatusCode::NOT_FOUND,
         "app_account_im_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_account_im_user_read_full" => StatusCode::TOO_MANY_REQUESTS,
@@ -279,6 +285,11 @@ pub async fn mark_im_user_read(State(manager):State<Arc<AccountManager>>,Path((l
     let Ok(Json(request))=request else{return failure("app_account_request_invalid");};let Ok(id)=message_id.parse::<i64>()else{return failure("app_account_request_invalid");};
     if id<=0||id.to_string()!=message_id||request.nonce.len()!=32||!request.nonce.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)){return failure("app_account_request_invalid");}
     success(StatusCode::OK,manager.mark_im_user_read(&line_id,request.expected_revision,id,&request.nonce,request.consent).await)
+}
+pub async fn mark_im_user_read_recipient(State(manager):State<Arc<AccountManager>>,Path((line_id,message_id)):Path<(String,String)>,request:Result<Json<ImUserReadRecipientRequest>,JsonRejection>)->Response{
+    let Ok(Json(request))=request else{return failure("app_account_request_invalid");};let Ok(id)=message_id.parse::<i64>()else{return failure("app_account_request_invalid");};
+    if id<=0||id.to_string()!=message_id||request.nonce.len()!=32||!request.nonce.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||!crate::connectivity::app_voice::providers::jegotrip::valid_user_read_recipient(&request.recipient){return failure("app_account_request_invalid");}
+    success(StatusCode::OK,manager.mark_im_user_read_via_recipient(&line_id,request.expected_revision,id,&request.nonce,&request.recipient,request.consent).await)
 }
 pub async fn reconcile_im_user_read(State(manager): State<Arc<AccountManager>>, Path((line_id, receipt_id)): Path<(String,String)>,
     request: Result<Json<ImReconciliationRequest>, JsonRejection>) -> Response {

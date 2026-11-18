@@ -3,6 +3,7 @@ use super::{im_inbox::ImReceiptGate,rpc_pending::RpcConnectionScope,session::Att
 use std::{fmt,sync::Arc,time::Instant};
 use zeroize::Zeroizing;
 pub fn valid_user_entry_recipient(recipient:&str)->bool{RecipientUri::parse(recipient.as_bytes()).is_ok()}
+pub fn valid_user_read_recipient(recipient:&str)->bool{RecipientUri::parse(recipient.as_bytes()).is_ok_and(|uri|uri.kind()!=super::user_entry_data::AidKind::Uid)}
 pub(super) struct UserEntryAction{owner:AttemptOwner,parent:RpcConnectionScope,gate:Arc<ImReceiptGate>,deadline:Instant,recipient:Zeroizing<Vec<u8>>,
     #[cfg(test)]auxiliary_io:std::sync::Mutex<Option<Arc<super::router_runtime::tests::auxiliary_io::AuxiliaryIoTest>>>,
 }

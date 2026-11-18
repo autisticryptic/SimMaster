@@ -111,6 +111,7 @@ import type {
   E911Status,
 } from './types'
 import { humanizeCostPolicyError } from '../policies/imsRegistration'
+import { userReadRecipientBody } from '../policies/userEntry'
 
 type SmsListResponse = {
   messages: SmsMessage[]
@@ -394,6 +395,7 @@ export interface AppAccountView {
   account_alive_state?: 'absent' | 'disabled' | 'unsupported' | 'starting' | 'registering' | 'registered' | 'retrying' | 'blocked' | 'unapproved' | 'session_invalid' | 'stopped'
   startup_failure?: JegotripStartupFailure
   im_user_read_supported?: boolean
+  im_user_read_recipient_supported?: boolean
   im_reconciliation_supported?: boolean
   user_entry_supported?: boolean
   user_entry_uid_local_supported?: boolean
@@ -1138,6 +1140,11 @@ class SimAdminCurrentAPI {
   }
   async markAppImUserRead(lineId: string, messageId: number, expectedRevision: number, nonce: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-messages/${messageId}/mark-read`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, nonce, consent: true }), timeoutMs: 10000 })
+  }
+  async markAppImUserReadViaRecipient(lineId: string, messageId: number, expectedRevision: number, nonce: string, recipient: string) {
+    const body = userReadRecipientBody(expectedRevision, nonce, recipient)
+    if (!body || !Number.isSafeInteger(messageId) || messageId <= 0) throw new Error('Original recipient user-read intent invalid')
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-messages/${messageId}/mark-read/recipient`, { method: 'POST', body: JSON.stringify(body), cache: 'no-store', timeoutMs: 10000 })
   }
   async reconcileAppImUserRead(lineId: string, receiptId: number, expectedRevision: number) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-user-reads/${receiptId}/reconcile`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, consent: true }), cache: 'no-store', timeoutMs: 10000 })

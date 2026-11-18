@@ -35,6 +35,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 mod alive;
 #[path="runtime_user_read.rs"]
 mod user_read;
+#[path="runtime_user_read_recipient.rs"]
+mod user_read_recipient;
 #[path="runtime_im_reconciliation.rs"]
 mod reconciliation;
 #[path="runtime_user_entry.rs"]

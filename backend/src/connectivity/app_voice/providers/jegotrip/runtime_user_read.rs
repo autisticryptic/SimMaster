@@ -11,15 +11,19 @@ impl NativeHostingBackend{
         let attempt=self.original(action.owner()).map_err(|_|"app_account_im_scope_invalid")?;
         {let state=lock(&attempt.state);if !state.configured||state.retired||state.logout_started||state.unregister_started{return Err("app_account_im_scope_invalid");}}
         let commands=attempt.commands(action.owner(),&action.scope()).map_err(|_|"app_account_im_scope_invalid")?;
-        let operation=async{
+        let operation=Box::pin(async{
             let binding=commands.original_im_binding(action.owner(),&action.scope()).await.map_err(|_|"app_account_im_scope_invalid")?;
-            let context=match action.bind_current(binding)?{BoundUserRead::Replay(view)=>return Ok(view),BoundUserRead::Context(c)=>c};
+            let mut context=match action.bind_current(binding)?{BoundUserRead::Replay(view)=>return Ok(view),BoundUserRead::Context(c)=>c};
+            if let Some(recipient)=context.recipient_action(){
+                let matched=self.user_read_recipient_reply(recipient).await?;
+                context=context.confirm_recipient(matched)?;
+            }
             // This read is explicitly scoped to this user action and its fixed
             // current native label; it does not install/readsync or move a cursor.
             let r=commands.read_user_target(&action,context.query()).await.map_err(|_|"app_account_im_user_read_target_unconfirmed")?;
             let p=context.admit(&r)?;
             commands.user_read_write(action.owner(),&action.scope(),p).await.map_err(|_|"app_account_im_user_read_uncertain")
-        };
+        });
         let parent_gate=action.parent_gate();
         tokio::select!{biased;
             _=parent_gate.retired()=>Err("app_account_im_scope_invalid"),

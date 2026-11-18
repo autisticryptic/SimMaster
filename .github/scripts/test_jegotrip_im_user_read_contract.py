@@ -15,7 +15,7 @@ class UserReadContracts(unittest.TestCase):
  def test_purpose_reply_requires_exact_binding_query_gate_and_matching_actual_latest(self):
   s=src('im_user_read_journal.rs');self.assertIn('Arc::ptr_eq(reply.request().binding(),&self.context.binding)',s);self.assertIn('Arc::ptr_eq(reply.request().query_arc(),&self.query)',s);self.assertIn('e.latest.is_some_and(|n|n>=self.index)',s);self.assertIn('self.verify_message(&tx,true)?',s)
  def test_unknown_write_marker_precedes_io_and_blocks_another_nonce_scope_or_target(self):
-  s=src('im_user_read_journal.rs');self.assertIn('UNIQUE(line_id,user_nonce)',s);self.assertIn('AND box_id=?4 AND state=0',s);self.assertIn('if unknown{return Err(UNCERTAIN);}',s);self.assertIn('scope_epoch,state,updated_at)',s);self.assertIn('MAX_LOCAL:i64=128',s);self.assertIn('MAX_GLOBAL:i64=4096',s)
+  s=src('im_user_read_journal.rs');self.assertIn('UNIQUE(line_id,user_nonce)',s);self.assertIn('AND box_id=?4 AND state=0',s);self.assertIn('if unknown{return Err(UNCERTAIN);}',s);self.assertIn('scope_epoch,state,updated_at,recipient_hash)',s);self.assertIn('MAX_LOCAL:i64=128',s);self.assertIn('MAX_GLOBAL:i64=4096',s)
  def test_same_nonce_replay_is_only_a_readonly_finite_view_and_conflicts_cannot_rebind(self):
   s=src('im_user_read_journal.rs');self.assertIn('BoundUserRead::Replay(view)',s);self.assertIn('app_account_im_user_read_nonce_conflict',s);self.assertIn('saved_box.as_slice()!=box_id.as_slice()',s);self.assertNotIn('Deserialize',s)
  def test_write_identity_and_token_come_from_original_sdk_and_id_never_reuses(self):

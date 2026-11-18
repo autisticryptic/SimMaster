@@ -62,7 +62,7 @@ mod user_entry_target;
 mod user_entry_rpc;
 mod user_entry_local;
 mod user_entry_action;
-pub use user_entry_action::valid_user_entry_recipient;
+pub use user_entry_action::{valid_user_entry_recipient,valid_user_read_recipient};
 mod rpc_im_received;
 pub(crate) mod im_delivery;
 pub(crate) mod im_inbox;

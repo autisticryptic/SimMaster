@@ -5,7 +5,7 @@ R=Path(__file__).resolve().parents[2];P=R/'backend/src/connectivity/app_voice/pr
 def text(p):return(R/p).read_text(encoding='utf-8')
 class UserReadHardeningContracts(unittest.TestCase):
  def test_current_scene_and_generation_baseline_precede_explicit_user_nonce(self):
-  s=text('frontend/src/pages/sim/AppImMessagesPane.tsx');self.assertIn('userReadBaselineReady(userOutcomes, lineId, active.current.generation)',s);self.assertIn('userOutcomes.context !== userReadContext',s);self.assertLess(s.index('userReadBaselineReady(userOutcomes'),s.index('crypto.randomUUID()'));self.assertIn('JSON.stringify([lineId, userRead?.revision, userRead?.installed, userRead?.hosted])',s);self.assertIn('[lineId, userRead?.installed, userReadContext]',s)
+  s=text('frontend/src/pages/sim/AppImMessagesPane.tsx');self.assertIn('userReadBaselineReady(userOutcomes, lineId, active.current.generation)',s);self.assertIn('userOutcomes.context !== userReadContext',s);self.assertLess(s.index('userReadBaselineReady(userOutcomes'),s.index('crypto.randomUUID()'));self.assertIn('JSON.stringify([lineId, userRead?.revision, userRead?.installed, userRead?.hosted, userRead?.recipientInstalled])',s);self.assertIn('[lineId, userRead?.installed, userReadContext]',s)
  def test_existing_unknown_cannot_be_cleared_by_a_prior_or_newer_terminal(self):
   s=text('frontend/src/policies/imUserReadState.ts');self.assertIn('row.id > unknown.after',s);self.assertIn("row.state === 'uncertain'",s);self.assertIn('userReadKnownUnknown(snapshot, line, generation, unknown.id, unknown.index)',s);self.assertIn('row.messageId === unknown.id && row.index === unknown.index',s)
  def test_controls_and_outcomes_reject_a_prior_account_or_configuration(self):

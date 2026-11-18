@@ -4,6 +4,8 @@ use super::*;
 use n::{im_inbox::{UserReadAction,BoundUserRead,UserReadPermit},im_user_read_data as d,im_status::StatusLabel,rpc_im::ImQuery};
 #[path="native_rpc_budget_user_read_tests.rs"]
 mod shared_budget;
+#[path="im_user_read_recipient_protocol_tests.rs"]
+mod recipient;
 fn message_id(f:&mut Fixture,rpc:i32,index:i64)->i64{let msg=f.message(rpc,b"P2P/1_2",index,r#"{"text":"user read text"}"#);let proof=f.inbox(&msg).commit(&f.temp.database,&msg).unwrap().unwrap();f.backend.complete_im(msg.ticket(),Some(&proof)).unwrap();f.temp.database.with_conn(|c|n::im_inbox::list(c,f.run.line_id(),16)).unwrap().into_iter().find(|r|r.message_index==index.to_string()).unwrap().id}
 fn action(f:&Fixture,id:i64,nonce:&str)->Arc<UserReadAction>{UserReadAction::original(f.temp.database.clone(),f.run.clone(),f.gate.clone(),f.owner.clone(),f.scope.clone(),id,nonce,Instant::now()+Duration::from_secs(30)).unwrap()}
 fn status(latest:Option<i64>,accepted:bool)->Vec<u8>{let mut w=Writer::new();w.boolean(accepted).unwrap();w.u32(1).unwrap();w.bytes(b"1_2").unwrap();let value=latest.map(|n|n.to_string());let props=value.as_ref().map(|n|vec![RpcProperty{key:n::im_status::LATEST,value:n.as_bytes()}]).unwrap_or_default();w.properties(&props).unwrap();w.i64(1).unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}

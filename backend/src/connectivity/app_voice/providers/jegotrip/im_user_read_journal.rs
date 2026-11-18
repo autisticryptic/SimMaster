@@ -19,7 +19,13 @@ pub(in super::super) fn initialize_schema(conn:&Connection)->Result<(),&'static 
         run_nonce TEXT NOT NULL,scope_epoch TEXT NOT NULL,state INTEGER NOT NULL CHECK(state IN(0,1,2,3)),
         request_id INTEGER CHECK(request_id>0),result_code INTEGER,updated_at TEXT NOT NULL,
         UNIQUE(line_id,user_nonce));
-        CREATE INDEX IF NOT EXISTS idx_im_user_read_context ON app_voice_im_user_reads(line_id,revision,identity_key,box_id,state);") .map_err(|_|STORAGE)
+        CREATE INDEX IF NOT EXISTS idx_im_user_read_context ON app_voice_im_user_reads(line_id,revision,identity_key,box_id,state);") .map_err(|_|STORAGE)?;
+    // A nullable private intent hash keeps all historical UID-only rows exact.
+    // No URI/token/route is stored or exported, and metadata never clears unknown.
+    let mut fields=conn.prepare("PRAGMA table_info(app_voice_im_user_reads)").map_err(|_|STORAGE)?;
+    let names=fields.query_map([],|r|r.get::<_,String>(1)).map_err(|_|STORAGE)?.collect::<Result<Vec<_>,_>>().map_err(|_|STORAGE)?;drop(fields);
+    if !names.iter().any(|name|name=="recipient_hash"){conn.execute("ALTER TABLE app_voice_im_user_reads ADD COLUMN recipient_hash BLOB CHECK(recipient_hash IS NULL OR(typeof(recipient_hash)='blob' AND length(recipient_hash)=32))",[]).map_err(|_|STORAGE)?;}
+    Ok(())
 }
 pub(in super::super) fn delete_account(conn:&Connection,line:&str)->Result<(),&'static str>{
     if account_store::metadata(conn,line)?.is_some(){return Err(SCOPE);}
@@ -38,7 +44,7 @@ pub(in super::super) fn metadata(conn:&Connection,line:&str,limit:usize)->Result
 }
 pub(in super::super) struct UserReadAction{
     database:Arc<Database>,run:Arc<RunToken>,parent_gate:Arc<ImReceiptGate>,gate:Arc<ImReceiptGate>,owner:AttemptOwner,scope:RpcConnectionScope,
-    message_id:i64,nonce:Zeroizing<String>,deadline:Instant,epoch_ms:i64,permit:Mutex<Weak<UserReadPermit>>,
+    message_id:i64,nonce:Zeroizing<String>,deadline:Instant,epoch_ms:i64,permit:Mutex<Weak<UserReadPermit>>,recipient:Option<Zeroizing<Vec<u8>>>,
     #[cfg(test)]
     target_submitted:std::sync::atomic::AtomicBool,
 }
@@ -50,11 +56,19 @@ impl UserReadAction{
         if message_id<=0||nonce.len()!=32||!nonce.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||owner.line_id()!=run.line_id()
             ||!scope.is_open()||scope.session_revoked()||!parent_gate.live()||Instant::now()>=deadline{return Err("app_account_im_user_read_request_invalid");}
         let epoch_ms=chrono::Utc::now().timestamp_millis();if epoch_ms<0{return Err(SCOPE);}
-        Ok(Arc::new(Self{database,run,parent_gate,gate:ImReceiptGate::fresh(),owner,scope,message_id,nonce:Zeroizing::new(nonce.to_owned()),deadline,epoch_ms,permit:Mutex::new(Weak::new()),
+        Ok(Arc::new(Self{database,run,parent_gate,gate:ImReceiptGate::fresh(),owner,scope,message_id,nonce:Zeroizing::new(nonce.to_owned()),deadline,epoch_ms,permit:Mutex::new(Weak::new()),recipient:None,
             #[cfg(test)]
             target_submitted:std::sync::atomic::AtomicBool::new(false),
         }))
     }
+    pub(in super::super) fn original_with_recipient(database:Arc<Database>,run:Arc<RunToken>,parent_gate:Arc<ImReceiptGate>,owner:AttemptOwner,scope:RpcConnectionScope,message_id:i64,nonce:&str,deadline:Instant,recipient:&[u8])->Result<Arc<Self>,&'static str>{
+        let parsed=super::super::user_entry_data::RecipientUri::parse(recipient).map_err(|_|"app_account_im_user_read_request_invalid")?;
+        if parsed.kind()==super::super::user_entry_data::AidKind::Uid{return Err("app_account_im_user_read_request_invalid");}
+        let mut action=Self::original(database,run,parent_gate,owner,scope,message_id,nonce,deadline)?;
+        Arc::get_mut(&mut action).ok_or(SCOPE)?.recipient=Some(Zeroizing::new(recipient.to_vec()));Ok(action)
+    }
+    pub(in super::super) fn recipient(&self)->Option<&[u8]>{self.recipient.as_deref().map(|s|s.as_slice())}
+    fn recipient_hash(&self)->Option<[u8;32]>{self.recipient().map(|uri|{let mut h=ring::digest::Context::new(&ring::digest::SHA256);h.update(b"original-im-user-read-recipient-v1\0");h.update(uri);h.finish().as_ref().try_into().expect("SHA256 width")})}
     #[cfg(test)]
     pub(in super::super) fn note_target_submitted(&self){self.target_submitted.store(true,Ordering::SeqCst);}
     #[cfg(test)]
@@ -79,6 +93,8 @@ impl UserReadAction{
             let old:Option<(i64,i64,i64,i64,Vec<u8>,Vec<u8>,String,Vec<u8>)>=tx.query_row("SELECT id,revision,message_id,target_index,identity_key,fingerprint,updated_at,box_id FROM app_voice_im_user_reads WHERE line_id=?1 AND user_nonce=?2",
                 params![self.run.line_id(),self.nonce.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional().map_err(|_|STORAGE)?;
             let replay=if let Some((id,revision,message_id,target,identity,saved,updated,saved_box))=old{
+                let saved_recipient:Option<Vec<u8>>=tx.query_row("SELECT recipient_hash FROM app_voice_im_user_reads WHERE id=?1",[id],|r|r.get(0)).map_err(|_|STORAGE)?;
+                let current_recipient=self.recipient_hash();if saved_recipient.as_deref()!=current_recipient.as_ref().map(|h|h.as_slice()){return Err("app_account_im_user_read_nonce_conflict");}
                 if revision!=self.run.revision()as i64||message_id!=self.message_id||target!=index||identity.as_slice()!=binding.identity().as_slice()||saved.as_slice()!=fingerprint.as_slice()||saved_box.as_slice()!=box_id.as_slice(){return Err("app_account_im_user_read_nonce_conflict");}
                 let state:i64=tx.query_row("SELECT state FROM app_voice_im_user_reads WHERE id=?1",[id],|r|r.get(0)).map_err(|_|STORAGE)?;Some(UserReadView{id,message_id,target_index:index.to_string(),state:state_name(state),updated_at:updated})
             }else{
@@ -90,14 +106,24 @@ impl UserReadAction{
         })?;
         if let Some(view)=replay{return Ok(BoundUserRead::Replay(view));}
         let label=StatusLabel::parse(&box_id[4..]).map_err(|_|INVALID)?;let query=Arc::new(ImQuery::refresh(&[label],-1).map_err(|_|INVALID)?);
-        Ok(BoundUserRead::Context(UserReadContext{action:self.clone(),context,box_id,index,fingerprint,query}))
+        let recipient_action=self.recipient().map(|uri|super::super::user_entry_action::UserEntryAction::original(self.owner.clone(),self.scope.clone(),self.gate.clone(),self.deadline,uri)).transpose()?;
+        Ok(BoundUserRead::Context(UserReadContext{action:self.clone(),context,box_id,index,fingerprint,query,recipient_action,recipient_reply:None}))
     }
 }
 pub(in super::super) enum BoundUserRead{Replay(UserReadView),Context(UserReadContext)}
-pub(in super::super) struct UserReadContext{action:Arc<UserReadAction>,context:ImInboxScope,box_id:Zeroizing<Vec<u8>>,index:i64,fingerprint:[u8;32],query:Arc<ImQuery>}
+pub(in super::super) struct UserReadContext{action:Arc<UserReadAction>,context:ImInboxScope,box_id:Zeroizing<Vec<u8>>,index:i64,fingerprint:[u8;32],query:Arc<ImQuery>,
+    recipient_action:Option<Arc<super::super::user_entry_action::UserEntryAction>>,recipient_reply:Option<Arc<super::super::user_entry_rpc::OwnedUserEntryReply>>,
+}
 impl fmt::Debug for UserReadContext{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("CheckedUserReadContext(<redacted>)")}}
 impl UserReadContext{
     pub(in super::super) fn query(&self)->Arc<ImQuery>{self.query.clone()}
+    pub(in super::super) fn recipient_action(&self)->Option<Arc<super::super::user_entry_action::UserEntryAction>>{self.recipient_action.clone()}
+    pub(in super::super) fn confirm_recipient(mut self,reply:super::super::user_entry_rpc::OwnedUserEntryReply)->Result<Self,&'static str>{
+        let action=self.recipient_action.as_ref().ok_or(SCOPE)?;
+        if !self.action.live()||reply.resolved_uid_for(action)!=Some(&self.box_id[4..]){return Err("app_account_im_user_read_recipient_unconfirmed");}
+        self.action.database.with_conn(|conn|{let tx=Transaction::new_unchecked(conn,TransactionBehavior::Deferred).map_err(|_|STORAGE)?;self.verify_message(&tx,true)?;tx.commit().map_err(|_|STORAGE)})?;
+        self.recipient_reply=Some(Arc::new(reply));Ok(self)
+    }
     fn verify_message(&self,conn:&Connection,visible:bool)->Result<(),&'static str>{
         self.context.validate(conn)?;if !self.action.live(){return Err(SCOPE);}
         let matches:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_im_messages WHERE id=?1 AND line_id=?2 AND revision=?3 AND identity_key=?4 AND box_id=?5 AND message_index=?6 AND fingerprint=?7 AND (?8=0 OR deleted=0))",
@@ -105,6 +131,7 @@ impl UserReadContext{
         if !matches{return Err("app_account_im_user_read_message_conflict");}Ok(())
     }
     pub(in super::super) fn admit(self,reply:&OwnedImReply)->Result<Arc<UserReadPermit>,&'static str>{
+        if self.action.recipient().is_some()&&!self.recipient_action.as_ref().is_some_and(|action|self.recipient_reply.as_ref().is_some_and(|resolved|resolved.resolved_uid_for(action)==Some(&self.box_id[4..]))){return Err("app_account_im_user_read_recipient_unconfirmed");}
         if !self.action.live()||!reply.matches(self.action.owner(),&self.action.scope())||!Arc::ptr_eq(reply.request().binding(),&self.context.binding)
             ||!Arc::ptr_eq(reply.request().query_arc(),&self.query)||!Arc::ptr_eq(&reply.request().gate(),&self.action.gate()){return Err(SCOPE);}
         let ImReplyData::Refresh(status)=reply.result().map_err(|_|INVALID)?else{return Err(SCOPE);};
@@ -113,8 +140,9 @@ impl UserReadContext{
             let unknown:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_im_user_reads WHERE line_id=?1 AND revision=?2 AND identity_key=?3 AND box_id=?4 AND state=0)",params![self.action.run.line_id(),self.action.run.revision()as i64,self.context.binding.identity().as_slice(),self.box_id.as_slice()],|r|r.get(0)).map_err(|_|STORAGE)?;
             if unknown{return Err(UNCERTAIN);}
             let(local,total):(i64,i64)=tx.query_row("SELECT COALESCE(SUM(line_id=?1),0),COUNT(*) FROM app_voice_im_user_reads",[self.action.run.line_id()],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|STORAGE)?;if local>=MAX_LOCAL||total>=MAX_GLOBAL{return Err("app_account_im_user_read_full");}
-            tx.execute("INSERT INTO app_voice_im_user_reads(line_id,revision,identity_key,box_id,message_id,target_index,fingerprint,user_nonce,epoch_ms,run_nonce,scope_epoch,state,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12)",
-                params![self.action.run.line_id(),self.action.run.revision()as i64,self.context.binding.identity().as_slice(),self.box_id.as_slice(),self.action.message_id,self.index,self.fingerprint.as_slice(),self.action.nonce.as_str(),self.action.epoch_ms,self.action.run.nonce(),self.context.binding.receipt_epoch(),chrono::Utc::now().to_rfc3339()]).map_err(|_|STORAGE)?;
+            let recipient_hash=self.action.recipient_hash();
+            tx.execute("INSERT INTO app_voice_im_user_reads(line_id,revision,identity_key,box_id,message_id,target_index,fingerprint,user_nonce,epoch_ms,run_nonce,scope_epoch,state,updated_at,recipient_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13)",
+                params![self.action.run.line_id(),self.action.run.revision()as i64,self.context.binding.identity().as_slice(),self.box_id.as_slice(),self.action.message_id,self.index,self.fingerprint.as_slice(),self.action.nonce.as_str(),self.action.epoch_ms,self.action.run.nonce(),self.context.binding.receipt_epoch(),chrono::Utc::now().to_rfc3339(),recipient_hash.as_ref().map(|h|h.as_slice())]).map_err(|_|STORAGE)?;
             let id=tx.last_insert_rowid();if !self.action.live(){return Err(SCOPE);}tx.commit().map_err(|_|STORAGE)?;Ok(id)
         })?;
         let p=Arc::new(UserReadPermit{context:self,row,phase:AtomicU8::new(QUEUED),request:Mutex::new(None),changed:tokio::sync::Notify::new()});

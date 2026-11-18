@@ -24,5 +24,10 @@ export function userEntryRecipient(value: string): boolean {
   return recipient.length > 2 && recipient.split('@').length === 2 && recipient.slice(recipient.indexOf('@') + 1).includes('.')
 }
 export function userEntryUid(value: string): boolean { return userEntryRecipient(value) && (/^[0-9]+_[1-9][0-9]*$/.test(value) || value.startsWith('[uid:')) }
+export function userReadRecipientAllowed(recipient: string): boolean { return userEntryRecipient(recipient) && !userEntryUid(recipient) }
+export function userReadRecipientBody(revision: number, nonce: string, recipient: string): { expected_revision: number; nonce: string; recipient: string; consent: true } | null {
+  if (!Number.isSafeInteger(revision) || revision <= 0 || !/^[a-f0-9]{32}$/.test(nonce) || !userReadRecipientAllowed(recipient)) return null
+  return { expected_revision: revision, nonce, recipient, consent: true }
+}
 export const USER_ENTRY_SCOPE = '仅向本次原账号 UserEntry 明确查询；不展示 UID，不标记已读、不清空未知写入、不发送消息，不重新登录或恢复授信。'
 export function userEntryLabel(value: UserEntryView): string { return value.report === 'local_uid' ? '本次仅本地识别原 UID；未查询服务端，不是回执或授信。' : value.report === 'reported' ? '本次原服务端报告已解析；不是写入回执或接收就绪。' : value.report === 'unreported' ? '本次原服务端未报告收件人；不猜测 UID，不自动重查。' : '本次原查询被拒绝；不自动重试或重新登录。' }

@@ -92,7 +92,7 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
                 {account.last_error && <Typography variant="caption" display="block" color="warning.main">{appLoginError(account.last_error)}</Typography>}
                 <AppCallNotificationsPane lineId={account.line_id} />
                 <AppInviteNotificationsPane lineId={account.line_id} enabled={account.incoming_call_ready} />
-                <AppImMessagesPane lineId={account.line_id} userRead={{ revision: account.revision, installed: account.im_user_read_supported === true, hosted: account.phase === 'hosted' }} />
+                <AppImMessagesPane lineId={account.line_id} userRead={{ revision: account.revision, installed: account.im_user_read_supported === true, hosted: account.phase === 'hosted', recipientInstalled: account.im_user_read_recipient_supported === true }} />
                 <AppUserEntryPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.user_entry_supported === true || account.user_entry_uid_local_supported === true} localOnly={account.user_entry_supported !== true} />
                 <AppImReceiptsPane lineId={account.line_id} />
                 <AppImReconciliationPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.im_reconciliation_supported === true} />

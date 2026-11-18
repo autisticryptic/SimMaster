@@ -1,16 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Stack, Typography } from '@mui/material'
+import { Alert, Button, Stack, TextField, Typography } from '@mui/material'
 import { api } from '../../api/current'
 import { IM_HISTORY_SCOPE, imHistoryRows, type ImHistoryRow } from '../../policies/imHistory'
 import { USER_READ_SCOPE, userReadRows, userReadLabel } from '../../policies/imUserRead'
 import { userReadBaselineReady, userReadKnownUnknown, userReadUnknownResolved, type UserReadSnapshot, type UserReadUnknown } from '../../policies/imUserReadState'
-export default function AppImMessagesPane({ lineId, userRead }: { lineId: string; userRead?: { revision: number; installed: boolean; hosted: boolean } }) {
+import { userReadRecipientAllowed } from '../../policies/userEntry'
+export default function AppImMessagesPane({ lineId, userRead }: { lineId: string; userRead?: { revision: number; installed: boolean; hosted: boolean; recipientInstalled?: boolean } }) {
   const [loaded, setLoaded] = useState<{ line: string; rows: ImHistoryRow[]; error: boolean } | null>(null)
   const [busy, setBusy] = useState(false)
   const [uncertain, setUncertain] = useState<{ line: string; id: number } | null>(null)
   const [userOutcomes, setUserOutcomes] = useState<UserReadSnapshot | null>(null)
   const [userUncertain, setUserUncertain] = useState<UserReadUnknown | null>(null)
-  const userReadContext = JSON.stringify([lineId, userRead?.revision, userRead?.installed, userRead?.hosted])
+  const userReadContext = JSON.stringify([lineId, userRead?.revision, userRead?.installed, userRead?.hosted, userRead?.recipientInstalled])
+  const [recipientInput, setRecipientInput] = useState({ context: userReadContext, value: '' })
+  const recipient = recipientInput.context === userReadContext ? recipientInput.value : ''
   const active = useRef({ line: lineId, generation: 0, readSerial: 0, live: false })
   const deleting = useRef(false)
   const marking = useRef(false)
@@ -53,15 +56,16 @@ export default function AppImMessagesPane({ lineId, userRead }: { lineId: string
       if (active.current.live && active.current.generation === original.generation) setUncertain({ line: original.line, id: row.id })
     } finally { deleting.current = false; if (active.current.live) setBusy(false) }
   }
-  const markRead = async (row: ImHistoryRow) => {
+  const markRead = async (row: ImHistoryRow, alias?: string) => {
+    if (alias !== undefined && (!userRead?.recipientInstalled || !userReadRecipientAllowed(alias))) return
     if (deleting.current || marking.current || !active.current.live || !userRead?.installed || !userRead.hosted || !Number.isSafeInteger(userRead.revision) || userRead.revision <= 0 || row.kind !== 'p2p' || row.index.startsWith('-') || !userReadBaselineReady(userOutcomes, lineId, active.current.generation) || userOutcomes.context !== userReadContext || userReadKnownUnknown(userOutcomes, lineId, active.current.generation, row.id, row.index) || userUncertain?.line === lineId && userUncertain.id === row.id) return
-    if (!window.confirm('确认已阅读这条原 IM 消息，并向原服务端标记已读？此操作与接收位置回执、渠道送达或通话/媒体状态无关。')) return
+    if (!window.confirm(alias === undefined ? '确认已阅读这条原 IM 消息，并向原服务端标记已读？此操作与接收位置回执、渠道送达或通话/媒体状态无关。' : '通过原收件人解析标记这条原消息已读？解析 UID 必须匹配本条本地原目标，不清空未知写入、不自动重放或重新登录。')) return
     const original = { ...active.current }; const revision = userRead.revision
     const after = userOutcomes?.line === lineId ? Math.max(0, ...userOutcomes.rows.map((row) => row.id)) : 0
     const nonce = crypto.randomUUID().replaceAll('-', '')
     marking.current = true; active.current.readSerial += 1; setBusy(true)
     try {
-      const response = await api.markAppImUserRead(original.line, row.id, revision, nonce)
+      const response = alias === undefined ? await api.markAppImUserRead(original.line, row.id, revision, nonce) : await api.markAppImUserReadViaRecipient(original.line, row.id, revision, nonce, alias)
       const result = userReadRows([response.data])[0]
       if (!result || result.messageId !== row.id || result.index !== row.index) throw new Error('Unconfirmed original user-read result')
       if (!active.current.live || active.current.generation !== original.generation) return
@@ -81,11 +85,13 @@ export default function AppImMessagesPane({ lineId, userRead }: { lineId: string
     {uncertain?.line === lineId && <Alert severity="warning">删除结果尚未核实；仅继续读取原账号，不自动重放删除。</Alert>}
     {userUncertain?.line === lineId && <Alert severity="warning">用户已读写入未核实；仅查询原账号状态，不自动重放。</Alert>}
     {userRead?.installed && <Typography variant="caption" color="text.secondary">{USER_READ_SCOPE}</Typography>}
+    {userRead?.recipientInstalled && <TextField size="small" label="已读收件人原 URI（可选）" value={recipient} autoComplete="off" slotProps={{ htmlInput: { maxLength: 512 } }} disabled={busy || !userRead.hosted} onChange={(event) => setRecipientInput({ context: userReadContext, value: event.target.value })} />}
     {rows.map((row) => <Stack key={row.id} spacing={0.5}>
       <Typography variant="caption">{row.kind === 'p2p' ? '点对点' : '群组'} · 消息索引 {row.index} · {row.receivedAt}</Typography>
       <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{row.text}</Typography>
       {!!row.attachments && <Typography variant="caption">私有附件 {row.attachments} 项；不会按服务端文件名写入路径或自动打开。</Typography>}
       {userRead?.installed && row.kind === 'p2p' && !row.index.startsWith('-') && <Button size="small" disabled={busy || !userRead.hosted || !currentUserOutcomes || userReadKnownUnknown(currentUserOutcomes, lineId, currentUserOutcomes.generation, row.id, row.index) || userUncertain?.line === lineId && userUncertain.id === row.id} onClick={() => { void markRead(row) }}>明确标记原消息已读</Button>}
+      {userRead?.installed && userRead.recipientInstalled && row.kind === 'p2p' && !row.index.startsWith('-') && <Button size="small" disabled={busy || !userRead.hosted || !currentUserOutcomes || !userReadRecipientAllowed(recipient) || userReadKnownUnknown(currentUserOutcomes, lineId, currentUserOutcomes.generation, row.id, row.index) || userUncertain?.line === lineId && userUncertain.id === row.id} onClick={() => { void markRead(row, recipient) }}>通过原收件人解析标记已读</Button>}
       {currentUserOutcomes && currentUserOutcomes.rows.filter((result) => result.messageId === row.id).slice(0, 1).map((result) => <Typography key={result.id} variant="caption">{userReadLabel(result.state)}</Typography>)}
       <Button size="small" color="warning" disabled={busy || (uncertain?.line === lineId && uncertain.id === row.id)} onClick={() => { void remove(row) }}>删除本地 IM 文本</Button>
     </Stack>)}
