@@ -2,6 +2,8 @@
 //! composition; target/history DATA never constructs a manual write capability.
 use super::*;
 use n::{im_inbox::{ReadStatusTargets,ReadStatusAction,ReadStatusWait,ReadStatusPrepared},im_read_status_policy::NativeReadStatusConfig};
+#[path="im_read_status_recipient_protocol_tests.rs"]
+mod recipient;
 fn policy()->NativeReadStatusConfig{NativeReadStatusConfig{set_read_status:true}}
 fn group_span(f:&mut Fixture)->GapCommitted{
     let mut w=Writer::new();w.boolean(true).unwrap();w.u32(1).unwrap();w.bytes(b"1-2").unwrap();w.properties(&[RpcProperty{key:n::im_status::PEER_READ,value:b"0"},RpcProperty{key:n::im_status::LATEST,value:b"7"}]).unwrap();w.i64(1).unwrap();w.bytes(b"").unwrap();let r=read(f,Arc::new(ImQuery::refresh(&[],-1).unwrap()),w.finish().expose_to_transport());let mut c=CursorSession::from_refresh(f.run.clone(),f.gate.clone(),&r).unwrap();c.observe_refresh(&f.temp.database,&r).unwrap();let gap=c.next_gap(&f.temp.database).unwrap().unwrap();let r=read(f,gap.query(),&empty());c.commit_gap(&f.temp.database,&gap,&r).unwrap()

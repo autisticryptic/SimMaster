@@ -37,6 +37,8 @@ mod alive;
 mod user_read;
 #[path="runtime_read_status.rs"]
 mod read_status;
+#[path="runtime_read_status_recipient.rs"]
+mod read_status_recipient;
 #[path="runtime_user_read_recipient.rs"]
 mod user_read_recipient;
 #[path="runtime_im_reconciliation.rs"]

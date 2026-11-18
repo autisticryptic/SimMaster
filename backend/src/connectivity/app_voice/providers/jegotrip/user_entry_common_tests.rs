@@ -11,6 +11,8 @@ mod uid_local;
 mod shared_budget;
 #[path="im_user_read_recipient_account_tests.rs"]
 mod recipient_reads;
+#[path="im_read_status_recipient_account_tests.rs"]
+mod manual_positions;
 fn bootstrap_user_entry()->Vec<u8>{
     let properties=[RpcProperty{key:b"DomainName",value:b"account-domain.invalid"},RpcProperty{key:b"DomainId",value:b"fixture-domain"},RpcProperty{key:b"AppId",value:b"fixture-app"},RpcProperty{key:b"CC",value:b"fixture-cc"}];
     let mut w=Writer::new();w.boolean(true).unwrap();w.properties(&properties).unwrap();w.bytes(DESTINATION.as_bytes()).unwrap();w.bytes(b"").unwrap();w.bytes(b"prefix/UserEntry:sarc -h 42.7 -p 98;").unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()

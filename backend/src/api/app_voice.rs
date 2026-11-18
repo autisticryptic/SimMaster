@@ -57,6 +57,10 @@ pub struct ImReadStatusRequest{expected_revision:u64,expected_index:String,nonce
 impl Drop for ImReadStatusRequest{fn drop(&mut self){zeroize::Zeroize::zeroize(&mut self.nonce);}}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ImReadStatusRecipientRequest{expected_revision:u64,expected_index:String,nonce:String,recipient:String,consent:bool}
+impl Drop for ImReadStatusRecipientRequest{fn drop(&mut self){zeroize::Zeroize::zeroize(&mut self.nonce);zeroize::Zeroize::zeroize(&mut self.recipient);}}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserEntryLookupRequest{expected_revision:u64,recipient:String,consent:bool}
 impl Drop for UserEntryLookupRequest{fn drop(&mut self){zeroize::Zeroize::zeroize(&mut self.recipient);}}
 fn default_inbox_limit() -> usize { 50 }
@@ -89,6 +93,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/im-receipts", get(get_im_receipts))
         .route("/api/non-3gpp/accounts/{line_id}/im-read-status-targets",get(get_im_read_status_targets))
         .route("/api/non-3gpp/accounts/{line_id}/im-read-status-targets/{target_id}/set",post(set_im_read_status))
+        .route("/api/non-3gpp/accounts/{line_id}/im-read-status-targets/{target_id}/set/recipient",post(set_im_read_status_via_recipient))
         .route("/api/non-3gpp/accounts/{line_id}/im-read-status-actions",get(get_im_read_status_history))
         .route("/api/non-3gpp/accounts/{line_id}/im-user-reads",get(get_im_user_reads))
         .route("/api/non-3gpp/accounts/{line_id}/im-user-reads/{receipt_id}/reconcile",post(reconcile_im_user_read))
@@ -137,7 +142,10 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_im_read_status_scope_invalid" | "app_account_im_read_status_uncertain" | "app_account_im_read_status_timeout" => StatusCode::SERVICE_UNAVAILABLE,
         "app_account_im_read_status_target_missing" => StatusCode::NOT_FOUND,
         "app_account_im_read_status_target_conflict" | "app_account_im_read_status_nonce_conflict" | "app_account_im_receipt_uncertain" => StatusCode::CONFLICT,
-        "app_account_im_read_status_full" => StatusCode::TOO_MANY_REQUESTS,
+        "app_account_im_read_status_recipient_not_installed" => StatusCode::FORBIDDEN,
+        "app_account_im_read_status_request_invalid" | "app_account_im_read_status_recipient_unsupported" => StatusCode::BAD_REQUEST,
+        "app_account_im_read_status_recipient_unconfirmed" | "app_account_im_read_status_recipient_target_stale" | "app_account_im_read_status_resolution_inflight" | "app_account_im_read_status_resolution_finished" => StatusCode::CONFLICT,
+        "app_account_im_read_status_full" | "app_account_im_read_status_recipient_capacity" => StatusCode::TOO_MANY_REQUESTS,
         "app_account_im_user_read_message_missing" => StatusCode::NOT_FOUND,
         "app_account_im_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_account_im_user_read_full" => StatusCode::TOO_MANY_REQUESTS,
@@ -303,6 +311,11 @@ pub async fn set_im_read_status(State(manager):State<Arc<AccountManager>>,Path((
     let Ok(Json(request))=request else{return failure("app_account_request_invalid");};let Ok(id)=target_id.parse::<i64>()else{return failure("app_account_request_invalid");};let Ok(index)=request.expected_index.parse::<i64>()else{return failure("app_account_request_invalid");};
     if id<=0||id.to_string()!=target_id||index<0||index.to_string()!=request.expected_index||request.nonce.len()!=32||!request.nonce.bytes().all(|c|c.is_ascii_digit()||(b'a'..=b'f').contains(&c)){return failure("app_account_request_invalid");}
     success(StatusCode::OK,manager.set_im_read_status(&line_id,request.expected_revision,id,&request.expected_index,&request.nonce,request.consent).await)
+}
+pub async fn set_im_read_status_via_recipient(State(manager):State<Arc<AccountManager>>,Path((line_id,target_id)):Path<(String,String)>,request:Result<Json<ImReadStatusRecipientRequest>,JsonRejection>)->Response{
+    let Ok(Json(request))=request else{return failure("app_account_request_invalid");};let Ok(id)=target_id.parse::<i64>()else{return failure("app_account_request_invalid");};let Ok(index)=request.expected_index.parse::<i64>()else{return failure("app_account_request_invalid");};
+    if id<=0||id.to_string()!=target_id||index<0||index.to_string()!=request.expected_index||request.nonce.len()!=32||!request.nonce.bytes().all(|c|c.is_ascii_digit()||(b'a'..=b'f').contains(&c))||!crate::connectivity::app_voice::providers::jegotrip::valid_user_read_recipient(&request.recipient){return failure("app_account_request_invalid");}
+    success(StatusCode::OK,manager.set_im_read_status_via_recipient(&line_id,request.expected_revision,id,&request.expected_index,&request.nonce,&request.recipient,request.consent).await)
 }
 pub async fn get_im_user_reads(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Query<InboxQuery>,QueryRejection>)->Response{
     let Ok(Query(request))=request else{return failure("app_account_request_invalid");};if !(1..=128).contains(&request.limit){return failure("app_account_request_invalid");}success(StatusCode::OK,manager.im_user_read_history(&line_id,request.limit))

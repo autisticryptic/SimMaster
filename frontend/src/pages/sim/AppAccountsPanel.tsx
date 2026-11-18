@@ -96,7 +96,7 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
                 <AppImMessagesPane lineId={account.line_id} userRead={{ revision: account.revision, installed: account.im_user_read_supported === true, hosted: account.phase === 'hosted', recipientInstalled: account.im_user_read_recipient_supported === true }} />
                 <AppUserEntryPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.user_entry_supported === true || account.user_entry_uid_local_supported === true} localOnly={account.user_entry_supported !== true} />
                 <AppImReceiptsPane lineId={account.line_id} />
-                <AppImReadStatusPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.im_read_status_supported === true} />
+                <AppImReadStatusPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.im_read_status_supported === true} recipientInstalled={account.im_read_status_recipient_supported === true} />
                 <AppImReconciliationPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.im_reconciliation_supported === true} />
               </Box>
               <Chip size="small" color={account.incoming_message_ready ? 'success' : 'default'} label={account.incoming_message_ready ? '短信就绪' : '短信未就绪'} />

@@ -43,5 +43,8 @@ export function readStatusUnknownResolved(unknown: ReadStatusUnknown, snapshot: 
   if (unknown.context !== context || !readStatusBaselineReady(snapshot, context, generation) || snapshot.rows.some((row) => row.state === 'uncertain')) return false
   return snapshot.rows.some((row) => row.targetId === unknown.targetId && row.index === unknown.index && row.id > unknown.after && row.state !== 'uncertain')
 }
+export function readStatusRecipientNoWriteError(error: unknown): boolean {
+  return error instanceof Error && ['app_account_im_read_status_recipient_unconfirmed', 'app_account_im_read_status_recipient_target_stale', 'app_account_im_read_status_resolution_inflight', 'app_account_im_read_status_resolution_finished', 'app_account_im_read_status_recipient_capacity', 'app_account_im_read_status_recipient_not_installed', 'app_account_im_read_status_recipient_unsupported', 'app_account_im_read_status_request_invalid'].includes(error.message)
+}
 export const READ_STATUS_SCOPE = '原连续消费位置的手动设置，含群组；不是用户已读 P:P_UDMR-N、消息通知回执、渠道送达或 SDK/媒体授信，不重放未知写入。'
 export function readStatusLabel(s: ReadStatusRow['state']): string { switch (s) { case 'uncertain': return '原读位置写入未核实，不重放'; case 'confirmed': return '原手动读位置操作已确认（不是用户已读）'; case 'rejected': return '原手动读位置操作被拒绝'; case 'not_sent': return '原手动读位置操作未写出' } }
