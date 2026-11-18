@@ -10,6 +10,7 @@ const WRITING:u8=1;
 const SUBMITTED:u8=2;
 const RESOLVED:u8=3;
 const RETIRED:u8=4;
+const CLOSED_WRITE:u8=5;
 const UNRESOLVED:&str="app_account_im_receipt_uncertain";
 const MAX_RECEIPTS_ACCOUNT:i64=128;
 const MAX_RECEIPTS_TOTAL:i64=4096;
@@ -77,13 +78,17 @@ impl ReceivedWritePermit{
         self.request_is_current(id)&&self.phase.compare_exchange(QUEUED,WRITING,Ordering::SeqCst,Ordering::SeqCst).is_ok()
     }
     pub(in super::super) fn submitted(&self)->bool{self.phase.compare_exchange(WRITING,SUBMITTED,Ordering::SeqCst,Ordering::SeqCst).is_ok()}
-    pub(in super::super) fn is_retired(&self)->bool{self.phase.load(Ordering::SeqCst)==RETIRED}
+    pub(in super::super) fn is_retired(&self)->bool{self.phase.load(Ordering::SeqCst)>=RETIRED}
+    /// Private cancellation provenance only: queued/read retirement never
+    /// claims that this original WRITE closed IO or supplies a new grant.
+    pub(in super::super) fn closed_original_io(&self)->bool{self.phase.load(Ordering::SeqCst)==CLOSED_WRITE}
     #[cfg(test)]
     pub(in super::super) fn has_submitted(&self)->bool{self.phase.load(Ordering::SeqCst)==SUBMITTED}
     pub(in super::super) fn cancel(&self){
         let original=loop{
             let phase=self.phase.load(Ordering::SeqCst);if phase>=RESOLVED{return;}
-            if self.phase.compare_exchange(phase,RETIRED,Ordering::SeqCst,Ordering::SeqCst).is_ok(){break phase;}
+            let retired=if phase==QUEUED{RETIRED}else{CLOSED_WRITE};
+            if self.phase.compare_exchange(phase,retired,Ordering::SeqCst,Ordering::SeqCst).is_ok(){break phase;}
         };
         if original==QUEUED{
             // A still-queued permit cannot have emitted any bytes. Failure to

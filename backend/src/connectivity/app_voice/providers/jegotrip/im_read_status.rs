@@ -37,19 +37,20 @@ fn state_name(s:i64)->Result<&'static str,&'static str>{match s{0=>Ok("uncertain
 /// It is not an SDK/WRITE grant and is never reset by stop/restart or clear.
 pub(in super::super) struct ReadStatusBudget{state:Mutex<(usize,usize)>}
 impl ReadStatusBudget{pub(in super::super) fn original()->Arc<Self>{Arc::new(Self{state:Mutex::new((0,0))})}#[cfg(test)]pub(in super::super) fn snapshot(&self)->(usize,usize){*lock(&self.state)}}
-struct TargetResources{state:Mutex<(usize,usize)>,aggregate:Arc<ReadStatusBudget>}
+struct TargetResources{state:Mutex<(usize,usize)>,aggregate:Arc<ReadStatusBudget>,retired:AtomicBool}
 pub(in super::super) struct TargetReservation{resources:Arc<TargetResources>,bytes:usize}
-impl TargetResources{fn reserve(self:&Arc<Self>,bytes:usize)->Result<TargetReservation,&'static str>{let mut state=lock(&self.state);let total=state.1.checked_add(bytes).ok_or(FULL)?;if state.0>=MAX_LOCAL as usize||total>1024*1024{return Err(FULL);}let mut aggregate=lock(&self.aggregate.state);let global=aggregate.1.checked_add(bytes).ok_or(FULL)?;if aggregate.0>=MAX_GLOBAL as usize||global>16*1024*1024{return Err(FULL);}state.0+=1;state.1=total;aggregate.0+=1;aggregate.1=global;Ok(TargetReservation{resources:self.clone(),bytes})}}
+impl TargetResources{fn reserve(self:&Arc<Self>,bytes:usize)->Result<TargetReservation,&'static str>{if self.retired.load(Ordering::SeqCst){return Err(STATUS_SCOPE);}let mut state=lock(&self.state);let total=state.1.checked_add(bytes).ok_or(FULL)?;if state.0>=MAX_LOCAL as usize||total>1024*1024{return Err(FULL);}let mut aggregate=lock(&self.aggregate.state);let global=aggregate.1.checked_add(bytes).ok_or(FULL)?;if aggregate.0>=MAX_GLOBAL as usize||global>16*1024*1024{return Err(FULL);}state.0+=1;state.1=total;aggregate.0+=1;aggregate.1=global;Ok(TargetReservation{resources:self.clone(),bytes})}}
 impl Drop for TargetReservation{fn drop(&mut self){let mut state=lock(&self.resources.state);let mut aggregate=lock(&self.resources.aggregate.state);state.0=state.0.saturating_sub(1);state.1=state.1.saturating_sub(self.bytes);aggregate.0=aggregate.0.saturating_sub(1);aggregate.1=aggregate.1.saturating_sub(self.bytes);}}
 pub(in super::super) struct ReadStatusTarget{id:i64,span:Arc<GapCommitted>,observed_at:String,_reservation:TargetReservation}
 impl ReadStatusTarget{
-    fn validate_current(&self,conn:&Connection)->Result<(),&'static str>{self.span.validate_current(conn)?;let context=self.span.receipt_context();let(box_id,index,hash)=self.span.receipt_span();let matching:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_im_read_status_targets WHERE id=?1 AND line_id=?2 AND revision=?3 AND run_nonce=?4 AND scope_epoch=?5 AND identity_key=?6 AND box_id=?7 AND target_index=?8 AND span_hash=?9)",params![self.id,context.run.line_id(),context.run.revision()as i64,context.run.nonce(),context.binding.receipt_epoch(),context.binding.identity().as_slice(),box_id,index,hash.as_slice()],|r|r.get(0)).map_err(|_|STORAGE)?;if !matching{return Err(STATUS_SCOPE);}Ok(())}
+    fn live(&self)->bool{!self._reservation.resources.retired.load(Ordering::SeqCst)}
+    fn validate_current(&self,conn:&Connection)->Result<(),&'static str>{if !self.live(){return Err(STATUS_SCOPE);}self.span.validate_current(conn)?;let context=self.span.receipt_context();let(box_id,index,hash)=self.span.receipt_span();let matching:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_im_read_status_targets WHERE id=?1 AND line_id=?2 AND revision=?3 AND run_nonce=?4 AND scope_epoch=?5 AND identity_key=?6 AND box_id=?7 AND target_index=?8 AND span_hash=?9)",params![self.id,context.run.line_id(),context.run.revision()as i64,context.run.nonce(),context.binding.receipt_epoch(),context.binding.identity().as_slice(),box_id,index,hash.as_slice()],|r|r.get(0)).map_err(|_|STORAGE)?;if !matching{return Err(STATUS_SCOPE);}Ok(())}
 }
 pub(in super::super) struct ReadStatusTargets{database:Arc<Database>,run:Arc<RunToken>,gate:Arc<ImReceiptGate>,targets:Mutex<BTreeMap<i64,Arc<ReadStatusTarget>>>,retired:AtomicBool,resources:Arc<TargetResources>}
 impl fmt::Debug for ReadStatusTargets{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ReadStatusTargets(<redacted>)")}}
 impl ReadStatusTargets{
-    pub(in super::super) fn original(database:Arc<Database>,run:Arc<RunToken>,gate:Arc<ImReceiptGate>,aggregate:Arc<ReadStatusBudget>)->Arc<Self>{Arc::new(Self{database,run,gate,targets:Mutex::new(BTreeMap::new()),retired:AtomicBool::new(false),resources:Arc::new(TargetResources{state:Mutex::new((0,0)),aggregate})})}
-    pub(in super::super) fn clear(&self){let mut targets=lock(&self.targets);self.retired.store(true,Ordering::SeqCst);targets.clear();}
+    pub(in super::super) fn original(database:Arc<Database>,run:Arc<RunToken>,gate:Arc<ImReceiptGate>,aggregate:Arc<ReadStatusBudget>)->Arc<Self>{Arc::new(Self{database,run,gate,targets:Mutex::new(BTreeMap::new()),retired:AtomicBool::new(false),resources:Arc::new(TargetResources{state:Mutex::new((0,0)),aggregate,retired:AtomicBool::new(false)})})}
+    pub(in super::super) fn clear(&self){let mut targets=lock(&self.targets);self.retired.store(true,Ordering::SeqCst);self.resources.retired.store(true,Ordering::SeqCst);targets.clear();}
     pub(in super::super) fn observe(&self,span:&GapCommitted)->Result<(),&'static str>{
         let context=span.receipt_context();if self.retired.load(Ordering::SeqCst)||!self.gate.live()||!Arc::ptr_eq(&self.gate,&context.gate)||!Arc::ptr_eq(&self.run,&context.run)||!span.is_current(&self.database){return Err(STATUS_SCOPE);}
         if lock(&self.targets).values().any(|target|target.span.same_captured_span(span)){return Ok(());}
@@ -72,13 +73,13 @@ pub(in super::super) struct ReadStatusAction{database:Arc<Database>,run:Arc<RunT
 impl fmt::Debug for ReadStatusAction{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ReadStatusAction(<redacted>)")}}
 impl ReadStatusAction{
     pub(in super::super) fn original(database:Arc<Database>,run:Arc<RunToken>,parent_gate:Arc<ImReceiptGate>,owner:AttemptOwner,scope:RpcConnectionScope,target:Arc<ReadStatusTarget>,nonce:&str,deadline:Instant)->Result<Arc<Self>,&'static str>{
-        let context=target.span.receipt_context();if nonce.len()!=32||!nonce.bytes().all(|c|c.is_ascii_digit()||(b'a'..=b'f').contains(&c))||!Arc::ptr_eq(&run,&context.run)||!Arc::ptr_eq(&parent_gate,&context.gate)||!context.binding.matches(&owner,&scope)||!target.span.is_current(&database)||Instant::now()>=deadline{return Err(STATUS_SCOPE);}
+        let context=target.span.receipt_context();if nonce.len()!=32||!nonce.bytes().all(|c|c.is_ascii_digit()||(b'a'..=b'f').contains(&c))||!Arc::ptr_eq(&run,&context.run)||!Arc::ptr_eq(&parent_gate,&context.gate)||!context.binding.matches(&owner,&scope)||!target.live()||!target.span.is_current(&database)||Instant::now()>=deadline{return Err(STATUS_SCOPE);}
         Ok(Arc::new(Self{database,run,parent_gate,gate:ImReceiptGate::fresh(),owner,scope,target,nonce:Zeroizing::new(nonce.to_owned()),deadline,permit:Mutex::new(Weak::new())}))
     }
     pub(in super::super) fn owner(&self)->&AttemptOwner{&self.owner}
     pub(in super::super) fn scope(&self)->RpcConnectionScope{self.scope.clone()}
     pub(in super::super) fn deadline(&self)->Instant{self.deadline}
-    pub(in super::super) fn live(&self)->bool{self.parent_gate.live()&&self.gate.live()&&self.scope.is_open()&&!self.scope.session_revoked()&&Instant::now()<self.deadline}
+    pub(in super::super) fn live(&self)->bool{self.target.live()&&self.parent_gate.live()&&self.gate.live()&&self.scope.is_open()&&!self.scope.session_revoked()&&Instant::now()<self.deadline}
     pub(in super::super) fn gate(&self)->Arc<ImReceiptGate>{self.gate.clone()}
     pub(in super::super) fn parent_gate(&self)->Arc<ImReceiptGate>{self.parent_gate.clone()}
     pub(in super::super) fn database(&self)->Arc<Database>{self.database.clone()}

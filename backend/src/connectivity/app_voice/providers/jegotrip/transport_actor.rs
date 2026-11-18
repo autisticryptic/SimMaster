@@ -547,7 +547,7 @@ impl PreparedRuntime {
         let owner = self.owner.clone(); let scope = self.scope.clone();
         let actor = Actor { io: Some(io), owner: owner.clone(), scope: scope.clone(), backend, tls:Some(tls), common:None, native_attempt_end:None, commands: commands_rx,
             events: events_tx, policy, timing: self.timing, start: self.start, pending: std::collections::BTreeMap::new(),
-            logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new(),im_pending:std::collections::BTreeMap::new(),received_pending:std::collections::BTreeMap::new(),user_read_pending:std::collections::BTreeMap::new(),user_write_retirement:None };
+            logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new(),im_pending:std::collections::BTreeMap::new(),received_pending:std::collections::BTreeMap::new(),user_read_pending:std::collections::BTreeMap::new(),user_write_retirement:None,received_write_retirement:None };
         self.attached = true;
         let task = tokio::spawn(actor.run());
         Ok((RuntimeHandle { owner, scope, commands: commands_tx, task: Some(task) }, events_rx))
@@ -582,6 +582,7 @@ struct Actor<I> {
     received_pending:std::collections::BTreeMap<i32,ReceivedPending>,
     user_read_pending:std::collections::BTreeMap<i32,UserReadPending>,
     user_write_retirement:Option<RuntimeError>,
+    received_write_retirement:Option<RuntimeError>,
 }
 impl<I> Drop for Actor<I> {
     fn drop(&mut self) {
@@ -593,6 +594,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     async fn run(mut self) -> RuntimeError {
         let result = self.loop_run().await;
         let result = if result==RuntimeError::Closed{self.user_write_close_reason().unwrap_or(result)}else{result};
+        let result = if result==RuntimeError::Closed{self.received_write_close_reason().unwrap_or(result)}else{result};
         let result = if self.scope.session_revoked() { RuntimeError::SessionRevoked } else { result };
         self.scope.close(); self.backend.close(); if let Some(tls)=&mut self.tls{tls.close();}
         if let Some(common)=&mut self.common{common.close();}self.common=None;self.io = None; self.commands.close();

@@ -18,6 +18,9 @@ impl RuntimeCommands{
     }
 }
 impl<I:AsyncRead+AsyncWrite+Unpin+Send+'static> Actor<I>{
+    /// Only an original possibly/full submitted WRITE can supply a cause for
+    /// generic Closed. Queued cancellation and unrelated IO errors cannot.
+    pub(super) fn received_write_close_reason(&self)->Option<RuntimeError>{self.received_write_retirement.or_else(||self.received_pending.values().find_map(|p|p.permit.closed_original_io().then_some(RuntimeError::Cancelled)))}
     pub(super) fn retire_received_writes(&mut self,now:Instant){
         let retired=self.received_pending.iter().filter_map(|(&id,p)|{
             if p.permit.is_retired()||p.reply.is_closed()||!p.permit.gate().live(){Some((id,RuntimeError::Cancelled))}
@@ -26,7 +29,7 @@ impl<I:AsyncRead+AsyncWrite+Unpin+Send+'static> Actor<I>{
         for(id,reason)in retired{if let Some(p)=self.received_pending.remove(&id){
             // Submitted remote writes remain unknown and close this original
             // scope. Removing only a readonly reply interest is not sufficient.
-            p.permit.cancel();self.backend.retire_received_write(id);self.pending.remove(&id);let _=p.reply.send(Err(reason));
+            p.permit.cancel();self.backend.retire_received_write(id);if p.permit.closed_original_io(){self.received_write_retirement.get_or_insert(reason);}self.pending.remove(&id);let _=p.reply.send(Err(reason));
         }}
     }
     pub(super) fn deliver_received_replies(&mut self,outcome:Result<(),RuntimeError>)->Result<(),RuntimeError>{
