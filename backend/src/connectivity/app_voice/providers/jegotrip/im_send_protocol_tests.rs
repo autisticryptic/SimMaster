@@ -1,4 +1,6 @@
 //! Actions-only original SDK/SQL/RPC sender capability, not SO/device execution.
+#[path="im_send_option_protocol_tests.rs"]
+mod options;
 #[path="im_send_hardening_tests.rs"]
 mod hardening;
 use super::*;

@@ -61,7 +61,7 @@ fn properties(fields:&[RpcProperty<'_>],attachments:bool,notify:bool)->Result<()
     let mut size=4usize;
     for(index,p)in fields.iter().enumerate(){
         key(p.key)?;
-        if notify{let name=p.key.strip_prefix(b"Notify.").or_else(||p.key.strip_prefix(b"Statistics.")).ok_or(CodecError::InvalidField)?;component(name)?;}
+        if notify&&p.key!=b"OnlineMsg"{let name=p.key.strip_prefix(b"Notify.").or_else(||p.key.strip_prefix(b"Statistics.")).ok_or(CodecError::InvalidField)?;component(name)?;}
         if attachments{
             if p.value.len()>MAX_ATTACHMENT_BYTES{return Err(CodecError::TooLarge);}
             if p.value.is_empty(){return Err(CodecError::InvalidField);}
@@ -91,14 +91,35 @@ fn json_content(prefix:&[u8],text:&str)->Result<Zeroizing<Vec<u8>>,CodecError>{
     Ok(out)
 }
 
+/// Original 5C347C (readonly real prologue) copies these three present string
+/// properties into notification DATA. Presence includes explicit empty values.
+/// 5C38F4 chooses nonempty MtcImDigestKey text, otherwise original Text content.
+/// These fields are NOT account authentication, retry/IO or delivery grants.
+pub(super) fn default_user_send_notifications<'a>(message:&OutgoingMessage<'a>,digest:Option<&'a[u8]>)->Result<Vec<RpcProperty<'a>>,CodecError>{
+    properties(message.parameters,false,false)?;
+    if let Some(value)=digest{string(value)?;if !matches!(&message.kind,SendKind::Text){return Err(CodecError::InvalidField);}}
+    let mut fields=Vec::with_capacity(4);
+    for(source,target)in[(b"userData".as_slice(),b"Notify.ImUserData".as_slice()),(b"OnlineMsg".as_slice(),b"OnlineMsg".as_slice()),(b"imdnId".as_slice(),b"Notify.ImdnId".as_slice())]{if let Some(value)=message.parameters.iter().find(|p|p.key==source).map(|p|p.value){fields.push(RpcProperty{key:target,value});}}
+    if matches!(&message.kind,SendKind::Text){fields.push(RpcProperty{key:b"Notify.Text",value:digest.filter(|value|!value.is_empty()).unwrap_or(message.content)});}
+    properties(&fields,false,true)?;Ok(fields)
+}
+
+/// Validate captured input with the original parent input bounds BEFORE a
+/// journal/replay lookup. Newly derived duplicates are checked at permit encode,
+/// not used to make a previously valid immutable legacy nonce unqueryable.
+/// This pure DATA function never returns a send request or permission.
+pub(super) fn validate_user_send_capture(message:&OutgoingMessage<'_>,notifications:Option<&[RpcProperty<'_>]>)->Result<(),CodecError>{
+    let text_default=[RpcProperty{key:b"Notify.Text",value:message.content}];
+    let capture:&[RpcProperty<'_>]=match notifications{Some(fields)=>fields,None=>match &message.kind{SendKind::Text=>text_default.as_slice(),SendKind::Info(_)=>&[]}};
+    encode_user_send(ImBox::parse(b"P2P/0_1")?,message,b"[uid:0_1@data.invalid]",Some(capture))?;Ok(())
+}
+
 /// Exact request DATA, not a runnable RPC, identity attestation or send permit.
-/// None defaults Text to Notify.Text=the ORIGINAL caller text; Info defaults
-/// to an empty map. Some(fields) is EXACTLY that explicit Notify.* map, even
-/// Some(&[]) (suppresses the Text default). No merging or implicit extraction
-/// from message.parameters occurs. Original Statistics.* (5C3130/16A9FC) also
-/// resides in this map; runtime injects its owned AppId/DomainId/CountryCode.
-/// Byte validation of either namespace remains DATA, not authorization.
-pub(super) fn encode_user_send(box_id:ImBox<'_>,message:&OutgoingMessage<'_>,account_uri:&[u8],notifications:Option<&[RpcProperty<'_>]>)->Result<RpcBytes,CodecError>{
+/// Explicit Some(fields) remains an EXACT override, including Some(&[]) which
+/// suppresses defaults. None follows original present metadata and Text digest
+/// rules; original Statistics.* stays in the same notification DATA map.
+pub(super) fn encode_user_send(box_id:ImBox<'_>,message:&OutgoingMessage<'_>,account_uri:&[u8],notifications:Option<&[RpcProperty<'_>]>)->Result<RpcBytes,CodecError>{encode_user_send_with_digest(box_id,message,account_uri,notifications,None)}
+pub(super) fn encode_user_send_with_digest(box_id:ImBox<'_>,message:&OutgoingMessage<'_>,account_uri:&[u8],notifications:Option<&[RpcProperty<'_>]>,digest:Option<&[u8]>)->Result<RpcBytes,CodecError>{
     // Only byte bounds/UTF-8/control checks, not proof of SDK ownership. Keep
     // the supplied normalized URI exact; do not infer it from any other field.
     string(account_uri)?;
@@ -121,8 +142,9 @@ pub(super) fn encode_user_send(box_id:ImBox<'_>,message:&OutgoingMessage<'_>,acc
     // These vectors contain borrowed references only, not copies of secrets.
     let mut parameters=Vec::with_capacity(message.parameters.len()+1);
     parameters.extend_from_slice(message.parameters);parameters.push(RpcProperty{key:b"account",value:account_uri});
-    let default_text=[RpcProperty{key:b"Notify.Text",value:message.content}];
-    let notify:&[RpcProperty<'_>]=match notifications{Some(fields)=>fields,None=>match &message.kind{SendKind::Text=>default_text.as_slice(),SendKind::Info(_)=>&[]}};
+    if notifications.is_some()&&digest.is_some(){return Err(CodecError::InvalidField);}
+    let defaults=if notifications.is_none(){default_user_send_notifications(message,digest)?}else{Vec::new()};
+    let notify=notifications.unwrap_or(&defaults);
     let mut writer=Writer::versioned()?;writer.bytes(box_id.bytes())?;
     writer.bytes(&kind)?;writer.bytes(&content)?;
     // Both native map value types share the type0 length-prefixed wire shape.

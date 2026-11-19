@@ -3,6 +3,8 @@
 //! Independent byte builders below intentionally do not use Writer.
 #[path="im_send_version_data_tests.rs"]
 mod version_errors;
+#[path="im_send_option_data_tests.rs"]
+mod options;
 use crate::connectivity::app_voice::providers::jegotrip::{
     im_data::{ImBox,ImMessage},
     im_send_data::{encode_user_send,decode_user_send_result,OutgoingMessage,SendKind,USER_SEND_METHOD,MAX_ATTACHMENT_BYTES,MAX_INFO_SUBTYPE_BYTES},

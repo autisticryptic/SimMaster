@@ -49,3 +49,26 @@ test('original IM send exact no-intent failure rechecks whole history but admitt
   await page.setViewportSize({ width: 390, height: 844 }); expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
   await page.screenshot({ path: 'test-results/jegotrip-device-ui/im-send-admission-mobile.png', fullPage: true, animations: 'disabled' })
 })
+test('original notification metadata editor keeps digest separate from body and no metadata change can replay an unknown business send', async ({ page }) => {
+  let writes = 0; let history: object[] = []
+  page.on('dialog', (dialog) => { void dialog.accept() })
+  await page.route((url) => url.pathname.startsWith('/api/'), async (route) => {
+    const request = route.request(); expect(new URL(request.url()).pathname.endsWith('/im-outbox')).toBe(true)
+    if (request.method() === 'GET') { expect(new URL(request.url()).searchParams.get('limit')).toBe('128'); await route.fulfill({ json: { status: 'ok', data: history } }); return }
+    writes += 1; const data = request.postDataJSON(); const bytes = (text: string) => Array.from(new TextEncoder().encode(text))
+    expect(data).toEqual({ expected_revision: 1, nonce: expect.stringMatching(/^[0-9a-f]{32}$/), recipient: '1_2', content: 'actual body', notification_digest: 'display summary', parameters: [{ key: bytes('userData'), value: bytes('opaque-user-data') }, { key: bytes('OnlineMsg'), value: bytes('01') }, { key: bytes('imdnId'), value: bytes('opaque-imdn') }], consent: true, write_consent: true })
+    if (writes === 1) { const row = { id: 1, nonce_tag: tag(data.nonce), kind: 'text', state: 'confirmed', message_index: '4294967297', original_time: '-1' }; history = [row]; await route.fulfill({ json: { status: 'ok', data: { ...row, private_notification: 'never-render-raw' } } }); return }
+    await route.abort()
+  })
+  await page.setViewportSize({ width: 1280, height: 1100 }); await page.goto('/e2e/fixtures/im-send.html')
+  await page.getByRole('textbox', { name: '原 IM 收件人（UID / GroupID / 原 URI）' }).fill('1_2'); await page.getByRole('textbox', { name: '原 IM 内容' }).fill('actual body')
+  await page.getByRole('button', { name: '原通知元数据（可选）', exact: true }).click()
+  await page.getByRole('textbox', { name: 'Text通知摘要（原MtcImDigestKey DATA）' }).fill('display summary')
+  await page.getByRole('textbox', { name: '原userData字符串' }).fill('opaque-user-data'); await page.getByRole('textbox', { name: '原OnlineMsg字符串（不代表在线状态）' }).fill('01'); await page.getByRole('textbox', { name: '原imdnId字符串（不是回执授信）' }).fill('opaque-imdn')
+  const button = page.getByRole('button', { name: '明确执行原 IM 外发', exact: true }); await expect(button).toBeEnabled(); await button.click(); await expect(page.getByText(/原消息 ID 4294967297/)).toBeVisible(); await expect(page.getByText('never-render-raw', { exact: false })).toHaveCount(0)
+  await page.screenshot({ path: 'test-results/jegotrip-device-ui/im-send-options-desktop.png', fullPage: true, animations: 'disabled' })
+  await button.click(); await expect(page.getByText('原 IM 外发尚未核实；仅查询历史，不自动重放。', { exact: true })).toBeVisible(); await expect(button).toBeDisabled(); expect(writes).toBe(2)
+  await page.getByRole('textbox', { name: 'Text通知摘要（原MtcImDigestKey DATA）' }).fill('changed-summary'); await expect(button).toBeDisabled(); expect(writes).toBe(2)
+  await page.setViewportSize({ width: 390, height: 1000 }); expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
+  await page.screenshot({ path: 'test-results/jegotrip-device-ui/im-send-options-mobile.png', fullPage: true, animations: 'disabled' })
+})

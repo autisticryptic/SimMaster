@@ -112,7 +112,7 @@ import type {
 } from './types'
 import { humanizeCostPolicyError } from '../policies/imsRegistration'
 import { userReadRecipientBody } from '../policies/userEntry'
-import { ImSendNotAdmittedError, imSendFailureEnvelope } from '../policies/imSend'
+import { ImSendNotAdmittedError, imSendFailureEnvelope, imSendMetadataBody, type ImSendMetadataInput } from '../policies/imSend'
 
 type SmsListResponse = {
   messages: SmsMessage[]
@@ -1159,8 +1159,10 @@ class SimAdminCurrentAPI {
   async getAppImOutbox(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-outbox?limit=128`, { cache: 'no-store', timeoutMs: 10000 })
   }
-  async sendAppIm(lineId: string, revision: number, nonce: string, recipient: string, content: string, infoType?: string, nonceTag?: string) {
-    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-outbox`, { method: 'POST', body: JSON.stringify({ expected_revision: revision, nonce, recipient, content, ...(infoType === undefined ? {} : { info_type: infoType }), consent: true, write_consent: true }), cache: 'no-store', timeoutMs: 10000, imSendNonceTag: nonceTag })
+  async sendAppIm(lineId: string, revision: number, nonce: string, recipient: string, content: string, infoType?: string, nonceTag?: string, metadata?: ImSendMetadataInput) {
+    const extra = imSendMetadataBody(metadata)
+    if (!extra || infoType !== undefined && extra.notification_digest !== undefined) { if (nonceTag) throw new ImSendNotAdmittedError('app_account_im_send_request_invalid', nonceTag); throw new Error('Original IM notification data invalid') }
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-outbox`, { method: 'POST', body: JSON.stringify({ expected_revision: revision, nonce, recipient, content, ...(infoType === undefined ? {} : { info_type: infoType }), ...extra, consent: true, write_consent: true }), cache: 'no-store', timeoutMs: 10000, imSendNonceTag: nonceTag })
   }
   async getAppImUserReads(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-user-reads?limit=16`, { cache: 'no-store', timeoutMs: 10000 })

@@ -57,8 +57,8 @@ pub struct ImSendDataField{key:Vec<u8>,value:Vec<u8>}
 impl Drop for ImSendDataField{fn drop(&mut self){zeroize::Zeroize::zeroize(&mut self.key);zeroize::Zeroize::zeroize(&mut self.value);}}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ImSendRequest{expected_revision:u64,nonce:String,recipient:String,content:String,info_type:Option<String>,#[serde(default)]attachments:Vec<ImSendDataField>,#[serde(default)]parameters:Vec<ImSendDataField>,notifications:Option<Vec<ImSendDataField>>,consent:bool,write_consent:bool}
-impl Drop for ImSendRequest{fn drop(&mut self){for s in [&mut self.nonce,&mut self.recipient,&mut self.content]{zeroize::Zeroize::zeroize(s);}if let Some(s)=&mut self.info_type{zeroize::Zeroize::zeroize(s);}}}
+pub struct ImSendRequest{expected_revision:u64,nonce:String,recipient:String,content:String,info_type:Option<String>,#[serde(default)]attachments:Vec<ImSendDataField>,#[serde(default)]parameters:Vec<ImSendDataField>,notifications:Option<Vec<ImSendDataField>>,notification_digest:Option<String>,consent:bool,write_consent:bool}
+impl Drop for ImSendRequest{fn drop(&mut self){for s in [&mut self.nonce,&mut self.recipient,&mut self.content]{zeroize::Zeroize::zeroize(s);}if let Some(s)=&mut self.info_type{zeroize::Zeroize::zeroize(s);}if let Some(s)=&mut self.notification_digest{zeroize::Zeroize::zeroize(s);}}}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImReadStatusRequest{expected_revision:u64,expected_index:String,nonce:String,consent:bool}
@@ -322,7 +322,7 @@ fn im_send_failure(code:&'static str,not_admitted:bool,nonce:&str)->Response{
 pub async fn send_im_message(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Json<ImSendRequest>,JsonRejection>)->Response{
     let Ok(Json(request))=request else{return failure("app_account_request_invalid");};
     if request.nonce.len()!=32||!request.nonce.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)){return failure("app_account_request_invalid");}
-    if request.recipient.len()>512||request.content.len()>65536||request.attachments.len()>128||request.parameters.len()>128||request.notifications.as_ref().is_some_and(|v|v.len()>128){return im_send_failure("app_account_request_invalid",true,&request.nonce);}
+    if request.recipient.len()>512||request.content.len()>65536||request.attachments.len()>128||request.parameters.len()>128||request.notifications.as_ref().is_some_and(|v|v.len()>128)||request.notification_digest.as_ref().is_some_and(|value|value.len()>65536){return im_send_failure("app_account_request_invalid",true,&request.nonce);}
     let fields=|v:&[ImSendDataField]|v.iter().map(|p|(p.key.clone(),p.value.clone())).collect::<Vec<_>>();
     let body={
         let attachments=zeroize::Zeroizing::new(fields(&request.attachments));
@@ -331,6 +331,7 @@ pub async fn send_im_message(State(manager):State<Arc<AccountManager>>,Path(line
         crate::connectivity::app_voice::providers::jegotrip::im_inbox::ImSendMessage::components(request.info_type.as_deref(),&request.content,&attachments,&parameters,notifications.as_ref().map(|v|v.as_slice()))
     };
     let body=match body{Ok(body)=>body,Err(code)=>return im_send_failure(code,true,&request.nonce)};
+    let body=if let Some(value)=&request.notification_digest{match body.with_notification_digest(value){Ok(body)=>body,Err(code)=>return im_send_failure(code,true,&request.nonce)}}else{body};
     let revision=request.expected_revision;let consent=request.consent;let write_consent=request.write_consent;
     let recipient=zeroize::Zeroizing::new(request.recipient.clone());let nonce=zeroize::Zeroizing::new(request.nonce.clone());
     // Erase the deserialized payload and temporary field copies BEFORE the

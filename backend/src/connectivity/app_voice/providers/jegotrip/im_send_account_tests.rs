@@ -2,6 +2,8 @@
 //! -> userSend WRITE -> SQL result/uncertainty -> stop and physical peer Joins.
 //! Mounted only as im_received_account_tests::sends. No SDK library, device,
 //! Provider API or real outbound business service is used by these fixtures.
+#[path="im_send_option_account_tests.rs"]
+mod options;
 #[path="im_send_account_hardening_tests.rs"]
 mod hardening;
 use super::*;
