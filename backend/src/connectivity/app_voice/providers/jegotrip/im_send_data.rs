@@ -122,7 +122,7 @@ pub(super) fn encode_user_send(box_id:ImBox<'_>,message:&OutgoingMessage<'_>,acc
     let mut parameters=Vec::with_capacity(message.parameters.len()+1);
     parameters.extend_from_slice(message.parameters);parameters.push(RpcProperty{key:b"account",value:account_uri});
     let default_text=[RpcProperty{key:b"Notify.Text",value:message.content}];
-    let notify=match notifications{Some(fields)=>fields,None=>match &message.kind{SendKind::Text=>&default_text,SendKind::Info(_)=>&[]}};
+    let notify:&[RpcProperty<'_>]=match notifications{Some(fields)=>fields,None=>match &message.kind{SendKind::Text=>default_text.as_slice(),SendKind::Info(_)=>&[]}};
     let mut writer=Writer::versioned()?;writer.bytes(box_id.bytes())?;
     writer.bytes(&kind)?;writer.bytes(&content)?;
     // Both native map value types share the type0 length-prefixed wire shape.
