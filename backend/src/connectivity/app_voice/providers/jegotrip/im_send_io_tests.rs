@@ -70,8 +70,17 @@ async fn sender_eof(peer: &mut CommonPeer) {
 
 async fn sender_logout(peer: &mut CommonPeer, expected_id: i32) {
     let packet = peer.next().await.unwrap();
-    assert_eq!(query(&packet, n::rpc_logout::LOGOUT_SESSION_METHOD), expected_id,
-        "no cancelled SEND, replay or low-level account poll consumes an ID");
+    let request=decode_request(&packet[1..]).unwrap();
+    assert_eq!(packet[0],0);
+    assert_eq!(request.method,n::rpc_logout::LOGOUT_SESSION_METHOD.as_bytes());
+    assert_eq!(request.call_id,expected_id,"no cancelled SEND, replay or low-level account poll consumes an ID");
+    assert_eq!(request.metadata.len(),2);
+    assert_eq!(request.metadata.iter().find(|p|p.key==b"id").unwrap().value,b"AccountEntry");
+    assert_eq!(request.metadata.iter().find(|p|p.key==b"token").unwrap().value,b"fixture-auth");
+    let mut arguments=Reader::versioned(request.arguments).unwrap();
+    assert_eq!(arguments.bytes().unwrap(),RETURNED_UID);
+    assert_eq!(arguments.bytes().unwrap(),b"fixture-selected-session");
+    arguments.finish().unwrap();
     peer.send(&[reply(expected_id, &[0, 1, 0, 0, 0, 0])]).await;
     sender_eof(peer).await;
 }
