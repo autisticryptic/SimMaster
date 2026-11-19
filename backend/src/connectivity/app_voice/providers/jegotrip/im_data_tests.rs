@@ -4,6 +4,8 @@ use super::*;
 use super::super::super::im_data::*;
 #[path="im_text_tests.rs"]
 mod text;
+#[path="im_info_tests.rs"]
+mod info;
 #[path="im_status_tests.rs"]
 mod status;
 #[path="im_send_data_tests.rs"]

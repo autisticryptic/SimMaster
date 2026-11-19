@@ -9,7 +9,7 @@ use serde::{de::{self,MapAccess,Visitor},Deserialize,Deserializer};
 use std::fmt;
 use zeroize::Zeroizing;
 const MAX_JSON_DEPTH:usize=32;
-fn bounded_json(bytes:&[u8])->bool{
+pub(super) fn bounded_json(bytes:&[u8])->bool{
     let(mut depth,mut quoted,mut escaped)=(0usize,false,false);
     for &byte in bytes{
         if quoted{if escaped{escaped=false;}else if byte==b'\\'{escaped=true;}else if byte==b'"'{quoted=false;}continue;}
