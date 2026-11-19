@@ -31,7 +31,8 @@ impl From<CodecError> for ProtocolError { fn from(error: CodecError) -> Self { S
 impl From<TransportError> for ProtocolError { fn from(error: TransportError) -> Self { Self::Transport(error) } }
 impl From<BatchError> for ProtocolError { fn from(error: BatchError) -> Self { Self::Batch(error) } }
 
-pub struct OwnedCallPackets { pub call_id: i32, pub packets: Vec<TransportBytes> }
+pub struct OwnedCallPackets { pub call_id: i32, pub packets: Vec<TransportBytes>, _send_budget:Option<std::sync::Arc<super::rpc_im_send::ImSendRpcRequest>> }
+impl OwnedCallPackets{fn uncharged(call_id:i32,packets:Vec<TransportBytes>)->Self{Self{call_id,packets,_send_budget:None}}}
 
 impl fmt::Debug for OwnedCallPackets {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -211,6 +212,10 @@ impl ArcProtocol {
         self.client_ex = Some(self.rpc.client_ex_dispatcher(binding)?); Ok(())
     }
     pub(super) fn captured_user_entry_auth(&self)->Result<Box<super::arc_session::UserEntryAuth>,CodecError>{self.rpc.user_entry_auth()}
+    pub(super) fn captured_send_identity(&self)->Result<std::sync::Arc<super::arc_session::ImSendIdentity>,CodecError>{self.rpc.send_identity()}
+    pub(super) fn prepare_im_send(&mut self,permit:std::sync::Arc<super::im_inbox::ImSendPermit>,deadline:std::time::Instant)->Result<OwnedCallPackets,ProtocolError>{let binding=self.im_binding.clone().ok_or(CodecError::InvalidField)?;let(id,bytes)=self.rpc.prepare_im_send(binding,permit,deadline)?;let original=self.rpc.pending_im_send(id).ok_or(CodecError::InvalidField)?;let mut packets=self.packets(id,bytes.expose_to_transport())?;packets._send_budget=Some(original);Ok(packets)}
+    pub(super) fn take_im_send_replies(&mut self)->Vec<super::rpc_im_send::OwnedImSendReply>{self.rpc.take_im_send_replies()}
+    pub(super) fn retire_im_send(&mut self,id:i32){self.rpc.retire_im_send(id);}
     pub(super) fn captured_im_binding(&self)->Option<std::sync::Arc<super::im_delivery::ImBinding>>{self.im_binding.clone()}
     pub(super) fn captured_client_ex(&self) -> Option<super::rpc_client_ex::ClientExDispatcher> {
         self.client_ex.as_ref().map(super::rpc_client_ex::ClientExDispatcher::captured_copy)
@@ -233,7 +238,7 @@ impl ArcProtocol {
 
     fn packets(&mut self, id: i32, bytes: &[u8]) -> Result<OwnedCallPackets, ProtocolError> {
         match encode_call_packets(CallKind::Request, bytes, TLS_FRAGMENT_THRESHOLD) {
-            Ok(packets) => Ok(OwnedCallPackets { call_id: id, packets }),
+            Ok(packets) => Ok(OwnedCallPackets::uncharged(id, packets)),
             Err(error) => { self.rpc.retire_request(id); self.close(); Err(error.into()) }
         }
     }
@@ -393,7 +398,7 @@ impl ArcProtocol {
             let packets = encode_call_packets(CallKind::Reply, reply.expose_to_transport(), TLS_FRAGMENT_THRESHOLD)?;
             self.direct_last_id = request.call_id;
             self.record_direct(request.call_id, magic.to_vec());
-            deliver(ProtocolEvent::ClientEx { reply: OwnedCallPackets { call_id: request.call_id, packets }, notice: action.notice });
+            deliver(ProtocolEvent::ClientEx { reply: OwnedCallPackets::uncharged(request.call_id, packets), notice: action.notice });
             return Ok(true);
         }
         if offline_hint {
@@ -421,7 +426,7 @@ impl ArcProtocol {
             }else{
                 let result=encode_notice_result(kind,false,&[])?;let reply=encode_reply(request.call_id,0,result.expose_to_transport())?;
                 let packets=encode_call_packets(CallKind::Reply,reply.expose_to_transport(),TLS_FRAGMENT_THRESHOLD)?;
-                self.record_direct(request.call_id,magic.to_vec());deliver(ProtocolEvent::OutgoingReply(OwnedCallPackets{call_id:request.call_id,packets}));
+                self.record_direct(request.call_id,magic.to_vec());deliver(ProtocolEvent::OutgoingReply(OwnedCallPackets::uncharged(request.call_id,packets)));
             }
             return Ok(true);
         }
@@ -449,7 +454,7 @@ impl ArcProtocol {
             let reply = encode_reply(request.call_id, 0, result.expose_to_transport())?;
             let packets = encode_call_packets(CallKind::Reply, reply.expose_to_transport(), TLS_FRAGMENT_THRESHOLD)?;
             self.record_direct(request.call_id, magic.to_vec());
-            deliver(ProtocolEvent::OutgoingReply(OwnedCallPackets { call_id: request.call_id, packets }));
+            deliver(ProtocolEvent::OutgoingReply(OwnedCallPackets::uncharged(request.call_id, packets)));
         }
         Ok(true)
     }
@@ -470,7 +475,7 @@ impl ArcProtocol {
         let result=encode_online_message_result(proof.is_some())?;let reply=encode_reply(inner.call_id,0,result.expose_to_transport())?;
         let packets=encode_call_packets(CallKind::Reply,reply.expose_to_transport(),TLS_FRAGMENT_THRESHOLD)?;
         let pending=self.direct_pending.remove(&inner.call_id).ok_or(CodecError::InvalidField)?;self.record_direct(inner.call_id,pending.magic);
-        Ok(Some(OwnedCallPackets{call_id:inner.call_id,packets}))
+        Ok(Some(OwnedCallPackets::uncharged(inner.call_id,packets)))
     }
 
     fn capture_im_status(&mut self,notice:super::im_status_delivery::ImStatusNotice,id:i32,magic:&[u8])->Result<super::im_status_delivery::IncomingImStatus,ProtocolError>{
@@ -486,7 +491,7 @@ impl ArcProtocol {
         if &fingerprint!=ticket.fingerprint()||deadline!=ticket.deadline()||proof.is_some_and(|p|!p.authorizes(ticket,Instant::now())){return Err(CodecError::InvalidField.into());}
         let result=encode_online_message_result(proof.is_some())?;let reply=encode_reply(inner.call_id,0,result.expose_to_transport())?;
         let packets=encode_call_packets(CallKind::Reply,reply.expose_to_transport(),TLS_FRAGMENT_THRESHOLD)?;
-        let pending=self.direct_pending.remove(&inner.call_id).ok_or(CodecError::InvalidField)?;self.record_direct(inner.call_id,pending.magic);Ok(Some(OwnedCallPackets{call_id:inner.call_id,packets}))
+        let pending=self.direct_pending.remove(&inner.call_id).ok_or(CodecError::InvalidField)?;self.record_direct(inner.call_id,pending.magic);Ok(Some(OwnedCallPackets::uncharged(inner.call_id,packets)))
     }
     fn record_direct(&mut self, id: i32, magic: Vec<u8>) {
         self.direct_seen.record(id, magic);
@@ -511,7 +516,7 @@ impl ArcProtocol {
         let packets = encode_call_packets(CallKind::Reply, reply.expose_to_transport(), TLS_FRAGMENT_THRESHOLD)?;
         let pending = self.direct_pending.remove(&inner.call_id).ok_or(CodecError::InvalidField)?;
         self.record_direct(inner.call_id, pending.magic);
-        Ok(Some(OwnedCallPackets { call_id: inner.call_id, packets }))
+        Ok(Some(OwnedCallPackets::uncharged(inner.call_id, packets)))
     }
 
     pub fn complete_incoming(&mut self, ticket: &DirectReplyTicket, accepted: bool)
@@ -526,7 +531,7 @@ impl ArcProtocol {
         let reply = encode_reply(ticket.call_id, 0, result.expose_to_transport())?;
         let packets = encode_call_packets(CallKind::Reply, reply.expose_to_transport(), TLS_FRAGMENT_THRESHOLD)?;
         self.record_direct(ticket.call_id, pending.magic);
-        Ok(Some(OwnedCallPackets { call_id: ticket.call_id, packets }))
+        Ok(Some(OwnedCallPackets::uncharged(ticket.call_id, packets)))
     }
     pub(super) fn complete_offline_hint(&mut self, ticket: &DirectReplyTicket, accepted: bool) -> Result<Option<OwnedCallPackets>, ProtocolError> {
         if !self.rpc.accepts_scope(&ticket.owner, &ticket.connection) { return Ok(None); }
@@ -537,7 +542,7 @@ impl ArcProtocol {
         let packets = encode_call_packets(CallKind::Reply, reply.expose_to_transport(), TLS_FRAGMENT_THRESHOLD)?;
         let pending = self.direct_pending.remove(&ticket.call_id).ok_or(CodecError::InvalidField)?;
         self.record_direct(ticket.call_id, pending.magic);
-        Ok(Some(OwnedCallPackets { call_id: ticket.call_id, packets }))
+        Ok(Some(OwnedCallPackets::uncharged(ticket.call_id, packets)))
     }
 
     pub fn complete_call(&mut self,ticket:&CallReplyTicket,accepted:bool,properties:&[RpcProperty<'_>])->Result<Option<OwnedCallPackets>,ProtocolError>{
@@ -553,7 +558,7 @@ impl ArcProtocol {
         let packets=encode_call_packets(CallKind::Reply,reply.expose_to_transport(),TLS_FRAGMENT_THRESHOLD)?;
         if ticket.kind()==CallNoticeKind::Invited{if let Some(control)=ticket.control_ticket(){self.rpc.call_acknowledged(control,accepted)?;}}
         let pending=self.direct_pending.remove(&inner.call_id).ok_or(CodecError::InvalidField)?;
-        self.record_direct(inner.call_id,pending.magic);Ok(Some(OwnedCallPackets{call_id:inner.call_id,packets}))
+        self.record_direct(inner.call_id,pending.magic);Ok(Some(OwnedCallPackets::uncharged(inner.call_id,packets)))
     }
 }
 

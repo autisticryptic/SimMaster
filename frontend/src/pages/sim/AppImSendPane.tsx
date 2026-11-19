@@ -1,0 +1,38 @@
+import { useEffect, useRef, useState } from 'react'
+import { Alert, Button, MenuItem, Stack, TextField, Typography } from '@mui/material'
+import { api } from '../../api/current'
+import { IM_SEND_SCOPE, imSendRows, imSendLabel, imSendNonceTag, imSendNotAdmitted, type ImSendRow } from '../../policies/imSend'
+export default function AppImSendPane({ lineId, revision, hosted, installed }: { lineId: string; revision: number; hosted: boolean; installed: boolean }) {
+  const context = JSON.stringify([lineId, revision, hosted, installed]); const [input, setInput] = useState({ context, recipient: '', content: '', kind: 'text', info: '' })
+  const form = input.context === context ? input : { context, recipient: '', content: '', kind: 'text', info: '' }
+  const [history, setHistory] = useState<{ context: string; generation: number; rows: ImSendRow[]; failed: boolean } | null>(null)
+  const [pending, setPending] = useState<{ context: string; after: number; nonceTag: string } | null>(null); const [busy, setBusy] = useState(false)
+  const current = useRef({ context, generation: 0, serial: 0, live: false }); const writing = useRef(false)
+  useEffect(() => {
+    const generation = current.current.generation + 1; current.current = { context, generation, serial: 0, live: true }; let active = true; let timer: ReturnType<typeof setTimeout> | undefined
+    const read = async () => {
+      if (!installed) return
+      if (writing.current) { if (active) timer = setTimeout(() => { void read() }, 5000); return }
+      const serial = ++current.current.serial
+      try { const result = await api.getAppImOutbox(lineId); const rows = imSendRows(result.data); if (!rows) throw new Error('Incomplete original outbox metadata'); if (active && current.current.generation === generation && current.current.serial === serial) { setHistory({ context, generation, rows, failed: false }); setPending((old) => old?.context === context && !rows.some((row) => row.state === 'uncertain') && rows.some((row) => row.id > old.after && row.nonceTag === old.nonceTag && row.state !== 'uncertain') ? null : old) } }
+      catch { if (active && current.current.generation === generation && current.current.serial === serial) setHistory({ context, generation, rows: [], failed: true }) }
+      if (active) timer = setTimeout(() => { void read() }, 5000)
+    }
+    void read(); return () => { active = false; if (timer) clearTimeout(timer); if (current.current.generation === generation) current.current.live = false }
+  }, [context, lineId, installed])
+  const selected = history?.context === context && history.generation === current.current.generation ? history : null
+  const unknown = pending?.context === context || selected?.rows.some((row) => row.state === 'uncertain') === true
+  const allowed = installed && hosted && Number.isSafeInteger(revision) && revision > 0 && selected && !selected.failed && !unknown && !busy && form.recipient.length > 0 && new TextEncoder().encode(form.recipient).length <= 512 && form.content.length > 0 && new TextEncoder().encode(form.content).length <= 65536 && !form.content.includes('\0') && (form.kind === 'text' || /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/.test(form.info) && form.info.length <= 64)
+  const send = async () => {
+    if (!allowed || writing.current || !current.current.live || current.current.context !== context || !selected) return
+    if (!window.confirm('向此原收件人执行 IM 业务外发？此操作可能产生业务费用；不是短信/呼叫、已读或媒体授信，未知结果不重试。')) return
+    const original = { ...current.current }; const after = Math.max(0, ...selected.rows.map((row) => row.id)); const nonce = crypto.randomUUID().replaceAll('-', '')
+    writing.current = true; current.current.serial += 1; setBusy(true)
+    let nonceTag = ''; let attempted = false
+    try { nonceTag = await imSendNonceTag(nonce); if (!current.current.live || current.current.generation !== original.generation || current.current.context !== original.context) return; attempted = true; const response = await api.sendAppIm(lineId, revision, nonce, form.recipient, form.content, form.kind === 'info' ? form.info : undefined, nonceTag); const rows = imSendRows([response.data]); const row = rows?.[0]; if (!row || row.id <= after || row.kind !== form.kind || row.nonceTag !== nonceTag) throw new Error('Original send result unconfirmed'); if (!current.current.live || current.current.generation !== original.generation || current.current.context !== original.context) return; setHistory((old) => old?.context === context && old.generation === original.generation ? { ...old, rows: [row, ...old.rows.filter((v) => v.id !== row.id)].slice(0, 128) } : old); if (row.state === 'uncertain') setPending({ context, after, nonceTag }) }
+    catch (error) { if (current.current.live && current.current.generation === original.generation && current.current.context === original.context) { if (!attempted || imSendNotAdmitted(error, nonceTag)) { setHistory((old) => old?.context === context && old.generation === original.generation ? { ...old, failed: true } : old); setPending((old) => old?.context === context && old.nonceTag === nonceTag ? null : old) } else if (nonceTag) setPending({ context, after, nonceTag }) } }
+    finally { writing.current = false; if (current.current.live) setBusy(false) }
+  }
+  if (!installed) return null
+  return <Stack spacing={1} sx={{ mt: 1, overflowWrap: 'anywhere' }}><Typography variant="subtitle2">原 IM 业务外发</Typography><Typography variant="caption" color="text.secondary">{IM_SEND_SCOPE}</Typography>{unknown && <Alert severity="warning">原 IM 外发尚未核实；仅查询历史，不自动重放。</Alert>}{selected?.failed && <Alert severity="warning">原外发历史未核实，不生成新的业务意图。</Alert>}<TextField size="small" label="原 IM 收件人（UID / GroupID / 原 URI）" value={form.recipient} autoComplete="off" disabled={busy || !hosted} slotProps={{ htmlInput: { maxLength: 512 } }} onChange={(event) => setInput({ ...form, recipient: event.target.value })} /><TextField select size="small" label="原消息类型" value={form.kind} disabled={busy || !hosted} onChange={(event) => setInput({ ...form, kind: event.target.value })}><MenuItem value="text">Text</MenuItem><MenuItem value="info">Info</MenuItem></TextField>{form.kind === 'info' && <TextField size="small" label="Info 原子类型（不含 Info. 前缀）" value={form.info} disabled={busy || !hosted} onChange={(event) => setInput({ ...form, info: event.target.value })} />}<TextField size="small" multiline minRows={2} label="原 IM 内容" value={form.content} disabled={busy || !hosted} slotProps={{ htmlInput: { maxLength: 65536 } }} onChange={(event) => setInput({ ...form, content: event.target.value })} /><Button size="small" disabled={!allowed} onClick={() => { void send() }}>明确执行原 IM 外发</Button>{selected?.rows.slice(0, 16).map((row) => <Typography key={row.id} variant="caption">{row.kind} · {imSendLabel(row.state)}{row.index !== null ? ` · 原消息 ID ${row.index}` : ''}</Typography>)}</Stack>
+}

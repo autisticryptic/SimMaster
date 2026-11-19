@@ -192,6 +192,9 @@ pub struct ProfileConfig {
     /// Manual setReadStatus is separate consent, not automatic receipt policy.
     #[serde(default)]
     pub im_read_status:Option<super::im_read_status_policy::NativeReadStatusConfig>,
+    /// Separately consented original IM sends, never automatic business IO.
+    #[serde(default)]
+    pub im_send:Option<super::im_send_policy::NativeImSendConfig>,
     pub connect_timeout_ms: u64,
     pub handshake_timeout_ms: u64,
     pub partial_timeout_ms: u64,
@@ -337,6 +340,7 @@ impl AccountConfig {
             .and_then(|profile|profile.with_im_receipts(p.im_receipts.as_ref()).map_err(|_|INVALID))
             .and_then(|profile|profile.with_user_read(p.im_user_read.as_ref()).map_err(|_|INVALID))
             .and_then(|profile|profile.with_im_read_status(p.im_read_status.as_ref()).map_err(|_|INVALID))
+            .and_then(|profile|profile.with_im_send(p.im_send.as_ref()).map_err(|_|INVALID))
     }
 
     pub(super) fn runtime_calls(&self) -> Result<Option<super::call_settings::CallSettings>, &'static str> {
@@ -572,6 +576,8 @@ pub(super) struct PrivateProfileRef<'a> {
     im_user_read:Option<&'a super::im_user_read_policy::NativeUserReadConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     im_read_status:Option<&'a super::im_read_status_policy::NativeReadStatusConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    im_send:Option<&'a super::im_send_policy::NativeImSendConfig>,
     connect_timeout_ms: u64, handshake_timeout_ms: u64, partial_timeout_ms: u64,
     io_timeout_ms: u64, rpc_timeout_ms: u64,
 }
@@ -617,7 +623,7 @@ impl<'a> PrivateConfigRef<'a> {
                 bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
                 call_incoming:p.call_incoming.as_ref().map(|binding|PrivateCallIncomingRef{object_id:&binding.object_id,domain:&binding.domain}),
                 call_control:p.call_control.as_ref().map(|properties|PrivateProperties(properties)),
-                native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),
+                native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),im_send:p.im_send.as_ref(),
                 connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
                 partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
             },
@@ -655,7 +661,7 @@ pub(super) fn private_profile_ref(p: &ProfileConfig) -> PrivateProfileRef<'_> {
         bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
         call_incoming: p.call_incoming.as_ref().map(|b| PrivateCallIncomingRef { object_id: &b.object_id, domain: &b.domain }),
         call_control: p.call_control.as_deref().map(private_properties),
-        native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),
+        native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),im_send:p.im_send.as_ref(),
         connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
         partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
     }

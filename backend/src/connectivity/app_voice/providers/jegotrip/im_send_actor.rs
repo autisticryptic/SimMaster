@@ -1,0 +1,15 @@
+//! Original current SDK sender snapshot and separately owned userSend WRITE.
+//! Private SQL/RPC permit required; no UID/row/codec/grant conversion or worker.
+use super::*;
+use super::super::{arc_session::ImSendIdentity,im_inbox::{ImSendPermit,ImSendPermitWait,ImSendView}};
+pub(super) struct ImSendWork{pub(super) permit:Arc<ImSendPermit>,pub(super) reply:oneshot::Sender<Result<ImSendView,RuntimeError>>}
+pub(super) struct ImSendPending{pub(super) permit:Arc<ImSendPermit>,pub(super) deadline:Instant,pub(super) reply:oneshot::Sender<Result<ImSendView,RuntimeError>>}
+impl RuntimeCommands{
+    pub(in super::super) async fn original_im_send_identity(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->Result<Arc<ImSendIdentity>,RuntimeError>{if !self.accepts(owner,scope){return Err(RuntimeError::Scope);}let(reply,data)=oneshot::channel();self.submit(owner,scope,Operation::GetImSendIdentity(reply)).await?;data.await.map_err(|_|RuntimeError::Closed)?.ok_or(RuntimeError::Scope)}
+    pub(in super::super) async fn send_im(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,permit:Arc<ImSendPermit>)->Result<ImSendView,RuntimeError>{let _wait=ImSendPermitWait::original(permit.clone());if !self.accepts(owner,scope)||!permit.matches(owner,scope){return Err(RuntimeError::Scope);}let(reply,data)=oneshot::channel();let sent=self.enqueue(owner,scope,Operation::ImSend(Box::new(ImSendWork{permit,reply})))?;sent.await.map_err(|_|RuntimeError::Closed)??;data.await.map_err(|_|RuntimeError::Closed)?}
+}
+impl<I:AsyncRead+AsyncWrite+Unpin+Send+'static> Actor<I>{
+    pub(super) fn im_send_close_reason(&self)->Option<RuntimeError>{self.im_send_retirement.or_else(||self.im_send_pending.values().find_map(|p|p.permit.closed_original_io().then_some(RuntimeError::Cancelled)))}
+    pub(super) fn retire_im_sends(&mut self,now:Instant){let ids=self.im_send_pending.iter().filter_map(|(&id,p)|{if p.permit.retired()||p.reply.is_closed()||!p.permit.gate().live()||!p.permit.parent_gate().live(){Some((id,RuntimeError::Cancelled))}else if now>=p.deadline{Some((id,RuntimeError::Timeout))}else{None}}).collect::<Vec<_>>();for(id,e)in ids{if let Some(p)=self.im_send_pending.remove(&id){p.permit.cancel();if p.permit.closed_original_io(){self.im_send_retirement.get_or_insert(e);}self.backend.retire_im_send(id);self.pending.remove(&id);let _=p.reply.send(Err(e));}}}
+    pub(super) fn deliver_im_send_replies(&mut self,outcome:Result<(),RuntimeError>)->Result<(),RuntimeError>{for reply in self.backend.take_im_send_replies(){let id=reply.request().id();let Some(p)=self.im_send_pending.remove(&id)else{continue;};self.pending.remove(&id);if outcome.is_err()||!reply.matches(&self.owner,&self.scope)||!Arc::ptr_eq(reply.request().permit(),&p.permit)||Instant::now()>=p.deadline||p.reply.is_closed(){p.permit.cancel();let _=p.reply.send(Err(RuntimeError::Cancelled));return Err(RuntimeError::Cancelled);}match p.permit.resolve(&reply){Ok(view)=>{let _=p.reply.send(Ok(view));},Err(_)=>{p.permit.cancel();let _=p.reply.send(Err(RuntimeError::Protocol));return Err(RuntimeError::Protocol);}}}Ok(())}
+}

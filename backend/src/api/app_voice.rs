@@ -53,6 +53,14 @@ pub struct ImReconciliationRequest { expected_revision: u64, consent: bool }
 pub struct ImReadStatusTargetsQuery{expected_revision:u64}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ImSendDataField{key:Vec<u8>,value:Vec<u8>}
+impl Drop for ImSendDataField{fn drop(&mut self){zeroize::Zeroize::zeroize(&mut self.key);zeroize::Zeroize::zeroize(&mut self.value);}}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImSendRequest{expected_revision:u64,nonce:String,recipient:String,content:String,info_type:Option<String>,#[serde(default)]attachments:Vec<ImSendDataField>,#[serde(default)]parameters:Vec<ImSendDataField>,notifications:Option<Vec<ImSendDataField>>,consent:bool,write_consent:bool}
+impl Drop for ImSendRequest{fn drop(&mut self){for s in [&mut self.nonce,&mut self.recipient,&mut self.content]{zeroize::Zeroize::zeroize(s);}if let Some(s)=&mut self.info_type{zeroize::Zeroize::zeroize(s);}}}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImReadStatusRequest{expected_revision:u64,expected_index:String,nonce:String,consent:bool}
 impl Drop for ImReadStatusRequest{fn drop(&mut self){zeroize::Zeroize::zeroize(&mut self.nonce);}}
 #[derive(Deserialize)]
@@ -90,6 +98,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/notifications", get(get_notifications))
         .route("/api/non-3gpp/accounts/{line_id}/call-notifications", get(get_call_notifications))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages", get(get_im_messages))
+        .route("/api/non-3gpp/accounts/{line_id}/im-outbox",get(get_im_send_history).post(send_im_message))
         .route("/api/non-3gpp/accounts/{line_id}/im-receipts", get(get_im_receipts))
         .route("/api/non-3gpp/accounts/{line_id}/im-read-status-targets",get(get_im_read_status_targets))
         .route("/api/non-3gpp/accounts/{line_id}/im-read-status-targets/{target_id}/set",post(set_im_read_status))
@@ -146,6 +155,11 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_im_read_status_request_invalid" | "app_account_im_read_status_recipient_unsupported" => StatusCode::BAD_REQUEST,
         "app_account_im_read_status_recipient_unconfirmed" | "app_account_im_read_status_recipient_target_stale" | "app_account_im_read_status_resolution_inflight" | "app_account_im_read_status_resolution_finished" => StatusCode::CONFLICT,
         "app_account_im_read_status_full" | "app_account_im_read_status_recipient_capacity" => StatusCode::TOO_MANY_REQUESTS,
+        "app_account_im_send_request_invalid" | "app_account_im_send_policy_invalid" => StatusCode::BAD_REQUEST,
+        "app_account_im_send_not_installed" | "app_account_im_send_consent_required" | "app_account_im_send_recipient_not_installed" => StatusCode::FORBIDDEN,
+        "app_account_im_send_scope_invalid" | "app_account_im_send_timeout" => StatusCode::SERVICE_UNAVAILABLE,
+        "app_account_im_send_uncertain" | "app_account_im_send_nonce_conflict" | "app_account_im_send_recipient_unconfirmed" => StatusCode::CONFLICT,
+        "app_account_im_send_full" | "app_account_im_send_capacity" => StatusCode::TOO_MANY_REQUESTS,
         "app_account_im_user_read_message_missing" => StatusCode::NOT_FOUND,
         "app_account_im_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_account_im_user_read_full" => StatusCode::TOO_MANY_REQUESTS,
@@ -295,6 +309,37 @@ pub async fn get_im_messages(State(manager):State<Arc<AccountManager>>,Path(line
     let Ok(Query(request))=request else{return failure("app_account_request_invalid");};
     if !(1..=128).contains(&request.limit){return failure("app_account_request_invalid");}
     success(StatusCode::OK,manager.im_messages(&line_id,request.limit))
+}
+pub async fn get_im_send_history(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Query<InboxQuery>,QueryRejection>)->Response{let Ok(Query(request))=request else{return failure("app_account_request_invalid");};if !(1..=128).contains(&request.limit){return failure("app_account_request_invalid");}success(StatusCode::OK,manager.im_send_history(&line_id,request.limit))}
+fn im_send_failure(code:&'static str,not_admitted:bool,nonce:&str)->Response{
+    // Exact request correlation DATA. Never export the user nonce/recipient,
+    // original identity, scope or token; generic failures have no stage claim.
+    let mut hash=ring::digest::Context::new(&ring::digest::SHA256);
+    hash.update(b"original-im-send-ui-nonce-v1\0");hash.update(nonce.as_bytes());
+    let nonce_tag:String=hash.finish().as_ref().iter().map(|b|format!("{b:02x}")).collect();
+    no_store((error_status(code),Json(serde_json::json!({"status":"error","message":code,"im_send_admission":if not_admitted{"not_admitted"}else{"admitted_or_unknown"},"nonce_tag":nonce_tag}))).into_response())
+}
+pub async fn send_im_message(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Json<ImSendRequest>,JsonRejection>)->Response{
+    let Ok(Json(request))=request else{return failure("app_account_request_invalid");};
+    if request.nonce.len()!=32||!request.nonce.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)){return failure("app_account_request_invalid");}
+    if request.recipient.len()>512||request.content.len()>65536||request.attachments.len()>128||request.parameters.len()>128||request.notifications.as_ref().is_some_and(|v|v.len()>128){return im_send_failure("app_account_request_invalid",true,&request.nonce);}
+    let fields=|v:&[ImSendDataField]|v.iter().map(|p|(p.key.clone(),p.value.clone())).collect::<Vec<_>>();
+    let body={
+        let attachments=zeroize::Zeroizing::new(fields(&request.attachments));
+        let parameters=zeroize::Zeroizing::new(fields(&request.parameters));
+        let notifications=request.notifications.as_ref().map(|v|zeroize::Zeroizing::new(fields(v)));
+        crate::connectivity::app_voice::providers::jegotrip::im_inbox::ImSendMessage::components(request.info_type.as_deref(),&request.content,&attachments,&parameters,notifications.as_ref().map(|v|v.as_slice()))
+    };
+    let body=match body{Ok(body)=>body,Err(code)=>return im_send_failure(code,true,&request.nonce)};
+    let revision=request.expected_revision;let consent=request.consent;let write_consent=request.write_consent;
+    let recipient=zeroize::Zeroizing::new(request.recipient.clone());let nonce=zeroize::Zeroizing::new(request.nonce.clone());
+    // Erase the deserialized payload and temporary field copies BEFORE the
+    // manager's first await; only the budgeted ImSendMessage is retained.
+    drop(request);
+    match manager.send_im_message_with_admission(&line_id,revision,&recipient,body,&nonce,consent,write_consent).await{
+        Ok(view)=>success(StatusCode::OK,Ok(view)),
+        Err(error)=>im_send_failure(error.code(),error.not_admitted(),&nonce),
+    }
 }
 pub async fn get_im_receipts(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Query<InboxQuery>,QueryRejection>)->Response{
     let Ok(Query(request))=request else{return failure("app_account_request_invalid");};

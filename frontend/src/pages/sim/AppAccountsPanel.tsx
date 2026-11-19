@@ -6,6 +6,7 @@ import AppInviteNotificationsPane from './AppInviteNotificationsPane'
 import AppImMessagesPane from './AppImMessagesPane'
 import AppImReceiptsPane from './AppImReceiptsPane'
 import AppImReadStatusPane from './AppImReadStatusPane'
+import AppImSendPane from './AppImSendPane'
 import AppImReconciliationPane from './AppImReconciliationPane'
 import AppUserEntryPane from './AppUserEntryPane'
 import JegotripConfigurationDialog from './JegotripConfigurationDialog'
@@ -97,6 +98,7 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
                 <AppUserEntryPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.user_entry_supported === true || account.user_entry_uid_local_supported === true} localOnly={account.user_entry_supported !== true} />
                 <AppImReceiptsPane lineId={account.line_id} />
                 <AppImReadStatusPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.im_read_status_supported === true} recipientInstalled={account.im_read_status_recipient_supported === true} />
+                <AppImSendPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.im_send_supported === true} />
                 <AppImReconciliationPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.im_reconciliation_supported === true} />
               </Box>
               <Chip size="small" color={account.incoming_message_ready ? 'success' : 'default'} label={account.incoming_message_ready ? '短信就绪' : '短信未就绪'} />

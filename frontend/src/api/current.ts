@@ -112,6 +112,7 @@ import type {
 } from './types'
 import { humanizeCostPolicyError } from '../policies/imsRegistration'
 import { userReadRecipientBody } from '../policies/userEntry'
+import { ImSendNotAdmittedError, imSendFailureEnvelope } from '../policies/imSend'
 
 type SmsListResponse = {
   messages: SmsMessage[]
@@ -123,6 +124,7 @@ type RequestOptions = RequestInit & {
   returnText?: boolean
   timeoutMs?: number
   skipAuthRedirect?: boolean
+  imSendNonceTag?: string
 }
 
 function redirectToLogin() {
@@ -398,6 +400,7 @@ export interface AppAccountView {
   im_user_read_recipient_supported?: boolean
   im_read_status_supported?: boolean
   im_read_status_recipient_supported?: boolean
+  im_send_supported?: boolean
   im_reconciliation_supported?: boolean
   user_entry_supported?: boolean
   user_entry_uid_local_supported?: boolean
@@ -407,7 +410,7 @@ async function request<T>(
   url: string,
   options: RequestOptions = {},
 ): Promise<T> {
-  const { returnText, timeoutMs, skipAuthRedirect, ...fetchOptions } = options
+  const { returnText, timeoutMs, skipAuthRedirect, imSendNonceTag, ...fetchOptions } = options
   const controller = timeoutMs ? new AbortController() : undefined
   const timeoutId = controller
     ? window.setTimeout(() => controller.abort(), timeoutMs)
@@ -438,15 +441,19 @@ async function request<T>(
       redirectToLogin()
     }
     let apiMessage: string | undefined
+    let imSendNotAdmitted = false
     try {
       const payload = await response.json()
+      if (imSendNonceTag && fetchOptions.method === 'POST' && url.endsWith('/im-outbox')) imSendNotAdmitted = imSendFailureEnvelope(payload, imSendNonceTag)
       if (typeof payload === 'object' && payload !== null && 'message' in payload) {
         const message = (payload as { message?: unknown }).message
         if (typeof message === 'string') apiMessage = message
       }
     } catch {
-      // Fall back to the HTTP status below.
+      // Fall back to the HTTP status below; malformed/missing stage metadata
+      // never becomes a claim that this native intent was not admitted.
     }
+    if (imSendNotAdmitted && imSendNonceTag) throw new ImSendNotAdmittedError(apiMessage ?? 'app_account_im_send_scope_invalid', imSendNonceTag)
     if (apiMessage) throw new Error(humanizeCostPolicyError(apiMessage))
     throw new Error(httpStatusMessage(response.status))
   }
@@ -1148,6 +1155,12 @@ class SimAdminCurrentAPI {
   }
   async setAppImReadStatusViaRecipient(lineId: string, targetId: number, revision: number, index: string, nonce: string, recipient: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-read-status-targets/${targetId}/set/recipient`, { method: 'POST', body: JSON.stringify({ expected_revision: revision, expected_index: index, nonce, recipient, consent: true }), cache: 'no-store', timeoutMs: 10000 })
+  }
+  async getAppImOutbox(lineId: string) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-outbox?limit=128`, { cache: 'no-store', timeoutMs: 10000 })
+  }
+  async sendAppIm(lineId: string, revision: number, nonce: string, recipient: string, content: string, infoType?: string, nonceTag?: string) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-outbox`, { method: 'POST', body: JSON.stringify({ expected_revision: revision, nonce, recipient, content, ...(infoType === undefined ? {} : { info_type: infoType }), consent: true, write_consent: true }), cache: 'no-store', timeoutMs: 10000, imSendNonceTag: nonceTag })
   }
   async getAppImUserReads(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-user-reads?limit=16`, { cache: 'no-store', timeoutMs: 10000 })

@@ -162,6 +162,10 @@ impl OfflineBackend {
     }
     pub(super) fn take_received_replies(&mut self)->Vec<super::rpc_im_received::OwnedReceivedReply>{self.protocol.take_received_replies()}
     pub(super) fn retire_received_write(&mut self,id:i32){self.protocol.retire_received_write(id);}
+    pub(super) fn prepare_im_send(&mut self,permit:std::sync::Arc<super::im_inbox::ImSendPermit>,deadline:std::time::Instant)->Result<OwnedCallPackets,ProtocolError>{if self.im_binding.is_none()||self.scheduler.is_none()||self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField.into());}self.protocol.prepare_im_send(permit,deadline)}
+    pub(super) fn take_im_send_replies(&mut self)->Vec<super::rpc_im_send::OwnedImSendReply>{self.protocol.take_im_send_replies()}
+    pub(super) fn retire_im_send(&mut self,id:i32){self.protocol.retire_im_send(id);}
+    pub(super) fn captured_send_identity(&self)->Result<std::sync::Arc<super::arc_session::ImSendIdentity>,ProtocolError>{if self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField.into());}self.protocol.captured_send_identity().map_err(Into::into)}
     pub(super) fn captured_user_entry_auth(&self)->Result<Box<super::arc_session::UserEntryAuth>,ProtocolError>{
         if self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField.into());}self.protocol.captured_user_entry_auth().map_err(Into::into)
     }

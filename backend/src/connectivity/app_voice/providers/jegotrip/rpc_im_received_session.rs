@@ -20,7 +20,7 @@ impl ArcRpcSession{
         // following local scope check fails. IDs are never reused for a retry.
         self.next_id=id.checked_add(1);
         let received=ReceivedRpcRequest::original(permit,id,budget)?;
-        self.pending.insert(id,PendingRpc{kind:PendingKind::ImWrite,selected_session_id:None,scheduler:None,call:None,im:None,received:Some(received),user_read:None});Ok((id,bytes))
+        self.pending.insert(id,PendingRpc{kind:PendingKind::ImWrite,selected_session_id:None,scheduler:None,call:None,im:None,received:Some(received),user_read:None,send:None});Ok((id,bytes))
     }
     pub(in super::super) fn take_received_replies(&mut self)->Vec<OwnedReceivedReply>{std::mem::take(&mut self.received_replies)}
     pub(in super::super) fn retire_received_write(&mut self,id:i32){

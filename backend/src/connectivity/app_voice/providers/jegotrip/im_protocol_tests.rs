@@ -16,6 +16,8 @@ mod status_consumer;
 mod received_writes;
 #[path="im_user_read_protocol_tests.rs"]
 mod user_reads;
+#[path="im_send_protocol_tests.rs"]
+mod sends;
 struct Fixture{owner:AttemptOwner,scope:RpcConnectionScope,backend:OfflineBackend,temp:TempDatabase,run:Arc<account_runs::RunToken>,gate:Arc<ImReceiptGate>}
 impl Fixture{
     fn new(enabled:bool)->Self{

@@ -32,6 +32,10 @@ pub(super) use receipts::{ReadStatusPrepared,begin_read_status};
 #[path="im_user_read_journal.rs"]
 mod user_reads;
 pub(super) use user_reads::{UserReadAction,UserReadWait,UserReadPermit,UserReadPermitWait,UserReadView,BoundUserRead,metadata as user_read_history};
+#[path="im_outbox.rs"]
+mod outbox;
+pub use outbox::{ImSendMessage,ImSendView,ImSendFailure};
+pub(super) use outbox::{ImSendAction,ImSendInput,ImSendPermit,ImSendWait,ImSendPermitWait,PreparedImSend,history as im_send_history};
 #[path="im_read_status.rs"]
 mod read_status;
 pub(super) use read_status::{ReadStatusBudget,ReadStatusTargets,ReadStatusAction,ReadStatusWait,ReadStatusTargetView,ReadStatusView,history as read_status_history};
@@ -60,6 +64,7 @@ pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
     statuses::initialize_schema(conn)?;
     receipts::initialize_schema(conn)?;
     user_reads::initialize_schema(conn)?;
+    outbox::initialize_schema(conn)?;
     read_status::initialize_schema(conn)
 }
 

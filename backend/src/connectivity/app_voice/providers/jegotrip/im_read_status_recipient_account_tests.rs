@@ -1,5 +1,7 @@
 //! Actions-only actual bootstrap/SDK/UserEntry/P2P span -> original manual
 //! setRead WRITE. No user UDMR grant, original library/device or paid traffic.
+#[path="im_send_recipient_account_tests.rs"]
+mod im_sends;
 use super::*;
 use super::super::super::super as n;
 async fn bounded<F:std::future::Future>(f:F)->F::Output{tokio::time::timeout(Duration::from_secs(12),f).await.expect("original owned account fixture deadline")}

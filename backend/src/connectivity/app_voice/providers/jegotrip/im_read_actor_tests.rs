@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool,Ordering};
 mod received_writes;
 #[path="im_user_read_io_tests.rs"]
 mod user_reads;
+#[path="im_send_io_tests.rs"]
+mod sends;
 async fn bounded<F:std::future::Future>(f:F)->F::Output{tokio::time::timeout(Duration::from_secs(12),f).await.expect("original IM IO fixture budget")}
 fn refresh()->Arc<ImQuery>{Arc::new(ImQuery::refresh(&[],-1).unwrap())}
 fn config(enabled:bool)->NativeReceiverConfig{NativeReceiverConfig{direct_domains:None,invite_notifications:None,im_messages:enabled.then_some(NativeImConfig{notification_timeout_ms:3000})}}
