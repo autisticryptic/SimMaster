@@ -13,6 +13,9 @@ class DirectoryReadSourceContracts(unittest.TestCase):
   for t in ['getRelations2.GroupServer.Group','getPropsPrefixs.GroupServer.Group','Writer::versioned()?','w.i64(since)?','w.u32(1)?;w.bytes(b"")?','if code!=0','CodecError::DuplicateKey','read_footer(&mut r)?;r.finish()?']:self.assertIn(t,s)
   for t in ['TcpStream','tokio::spawn','Database','UserReadPermit','ImSendPermit','ReceivedWritePermit','std::fs','Zeroizing::new(Vec']:self.assertNotIn(t,s)
   self.assertIn('value.iter().all(u8::is_ascii_digit)',s);self.assertIn("value[0]!=b'0'",s)
+  self.assertIn('self.take(1)?[0] != 0',src('rpc_stream.rs'))
+  test=src('group_directory_data_tests.rs');self.assertIn('more[1]=2;{let value=g::decode_relations(0,&more).unwrap()',test);self.assertIn('more[2]=2;{let value=g::decode_relations(0,&more).unwrap()',test)
+  self.assertIn('more.truncate(2);assert!',test);self.assertIn('more.truncate(3);assert!',test)
  def test_preparation_reserves_original_input_before_copy_or_controller_await(self):
   s=src('runtime_backend.rs').split('pub(super) fn reserve_directory_query',1)[1].split('pub(super) async fn read_directory',1)[0]
   self.assertLess(s.index('reserve_native_rpc('),s.index('ImQuery::group_properties('));self.assertIn('group.map_or(0,|id|id.len())+64',s)
@@ -43,6 +46,7 @@ class DirectoryReadSourceContracts(unittest.TestCase):
   for text in ['uid:','token:','body:','scope:','label:','flags:','property_values:']:self.assertNotIn(text,s)
   p=(R/'frontend/src/policies/nativeDirectory.ts').read_text(encoding='utf-8');pane=(R/'frontend/src/pages/sim/AppNativeDirectoryPane.tsx').read_text(encoding='utf-8')
   for text in ["own(value, 'operation')","own(value, 'target_kind')","own(value, 'original_time')",'BigInt(value)','-9223372036854775808n','9223372036854775807n','不解决未知 WRITE']:self.assertIn(text,p)
+  self.assertIn("(operation !== 'relations' && operation !== 'properties') || operation !== requested.operation",p)
   for text in ['window.confirm(', 'active.current.generation !== original.generation','active.current.context !== original.context','setResult(null)','不创建关系、群组或业务']:self.assertIn(text,pane)
   for text in ['dangerouslySetInnerHTML','setAppAccountRunning','localStorage','setInterval','setTimeout']:self.assertNotIn(text,pane)
  def test_new_native_http_and_ui_leafs_are_additive_mounted_with_all_cases(self):

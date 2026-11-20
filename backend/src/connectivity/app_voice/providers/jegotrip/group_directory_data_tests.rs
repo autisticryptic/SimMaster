@@ -31,7 +31,12 @@ fn group_directory_nonzero_remote_code_and_version_refusal_are_not_normal_succes
  for code in [1,65536,65537,u32::MAX]{assert_eq!(g::decode_relations(code,&relations(true,true,b"")).err(),Some(CodecError::RemoteFailure));assert_eq!(g::decode_properties(code,&properties(true,b"")).err(),Some(CodecError::RemoteFailure));}}
 #[test]
 fn group_directory_every_truncation_trailing_data_and_bad_bool_is_rejected(){
- let bytes=relations(true,true,b"");for end in 0..bytes.len(){assert!(g::decode_relations(0,&bytes[..end]).is_err());}let mut more=bytes.clone();more.push(0);assert!(g::decode_relations(0,&more).is_err());more=bytes.clone();more[1]=2;assert!(g::decode_relations(0,&more).is_err());more=bytes.clone();more[2]=2;assert!(g::decode_relations(0,&more).is_err());more=bytes;more[3]=2;assert!(g::decode_relations(0,&more).is_err());
+ let bytes=relations(true,true,b"");for end in 0..bytes.len(){assert!(g::decode_relations(0,&bytes[..end]).is_err());}let mut more=bytes.clone();more.push(0);assert!(g::decode_relations(0,&more).is_err());
+ // Native bool is any nonzero byte, not the frontend's JSON bool. Keep the
+ // incomplete-field and oversized-map refusals; do not change the old Reader.
+ more=bytes.clone();more[1]=2;{let value=g::decode_relations(0,&more).unwrap();assert!(value.accepted&&value.reported);assert_eq!(value.time,i64::MIN);}more.truncate(2);assert!(g::decode_relations(0,&more).is_err());
+ more=bytes.clone();more[2]=2;{let value=g::decode_relations(0,&more).unwrap();assert!(value.accepted&&value.reported);assert_eq!(value.first.len(),1);}more.truncate(3);assert!(g::decode_relations(0,&more).is_err());
+ more=bytes;more[3]=2;assert!(g::decode_relations(0,&more).is_err());
  let bytes=properties(true,b"");for end in 0..bytes.len(){assert!(g::decode_properties(0,&bytes[..end]).is_err());}let mut more=bytes;more.push(0);assert!(g::decode_properties(0,&more).is_err());}
 #[test]
 fn group_directory_relation_and_name_duplicate_keys_are_refused_not_last_write_wins(){

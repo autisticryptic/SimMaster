@@ -32,6 +32,8 @@ void test('native directory snapshot rejects bad counts false metadata and inher
   for (const key of ['first_relations', 'second_relations', 'names', 'properties']) for (const value of [-1, 129, 1.5, '1', null]) assert.equal(directorySnapshot({ ...result, [key]: value }, self), null)
   for (const extra of [{ accepted: 1 }, { reported: 'false' }, { reported: undefined }, { original_time: '+1' }, { original_time: '9223372036854775808' }, { properties: 1 }]) assert.equal(directorySnapshot({ ...result, ...extra }, self), null)
   assert.equal(directorySnapshot(Object.create(result) as unknown, self), null)
+  // Matching untrusted strings still must be one of the two original READ variants.
+  assert.equal(directorySnapshot({ ...result, operation: 'send' }, { ...self, operation: 'send' } as unknown as DirectoryInput), null)
   const props = { operation: 'properties', target_kind: 'group', accepted: true, first_relations: 0, second_relations: 0, names: 0, properties: 1 }
   for (const extra of [{ reported: false }, { original_time: '0' }, { first_relations: 1 }, { names: 1 }]) assert.equal(directorySnapshot({ ...props, ...extra }, group), null)
 })

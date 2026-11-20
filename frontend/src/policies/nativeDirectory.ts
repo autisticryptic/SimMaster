@@ -20,7 +20,7 @@ export function directorySnapshot(value: unknown, requested: DirectoryInput): Di
   const operation = own(value, 'operation'); const target = own(value, 'target_kind'); const accepted = own(value, 'accepted'); const reported = own(value, 'reported'); const time = own(value, 'original_time')
   const first = own(value, 'first_relations'); const second = own(value, 'second_relations'); const names = own(value, 'names'); const properties = own(value, 'properties')
   const count = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 128
-  if (operation !== requested.operation || target !== (requested.groupId === '' ? 'current_user' : 'group') || typeof accepted !== 'boolean' || !count(first) || !count(second) || !count(names) || !count(properties)) return null
+  if ((operation !== 'relations' && operation !== 'properties') || operation !== requested.operation || target !== (requested.groupId === '' ? 'current_user' : 'group') || typeof accepted !== 'boolean' || !count(first) || !count(second) || !count(names) || !count(properties)) return null
   if (operation === 'relations' ? typeof reported !== 'boolean' || !signed64(time) || properties !== 0 : reported !== undefined || time !== undefined || first !== 0 || second !== 0 || names !== 0) return null
   return { operation, targetKind: target as 'current_user' | 'group', accepted, ...(operation === 'relations' ? { reported: reported as boolean, time: time as string } : {}), first, second, names, properties }
 }
