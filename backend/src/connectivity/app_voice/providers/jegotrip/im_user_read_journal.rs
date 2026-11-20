@@ -85,8 +85,8 @@ impl UserReadAction{
         let context=ImInboxScope::original(self.run.clone(),binding.clone(),self.parent_gate.clone())?;
         let(box_id,index,fingerprint,replay)=self.database.with_conn(|conn|{
             let tx=Transaction::new_unchecked(conn,TransactionBehavior::Deferred).map_err(|_|STORAGE)?;context.validate(&tx)?;
-            let(box_id,index,fingerprint,deleted):(Vec<u8>,i64,Vec<u8>,i64)=tx.query_row("SELECT box_id,message_index,fingerprint,deleted FROM app_voice_im_messages WHERE id=?1 AND line_id=?2 AND revision=?3 AND identity_key=?4",
-                params![self.message_id,self.run.line_id(),self.run.revision()as i64,binding.identity().as_slice()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|_|STORAGE)?.ok_or("app_account_im_user_read_message_missing")?;
+            let(box_id,index,fingerprint,deleted):(Vec<u8>,i64,Vec<u8>,i64)=tx.query_row("SELECT box_id,message_index,fingerprint,deleted FROM app_voice_im_messages WHERE id=?1 AND line_id=?2 AND revision=?3 AND identity_key=?4 AND (body_kind='text' OR(body_kind='info' AND ?5=1 AND info_epoch=?6))",
+                params![self.message_id,self.run.line_id(),self.run.revision()as i64,binding.identity().as_slice(),i64::from(binding.receives_info()),binding.receipt_epoch()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|_|STORAGE)?.ok_or("app_account_im_user_read_message_missing")?;
             if deleted!=0||index<0{return Err("app_account_im_user_read_message_missing");}
             let key=ImBox::parse(&box_id).map_err(|_|INVALID)?;if key.kind()!=BoxKind::P2P{return Err("app_account_im_user_read_recipient_unsupported");}
             let fingerprint:[u8;32]=fingerprint.try_into().map_err(|_|STORAGE)?;
@@ -126,8 +126,8 @@ impl UserReadContext{
     }
     fn verify_message(&self,conn:&Connection,visible:bool)->Result<(),&'static str>{
         self.context.validate(conn)?;if !self.action.live(){return Err(SCOPE);}
-        let matches:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_im_messages WHERE id=?1 AND line_id=?2 AND revision=?3 AND identity_key=?4 AND box_id=?5 AND message_index=?6 AND fingerprint=?7 AND (?8=0 OR deleted=0))",
-            params![self.action.message_id,self.action.run.line_id(),self.action.run.revision()as i64,self.context.binding.identity().as_slice(),self.box_id.as_slice(),self.index,self.fingerprint.as_slice(),i64::from(visible)],|r|r.get(0)).map_err(|_|STORAGE)?;
+        let matches:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_im_messages WHERE id=?1 AND line_id=?2 AND revision=?3 AND identity_key=?4 AND box_id=?5 AND message_index=?6 AND fingerprint=?7 AND (?8=0 OR deleted=0) AND (body_kind='text' OR(body_kind='info' AND ?9=1 AND info_epoch=?10)))",
+            params![self.action.message_id,self.action.run.line_id(),self.action.run.revision()as i64,self.context.binding.identity().as_slice(),self.box_id.as_slice(),self.index,self.fingerprint.as_slice(),i64::from(visible),i64::from(self.context.binding.receives_info()),self.context.binding.receipt_epoch()],|r|r.get(0)).map_err(|_|STORAGE)?;
         if !matches{return Err("app_account_im_user_read_message_conflict");}
         let saved:Option<Option<Vec<u8>>>=conn.query_row("SELECT recipient_hash FROM app_voice_im_user_reads WHERE line_id=?1 AND user_nonce=?2",params![self.action.run.line_id(),self.action.nonce.as_str()],|r|r.get(0)).optional().map_err(|_|STORAGE)?;
         if let Some(saved)=saved{let expected=self.action.recipient_hash();if saved.as_deref()!=expected.as_ref().map(|h|h.as_slice()){return Err("app_account_im_user_read_nonce_conflict");}}

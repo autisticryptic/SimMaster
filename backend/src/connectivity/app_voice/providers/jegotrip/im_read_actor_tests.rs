@@ -11,9 +11,11 @@ mod received_writes;
 mod user_reads;
 #[path="im_send_io_tests.rs"]
 mod sends;
+#[path="im_info_runtime_io_tests.rs"]
+mod info;
 async fn bounded<F:std::future::Future>(f:F)->F::Output{tokio::time::timeout(Duration::from_secs(12),f).await.expect("original IM IO fixture budget")}
 fn refresh()->Arc<ImQuery>{Arc::new(ImQuery::refresh(&[],-1).unwrap())}
-fn config(enabled:bool)->NativeReceiverConfig{NativeReceiverConfig{direct_domains:None,invite_notifications:None,im_messages:enabled.then_some(NativeImConfig{notification_timeout_ms:3000})}}
+fn config(enabled:bool)->NativeReceiverConfig{NativeReceiverConfig{direct_domains:None,invite_notifications:None,im_messages:enabled.then_some(NativeImConfig{notification_timeout_ms:3000,receive_info:false})}}
 async fn auth(handle:&RuntimeHandle,events:&mut mpsc::Receiver<RuntimeEvent>,original:&AttemptOwner,scope:&RpcConnectionScope,enabled:bool){
     let setup=NativeReceiverSetup::capture(NativeReceiverPolicy::capture(&config(enabled)).unwrap(),true,None).unwrap();let commands=handle.command_handle();commands.arm_native_receivers(original,scope,setup).await.unwrap();authenticated(handle,events,original,scope).await;commands.configure_native_receivers(original,scope,7).await.unwrap();
 }

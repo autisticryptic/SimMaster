@@ -28,16 +28,16 @@ pub(in super::super) fn delete_account(conn:&Connection,line:&str)->Result<(),&'
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_voice_im_receive_cursors')",[],|row|row.get(0)).map_err(|_|STORAGE)?;
     if exists{conn.execute("DELETE FROM app_voice_im_receive_cursors WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;}Ok(())
 }
-struct Record{key:Arc<ImKey>,raw:Zeroizing<Vec<u8>>,text:Zeroizing<String>,sender:Zeroizing<Vec<u8>>,fingerprint:[u8;32],time:i64,attachments:i64}
+struct Record{key:Arc<ImKey>,raw:Zeroizing<Vec<u8>>,text:Zeroizing<String>,sender:Zeroizing<Vec<u8>>,fingerprint:[u8;32],time:i64,attachments:i64,body_kind:&'static str,info_type:Option<Zeroizing<Vec<u8>>>,system_info:bool,info_epoch:Option<Zeroizing<String>>}
 impl Record{
     fn capture(binding:&ImBinding,box_id:ImBox<'_>,message:&ImMessage<'_>)->Result<Self,&'static str>{
-        let text=ImText::decode(message).map_err(|_|INVALID)?.ok_or(UNSUPPORTED)?;
+        let text=ImContent::capture(binding,message)?.ok_or(UNSUPPORTED)?;
         let raw=message.encode().map_err(|_|INVALID)?;let raw=Zeroizing::new(raw.expose_to_transport().to_vec());
-        if raw.len()>65536||text.text().len()>65536||message.sender_uid.len()>65536{return Err(INVALID);}
+        if raw.len()>65536||text.value().len()>65536||message.sender_uid.len()>65536{return Err(INVALID);}
         let key=ImKey::capture(binding,box_id,message.index);let fingerprint=key.message_fingerprint(&raw);
-        Ok(Self{key,raw,text:Zeroizing::new(text.text().to_owned()),sender:Zeroizing::new(message.sender_uid.to_vec()),fingerprint,time:message.time,attachments:message.attachments.len()as i64})
+        Ok(Self{key,raw,text:Zeroizing::new(text.value().to_owned()),sender:Zeroizing::new(message.sender_uid.to_vec()),fingerprint,time:message.time,attachments:message.attachments.len()as i64,body_kind:text.body_kind(),info_type:text.info_type().map(|v|Zeroizing::new(v.to_vec())),system_info:text.system_info(),info_epoch:if text.body_kind()=="info"{Some(Zeroizing::new(binding.receipt_epoch().to_owned()))}else{None}})
     }
-    fn bytes(&self)->usize{self.raw.len()+self.text.len()+self.sender.len()}
+    fn bytes(&self)->usize{self.raw.len()+self.text.len()+self.sender.len()+self.info_type.as_ref().map_or(0,|v|v.len())+self.info_epoch.as_ref().map_or(0,|v|v.len())}
 }
 /// One current-original login view, not a serialized/restartable capability.
 pub(in super::super) struct CursorSession{context:ImInboxScope,since:i64,initial:bool}
@@ -128,13 +128,13 @@ impl CursorSession{
     fn insert_record(&self,tx:&Connection,record:&Record)->Result<(i64,Option<crate::platform::db::AppEventEntry>),&'static str>{
         let key=&record.key;let existing:Option<(i64,Vec<u8>)>=tx.query_row("SELECT id,fingerprint FROM app_voice_im_messages WHERE line_id=?1 AND revision=?2 AND identity_key=?3 AND box_id=?4 AND message_index=?5",
             params![self.context.run.line_id(),self.context.run.revision()as i64,self.context.binding.identity().as_slice(),key.box_id().bytes(),key.index()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_|STORAGE)?;
-        if let Some((id,fingerprint))=existing{if fingerprint.as_slice()!=record.fingerprint.as_slice(){return Err("app_account_im_message_conflict");}return Ok((id,None));}
-        let(local,total,bytes):(i64,i64,i64)=tx.query_row("SELECT COALESCE(SUM(line_id=?1),0),COUNT(*),COALESCE(SUM(length(body)+length(CAST(text AS BLOB))+length(sender)),0) FROM app_voice_im_messages",[self.context.run.line_id()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|STORAGE)?;
+        if let Some((id,fingerprint))=existing{if fingerprint.as_slice()!=record.fingerprint.as_slice(){return Err("app_account_im_message_conflict");}if record.info_epoch.is_some(){self.context.mark_info_consumed(tx,id)?;}return Ok((id,None));}
+        let(local,total,bytes):(i64,i64,i64)=tx.query_row("SELECT COALESCE(SUM(line_id=?1),0),COUNT(*),COALESCE(SUM(length(body)+length(CAST(text AS BLOB))+length(sender)+COALESCE(length(info_type),0)+COALESCE(length(CAST(info_epoch AS BLOB)),0)),0) FROM app_voice_im_messages",[self.context.run.line_id()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|STORAGE)?;
         if local>=MAX_PER_ACCOUNT||total>=MAX_TOTAL||bytes.checked_add(record.bytes()as i64).is_none_or(|n|n>MAX_TOTAL_BYTES){return Err(FULL);}
         let kind=match key.box_id().kind(){super::super::im_data::BoxKind::P2P=>"p2p",super::super::im_data::BoxKind::Org=>"org"};let now=chrono::Utc::now().to_rfc3339();
-        tx.execute("INSERT INTO app_voice_im_messages(line_id,revision,identity_key,box_id,box_kind,message_index,fingerprint,original_time,body,text,sender,attachment_count,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![self.context.run.line_id(),self.context.run.revision()as i64,self.context.binding.identity().as_slice(),key.box_id().bytes(),kind,key.index(),record.fingerprint.as_slice(),record.time,record.raw.as_slice(),record.text.as_str(),record.sender.as_slice(),record.attachments,now]).map_err(|_|STORAGE)?;
-        let id=tx.last_insert_rowid();let payload=serde_json::json!({"im_id":id,"kind":"text","transport":"app_voice_im"}).to_string();let event=insert_app_event_for_conn(tx,"im.received",Some(self.context.run.line_id()),Some("app_voice_im"),&payload,&now).map_err(|_|STORAGE)?;Ok((id,Some(event)))
+        tx.execute("INSERT INTO app_voice_im_messages(line_id,revision,identity_key,box_id,box_kind,message_index,fingerprint,original_time,body,text,sender,attachment_count,created_at,body_kind,info_type,system_info,info_epoch) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            params![self.context.run.line_id(),self.context.run.revision()as i64,self.context.binding.identity().as_slice(),key.box_id().bytes(),kind,key.index(),record.fingerprint.as_slice(),record.time,record.raw.as_slice(),record.text.as_str(),record.sender.as_slice(),record.attachments,now,record.body_kind,record.info_type.as_ref().map(|v|v.as_slice()),i64::from(record.system_info),record.info_epoch.as_ref().map(|v|v.as_str())]).map_err(|_|STORAGE)?;
+        let id=tx.last_insert_rowid();let payload=serde_json::json!({"im_id":id,"kind":record.body_kind,"transport":"app_voice_im"}).to_string();let event=insert_app_event_for_conn(tx,"im.received",Some(self.context.run.line_id()),Some("app_voice_im"),&payload,&now).map_err(|_|STORAGE)?;Ok((id,Some(event)))
     }
     fn advance(&self,tx:&Connection,box_id:&[u8],baseline:i64,consumed:i64,gap:Gap,end:i64,span_hash:&[u8;32])->Result<(),&'static str>{
         if gap.start!=consumed.checked_add(1).ok_or(CURSOR)?||end<gap.start||end>gap.end().map_err(|_|CURSOR)?{return Err(CURSOR);}
@@ -190,7 +190,7 @@ impl CursorSession{
             let(baseline,consumed):(i64,i64)=tx.query_row("SELECT baseline,consumed FROM app_voice_im_receive_cursors WHERE line_id=?1 AND revision=?2 AND identity_key=?3 AND box_id=?4 AND observed_run=?5 AND observed_epoch=?6",
                 params![self.context.run.line_id(),self.context.run.revision()as i64,self.context.binding.identity().as_slice(),record.key.box_id().bytes(),self.context.run.nonce(),self.context.binding.receipt_epoch()],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|CURSOR)?;
             if record.key.index()<=consumed{let existing:Option<(i64,Vec<u8>)>=tx.query_row("SELECT id,fingerprint FROM app_voice_im_messages WHERE line_id=?1 AND revision=?2 AND identity_key=?3 AND box_id=?4 AND message_index=?5",params![self.context.run.line_id(),self.context.run.revision()as i64,self.context.binding.identity().as_slice(),record.key.box_id().bytes(),record.key.index()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_|STORAGE)?;
-                let Some((id,fingerprint))=existing else{return Ok((None,None));};if fingerprint.as_slice()!=record.fingerprint.as_slice(){return Err("app_account_im_message_conflict");}tx.commit().map_err(|_|STORAGE)?;return Ok((Some(id),None));}
+                let Some((id,fingerprint))=existing else{return Ok((None,None));};if fingerprint.as_slice()!=record.fingerprint.as_slice(){return Err("app_account_im_message_conflict");}if record.info_epoch.is_some(){self.context.mark_info_consumed(&tx,id)?;}tx.commit().map_err(|_|STORAGE)?;return Ok((Some(id),None));}
             let span_hash=hash(&[b"original-im-online-span-v1\0",record.key.box_id().bytes(),&record.key.index().to_be_bytes(),&record.fingerprint]);let(id,event)=self.insert_record(&tx,&record)?;
             self.advance(&tx,record.key.box_id().bytes(),baseline,consumed,Gap{start:record.key.index(),count:1},record.key.index(),&span_hash)?;
             tx.commit().map_err(|_|STORAGE)?;Ok((Some(id),event))})?;

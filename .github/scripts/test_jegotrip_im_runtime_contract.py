@@ -34,8 +34,9 @@ class ImRuntimeContracts(unittest.TestCase):
     def test_sql_transaction_preserves_raw_im_text_receipt_event_and_original_run_revision(self):
         store=src('im_inbox.rs')
         for value in ['TransactionBehavior::Immediate','account_runs::runtime_matches','account_runs::require_live','row.revision!=self.run.revision()',
-                      'UNIQUE(line_id,revision,identity_key,box_id,message_index)','ImText::decode','insert_app_event_for_conn(&tx,"im.received"','db.publish_committed_app_event']:
+                      'UNIQUE(line_id,revision,identity_key,box_id,message_index)','ImContent::capture(&self.binding,&message)','insert_app_event_for_conn(&tx,"im.received"','db.publish_committed_app_event']:
             self.assertIn(value,store)
+        content=src('im_content.rs');self.assertIn('ImText::decode(message)',content);self.assertIn('if !binding.receives_info(){return Ok(None);}',content);self.assertLess(content.index('ImText::decode(message)'),content.index('ImInfo::decode(message)'))
         self.assertLess(store.index('tx.commit().map_err(|_|STORAGE)?;Ok((id,Some(event)))'),store.index('Ok(Some(self.permit'))
         for value in ['INSERT INTO sms','INSERT INTO call_history','std::fs','with_io_gate(','with_media_gate(']:self.assertNotIn(value,store)
     def test_delete_is_a_private_tombstone_not_row_reuse_or_message_resurrection(self):

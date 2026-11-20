@@ -43,7 +43,7 @@ export default function AppImMessagesPane({ lineId, userRead }: { lineId: string
   const remove = async (row: ImHistoryRow) => {
     if (deleting.current || marking.current || (uncertain?.line === lineId && uncertain.id === row.id) || !active.current.live) return
     const original = { ...active.current }
-    if (!window.confirm('删除本地 IM 文本？仅保留私有去重回执，防止服务端重放恢复已删除内容。')) return
+    if (!window.confirm(row.infoType === undefined ? '删除本地 IM 文本？仅保留私有去重回执，防止服务端重放恢复已删除内容。' : '删除本地 Info 内容与类型？仅保留私有原消息去重信息，不恢复内容或执行服务端命令。')) return
     deleting.current = true; active.current.readSerial += 1; setBusy(true)
     try {
       const deleted = await api.deleteAppImMessage(original.line, row.id)
@@ -88,12 +88,13 @@ export default function AppImMessagesPane({ lineId, userRead }: { lineId: string
     {userRead?.recipientInstalled && <TextField size="small" label="已读收件人原 URI（可选）" value={recipient} autoComplete="off" slotProps={{ htmlInput: { maxLength: 512 } }} disabled={busy || !userRead.hosted} onChange={(event) => setRecipientInput({ context: userReadContext, value: event.target.value })} />}
     {rows.map((row) => <Stack key={row.id} spacing={0.5}>
       <Typography variant="caption">{row.kind === 'p2p' ? '点对点' : '群组'} · 消息索引 {row.index} · {row.receivedAt}</Typography>
+      {row.infoType !== undefined && <Typography variant="caption">{row.systemInfo ? '原系统 Info' : '原 Info'} · 类型 {row.infoType}；仅显示结构化内容，不据此确认在线、渠道送达或执行命令。</Typography>}
       <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{row.text}</Typography>
       {!!row.attachments && <Typography variant="caption">私有附件 {row.attachments} 项；不会按服务端文件名写入路径或自动打开。</Typography>}
       {userRead?.installed && row.kind === 'p2p' && !row.index.startsWith('-') && <Button size="small" disabled={busy || !userRead.hosted || !currentUserOutcomes || userReadKnownUnknown(currentUserOutcomes, lineId, currentUserOutcomes.generation, row.id, row.index) || userUncertain?.line === lineId && userUncertain.id === row.id} onClick={() => { void markRead(row) }}>明确标记原消息已读</Button>}
       {userRead?.installed && userRead.recipientInstalled && row.kind === 'p2p' && !row.index.startsWith('-') && <Button size="small" disabled={busy || !userRead.hosted || !currentUserOutcomes || !userReadRecipientAllowed(recipient) || userReadKnownUnknown(currentUserOutcomes, lineId, currentUserOutcomes.generation, row.id, row.index) || userUncertain?.line === lineId && userUncertain.id === row.id} onClick={() => { void markRead(row, recipient) }}>通过原收件人解析标记已读</Button>}
       {currentUserOutcomes && currentUserOutcomes.rows.filter((result) => result.messageId === row.id).slice(0, 1).map((result) => <Typography key={result.id} variant="caption">{userReadLabel(result.state)}</Typography>)}
-      <Button size="small" color="warning" disabled={busy || (uncertain?.line === lineId && uncertain.id === row.id)} onClick={() => { void remove(row) }}>删除本地 IM 文本</Button>
+      <Button size="small" color="warning" disabled={busy || (uncertain?.line === lineId && uncertain.id === row.id)} onClick={() => { void remove(row) }}>{row.infoType === undefined ? '删除本地 IM 文本' : '删除本地 Info 内容'}</Button>
     </Stack>)}
   </Stack>
 }

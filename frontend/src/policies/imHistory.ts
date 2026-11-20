@@ -1,5 +1,5 @@
 // Original IM history is distinct from SMS, SDK readiness and read-status ACKs.
-export interface ImHistoryRow { id: number; kind: 'p2p' | 'org'; index: string; text: string; attachments: number; receivedAt: string }
+export interface ImHistoryRow { id: number; kind: 'p2p' | 'org'; index: string; text: string; attachments: number; receivedAt: string; infoType?: string; systemInfo?: boolean }
 function index(value: unknown): value is string {
   if (typeof value !== 'string' || !/^(?:0|-[1-9][0-9]{0,18}|[1-9][0-9]{0,18})$/.test(value)) return false
   const number = BigInt(value)
@@ -15,8 +15,11 @@ export function imHistoryRows(value: unknown): ImHistoryRow[] {
     if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0 || seen.has(id) || (kind !== 'p2p' && kind !== 'org') || !index(messageIndex)) continue
     if (typeof text !== 'string' || text.length > 65536 || text.includes('\0') || new TextEncoder().encode(text).length > 65536) continue
     if (typeof attachments !== 'number' || !Number.isInteger(attachments) || attachments < 0 || attachments > 128) continue
+    const bodyKind = own('kind'); const infoType = own('info_type'); const systemInfo = own('system_info')
+    const info = bodyKind === 'info'
+    if (bodyKind !== undefined && !info || info && (typeof infoType !== 'string' || !/^[A-Za-z0-9_.-]{1,128}$/.test(infoType) || typeof systemInfo !== 'boolean') || !info && (infoType !== undefined || systemInfo !== undefined)) continue
     const receivedAt = typeof received === 'string' && received.length <= 64 && Number.isFinite(Date.parse(received)) ? new Date(received).toLocaleString() : '本地接收时间未知'
-    seen.add(id); rows.push({ id, kind, index: messageIndex, text, attachments, receivedAt })
+    seen.add(id); rows.push({ id, kind, index: messageIndex, text, attachments, receivedAt, ...(info ? { infoType: infoType as string, systemInfo: systemInfo as boolean } : {}) })
     if (rows.length === 16) break
   }
   return rows

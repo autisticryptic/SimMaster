@@ -2,6 +2,8 @@
 //! No device, original SDK loading or real Provider service is used.
 use super::*;
 use n::im_sync_policy::NativeImSyncConfig;
+#[path="im_info_runtime_sync_account_tests.rs"]
+mod info;
 fn config(root:&str,port:u16,timeout:u64)->AccountConfig{let mut c=super::config(root,port,timeout);c.profile.im_sync=Some(NativeImSyncConfig{receive:true});c}
 fn status(base:i64,target:i64,time:i64)->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.u32(1).unwrap();w.bytes(b"1_2").unwrap();let b=base.to_string();let t=target.to_string();w.properties(&[RpcProperty{key:n::im_status::PEER_READ,value:b.as_bytes()},RpcProperty{key:n::im_status::LATEST,value:t.as_bytes()}]).unwrap();w.i64(time).unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}
 fn received(indices:&[i64],unknown:bool)->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.u32(indices.len()as u32).unwrap();for(index,i)in indices.iter().zip(0..){w.i64(*index).unwrap();w.i64(1234567890123).unwrap();w.bytes(b"fixture-private-uid").unwrap();w.bytes(if unknown&&i==1{b"Info.Unknown"}else{b"Text"}).unwrap();w.bytes(br#"{"text":"original IM text","userData":"private-not-public"}"#).unwrap();w.properties(&[RpcProperty{key:b"../never-written",value:b"attachment-bytes"}]).unwrap();w.properties(&[]).unwrap();}w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}

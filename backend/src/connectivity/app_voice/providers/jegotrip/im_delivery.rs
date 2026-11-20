@@ -11,7 +11,14 @@ use zeroize::Zeroizing;
 
 #[derive(Clone,Copy,Deserialize,Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct NativeImConfig{pub notification_timeout_ms:u64}
+pub struct NativeImConfig{
+    pub notification_timeout_ms:u64,
+    /// Independent explicit Info DATA consumption opt-in; never an ACK/WRITE,
+    /// SMS/media/SDK grant. Missing/false preserves the original Text behavior.
+    #[serde(default,skip_serializing_if="no_info")]
+    pub receive_info:bool,
+}
+fn no_info(value:&bool)->bool{!*value}
 impl fmt::Debug for NativeImConfig{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("NativeImConfig(<redacted>)")}}
 impl NativeImConfig{
     pub(super) fn timeout(self)->Result<Duration,CodecError>{
@@ -45,6 +52,7 @@ impl ImBinding{
     pub(super) fn receipt_epoch(&self)->&str{self.receipt_epoch.as_str()}
     pub(super) fn deadline(&self,now:Instant)->Result<Instant,CodecError>{now.checked_add(self.config.timeout()?).ok_or(CodecError::InvalidField)}
     pub(super) fn policy(&self)->&Arc<NativeReceiverPolicy>{self.native.policy()}
+    pub(super) fn receives_info(&self)->bool{self.config.receive_info}
 }
 
 pub(super) struct ImKey{box_id:Zeroizing<Vec<u8>>,index:i64,digest:[u8;32]}
