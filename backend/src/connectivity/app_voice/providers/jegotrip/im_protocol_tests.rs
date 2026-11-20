@@ -20,12 +20,15 @@ mod user_reads;
 mod sends;
 #[path="im_info_runtime_protocol_tests.rs"]
 mod info;
+#[path="group_directory_protocol_tests.rs"]
+mod directory;
 struct Fixture{owner:AttemptOwner,scope:RpcConnectionScope,backend:OfflineBackend,temp:TempDatabase,run:Arc<account_runs::RunToken>,gate:Arc<ImReceiptGate>}
 impl Fixture{
     fn new(enabled:bool)->Self{Self::with_info(enabled,false)}
-    fn with_info(enabled:bool,receive_info:bool)->Self{
+    fn with_info(enabled:bool,receive_info:bool)->Self{Self::with_directory(enabled,receive_info,false)}
+    fn with_directory(enabled:bool,receive_info:bool,directory_queries:bool)->Self{
         let temp=TempDatabase::new();let cert=n::tls_engine::tests::Certificates::generate("IP:127.0.0.1");let line="app-account-0123456789abcdef0123456789abcdef";
-        let cfg=NativeReceiverConfig{direct_domains:None,invite_notifications:None,im_messages:enabled.then_some(NativeImConfig{notification_timeout_ms:30000,receive_info})};
+        let cfg=NativeReceiverConfig{direct_domains:None,invite_notifications:None,im_messages:enabled.then_some(NativeImConfig{notification_timeout_ms:30000,receive_info,directory_queries})};
         let mut config=n::account_config::tests::native_fixture(&cert.root,"127.0.0.1",1);config.profile.incoming=None;config.profile.client_ex=true;config.profile.native_receivers=Some(cfg.clone());config.credentials.sdk.expires_at_unix_seconds=None;
         temp.database.with_conn(|conn|account_store::create(conn,line,&config,100)).unwrap();let run=Arc::new(temp.database.with_conn(|conn|account_runs::register_runtime(conn,line,1,&local_nonce().unwrap())).unwrap());
         let mut session=HostingSession::new(line.into());session.import(imported(),100).unwrap();let owner=session.begin_login(100).unwrap();let mut backend=OfflineBackend::new(owner.clone());backend.claim_common_transport().unwrap();backend.bind_common_identity(b"AccountEntry").unwrap();let scope=backend.connection_scope();
@@ -121,7 +124,7 @@ fn im_runtime_im_ticket_cannot_be_completed_through_generic_sms_path(){
 }
 #[test]
 fn im_runtime_configuration_is_explicit_bounded_and_absence_is_omitted_from_private_bytes(){
-    let f=Fixture::new(false);let stored=f.temp.database.with_conn(|conn|account_store::load(conn,f.run.line_id())).unwrap().unwrap();let bytes=stored.config.encode_private().unwrap();assert!(!std::str::from_utf8(&bytes).unwrap().contains("im_messages"));let value:NativeReceiverConfig=serde_json::from_str("{}").unwrap();assert!(value.im_messages.is_none());for ms in [0,99,30001,u64::MAX]{assert!(NativeImConfig{notification_timeout_ms:ms,receive_info:false}.timeout().is_err());}
+    let f=Fixture::new(false);let stored=f.temp.database.with_conn(|conn|account_store::load(conn,f.run.line_id())).unwrap().unwrap();let bytes=stored.config.encode_private().unwrap();assert!(!std::str::from_utf8(&bytes).unwrap().contains("im_messages"));let value:NativeReceiverConfig=serde_json::from_str("{}").unwrap();assert!(value.im_messages.is_none());for ms in [0,99,30001,u64::MAX]{assert!(NativeImConfig{notification_timeout_ms:ms,receive_info:false,directory_queries:false}.timeout().is_err());}
 }
 #[test]
 fn im_runtime_full_signed_message_indices_stay_exact_in_sql_and_public_strings(){

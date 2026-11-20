@@ -6,6 +6,8 @@ use super::super::super::im_data::*;
 mod text;
 #[path="im_info_tests.rs"]
 mod info;
+#[path="group_directory_data_tests.rs"]
+mod directory;
 #[path="im_status_tests.rs"]
 mod status;
 #[path="im_send_data_tests.rs"]

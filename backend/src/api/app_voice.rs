@@ -71,6 +71,13 @@ impl Drop for ImReadStatusRecipientRequest{fn drop(&mut self){zeroize::Zeroize::
 #[serde(deny_unknown_fields)]
 pub struct UserEntryLookupRequest{expected_revision:u64,recipient:String,consent:bool}
 impl Drop for UserEntryLookupRequest{fn drop(&mut self){zeroize::Zeroize::zeroize(&mut self.recipient);}}
+#[derive(Clone,Copy,Deserialize)]
+#[serde(rename_all="snake_case")]
+pub enum DirectoryReadOperation{Relations,Properties}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryReadRequest{expected_revision:u64,operation:DirectoryReadOperation,group_id:Option<String>,since:String,consent:bool}
+impl Drop for DirectoryReadRequest{fn drop(&mut self){if let Some(id)=&mut self.group_id{zeroize::Zeroize::zeroize(id);}zeroize::Zeroize::zeroize(&mut self.since);}}
 fn default_inbox_limit() -> usize { 50 }
 
 /// Merged into main's protected routes BEFORE its existing auth middleware.
@@ -107,6 +114,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/im-user-reads",get(get_im_user_reads))
         .route("/api/non-3gpp/accounts/{line_id}/im-user-reads/{receipt_id}/reconcile",post(reconcile_im_user_read))
         .route("/api/non-3gpp/accounts/{line_id}/user-entry/lookup",post(lookup_user_entry))
+        .route("/api/non-3gpp/accounts/{line_id}/native-directory/read",post(read_native_directory))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}/mark-read",post(mark_im_user_read))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}/mark-read/recipient",post(mark_im_user_read_recipient))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}", delete(delete_im_message))
@@ -172,6 +180,10 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_user_entry_scope_invalid" | "app_account_user_entry_reference_unsupported" | "app_account_user_entry_transport_failed"
             | "app_account_user_entry_timeout" | "app_account_user_entry_reply_invalid" => StatusCode::SERVICE_UNAVAILABLE,
         "app_account_user_entry_ambiguous" | "app_account_user_entry_realm_mismatch" => StatusCode::CONFLICT,
+        "app_account_directory_request_invalid" => StatusCode::BAD_REQUEST,
+        "app_account_directory_consent_required" | "app_account_directory_not_installed" => StatusCode::FORBIDDEN,
+        "app_account_directory_capacity" => StatusCode::TOO_MANY_REQUESTS,
+        "app_account_directory_scope_invalid" | "app_account_directory_timeout" | "app_account_directory_reply_invalid" => StatusCode::SERVICE_UNAVAILABLE,
         "app_account_im_user_read_operation_timeout" | "app_account_im_scope_invalid" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
     }
@@ -305,6 +317,18 @@ pub async fn get_notifications(State(manager):State<Arc<AccountManager>>,Path(li
     success(StatusCode::OK,manager.notification_status(&line_id,request.limit))
 }
 
+pub async fn read_native_directory(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Json<DirectoryReadRequest>,JsonRejection>)->Response{
+    let Ok(Json(request))=request else{return failure("app_account_directory_request_invalid");};
+    if request.since.is_empty()||request.since.len()>20||request.group_id.as_ref().is_some_and(|id|id.len()>508){return failure("app_account_directory_request_invalid");}
+    let Ok(since)=request.since.parse::<i64>()else{return failure("app_account_directory_request_invalid");};
+    if since< -1||since.to_string()!=request.since{return failure("app_account_directory_request_invalid");}
+    let prepared=manager.prepare_native_directory(&line_id,request.expected_revision,request.group_id.as_deref(),since,matches!(request.operation,DirectoryReadOperation::Properties),request.consent);
+    // Preparation reserved/captured the original native budget and query;
+    // destroy HTTP temporary fields before the first manager/network await.
+    drop(request);
+    let prepared=match prepared{Ok(value)=>value,Err(code)=>return failure(code)};
+    success(StatusCode::OK,manager.finish_native_directory(prepared).await)
+}
 pub async fn get_im_messages(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Query<InboxQuery>,QueryRejection>)->Response{
     let Ok(Query(request))=request else{return failure("app_account_request_invalid");};
     if !(1..=128).contains(&request.limit){return failure("app_account_request_invalid");}

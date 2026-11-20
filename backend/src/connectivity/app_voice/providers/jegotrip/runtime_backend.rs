@@ -697,6 +697,26 @@ impl NativeHostingBackend {
         self.profile.client_ex&&self.profile.native_receivers.as_ref().is_some_and(|policy|policy.im_messages().is_some())
     }
     pub(super) fn im_sync_enabled(&self)->bool{self.profile.im_sync.is_some()&&self.im_messages_enabled()}
+    pub(super) fn directory_queries_enabled(&self)->bool{self.im_messages_enabled()&&self.profile.native_receivers.as_ref().and_then(|p|p.im_messages()).is_some_and(|config|config.directory_queries)}
+    pub(super) fn directory_query_timeout(&self)->std::time::Duration{self.profile.native_receivers.as_ref().and_then(|p|p.im_messages()).and_then(|config|config.timeout().ok()).unwrap_or(std::time::Duration::ZERO)}
+    pub(super) fn reserve_directory_query(&self,group:Option<&[u8]>,since:i64,properties:bool,deadline:Instant)->Result<(AttemptOwner,RpcConnectionScope,Arc<super::rpc_im::ImQuery>),RuntimeError>{
+        if !self.directory_queries_enabled()||group.is_some_and(|id|id.len()>508)||properties&&group.is_none(){return Err(RuntimeError::InvalidConfiguration);}
+        let attempt=lock(&self.state).slot.clone().ok_or(RuntimeError::Scope)?;let state=lock(&attempt.state);
+        if !state.configured||state.retired||state.logout_started||state.unregister_started||!attempt.scope.is_open()||attempt.scope.session_revoked(){return Err(RuntimeError::Scope);}
+        // Same original native budget, before copying caller group bytes or
+        // waiting for the controller. Last query/reply holder keeps this charge.
+        let input=attempt.scope.reserve_native_rpc(group.map_or(0,|id|id.len())+64).map_err(|_|RuntimeError::Backpressure)?;
+        let query=if properties{super::rpc_im::ImQuery::group_properties(super::group_directory_data::GroupId::parse(group.ok_or(RuntimeError::InvalidConfiguration)?).map_err(|_|RuntimeError::InvalidConfiguration)?)}
+            else{let id=group.map(super::group_directory_data::GroupId::parse).transpose().map_err(|_|RuntimeError::InvalidConfiguration)?;super::rpc_im::ImQuery::relations(id,since)}.map_err(|_|RuntimeError::InvalidConfiguration)?;
+        let query=query.attach_directory_input(input).and_then(|query|query.fix_directory_deadline(deadline)).map_err(|_|RuntimeError::InvalidConfiguration)?;
+        Ok((attempt.owner.clone(),attempt.scope.clone(),Arc::new(query)))
+    }
+    pub(super) async fn read_directory(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,query:Arc<super::rpc_im::ImQuery>,gate:Arc<super::im_inbox::ImReceiptGate>)->Result<super::rpc_im::OwnedImReply,RuntimeError>{
+        if !query.directory_query()||!self.directory_queries_enabled(){return Err(RuntimeError::InvalidConfiguration);}
+        let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;
+        {let state=lock(&attempt.state);if !state.configured||state.retired||state.logout_started||state.unregister_started{return Err(RuntimeError::Closed);}}
+        attempt.commands(owner,scope)?.read_im(owner,scope,query,gate).await
+    }
     pub(super) fn im_send_enabled(&self)->bool{self.profile.im_send.is_some()&&self.im_messages_enabled()}
     pub(super) fn im_read_status_enabled(&self)->bool{self.profile.im_read_status.is_some()&&self.im_messages_enabled()}
     pub(super) fn im_receipt_policy(&self)->Option<super::im_receipt_policy::NativeImReceiptConfig>{self.profile.im_receipts.filter(|_|self.im_sync_enabled())}

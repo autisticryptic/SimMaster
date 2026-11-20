@@ -33,6 +33,9 @@ mod user_read_recipient;
 mod read_status;
 #[path="account_im_send.rs"]
 mod im_send;
+#[path="account_directory.rs"]
+mod directory;
+pub use directory::{DirectoryReadView,PreparedDirectoryRead};
 
 pub trait AccountBackendFactory: Send + Sync {
     /// Construction only. Network work remains inside the original-owned
@@ -99,6 +102,9 @@ pub struct AccountView {
     /// Installed original Group READ support, not a WRITE or runtime grant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub im_reconciliation_supported:Option<bool>,
+    /// Installed directory READ policy, not current SDK/relationship permission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory_queries_supported:Option<bool>,
     /// Current original auxiliary reference support, never authentication/readiness.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_entry_supported:Option<bool>,
@@ -114,7 +120,7 @@ fn view(metadata: AccountMetadata, phase: Phase, cleanup: bool, error: Option<&'
         // A hosted SDK acknowledgement is not verified SMS/call/media support.
         incoming_call_ready: false, incoming_message_ready: false, outbound_authorized: false,
         provider_availability: "unsupported", manual_start_required: true, cleanup_on_disconnect: None, cleanup_error: None,
-        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, account_alive_state:None, startup_failure:None, im_user_read_supported:None, im_user_read_recipient_supported:None, im_read_status_supported:None, im_read_status_recipient_supported:None, im_send_supported:None, im_reconciliation_supported:None, user_entry_supported:None, user_entry_uid_local_supported:None, last_error: error }
+        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, account_alive_state:None, startup_failure:None, im_user_read_supported:None, im_user_read_recipient_supported:None, im_read_status_supported:None, im_read_status_recipient_supported:None, im_send_supported:None, im_reconciliation_supported:None, directory_queries_supported:None, user_entry_supported:None, user_entry_uid_local_supported:None, last_error: error }
 }
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
@@ -415,6 +421,7 @@ impl AccountManager {
         snapshot.im_read_status_supported=Some(run.backend.im_read_status_enabled());
         snapshot.im_send_supported=Some(run.backend.im_send_enabled());
         snapshot.im_reconciliation_supported=Some(run.backend.im_reconciliation_enabled());
+        snapshot.directory_queries_supported=Some(run.backend.directory_queries_enabled());
         snapshot.cleanup_error = *lock(&run.cleanup_error);
         if let Some(owner)=controller.resource_owner() {
             snapshot.im_user_read_recipient_supported=Some(run.backend.user_read_enabled()&&run.backend.user_entry_supported(&owner));

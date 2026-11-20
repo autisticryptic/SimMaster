@@ -15,8 +15,10 @@ mod received_writes;
 mod user_reads;
 #[path="im_info_runtime_account_tests.rs"]
 mod info;
+#[path="group_directory_account_tests.rs"]
+mod directory;
 async fn bounded<F:Future>(future:F)->F::Output{tokio::time::timeout(Duration::from_secs(12),future).await.expect("original IM account fixture deadline")}
-fn config(root:&str,port:u16,timeout:u64)->AccountConfig{let mut cfg=account_config(root,port,false);cfg.profile.native_receivers.as_mut().unwrap().im_messages=Some(NativeImConfig{notification_timeout_ms:timeout,receive_info:false});cfg}
+fn config(root:&str,port:u16,timeout:u64)->AccountConfig{let mut cfg=account_config(root,port,false);cfg.profile.native_receivers.as_mut().unwrap().im_messages=Some(NativeImConfig{notification_timeout_ms:timeout,receive_info:false,directory_queries:false});cfg}
 fn hint(rpc:i32,id:u64,index:i64)->Vec<u8>{let idx=index.to_string();let mut w=Writer::versioned().unwrap();w.u64(id).unwrap();w.properties(&[RpcProperty{key:b"Notify.Command",value:b"Message"},RpcProperty{key:b"Notify.Box",value:b"P2P/1_2"},RpcProperty{key:b"Notify.MsgIdx",value:idx.as_bytes()}]).unwrap();let args=w.finish();let magic=rpc.to_be_bytes();let raw=encode_request(rpc,&[RpcProperty{key:b"id",value:b"MessageReceiver"},RpcProperty{key:b"token",value:b"fixture-auth"},RpcProperty{key:b"__magic",value:&magic}],n::rpc_client_ex::NOTIFY_CALLS_METHOD.as_bytes(),args.expose_to_transport()).unwrap();let mut p=vec![0];p.extend_from_slice(raw.expose_to_transport());p}
 fn message(rpc:i32,index:i64,valid:bool)->Vec<u8>{
     let mut raw=Writer::new();raw.i64(index).unwrap();raw.i64(1234567890123).unwrap();raw.bytes(b"fixture-private-uid").unwrap();raw.bytes(b"Text").unwrap();raw.bytes(if valid{br#"{"text":"original IM text","userData":"private-not-public"}"#}else{b"malformed-json"}).unwrap();raw.properties(&[RpcProperty{key:b"../never-written",value:b"attachment-bytes"}]).unwrap();raw.properties(&[]).unwrap();

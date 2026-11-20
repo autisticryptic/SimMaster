@@ -2,7 +2,7 @@
 fn im_runtime_config_json(root:&str)->serde_json::Value{
     use crate::connectivity::app_voice::providers::jegotrip as n;
     let mut cfg=n::account_config::tests::native_fixture(root,"127.0.0.1",1);cfg.credentials.sdk.expires_at_unix_seconds=None;cfg.profile.incoming=None;cfg.profile.client_ex=true;
-    cfg.profile.native_receivers=Some(n::native_receiver::NativeReceiverConfig{direct_domains:None,invite_notifications:None,im_messages:Some(n::im_delivery::NativeImConfig{notification_timeout_ms:3000,receive_info:false})});
+    cfg.profile.native_receivers=Some(n::native_receiver::NativeReceiverConfig{direct_domains:None,invite_notifications:None,im_messages:Some(n::im_delivery::NativeImConfig{notification_timeout_ms:3000,receive_info:false,directory_queries:false})});
     serde_json::from_slice::<serde_json::Value>(&cfg.encode_private().unwrap()).unwrap()["config"].clone()
 }
 #[tokio::test]

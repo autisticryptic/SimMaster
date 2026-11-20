@@ -817,6 +817,9 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         let native_deadline = match (native_deadline, invite_deadline) {
             (Some(original), Some(invite)) => Some(original.min(invite)), (None, Some(invite)) => Some(invite), (original, None) => original,
         };
+        // Directory preparation owns an earlier absolute deadline. Queuing or
+        // controller waits may clip it, never restart its timeout on admission.
+        let native_deadline=match &command.operation{Operation::ImRead(work)=>native_deadline.map(|end|work.query.clipped_deadline(end)),_=>native_deadline};
         if native_deadline.is_some_and(|deadline| now >= deadline) { let _ = command.completion.send(Err(RuntimeError::Timeout)); return Ok(()); }
         if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _) | Operation::ImRead(_) | Operation::WriteReceived(_) | Operation::UserMarkRead(_) | Operation::ImSend(_)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());

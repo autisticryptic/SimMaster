@@ -17,8 +17,13 @@ pub struct NativeImConfig{
     /// SMS/media/SDK grant. Missing/false preserves the original Text behavior.
     #[serde(default,skip_serializing_if="no_info")]
     pub receive_info:bool,
+    /// Independent original Group/Buddy directory READ opt-in. No reception
+    /// position, user WRITE, SDK readiness or cached relationship grants it.
+    #[serde(default,skip_serializing_if="no_directory")]
+    pub directory_queries:bool,
 }
 fn no_info(value:&bool)->bool{!*value}
+fn no_directory(value:&bool)->bool{!*value}
 impl fmt::Debug for NativeImConfig{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("NativeImConfig(<redacted>)")}}
 impl NativeImConfig{
     pub(super) fn timeout(self)->Result<Duration,CodecError>{
@@ -53,6 +58,7 @@ impl ImBinding{
     pub(super) fn deadline(&self,now:Instant)->Result<Instant,CodecError>{now.checked_add(self.config.timeout()?).ok_or(CodecError::InvalidField)}
     pub(super) fn policy(&self)->&Arc<NativeReceiverPolicy>{self.native.policy()}
     pub(super) fn receives_info(&self)->bool{self.config.receive_info}
+    pub(super) fn directory_queries(&self)->bool{self.config.directory_queries}
 }
 
 pub(super) struct ImKey{box_id:Zeroizing<Vec<u8>>,index:i64,digest:[u8;32]}

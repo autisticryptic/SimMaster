@@ -45,6 +45,7 @@ pub(crate) mod im_data;
 pub(crate) mod im_text;
 pub(crate) mod im_info;
 pub(crate) mod im_content;
+pub(crate) mod group_directory_data;
 pub(crate) mod im_status;
 mod im_status_delivery;
 pub(crate) mod im_receive_state;

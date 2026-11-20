@@ -113,7 +113,7 @@ fn next_native_login(f: &mut Fixture, receive_info: bool, selector: &'static [u8
     f.scope.close();
     let cfg = NativeReceiverConfig {
         direct_domains: None, invite_notifications: None,
-        im_messages: Some(NativeImConfig { notification_timeout_ms: 30000, receive_info }),
+        im_messages: Some(NativeImConfig { notification_timeout_ms: 30000, receive_info, directory_queries: false }),
     };
     let mut backend = OfflineBackend::new(f.owner.clone());
     backend.claim_common_transport().unwrap(); backend.bind_common_identity(b"AccountEntry").unwrap();

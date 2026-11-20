@@ -307,8 +307,9 @@ impl ArcRpcSession {
     }
 
     pub(super) fn prepare_im_read(&mut self,binding:Arc<super::im_delivery::ImBinding>,query:Arc<super::rpc_im::ImQuery>,gate:Arc<super::im_inbox::ImReceiptGate>,deadline:std::time::Instant)->Result<(i32,RpcBytes),CodecError>{
+        let deadline=query.clipped_deadline(deadline);
         if !self.native_receiver_scope()||!binding.matches(&self.owner,&self.connection)||!gate.live()||std::time::Instant::now()>=deadline
-            ||query.operation()==super::rpc_im::ImOperation::SetReceived{return Err(CodecError::InvalidField);}
+            ||query.operation()==super::rpc_im::ImOperation::SetReceived||query.directory_query()&&!binding.directory_queries()||!query.directory_input_matches(&self.connection){return Err(CodecError::InvalidField);}
         if self.pending.len()>=MAX_MAP_ENTRIES||self.im_reply_count()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
         let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
         if !binding.authenticates(&auth.user_id,&auth.selected_session_id){return Err(CodecError::InvalidField);}

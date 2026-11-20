@@ -36,6 +36,7 @@ mod app_voice_accounts {
     include!("app_voice_invite_notification_http_tests.rs");
     include!("app_voice_im_http_tests.rs");
     include!("app_voice_im_info_http_tests.rs");
+    include!("app_voice_native_directory_http_tests.rs");
     include!("app_voice_im_receipt_http_tests.rs");
     include!("app_voice_im_user_read_http_tests.rs");
     include!("app_voice_im_reconciliation_http_tests.rs");

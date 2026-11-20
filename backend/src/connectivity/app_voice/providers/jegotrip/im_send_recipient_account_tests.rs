@@ -27,7 +27,7 @@ fn send_configuration(root: &str, port: u16, changed_selector: bool) -> AccountC
     let mut cfg = bootstrap_account_config(root, port);
     cfg.profile.incoming = None;
     cfg.profile.native_receivers = Some(n::native_receiver::NativeReceiverConfig {
-        im_messages: Some(n::im_delivery::NativeImConfig { notification_timeout_ms: 3000, receive_info: false }),
+        im_messages: Some(n::im_delivery::NativeImConfig { notification_timeout_ms: 3000, receive_info: false, directory_queries: false }),
         direct_domains: None, invite_notifications: None,
     });
     cfg.profile.client_ex = true;
