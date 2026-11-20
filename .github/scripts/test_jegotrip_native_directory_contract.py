@@ -16,6 +16,10 @@ class DirectoryReadSourceContracts(unittest.TestCase):
   self.assertIn('self.take(1)?[0] != 0',src('rpc_stream.rs'))
   test=src('group_directory_data_tests.rs');self.assertIn('more[1]=2;{let value=g::decode_relations(0,&more).unwrap()',test);self.assertIn('more[2]=2;{let value=g::decode_relations(0,&more).unwrap()',test)
   self.assertIn('more.truncate(2);assert!',test);self.assertIn('more.truncate(3);assert!',test)
+  protocol=src('group_directory_protocol_tests.rs')
+  self.assertIn('for end in 0..valid.len()',protocol);self.assertIn('end==no_footer.len()',protocol)
+  self.assertIn('if original_no_footer{',protocol);self.assertIn('value.footer.properties.is_empty()',protocol)
+  self.assertIn('if reader.is_empty() { vec![] } else { reader.properties()? }',src('rpc_stream.rs'))
  def test_preparation_reserves_original_input_before_copy_or_controller_await(self):
   s=src('runtime_backend.rs').split('pub(super) fn reserve_directory_query',1)[1].split('pub(super) async fn read_directory',1)[0]
   self.assertLess(s.index('reserve_native_rpc('),s.index('ImQuery::group_properties('));self.assertIn('group.map_or(0,|id|id.len())+64',s)

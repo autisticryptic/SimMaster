@@ -6,7 +6,8 @@ use n::{group_directory_data as directory, rpc_im::{ImQuery, ImReplyData},
     rpc_stream::{CodecError, MAX_MAP_ENTRIES, MAX_STREAM_BYTES}};
 
 // Local result writers and original prepare-im-read roundtrip helpers only.
-fn directory_relations(accepted:bool, reported:bool, reason:&[u8])->Vec<u8>{
+fn directory_relations(accepted:bool,reported:bool,reason:&[u8])->Vec<u8>{directory_relations_with_footer(accepted,reported,reason,true)}
+fn directory_relations_with_footer(accepted:bool,reported:bool,reason:&[u8],footer_map:bool)->Vec<u8>{
     let mut w=Writer::new();
     w.boolean(accepted).unwrap();w.boolean(reported).unwrap();
     for (label,flags,first,second) in [
@@ -19,14 +20,15 @@ fn directory_relations(accepted:bool, reported:bool, reason:&[u8])->Vec<u8>{
     }
     w.u32(1).unwrap();w.bytes(b"opaque-name").unwrap();w.i64(i64::MIN).unwrap();
     w.bytes(reason).unwrap();
-    w.properties(&[RpcProperty{key:b"token",value:b"opaque-footer-not-token"}]).unwrap();
+    if footer_map{w.properties(&[RpcProperty{key:b"token",value:b"opaque-footer-not-token"}]).unwrap();}
     w.finish().expose_to_transport().to_vec()
 }
-fn directory_properties(accepted:bool, reason:&[u8])->Vec<u8>{
+fn directory_properties(accepted:bool,reason:&[u8])->Vec<u8>{directory_properties_with_footer(accepted,reason,true)}
+fn directory_properties_with_footer(accepted:bool,reason:&[u8],footer_map:bool)->Vec<u8>{
     let mut w=Writer::new();w.boolean(accepted).unwrap();
     w.properties(&[RpcProperty{key:b"P:P_MR",value:b"9223372036854775807"},
         RpcProperty{key:b"WRITE",value:b"opaque-not-permission"}]).unwrap();
-    w.bytes(reason).unwrap();w.properties(&[RpcProperty{key:b"grant",value:b"opaque-footer"}]).unwrap();
+    w.bytes(reason).unwrap();if footer_map{w.properties(&[RpcProperty{key:b"grant",value:b"opaque-footer"}]).unwrap();}
     w.finish().expose_to_transport().to_vec()
 }
 fn directory_request(f:&mut Fixture,query:Arc<ImQuery>)->n::arc_protocol::OwnedCallPackets{
@@ -212,19 +214,37 @@ fn directory_wrong_ids_malformed_whole_maps_trailing_and_remote_versions_never_e
     let duplicate_properties=duplicate_properties.finish().expose_to_transport().to_vec();
     for properties in [false,true]{
         let valid=if properties{directory_properties(true,b"")}else{directory_relations(true,true,b"")};
-        let mut cases=Vec::new();for end in 0..valid.len(){cases.push((0,valid[..end].to_vec()));}
-        let mut trailing=valid.clone();trailing.push(0);cases.push((0,trailing));
-        let mut wrong_stream=valid.clone();wrong_stream[0]=1;cases.push((0,wrong_stream));
-        cases.push((0,if properties{duplicate_properties.clone()}else{duplicate.clone()}));
+        let no_footer=if properties{directory_properties_with_footer(true,b"",false)}else{directory_relations_with_footer(true,true,b"",false)};
+        assert!(valid.starts_with(&no_footer)&&no_footer.len()<valid.len());
+        // Test every prefix, including the ONE complete original result with
+        // its optional footer-property map absent. This is DATA, not a grant.
+        let mut cases=Vec::new();for end in 0..valid.len(){cases.push((0,valid[..end].to_vec(),end==no_footer.len()));}
+        let mut trailing=valid.clone();trailing.push(0);cases.push((0,trailing,false));
+        let mut wrong_stream=valid.clone();wrong_stream[0]=1;cases.push((0,wrong_stream,false));
+        cases.push((0,if properties{duplicate_properties.clone()}else{duplicate.clone()},false));
         let mut oversized=Writer::new();oversized.boolean(true).unwrap();if !properties{oversized.boolean(true).unwrap();}
-        oversized.u32((MAX_MAP_ENTRIES+1)as u32).unwrap();cases.push((0,oversized.finish().expose_to_transport().to_vec()));
-        for code in [1,65536,65537,u32::MAX]{cases.push((code,valid.clone()));}
-        for (code,body) in cases{
+        oversized.u32((MAX_MAP_ENTRIES+1)as u32).unwrap();cases.push((0,oversized.finish().expose_to_transport().to_vec(),false));
+        for code in [1,65536,65537,u32::MAX]{cases.push((code,valid.clone(),false));}
+        for (code,body,original_no_footer) in cases{
             let mut f=Fixture::with_directory(true,false,true);
             let query=if properties{ImQuery::group_properties(directory::GroupId::parse(b"1-2").unwrap()).unwrap()}else{ImQuery::relations(None,-1).unwrap()};
-            let packet=directory_request(&mut f,Arc::new(query));let rpc=encode_reply(packet.call_id,code,&body).unwrap();let mut raw=vec![1];raw.extend_from_slice(rpc.expose_to_transport());
-            assert!(f.backend.on_plaintext_packet(&f.owner,&f.scope,&raw,1).is_err());
-            assert!(f.backend.take_im_replies().is_empty());assert!(!f.scope.is_open());assert_eq!(f.count(),0);
+            let query=Arc::new(query);let packet=directory_request(&mut f,query.clone());let rpc=encode_reply(packet.call_id,code,&body).unwrap();let mut raw=vec![1];raw.extend_from_slice(rpc.expose_to_transport());
+            let outcome=f.backend.on_plaintext_packet(&f.owner,&f.scope,&raw,1);
+            if original_no_footer{
+                assert!(outcome.unwrap().is_empty());assert!(f.scope.is_open());
+                let replies=f.backend.take_im_replies();assert_eq!(replies.len(),1);let data=&replies[0];
+                assert!(data.matches(&f.owner,&f.scope));assert!(Arc::ptr_eq(data.request().query_arc(),&query));assert!(Arc::ptr_eq(&data.request().gate(),&f.gate));
+                match data.result().unwrap(){
+                    ImReplyData::Relations(value)=>{assert!(!properties);assert!(value.accepted&&value.reported);assert_eq!(value.first.len(),1);assert_eq!(value.second.len(),1);assert_eq!(value.names.len(),1);assert_eq!(value.time,i64::MIN);assert!(value.footer.reason.is_empty()&&value.footer.properties.is_empty());},
+                    ImReplyData::GroupProperties(value)=>{assert!(properties);assert!(value.accepted);assert_eq!(value.properties.len(),2);assert!(value.footer.reason.is_empty()&&value.footer.properties.is_empty());},
+                    _=>panic!("only original directory DATA"),
+                }
+                assert!(f.backend.take_received_replies().is_empty());assert!(f.backend.im_write_guard().0.is_empty());
+            }else{
+                assert!(outcome.is_err(),"properties={properties}; code={code}; len={}; optional-boundary={}",body.len(),no_footer.len());
+                assert!(f.backend.take_im_replies().is_empty());assert!(!f.scope.is_open());
+            }
+            assert_eq!(f.count(),0);
         }
     }
 }
