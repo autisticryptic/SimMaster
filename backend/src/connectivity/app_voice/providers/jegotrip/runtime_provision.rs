@@ -127,14 +127,15 @@ impl ProvisionedCommonLogin{
         let material=reply.material_for(owner,source).ok_or(ProvisionError::Scope)?;
         let deployment=BootstrapDeployment::from_reply(reply,owner,source,reference_key).map_err(|_|ProvisionError::Configuration)?;
         let reference=deployment.account_reference_for(owner,source).ok_or(ProvisionError::Scope)?;
-        let encoded=reference.encode_native().map_err(|_|ProvisionError::UnsupportedReference)?;
-        let entry=super::object_reference::parse_object_reference(encoded.expose_to_backend()).map_err(|_|ProvisionError::UnsupportedReference)?;
+        // Canonical encoding is a separate legacy API. Preserve the original
+        // decoded factory input across the owning source/destination handoff.
+        let entry=super::object_reference::parse_object_reference(reference.original_factory_input()).map_err(|_|ProvisionError::UnsupportedReference)?;
         let super::object_reference::ReferenceTarget::Direct(endpoints)=entry.target()else{return Err(ProvisionError::UnsupportedReference);};
         if endpoints.is_empty()||endpoints.len()>16||endpoints.iter().any(|endpoint|!matches!(endpoint.scheme(),b"arc"|b"sarc")||endpoint.router_host().is_err()){
             return Err(ProvisionError::UnsupportedReference);
         }
         let raw_domain=material.properties.iter().find(|p|p.key==b"DomainName").ok_or(ProvisionError::MissingProperty)?.value;
-        let mut total=encoded.expose_to_backend().len();let domain_name=field(raw_domain,false,&mut total)?;
+        let mut total=entry.retained_bytes();let domain_name=field(raw_domain,false,&mut total)?;
         if domain_name.iter().any(|b|matches!(b,b'@'|b'['|b']')){return Err(ProvisionError::InvalidProperty);}
         let decoded=|name:&[u8]|deployment.property_for(owner,source,name,client_key).map_err(|_|ProvisionError::Configuration);
         let domain=decoded(b"DomainId")?.ok_or(ProvisionError::MissingProperty)?;let domain_id=field(domain.expose_to_backend(),false,&mut total)?;
@@ -145,10 +146,14 @@ impl ProvisionedCommonLogin{
         let alive_reference=Zeroizing::new(alive.to_vec());
         // Auxiliary decode failure is retained for an explicit lookup; it does
         // not change successful original SDK bootstrap/default behaviour.
-        let user_entry_uid_local=super::user_entry_local::UserEntryLocalReference::from_bootstrap(reply,owner,source,destination,router,reference_key).map_err(|_|ProvisionError::UnsupportedReference);
+        let user_entry_uid_local=super::user_entry_local::UserEntryLocalReference::from_bootstrap(reply,owner,source,destination,router,reference_key)
+            .map_err(|_|ProvisionError::UnsupportedReference).and_then(|local|{
+                if local.as_ref().is_some_and(|r|total.checked_add(alive.len()).and_then(|n|n.checked_add(r.retained_bytes())).is_none_or(|n|n>128*1024)){return Err(ProvisionError::ResourceLimit);}Ok(local)
+            });
+        let local_bytes=user_entry_uid_local.as_ref().ok().and_then(|r|r.as_ref()).map_or(0,|r|r.retained_bytes());
         let user_entry=super::user_entry_target::UserEntryTarget::from_bootstrap(reply,owner,source,destination,router,reference_key,&domain_name,&cc)
             .map_err(|_|ProvisionError::UnsupportedReference).and_then(|target|{
-                if target.as_ref().is_some_and(|t|total.checked_add(alive.len()).and_then(|n|n.checked_add(t.retained_bytes())).is_none_or(|n|n>128*1024)){return Err(ProvisionError::ResourceLimit);}
+                if target.as_ref().is_some_and(|t|total.checked_add(alive.len()).and_then(|n|n.checked_add(local_bytes)).and_then(|n|n.checked_add(t.retained_bytes())).is_none_or(|n|n>128*1024)){return Err(ProvisionError::ResourceLimit);}
                 Ok(target.map(Arc::from))
             });
         Ok(Self{owner:reply.owner().clone(),source:source.clone(),destination:destination.clone(),policy:router.original_identity(),call_id:reply.call_id(),

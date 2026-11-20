@@ -202,7 +202,7 @@ impl CommonProfile{
             if matches!(endpoints[input.endpoint_index].router_host(),Ok(super::object_reference::RouterHost::Address(_)))&&input.resolved_host_index!=0{return Err(ProfileError::InvalidConfiguration);}
             let encoded=entry.encode_native().map_err(|_|ProfileError::InvalidConfiguration)?;
             let reference=std::str::from_utf8(encoded.expose_to_backend()).map_err(|_|ProfileError::InvalidConfiguration)?;
-            add_bytes(total,reference.len()*2)?;
+            add_bytes(total,entry.retained_bytes().checked_add(reference.len()).ok_or(ProfileError::ResourceLimit)?)?;
             (Some(entry),Some(Zeroizing::new(reference.to_owned())))
         };
         add_bytes(total,input.router.retained_bytes())?;

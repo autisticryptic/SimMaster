@@ -1,4 +1,6 @@
 //! Actions-only original bootstrap codec/data and separate TLS-anchor tests.
+#[path="runtime_common_reference_ownership_tests.rs"]
+mod ownership;
 use super::*;
 use super::super::{arc_session::{ArcReply,ArcRpcSession},rpc_envelope::encode_reply,rpc_stream::{RpcProperty,Writer},
     session::HostingSession,tests::imported,tls_engine::tests::Certificates};

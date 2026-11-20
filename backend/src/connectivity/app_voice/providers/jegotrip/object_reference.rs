@@ -9,7 +9,7 @@
 //! they never pass the ordinary TCP/TLS DNS/authority validation path.
 use super::rpc_stream::MAX_FIELD_BYTES;
 use std::fmt;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_COMPONENTS: usize = 32;
 const MAX_ENDPOINTS: usize = 32;
@@ -133,8 +133,22 @@ impl fmt::Debug for ReferenceTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("ReferenceTarget(<redacted>)") }
 }
 
-pub struct ObjectReference { identity: Vec<u8>, components: Vec<Vec<u8>>, target: ReferenceTarget }
+pub struct ObjectReference { identity: Vec<u8>, components: Vec<Vec<u8>>, target: ReferenceTarget, original: Zeroizing<Vec<u8>> }
 impl ObjectReference {
+    /// Exact decoded factory-input bytes, distinct from canonical encoding.
+    /// Retention is DATA only: no producer, current scope, endpoint or trust.
+    pub(super) fn original_factory_input(&self) -> &[u8] { &self.original }
+    /// Owned payload bytes including both parsed storage and exact input. No
+    /// re-encoding/allocation is performed by this accounting observation.
+    pub(super) fn retained_bytes(&self) -> usize {
+        let target = match &self.target {
+            ReferenceTarget::IdentityOnly => 0,
+            ReferenceTarget::Adapter { adapter, locator } => adapter.len() + locator.as_ref().map_or(0, Vec::len),
+            ReferenceTarget::Direct(endpoints) => endpoints.iter().map(|e| e.scheme.len() + e.host.len()
+                + e.router_id.as_ref().map_or(0, |id| id.literal.len())).sum(),
+        };
+        self.original.len() + self.identity.len() + self.components.iter().map(Vec::len).sum::<usize>() + target
+    }
     /// Exact native identity path; it is not automatically a SIP user, line id
     /// or authorization token. Adapter/locator routing stays separate.
     pub fn identity(&self) -> &[u8] { &self.identity }
@@ -164,6 +178,8 @@ impl ObjectReference {
         }
         Ok(groups.into_iter().map(|(router_id, endpoints)| RouterEndpointGroup { router_id, endpoints }).collect())
     }
+    /// Legacy canonical encoder remains unchanged. It must not replace the
+    /// original factory input when a native producer requires exact bytes.
     pub fn encode_native(&self) -> Result<ReferenceBytes, ReferenceError> {
         let mut bytes = self.identity.clone();
         match &self.target {
@@ -357,7 +373,7 @@ pub fn parse_object_reference(bytes: &[u8]) -> Result<ObjectReference, Reference
     };
     let mut identity = Vec::new();
     for (index, component) in components.iter().enumerate() { if index != 0 { identity.push(b'/'); } identity.extend_from_slice(component); }
-    Ok(ObjectReference { identity, components, target })
+    Ok(ObjectReference { identity, components, target, original: Zeroizing::new(bytes.to_vec()) })
 }
 
 #[cfg(test)]

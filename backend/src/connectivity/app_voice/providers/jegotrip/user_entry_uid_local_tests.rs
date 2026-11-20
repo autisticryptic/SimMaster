@@ -1,4 +1,6 @@
 //! Actions-only DATA/source/current-auth boundaries for UID-local completion.
+#[path="user_entry_uid_local_ownership_tests.rs"]
+mod ownership;
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip as n;
 use std::{sync::Arc,time::{Instant,Duration}};

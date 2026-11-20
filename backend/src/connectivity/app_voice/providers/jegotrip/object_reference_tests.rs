@@ -1,4 +1,6 @@
 use super::*;
+#[path = "object_reference_factory_input_tests.rs"]
+mod factory_input;
 
 #[test]
 fn native_slash_identity_and_semicolon_explicit_endpoint_fixture_roundtrips() {

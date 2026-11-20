@@ -1,4 +1,6 @@
 //! Actions-only native profile -> shared HostingBackend/actor integration.
+#[path="runtime_reference_profile_ownership_tests.rs"]
+mod reference_ownership;
 use super::*;
 use super::super::{common_runtime::tests::CommonPeer,netstream_runtime::tests::{owner,policy},
     tls_engine::tests::Certificates,rpc_envelope::{encode_reply,encode_request,decode_reply,decode_request},rpc_stream::{Writer,Reader},

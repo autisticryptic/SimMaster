@@ -1,6 +1,6 @@
 //! Matched bootstrap auxiliary reference bound to the pre-existing account and
 //! original Router policy. This is routing DATA, never current SDK authority.
-use super::{arc_session::OwnedBootstrapReply,legacy_config::ConfigDecodeKey,object_reference::{ObjectReference,ReferenceTarget,parse_object_reference},
+use super::{arc_session::OwnedBootstrapReply,legacy_config::ConfigDecodeKey,object_reference::{ObjectReference,ReferenceTarget},
     rpc_pending::RpcConnectionScope,rpc_stream::{CodecError,MAX_FIELD_BYTES},router_connector::{RouterPolicy,RouterPolicyIdentity},
     session::AttemptOwner,user_entry_reference::UserEntryReference};
 use std::fmt;
@@ -16,10 +16,11 @@ impl UserEntryTarget{
         let reference=original.reference_for(owner,source).ok_or(CodecError::InvalidField)?;
         let ReferenceTarget::Direct(endpoints)=reference.target()else{return Err(CodecError::InvalidField);};
         if endpoints.is_empty()||endpoints.len()>16||endpoints.iter().any(|e|!matches!(e.scheme(),b"arc"|b"sarc")||e.router_host().is_err()){return Err(CodecError::InvalidField);}
-        let bytes=reference.encode_native().map_err(|_|CodecError::InvalidField)?;
-        if bytes.expose_to_backend().len().checked_add(realm.len()).and_then(|n|n.checked_add(cc.len())).is_none_or(|n|n>MAX_FIELD_BYTES){return Err(CodecError::TooLarge);}
-        let reference=parse_object_reference(bytes.expose_to_backend()).map_err(|_|CodecError::InvalidField)?;
-        Ok(Some(Box::new(Self{owner:owner.clone(),parent:parent.clone(),router:router.original_identity(),bootstrap_id:original.original_call_id(),reference,
+        let raw_bytes=reference.original_factory_input().len();
+        if raw_bytes.checked_add(realm.len()).and_then(|n|n.checked_add(cc.len())).is_none_or(|n|n>MAX_FIELD_BYTES){return Err(CodecError::TooLarge);}
+        let bootstrap_id=original.original_call_id();
+        let reference=original.into_reference(owner,source)?;
+        Ok(Some(Box::new(Self{owner:owner.clone(),parent:parent.clone(),router:router.original_identity(),bootstrap_id,reference,
             realm:Zeroizing::new(realm.to_vec()),cc:Zeroizing::new(cc.to_vec())})))
     }
     fn matches(&self,owner:&AttemptOwner,parent:&RpcConnectionScope,router:&RouterPolicy)->bool{
@@ -28,6 +29,6 @@ impl UserEntryTarget{
     pub(super) fn reference_for(&self,owner:&AttemptOwner,parent:&RpcConnectionScope,router:&RouterPolicy)->Option<&ObjectReference>{self.matches(owner,parent,router).then_some(&self.reference)}
     pub(super) fn realm_for(&self,owner:&AttemptOwner,parent:&RpcConnectionScope,router:&RouterPolicy)->Option<&[u8]>{self.matches(owner,parent,router).then_some(&self.realm)}
     pub(super) fn cc_for(&self,owner:&AttemptOwner,parent:&RpcConnectionScope,router:&RouterPolicy)->Option<&[u8]>{self.matches(owner,parent,router).then_some(&self.cc)}
-    pub(super) fn retained_bytes(&self)->usize{self.reference.encode_native().map_or(MAX_FIELD_BYTES+1,|b|b.expose_to_backend().len())+self.realm.len()+self.cc.len()}
+    pub(super) fn retained_bytes(&self)->usize{self.reference.retained_bytes()+self.realm.len()+self.cc.len()}
     pub(super) fn original_bootstrap_id(&self)->i32{self.bootstrap_id}
 }

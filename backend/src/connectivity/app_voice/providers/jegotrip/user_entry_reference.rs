@@ -16,6 +16,11 @@ impl UserEntryReference{
         let reference=parse_object_reference(decoded.expose_to_backend()).map_err(|_|CodecError::InvalidField)?;
         Ok(Some(Self{owner:owner.clone(),source:source.clone(),call_id:reply.call_id(),reference}))
     }
+    /// Transfer this exact parsed/raw snapshot only while the original source
+    /// grant is still valid. Destination ownership is established separately.
+    pub(super) fn into_reference(self,owner:&AttemptOwner,source:&RpcConnectionScope)->Result<ObjectReference,CodecError>{
+        if self.reference_for(owner,source).is_none(){return Err(CodecError::InvalidField);}Ok(self.reference)
+    }
     pub(super) fn original_call_id(&self)->i32{self.call_id}
     pub(super) fn reference_for(&self,owner:&AttemptOwner,source:&RpcConnectionScope)->Option<&ObjectReference>{
         if &self.owner==owner&&self.source.matches(source)&&source.is_open()&&!source.session_revoked(){Some(&self.reference)}else{None}
