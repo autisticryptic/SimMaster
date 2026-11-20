@@ -438,7 +438,7 @@ async fn directory_account_prepared_requires_exact_sql_lease_live_fence_revision
                         f.temp.database.with_conn(|c| c.execute(sql, rusqlite::params![revision + 1, f.line, nonce]).map_err(|_| "fixture lease revision")).unwrap()
                     } else {
                         f.temp.database.with_conn(|c| c.execute(sql, rusqlite::params![alien, f.line, nonce]).map_err(|_| "fixture lease nonce")).unwrap()
-                    }; assert_eq!(changed, 1); "app_account_directory_scope_invalid"
+                    }; assert_eq!(changed, 1); "app_account_runtime_owner_unconfirmed"
                 }
                 3 => {
                     assert_eq!(f.temp.database.with_conn(|c| c.execute("UPDATE app_voice_inbox_runs SET state='released' WHERE line_id=?1 AND revision=?2 AND run_nonce=?3 AND state='live'",
@@ -480,7 +480,7 @@ async fn directory_account_submitted_cancel_and_timeout_ignore_late_malformed_re
         for cancel in [true, false] {
             let f = Box::pin(Fixture::new(true, false, if cancel { 10000 } else { 100 }, 1)).await; Box::pin(f.start(true)).await;
             let (seen, release) = Box::pin(f.plan(None, -1, false, Vec::new())).await;
-            let prepared = f.prepare(None, -1, false); let began = Instant::now();
+            let began = Instant::now(); let prepared = f.prepare(None, -1, false);
             let mut reading = Box::pin(f.manager.finish_native_directory(prepared));
             let id = tokio::select! {
                 result = reading.as_mut() => panic!("not fully submitted: {result:?}"),
@@ -514,7 +514,7 @@ async fn directory_account_explicit_restart_rejects_old_prepared_snapshot_scope_
         assert_eq!(old_scope.native_rpc_resources(), (3, 195));
         Box::pin(f.stop_run()).await;
         assert!(!old_scope.is_open()); assert_eq!(old_scope.native_rpc_resources(), (3, 195), "Join/SQL compaction do not reset retained input charges");
-        assert_eq!(bounded(Box::pin(f.manager.finish_native_directory(stopped_context))).await.unwrap_err(), "app_account_directory_scope_invalid");
+        assert_eq!(bounded(Box::pin(f.manager.finish_native_directory(stopped_context))).await.unwrap_err(), "app_account_runtime_owner_unconfirmed");
         assert_eq!(old_scope.native_rpc_resources(), (2, 131));
         Box::pin(f.start(true)).await; assert_eq!(f.factory.count(), 2);
         let (_, current_owner, current_scope, current_query) = f.original_query();
