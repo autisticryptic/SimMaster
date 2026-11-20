@@ -221,10 +221,11 @@ async fn directory_io_original_self_relations_properties_wire_and_last_holder_ch
             let ImReplyData::GroupProperties(value) = data.result().unwrap() else { panic!("original properties DATA") };
             assert!(!value.accepted, "true plus refusal footer is not a positive ACK");
             assert_eq!(value.properties.len(), 2);
-            assert_eq!(value.properties[0].key, b"P:P_MR");
-            assert_eq!(value.properties[0].value, b"9223372036854775807");
-            assert_eq!(value.properties[1].key, b"WRITE");
-            assert_eq!(value.properties[1].value, b"opaque-not-permission");
+            // Original map ordering is key length first: WRITE(5) precedes P:P_MR(6).
+            assert_eq!(value.properties[0].key, b"WRITE");
+            assert_eq!(value.properties[0].value, b"opaque-not-permission");
+            assert_eq!(value.properties[1].key, b"P:P_MR");
+            assert_eq!(value.properties[1].value, b"9223372036854775807");
             assert_eq!(value.footer.reason, b"opaque-refusal");
             assert_eq!(value.footer.properties.len(), 1);
             assert_eq!(value.footer.properties[0].key, b"grant");

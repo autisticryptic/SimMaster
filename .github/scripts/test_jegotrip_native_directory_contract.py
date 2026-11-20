@@ -71,4 +71,6 @@ class DirectoryReadSourceContracts(unittest.TestCase):
   a=src('group_directory_account_tests.rs');i=src('group_directory_io_tests.rs')
   for t in ['finish_account(&mut peer)','ownership_pending(c, &self.line)','original group.len()+64','pause_original_polls_for_test']:self.assertIn(t,a)
   for t in ['handle.task.is_none()','Duration::from_millis(35)','interest.is_writing()','gate_im_read_write','RuntimeError::SessionRevoked','directory_logout']:self.assertIn(t,i)
+  self.assertIn('value.properties[0].key, b"WRITE"',i);self.assertIn('value.properties[1].key, b"P:P_MR"',i)
+  self.assertIn('compare_keys(left.key, right.key)',src('rpc_stream.rs'))
 if __name__=='__main__':unittest.main()
