@@ -60,6 +60,8 @@ impl NetstreamPath{
     pub fn close(&mut self){
         self.scope.close();self.session.close();self.incoming.clear();self.incoming_bytes=0;self.router.close();
     }
+    #[cfg(test)]
+    pub(crate) fn gate_client_read_test(&mut self,test:std::sync::Arc<super::router_runtime::tests::client_read_io::ClientReadIoTest>){super::router_runtime::tests::client_read_io::gate_client_prefix(&mut self.router,test);}
     pub fn ready_for(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{
         self.original(owner,scope)&&self.session.ready_for(owner,scope)
     }

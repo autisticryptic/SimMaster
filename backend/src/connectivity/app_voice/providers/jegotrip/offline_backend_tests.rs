@@ -1,3 +1,5 @@
+#[path="client_user_entry_protocol_tests.rs"]
+mod client_user_entry;
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip::{
     batch_scheduler::BatchWords, controller::Callback,

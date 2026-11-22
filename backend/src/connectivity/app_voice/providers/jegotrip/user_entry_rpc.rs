@@ -16,9 +16,27 @@ pub(super) fn netstream_error(error:super::netstream_runtime::NetstreamError)->U
 pub(super) fn common_error(error:super::common_runtime::CommonIoError)->UserEntryError{use super::common_runtime::CommonIoError as E;match error{E::Timeout=>UserEntryError::Timeout,E::Netstream(error)=>netstream_error(error),_=>UserEntryError::Transport}}
 struct Query{action:Arc<UserEntryAction>,id:i32}
 impl fmt::Debug for Query{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("UserEntryQuery(<redacted>)")}}
-pub(super) struct OwnedUserEntryReply{query:Arc<Query>,accepted:bool,uid:Option<Zeroizing<Vec<u8>>>,observed_at:String,_budget:Arc<super::native_rpc_budget::NativeRpcReservation>}
+pub(super) struct OwnedUserEntryReply{query:Arc<Query>,accepted:bool,uid:Option<Zeroizing<Vec<u8>>>,observed_at:String,_result:Option<Zeroizing<Vec<u8>>>,_client:Option<Arc<super::user_entry_client::ClientUserEntryRequest>>,_budget:Arc<super::native_rpc_budget::NativeRpcReservation>}
 impl fmt::Debug for OwnedUserEntryReply{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("OwnedUserEntryReply(<redacted>)")}}
+/// Bound the unchanged strict decoder's entry/footer vectors before it runs.
+/// Wire bytes alone cannot bound its128 borrowed-property/entry model slots.
+pub(super) fn client_result_peak(bytes:usize)->Result<usize,UserEntryError>{
+    let model=user_entry_data::MAX_AIDS*std::mem::size_of::<user_entry_data::AidUidEntry<'_>>()
+        +super::rpc_stream::MAX_MAP_ENTRIES*std::mem::size_of::<RpcProperty<'_>>();
+    bytes.checked_mul(2).and_then(|n|n.checked_add(model)).and_then(|n|n.checked_add(std::mem::size_of::<OwnedUserEntryReply>()+std::mem::size_of::<Query>()+256)).ok_or(UserEntryError::Capacity)
+}
 impl OwnedUserEntryReply{
+    pub(super) fn from_client(request:Arc<super::user_entry_client::ClientUserEntryRequest>,code:u32,bytes:&[u8])->Result<Self,UserEntryError>{
+        let action=request.query().action();let parent=action.parent();
+        if !request.matches(action.owner(),&parent){return Err(UserEntryError::Scope);}
+        let retained=client_result_peak(bytes.len())?;
+        request.retain_reply(retained).map_err(|_|UserEntryError::Capacity)?;
+        let uri=RecipientUri::parse(action.recipient()).map_err(|_|UserEntryError::Protocol)?;
+        let(accepted,uid)=matched_uid(code,bytes,uri)?;
+        let query=Arc::new(Query{action:action.clone(),id:request.sequence()});
+        Ok(Self{query,accepted,uid,observed_at:chrono::Utc::now().to_rfc3339(),_budget:request.budget(),_result:Some(Zeroizing::new(bytes.to_vec())),_client:Some(request)})
+    }
+    pub(super) fn matches_action(&self,action:&Arc<UserEntryAction>)->bool{Arc::ptr_eq(action,&self.query.action)&&action.live()}
     pub(super) fn observe(&self,action:&Arc<UserEntryAction>)->Result<UserEntryObservation,UserEntryError>{
         if !Arc::ptr_eq(action,&self.query.action)||!action.live(){return Err(UserEntryError::Scope);}
         let kind=RecipientUri::parse(action.recipient()).map_err(|_|UserEntryError::Protocol)?.kind();
@@ -29,6 +47,19 @@ impl OwnedUserEntryReply{
     pub(super) fn resolved_uid_for(&self,action:&Arc<UserEntryAction>)->Option<&[u8]>{
         (Arc::ptr_eq(action,&self.query.action)&&action.live()&&self.accepted).then(||self.uid.as_deref().map(|v|v.as_slice())).flatten()
     }
+}
+/// The original nested and qualified transports use the SAME strict DATA
+/// decoder. This borrowed result cannot grant scope, query, WRITE or retry.
+pub(super) fn matched_uid(code:u32,bytes:&[u8],uri:RecipientUri<'_>)->Result<(bool,Option<Zeroizing<Vec<u8>>>),UserEntryError>{
+    if code!=0{return Ok((false,None));}
+    let data=user_entry_data::decode_aid_to_uid(code,bytes).map_err(|_|UserEntryError::Protocol)?;
+    let mut uid=None;
+    if data.accepted{for entry in data.entries{
+        if entry.aid.kind()!=uri.kind()||entry.aid.value()!=uri.value(){return Err(UserEntryError::Protocol);}
+        if uid.is_some(){return Err(UserEntryError::Ambiguous);}
+        uid=Some(Zeroizing::new(entry.uid.to_vec()));
+    }}
+    Ok((data.accepted,uid))
 }
 pub(super) async fn resolve_original(action:Arc<UserEntryAction>,auth:Box<UserEntryAuth>,target:Arc<UserEntryTarget>,
     lease:&UserEntryLease,router:&RouterPolicy,access:&[RpcProperty<'_>],timeouts:RouterTimeouts,compress:Option<usize>)->Result<OwnedUserEntryReply,UserEntryError>{
@@ -71,16 +102,9 @@ pub(super) async fn resolve_original(action:Arc<UserEntryAction>,auth:Box<UserEn
             }
             let Some(reply)=matched else{continue;};
             let budget=lease.retain_reply(reply.result_stream.len()).map_err(|_|UserEntryError::Capacity)?;
-            let mut uid=None;let accepted=if reply.result_code!=0{false}else{
-                let data=user_entry_data::decode_aid_to_uid(reply.result_code,reply.result_stream).map_err(|_|UserEntryError::Protocol)?;
-                // A negative reply cannot deliver an otherwise valid UID.
-                if data.accepted{for entry in data.entries{
-                    if entry.aid.kind()!=uri.kind()||entry.aid.value()!=uri.value(){return Err(UserEntryError::Protocol);}
-                    if uid.is_some(){return Err(UserEntryError::Ambiguous);}uid=Some(Zeroizing::new(entry.uid.to_vec()));
-                }}data.accepted
-            };
+            let(accepted,uid)=matched_uid(reply.result_code,reply.result_stream,uri)?;
             if !current()||Instant::now()>=deadline{return Err(UserEntryError::Scope);}
-            let result=OwnedUserEntryReply{query:query.clone(),accepted,uid,observed_at:chrono::Utc::now().to_rfc3339(),_budget:budget};
+            let result=OwnedUserEntryReply{query:query.clone(),accepted,uid,observed_at:chrono::Utc::now().to_rfc3339(),_budget:budget,_client:None,_result:None};
             path.close();return Ok(result);
         }
     });

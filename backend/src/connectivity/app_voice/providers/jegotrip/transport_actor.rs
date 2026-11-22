@@ -35,6 +35,10 @@ mod im_sends;
 use im_sends::{ImSendWork,ImSendPending};
 #[path="user_entry_actor.rs"]
 mod user_entry;
+#[path="client_user_entry_actor.rs"]
+mod client_user_entry;
+use client_user_entry::{ClientReadWork,ClientReadPending};
+pub(super) use client_user_entry::ClientReadState;
 use std::{fmt, future::poll_fn, io, pin::Pin, sync::Arc, task::Poll, time::{Duration, Instant}};
 use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite}, sync::{mpsc, oneshot}, task::JoinHandle};
 use zeroize::{Zeroize, Zeroizing};
@@ -168,6 +172,7 @@ enum Operation {
     GetImSendIdentity(oneshot::Sender<Option<Arc<super::arc_session::ImSendIdentity>>>),
     ImSend(Box<ImSendWork>),
     GetUserEntryAuth(oneshot::Sender<Option<Box<super::arc_session::UserEntryAuth>>>),
+    ClientUserEntry(Box<ClientReadWork>),
     UserMarkRead(Box<UserReadWork>),
     ArmNativeReceivers(std::sync::Arc<super::native_receiver::NativeReceiverSetup>), ConfigureNativeReceivers(u32),
     GetOffline(i64, Vec<Property>), CompleteOfflineHint(super::rpc_offline::IncomingOfflineHint, bool),
@@ -192,6 +197,7 @@ impl Operation {
             Self::ImRead(work)=>work.query.retained_bytes(),
             Self::WriteReceived(work)=>work.permit.query().retained_bytes(),
             Self::GetImBinding(_)|Self::GetUserEntryAuth(_)|Self::GetImSendIdentity(_)=>0,
+            Self::ClientUserEntry(work)=>work.query.retained_bytes()+work.routing.iter().map(|p|p.key.len()+p.value.len()).sum::<usize>(),
             Self::UserMarkRead(work)=>work.permit.label().len()+96,
             Self::ImSend(work)=>work.permit.retained_bytes(),
             Self::ArmClientEx(binding)=>binding.object.len()+binding.domain.len()+binding.receiver.len(),
@@ -610,6 +616,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         result
     }
     fn retire_im_reads(&mut self,now:Instant){
+        self.retire_client_reads(now);
         self.retire_received_writes(now);
         self.retire_user_read_writes(now);
         self.retire_im_sends(now);
@@ -694,6 +701,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             }
             let result=outcome.map(|()|reply);pending.interest.cancel();let _=pending.reply.send(result);
         }
+        self.deliver_client_user_entry_replies(outcome);
         self.deliver_received_replies(outcome)?;
         self.deliver_user_read_replies(outcome)?;
         self.deliver_im_send_replies(outcome)?;
@@ -802,7 +810,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             if !proof.authorizes(&data.0,now){let _=command.completion.send(Err(RuntimeError::Scope));return Ok(());}
             im_gates.push(proof.gate());let end=data.0.deadline();invite_deadline=Some(invite_deadline.map_or(end,|original|original.min(end)));
         }}
-        if matches!(&command.operation, Operation::Swap(_, _)) {
+        if matches!(&command.operation, Operation::Swap(_, _) | Operation::ClientUserEntry(_)) {
             let (gates,deadline)=self.backend.im_write_guard();im_gates.extend(gates);
             if let Some(deadline)=deadline{invite_deadline=Some(invite_deadline.map_or(deadline,|original|original.min(deadline)));}
             let (claims, deadline) = self.backend.invite_write_guard(); invite_claims.extend(claims);
@@ -821,12 +829,12 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         // controller waits may clip it, never restart its timeout on admission.
         let native_deadline=match &command.operation{Operation::ImRead(work)=>native_deadline.map(|end|work.query.clipped_deadline(end)),_=>native_deadline};
         if native_deadline.is_some_and(|deadline| now >= deadline) { let _ = command.completion.send(Err(RuntimeError::Timeout)); return Ok(()); }
-        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _) | Operation::ImRead(_) | Operation::WriteReceived(_) | Operation::UserMarkRead(_) | Operation::ImSend(_)) {
+        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _) | Operation::ImRead(_) | Operation::WriteReceived(_) | Operation::UserMarkRead(_) | Operation::ImSend(_) | Operation::ClientUserEntry(_)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
         let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_) | Operation::CompleteImStatus(_));
         let is_logout = matches!(&command.operation, Operation::Logout(_));
-        let mut unhosting_sequence = None;let mut call_wait=None;let mut im_wait=None;let mut received_wait=None;let mut user_wait=None;let mut send_wait=None;
+        let mut unhosting_sequence = None;let mut call_wait=None;let mut im_wait=None;let mut received_wait=None;let mut user_wait=None;let mut send_wait=None;let mut client_wait=None;
         let elapsed_ms = self.elapsed_ms(now);
         let prepared = match command.operation {
             Operation::Configure(epoch, incoming) => {
@@ -896,6 +904,20 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 match self.backend.prepare_received_write(work.permit.clone(),native_deadline.ok_or(RuntimeError::Timeout)?){
                     Ok(packets)=>{received_wait=Some(*work);Ok(packets)}
                     Err(_)=>{work.permit.cancel();let _=work.reply.send(Err(RuntimeError::InvalidConfiguration));let _=command.completion.send(Err(RuntimeError::InvalidConfiguration));return Ok(());}
+                }
+            }
+            Operation::ClientUserEntry(work)=>{
+                use super::user_entry_rpc::UserEntryError as E;
+                if self.common.is_none()||!work.query.matches(&self.owner,&self.scope)||work.reply.is_closed(){work.query.interest().retire();let _=work.reply.send(Err(E::Scope));let _=command.completion.send(Err(RuntimeError::Scope));return Ok(());}
+                let sequence=match self.backend.queue_client_user_entry(work.query.clone()){
+                    Ok(sequence)=>sequence,Err(error)=>{work.query.interest().retire();let code=if error==E::Capacity{RuntimeError::Backpressure}else{RuntimeError::InvalidConfiguration};let _=work.reply.send(Err(error));let _=command.completion.send(Err(code));return Ok(());}
+                };
+                #[cfg(test)]
+                if let Some(test)=work.query.action().client_io_test(){test.after_admission(sequence,&self.scope).await;}
+                match self.backend.prepare_swap(elapsed_ms,&borrowed(&work.routing)){
+                    Ok(packets)=>{client_wait=Some((sequence,*work));Ok(packets)},
+                    Err(super::arc_protocol::ProtocolError::Batch(super::batch_scheduler::BatchError::Backpressure))=>{self.backend.retire_client_user_entry(sequence);work.query.interest().retire();let _=work.reply.send(Err(E::Capacity));let _=command.completion.send(Err(RuntimeError::Backpressure));return Ok(());}
+                    Err(error)=>{self.backend.retire_client_user_entry(sequence);work.query.interest().retire();let _=work.reply.send(Err(E::Protocol));Err(error)}
                 }
             }
             Operation::GetUserEntryAuth(reply)=>{
@@ -1026,7 +1048,13 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         // Keep one heap-owned transport future, not two large inline copies
         // in the new guarded/legacy branches. Standard test stack and all IO
         // deadlines/gates remain unchanged, including when Invite is absent.
-        let mut sending = Box::pin(self.send_packets(&packets.packets,Some(&mut command.completion),native_deadline));
+        let read_owned_frame=client_wait.is_some()||packets.client_only();
+        // This actor still owns and Joins the indivisible frame. READ waiter
+        // retirement does not abort it; existing mixed WRITE gates still do.
+        #[cfg(test)]
+        if let Some((_,work))=&client_wait{if let Some(test)=work.query.action().client_io_test(){if test.is_prefix(){self.common.as_mut().ok_or(RuntimeError::Closed)?.gate_client_read_test(test);}}}
+        let completion=if read_owned_frame{None}else{Some(&mut command.completion)};
+        let mut sending = Box::pin(self.send_packets(&packets.packets,completion,native_deadline));
         let sent = if !invite_claims.is_empty() || !im_gates.is_empty() {
             let cancelled = async {
                 use futures_util::StreamExt;
@@ -1055,6 +1083,19 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             self.backend.retire_request(packets.call_id); let _ = command.completion.send(Err(error)); return Err(error);
         }
         let rpc_deadline=native_deadline.unwrap_or(Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?);
+        if packets.client_only()||client_wait.is_some()&&!packets.has_business_work(){
+            let mut sequences=packets.client_sequences();if let Some((sequence,_))=&client_wait{if !sequences.contains(sequence){sequences.push(*sequence);}}
+            self.backend.client_read_state_mut().client_read_outer.insert(packets.call_id,sequences);
+        }
+        if let Some((sequence,work))=client_wait{
+            self.pending.insert(packets.call_id,rpc_deadline);
+            if !work.query.matches(&self.owner,&self.scope)||work.reply.is_closed(){
+                let error=if Instant::now()>=work.query.deadline(){super::user_entry_rpc::UserEntryError::Timeout}else{super::user_entry_rpc::UserEntryError::Scope};
+                work.query.interest().retire();self.backend.retire_client_user_entry(sequence);let _=work.reply.send(Err(error));
+            }else{self.backend.client_read_state_mut().client_read_pending.insert(sequence,ClientReadPending{query:work.query,reply:work.reply});}
+            let _=command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),Some(packets.call_id))));
+            self.retire_client_reads(Instant::now());return Ok(());
+        }
         if let Some(work)=im_wait{
             if !work.interest.submitted(){self.backend.retire_im_read(packets.call_id);let _=command.completion.send(Err(RuntimeError::Cancelled));return Err(RuntimeError::Cancelled);}
             if !work.gate.live()||work.interest.is_retired()||work.reply.is_closed()||Instant::now()>=rpc_deadline{
@@ -1097,6 +1138,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         // boundary. BatchQueued/login/poll receipts cannot mint compaction proof.
         if is_response { receipt.direct = self.backend.direct_replay_frontier(); }
         if command.completion.send(Ok(receipt)).is_err() {
+            if packets.client_only(){self.retire_client_reads(Instant::now());return Ok(());}
             return Err(RuntimeError::Cancelled);
         }
         Ok(())

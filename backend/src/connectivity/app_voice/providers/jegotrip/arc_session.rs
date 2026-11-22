@@ -470,23 +470,31 @@ impl ArcRpcSession {
         if !self.batch_scheduler_taken || !batch.matches(&self.owner, &self.connection) || batch.is_encoded() {
             return Err(CodecError::InvalidField);
         }
-        let result = self.prepare_swap(&batch.payload(), routing, Some(batch.identity()))?;
+        let result = if batch.has_client_reads() {
+            self.prepare_swap_encoded(&batch.payload(), routing, Some(batch.identity()), true)?
+        } else { self.prepare_swap(&batch.payload(), routing, Some(batch.identity()))? };
         batch.mark_encoded();
         Ok(result)
     }
 
     fn prepare_swap(&mut self, payload: &BatchPayload<'_>, routing: &[RpcProperty<'_>], scheduler: Option<Arc<()>>)
         -> Result<(i32, RpcBytes), CodecError> {
+        self.prepare_swap_encoded(payload, routing, scheduler, false)
+    }
+    fn prepare_swap_encoded(&mut self, payload: &BatchPayload<'_>, routing: &[RpcProperty<'_>], scheduler: Option<Arc<()>>, measured_client: bool)
+        -> Result<(i32, RpcBytes), CodecError> {
         if self.phase() != ArcPhase::Authenticated || self.connection.session_revoked() { return Err(CodecError::InvalidField); }
         if scheduler.is_some() && payload.fields[0] == 0 { return Err(CodecError::InvalidField); }
         reject_auth_keys(routing)?;
         let auth = self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
-        let arguments = encode_swap_calls(&auth.user_id, &auth.selected_session_id, payload)?;
+        let arguments = if measured_client { super::client_user_entry_encoding::encode_swap_calls(&auth.user_id, &auth.selected_session_id, payload)? }
+            else { encode_swap_calls(&auth.user_id, &auth.selected_session_id, payload)? };
         let mut metadata = self.account_metadata(routing,self.common_identity.as_deref())?;
         metadata.push(RpcProperty { key: b"token", value: &auth.token });
         let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
         if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
-        let bytes = encode_request(id, &metadata, SWAP_CALLS_METHOD.as_bytes(), arguments.expose_to_transport())?;
+        let bytes = if measured_client { super::client_user_entry_encoding::encode_request(id, &metadata, SWAP_CALLS_METHOD.as_bytes(), arguments.expose_to_transport())? }
+            else { encode_request(id, &metadata, SWAP_CALLS_METHOD.as_bytes(), arguments.expose_to_transport())? };
         self.next_id = id.checked_add(1);
         self.pending.insert(id, PendingRpc { kind: PendingKind::Swap, selected_session_id: None, scheduler,call:None,im:None,received:None,user_read:None,send:None });
         Ok((id, bytes))
@@ -681,6 +689,8 @@ mod im_send;
 #[path="user_entry_auth.rs"]
 mod user_entry_auth;
 pub(super) use user_entry_auth::UserEntryAuth;
+#[path="rpc_client_user_entry_session.rs"]
+mod client_user_entry;
 #[cfg(test)]
 #[path = "arc_session_tests.rs"]
 mod tests;

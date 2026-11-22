@@ -47,6 +47,7 @@ impl Drop for RpcBytes{fn drop(&mut self){self.0.zeroize();}}
 
 impl RpcBytes {
     pub fn expose_to_transport(&self) -> &[u8] { &self.0 }
+    #[cfg(test)] pub(super) fn allocated_capacity(&self) -> usize { self.0.capacity() }
 }
 
 impl fmt::Debug for RpcBytes {
@@ -80,6 +81,17 @@ impl Writer {
     /// buffers must not free unwiped old allocations on ordinary append.
     pub fn new() -> Self { let mut bytes=Vec::with_capacity(MAX_STREAM_BYTES);bytes.push(STREAM_DATA);Self(bytes) }
 
+    /// New Client encoders premeasure and charge this exact capacity before
+    /// construction. Append may not grow/free an unwiped secret allocation.
+    /// Original callers retain their existing full-bound Writer unchanged.
+    pub(super) fn measured(capacity: usize) -> Result<Self, CodecError> {
+        if capacity == 0 || capacity > MAX_STREAM_BYTES { return Err(CodecError::TooLarge); }
+        let mut bytes = Vec::with_capacity(capacity); bytes.push(STREAM_DATA); Ok(Self(bytes))
+    }
+    pub(super) fn versioned_measured(capacity: usize) -> Result<Self, CodecError> {
+        let mut writer = Self::measured(capacity)?; writer.u16(1)?; writer.u16(0)?; Ok(writer)
+    }
+
     /// Produces the supported native method-version list: BE16 count=1 followed
     /// by one BE16 method version=0. These words are not a major/minor pair;
     /// result streams do not repeat the list prefix.
@@ -92,7 +104,7 @@ impl Writer {
 
     fn append(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
         let next = self.0.len().checked_add(bytes.len()).ok_or(CodecError::TooLarge)?;
-        if next > MAX_STREAM_BYTES { return Err(CodecError::TooLarge); }
+        if next > MAX_STREAM_BYTES || next > self.0.capacity() { return Err(CodecError::TooLarge); }
         self.0.extend_from_slice(bytes);
         Ok(())
     }

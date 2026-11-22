@@ -77,6 +77,7 @@ pub struct OfflineBackend {
     offline_hints: std::collections::BTreeSet<(u32, i32)>,
     call_acks:BTreeMap<(u32,i32),(CallControlTicket,bool)>,
     swaps: BTreeMap<i32, u64>,
+    client_actor:super::transport_actor::ClientReadState,
 }
 
 impl fmt::Debug for OfflineBackend {
@@ -90,7 +91,7 @@ impl OfflineBackend {
     pub fn new(owner: AttemptOwner) -> Self {
         let mut protocol = ArcProtocol::new(owner);
         let tracker = protocol.take_hosting_tracker().expect("fresh ARC tracker");
-        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,client_ex:None,im_binding:None,im_pending:BTreeMap::new(),im_completed:BTreeMap::new(),status_pending:BTreeMap::new(),status_completed:BTreeMap::new(),call_pending:BTreeMap::new(),invite_pending:BTreeMap::new(),invite_completed:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new() }
+        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,client_ex:None,im_binding:None,im_pending:BTreeMap::new(),im_completed:BTreeMap::new(),status_pending:BTreeMap::new(),status_completed:BTreeMap::new(),call_pending:BTreeMap::new(),invite_pending:BTreeMap::new(),invite_completed:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new(),client_actor:super::transport_actor::ClientReadState::default() }
     }
     pub fn phase(&self) -> ArcPhase { self.protocol.phase() }
     pub(super) fn is_pending(&self, id: i32) -> bool { self.protocol.is_pending(id) }
@@ -132,7 +133,7 @@ impl OfflineBackend {
     }
     pub fn close(&mut self) {
         self.protocol.close(); if let Some(s) = &mut self.scheduler { s.close(); }
-        self.tracker.retire_all();
+        self.tracker.retire_all();self.client_actor.clear();
         self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.invite_pending.clear();self.invite_completed.clear();self.call_acks.clear();self.offline_hints.clear();
         self.swaps.clear();self.dispatcher=None;self.im_binding=None;self.im_pending.clear();self.im_completed.clear();self.status_pending.clear();self.status_completed.clear();
     }
@@ -272,7 +273,15 @@ impl OfflineBackend {
         };
         let result_sequences=batch.payload().results.keys().copied().collect::<Vec<_>>();
         let packets = match self.protocol.prepare_scheduled_swap(&batch, routing) {
-            Ok(packets) => packets, Err(error) => { self.close(); return Err(error); }
+            Ok(packets) => packets,
+            Err(ProtocolError::Batch(super::batch_scheduler::BatchError::Backpressure)) if !batch.is_encoded()&&!batch.client_holders().is_empty()=>{
+                // Original shared-budget refusal occurred before ARC encoding.
+                // Abandon this unsent snapshot, preserving unrelated WRITE
+                // work/epochs. The READ caller retires only its own interest.
+                self.scheduler.as_mut().ok_or(CodecError::InvalidField)?.cancel_prepared();
+                return Err(ProtocolError::Batch(super::batch_scheduler::BatchError::Backpressure));
+            }
+            Err(error) => { self.close(); return Err(error); }
         };
         if let Err(error) = self.scheduler.as_mut().ok_or(CodecError::InvalidField)?.commit_submission(batch, now_ms) {
             self.close(); return Err(error.into());
@@ -322,6 +331,7 @@ impl OfflineBackend {
                     };
                     let retirement = delivery.retirement.take();
                     for callback in tracker.on_scheduled_delivery(&delivery) { events.push(OfflineEvent::Callback(callback)); }
+                    tracker.consume_scheduled_client_results(&mut delivery);
                     for reply in tracker.take_unhosting_replies() { events.push(OfflineEvent::Unhosting(reply)); }
                     for incoming in delivery.requests {
                         if super::rpc_client_ex::method_kind(incoming.request().method).is_some() {
@@ -579,6 +589,9 @@ impl OfflineBackend {
         }
     }
 }
+
+#[path="offline_client_user_entry.rs"]
+mod client_user_entry;
 
 #[cfg(test)]
 #[path = "offline_backend_tests.rs"]

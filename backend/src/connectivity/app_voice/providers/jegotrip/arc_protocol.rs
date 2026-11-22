@@ -31,8 +31,13 @@ impl From<CodecError> for ProtocolError { fn from(error: CodecError) -> Self { S
 impl From<TransportError> for ProtocolError { fn from(error: TransportError) -> Self { Self::Transport(error) } }
 impl From<BatchError> for ProtocolError { fn from(error: BatchError) -> Self { Self::Batch(error) } }
 
-pub struct OwnedCallPackets { pub call_id: i32, pub packets: Vec<TransportBytes>, _send_budget:Option<std::sync::Arc<super::rpc_im_send::ImSendRpcRequest>> }
-impl OwnedCallPackets{fn uncharged(call_id:i32,packets:Vec<TransportBytes>)->Self{Self{call_id,packets,_send_budget:None}}}
+pub struct OwnedCallPackets { pub call_id: i32, pub packets: Vec<TransportBytes>, _send_budget:Option<std::sync::Arc<super::rpc_im_send::ImSendRpcRequest>>,_client_holders:Vec<std::sync::Arc<super::user_entry_client::ClientUserEntryRequest>>,_client_packet_budget:Option<std::sync::Arc<super::native_rpc_budget::NativeRpcReservation>>,_client_only:bool,_has_business_work:bool }
+impl OwnedCallPackets{
+    fn uncharged(call_id:i32,packets:Vec<TransportBytes>)->Self{Self{call_id,packets,_send_budget:None,_client_holders:Vec::new(),_client_packet_budget:None,_client_only:false,_has_business_work:true}}
+    pub(super) fn has_business_work(&self)->bool{self._has_business_work}
+    pub(super) fn client_only(&self)->bool{self._client_only}
+    pub(super) fn client_sequences(&self)->Vec<i32>{self._client_holders.iter().map(|request|request.sequence()).collect()}
+}
 
 impl fmt::Debug for OwnedCallPackets {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -211,6 +216,7 @@ impl ArcProtocol {
         let binding = self.incoming.as_ref().ok_or(CodecError::InvalidField)?.binding();
         self.client_ex = Some(self.rpc.client_ex_dispatcher(binding)?); Ok(())
     }
+    pub(super) fn capture_client_user_entry_auth(&self,query:&std::sync::Arc<super::user_entry_client::ClientUserEntryQuery>)->Result<(Box<super::arc_session::UserEntryAuth>,std::sync::Arc<super::native_rpc_budget::NativeRpcReservation>),super::user_entry_rpc::UserEntryError>{self.rpc.capture_client_user_entry_auth(query)}
     pub(super) fn captured_user_entry_auth(&self)->Result<Box<super::arc_session::UserEntryAuth>,CodecError>{self.rpc.user_entry_auth()}
     pub(super) fn captured_send_identity(&self)->Result<std::sync::Arc<super::arc_session::ImSendIdentity>,CodecError>{self.rpc.send_identity()}
     pub(super) fn prepare_im_send(&mut self,permit:std::sync::Arc<super::im_inbox::ImSendPermit>,deadline:std::time::Instant)->Result<OwnedCallPackets,ProtocolError>{let binding=self.im_binding.clone().ok_or(CodecError::InvalidField)?;let(id,bytes)=self.rpc.prepare_im_send(binding,permit,deadline)?;let original=self.rpc.pending_im_send(id).ok_or(CodecError::InvalidField)?;let mut packets=self.packets(id,bytes.expose_to_transport())?;packets._send_budget=Some(original);Ok(packets)}
@@ -232,8 +238,15 @@ impl ArcProtocol {
 
     pub fn prepare_scheduled_swap(&mut self, batch: &ScheduledBatch, routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> {
+        let charge=self.rpc.reserve_scheduled_client_packets(batch,routing).map_err(|error|if error==CodecError::TooLarge{ProtocolError::Batch(BatchError::Backpressure)}else{error.into()})?;
+        let holders=batch.client_holders();
         let (id, bytes) = self.rpc.prepare_scheduled_swap(batch, routing)?;
-        self.packets(id, bytes.expose_to_transport())
+        let mut packets=self.packets(id, bytes.expose_to_transport())?;
+        if let Some(budget)=&charge{
+            let actual=super::client_packet_retention::ClientPacketRetention::original(holders.clone(),budget.clone());
+            for packet in &mut packets.packets{packet.retain_client_packet(actual.clone());}
+        }
+        packets._client_holders=holders;packets._client_packet_budget=charge;packets._client_only=batch.client_only();packets._has_business_work=batch.has_business_work();Ok(packets)
     }
 
     fn packets(&mut self, id: i32, bytes: &[u8]) -> Result<OwnedCallPackets, ProtocolError> {

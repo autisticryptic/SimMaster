@@ -28,6 +28,8 @@ impl NativeHostingBackend {
         let owner = action.owner(); let scope = action.parent();
         let attempt = self.original(owner).map_err(|_| "app_account_im_send_scope_invalid")?;
         let common = self.profile.common.as_ref().ok_or("app_account_im_send_recipient_not_installed")?;
+        let client=attempt.user_entries.client_target().ok().flatten();
+        if let Some(target)=client{return self.resolve_client_user_entry(action.clone(),target).await.map_err(|_|"app_account_im_send_recipient_unconfirmed");}
         let target = lock(&attempt.user_entry).clone().map_err(|_| "app_account_im_send_recipient_not_installed")?
             .ok_or("app_account_im_send_recipient_not_installed")?;
         let commands = attempt.commands(owner, &scope).map_err(|_| "app_account_im_send_scope_invalid")?;

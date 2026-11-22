@@ -17,3 +17,14 @@ async fn user_entry_http_rejects_ambiguous_recipient_missing_boolean_or_oversize
     for recipient in ["12345".to_string(),"fixture@example.invalid".into(),"scheme://fixture.invalid".into(),"[phone:+12345]".into(),"[username:fixture@invalid]".into(),"x".repeat(513)]{let(status,headers,body)=account_request(&served,reqwest::Method::POST,path,Some(serde_json::json!({"expected_revision":1,"recipient":recipient,"consent":true})),Some(&cookie)).await;assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);}
     for input in [serde_json::json!({"expected_revision":1,"recipient":"7_9"}),serde_json::json!({"expected_revision":1,"recipient":"7_9","consent":"true"}),serde_json::json!({"expected_revision":1,"recipient":null,"consent":true})]{let(status,headers,body)=account_request(&served,reqwest::Method::POST,path,Some(input),Some(&cookie)).await;assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);}assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
 }
+#[tokio::test]
+async fn client_user_entry_http_caller_factory_nested_sequence_sdk_session_or_scope_are_not_query_admission(){
+    let state=build_test_router().await.expect("Actions private bus required; no skip");let served=serve(state.router.clone()).await;let cookie=authenticate(&served).await;
+    let path="/api/non-3gpp/accounts/app-account-0123456789abcdef0123456789abcdef/user-entry/lookup";
+    for field in ["factory_input","client_sequence","selected_session_id","source_scope","router_policy","grant","adapter","locator"]{
+        let mut input=serde_json::json!({"expected_revision":1,"recipient":"[phone:+12345@fixture.invalid]","consent":true});input[field]=serde_json::json!("private-no-factory-or-auth");
+        let(status,headers,body)=account_request(&served,reqwest::Method::POST,path,Some(input),Some(&cookie)).await;
+        assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);assert!(!body.contains("private-")&&!body.contains("12345"));
+    }
+    assert!(state.app.app_accounts.list(100).await.unwrap().is_empty());
+}

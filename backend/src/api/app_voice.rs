@@ -410,7 +410,12 @@ pub async fn reconcile_im_user_read(State(manager): State<Arc<AccountManager>>, 
 pub async fn lookup_user_entry(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Json<UserEntryLookupRequest>,JsonRejection>)->Response{
     let Ok(Json(request))=request else{return failure("app_account_request_invalid");};
     if !crate::connectivity::app_voice::providers::jegotrip::valid_user_entry_recipient(&request.recipient){return failure("app_account_request_invalid");}
-    success(StatusCode::OK,manager.lookup_user_entry(&line_id,request.expected_revision,&request.recipient,request.consent).await)
+    let prepared=manager.prepare_user_entry(&line_id,request.expected_revision,&request.recipient,request.consent);
+    // The original run/input/deadline is captured synchronously. Wipe the
+    // temporary HTTP recipient before controller acquisition or any network IO.
+    drop(request);
+    let prepared=match prepared{Ok(value)=>value,Err(code)=>return failure(code)};
+    success(StatusCode::OK,manager.finish_user_entry(prepared).await)
 }
 pub async fn delete_im_message(State(manager):State<Arc<AccountManager>>,Path((line_id,message_id)):Path<(String,String)>)->Response{
     let Ok(id)=message_id.parse::<i64>()else{return failure("app_account_request_invalid");};

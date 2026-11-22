@@ -302,6 +302,7 @@ jobs:
             connectivity::app_voice::providers::jegotrip::legacy_config::tests \
             connectivity::app_voice::providers::jegotrip::object_reference::tests \
             connectivity::app_voice::providers::jegotrip::deployment::tests \
+            connectivity::app_voice::providers::jegotrip::user_entry_client_target::tests \
             connectivity::app_voice::providers::jegotrip::native_router::tests \
             connectivity::app_voice::providers::jegotrip::native_routing::tests \
             connectivity::app_voice::providers::jegotrip::router_ports::tests \

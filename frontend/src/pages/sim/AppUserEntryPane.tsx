@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Alert, Button, Stack, TextField, Typography } from '@mui/material'
 import { api } from '../../api/current'
-import { userEntryView, userEntryRecipient, userEntryUid, userEntryLabel, USER_ENTRY_SCOPE, type UserEntryView } from '../../policies/userEntry'
+import { userEntryView, userEntryRecipient, userEntryUid, userEntryLabel, USER_ENTRY_SCOPE, USER_ENTRY_ROUTING_SCOPE, type UserEntryView } from '../../policies/userEntry'
 export default function AppUserEntryPane({ lineId, revision, hosted, installed, localOnly = false }: { lineId: string; revision: number; hosted: boolean; installed: boolean; localOnly?: boolean }) {
   const context = JSON.stringify([lineId, revision, hosted, installed, localOnly])
   const [input, setInput] = useState({ context, value: '' })
@@ -32,6 +32,7 @@ export default function AppUserEntryPane({ lineId, revision, hosted, installed, 
   return <Stack spacing={1} sx={{ mt: 1, overflowWrap: 'anywhere' }}>
     <Typography variant="subtitle2">原收件人只读解析</Typography>
     <Typography variant="caption" color="text.secondary">{USER_ENTRY_SCOPE}</Typography>
+    {!localOnly && <Typography variant="caption" color="text.secondary">{USER_ENTRY_ROUTING_SCOPE}</Typography>}
     {localOnly && <Typography variant="caption">当前原引用仅提供 UID 本地分支；别名解析需其原拥有者路由，不能猜测默认服务。</Typography>}
     <TextField size="small" label="收件人原 URI" placeholder="[phone:+号码@原账号域]" value={value} autoComplete="off" disabled={busy || !hosted} slotProps={{ htmlInput: { maxLength: 512 } }} onChange={(event) => setInput({ context, value: event.target.value })} />
     <Button size="small" disabled={busy || !hosted || !Number.isSafeInteger(revision) || revision <= 0 || !userEntryRecipient(value) || localOnly && !userEntryUid(value)} onClick={() => { void lookup() }}>只读解析收件人</Button>

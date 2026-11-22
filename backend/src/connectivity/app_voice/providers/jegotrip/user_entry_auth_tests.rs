@@ -2,6 +2,8 @@
 use super::*;
 #[path="user_entry_uid_local_tests.rs"]
 mod uid_local;
+#[path="user_entry_preparation_budget_tests.rs"]
+mod preparation;
 #[path="im_send_identity_tests.rs"]
 mod send_identity;
 fn current_native()->(ArcRpcSession,AttemptOwner,RpcConnectionScope){

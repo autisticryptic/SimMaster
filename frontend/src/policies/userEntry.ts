@@ -30,4 +30,5 @@ export function userReadRecipientBody(revision: number, nonce: string, recipient
   return { expected_revision: revision, nonce, recipient, consent: true }
 }
 export const USER_ENTRY_SCOPE = '仅向本次原账号 UserEntry 明确查询；不展示 UID，不标记已读、不清空未知写入、不发送消息，不重新登录或恢复授信。'
+export const USER_ENTRY_ROUTING_SCOPE = '查询仅使用当前 SDK 原会话批次或已核原独立端点；解析数据不提供新路由、TLS 授信或未知写入重试权限。'
 export function userEntryLabel(value: UserEntryView): string { return value.report === 'local_uid' ? '本次仅本地识别原 UID；未查询服务端，不是回执或授信。' : value.report === 'reported' ? '本次原服务端报告已解析；不是写入回执或接收就绪。' : value.report === 'unreported' ? '本次原服务端未报告收件人；不猜测 UID，不自动重查。' : '本次原查询被拒绝；不自动重试或重新登录。' }

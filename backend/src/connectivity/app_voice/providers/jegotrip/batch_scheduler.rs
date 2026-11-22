@@ -58,7 +58,7 @@ impl BatchWords {
 }
 
 #[derive(Clone)]
-struct RequestData { method: Vec<u8>, arguments: Vec<u8>, metadata: Vec<(Vec<u8>, Vec<u8>)>, bytes: usize }
+struct RequestData { method: Vec<u8>, arguments: Vec<u8>, metadata: Vec<(Vec<u8>, Vec<u8>)>, bytes: usize,client:Option<Arc<super::user_entry_client::ClientUserEntryRequest>> }
 
 impl RequestData {
     fn measure(request: &BatchRequest<'_>) -> Result<usize, CodecError> {
@@ -78,9 +78,16 @@ impl RequestData {
     fn capture(request: &BatchRequest<'_>) -> Result<Self, CodecError> {
         let bytes = Self::measure(request)?;
         Ok(Self { method: request.method.to_vec(), arguments: request.arguments.to_vec(),
-            metadata: request.metadata.iter().map(|p| (p.key.to_vec(), p.value.to_vec())).collect(), bytes })
+            metadata: request.metadata.iter().map(|p| (p.key.to_vec(), p.value.to_vec())).collect(), bytes,client:None })
+    }
+    fn captured_client(request:Arc<super::user_entry_client::ClientUserEntryRequest>)->Result<Self,CodecError>{
+        let bytes=Self::measure(&request.as_batch_request())?;
+        // Share the already charged private request, rather than copying its
+        // factory/arguments into working, history and prepared snapshots.
+        Ok(Self{method:Vec::new(),arguments:Vec::new(),metadata:Vec::new(),bytes,client:Some(request)})
     }
     fn borrowed(&self) -> BatchRequest<'_> {
+        if let Some(request)=&self.client{return request.as_batch_request();}
         BatchRequest { method: &self.method, arguments: &self.arguments,
             metadata: self.metadata.iter().map(|(key, value)| super::rpc_stream::RpcProperty { key, value }).collect() }
     }
@@ -118,6 +125,28 @@ impl ScheduledBatch {
         BatchPayload { fields: self.words.fields(),
             requests: self.bucket.requests.iter().map(|(&s, r)| (s, r.borrowed())).collect(),
             results: self.bucket.results.iter().map(|(&s, r)| (s, r.borrowed())).collect() }
+    }
+    pub(super) fn has_business_work(&self)->bool{!self.bucket.results.is_empty()||self.bucket.requests.values().any(|request|request.client.is_none())}
+    pub(super) fn client_only(&self)->bool{!self.bucket.requests.is_empty()&&self.bucket.results.is_empty()&&self.bucket.requests.values().all(|request|request.client.is_some())}
+    pub(super) fn has_client_reads(&self)->bool{self.bucket.requests.values().any(|request|request.client.is_some())}
+    pub(super) fn client_holders(&self)->Vec<Arc<super::user_entry_client::ClientUserEntryRequest>>{self.bucket.requests.values().filter_map(|request|request.client.clone()).collect()}
+    pub(super) fn encoded_argument_bytes(&self,uid:usize,selector:usize)->Result<usize,CodecError>{
+        let prefix=45usize.checked_add(uid).and_then(|n|n.checked_add(selector)).ok_or(CodecError::TooLarge)?;
+        self.bucket.requests.values().map(|request|request.bytes).chain(self.bucket.results.values().map(|result|result.bytes())).try_fold(prefix,|total,n|total.checked_add(n).ok_or(CodecError::TooLarge))
+    }
+    pub(super) fn client_encoding_model_bytes(&self)->Result<usize,CodecError>{
+        // Conservative per-entry bound for the current std BTreeMap's at-most
+        // 11-slot node plus edges/header, borrowed metadata and sort workspace.
+        // Client request admission already charges its retained map anchors;
+        // this additional reservation covers the transient encoding snapshot.
+        let slots=self.bucket.requests.len().checked_add(self.bucket.results.len()).ok_or(CodecError::TooLarge)?;
+        let node=16usize.checked_mul(std::mem::size_of::<(i32,BatchRequest<'_>)>()+std::mem::size_of::<(i32,BatchResult<'_>)>()+16).ok_or(CodecError::TooLarge)?;
+        let mut total=slots.checked_mul(node).and_then(|n|n.checked_add(256)).ok_or(CodecError::TooLarge)?;
+        for request in self.bucket.requests.values(){
+            let properties=if request.client.is_some(){2}else{request.metadata.len()};
+            total=total.checked_add(properties*(std::mem::size_of::<super::rpc_stream::RpcProperty<'_>>()+2*std::mem::size_of::<usize>())).ok_or(CodecError::TooLarge)?;
+        }
+        Ok(total)
     }
     pub(super) fn matches(&self, owner: &AttemptOwner, connection: &RpcConnectionScope) -> bool {
         &self.owner == owner && self.connection.matches(connection) && self.connection.is_open()
@@ -201,12 +230,14 @@ pub struct BatchDelivery {
     owner: AttemptOwner,
     connection: RpcConnectionScope,
     results: BTreeMap<i32, ResultData>,
+    client_results:Vec<super::user_entry_client::ClientUserEntryCompletion>,
 }
 
 impl BatchDelivery {
     pub(super) fn matches(&self, owner: &AttemptOwner, connection: &RpcConnectionScope) -> bool {
         &self.owner == owner && self.connection.matches(connection) && self.connection.is_open()
     }
+    pub(super) fn take_client_results(&mut self)->Vec<super::user_entry_client::ClientUserEntryCompletion>{std::mem::take(&mut self.client_results)}
     pub(super) fn results(&self) -> impl Iterator<Item = (i32, BatchResult<'_>)> {
         self.results.iter().map(|(&sequence, result)| (sequence, result.borrowed()))
     }
@@ -260,6 +291,9 @@ pub struct BatchScheduler {
     working: Bucket,
     pending_client: BTreeSet<i32>,
     submitted_client: BTreeSet<i32>,
+    client_reads:BTreeSet<i32>,retired_reads:BTreeSet<i32>,
+    // Business pending identity survives transport epoch ACK/history removal.
+    client_requests:BTreeMap<i32,Arc<super::user_entry_client::ClientUserEntryRequest>>,
     last_client_sequence: i32,
     pending_server: BTreeMap<i32, usize>,
     peer_incarnation: Option<u32>,
@@ -284,7 +318,7 @@ impl BatchScheduler {
         if !connection.is_open() { return Err(BatchError::Closed); }
         Ok(Self { owner, connection, identity: Arc::new(()), local_incarnation: incarnation, next_batch: 0,
             next_serial: Some(1), prepared: None, clock_ms: 0, history: BTreeMap::new(), working: Bucket::default(),
-            pending_client: BTreeSet::new(), submitted_client: BTreeSet::new(),
+            pending_client: BTreeSet::new(), submitted_client: BTreeSet::new(),client_reads:BTreeSet::new(),retired_reads:BTreeSet::new(),client_requests:BTreeMap::new(),
             last_client_sequence: 0, pending_server: BTreeMap::new(),
             peer_incarnation: None, peer_next: 0, peer_batches: 0, dedup: DedupWindow::default(), retired_through: 0, closed: false })
     }
@@ -295,7 +329,7 @@ impl BatchScheduler {
 
     pub fn close(&mut self) {
         self.closed = true; self.connection.close();
-        self.history.clear(); self.working = Bucket::default(); self.pending_client.clear(); self.submitted_client.clear();
+        self.history.clear(); self.working = Bucket::default(); self.pending_client.clear(); self.submitted_client.clear();self.client_reads.clear();self.retired_reads.clear();self.client_requests.clear();
         self.pending_server.clear();
         self.dedup = DedupWindow::default();
         if let Some((_, active, _)) = self.prepared.take() { active.store(false, Ordering::Release); }
@@ -348,6 +382,31 @@ impl BatchScheduler {
         Ok(())
     }
 
+    pub(super) fn queue_client_user_entry(&mut self,request:Arc<super::user_entry_client::ClientUserEntryRequest>)->Result<(),BatchError>{
+        self.require_open()?;
+        if !request.matches(&self.owner,&self.connection){return Err(BatchError::Scope);}
+        let sequence=request.sequence();if sequence<=self.last_client_sequence{return Err(BatchError::Epoch);}
+        if self.prepared.is_some(){return Err(BatchError::Backpressure);}
+        let data=RequestData::captured_client(request.clone())?;let(count,_,bytes)=self.totals();
+        if self.pending_client.len()>=MAX_MAP_ENTRIES||count>=MAX_MAP_ENTRIES||bytes.checked_add(data.bytes).is_none_or(|n|n>MAX_RETAINED_BYTES){return Err(BatchError::Backpressure);}
+        self.last_client_sequence=sequence;self.pending_client.insert(sequence);self.client_reads.insert(sequence);self.client_requests.insert(sequence,request);self.working.requests.insert(sequence,Arc::new(data));Ok(())
+    }
+    /// READ-only retirement cannot cancel a prepared mixed frame, delete an
+    /// epoch shell, fabricate ACKs or relax the original hosting WRITE path.
+    pub(super) fn retire_client_read(&mut self,sequence:i32){
+        if !self.client_reads.contains(&sequence){return;}
+        self.pending_client.remove(&sequence);self.submitted_client.remove(&sequence);self.retired_reads.insert(sequence);
+        if self.prepared.is_none(){self.prune_retired_reads();}
+    }
+    fn prune_retired_reads(&mut self){
+        if self.prepared.is_some(){return;}
+        let retired=std::mem::take(&mut self.retired_reads);
+        for sequence in retired{self.client_reads.remove(&sequence);self.client_requests.remove(&sequence);self.working.requests.remove(&sequence);for epoch in self.history.values_mut(){epoch.bucket.requests.remove(&sequence);}}
+    }
+    fn expire_client_reads(&mut self){
+        let retired=self.client_requests.iter().filter_map(|(&sequence,request)|request.retired().then_some(sequence)).collect::<BTreeSet<_>>();
+        for sequence in retired{self.retire_client_read(sequence);}
+    }
     /// Cancel local interest and all retry copies, but never reuse its sequence.
     /// Tracker retirement is separate; ACK does not mean business completion.
     pub fn retire_client_request(&mut self, sequence: i32) {
@@ -363,6 +422,7 @@ impl BatchScheduler {
     pub fn prepare(&mut self, now_ms: u64) -> Result<ScheduledBatch, BatchError> {
         self.clock(now_ms)?; self.ensure_retention(now_ms)?;
         if self.prepared.is_some() { return Err(BatchError::Backpressure); }
+        self.expire_client_reads();self.prune_retired_reads();
         let Some(serial) = self.next_serial else { return self.fail(BatchError::Epoch); };
         let mut bucket = self.working.clone();
         let has_work = !bucket.requests.is_empty() || !bucket.results.is_empty();
@@ -396,6 +456,7 @@ impl BatchScheduler {
             active.store(false, Ordering::Release);
             if encoded.load(Ordering::Acquire) { self.close(); }
         }
+        self.prune_retired_reads();
     }
 
     pub fn commit_submission(&mut self, batch: ScheduledBatch, now_ms: u64) -> Result<(), BatchError> {
@@ -412,6 +473,7 @@ impl BatchScheduler {
         }
         batch.active.store(false, Ordering::Release);
         self.prepared = None;
+        self.prune_retired_reads();
         self.next_serial = batch.serial.checked_add(1);
         Ok(())
     }
@@ -469,6 +531,9 @@ impl BatchScheduler {
             || fresh.iter().any(|(sequence, _)| self.pending_server.contains_key(sequence)) {
             return self.fail(BatchError::Backpressure);
         }
+        // Private business-pending Client identity is independent of epoch
+        // history. An earlier ACK can remove every retry copy, but a later
+        // nested result must still use the charged decoder, never generic copy.
         let mut acknowledged = BTreeSet::new();
         if words.ack_incarnation == self.local_incarnation {
             for bit in 0..32 {
@@ -489,18 +554,21 @@ impl BatchScheduler {
             requests.push(IncomingBatchRequest { request, ticket: ServerRequestTicket { owner: self.owner.clone(),
                 connection: self.connection.clone(), scheduler: self.identity.clone(), peer_incarnation: words.incarnation, sequence } });
         }
-        let mut results = BTreeMap::new();
+        let mut results = BTreeMap::new();let mut client_results=Vec::new();
         for (&sequence, result) in &reply.payload.results {
             if self.pending_client.contains(&sequence) && self.submitted_client.contains(&sequence) {
-                results.insert(sequence, ResultData { code: result.result_code, stream: result.result_stream.to_vec() });
+                if let Some(request)=self.client_requests.get(&sequence){
+                    let result=super::user_entry_rpc::OwnedUserEntryReply::from_client(request.clone(),result.result_code,result.result_stream);
+                    client_results.push(super::user_entry_client::ClientUserEntryCompletion{request:request.clone(),result});
+                }else{results.insert(sequence, ResultData { code: result.result_code, stream: result.result_stream.to_vec() });}
             }
         }
         // Commit original pending retirement only after all delivery payloads
         // have been copied/validated; no partially retired successful batch.
-        for sequence in results.keys() {
-            self.submitted_client.remove(sequence); self.pending_client.remove(sequence);
+        let matched_result_sequences=results.keys().copied().chain(client_results.iter().map(|result|result.request.sequence())).collect::<Vec<_>>();
+        for sequence in &matched_result_sequences {
+            self.submitted_client.remove(sequence); self.pending_client.remove(sequence);self.client_requests.remove(sequence);
         }
-        let matched_result_sequences = results.keys().copied().collect();
         // Native epoch history holds immutable original calls until ACK/retention;
         // even an AgentCall result does not itself change the six ACK words.
         // Before-base IDs can never re-enter this safe subset, but do not
@@ -516,7 +584,7 @@ impl BatchScheduler {
                 peer_incarnation: words.incarnation, through: self.retired_through,
                 acknowledged: acknowledged.into_iter().collect() })
         } else { None };
-        Ok(Some(BatchDelivery { requests, matched_result_sequences, retirement, results,
+        Ok(Some(BatchDelivery { requests, matched_result_sequences, retirement, results,client_results,
             owner: self.owner.clone(), connection: self.connection.clone() }))
     }
 

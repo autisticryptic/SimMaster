@@ -10,6 +10,8 @@ impl NativeHostingBackend{
         let who=action.owner();let parent=action.parent();let attempt=self.original(who).map_err(|_|"app_account_im_scope_invalid")?;
         {let state=lock(&attempt.state);if !state.configured||state.retired||state.logout_started||state.unregister_started||!action.live()||!attempt.scope.matches(&parent){return Err("app_account_im_scope_invalid");}}
         let common=self.profile.common.as_ref().ok_or("app_account_im_user_read_recipient_not_installed")?;
+        let client=attempt.user_entries.client_target().ok().flatten();
+        if let Some(target)=client{return self.resolve_client_user_entry(action.clone(),target).await.map_err(|_|"app_account_im_user_read_recipient_unconfirmed");}
         let target=lock(&attempt.user_entry).clone().map_err(|_|"app_account_im_user_read_recipient_not_installed")?.ok_or("app_account_im_user_read_recipient_not_installed")?;
         let commands=attempt.commands(who,&parent).map_err(|_|"app_account_im_scope_invalid")?;
         let operation=Box::pin(async{

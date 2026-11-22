@@ -44,10 +44,11 @@ impl TransportError {
     }
 }
 
-pub struct TransportBytes(Vec<u8>);
+pub struct TransportBytes(Vec<u8>,Option<std::sync::Arc<super::client_packet_retention::ClientPacketRetention>>);
 
 impl TransportBytes {
-    pub(super) fn from_bytes(bytes: Vec<u8>) -> Self { Self(bytes) }
+    pub(super) fn from_bytes(bytes: Vec<u8>) -> Self { Self(bytes,None) }
+    pub(super) fn retain_client_packet(&mut self,guard:std::sync::Arc<super::client_packet_retention::ClientPacketRetention>){self.1=Some(guard);}
     pub fn expose_to_transport(&self) -> &[u8] { &self.0 }
 }
 
@@ -117,7 +118,7 @@ pub fn encode_call_packets(kind: CallKind, payload: &[u8], threshold: usize)
         let mut bytes = Vec::with_capacity(payload.len() + 1);
         bytes.push(kind as u8);
         bytes.extend_from_slice(payload);
-        return Ok(vec![TransportBytes(bytes)]);
+        return Ok(vec![TransportBytes(bytes,None)]);
     }
     let mut full = Zeroizing::new(Vec::with_capacity(payload.len() + 4));
     full.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -133,7 +134,7 @@ pub fn encode_call_packets(kind: CallKind, payload: &[u8], threshold: usize)
         let mut bytes = Vec::with_capacity(length + 1);
         bytes.push(if first { kind as u8 | FRAGMENTED } else { CONTINUATION });
         bytes.extend_from_slice(chunk);
-        packets.push(TransportBytes(bytes));
+        packets.push(TransportBytes(bytes,None));
         remaining = rest;
         first = false;
     }
@@ -148,7 +149,7 @@ pub fn encode_tls_carrier(tls_bytes: &[u8]) -> Result<TransportBytes, TransportE
     let mut bytes = Vec::with_capacity(tls_bytes.len() + 3);
     bytes.extend_from_slice(&[0xff, 0xff, DATA_KEY_TLS]);
     bytes.extend_from_slice(tls_bytes);
-    Ok(TransportBytes(bytes))
+    Ok(TransportBytes(bytes,None))
 }
 
 /// Mode3 accepts exact FF FF 06. FF FF FF is the escaped NetStream route, not
@@ -199,13 +200,13 @@ impl CallAssembler {
             partial.bytes.extend_from_slice(body);
             if partial.bytes.len() != partial.expected { return Ok(None); }
             let mut partial = self.partial.take().ok_or(TransportError::InvalidFragment)?;
-            return Ok(Some(CallMessage { kind: partial.kind, payload: TransportBytes(std::mem::take(&mut partial.bytes)) }));
+            return Ok(Some(CallMessage { kind: partial.kind, payload: TransportBytes(std::mem::take(&mut partial.bytes),None) }));
         }
         if self.partial.is_some() { return Err(TransportError::InvalidFragment); }
         let kind = CallKind::from_byte(header & 0x0f)?;
         if header & FRAGMENTED == 0 {
             kind.validate_payload(body)?;
-            return Ok(Some(CallMessage { kind, payload: TransportBytes(body.to_vec()) }));
+            return Ok(Some(CallMessage { kind, payload: TransportBytes(body.to_vec(),None) }));
         }
         if !matches!(kind, CallKind::Request | CallKind::Reply) { return Err(TransportError::InvalidFragment); }
         let prefix = body.get(..4).ok_or(TransportError::Truncated)?;

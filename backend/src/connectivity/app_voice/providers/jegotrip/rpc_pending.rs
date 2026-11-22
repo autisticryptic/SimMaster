@@ -138,6 +138,8 @@ pub struct HostingRpcTracker {
     next_id: Option<i32>,
     pending: BTreeMap<i32, PendingRequest>,
     unhosting: Vec<OwnedUnhostingReply>,
+    client_reads:BTreeMap<i32,Arc<super::user_entry_client::ClientUserEntryRequest>>,
+    client_replies:Vec<super::user_entry_client::ClientUserEntryCompletion>,
 }
 
 impl Default for HostingRpcTracker {
@@ -149,11 +151,11 @@ impl HostingRpcTracker {
     /// Native nested hosting requires the original ARC session's one-time tracker.
     pub fn new() -> Self {
         Self { connection: RpcConnectionScope::fresh(), batch_owner: None,
-            next_id: Some(1), pending: BTreeMap::new(), unhosting: Vec::new() }
+            next_id: Some(1), pending: BTreeMap::new(), unhosting: Vec::new(),client_reads:BTreeMap::new(),client_replies:Vec::new() }
     }
 
     pub(super) fn for_arc_session(owner: AttemptOwner, connection: RpcConnectionScope) -> Self {
-        Self { connection, batch_owner: Some(owner), next_id: Some(1), pending: BTreeMap::new(), unhosting: Vec::new() }
+        Self { connection, batch_owner: Some(owner), next_id: Some(1), pending: BTreeMap::new(), unhosting: Vec::new(),client_reads:BTreeMap::new(),client_replies:Vec::new() }
     }
 
     /// Capture this when the authenticated connection installs its receive task.
@@ -163,6 +165,17 @@ impl HostingRpcTracker {
         self.batch_owner.clone().filter(|_| self.connection.is_open()).ok_or(CodecError::InvalidField)
     }
 
+    pub(super) fn prepare_client_user_entry(&mut self,query:Arc<super::user_entry_client::ClientUserEntryQuery>,auth:Box<super::arc_session::UserEntryAuth>,budget:Arc<super::native_rpc_budget::NativeRpcReservation>)->Result<Arc<super::user_entry_client::ClientUserEntryRequest>,super::user_entry_rpc::UserEntryError>{
+        use super::user_entry_rpc::UserEntryError as E;
+        let owner=self.batch_owner.as_ref().ok_or(E::Scope)?;
+        if !query.matches(owner,&self.connection)||!auth.matches(owner,&self.connection){return Err(E::Scope);}
+        if self.pending.len()+self.client_reads.len()+self.client_replies.len()>=MAX_MAP_ENTRIES{return Err(E::Capacity);}
+        let sequence=self.next_id.ok_or(E::Capacity)?;
+        let request=super::user_entry_client::ClientUserEntryRequest::original(sequence,query,auth,budget)?;
+        self.next_id=sequence.checked_add(1);self.client_reads.insert(sequence,request.clone());Ok(request)
+    }
+    pub(super) fn take_client_user_entry_replies(&mut self)->Vec<super::user_entry_client::ClientUserEntryCompletion>{std::mem::take(&mut self.client_replies)}
+    pub(super) fn retire_client_user_entry(&mut self,id:i32){self.client_reads.remove(&id);self.client_replies.retain(|reply|reply.request.sequence()!=id);}
     /// Common-envelope helper retained for offline codec/mock callers. The
     /// native ARC hosting path uses prepare_batch_update_status instead: it
     /// nests this method inside swapCalls rather than sending it to the socket.
@@ -173,6 +186,7 @@ impl HostingRpcTracker {
         -> Result<(i32, RpcBytes), CodecError> {
         if !self.connection.is_open() { self.pending.clear(); return Err(CodecError::InvalidField); }
         if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
+        if self.pending.len()+self.client_reads.len()+self.client_replies.len()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
         let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
         let operation = match status {
             STATUS_REGISTER => NativeOperation::HostingRegister,
@@ -198,6 +212,7 @@ impl HostingRpcTracker {
         if !self.connection.is_open() { self.pending.clear(); return Err(CodecError::InvalidField); }
         if self.batch_owner.as_ref() != Some(&owner) { return Err(CodecError::InvalidField); }
         if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
+        if self.pending.len()+self.client_reads.len()+self.client_replies.len()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
         let sequence = self.next_id.ok_or(CodecError::InvalidCallId)?;
         let operation = match status {
             STATUS_REGISTER => NativeOperation::HostingRegister,
@@ -239,10 +254,20 @@ impl HostingRpcTracker {
         Ok(callbacks)
     }
 
+    pub(super) fn consume_scheduled_client_results(&mut self,delivery:&mut super::batch_scheduler::BatchDelivery){
+        let Some(owner)=self.batch_owner.clone()else{return;};
+        if !delivery.matches(&owner,&self.connection){return;}
+        for completion in delivery.take_client_results(){
+            let sequence=completion.request.sequence();let Some(original)=self.client_reads.remove(&sequence)else{continue;};
+            if !Arc::ptr_eq(&original,&completion.request){continue;}
+            self.client_replies.push(completion);
+        }
+    }
     pub(super) fn on_scheduled_delivery(&mut self, delivery: &super::batch_scheduler::BatchDelivery)
         -> Vec<OwnedRpcCallback> {
         if !self.connection.is_open() { self.pending.clear(); return vec![]; }
-        let Some(owner) = self.batch_owner.as_ref() else { return vec![]; };
+        let Some(captured_owner) = self.batch_owner.clone() else { return vec![]; };
+        let owner=&captured_owner;
         if !delivery.matches(owner, &self.connection) { return vec![]; }
         let mut callbacks = Vec::new();
         for (sequence, result) in delivery.results() {
@@ -271,7 +296,7 @@ impl HostingRpcTracker {
         if !self.connection.is_open() { self.retire_all(); return Vec::new(); }
         std::mem::take(&mut self.unhosting)
     }
-    pub(super) fn retire_all(&mut self) { self.pending.clear(); self.unhosting.clear(); }
+    pub(super) fn retire_all(&mut self) { self.pending.clear(); self.unhosting.clear();self.client_reads.clear();self.client_replies.clear(); }
 
     /// Retire pending work AND any completion not yet handed to its consumer.
     /// Already borrowed/copied results remain scoped snapshots, not revocable.
@@ -283,6 +308,8 @@ impl HostingRpcTracker {
     pub fn retire_owner(&mut self, owner: &AttemptOwner) {
         self.pending.retain(|_, request| &request.owner != owner);
         self.unhosting.retain(|reply| &reply.owner != owner);
+        self.client_reads.retain(|_,request|request.query().action().owner()!=owner);
+        self.client_replies.retain(|reply|reply.request.query().action().owner()!=owner);
     }
 
     /// A failed outer RPC or malformed nested result consumes its request and

@@ -47,6 +47,8 @@ mod user_read_recipient;
 mod reconciliation;
 #[path="runtime_user_entry.rs"]
 mod user_entry;
+#[path="runtime_client_user_entry.rs"]
+mod client_user_entry;
 use std::{fmt, sync::{Arc, Mutex, MutexGuard}, time::{Duration, Instant}};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use zeroize::{Zeroize, Zeroizing};
@@ -811,6 +813,7 @@ impl NativeHostingBackend {
             if let Some(plan)=&plan {
                 *lock(&attempt.user_entry)=plan.user_entry_for(&attempt.owner,&attempt.scope,&common.router);
                 *lock(&attempt.user_entry_uid_local)=plan.user_entry_uid_local_for(&attempt.owner,&attempt.scope,&common.router);
+                attempt.user_entries.install_client_target(&attempt.owner,&attempt.scope,plan.user_entry_client_for(&attempt.owner,&attempt.scope,&common.router)).map_err(|_|BackendFailure::Unavailable)?;
                 let reference=if self.profile.account_alive.is_some(){Some(Zeroizing::new(plan.alive_reference_for(&attempt.owner,&attempt.scope,&common.router).map_err(|_|BackendFailure::Unavailable)?.to_vec()))}else{None};
                 let mut state=lock(&attempt.state);state.account_alive=Some(plan.account_alive());state.alive_reference=reference;
             }

@@ -39,6 +39,8 @@ impl CommonPath{
         &self.owner==owner&&self.scope.matches(scope)&&self.scope.is_open()&&self.live.load(Ordering::Acquire)&&self.stream.ready_for(owner,scope)
     }
     pub fn close(&mut self){self.live.store(false,Ordering::Release);self.scope.close();self.assembler.close();self.controls.close();self.stream.close();}
+    #[cfg(test)]
+    pub(crate) fn gate_client_read_test(&mut self,test:Arc<super::router_runtime::tests::client_read_io::ClientReadIoTest>){self.stream.gate_client_read_test(test);}
     pub fn next_deadline(&self)->Option<Instant>{
         if !self.original(&self.owner,&self.scope){return None;}
         self.assembler.deadline().into_iter().chain(self.controls.deadline()).min()

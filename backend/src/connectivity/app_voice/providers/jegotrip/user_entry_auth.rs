@@ -11,6 +11,11 @@ impl UserEntryAuth{
     pub(in super::super) fn selector_for(&self,owner:&AttemptOwner,parent:&RpcConnectionScope)->Option<&[u8]>{self.matches(owner,parent).then_some(self.selector.as_slice())}
 }
 impl ArcRpcSession{
+    pub(in super::super) fn user_entry_auth_retained_bytes(&self)->Result<usize,CodecError>{
+        if !self.common_transport_claimed||self.phase()!=ArcPhase::Authenticated||self.connection.session_revoked(){return Err(CodecError::InvalidField);}
+        let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
+        Ok(auth.user_id.len()+auth.selected_session_id.len()+auth.token.len()+64)
+    }
     pub(in super::super) fn user_entry_auth(&self)->Result<Box<UserEntryAuth>,CodecError>{
         if !self.common_transport_claimed||self.phase()!=ArcPhase::Authenticated||self.connection.session_revoked(){return Err(CodecError::InvalidField);}
         let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
