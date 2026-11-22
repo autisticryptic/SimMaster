@@ -151,7 +151,7 @@ impl ProvisionedCommonLogin{
                 if local.as_ref().is_some_and(|r|total.checked_add(alive.len()).and_then(|n|n.checked_add(r.retained_bytes())).is_none_or(|n|n>128*1024)){return Err(ProvisionError::ResourceLimit);}Ok(local)
             });
         let local_bytes=user_entry_uid_local.as_ref().ok().and_then(|r|r.as_ref()).map_or(0,|r|r.retained_bytes());
-        let user_entry=super::user_entry_target::UserEntryTarget::from_bootstrap(reply,owner,source,destination,router,reference_key,&domain_name,&cc)
+        let user_entry:Result<Option<Arc<super::user_entry_target::UserEntryTarget>>,ProvisionError>=super::user_entry_target::UserEntryTarget::from_bootstrap(reply,owner,source,destination,router,reference_key,&domain_name,&cc)
             .map_err(|_|ProvisionError::UnsupportedReference).and_then(|target|{
                 if target.as_ref().is_some_and(|t|total.checked_add(alive.len()).and_then(|n|n.checked_add(local_bytes)).and_then(|n|n.checked_add(t.retained_bytes())).is_none_or(|n|n>128*1024)){return Err(ProvisionError::ResourceLimit);}
                 Ok(target.map(Arc::from))

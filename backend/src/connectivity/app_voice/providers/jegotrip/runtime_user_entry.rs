@@ -14,7 +14,7 @@ impl NativeHostingBackend{
     }
     /// Capture account intent before controller acquisition or recipient copy.
     /// The existing scope/budget is retained; no SDK, auxiliary ID or IO is made.
-    pub(in super::super) fn reserve_user_entry_action(&self,recipient:&[u8],gate:Arc<super::im_inbox::ImReceiptGate>,deadline:Instant)->Result<Arc<UserEntryAction>,&'static str>{
+    pub(in super::super) fn reserve_user_entry_action(&self,recipient:&[u8],gate:Arc<super::super::im_inbox::ImReceiptGate>,deadline:Instant)->Result<Arc<UserEntryAction>,&'static str>{
         super::super::user_entry_data::RecipientUri::parse(recipient).map_err(|_|"app_account_user_entry_recipient_invalid")?;
         let attempt=lock(&self.state).slot.clone().ok_or("app_account_user_entry_scope_invalid")?;
         let state=lock(&attempt.state);
