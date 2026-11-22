@@ -87,12 +87,10 @@ fn swap_answer(fields: [u32; 6], results: &[(i32, u32, &[u8])], ack: bool) -> Ve
     w.finish().expose_to_transport().to_vec()
 }
 
-fn stored_config(root: &str, port: u16, case: Case) -> n::account_config::AccountConfig {
-    let mut config = bootstrap_account_config(root, port);
-    // Only shorten the existing advertised RPC budget to the old 100-ms test
-    // deadline. No handshake, startup, IO, stack or aggregate limit is enlarged.
-    if matches!(case,Case::PreparedDeadline|Case::ControllerDeadline) { config.profile.rpc_timeout_ms = 100; }
-    config
+fn stored_config(root: &str, port: u16, _case: Case) -> n::account_config::AccountConfig {
+    // Keep the original2000-ms SDK/bootstrap RPC policy. The deadline cases
+    // cap only the original UserEntry preparation budget through a test seam.
+    bootstrap_account_config(root, port)
 }
 
 /// Expected selector/password/application/device are captured from the actual
@@ -470,9 +468,13 @@ async fn managed(case: Case) {
     let connector = Arc::new(LegacyDenied { calls: AtomicUsize::new(0) }); factory.add(connector.clone());
     let manager = Arc::new(n::account_runtime::AccountManager::with_factory(temp.database.clone(), factory.clone()));
     let config = stored_config(&wire.root, wire.port, case);
-    let original_timeout = config.runtime_profile().unwrap().rpc_timeout;
+    let original_sdk_timeout = config.runtime_profile().unwrap().rpc_timeout;
+    assert_eq!(original_sdk_timeout,Duration::from_millis(2000));
     let created = manager.create(config, 100).await.unwrap(); let line = created.account.line_id.clone();
     manager.start(&line, 1, 100).await.unwrap();
+    let cap=matches!(case,Case::PreparedDeadline|Case::ControllerDeadline).then_some(READ_DEADLINE);
+    let original_timeout=manager.test_user_entry_fixture_barrier(&line,cap).await.unwrap();
+    assert_eq!(original_timeout,cap.unwrap_or(original_sdk_timeout));
     let before = tokio::time::timeout(Duration::from_secs(10), async {
         loop { let view = manager.get(&line, 100).await.unwrap();
             if view.phase == "hosted" { break view; } tokio::task::yield_now().await;

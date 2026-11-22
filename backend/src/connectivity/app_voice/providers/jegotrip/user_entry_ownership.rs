@@ -7,17 +7,24 @@ const MAX_PENDING_BYTES:usize=128*1024;
 struct Slot{scope:RpcConnectionScope,bytes:usize,budget:Option<Arc<super::native_rpc_budget::NativeRpcReservation>>}
 struct State{retired:bool,next:Option<i32>,scopes:BTreeMap<i32,Slot>,bytes:usize}
 pub(super) struct UserEntryBook{owner:AttemptOwner,parent:RpcConnectionScope,state:Mutex<State>,changed:tokio::sync::Notify,
-    client_target:Mutex<Result<Option<Arc<super::user_entry_client_target::NewClientTarget>>,super::runtime_provision::ProvisionError>>,client_installed:AtomicBool}
+    client_target:Mutex<Result<Option<Arc<super::user_entry_client_target::NewClientTarget>>,super::runtime_provision::ProvisionError>>,client_installed:AtomicBool,
+    #[cfg(test)]query_timeout_cap:Mutex<Option<std::time::Duration>>,
+}
 impl fmt::Debug for UserEntryBook{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("UserEntryBook(<redacted>)")}}
 fn lock<T>(m:&Mutex<T>)->std::sync::MutexGuard<'_,T>{m.lock().unwrap_or_else(|e|e.into_inner())}
 impl UserEntryBook{
-    pub(super) fn original(owner:AttemptOwner,parent:RpcConnectionScope)->Arc<Self>{Arc::new(Self{owner,parent,state:Mutex::new(State{retired:false,next:Some(1),scopes:BTreeMap::new(),bytes:0}),changed:tokio::sync::Notify::new(),client_target:Mutex::new(Ok(None)),client_installed:AtomicBool::new(false)})}
+    pub(super) fn original(owner:AttemptOwner,parent:RpcConnectionScope)->Arc<Self>{Arc::new(Self{owner,parent,state:Mutex::new(State{retired:false,next:Some(1),scopes:BTreeMap::new(),bytes:0}),changed:tokio::sync::Notify::new(),client_target:Mutex::new(Ok(None)),client_installed:AtomicBool::new(false),
+        #[cfg(test)]query_timeout_cap:Mutex::new(None),
+    })}
     pub(super) fn install_client_target(&self,owner:&AttemptOwner,parent:&RpcConnectionScope,target:Result<Option<Arc<super::user_entry_client_target::NewClientTarget>>,super::runtime_provision::ProvisionError>)->Result<(),CodecError>{
         if &self.owner!=owner||!self.parent.matches(parent)||!self.live()||self.client_installed.compare_exchange(false,true,Ordering::SeqCst,Ordering::SeqCst).is_err(){return Err(CodecError::InvalidField);}
         *lock(&self.client_target)=target;Ok(())
     }
     /// Optional matched target DATA, never an auxiliary lease or SDK grant.
     pub(super) fn client_target(&self)->Result<Option<Arc<super::user_entry_client_target::NewClientTarget>>,super::runtime_provision::ProvisionError>{lock(&self.client_target).clone()}
+    /// The actual book's retirement mutex is a synchronous READ-admission
+    /// fence. Notify/waiter Drop alone cannot fence the next unregister frame.
+    pub(super) fn permits_client_read(&self,owner:&AttemptOwner,parent:&RpcConnectionScope)->bool{&self.owner==owner&&self.parent.matches(parent)&&self.live()}
     pub(super) fn acquire(self:&Arc<Self>,owner:&AttemptOwner,parent:&RpcConnectionScope,deadline:Instant)->Result<UserEntryLease,CodecError>{
         if &self.owner!=owner||!self.parent.matches(parent)||!parent.is_open()||parent.session_revoked()||Instant::now()>=deadline{return Err(CodecError::InvalidField);}
         let mut s=lock(&self.state);if s.retired||s.scopes.len()>=MAX_AUXILIARY_OPERATIONS{return Err(CodecError::TooLarge);}let id=s.next.ok_or(CodecError::TooLarge)?;
@@ -28,6 +35,11 @@ impl UserEntryBook{
     pub(super) async fn retired(&self){loop{let changed=self.changed.notified();tokio::pin!(changed);changed.as_mut().enable();if !self.live(){return;}changed.await;}}
     pub(super) async fn retired_and_empty(&self){self.retire();loop{let changed=self.changed.notified();tokio::pin!(changed);changed.as_mut().enable();if lock(&self.state).scopes.is_empty(){return;}changed.await;}}
     pub(super) fn live(&self)->bool{self.parent.is_open()&&!self.parent.session_revoked()&&!lock(&self.state).retired}
+    #[cfg(test)]pub(super) fn set_query_timeout_cap(&self,cap:Option<std::time::Duration>)->Result<(),CodecError>{
+        if !self.live()||cap.is_some_and(|value|value.is_zero()||value>std::time::Duration::from_secs(30)){return Err(CodecError::InvalidField);}
+        *lock(&self.query_timeout_cap)=cap;Ok(())
+    }
+    #[cfg(test)]pub(super) fn query_timeout_cap(&self)->Option<std::time::Duration>{*lock(&self.query_timeout_cap)}
     #[cfg(test)]pub(super) fn active(&self)->usize{lock(&self.state).scopes.len()}
     #[cfg(test)]pub(super) fn retained_bytes(&self)->usize{lock(&self.state).bytes}
 }

@@ -8,7 +8,7 @@ impl NativeHostingBackend{
         let attempt=self.original(owner).map_err(|_|UserEntryError::Scope)?;
         {let state=lock(&attempt.state);if !state.configured||state.retired||state.logout_started||state.unregister_started||!action.live()||!attempt.scope.matches(&parent)||!attempt.user_entries.live(){return Err(UserEntryError::Scope);}}
         let common=self.profile.common.as_ref().ok_or(UserEntryError::Configuration)?;
-        let query=ClientUserEntryQuery::original(action.clone(),target,&common.router)?;
+        let query=ClientUserEntryQuery::original_in_book(action.clone(),target,&common.router,attempt.user_entries.clone())?;
         let _interest=ClientReadWait::original(query.interest());
         let commands=attempt.commands(owner,&parent).map_err(|_|UserEntryError::Scope)?;
         let routing=borrowed(&self.profile.poll_routing);

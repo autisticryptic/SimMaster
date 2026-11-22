@@ -17,12 +17,16 @@ impl ClientReadInterest{
 pub(super) struct ClientReadWait{interest:Arc<ClientReadInterest>}
 impl ClientReadWait{pub(super) fn original(interest:Arc<ClientReadInterest>)->Self{Self{interest}}}
 impl Drop for ClientReadWait{fn drop(&mut self){self.interest.retire();}}
-pub(super) struct ClientUserEntryQuery{action:Arc<UserEntryAction>,target:Arc<NewClientTarget>,interest:Arc<ClientReadInterest>,factory:Zeroizing<Vec<u8>>,cc:Zeroizing<Vec<u8>>,budget:Arc<NativeRpcReservation>}
+pub(super) struct ClientUserEntryQuery{action:Arc<UserEntryAction>,target:Arc<NewClientTarget>,interest:Arc<ClientReadInterest>,book:Option<Arc<super::user_entry_ownership::UserEntryBook>>,factory:Zeroizing<Vec<u8>>,cc:Zeroizing<Vec<u8>>,budget:Arc<NativeRpcReservation>}
 impl fmt::Debug for ClientUserEntryQuery{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ClientUserEntryQuery(<redacted>)")}}
 impl ClientUserEntryQuery{
-    pub(super) fn original(action:Arc<UserEntryAction>,target:Arc<NewClientTarget>,router:&RouterPolicy)->Result<Arc<Self>,UserEntryError>{
+    /// Protocol-only constructor; production must capture the actual book.
+    #[cfg(test)]
+    pub(super) fn original(action:Arc<UserEntryAction>,target:Arc<NewClientTarget>,router:&RouterPolicy)->Result<Arc<Self>,UserEntryError>{Self::captured(action,target,router,None)}
+    pub(super) fn original_in_book(action:Arc<UserEntryAction>,target:Arc<NewClientTarget>,router:&RouterPolicy,book:Arc<super::user_entry_ownership::UserEntryBook>)->Result<Arc<Self>,UserEntryError>{Self::captured(action,target,router,Some(book))}
+    fn captured(action:Arc<UserEntryAction>,target:Arc<NewClientTarget>,router:&RouterPolicy,book:Option<Arc<super::user_entry_ownership::UserEntryBook>>)->Result<Arc<Self>,UserEntryError>{
         let owner=action.owner();let parent=action.parent();
-        if !action.live(){return Err(UserEntryError::Scope);}
+        if !action.live()||book.as_ref().is_some_and(|book|!book.permits_client_read(owner,&parent)){return Err(UserEntryError::Scope);}
         let uri=RecipientUri::parse(action.recipient()).map_err(|_|UserEntryError::Configuration)?;
         if uri.kind()==AidKind::Uid{return Err(UserEntryError::Configuration);}
         let realm=target.realm_for(owner,&parent,router).ok_or(UserEntryError::Scope)?;
@@ -33,13 +37,13 @@ impl ClientUserEntryQuery{
         // This prefix is a separate holder from the one-shot prepared request.
         let budget=parent.reserve_native_rpc(target.retained_bytes()+factory.len()+cc.len()+action.recipient().len()+128).map_err(|_|UserEntryError::Capacity)?;
         let factory=Zeroizing::new(factory.to_vec());let cc=Zeroizing::new(cc.to_vec());
-        Ok(Arc::new(Self{action,target,interest:ClientReadInterest::original(),budget,factory,cc}))
+        Ok(Arc::new(Self{action,target,interest:ClientReadInterest::original(),book,budget,factory,cc}))
     }
     pub(super) fn action(&self)->&Arc<UserEntryAction>{&self.action}
     pub(super) fn interest(&self)->Arc<ClientReadInterest>{self.interest.clone()}
     pub(super) fn deadline(&self)->Instant{self.action.deadline()}
     pub(super) fn matches(&self,owner:&AttemptOwner,parent:&RpcConnectionScope)->bool{
-        self.action.owner()==owner&&self.action.parent().matches(parent)&&self.action.live()&&!self.interest.is_retired()&&self.budget.belongs_to(parent)
+        self.action.owner()==owner&&self.action.parent().matches(parent)&&self.action.live()&&!self.interest.is_retired()&&self.budget.belongs_to(parent)&&self.book.as_ref().is_none_or(|book|book.permits_client_read(owner,parent))
     }
     pub(super) fn retained_bytes(&self)->usize{self.target.retained_bytes()+self.factory.len()+self.cc.len()+self.action.recipient().len()+128}
     pub(super) fn argument_bytes(&self)->Result<usize,UserEntryError>{let uri=RecipientUri::parse(self.action.recipient()).map_err(|_|UserEntryError::Configuration)?;super::client_user_entry_encoding::aid_arguments_bytes(uri.aid()).map_err(|_|UserEntryError::Configuration)}

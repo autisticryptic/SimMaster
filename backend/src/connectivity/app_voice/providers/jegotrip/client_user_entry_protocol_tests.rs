@@ -134,3 +134,17 @@ fn client_read_reply_footer_model_and_reply_only_last_holder_remain_charged_afte
     b.close();drop(packets);let retained=parent.native_rpc_resources();assert!(retained.0>0&&retained.1>=peak);drop(only);assert_eq!(parent.native_rpc_resources(),retained);
     drop(last);assert_eq!(parent.native_rpc_resources(),(0,0));
 }
+
+#[test]
+fn client_read_original_book_retirement_fences_query_before_waiter_drop_without_refund(){
+    let(mut b,who,parent,p)=current();let(_source,source_scope,reply)=source(&who,b"UserEntry");
+    let target=Arc::from(NewClientTarget::from_bootstrap(&reply,&who,&source_scope,&parent,&p,None,b"fixture.invalid",b"fixture-cc").unwrap().unwrap());
+    let action=UserEntryAction::original(who.clone(),parent.clone(),ImReceiptGate::fresh(),std::time::Instant::now()+std::time::Duration::from_secs(3),b"[phone:+12345@fixture.invalid]").unwrap();
+    let book=n::user_entry_ownership::UserEntryBook::original(who.clone(),parent.clone());
+    let query=ClientUserEntryQuery::original_in_book(action.clone(),target,&p,book.clone()).unwrap();let waiter=n::user_entry_client::ClientReadWait::original(query.interest());
+    let sequence=b.queue_client_user_entry(query.clone()).unwrap();let original=b.prepare_swap(1,&[]).unwrap();let charged=parent.native_rpc_resources();
+    book.retire();assert!(!query.matches(&who,&parent));assert!(!query.interest().is_retired());assert!(action.live()&&action.gate().live()&&parent.is_open());assert_eq!(parent.native_rpc_resources(),charged);
+    let unregister=b.queue_hosting(who.clone(),"uid:7_9",STATUS_UNREGISTER,&registration(),&[]).unwrap();assert_eq!(unregister,sequence+1);
+    let next=b.prepare_swap(2,&[]).unwrap();let data=payload(&next);assert!(!data.requests.contains_key(&sequence));assert!(data.requests.contains_key(&unregister));assert!(parent.is_open());
+    drop(waiter);b.retire_client_user_entry(sequence);drop(query);b.close();drop(original);drop(next);assert_eq!(parent.native_rpc_resources(),(0,0));
+}

@@ -647,6 +647,15 @@ impl NativeHostingBackend {
         lock(&attempt.state).polls_paused = paused;
         Ok(())
     }
+    #[cfg(test)]
+    pub(super) async fn user_entry_fixture_barrier(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,cap:Option<Duration>)->Result<Duration,RuntimeError>{
+        let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;
+        let _poll_admission=attempt.poll_work.lock().await;
+        if !attempt.scope.matches(scope)||!scope.is_open()||scope.session_revoked()||!attempt.user_entries.live(){return Err(RuntimeError::Scope);}
+        self.pause_original_polls_for_test(owner,scope,true)?;
+        attempt.user_entries.set_query_timeout_cap(cap).map_err(|_|RuntimeError::InvalidConfiguration)?;
+        Ok(self.user_entry_timeout())
+    }
     fn original(&self, owner: &AttemptOwner) -> Result<Arc<Attempt>, BackendFailure> {
         lock(&self.state).slot.as_ref().filter(|a| &a.owner == owner).cloned().ok_or(BackendFailure::Disconnected)
     }

@@ -3,7 +3,12 @@
 use super::*;
 use super::super::{user_entry_action::{UserEntryAction,UserEntryObservation},user_entry_rpc::{resolve_original,UserEntryError}};
 impl NativeHostingBackend{
-    pub(in super::super) fn user_entry_timeout(&self)->Duration{self.profile.rpc_timeout.min(Duration::from_secs(30))}
+    pub(in super::super) fn user_entry_timeout(&self)->Duration{
+        let original=self.profile.rpc_timeout.min(Duration::from_secs(30));
+        #[cfg(test)]
+        if let Some(attempt)=lock(&self.state).slot.clone(){if let Some(cap)=attempt.user_entries.query_timeout_cap(){return original.min(cap);}}
+        original
+    }
     pub(in super::super) fn user_entry_supported(&self,owner:&AttemptOwner)->bool{
         let Ok(attempt)=self.original(owner)else{return false;};let state=lock(&attempt.state);
         !state.retired&&!state.logout_started&&!state.unregister_started&&self.profile.common.is_some()&&attempt.user_entries.live()&&(lock(&attempt.user_entry).as_ref().is_ok_and(|target|target.is_some())||attempt.user_entries.client_target().as_ref().is_ok_and(|target|target.is_some()))

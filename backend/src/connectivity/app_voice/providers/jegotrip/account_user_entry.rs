@@ -52,6 +52,18 @@ impl AccountManager{
         if !original.live()||!Arc::ptr_eq(&original.gate(),&run.im_gate)||!run.backend.original_scope(original.owner()).is_some_and(|current|current.matches(&scope)){return Err("app_account_user_entry_scope_invalid");}
         Ok(result)
     }
+    /// Fixture-only original-run poll admission barrier and READ-only cap.
+    /// Startup/transport policy remains the actual stored profile; no identity
+    /// or handle is exported and no controller is held across the barrier.
+    #[cfg(test)]
+    pub(crate) async fn test_user_entry_fixture_barrier(&self,line:&str,cap:Option<Duration>)->Result<Duration,&'static str>{
+        let slot=self.slot(line)?;let run=lock(&slot.run).clone().ok_or("app_account_user_entry_scope_invalid")?;
+        self.current_user_entry_run(&run)?;
+        let controller=run.controller.lock().await;let owner=controller.resource_owner().ok_or("app_account_user_entry_scope_invalid")?;
+        let scope=run.backend.original_scope(&owner).ok_or("app_account_user_entry_scope_invalid")?;drop(controller);
+        let timeout=run.backend.user_entry_fixture_barrier(&owner,&scope,cap).await.map_err(|_|"app_account_user_entry_scope_invalid")?;
+        self.current_user_entry_run(&run)?;Ok(timeout)
+    }
     /// Fixture-only barrier: expose no run/scope/identity and perform no IO.
     /// Lets Actions prove controller contention and SQL revalidation without
     /// racing the original background controller against synthetic fault data.
