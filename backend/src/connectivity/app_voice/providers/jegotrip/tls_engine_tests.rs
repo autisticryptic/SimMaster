@@ -491,3 +491,4 @@ fn checked_tls_plaintext_scope_cannot_be_rebound_to_new_arc_or_delivered_after_c
 
 #[path="tls_engine_detail_tests.rs"]
 mod detail;
+pub(crate) use detail::DiagnosticCertificates;

@@ -30,4 +30,7 @@ class TlsDetailContract(unittest.TestCase):
   s=(R/'frontend/playwright.jegotrip.config.ts').read_text(encoding='utf-8');self.assertIn("'jegotrip-tls-startup-detail.spec.ts'",s);self.assertIn('timeout: 45_000',s);self.assertIn('workers: 1',s);self.assertIn('retries: 0',s);self.assertIn("VITE_API_PROXY_TARGET: 'http://127.0.0.1:1'",s)
  def test_no_scope_cycle_or_new_budget_or_reset_path_is_created_by_detail_store(self):
   s=text('native_rpc_budget.rs');self.assertIn('state:Mutex<State>,tls_detail:super::tls_failure_detail::TlsDiagnosticStore',s);d=text('tls_failure_detail.rs');self.assertIn('struct Recorded {owner:AttemptOwner,reason:TlsFailureReason}',d);self.assertNotIn('RpcConnectionScope',d);self.assertNotIn('pub(super) fn reset',d);self.assertNotIn('pub(super) fn clear',d)
+ def test_diagnostic_issuer_fixtures_are_distinct_without_changing_original_generator(self):
+  s=text('tls_engine_detail_tests.rs');self.assertIn('pub(crate) struct DiagnosticCertificates(super::Certificates)',s);self.assertIn('original.directory.file_name()',s);self.assertIn('use DiagnosticCertificates as Certificates;',s);self.assertIn('impl std::ops::Deref for DiagnosticCertificates',s);self.assertIn('R::BadSignature',s)
+  original=text('tls_engine_tests.rs');self.assertIn('"-subj", "/CN=fixture.invalid"',original);self.assertIn('pub(crate) use detail::DiagnosticCertificates;',original);self.assertIn('tls_engine::tests::DiagnosticCertificates as Certificates',text('runtime_tls_detail_tests.rs'))
 if __name__=='__main__':unittest.main()

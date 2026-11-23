@@ -1,6 +1,33 @@
 //! Original Actions-only in-memory TLS exchanges; no target keys or live Provider.
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip::tls_failure_detail::TlsFailureReason as R;
+use base64::Engine;
+use DiagnosticCertificates as Certificates;
+
+/// New diagnostics-only fixture. The original certificate generator and every
+/// old test remain unchanged. Different keys must also have different issuer
+/// subjects to exercise UnknownIssuer instead of real signature rejection.
+pub(crate) struct DiagnosticCertificates(super::Certificates);
+impl std::ops::Deref for DiagnosticCertificates {
+    type Target=super::Certificates;
+    fn deref(&self)->&Self::Target{&self.0}
+}
+impl DiagnosticCertificates {
+    pub(crate) fn generate(san:&str)->Self{
+        let mut original=super::Certificates::generate(san);
+        let subject=format!("/CN={}",original.directory.file_name().unwrap().to_str().unwrap());
+        let run=|arguments:&[&str]|{
+            assert!(std::process::Command::new("openssl").args(arguments).current_dir(&original.directory)
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().expect("Actions openssl").success());
+        };
+        run(&["req","-x509","-key","key.pem","-out","cert.pem","-days","1","-subj",&subject,
+            "-addext",&format!("subjectAltName={san}"),"-addext","basicConstraints=critical,CA:FALSE",
+            "-addext","keyUsage=critical,digitalSignature,keyEncipherment","-addext","extendedKeyUsage=serverAuth"]);
+        run(&["x509","-in","cert.pem","-outform","DER","-out","cert.der"]);
+        let der=std::fs::read(original.directory.join("cert.der")).unwrap();
+        original.root=STANDARD.encode(&der);original.certificate=CertificateDer::from(der);Self(original)
+    }
+}
 
 fn carrier_failure(cert:&Certificates,authority:&str,root:&str,reason:R){
     let original=owner();let mut protocol=ArcProtocol::new(original.clone());let scope=protocol.connection_scope();let now=Instant::now();
@@ -93,4 +120,14 @@ fn carrier_tls_detail_tls12_tls13_success_sni_and_drop_never_claim_a_failure_or_
 fn endpoint_router_tls_detail_tls12_tls13_success_sni_and_drop_never_claim_a_failure_or_sdk_grant(){
     let cert=Certificates::generate("DNS:fixture.invalid");
     for version in [&rustls::version::TLS12,&rustls::version::TLS13]{let(protocol,original,scope,engine,server,_)=endpoint_setup(&cert,version);assert_eq!(scope.tls_detail_for(&original),None);assert_eq!(engine.phase(),TlsPhase::Verified);assert_eq!(server.server_name(),Some("fixture.invalid"));assert_eq!(protocol.phase(),ArcPhase::Initial);drop(engine);assert!(!scope.is_open());assert_eq!(scope.tls_detail_for(&original),None);}
+}
+#[test]
+fn carrier_tls_detail_same_issuer_wrong_key_is_real_bad_signature_not_unknown_issuer(){
+    let cert=DiagnosticCertificates(super::Certificates::generate("DNS:fixture.invalid"));let other=DiagnosticCertificates(super::Certificates::generate("DNS:fixture.invalid"));
+    carrier_failure(&cert,"fixture.invalid",&other.root,R::BadSignature);
+}
+#[test]
+fn endpoint_router_tls_detail_same_issuer_wrong_key_is_real_bad_signature_not_unknown_issuer(){
+    let cert=DiagnosticCertificates(super::Certificates::generate("DNS:fixture.invalid"));let other=DiagnosticCertificates(super::Certificates::generate("DNS:fixture.invalid"));
+    endpoint_failure(&cert,"fixture.invalid",&other.root,R::BadSignature);
 }

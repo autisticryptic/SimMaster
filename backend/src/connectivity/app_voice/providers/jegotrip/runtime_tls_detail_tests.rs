@@ -2,6 +2,7 @@
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip::{self as n,startup_diagnostics::{StartupPhase,StartupStage},tls_failure_detail::TlsFailureReason};
 use tokio::io::AsyncWriteExt;
+use crate::connectivity::app_voice::providers::jegotrip::tls_engine::tests::DiagnosticCertificates as Certificates;
 async fn failing(kind:u8){
     let cert=Certificates::generate(if kind==0{"DNS:wrong.fixture.invalid"}else{"IP:127.0.0.1"});
     let other=Certificates::generate("IP:127.0.0.1");let root=if kind==1{&other.root}else{&cert.root};
