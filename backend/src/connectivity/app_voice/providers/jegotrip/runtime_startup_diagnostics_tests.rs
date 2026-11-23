@@ -64,3 +64,6 @@ async fn account_view_exposes_bounded_startup_failure_without_ready_and_stop_doe
 
 #[path="runtime_tls_detail_tests.rs"]
 mod tls_detail;
+
+#[path="runtime_connect_detail_tests.rs"]
+mod connect_detail;

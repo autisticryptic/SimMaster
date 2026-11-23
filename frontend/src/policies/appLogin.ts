@@ -217,6 +217,16 @@ export function startupTlsDetailLabel(failure: unknown, detail: unknown): string
   return `${labels[data.reason]}；仅本次失败分类，不授信、不恢复连接或就绪`
 }
 
+export function startupConnectDetailLabel(failure: unknown, detail: unknown): string {
+  if (typeof failure !== 'object' || failure === null || typeof detail !== 'object' || detail === null) return ''
+  const base = failure as Record<string, unknown>; const data = detail as Record<string, unknown>
+  if (!['phase', 'stage', 'code'].every((key) => Object.hasOwn(base, key)) || !['phase', 'step'].every((key) => Object.hasOwn(data, key))) return ''
+  if ((base.phase !== 'bootstrap' && base.phase !== 'account') || base.phase !== data.phase || base.stage !== 'router_connect' || base.code !== 'jegotrip_connector_timeout' || typeof data.step !== 'string') return ''
+  const labels: Record<string, string> = { dns: 'DNS准备或解析时限到达', tcp: 'TCP连接时限到达' }
+  if (!Object.hasOwn(labels, data.step)) return ''
+  return `${labels[data.step]}；仅本次超时步骤，不授信、不延长时限、不重试或恢复就绪`
+}
+
 export function deviceSyncLabel(observation: JegotripDeviceSyncObservation): string {
   if (observation.state === 'not_configured') return '未配置本人手机报告，未发送'
   if (observation.state === 'not_requested') return '本次未发送设备报告'

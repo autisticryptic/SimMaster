@@ -17,7 +17,9 @@ struct Target { router_id:i32, host:Zeroizing<String>, port:u16,
 impl Target { fn same_origin(&self,a:&RouterAnchor<'_>)->bool {
     self.router_id==a.router_id && self.host.as_str()==a.host && self.port==a.port
 } }
-pub struct RouterPolicy { reference:Zeroizing<String>, targets:Vec<Target>, identity:Arc<()> }
+pub struct RouterPolicy { reference:Zeroizing<String>, targets:Vec<Target>, identity:Arc<()>,
+    #[cfg(test)]test_connect_gate:Option<Arc<super::router_connect_detail_test_gate::RouterConnectTestGate>>,
+}
 pub(super) struct RouterPolicyIdentity(Arc<()>);
 impl RouterPolicyIdentity{pub fn matches(&self,policy:&RouterPolicy)->bool{Arc::ptr_eq(&self.0,&policy.identity)}}
 impl fmt::Debug for RouterPolicyIdentity{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RouterPolicyIdentity(<redacted>)")}}
@@ -45,7 +47,13 @@ impl RouterPolicy {
                 enable_sni:anchor.enable_sni,identity:Arc::new(())});
         }}
         if targets.is_empty() || used.iter().any(|used|!*used) {return Err(ConnectError::InvalidConfiguration);}
-        Ok(Self{reference:Zeroizing::new(reference.to_owned()),targets,identity:Arc::new(())})
+        Ok(Self{reference:Zeroizing::new(reference.to_owned()),targets,identity:Arc::new(()),
+            #[cfg(test)]test_connect_gate:None,
+        })
+    }
+    #[cfg(test)]pub(crate) fn connect_detail_test_gate(&mut self,step:super::connect_failure_detail::ConnectFailureStep)->Arc<super::router_connect_detail_test_gate::RouterConnectTestGate>{
+        assert!(self.test_connect_gate.is_none());
+        let gate=super::router_connect_detail_test_gate::RouterConnectTestGate::arm(step);self.test_connect_gate=Some(gate.clone());gate
     }
     pub(super) fn original_identity(&self)->RouterPolicyIdentity{RouterPolicyIdentity(self.identity.clone())}
     pub(super) fn len(&self)->usize {self.targets.len()}
@@ -97,9 +105,12 @@ impl RouterTcpConnector {
     pub(super) async fn connect(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,policy:&RouterPolicy)->Result<ConnectedRouterIo,ConnectError> {
         if !scope.is_open() {return Err(ConnectError::Scope);}
         let deadline=std::time::Instant::now().checked_add(self.timeout).ok_or(ConnectError::InvalidConfiguration)?;
+        let observation=super::connect_failure_detail::ConnectAttempt::original(owner,scope);
         let group=async {
             let mut attempted=Vec::<(i32,SocketAddr)>::new(); let mut resolved=0usize;
             for (index,target) in policy.targets.iter().enumerate() {
+                observation.entering(super::connect_failure_detail::ConnectFailureStep::Dns);
+                #[cfg(test)]if let Some(gate)=&policy.test_connect_gate{gate.pause(owner,scope,super::connect_failure_detail::ConnectFailureStep::Dns,deadline).await?;}
                 let lookup=prepare_socket_addrs(&target.host,target.port).map_err(|_|ConnectError::Io)?;
                 let addresses=poll_before(scope,lookup.resolve(),deadline).await?.map_err(|_|ConnectError::Io)?;
                 for address in addresses {
@@ -107,6 +118,8 @@ impl RouterTcpConnector {
                     // Do not merge equal OS targets under different original ri.
                     if attempted.contains(&(target.router_id,address)) {continue;}
                     if attempted.len()==16 {return Err(ConnectError::ResourceLimit);}attempted.push((target.router_id,address));
+                    observation.entering(super::connect_failure_detail::ConnectFailureStep::Tcp);
+                    #[cfg(test)]if let Some(gate)=&policy.test_connect_gate{gate.pause(owner,scope,super::connect_failure_detail::ConnectFailureStep::Tcp,deadline).await?;}
                     if let Ok(io)=poll_before(scope,TcpStream::connect(address),deadline).await? {
                         io.set_nodelay(true).map_err(|_|ConnectError::Io)?;
                         return ConnectedRouterIo::original(owner,scope,policy,index,io);
@@ -115,8 +128,10 @@ impl RouterTcpConnector {
             }
             Err(ConnectError::Io)
         };
-        tokio::select! {biased; _=scope.closed()=>Err(ConnectError::Scope),
-            result=tokio::time::timeout_at(deadline.into(),group)=>result.unwrap_or(Err(ConnectError::Timeout))}
+        let result=tokio::select! {biased; _=scope.closed()=>Err(ConnectError::Scope),
+            result=tokio::time::timeout_at(deadline.into(),group)=>result.unwrap_or(Err(ConnectError::Timeout))};
+        if let Err(error)=&result{observation.finish(*error);}
+        result
     }
 }
 

@@ -106,6 +106,11 @@ pub mod session;
 pub mod transport_packets;
 pub mod tls_engine;
 mod tls_failure_detail;
+mod connect_failure_detail;
+#[cfg(test)]
+pub(crate) mod router_connect_detail_test_gate;
+#[cfg(test)]
+pub(crate) mod connect_phase_test_support;
 pub mod tls_plaintext;
 pub mod transport_actor;
 pub mod runtime_connector;

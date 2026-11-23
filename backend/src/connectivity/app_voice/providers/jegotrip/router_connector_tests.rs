@@ -56,3 +56,6 @@ fn router_same_socket_different_ri_is_not_deduplicated_and_timeout_is_bounded(){
  assert_eq!(p.router_id(0).unwrap(),12001);assert_eq!(p.router_id(1).unwrap(),12002);
  for timeout in [Duration::ZERO,Duration::from_secs(11)]{assert!(RouterTcpConnector::new(timeout).is_err());}
 }
+
+#[path="router_connect_detail_tests.rs"]
+mod connect_detail;

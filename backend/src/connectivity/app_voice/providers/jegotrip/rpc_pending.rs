@@ -29,6 +29,8 @@ impl RpcConnectionScope {
     /// or budget counters. Same original branding/owner is required on read.
     pub(super) fn record_tls_detail(&self,owner:&AttemptOwner,reason:super::tls_failure_detail::TlsFailureReason){self.4.record_tls_detail(owner,reason);}
     pub(super) fn tls_detail_for(&self,owner:&AttemptOwner)->Option<super::tls_failure_detail::TlsFailureReason>{self.4.tls_detail_for(owner)}
+    pub(super) fn record_connect_timeout(&self,owner:&AttemptOwner,step:super::connect_failure_detail::ConnectFailureStep){self.4.record_connect_timeout(owner,step)}
+    pub(super) fn connect_timeout_for(&self,owner:&AttemptOwner)->Option<super::connect_failure_detail::ConnectFailureStep>{self.4.connect_timeout_for(owner)}
     /// Authenticated native session revocation is sticky for THIS scope. It is
     /// not IO closure: the owning actor may still write the one control reply
     /// before closing/Joining, but no new RPC/readiness/reconnect is admitted.

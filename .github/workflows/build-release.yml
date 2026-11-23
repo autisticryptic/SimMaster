@@ -435,6 +435,7 @@ jobs:
             connectivity::app_voice::providers::jegotrip::tls_plaintext::tests \
             connectivity::app_voice::providers::jegotrip::tls_engine::tests \
             connectivity::app_voice::providers::jegotrip::tls_failure_detail::tests \
+            connectivity::app_voice::providers::jegotrip::connect_failure_detail::tests \
             connectivity::app_voice::providers::jegotrip::transport_actor::tests \
             connectivity::app_voice::providers::jegotrip::transport_actor::native::tests \
             connectivity::app_voice::providers::jegotrip::runtime_connector::tests \

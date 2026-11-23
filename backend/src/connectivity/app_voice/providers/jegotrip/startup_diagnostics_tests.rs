@@ -144,3 +144,6 @@ async fn cancelled_native_startup_closes_io_but_does_not_fabricate_an_observed_f
 
 #[path="startup_tls_detail_tests.rs"]
 mod tls_detail;
+
+#[path="startup_connect_detail_tests.rs"]
+mod connect_detail;

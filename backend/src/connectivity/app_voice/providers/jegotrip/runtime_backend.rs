@@ -235,6 +235,9 @@ impl fmt::Debug for RuntimeProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RuntimeProfile(<redacted>)") }
 }
 impl RuntimeProfile {
+    #[cfg(test)]pub(crate) fn connect_detail_test_gate(&mut self,step:super::connect_failure_detail::ConnectFailureStep)->Result<Arc<super::router_connect_detail_test_gate::RouterConnectTestGate>,ProfileError>{
+        Ok(self.common.as_mut().ok_or(ProfileError::InvalidConfiguration)?.router.connect_detail_test_gate(step))
+    }
     /// 明确的本地消费策略，不发送新属性，不创造接收器或服务端认可。
     pub fn with_offline_reception(mut self, enabled: bool) -> Result<Self, ProfileError> {
         if self.native_receivers.is_none() {
@@ -624,6 +627,13 @@ impl NativeHostingBackend {
             if trace.snapshot(owner,scope,StartupPhase::Bootstrap).is_some(){return trace.tls_detail(owner,scope,StartupPhase::Bootstrap);}
         }
         destination.tls_detail(owner,&attempt.scope,StartupPhase::Account)
+    }
+    pub(super) fn startup_connect_detail_observation(&self,owner:&AttemptOwner)->Option<super::startup_diagnostics::StartupConnectDetail>{
+        let attempt=self.original(owner).ok()?;let(destination,bootstrap)=attempt.startup_traces.as_ref()?;
+        if let(Some(trace),Some(scope))=(bootstrap,attempt.bootstrap_scope.as_ref()){
+            if trace.snapshot(owner,scope,StartupPhase::Bootstrap).is_some(){return trace.connect_detail(owner,scope,StartupPhase::Bootstrap);}
+        }
+        destination.connect_detail(owner,&attempt.scope,StartupPhase::Account)
     }
     pub(super) fn original_incoming_binding(&self, owner: &AttemptOwner, scope: &RpcConnectionScope)
         -> Option<super::rpc_incoming::IncomingBinding<'_>> {

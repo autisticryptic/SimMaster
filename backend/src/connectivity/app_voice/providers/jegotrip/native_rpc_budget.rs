@@ -6,17 +6,19 @@ use super::{rpc_pending::RpcConnectionScope,rpc_stream::{CodecError,MAX_MAP_ENTR
 use std::{fmt,sync::{Arc,Mutex}};
 #[derive(Default)]
 struct State{entries:usize,bytes:usize}
-pub(super) struct NativeRpcBudget{state:Mutex<State>,tls_detail:super::tls_failure_detail::TlsDiagnosticStore}
+pub(super) struct NativeRpcBudget{state:Mutex<State>,tls_detail:super::tls_failure_detail::TlsDiagnosticStore,connect_detail:super::connect_failure_detail::ConnectDiagnosticStore}
 impl fmt::Debug for NativeRpcBudget{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("NativeRpcBudget(<redacted>)")}}
 fn lock<T>(m:&Mutex<T>)->std::sync::MutexGuard<'_,T>{m.lock().unwrap_or_else(|e|e.into_inner())}
 impl NativeRpcBudget{
     // Constructed only with RpcConnectionScope::fresh; cloned scopes keep the
     // same budget, whereas a genuine new account incarnation has its own one.
-    pub(super) fn original()->Arc<Self>{Arc::new(Self{state:Mutex::new(State::default()),tls_detail:super::tls_failure_detail::TlsDiagnosticStore::original()})}
+    pub(super) fn original()->Arc<Self>{Arc::new(Self{state:Mutex::new(State::default()),tls_detail:super::tls_failure_detail::TlsDiagnosticStore::original(),connect_detail:super::connect_failure_detail::ConnectDiagnosticStore::original()})}
     // This independent diagnostic slot belongs to the original scope owner.
     // It never enters the accounting lock or changes reservation counters.
     pub(super) fn record_tls_detail(&self,owner:&super::session::AttemptOwner,reason:super::tls_failure_detail::TlsFailureReason){self.tls_detail.record(owner,reason)}
     pub(super) fn tls_detail_for(&self,owner:&super::session::AttemptOwner)->Option<super::tls_failure_detail::TlsFailureReason>{self.tls_detail.for_owner(owner)}
+    pub(super) fn record_connect_timeout(&self,owner:&super::session::AttemptOwner,step:super::connect_failure_detail::ConnectFailureStep){self.connect_detail.record(owner,step)}
+    pub(super) fn connect_timeout_for(&self,owner:&super::session::AttemptOwner)->Option<super::connect_failure_detail::ConnectFailureStep>{self.connect_detail.for_owner(owner)}
     pub(super) fn reserve(self:&Arc<Self>,scope:&RpcConnectionScope,bytes:usize)->Result<Arc<NativeRpcReservation>,CodecError>{
         if !scope.is_open()||scope.session_revoked()||!scope.has_rpc_budget(self){return Err(CodecError::InvalidField);}
         if bytes>MAX_STREAM_BYTES{return Err(CodecError::TooLarge);}

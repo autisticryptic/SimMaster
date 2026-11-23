@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Alert, Button, Stack, Typography } from '@mui/material'
 import { api, type JegotripPushStatus } from '../../api/current'
-import { appLoginError, startupFailureLabel, startupTlsDetailLabel, accountAliveLabel } from '../../policies/appLogin'
+import { appLoginError, startupFailureLabel, startupTlsDetailLabel, startupConnectDetailLabel, accountAliveLabel } from '../../policies/appLogin'
 
 const warningLabels: Record<string, string> = {
   login_manager_uninitialized: '登录管理器未初始化',
@@ -55,6 +55,7 @@ export default function JegotripPushStatusPane({ open, refreshKey }: { open: boo
         {account.account_alive_state && ` · AccountAlive：${accountAliveLabel(account.account_alive_state)}`}
         {account.startup_failure && <span> · 启动连接诊断：{startupFailureLabel(account.startup_failure)}</span>}
         {startupTlsDetailLabel(account.startup_failure, account.startup_tls_detail) && <span> · TLS类别：{startupTlsDetailLabel(account.startup_failure, account.startup_tls_detail)}</span>}
+        {startupConnectDetailLabel(account.startup_failure, account.startup_connect_detail) && <span> · 连接超时步骤：{startupConnectDetailLabel(account.startup_failure, account.startup_connect_detail)}</span>}
       </Typography>)}
       {view.warnings.length > 0 && <Alert severity="warning">{view.warnings.map((code) => <Typography key={code} variant="body2">• {warningLabels[code] ?? '有未支持或未验证的推送条件'}</Typography>)}</Alert>}
       <Typography variant="caption" color="text.secondary">服务器在线推送使用原生长连接；SSE / 页面事件是本地显示，Webhook / Telegram 等是接收后的通知转发。停掉进程后没有 Android 厂商离线唤醒，勿将其视为在线收件的替代。</Typography>

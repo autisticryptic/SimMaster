@@ -7,6 +7,7 @@ use super::{common_runtime::CommonIoError,netstream_runtime::NetstreamError,
     session::AttemptOwner,transport_actor::RuntimeError};
 use serde::Serialize;
 pub use super::tls_failure_detail::TlsFailureReason;
+pub use super::connect_failure_detail::ConnectFailureStep;
 use std::{fmt,sync::Mutex};
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize)]
@@ -24,8 +25,10 @@ pub struct StartupFailure {
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize)]
 pub struct StartupTlsDetail {pub phase:StartupPhase,pub reason:TlsFailureReason}
+#[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize)]
+pub struct StartupConnectDetail {pub phase:StartupPhase,pub step:ConnectFailureStep}
 #[derive(Clone,Copy,PartialEq,Eq)]
-struct Failure {stage:StartupStage,code:&'static str,tls_reason:Option<super::tls_failure_detail::TlsFailureReason>}
+struct Failure {stage:StartupStage,code:&'static str,tls_reason:Option<super::tls_failure_detail::TlsFailureReason>,connect_step:Option<ConnectFailureStep>}
 
 pub(crate) struct StartupTrace {
     owner:AttemptOwner,scope:RpcConnectionScope,first:Mutex<Option<Failure>>,
@@ -54,6 +57,12 @@ impl StartupTrace {
             (failure.stage==StartupStage::RouterTls).then_some(failure.tls_reason).flatten().map(|reason|StartupTlsDetail{phase,reason})
         })
     }
+    pub(super) fn connect_detail(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,phase:StartupPhase)->Option<StartupConnectDetail>{
+        if &self.owner!=owner||!self.scope.matches(scope){return None;}
+        self.first.lock().unwrap_or_else(|p|p.into_inner()).and_then(|failure|{
+            (failure.stage==StartupStage::RouterConnect&&failure.code=="jegotrip_connector_timeout").then_some(failure.connect_step).flatten().map(|step|StartupConnectDetail{phase,step})
+        })
+    }
     pub(super) fn runtime(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,error:RuntimeError) {
         let code=match error {
             RuntimeError::Scope=>"jegotrip_startup_scope_invalid",RuntimeError::InvalidConfiguration=>"jegotrip_startup_configuration_invalid",
@@ -67,11 +76,12 @@ impl StartupTrace {
         // A whole-attempt timeout/close is not proof of a precise network
         // stage. A more specific captured error, if any, keeps its first slot.
         let stage=match error {RuntimeError::Scope|RuntimeError::InvalidConfiguration=>StartupStage::Preparation,_=>StartupStage::Attempt};
-        self.record(owner,scope,Failure {stage,code,tls_reason:None});
+        self.record(owner,scope,Failure {stage,code,tls_reason:None,connect_step:None});
     }
     pub(super) fn router(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,error:RouterIoError) {
         let mut failure=router_failure(error);
         if matches!(error,RouterIoError::Tls(super::tls_engine::TlsError::HandshakeFailed)){failure.tls_reason=scope.tls_detail_for(owner);}
+        if matches!(error,RouterIoError::Connect(super::runtime_connector::ConnectError::Timeout)){failure.connect_step=scope.connect_timeout_for(owner);}
         self.record(owner,scope,failure);
     }
     pub(super) fn netstream(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,error:NetstreamError) {
@@ -80,7 +90,7 @@ impl StartupTrace {
             NetstreamError::Timeout=>"jegotrip_logical_channel_timeout",NetstreamError::Entropy=>"jegotrip_logical_channel_entropy_failed",
             NetstreamError::Router(value)=>router_failure(value).code,NetstreamError::Session(_)=>"jegotrip_logical_channel_session_failed",
         };
-        self.record(owner,scope,Failure {stage:StartupStage::LogicalChannel,code,tls_reason:None});
+        self.record(owner,scope,Failure {stage:StartupStage::LogicalChannel,code,tls_reason:None,connect_step:None});
     }
     pub(super) fn common(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,error:CommonIoError) {
         let code=match error {
@@ -88,7 +98,7 @@ impl StartupTrace {
             CommonIoError::Timeout=>"jegotrip_common_startup_timeout",CommonIoError::Packet(_)=>"jegotrip_common_startup_packet_failed",
             CommonIoError::Control(_)=>"jegotrip_common_startup_control_failed",CommonIoError::Netstream(_)=>"jegotrip_common_startup_channel_failed",
         };
-        self.record(owner,scope,Failure {stage:StartupStage::CommonFraming,code,tls_reason:None});
+        self.record(owner,scope,Failure {stage:StartupStage::CommonFraming,code,tls_reason:None,connect_step:None});
     }
 }
 fn router_failure(error:RouterIoError)->Failure {
@@ -105,5 +115,5 @@ fn router_failure(error:RouterIoError)->Failure {
         RouterIoError::Timeout=>(StartupStage::RouterIo,"jegotrip_router_timeout"),RouterIoError::Entropy=>(StartupStage::RouterIo,"jegotrip_router_entropy_failed"),
         RouterIoError::Configuration=>(StartupStage::RouterIo,"jegotrip_router_configuration_invalid"),
     };
-    Failure {stage,code,tls_reason:None}
+    Failure {stage,code,tls_reason:None,connect_step:None}
 }
