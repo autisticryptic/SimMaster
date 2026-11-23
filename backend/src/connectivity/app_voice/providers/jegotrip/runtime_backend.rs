@@ -618,6 +618,13 @@ impl NativeHostingBackend {
         }
         destination.snapshot(owner,&attempt.scope,StartupPhase::Account)
     }
+    pub(super) fn startup_tls_detail_observation(&self,owner:&AttemptOwner)->Option<super::startup_diagnostics::StartupTlsDetail>{
+        let attempt=self.original(owner).ok()?;let(destination,bootstrap)=attempt.startup_traces.as_ref()?;
+        if let(Some(trace),Some(scope))=(bootstrap,attempt.bootstrap_scope.as_ref()){
+            if trace.snapshot(owner,scope,StartupPhase::Bootstrap).is_some(){return trace.tls_detail(owner,scope,StartupPhase::Bootstrap);}
+        }
+        destination.tls_detail(owner,&attempt.scope,StartupPhase::Account)
+    }
     pub(super) fn original_incoming_binding(&self, owner: &AttemptOwner, scope: &RpcConnectionScope)
         -> Option<super::rpc_incoming::IncomingBinding<'_>> {
         let attempt = self.original(owner).ok()?;

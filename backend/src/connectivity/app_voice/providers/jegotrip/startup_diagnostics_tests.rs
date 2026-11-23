@@ -141,3 +141,6 @@ async fn cancelled_native_startup_closes_io_but_does_not_fabricate_an_observed_f
     assert!(!scope.is_open());assert!(trace.snapshot(&original,&scope,StartupPhase::Account).is_none());
     tokio::time::timeout(Duration::from_secs(2),async{loop{match tcp.read(&mut bytes).await{Ok(0)|Err(_)=>break,Ok(_)=>{}}}}).await.unwrap();
 }
+
+#[path="startup_tls_detail_tests.rs"]
+mod tls_detail;

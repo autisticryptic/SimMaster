@@ -41,6 +41,7 @@ mod app_voice_accounts {
     include!("app_voice_im_user_read_http_tests.rs");
     include!("app_voice_im_reconciliation_http_tests.rs");
     include!("app_voice_user_entry_http_tests.rs");
+    include!("app_voice_tls_detail_http_tests.rs");
     include!("app_voice_uid_local_http_tests.rs");
     include!("app_voice_im_recipient_read_http_tests.rs");
     include!("app_voice_im_read_status_http_tests.rs");

@@ -302,25 +302,30 @@ impl TlsEngine {
     fn receive(&mut self, bytes: &[u8], timing: Option<RouterTiming>, now: Instant) -> Result<ReceivedTls, TlsError> {
         self.check_time(now)?;
         let was_verified = self.phase == TlsPhase::Verified;
+        let detail_scope=self.scope.clone();let detail_owner=self.owner.clone();
+        let failed=|reason|{detail_scope.record_tls_detail(&detail_owner,reason);TlsError::HandshakeFailed};
         let input = self.transport.on_bytes(&self.owner, &self.scope, bytes)?;
         let mut packets = Vec::new(); let mut record_count = 0usize;
         for input in input {
             let raw = input.expose_to_transport();
             // Allowance is shared across all carrier packets in this step.
             // Handshake ciphertext counts as well as application records.
-            for record in self.records.feed(raw)? {
+            let records=self.records.feed(raw).map_err(|error|{
+                if error==TlsError::HandshakeFailed{failed(super::tls_failure_detail::TlsFailureReason::MalformedRecord)}else{error}
+            })?;
+            for record in records {
                 record_count += 1;
                 if record_count > MAX_TLS_RECORDS_PER_STEP { return Err(TlsError::TooLarge); }
                 let mut cursor = Cursor::new(record);
                 while cursor.position() < cursor.get_ref().len() as u64 {
                     let connection = self.connection.as_mut().ok_or(TlsError::Closed)?;
-                    let count = connection.read_tls(&mut cursor).map_err(|_| TlsError::HandshakeFailed)?;
-                    if count == 0 { return Err(TlsError::HandshakeFailed); }
-                    let state = connection.process_new_packets().map_err(|_| TlsError::HandshakeFailed)?;
+                    let count = connection.read_tls(&mut cursor).map_err(|_|failed(super::tls_failure_detail::TlsFailureReason::ReadFailed))?;
+                    if count == 0 { return Err(failed(super::tls_failure_detail::TlsFailureReason::ReadFailed)); }
+                    let state = connection.process_new_packets().map_err(|error|failed(super::tls_failure_detail::TlsFailureReason::from_rustls(&error)))?;
                     if !connection.is_handshaking() && self.phase != TlsPhase::Verified {
-                        let peer = connection.peer_certificates().and_then(|certificates| certificates.first()).ok_or(TlsError::HandshakeFailed)?;
+                        let peer = connection.peer_certificates().and_then(|certificates| certificates.first()).ok_or_else(||failed(super::tls_failure_detail::TlsFailureReason::NoPeerChain))?;
                         if !crate::connectivity::core::tls_identity::has_exact_identity(peer.as_ref(), &self.authority) {
-                            return Err(TlsError::HandshakeFailed);
+                            return Err(failed(super::tls_failure_detail::TlsFailureReason::ExactNameMissing));
                         }
                         self.phase = TlsPhase::Verified;
                     }
@@ -336,7 +341,7 @@ impl TlsEngine {
                             }
                             Ok(_) => return Err(TlsError::NotReady),
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                            Err(_) => return Err(TlsError::HandshakeFailed),
+                            Err(_) => return Err(failed(super::tls_failure_detail::TlsFailureReason::ReadFailed)),
                         }
                     }
                 }

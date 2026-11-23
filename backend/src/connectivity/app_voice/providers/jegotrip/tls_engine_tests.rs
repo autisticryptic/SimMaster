@@ -488,3 +488,6 @@ fn checked_tls_plaintext_scope_cannot_be_rebound_to_new_arc_or_delivered_after_c
     protocol.close(); assert!(progress.plaintext.packets_for(&original, &scope).is_none());
     assert_eq!(engine.phase(), TlsPhase::Closed);
 }
+
+#[path="tls_engine_detail_tests.rs"]
+mod detail;

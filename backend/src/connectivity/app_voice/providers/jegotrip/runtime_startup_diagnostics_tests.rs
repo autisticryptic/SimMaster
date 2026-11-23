@@ -61,3 +61,6 @@ async fn account_view_exposes_bounded_startup_failure_without_ready_and_stop_doe
     assert_eq!(temp.database.with_conn(|c|c.query_row("SELECT COUNT(*) FROM app_voice_runtime_leases",[],|r|r.get::<_,i64>(0)).map_err(|_|"test_query_failed")).unwrap(),0);
     assert_eq!(manager.list(100).await.unwrap().len(),1);server.await.unwrap();
 }
+
+#[path="runtime_tls_detail_tests.rs"]
+mod tls_detail;

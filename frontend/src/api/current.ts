@@ -377,6 +377,10 @@ export interface JegotripStartupFailure {
   stage: 'preparation' | 'attempt' | 'router_connect' | 'router_tls' | 'router_control' | 'router_io' | 'logical_channel' | 'common_framing'
   code: string
 }
+export interface JegotripStartupTlsDetail {
+  phase: 'bootstrap' | 'account'
+  reason: 'malformed_record' | 'read_failed' | 'no_peer_chain' | 'name_mismatch' | 'exact_name_missing' | 'unknown_issuer' | 'expired' | 'not_yet_valid' | 'revoked' | 'bad_encoding' | 'bad_signature' | 'unsupported_signature' | 'invalid_purpose' | 'invalid_chain' | 'no_protocol_version' | 'no_cipher_suite' | 'peer_alert' | 'peer_protocol' | 'decryption_failed' | 'protocol_other'
+}
 export interface AppCallNotificationStatus {
   id: number
   call_history_id: number
@@ -396,6 +400,7 @@ export interface AppAccountView {
   last_error?: string
   account_alive_state?: 'absent' | 'disabled' | 'unsupported' | 'starting' | 'registering' | 'registered' | 'retrying' | 'blocked' | 'unapproved' | 'session_invalid' | 'stopped'
   startup_failure?: JegotripStartupFailure
+  startup_tls_detail?: JegotripStartupTlsDetail
   im_user_read_supported?: boolean
   im_user_read_recipient_supported?: boolean
   im_read_status_supported?: boolean

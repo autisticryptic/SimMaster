@@ -202,6 +202,21 @@ export function startupFailureLabel(failure: unknown): string {
   return `${phase} / ${stage}：${own(reasons, fields.code) ?? '未识别的原生启动错误'}（仅失败阶段观察，不恢复连接或就绪）`
 }
 
+export function startupTlsDetailLabel(failure: unknown, detail: unknown): string {
+  if (typeof failure !== 'object' || failure === null || typeof detail !== 'object' || detail === null) return ''
+  const base = failure as Record<string, unknown>; const data = detail as Record<string, unknown>
+  if (!['phase', 'stage', 'code'].every((key) => Object.hasOwn(base, key)) || !['phase', 'reason'].every((key) => Object.hasOwn(data, key))) return ''
+  if ((base.phase !== 'bootstrap' && base.phase !== 'account') || base.phase !== data.phase || base.stage !== 'router_tls' || base.code !== 'jegotrip_tls_handshake_failed' || typeof data.reason !== 'string') return ''
+  const labels: Record<string, string> = {
+    malformed_record: 'TLS记录格式无效', read_failed: 'TLS读取失败', no_peer_chain: '对端未提供验证链', name_mismatch: '验证名称不匹配', exact_name_missing: '缺少要求的精确SAN名称',
+    unknown_issuer: '信任链发行方未知', expired: '验证时间晚于有效期', not_yet_valid: '验证时间早于有效期', revoked: '验证链已撤销', bad_encoding: '验证链编码无效',
+    bad_signature: '签名校验失败', unsupported_signature: '签名算法不受支持', invalid_purpose: '验证用途不匹配', invalid_chain: '验证链无效', no_protocol_version: '协议版本不兼容',
+    no_cipher_suite: '没有兼容加密套件', peer_alert: '对端返回TLS告警', peer_protocol: '对端协议无效', decryption_failed: 'TLS解密失败', protocol_other: '其它TLS协议失败',
+  }
+  if (!Object.hasOwn(labels, data.reason)) return ''
+  return `${labels[data.reason]}；仅本次失败分类，不授信、不恢复连接或就绪`
+}
+
 export function deviceSyncLabel(observation: JegotripDeviceSyncObservation): string {
   if (observation.state === 'not_configured') return '未配置本人手机报告，未发送'
   if (observation.state === 'not_requested') return '本次未发送设备报告'

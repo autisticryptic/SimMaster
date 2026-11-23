@@ -25,6 +25,10 @@ impl RpcConnectionScope {
     pub(super) fn has_rpc_budget(&self,budget:&Arc<super::native_rpc_budget::NativeRpcBudget>)->bool{Arc::ptr_eq(&self.4,budget)}
     pub(super) fn reserve_native_rpc(&self,bytes:usize)->Result<Arc<super::native_rpc_budget::NativeRpcReservation>,CodecError>{self.4.reserve(self,bytes)}
     #[cfg(test)]pub(super) fn native_rpc_resources(&self)->(usize,usize){self.4.snapshot()}
+    /// Diagnostic DATA in an independent mutex, never the nonblocking IO gate
+    /// or budget counters. Same original branding/owner is required on read.
+    pub(super) fn record_tls_detail(&self,owner:&AttemptOwner,reason:super::tls_failure_detail::TlsFailureReason){self.4.record_tls_detail(owner,reason);}
+    pub(super) fn tls_detail_for(&self,owner:&AttemptOwner)->Option<super::tls_failure_detail::TlsFailureReason>{self.4.tls_detail_for(owner)}
     /// Authenticated native session revocation is sticky for THIS scope. It is
     /// not IO closure: the owning actor may still write the one control reply
     /// before closing/Joining, but no new RPC/readiness/reconnect is admitted.
