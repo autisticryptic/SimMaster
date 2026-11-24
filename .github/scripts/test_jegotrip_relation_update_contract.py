@@ -84,4 +84,10 @@ class RelationUpdateContracts(unittest.TestCase):
   for name in ['relation_updates_enabled','relation_update_timeout','reserve_relation_http_scratch','reserve_relation_message']:
    self.assertIn('pub(in super::super) fn '+name,s)
   self.assertIn('pub(in super::super) async fn update_relations',s);self.assertNotIn('pub fn ',s);self.assertNotIn('pub async fn ',s)
+ def test_actor_relation_exit_completes_waits_with_original_reason_before_backend_cleanup(self):
+  s=source('relation_actor.rs');clear=s[s.index('fn clear(&mut self)'):s.index('fn finish(&mut self')]
+  self.assertIn('p.permit.cancel()',clear);self.assertNotIn('reply.send',clear)
+  self.assertIn('p.reply.send(Err(error))',s);self.assertIn('impl Drop for RelationActorState',s)
+  s=source('transport_actor.rs');begin=s.index('let result = self.loop_run().await;');finish=s.index('self.backend.relation_actor_state_mut().finish(result);',begin);close=s.index('self.scope.close(); self.backend.close();',begin)
+  self.assertLess(finish,close);self.assertIn('self.scope.session_revoked()',s[begin:finish])
 if __name__=='__main__':unittest.main()

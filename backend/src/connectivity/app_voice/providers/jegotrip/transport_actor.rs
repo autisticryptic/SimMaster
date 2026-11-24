@@ -618,6 +618,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         let result = if result==RuntimeError::Closed{self.im_send_close_reason().unwrap_or(result)}else{result};
         let result = if result==RuntimeError::Closed{self.relation_close_reason().unwrap_or(result)}else{result};
         let result = if self.scope.session_revoked() { RuntimeError::SessionRevoked } else { result };
+        self.backend.relation_actor_state_mut().finish(result);
         self.scope.close(); self.backend.close(); if let Some(tls)=&mut self.tls{tls.close();}
         if let Some(common)=&mut self.common{common.close();}self.common=None;self.io = None; self.commands.close();
         while let Ok(command) = self.commands.try_recv() { let _ = command.completion.send(Err(RuntimeError::Closed)); }

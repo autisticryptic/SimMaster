@@ -5,12 +5,15 @@ pub(super) struct RelationWork{pub(super) permit:Arc<RelationPermit>,pub(super) 
 pub(super) struct RelationPending{pub(super) permit:Arc<RelationPermit>,pub(super) deadline:Instant,pub(super) reply:oneshot::Sender<Result<RelationWriteView,RuntimeError>>}
 /// Original backend-owned actor state, never part of a scope/budget Arc. This
 /// keeps the established Actor initializer shape and prevents a permit/scope
-/// reference cycle. Close cancels owned waits, but preserves its semantic reason.
+/// reference cycle. Protocol close retires permits without inventing the IO
+/// exit reason; the original Actor completes the retained wait with that reason.
 #[derive(Default)]
 pub(in super::super) struct RelationActorState{pub(super) pending:std::collections::BTreeMap<i32,RelationPending>,pub(super) retirement:Option<RuntimeError>}
 impl RelationActorState{
-    pub(in super::super) fn clear(&mut self){for(_,p)in std::mem::take(&mut self.pending){p.permit.cancel();let _=p.reply.send(Err(RuntimeError::Cancelled));}}
+    pub(in super::super) fn clear(&mut self){for p in self.pending.values(){p.permit.cancel();}}
+    pub(in super::super) fn finish(&mut self,error:RuntimeError){for(_,p)in std::mem::take(&mut self.pending){p.permit.cancel();let _=p.reply.send(Err(error));}}
 }
+impl Drop for RelationActorState{fn drop(&mut self){self.finish(RuntimeError::Cancelled);}}
 impl RuntimeCommands{
     pub(in super::super) async fn original_relation_identity(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->Result<Arc<RelationIdentity>,RuntimeError>{
         if !self.accepts(owner,scope){return Err(RuntimeError::Scope);}let(reply,data)=oneshot::channel();self.submit(owner,scope,Operation::GetRelationIdentity(reply)).await?;data.await.map_err(|_|RuntimeError::Closed)?.ok_or(RuntimeError::Scope)
