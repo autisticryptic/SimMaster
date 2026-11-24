@@ -1,3 +1,4 @@
+import type { RelationWriteBody } from '../policies/relationWrite'
 import type {
   ApiResponse,
   AutomationConfig,
@@ -1152,6 +1153,12 @@ class SimAdminCurrentAPI {
 
   async readAppNativeDirectory(lineId: string, body: { expected_revision: number; operation: 'relations' | 'properties'; group_id?: string; since: string; consent: true }) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/native-directory/read`, { method: 'POST', body: JSON.stringify(body), cache: 'no-store', timeoutMs: 35000 })
+  }
+  async getAppRelationIntents(lineId: string) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/relation-intents?limit=128`, { cache: 'no-store', timeoutMs: 10000 })
+  }
+  async updateAppRelations(lineId: string, body: RelationWriteBody) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/relation-writes`, { method: 'POST', body: JSON.stringify(body), cache: 'no-store', timeoutMs: 10000 })
   }
   async getAppRelationHistory(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/relation-writes?limit=128`, { cache: 'no-store', timeoutMs: 10000 })

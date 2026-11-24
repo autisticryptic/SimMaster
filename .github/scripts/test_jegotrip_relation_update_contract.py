@@ -120,4 +120,25 @@ class RelationUpdateContracts(unittest.TestCase):
  def test_original_start_contract_is_exact_accepted_not_fabricated_hosted_http_ok(self):
   s=(ROOT/'backend/src/api/app_voice.rs').read_text(encoding='utf-8');self.assertIn('success(StatusCode::ACCEPTED, manager.start',s)
   s=(ROOT/'backend/src/api/app_voice_relation_http_tests.rs').read_text(encoding='utf-8');self.assertIn('assert_eq!(status,StatusCode::ACCEPTED);no_store',s);self.assertIn('phase!="hosted"',s)
+ def test_new_write_editor_is_separate_and_needs_explicit_consent_nonce_and_original_installation(self):
+  p=ROOT/'frontend/src/pages/sim/AppRelationWritePane.tsx';s=p.read_text(encoding='utf-8');self.assertIn('window.confirm(',s);self.assertIn('form.consent, form.writeConsent',s);self.assertIn('if (!installed) return null',s);self.assertIn('!ready || !hosted || !body',s)
+  self.assertIn('AppRelationWritePane',(ROOT/'frontend/src/pages/sim/AppAccountsPanel.tsx').read_text(encoding='utf-8'))
+ def test_new_write_ui_uses_account_web_lock_without_unguarded_fallback_or_auto_business_retry(self):
+  s=(ROOT/'frontend/src/pages/sim/AppRelationWritePane.tsx').read_text(encoding='utf-8');self.assertIn("mode: 'exclusive', ifAvailable: true",s);self.assertIn('navigator.locks.request',s);self.assertIn('if (!lock || !active())',s)
+  for forbidden in ['setInterval','setTimeout','setAppAccountRunning','sendAppIm','imSendNotAdmitted']:self.assertNotIn(forbidden,s)
+ def test_ui_durable_opaque_marker_precedes_post_and_errors_do_not_clear_unknown(self):
+  s=(ROOT/'frontend/src/policies/relationWriteFlow.ts').read_text(encoding='utf-8');self.assertLess(s.index('storeRelationMarker(ports.storage, line, marker)'),s.index('await ports.post(body)'));self.assertIn('relationMarkerResolved(marker, after)',s);self.assertIn('relationMarkerResolved(marker, snapshot)',s);self.assertIn("return { status: 'unresolved'",s)
+  s=(ROOT/'frontend/src/policies/relationWriteStorage.ts').read_text(encoding='utf-8');self.assertIn('JSON.stringify(current) !== JSON.stringify(marker)',s);self.assertIn('loadRelationMarker(storage, line) !== null',s);self.assertNotIn('rawBody',s)
+ def test_write_input_is_cloned_before_async_and_server_identity_is_not_a_ui_field(self):
+  s=(ROOT/'frontend/src/policies/relationWriteFlow.ts').read_text(encoding='utf-8');self.assertLess(s.index('captureRelationWriteBody(input)'),s.index('await ports.read()'))
+  s=(ROOT/'frontend/src/policies/relationWrite.ts').read_text(encoding='utf-8');self.assertIn('target === \'buddy\' && groupId !== \'\'',s);self.assertIn("const nativeTypes = [11, 12, 13, 14, 15, 16, 18, 257, 258, 259, 4097]",s);self.assertIn("false : own(entry, 'flag')",s)
+ def test_nonce_ui_tags_match_original_length_prefixed_domains_and_unknown_requires_own_terminal(self):
+  s=(ROOT/'frontend/src/policies/relationWrite.ts').read_text(encoding='utf-8');self.assertIn('setBigUint64(offset, BigInt(part.length), false)',s);self.assertIn('original-relation-intent-ui-nonce-v1',s);self.assertIn('original-relation-ui-nonce-v1',s);self.assertIn('row.nonceTag === marker.intentTag && row.id > marker.afterIntent',s);self.assertIn('row.nonceTag === marker.writeTag',s)
+ def test_write_ui_generation_key_and_storage_changes_invalidate_stale_baselines(self):
+  s=(ROOT/'frontend/src/pages/sim/AppRelationWritePane.tsx').read_text(encoding='utf-8');self.assertIn('key={JSON.stringify([props.lineId, props.revision, props.hosted, props.installed])}',s);self.assertIn("window.addEventListener('storage', changed)",s);self.assertIn('current.current.generation === original.generation',s);self.assertIn('if (write) setInput(empty)',s)
+ def test_write_ui_api_uses_original_timeout_and_authenticated_finite_get_post_only(self):
+  s=(ROOT/'frontend/src/api/current.ts').read_text(encoding='utf-8');start=s.index('  async getAppRelationIntents(');end=s.index('  async getAppRelationHistory(',start);block=s[start:end];self.assertIn('relation-intents?limit=128',block);self.assertIn("method: 'POST'",block);self.assertIn("cache: 'no-store', timeoutMs: 10000",block);self.assertNotIn('65000',block)
+ def test_new_browser_and_unit_write_tests_are_appended_without_changing_existing_strict_lists(self):
+  s=(ROOT/'frontend/package.json').read_text(encoding='utf-8');self.assertIn('tests/relationHistory.test.ts tests/relationWrite.test.ts tests/relationWriteFlow.test.ts',s)
+  s=(ROOT/'frontend/playwright.jegotrip.config.ts').read_text(encoding='utf-8');self.assertIn(".concat(['jegotrip-relation-write.spec.ts'])",s);self.assertIn('timeout: 45_000',s);self.assertIn('retries: 0',s)
 if __name__=='__main__':unittest.main()
