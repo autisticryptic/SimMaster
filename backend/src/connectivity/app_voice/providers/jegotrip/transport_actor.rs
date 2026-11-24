@@ -36,6 +36,7 @@ use im_sends::{ImSendWork,ImSendPending};
 #[path="relation_actor.rs"]
 mod relations;
 use relations::{RelationWork,RelationPending};
+pub(super) use relations::RelationActorState;
 #[path="user_entry_actor.rs"]
 mod user_entry;
 #[path="client_user_entry_actor.rs"]
@@ -565,7 +566,7 @@ impl PreparedRuntime {
         let owner = self.owner.clone(); let scope = self.scope.clone();
         let actor = Actor { io: Some(io), owner: owner.clone(), scope: scope.clone(), backend, tls:Some(tls), common:None, native_attempt_end:None, commands: commands_rx,
             events: events_tx, policy, timing: self.timing, start: self.start, pending: std::collections::BTreeMap::new(),
-            logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new(),im_pending:std::collections::BTreeMap::new(),received_pending:std::collections::BTreeMap::new(),user_read_pending:std::collections::BTreeMap::new(),user_write_retirement:None,received_write_retirement:None,im_send_pending:std::collections::BTreeMap::new(),im_send_retirement:None,relation_pending:std::collections::BTreeMap::new(),relation_retirement:None };
+            logout_pending: None, unhosting_pending: None,call_pending:std::collections::BTreeMap::new(),im_pending:std::collections::BTreeMap::new(),received_pending:std::collections::BTreeMap::new(),user_read_pending:std::collections::BTreeMap::new(),user_write_retirement:None,received_write_retirement:None,im_send_pending:std::collections::BTreeMap::new(),im_send_retirement:None };
         self.attached = true;
         let task = tokio::spawn(actor.run());
         Ok((RuntimeHandle { owner, scope, commands: commands_tx, task: Some(task) }, events_rx))
@@ -602,7 +603,6 @@ struct Actor<I> {
     user_write_retirement:Option<RuntimeError>,
     received_write_retirement:Option<RuntimeError>,
     im_send_pending:std::collections::BTreeMap<i32,ImSendPending>,im_send_retirement:Option<RuntimeError>,
-    relation_pending:std::collections::BTreeMap<i32,RelationPending>,relation_retirement:Option<RuntimeError>,
 }
 impl<I> Drop for Actor<I> {
     fn drop(&mut self) {
@@ -1145,7 +1145,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if let Some(work)=send_wait{if !work.permit.submitted()||!work.permit.current(packets.call_id)||work.reply.is_closed(){work.permit.cancel();self.backend.retire_im_send(packets.call_id);let _=work.reply.send(Err(RuntimeError::Cancelled));let _=command.completion.send(Err(RuntimeError::Cancelled));return Err(RuntimeError::Cancelled);}self.pending.insert(packets.call_id,rpc_deadline);self.im_send_pending.insert(packets.call_id,ImSendPending{permit:work.permit,deadline:rpc_deadline,reply:work.reply});if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),Some(packets.call_id)))).is_err(){self.retire_im_sends(Instant::now());return Err(RuntimeError::Cancelled);}return Ok(());}
         if let Some(work)=relation_wait{
             if !work.permit.submitted()||!work.permit.current(packets.call_id)||work.reply.is_closed(){work.permit.cancel();self.backend.retire_relation_update(packets.call_id);let _=work.reply.send(Err(RuntimeError::Cancelled));let _=command.completion.send(Err(RuntimeError::Cancelled));return Err(RuntimeError::Cancelled);}
-            self.pending.insert(packets.call_id,rpc_deadline);self.relation_pending.insert(packets.call_id,RelationPending{permit:work.permit,deadline:rpc_deadline,reply:work.reply});
+            self.pending.insert(packets.call_id,rpc_deadline);self.backend.relation_actor_state_mut().pending.insert(packets.call_id,RelationPending{permit:work.permit,deadline:rpc_deadline,reply:work.reply});
             if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),Some(packets.call_id)))).is_err(){self.retire_relation_updates(Instant::now());return Err(RuntimeError::Cancelled);}return Ok(());
         }
         if !is_response { self.pending.insert(packets.call_id,rpc_deadline); }

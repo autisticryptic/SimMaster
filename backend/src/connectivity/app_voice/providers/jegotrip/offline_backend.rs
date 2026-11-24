@@ -78,6 +78,7 @@ pub struct OfflineBackend {
     call_acks:BTreeMap<(u32,i32),(CallControlTicket,bool)>,
     swaps: BTreeMap<i32, u64>,
     client_actor:super::transport_actor::ClientReadState,
+    relation_actor:Box<super::transport_actor::RelationActorState>,
 }
 
 impl fmt::Debug for OfflineBackend {
@@ -91,7 +92,7 @@ impl OfflineBackend {
     pub fn new(owner: AttemptOwner) -> Self {
         let mut protocol = ArcProtocol::new(owner);
         let tracker = protocol.take_hosting_tracker().expect("fresh ARC tracker");
-        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,client_ex:None,im_binding:None,im_pending:BTreeMap::new(),im_completed:BTreeMap::new(),status_pending:BTreeMap::new(),status_completed:BTreeMap::new(),call_pending:BTreeMap::new(),invite_pending:BTreeMap::new(),invite_completed:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new(),client_actor:super::transport_actor::ClientReadState::default() }
+        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,client_ex:None,im_binding:None,im_pending:BTreeMap::new(),im_completed:BTreeMap::new(),status_pending:BTreeMap::new(),status_completed:BTreeMap::new(),call_pending:BTreeMap::new(),invite_pending:BTreeMap::new(),invite_completed:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new(),client_actor:super::transport_actor::ClientReadState::default(),relation_actor:Box::default() }
     }
     pub fn phase(&self) -> ArcPhase { self.protocol.phase() }
     pub(super) fn is_pending(&self, id: i32) -> bool { self.protocol.is_pending(id) }
@@ -133,7 +134,7 @@ impl OfflineBackend {
     }
     pub fn close(&mut self) {
         self.protocol.close(); if let Some(s) = &mut self.scheduler { s.close(); }
-        self.tracker.retire_all();self.client_actor.clear();
+        self.tracker.retire_all();self.client_actor.clear();self.relation_actor.clear();
         self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.invite_pending.clear();self.invite_completed.clear();self.call_acks.clear();self.offline_hints.clear();
         self.swaps.clear();self.dispatcher=None;self.im_binding=None;self.im_pending.clear();self.im_completed.clear();self.status_pending.clear();self.status_completed.clear();
     }
@@ -167,6 +168,8 @@ impl OfflineBackend {
     pub(super) fn take_im_send_replies(&mut self)->Vec<super::rpc_im_send::OwnedImSendReply>{self.protocol.take_im_send_replies()}
     pub(super) fn retire_im_send(&mut self,id:i32){self.protocol.retire_im_send(id);}
     pub(super) fn captured_send_identity(&self)->Result<std::sync::Arc<super::arc_session::ImSendIdentity>,ProtocolError>{if self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField.into());}self.protocol.captured_send_identity().map_err(Into::into)}
+    pub(super) fn relation_actor_state(&self)->&super::transport_actor::RelationActorState{self.relation_actor.as_ref()}
+    pub(super) fn relation_actor_state_mut(&mut self)->&mut super::transport_actor::RelationActorState{self.relation_actor.as_mut()}
     pub(super) fn captured_relation_identity(&self)->Result<std::sync::Arc<super::arc_session::RelationIdentity>,ProtocolError>{if self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField.into());}self.protocol.captured_relation_identity().map_err(Into::into)}
     pub(super) fn prepare_relation_update(&mut self,permit:std::sync::Arc<super::relation_journal::RelationPermit>,deadline:std::time::Instant)->Result<OwnedCallPackets,ProtocolError>{
         if self.im_binding.is_none()||self.scheduler.is_none()||self.phase()!=ArcPhase::Authenticated{return Err(CodecError::InvalidField.into());}self.protocol.prepare_relation_update(permit,deadline)

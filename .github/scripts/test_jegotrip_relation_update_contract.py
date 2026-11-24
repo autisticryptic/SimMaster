@@ -75,4 +75,13 @@ class RelationUpdateContracts(unittest.TestCase):
  def test_new_ui_tests_append_to_existing_actions_lists_and_keep_budgets_and_retries(self):
   s=(ROOT/'frontend/package.json').read_text(encoding='utf-8');self.assertIn('tests/connectStartupDetail.test.ts tests/relationHistory.test.ts',s)
   s=(ROOT/'frontend/playwright.jegotrip.config.ts').read_text(encoding='utf-8');self.assertIn(".concat(['jegotrip-relation-history.spec.ts'])",s);self.assertIn('timeout: 45_000',s);self.assertIn('workers: 1',s);self.assertIn('retries: 0',s)
+ def test_relation_actor_state_preserves_original_actor_initializer_shape_and_has_no_scope_cycle(self):
+  s=source('transport_actor.rs');self.assertNotIn('relation_pending:',s);self.assertNotIn('relation_retirement:',s);self.assertIn('self.backend.relation_actor_state_mut().pending.insert',s)
+  s=source('offline_backend.rs');self.assertIn('relation_actor:Box<super::transport_actor::RelationActorState>',s);self.assertIn('self.relation_actor.clear()',s)
+  s=source('relation_actor.rs');self.assertIn('std::mem::take(&mut self.pending)',s);self.assertIn('p.permit.cancel()',s);self.assertNotIn('Arc<RelationActorState>',s)
+ def test_runtime_relation_methods_remain_internal_to_jegotrip_not_public_http_or_unrelated_providers(self):
+  s=source('runtime_relation_updates.rs')
+  for name in ['relation_updates_enabled','relation_update_timeout','reserve_relation_http_scratch','reserve_relation_message']:
+   self.assertIn('pub(in super::super) fn '+name,s)
+  self.assertIn('pub(in super::super) async fn update_relations',s);self.assertNotIn('pub fn ',s);self.assertNotIn('pub async fn ',s)
 if __name__=='__main__':unittest.main()

@@ -14,7 +14,7 @@ export function relationHistoryRows(value: unknown): RelationHistoryRow[] | null
     if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0 || ids.has(id) || typeof nonceTag !== 'string' || !/^[0-9a-f]{64}$/.test(nonceTag) || tags.has(nonceTag) || targetKind !== 'buddy' && targetKind !== 'group' || state !== 'uncertain' && state !== 'confirmed' && state !== 'rejected' && state !== 'not_sent' || !count(additions) || !count(updates) || !count(removals) || additions + updates + removals === 0) return null
     if (typeof at !== 'string' || at.length > 64 || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.[0-9]{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(at)) return null
     if (state === 'confirmed' || state === 'rejected') { if (!signed64(baseTime) || !signed64(updateTime)) return null } else if (baseTime !== null || updateTime !== null) return null
-    ids.add(id); tags.add(nonceTag); rows.push({ id, nonceTag, targetKind, state, additions, updates, removals, baseTime: baseTime as string | null, updateTime: updateTime as string | null })
+    ids.add(id); tags.add(nonceTag); rows.push({ id, nonceTag, targetKind, state, additions, updates, removals, baseTime, updateTime })
   }
   return rows
 }
