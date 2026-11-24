@@ -144,4 +144,10 @@ class RelationUpdateContracts(unittest.TestCase):
  def test_relation_target_combobox_exposes_exact_stable_accessible_name_not_selected_option_text(self):
   s=(ROOT/'frontend/src/pages/sim/AppRelationWritePane.tsx').read_text(encoding='utf-8');self.assertIn("SelectDisplayProps: { 'aria-label': '关系修改目标', 'aria-labelledby': undefined }",s)
   s=(ROOT/'frontend/e2e/jegotrip-relation-write.spec.ts').read_text(encoding='utf-8');self.assertIn("getByRole('combobox', { name: '关系修改目标', exact: true })",s)
+ def test_new_group_write_browser_fixture_is_valid_borrowed_json_not_weakened_button_assertion(self):
+  import json,re
+  s=(ROOT/'frontend/e2e/jegotrip-relation-write.spec.ts').read_text(encoding='utf-8');inputs=re.findall(r"\.fill\('([^']*)'\)",s)
+  arrays=[value for value in inputs if value.startswith('[')];self.assertGreaterEqual(len(arrays),5)
+  for value in arrays:self.assertIsInstance(json.loads(value),list)
+  self.assertIn('await expect(send).toBeEnabled(); await send.click();',s);self.assertIn("group_id: '1+2'",s)
 if __name__=='__main__':unittest.main()
