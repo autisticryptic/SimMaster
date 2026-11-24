@@ -76,6 +76,7 @@ pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
     receipts::initialize_schema(conn)?;
     user_reads::initialize_schema(conn)?;
     outbox::initialize_schema(conn)?;
+    super::relation_journal::initialize_schema(conn)?;
     read_status::initialize_schema(conn)
 }
 

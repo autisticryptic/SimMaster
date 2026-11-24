@@ -11,6 +11,8 @@ mod received_writes;
 mod user_reads;
 #[path="im_send_io_tests.rs"]
 mod sends;
+#[path="relation_io_tests.rs"]
+mod relations;
 #[path="im_info_runtime_io_tests.rs"]
 mod info;
 #[path="group_directory_io_tests.rs"]

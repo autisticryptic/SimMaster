@@ -50,13 +50,18 @@ impl fmt::Debug for ArcLoginInputs<'_> {
 #[path="im_send_identity.rs"]
 mod send_identity;
 pub(super) use send_identity::ImSendIdentity;
+#[path="relation_identity.rs"]
+mod relation_identity;
+pub(super) use relation_identity::RelationIdentity;
+#[path="rpc_relation_update_session.rs"]
+mod relation_session;
 struct ArcAuthentication { user_id: Vec<u8>, selected_session_id: Vec<u8>, token: Vec<u8> }
 impl Drop for ArcAuthentication {
     fn drop(&mut self) { self.user_id.zeroize(); self.selected_session_id.zeroize(); self.token.zeroize(); }
 }
 
 #[derive(Clone, Copy)]
-enum PendingKind { Bootstrap, Login, Swap, Logout, Call, ImRead, ImWrite, UserRead, ImSend, Offline { position: i64 } }
+enum PendingKind { Bootstrap, Login, Swap, Logout, Call, ImRead, ImWrite, UserRead, ImSend, RelationUpdate, Offline { position: i64 } }
 struct PendingCall{ticket:CallControlTicket,operation:CallOperation}
 
 struct PendingRpc {
@@ -89,6 +94,8 @@ pub struct ArcRpcSession {
     received_replies:Vec<super::rpc_im_received::OwnedReceivedReply>,
     user_read_replies:Vec<super::im_user_read_rpc::OwnedUserReadReply>,
     send_replies:Vec<super::rpc_im_send::OwnedImSendReply>,
+    relation_requests:BTreeMap<i32,Arc<super::rpc_relation_update::RelationRpcRequest>>,
+    relation_replies:Vec<super::rpc_relation_update::OwnedRelationReply>,
 }
 
 impl fmt::Debug for ArcRpcSession {
@@ -197,7 +204,7 @@ impl ArcRpcSession {
         let alive=super::alive_session::AliveLink::original(owner.clone(),connection.clone());
         Self { owner, connection, phase: ArcPhase::Initial,
             next_id: Some(1), pending: BTreeMap::new(), authentication: None, hosting_tracker_taken: false,
-            batch_scheduler_taken: false, packet_transport_taken: false,common_transport_claimed:false,common_identity:None,main_account:None,login_uri:None,login_application:None,login_domain:None,call_book,alive,im_replies:Vec::new(),received_replies:Vec::new(),user_read_replies:Vec::new(),send_replies:Vec::new() }
+            batch_scheduler_taken: false, packet_transport_taken: false,common_transport_claimed:false,common_identity:None,main_account:None,login_uri:None,login_application:None,login_domain:None,call_book,alive,im_replies:Vec::new(),received_replies:Vec::new(),user_read_replies:Vec::new(),send_replies:Vec::new(),relation_requests:BTreeMap::new(),relation_replies:Vec::new() }
     }
 
     pub fn connection_scope(&self) -> RpcConnectionScope { self.connection.clone() }
@@ -522,6 +529,7 @@ impl ArcRpcSession {
     /// Retire timeouts explicitly. A submitted login may have changed remote
     /// state, so cancelling it closes this incarnation rather than reopening it.
     pub fn retire_request(&mut self, id: i32) {
+        self.relation_requests.remove(&id);
         if self.pending.remove(&id).is_some_and(|pending| matches!(pending.kind, PendingKind::Login | PendingKind::Logout)) {
             self.close();
         }
@@ -535,7 +543,7 @@ impl ArcRpcSession {
         if let Some(account)=&mut self.main_account{account.zeroize();}self.main_account=None;
         if let Some(uri)=&mut self.login_uri{uri.zeroize();}self.login_uri=None;
         if let Some(app)=&mut self.login_application{app.zeroize();}self.login_application=None;if let Some(domain)=&mut self.login_domain{domain.zeroize();}self.login_domain=None;
-        self.pending.clear();self.im_replies.clear();self.received_replies.clear();self.user_read_replies.clear();self.send_replies.clear();self.call_book.close();self.alive.close();
+        self.pending.clear();self.im_replies.clear();self.received_replies.clear();self.user_read_replies.clear();self.send_replies.clear();self.relation_requests.clear();self.relation_replies.clear();self.call_book.close();self.alive.close();
     }
 
     pub fn accepts_scope(&self, owner: &AttemptOwner, connection: &RpcConnectionScope) -> bool {
@@ -561,6 +569,7 @@ impl ArcRpcSession {
         };
         let Some(mut pending) = self.pending.remove(&reply.call_id) else { return Ok(None); };
         let result = match pending.kind {
+            PendingKind::RelationUpdate=>{self.captured_relation_reply(reply.call_id,owner,connection,reply.result_code,reply.result_stream)?;return Ok(None);},
             PendingKind::ImRead=>{
                 let Some(request)=pending.im.take()else{self.close();return Err(CodecError::InvalidField);};
                 // A fully submitted READ has no durable remote write to

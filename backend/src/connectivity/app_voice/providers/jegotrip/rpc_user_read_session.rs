@@ -14,8 +14,8 @@ impl ArcRpcSession{
         permit.arm(id,deadline).map_err(|_|CodecError::InvalidField)?;self.next_id=id.checked_add(1);
         self.pending.insert(id,PendingRpc{kind:PendingKind::UserRead,selected_session_id:None,scheduler:None,call:None,im:None,received:None,user_read:Some(UserReadRpcRequest::original(permit,id,budget)?),send:None});Ok((id,bytes))
     }
-    pub(in super::super) fn im_reply_count(&self)->usize{self.im_replies.len()+self.received_replies.len()+self.user_read_replies.len()+self.send_replies.len()}
-    pub(in super::super) fn im_reply_bytes(&self)->usize{self.im_replies.iter().map(|r|r.retained_bytes()).chain(self.received_replies.iter().map(|r|r.retained_bytes())).chain(self.user_read_replies.iter().map(|r|r.retained_bytes())).chain(self.send_replies.iter().map(|r|r.retained_bytes())).sum()}
+    pub(in super::super) fn im_reply_count(&self)->usize{self.im_replies.len()+self.received_replies.len()+self.user_read_replies.len()+self.send_replies.len()+self.relation_replies.len()}
+    pub(in super::super) fn im_reply_bytes(&self)->usize{self.im_replies.iter().map(|r|r.retained_bytes()).chain(self.received_replies.iter().map(|r|r.retained_bytes())).chain(self.user_read_replies.iter().map(|r|r.retained_bytes())).chain(self.send_replies.iter().map(|r|r.retained_bytes())).chain(self.relation_replies.iter().map(|r|r.retained_bytes())).sum()}
     pub(in super::super) fn take_user_read_replies(&mut self)->Vec<OwnedUserReadReply>{std::mem::take(&mut self.user_read_replies)}
     pub(in super::super) fn retire_user_read_write(&mut self,id:i32){if self.pending.get(&id).is_some_and(|p|matches!(p.kind,PendingKind::UserRead)){self.pending.remove(&id);}}
     pub(super) fn captured_user_read_reply(&mut self,request:Arc<UserReadRpcRequest>,owner:&AttemptOwner,scope:&RpcConnectionScope,code:u32,bytes:&[u8])->Result<(),CodecError>{

@@ -410,6 +410,7 @@ export interface AppAccountView {
   im_user_read_recipient_supported?: boolean
   im_read_status_supported?: boolean
   im_read_status_recipient_supported?: boolean
+  relation_updates_supported?: boolean
   im_send_supported?: boolean
   im_reconciliation_supported?: boolean
   directory_queries_supported?: boolean
@@ -1151,6 +1152,9 @@ class SimAdminCurrentAPI {
 
   async readAppNativeDirectory(lineId: string, body: { expected_revision: number; operation: 'relations' | 'properties'; group_id?: string; since: string; consent: true }) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/native-directory/read`, { method: 'POST', body: JSON.stringify(body), cache: 'no-store', timeoutMs: 35000 })
+  }
+  async getAppRelationHistory(lineId: string) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/relation-writes?limit=128`, { cache: 'no-store', timeoutMs: 10000 })
   }
   async getAppImMessages(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-messages?limit=16`, { cache: 'no-store', timeoutMs: 10000 })

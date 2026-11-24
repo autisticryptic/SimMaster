@@ -39,6 +39,8 @@ mod user_read;
 mod read_status;
 #[path="runtime_im_send.rs"]
 mod im_send;
+#[path="runtime_relation_updates.rs"]
+mod relation_updates;
 #[path="runtime_read_status_recipient.rs"]
 mod read_status_recipient;
 #[path="runtime_user_read_recipient.rs"]
@@ -229,6 +231,7 @@ pub struct RuntimeProfile {
     im_user_read:Option<super::im_user_read_policy::NativeUserReadConfig>,
     im_read_status:Option<super::im_read_status_policy::NativeReadStatusConfig>,
     im_send:Option<super::im_send_policy::NativeImSendConfig>,
+    relation_updates:Option<super::relation_update_policy::NativeRelationUpdateConfig>,
     io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>,native_call_control:bool,byte_length:usize,
 }
 impl fmt::Debug for RuntimeProfile {
@@ -300,6 +303,12 @@ impl RuntimeProfile {
         add_bytes(&mut self.byte_length,16)?;self.im_sync=Some(*config);Ok(self)
     }
     pub(super) fn with_im_send(mut self,config:Option<&super::im_send_policy::NativeImSendConfig>)->Result<Self,ProfileError>{let Some(config)=config else{return Ok(self);};config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;if self.im_send.is_some()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}add_bytes(&mut self.byte_length,64+config.auth_country_code.as_ref().map_or(0,String::len))?;self.im_send=Some(config.clone());Ok(self)}
+    pub(super) fn with_relation_updates(mut self,config:Option<super::relation_update_policy::NativeRelationUpdateConfig>)->Result<Self,ProfileError>{
+        let Some(config)=config else{return Ok(self);};
+        config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;
+        if self.relation_updates.is_some()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}
+        add_bytes(&mut self.byte_length,std::mem::size_of_val(&config))?;self.relation_updates=Some(config);Ok(self)
+    }
     pub(super) fn with_im_read_status(mut self,config:Option<&super::im_read_status_policy::NativeReadStatusConfig>)->Result<Self,ProfileError>{
         let Some(config)=config else{return Ok(self);};config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;
         if self.im_read_status.is_some()||self.common.is_none()||!self.client_ex||self.im_sync.is_none()||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}
@@ -425,7 +434,7 @@ impl RuntimeProfile {
             poll_routing, logout_routing, incoming, offline_reception: false, client_ex: false, reference_decode_key: input.reference_decode_key,
             native_receivers: None,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
-            account_alive:None,im_sync:None,im_receipts:None,im_user_read:None,im_read_status:None,im_send:None,io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
+            account_alive:None,im_sync:None,im_receipts:None,im_user_read:None,im_read_status:None,im_send:None,relation_updates:None,io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
         })
     }
 }

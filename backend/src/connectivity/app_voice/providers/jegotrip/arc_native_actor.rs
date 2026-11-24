@@ -80,7 +80,7 @@ impl ConnectedCommonRuntime{
         if !common.is_open_for(&owner,&scope)||!backend.connection_scope().matches(&scope){return Err(RuntimeError::Scope);}
         let(commands_tx,commands_rx)=mpsc::channel(MAX_COMMANDS);let(events_tx,events_rx)=mpsc::channel(MAX_EVENTS);
         let actor:Actor<super::super::runtime_connector::BoxRuntimeIo>=Actor{io:None,owner:owner.clone(),scope:scope.clone(),backend,tls:None,common:Some(common),native_attempt_end:Some(self.attempt_end),
-            commands:commands_rx,events:events_tx,policy,timing:None,start:self.start,pending:std::collections::BTreeMap::new(),logout_pending:None,unhosting_pending:None,call_pending:std::collections::BTreeMap::new(),im_pending:std::collections::BTreeMap::new(),received_pending:std::collections::BTreeMap::new(),user_read_pending:std::collections::BTreeMap::new(),user_write_retirement:None,received_write_retirement:None,im_send_pending:std::collections::BTreeMap::new(),im_send_retirement:None};
+            commands:commands_rx,events:events_tx,policy,timing:None,start:self.start,pending:std::collections::BTreeMap::new(),logout_pending:None,unhosting_pending:None,call_pending:std::collections::BTreeMap::new(),im_pending:std::collections::BTreeMap::new(),received_pending:std::collections::BTreeMap::new(),user_read_pending:std::collections::BTreeMap::new(),user_write_retirement:None,received_write_retirement:None,im_send_pending:std::collections::BTreeMap::new(),im_send_retirement:None,relation_pending:std::collections::BTreeMap::new(),relation_retirement:None};
         self.attached=true;let task=tokio::spawn(actor.run());
         Ok((RuntimeHandle{owner,scope,commands:commands_tx,task:Some(task)},events_rx))
     }

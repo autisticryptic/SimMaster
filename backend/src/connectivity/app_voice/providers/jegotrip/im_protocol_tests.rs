@@ -22,6 +22,8 @@ mod sends;
 mod info;
 #[path="group_directory_protocol_tests.rs"]
 mod directory;
+#[path="relation_protocol_tests.rs"]
+mod relations;
 struct Fixture{owner:AttemptOwner,scope:RpcConnectionScope,backend:OfflineBackend,temp:TempDatabase,run:Arc<account_runs::RunToken>,gate:Arc<ImReceiptGate>}
 impl Fixture{
     fn new(enabled:bool)->Self{Self::with_info(enabled,false)}

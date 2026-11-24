@@ -30,7 +30,8 @@ pub(super) fn encode_relations(identifier:&[u8],since:i64)->Result<RpcBytes,Code
 pub(super) fn encode_properties(group:GroupId<'_>)->Result<RpcBytes,CodecError>{
     let mut w=Writer::versioned()?;w.bytes(group.bytes())?;w.u32(1)?;w.bytes(b"")?;Ok(w.finish())
 }
-pub(super) struct Relation<'a>{pub(super) label:&'a[u8],pub(super) flags:u32,pub(super) first:&'a[u8],pub(super) second:&'a[u8],pub(super) properties:Vec<RpcProperty<'a>>}
+/// Private wire-shaped INPUT/READ DATA inside this crate, never a runtime grant.
+pub(crate) struct Relation<'a>{pub(crate) label:&'a[u8],pub(crate) flags:u32,pub(crate) first:&'a[u8],pub(crate) second:&'a[u8],pub(crate) properties:Vec<RpcProperty<'a>>}
 impl fmt::Debug for Relation<'_>{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("OriginalRelation(<redacted>)")}}
 fn relations<'a>(r:&mut Reader<'a>)->Result<Vec<Relation<'a>>,CodecError>{
     // 3F6C64 count -> label STRING -> 3F6BF8 u32/two STRING/property map.

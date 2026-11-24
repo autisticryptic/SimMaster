@@ -36,6 +36,9 @@ mod im_send;
 #[path="account_directory.rs"]
 mod directory;
 pub use directory::{DirectoryReadView,PreparedDirectoryRead};
+#[path="account_relation_updates.rs"]
+mod relations;
+pub(crate) use relations::PreparedRelationUpdate;
 
 pub trait AccountBackendFactory: Send + Sync {
     /// Construction only. Network work remains inside the original-owned
@@ -94,6 +97,9 @@ pub struct AccountView {
     /// Separate finite DNS/TCP timeout step, never a TLS cause or retry grant.
     #[serde(skip_serializing_if="Option::is_none")]
     pub startup_connect_detail:Option<super::startup_diagnostics::StartupConnectDetail>,
+    /// Installed independent relation operation, not a WRITE/current SDK grant.
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub relation_updates_supported:Option<bool>,
     /// Installed runtime operation only, not a user-read or SDK authorization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub im_user_read_supported:Option<bool>,
@@ -126,7 +132,7 @@ fn view(metadata: AccountMetadata, phase: Phase, cleanup: bool, error: Option<&'
         // A hosted SDK acknowledgement is not verified SMS/call/media support.
         incoming_call_ready: false, incoming_message_ready: false, outbound_authorized: false,
         provider_availability: "unsupported", manual_start_required: true, cleanup_on_disconnect: None, cleanup_error: None,
-        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, account_alive_state:None, startup_failure:None, startup_tls_detail:None, startup_connect_detail:None, im_user_read_supported:None, im_user_read_recipient_supported:None, im_read_status_supported:None, im_read_status_recipient_supported:None, im_send_supported:None, im_reconciliation_supported:None, directory_queries_supported:None, user_entry_supported:None, user_entry_uid_local_supported:None, last_error: error }
+        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, account_alive_state:None, startup_failure:None, startup_tls_detail:None, startup_connect_detail:None, relation_updates_supported:None, im_user_read_supported:None, im_user_read_recipient_supported:None, im_read_status_supported:None, im_read_status_recipient_supported:None, im_send_supported:None, im_reconciliation_supported:None, directory_queries_supported:None, user_entry_supported:None, user_entry_uid_local_supported:None, last_error: error }
 }
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
@@ -185,6 +191,7 @@ struct ManagedRun {
     revision: u64,
     inbox_nonce: String,
     run_token: Arc<RunToken>,
+    relation_configuration:Option<Arc<super::relation_journal::RelationConfiguration>>,
     finalized: AtomicBool,
     notifications: Option<Arc<dyn NoticePlanner>>,
     sms_supported: bool,
@@ -438,6 +445,7 @@ impl AccountManager {
             snapshot.startup_failure=run.backend.startup_failure_observation(&owner);
             snapshot.startup_tls_detail=run.backend.startup_tls_detail_observation(&owner);
             snapshot.startup_connect_detail=run.backend.startup_connect_detail_observation(&owner);
+            snapshot.relation_updates_supported=Some(run.backend.relation_updates_enabled());
         }
         if run.reconnect.is_some() {
             snapshot.reconnect_attempt = Some(run.reconnect_attempt);
@@ -669,7 +677,7 @@ impl AccountManager {
         }
         let metadata = self.check_revision(line_id, expected_revision)?;
         self.require_released(line_id,&slot).await?;
-        let StoredAccount { metadata: stored, config } = self.database.with_conn(|conn| account_store::load(conn, line_id))?
+        let (StoredAccount { metadata: stored, config },relation_configuration) = self.database.with_conn(|conn| relations::load_original_account(conn,line_id))?
             .ok_or("app_account_not_found")?;
         if stored.revision != metadata.revision { return Err("app_account_revision_conflict"); }
         config.validate(now)?;
@@ -690,7 +698,7 @@ impl AccountManager {
         let im_gate=super::im_inbox::ImReceiptGate::fresh();
         let read_status_targets=backend.im_read_status_enabled().then(||super::im_inbox::ReadStatusTargets::original(self.database.clone(),run_token.clone(),im_gate.clone(),self.read_status_budget.clone()));
         let run = Arc::new(ManagedRun { line_id: line_id.to_owned(), database: self.database.clone(), revision: metadata.revision,
-            inbox_nonce, run_token, finalized: AtomicBool::new(false), notifications:self.notifications.clone(),
+            inbox_nonce, run_token, relation_configuration, finalized: AtomicBool::new(false), notifications:self.notifications.clone(),
             sms_supported, credential_expiry, cleanup_on_disconnect,
             reconnect, reconnect_attempt, hosted_once: AtomicBool::new(false), supervisor: lock(&self.supervisor).clone(),
             reconnect_task: Mutex::new(None), reconnect_state: Mutex::new(None), reconnect_error: Mutex::new(None),

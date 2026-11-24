@@ -342,6 +342,7 @@ pub(super) fn delete_private_for_account(conn:&Connection,line:&str)->Result<(),
     }
     super::offline_inbox::delete_account(conn, line)?;
     super::im_inbox::delete_account(conn, line)?;
+    super::relation_journal::delete_account(conn, line)?;
     account_notifications::cancel_account(conn,line)?;
     account_runs::delete_account_state(conn,line)?;
     Ok(())

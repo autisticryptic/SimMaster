@@ -44,11 +44,15 @@ impl TransportError {
     }
 }
 
-pub struct TransportBytes(Vec<u8>,Option<std::sync::Arc<super::client_packet_retention::ClientPacketRetention>>);
+// Typed lifetime holders only, never conversions between READ and WRITE grants.
+#[allow(dead_code)]
+enum PacketRetention{Client(std::sync::Arc<super::client_packet_retention::ClientPacketRetention>),Relation(std::sync::Arc<super::rpc_relation_update::RelationRpcRequest>)}
+pub struct TransportBytes(Vec<u8>,Option<PacketRetention>);
 
 impl TransportBytes {
     pub(super) fn from_bytes(bytes: Vec<u8>) -> Self { Self(bytes,None) }
-    pub(super) fn retain_client_packet(&mut self,guard:std::sync::Arc<super::client_packet_retention::ClientPacketRetention>){self.1=Some(guard);}
+    pub(super) fn retain_client_packet(&mut self,guard:std::sync::Arc<super::client_packet_retention::ClientPacketRetention>){let guard=PacketRetention::Client(guard);self.1=Some(guard);}
+    pub(super) fn retain_relation_packet(&mut self,guard:std::sync::Arc<super::rpc_relation_update::RelationRpcRequest>){let guard=PacketRetention::Relation(guard);self.1=Some(guard);}
     pub fn expose_to_transport(&self) -> &[u8] { &self.0 }
 }
 

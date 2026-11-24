@@ -46,6 +46,12 @@ pub(crate) mod im_text;
 pub(crate) mod im_info;
 pub(crate) mod im_content;
 pub(crate) mod group_directory_data;
+pub(crate) mod group_relation_updates;
+pub(crate) mod relation_update_policy;
+pub(crate) mod relation_journal;
+#[cfg(test)]
+pub(crate) mod relation_http_test_peer;
+mod rpc_relation_update;
 pub(crate) mod im_status;
 mod im_status_delivery;
 pub(crate) mod im_receive_state;
