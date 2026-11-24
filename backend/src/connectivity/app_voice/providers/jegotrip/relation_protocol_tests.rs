@@ -1,4 +1,6 @@
 //! Actions-only original SDK/SQLite/RPC relation WRITEs, never a live peer.
+#[path="relation_intent_protocol_tests.rs"]
+mod admission;
 use super::*;
 use n::{group_directory_data::Relation,group_relation_updates::Removal,relation_update_policy::NativeRelationUpdateConfig as Policy,
     relation_journal::{RelationAction,RelationMessage,RelationPermit,PreparedRelation}};

@@ -2,7 +2,7 @@
 //! No new login, auxiliary lookup, automatic relation retry or route conversion.
 use super::*;
 use super::super::{account_runs::RunToken,group_directory_data::Relation,group_relation_updates::Removal,
-    im_inbox::ImReceiptGate,relation_journal::{RelationMessage,RelationAction,PreparedRelation,RelationWait,RelationWriteView,RelationConfiguration}};
+    im_inbox::ImReceiptGate,relation_journal::{RelationMessage,PreparedRelation,RelationWait,RelationWriteView,RelationConfiguration,RelationIntent}};
 impl NativeHostingBackend{
     pub(in super::super) fn relation_updates_enabled(&self)->bool{self.profile.relation_updates.is_some()&&self.im_messages_enabled()}
     pub(in super::super) fn relation_update_timeout(&self)->Duration{self.profile.rpc_timeout}
@@ -23,20 +23,23 @@ impl NativeHostingBackend{
         let message=RelationMessage::capture(&attempt.scope,group,adds,updates,removes,nonce,policy)?;
         Ok((attempt.owner.clone(),attempt.scope.clone(),message))
     }
-    pub(in super::super) async fn update_relations(&self,database:Arc<crate::platform::db::Database>,run:Arc<RunToken>,parent_gate:Arc<ImReceiptGate>,owner:AttemptOwner,scope:RpcConnectionScope,message:RelationMessage,deadline:Instant,configuration:Arc<RelationConfiguration>)->Result<RelationWriteView,&'static str>{
+    pub(in super::super) async fn update_relations(&self,database:Arc<crate::platform::db::Database>,run:Arc<RunToken>,parent_gate:Arc<ImReceiptGate>,owner:AttemptOwner,scope:RpcConnectionScope,message:Arc<RelationMessage>,deadline:Instant,configuration:Arc<RelationConfiguration>,intent:Arc<RelationIntent>)->Result<RelationWriteView,&'static str>{
         if !self.relation_updates_enabled()||!parent_gate.live(){return Err("app_account_relation_not_installed");}
+        if !intent.belongs_to(&database,&run,&configuration,&parent_gate,&owner,&scope,&message,deadline){return Err("app_account_relation_scope_invalid");}
         let policy=self.profile.relation_updates.ok_or("app_account_relation_not_installed")?;let attempt=self.original(&owner).map_err(|_|"app_account_relation_scope_invalid")?;
         {
             let state=lock(&attempt.state);
             if !state.configured||state.retired||state.logout_started||state.unregister_started||!attempt.scope.matches(&scope){return Err("app_account_relation_scope_invalid");}
         }
         let commands=attempt.commands(&owner,&scope).map_err(|_|"app_account_relation_scope_invalid")?;
+        let intent_gate=intent.gate();
         let preparation=Box::pin(async{
             let binding=commands.original_im_binding(&owner,&scope).await.map_err(|_|"app_account_relation_scope_invalid")?;
             let identity=commands.original_relation_identity(&owner,&scope).await.map_err(|_|"app_account_relation_scope_invalid")?;
-            RelationAction::original_with_configuration(database,run,binding,identity,parent_gate.clone(),message,deadline,policy,configuration)
+            intent.bind(binding,identity,policy)
         });
         let prepared=tokio::select!{biased;
+            _=intent_gate.retired()=>return Err("app_account_relation_scope_invalid"),
             _=parent_gate.retired()=>return Err("app_account_relation_scope_invalid"),
             _=scope.session_ended()=>return Err("app_account_relation_scope_invalid"),
             result=tokio::time::timeout_at(deadline.into(),preparation)=>result.map_err(|_|"app_account_relation_timeout")??,

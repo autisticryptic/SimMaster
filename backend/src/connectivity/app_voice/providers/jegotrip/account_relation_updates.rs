@@ -3,7 +3,7 @@
 //! first await; UID/selector/token and an active RPC permit never come from HTTP.
 use super::*;
 use super::super::{group_directory_data::Relation,group_relation_updates::Removal,
-    relation_journal::{RelationMessage,RelationWriteView,RelationConfiguration}};
+    relation_journal::{RelationMessage,RelationWriteView,RelationConfiguration,RelationIntent,IntentAdmission,RelationIntentWait,RelationIntentView}};
 /// The existing stored config and relation fingerprint share one SQLite read
 /// snapshot before factory construction. A later same-revision blob change
 /// cannot replace the policy/credentials of this original runtime.
@@ -16,7 +16,7 @@ pub(super) fn load_original_account(c:&rusqlite::Connection,line:&str)->Result<O
 pub(crate) struct RelationHttpScratch(Arc<super::super::native_rpc_budget::NativeRpcReservation>);
 impl std::fmt::Debug for RelationHttpScratch{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str("RelationHttpScratch(<redacted>)")}}
 impl RelationHttpScratch{pub(crate) fn matches(&self,prepared:&PreparedRelationUpdate)->bool{self.0.belongs_to(&prepared.scope)}}
-pub(crate) struct PreparedRelationUpdate{run:Arc<ManagedRun>,owner:AttemptOwner,scope:RpcConnectionScope,message:RelationMessage,deadline:Instant,configuration:Arc<RelationConfiguration>}
+pub(crate) struct PreparedRelationUpdate{run:Arc<ManagedRun>,owner:AttemptOwner,scope:RpcConnectionScope,message:Arc<RelationMessage>,deadline:Instant,configuration:Arc<RelationConfiguration>,admission:IntentAdmission,_interest:Option<RelationIntentWait>}
 impl std::fmt::Debug for PreparedRelationUpdate{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str("PreparedRelationUpdate(<redacted>)")}}
 fn live_run(run:&ManagedRun)->Result<(),&'static str>{
     run.database.with_conn(|c|{if !super::super::account_runs::runtime_matches(c,&run.run_token)?{return Err("app_account_relation_scope_invalid");}super::super::account_runs::require_live(c,run.run_token.line_id(),run.run_token.revision(),run.run_token.nonce())})
@@ -42,15 +42,21 @@ impl AccountManager{
         let(owner,scope,message)=run.backend.reserve_relation_message(group,adds,updates,removes,nonce)?;
         let configuration=run.relation_configuration.as_ref().cloned().ok_or("app_account_relation_not_installed")?;
         run.database.with_conn(|c|configuration.require_current(c,line,revision,&scope))?;
-        Ok(PreparedRelationUpdate{run,owner,scope,message,deadline,configuration})
+        let message=Arc::new(message);
+        let admission=RelationIntent::capture(run.database.clone(),run.run_token.clone(),owner.clone(),scope.clone(),message.clone(),configuration.clone(),run.im_gate.clone(),deadline)?;
+        let interest=match &admission{IntentAdmission::Fresh(intent)=>Some(RelationIntentWait::original(intent.clone())),IntentAdmission::Replay(_)=>None};
+        Ok(PreparedRelationUpdate{run,owner,scope,message,deadline,configuration,admission,_interest:interest})
     }
     pub(crate) async fn finish_relation_update(&self,prepared:PreparedRelationUpdate)->Result<RelationWriteView,&'static str>{
-        let PreparedRelationUpdate{run,owner,scope,message,deadline,configuration}=prepared;let slot=self.slot(run.run_token.line_id())?;
+        let PreparedRelationUpdate{run,owner,scope,message,deadline,configuration,admission,_interest}=prepared;let slot=self.slot(run.run_token.line_id())?;
         if !lock(&slot.run).as_ref().is_some_and(|current|Arc::ptr_eq(current,&run)){return Err("app_account_relation_scope_invalid");}
         run.configuration_current()?;live_run(&run)?;
         run.database.with_conn(|c|configuration.require_current(c,run.run_token.line_id(),run.run_token.revision(),&scope))?;
         if Instant::now()>=deadline{return Err("app_account_relation_timeout");}
+        let intent=match admission{IntentAdmission::Replay(id)=>return run.database.with_conn(|c|super::super::relation_journal::historical_view(c,run.run_token.line_id(),id)),IntentAdmission::Fresh(intent)=>intent};
+        let gate=intent.gate();
         let controller=tokio::select!{biased;
+            _=gate.retired()=>return Err("app_account_relation_scope_invalid"),
             _=run.im_gate.retired()=>return Err("app_account_relation_scope_invalid"),_=scope.session_ended()=>return Err("app_account_relation_scope_invalid"),
             result=tokio::time::timeout_at(deadline.into(),run.controller.lock())=>result.map_err(|_|"app_account_relation_timeout")?,
         };
@@ -58,7 +64,7 @@ impl AccountManager{
         run.database.with_conn(|c|configuration.require_current(c,run.run_token.line_id(),run.run_token.revision(),&scope))?;
         if controller.phase()!=Phase::Hosted||controller.resource_owner().as_ref()!=Some(&owner)||!run.backend.original_scope(&owner).is_some_and(|s|s.matches(&scope))||!run.accepting.load(Ordering::SeqCst)||run.stopping.load(Ordering::SeqCst)||run.finalized.load(Ordering::SeqCst)||!run.im_gate.live(){return Err("app_account_relation_scope_invalid");}
         drop(controller);
-        let result=Box::pin(run.backend.update_relations(run.database.clone(),run.run_token.clone(),run.im_gate.clone(),owner,scope,message,deadline,configuration)).await?;
+        let result=Box::pin(run.backend.update_relations(run.database.clone(),run.run_token.clone(),run.im_gate.clone(),owner,scope,message,deadline,configuration,intent)).await?;
         run.configuration_current()?;live_run(&run)?;
         if !run.accepting.load(Ordering::SeqCst)||run.stopping.load(Ordering::SeqCst)||run.finalized.load(Ordering::SeqCst)||!run.im_gate.live(){return Err("app_account_relation_scope_invalid");}Ok(result)
     }
@@ -68,5 +74,6 @@ impl AccountManager{
     pub(crate) async fn relation_controller_pause_for_test(&self,line:&str,ready:tokio::sync::oneshot::Sender<()>,release:tokio::sync::oneshot::Receiver<()>)->Result<(),&'static str>{let slot=self.slot(line)?;let run=lock(&slot.run).clone().ok_or("fixture original relation run")?;let _controller=run.controller.lock().await;ready.send(()).map_err(|_|"fixture controller ready")?;release.await.map_err(|_|"fixture controller release")}
     #[cfg(test)]
     pub(crate) fn relation_retire_parent_for_test(&self,line:&str)->Result<(),&'static str>{let slot=self.slot(line)?;let run=lock(&slot.run).clone().ok_or("fixture original relation run")?;run.im_gate.retire();Ok(())}
+    pub(crate) fn relation_intent_history(&self,line:&str,limit:usize)->Result<Vec<RelationIntentView>,&'static str>{self.database.with_conn(|c|super::super::relation_journal::intent_history(c,line,limit))}
     pub(crate) fn relation_write_history(&self,line:&str,limit:usize)->Result<Vec<RelationWriteView>,&'static str>{self.database.with_conn(|c|super::super::relation_journal::history(c,line,limit))}
 }

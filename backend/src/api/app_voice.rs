@@ -118,6 +118,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/user-entry/lookup",post(lookup_user_entry))
         .route("/api/non-3gpp/accounts/{line_id}/native-directory/read",post(read_native_directory))
         .route("/api/non-3gpp/accounts/{line_id}/relation-writes",get(relation_updates::relation_history).post(relation_updates::update_relations))
+        .route("/api/non-3gpp/accounts/{line_id}/relation-intents",get(relation_updates::intent_history))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}/mark-read",post(mark_im_user_read))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}/mark-read/recipient",post(mark_im_user_read_recipient))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}", delete(delete_im_message))
@@ -184,9 +185,9 @@ fn error_status(code: &str) -> StatusCode {
             | "app_account_user_entry_timeout" | "app_account_user_entry_reply_invalid" => StatusCode::SERVICE_UNAVAILABLE,
         "app_account_user_entry_ambiguous" | "app_account_user_entry_realm_mismatch" => StatusCode::CONFLICT,
         "app_account_relation_consent_required" | "app_account_relation_not_installed" => StatusCode::FORBIDDEN,
-        "app_account_relation_uncertain" | "app_account_relation_nonce_conflict" => StatusCode::CONFLICT,
+        "app_account_relation_uncertain" | "app_account_relation_nonce_conflict" | "app_account_relation_preparing" | "app_account_relation_nonce_retired" | "app_account_relation_legacy_intent" => StatusCode::CONFLICT,
         "app_account_relation_capacity" | "app_account_relation_full" => StatusCode::TOO_MANY_REQUESTS,
-        "app_account_relation_scope_invalid" | "app_account_relation_timeout" => StatusCode::SERVICE_UNAVAILABLE,
+        "app_account_relation_scope_invalid" | "app_account_relation_timeout" | "app_account_relation_entropy_failed" => StatusCode::SERVICE_UNAVAILABLE,
         "app_account_relation_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_account_directory_request_invalid" => StatusCode::BAD_REQUEST,
         "app_account_directory_consent_required" | "app_account_directory_not_installed" => StatusCode::FORBIDDEN,

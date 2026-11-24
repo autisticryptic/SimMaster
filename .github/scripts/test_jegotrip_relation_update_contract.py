@@ -90,4 +90,34 @@ class RelationUpdateContracts(unittest.TestCase):
   self.assertIn('p.reply.send(Err(error))',s);self.assertIn('impl Drop for RelationActorState',s)
   s=source('transport_actor.rs');begin=s.index('let result = self.loop_run().await;');finish=s.index('self.backend.relation_actor_state_mut().finish(result);',begin);close=s.index('self.scope.close(); self.backend.close();',begin)
   self.assertLess(finish,close);self.assertIn('self.scope.session_revoked()',s[begin:finish])
+ def test_before_await_intent_is_committed_in_synchronous_account_prepare_not_native_auth(self):
+  s=source('account_relation_updates.rs');begin=s.index('pub(crate) fn prepare_relation_update');end=s.index('pub(crate) async fn finish_relation_update');block=s[begin:end]
+  self.assertIn('RelationIntent::capture(',block);self.assertIn('RelationIntentWait::original',block);self.assertNotIn('.await',block)
+  s=source('relation_intent.rs');self.assertIn('TransactionBehavior::Immediate',s);self.assertIn('INSERT INTO app_voice_relation_intents',s);self.assertIn('tx.commit()',s)
+ def test_preparing_body_and_nonce_fence_cannot_be_bypassed_by_new_group_or_read(self):
+  s=source('relation_intent.rs');self.assertIn('UNIQUE(line_id,user_nonce)',s);self.assertIn('body.as_slice()!=body_hash.as_slice()',s);self.assertIn('app_account_relation_preparing',s);self.assertIn('if pending{return Err',s);self.assertIn('if unknown{return Err(UNKNOWN);}',s)
+  self.assertIn('if legacy{return Err("app_account_relation_legacy_intent");}',s)
+ def test_retired_preparing_nonce_is_not_adopted_or_rearmed_after_owner_drop(self):
+  s=source('relation_intent.rs');self.assertIn('(2,None)=>return Err("app_account_relation_nonce_retired")',s);self.assertIn('SET state=2',s);self.assertIn('state=0 AND write_id IS NULL',s);self.assertIn('impl Drop for RelationIntentWait',s)
+ def test_intent_original_database_run_config_scope_message_and_parent_remain_bound(self):
+  s=source('relation_intent.rs');self.assertIn('Arc::ptr_eq(database,&self.database)',s);self.assertIn('Arc::ptr_eq(run,&self.run)',s);self.assertIn('Arc::ptr_eq(configuration,&self.configuration)',s);self.assertIn('Arc::ptr_eq(parent,&self.parent)',s);self.assertIn('Arc::ptr_eq(&self.message,message)',s);self.assertIn('deadline==self.deadline',s)
+ def test_actual_native_action_binding_and_preparation_binding_share_original_sql_transaction(self):
+  s=source('relation_journal.rs');self.assertIn('intent.commit_binding(&tx,id)?',s);self.assertIn('intent.require_bound(c,row)?',s)
+  s=source('relation_intent.rs');self.assertIn('self.fixed(c,0,None)?',s);self.assertIn('SET state=1,write_id=?2',s);self.assertIn('self.fixed(c,1,Some(write))',s)
+ def test_preparation_cancellation_uses_weak_actual_action_not_an_arc_scope_budget_cycle(self):
+  s=source('relation_intent.rs');self.assertIn('transition:Mutex<Weak<RelationAction>>',s);self.assertIn('*slot=Arc::downgrade(action)',s);self.assertIn('self.gate.retire();if let Some(action)=action{action.cancel();}',s);self.assertNotIn('self.scope.close()',s)
+  s=source('relation_journal.rs');self.assertIn('std::mem::size_of::<RelationIntent>()',s);self.assertIn('message:Arc<RelationMessage>',s)
+ def test_runtime_needs_preparing_ticket_before_current_sdk_identity_and_no_new_login(self):
+  s=source('runtime_relation_updates.rs');self.assertLess(s.index('intent.belongs_to'),s.index('commands.original_im_binding'));self.assertIn('intent.bind(binding,identity,policy)',s);self.assertIn('_=intent_gate.retired()',s)
+  for text in ['connect(', 'login(', 'tokio::spawn', 'retry(']:self.assertNotIn(text,s)
+ def test_intent_history_is_separate_read_only_projection_without_current_auth_or_grant(self):
+  s=source('relation_intent.rs');self.assertIn('state:match state{0=>"preparing",1=>"bound",2=>"not_sent"',s);self.assertIn('RelationIntentView(<redacted>)',s);self.assertIn('original-relation-intent-ui-nonce-v1',s)
+  s=(ROOT/'backend/src/api/app_voice.rs').read_text(encoding='utf-8');self.assertIn('relation-intents",get(relation_updates::intent_history)',s);self.assertNotIn('relation-intents",get(relation_updates::intent_history).post',s)
+ def test_new_preparation_tests_cover_durable_owner_cancel_restart_and_http_data_only(self):
+  self.assertIn('#[path="relation_intent_protocol_tests.rs"]',source('relation_protocol_tests.rs'));self.assertIn('#[path="relation_intent_account_tests.rs"]',source('relation_account_tests.rs'))
+  s=source('relation_intent_account_tests.rs');self.assertIn('unknown_preparation_is_not_adopted_by_explicit_stop_new_sdk_or_empty_write_history',s);self.assertIn('No await before these assertions',s)
+  self.assertIn('include!("app_voice_relation_intent_http_tests.rs")',(ROOT/'backend/src/api/app_voice_http_tests.rs').read_text(encoding='utf-8'))
+ def test_original_start_contract_is_exact_accepted_not_fabricated_hosted_http_ok(self):
+  s=(ROOT/'backend/src/api/app_voice.rs').read_text(encoding='utf-8');self.assertIn('success(StatusCode::ACCEPTED, manager.start',s)
+  s=(ROOT/'backend/src/api/app_voice_relation_http_tests.rs').read_text(encoding='utf-8');self.assertIn('assert_eq!(status,StatusCode::ACCEPTED);no_store',s);self.assertIn('phase!="hosted"',s)
 if __name__=='__main__':unittest.main()
