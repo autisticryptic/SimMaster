@@ -67,7 +67,7 @@ function RelationEditor({ lineId, revision, hosted, installed }: RelationWritePr
     {!selected && <Typography variant="caption">先核对两套记录；字段存在或空列表不构成关系写权限。</Typography>}
     {(selected?.status === 'unresolved' || selected?.status === 'blocked' || fault?.context === context) && <Alert severity="warning">{RELATION_WRITE_UNRESOLVED}</Alert>}
     {selected?.status === 'observed_terminal' && <Typography variant="caption">本次记录核对完成；仍需新的明确授权、未使用 nonce 和当前原 SDK 检查，不代表关系在线或消息送达。</Typography>}
-    <TextField select size="small" label="关系修改目标" value={form.target} disabled={disabled} onChange={(event) => setInput({ ...form, target: event.target.value === 'group' ? 'group' : 'buddy', groupId: '', consent: false, writeConsent: false })}>
+    <TextField select size="small" label="关系修改目标" slotProps={{ select: { SelectDisplayProps: { 'aria-label': '关系修改目标', 'aria-labelledby': undefined } } }} value={form.target} disabled={disabled} onChange={(event) => setInput({ ...form, target: event.target.value === 'group' ? 'group' : 'buddy', groupId: '', consent: false, writeConsent: false })}>
       <MenuItem value="buddy">Buddy（当前原 SDK 用户）</MenuItem><MenuItem value="group">Group（明确原群组 ID）</MenuItem>
     </TextField>
     {form.target === 'group' && <TextField size="small" label="本次原群组 ID" value={form.groupId} disabled={disabled} autoComplete="off" slotProps={{ htmlInput: { maxLength: 508 } }} helperText="仅原 GroupID；不是 P2P/Org Box、URI 或网络端点，不创建新群组。" onChange={(event) => setInput({ ...form, groupId: event.target.value, consent: false, writeConsent: false })} />}

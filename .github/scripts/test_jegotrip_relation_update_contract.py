@@ -141,4 +141,7 @@ class RelationUpdateContracts(unittest.TestCase):
  def test_new_browser_and_unit_write_tests_are_appended_without_changing_existing_strict_lists(self):
   s=(ROOT/'frontend/package.json').read_text(encoding='utf-8');self.assertIn('tests/relationHistory.test.ts tests/relationWrite.test.ts tests/relationWriteFlow.test.ts',s)
   s=(ROOT/'frontend/playwright.jegotrip.config.ts').read_text(encoding='utf-8');self.assertIn(".concat(['jegotrip-relation-write.spec.ts'])",s);self.assertIn('timeout: 45_000',s);self.assertIn('retries: 0',s)
+ def test_relation_target_combobox_exposes_exact_stable_accessible_name_not_selected_option_text(self):
+  s=(ROOT/'frontend/src/pages/sim/AppRelationWritePane.tsx').read_text(encoding='utf-8');self.assertIn("SelectDisplayProps: { 'aria-label': '关系修改目标', 'aria-labelledby': undefined }",s)
+  s=(ROOT/'frontend/e2e/jegotrip-relation-write.spec.ts').read_text(encoding='utf-8');self.assertIn("getByRole('combobox', { name: '关系修改目标', exact: true })",s)
 if __name__=='__main__':unittest.main()
