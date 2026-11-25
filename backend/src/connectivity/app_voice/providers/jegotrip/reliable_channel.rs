@@ -143,7 +143,11 @@ impl ChannelCore {
     /// Reserve all encrypted fragments before committing a directional record
     ///encoder. A capacity error here has consumed no plaintext/cipher state.
     pub fn queue_record(&mut self, record: &[u8], deadline: Instant, now: Instant) -> Result<(), ChannelError> {
+        self.queue_record_retained(record,deadline,now,None)
+    }
+    pub(super) fn queue_record_retained(&mut self,record:&[u8],deadline:Instant,now:Instant,event:Option<std::sync::Arc<super::group_event_packets::GroupEventPackets>>)->Result<(),ChannelError>{
         self.tick(now)?;
+        if event.as_ref().is_some_and(|e|!e.current(now)){return Err(ChannelError::Closed);}
         if record.is_empty() || deadline.checked_duration_since(now).is_none_or(|left| left.is_zero() || left > MAX_WAIT) {
             return Err(ChannelError::Configuration);
         }
@@ -151,7 +155,8 @@ impl ChannelCore {
         let bytes = record.len().checked_add(count.checked_mul(3).ok_or(ChannelError::Window)?).ok_or(ChannelError::Window)?;
         if count > MAX_PENDING.saturating_sub(self.queued.len() + self.roots.len())
             || bytes > MAX_BYTES.saturating_sub(self.retained_send_bytes()) { return Err(ChannelError::Window); }
-        let pieces = native_channel::encode_record(record, self.body_budget)?;
+        let mut pieces = native_channel::encode_record(record, self.body_budget)?;
+        if let Some(event)=event{for piece in &mut pieces{piece.retain_group_event_packet(event.clone());}}
         self.queued.extend(pieces.into_iter().map(|body| Queued { body, deadline })); Ok(())
     }
     fn ack_fields(&self) -> (u16, u16, Vec<u8>) {
@@ -200,6 +205,9 @@ impl ChannelCore {
             && item.sent.is_none_or(|sent| now.duration_since(sent) >= self.rto)).map(|(&seq, _)| seq);
         if let Some(root) = retry {
             let item = self.roots.get(&root).ok_or(ChannelError::Protocol)?;
+            // Receiving an original Channel ACK may release a retired holder.
+            // Only emission/re-emission requires its still-live event receipt.
+            if item.body.as_ref().is_some_and(|b|!b.group_event_packet_current(now)){return Err(ChannelError::Closed);}
             if item.retries >= 128 { return Err(ChannelError::Timeout); }
             let original = ChannelPacket { timestamp: None, sequence: root as u16, kind: item.kind, data_gap: item.gap,
                 ack_sequence: 0, delivered_sequence: 0, inclusive_ack: false, ack_mask: &[],
@@ -210,12 +218,15 @@ impl ChannelCore {
             let body = if sent { native_channel::retransmission_body(&original, self.next_tx as u16)? }
                 else { TransportBytes::from_bytes(original.body.to_vec()) };
             let kind = if sent { PacketKind::Skip } else { item.kind };
-            let packet = self.frame(kind, gap, body.expose_to_transport(), Some(root))?;
+            let event=item.body.as_ref().and_then(TransportBytes::group_event_retention);
+            let mut packet = self.frame(kind, gap, body.expose_to_transport(), Some(root))?;
+            if let Some(event)=event{packet.retain_group_event_packet(event);}
             let item = self.roots.get_mut(&root).ok_or(ChannelError::Protocol)?; item.sent = Some(now); item.retries += 1;
             return Ok(Some(packet));
         }
         if self.ready() && self.roots.len() < MAX_PENDING {
             if let Some(queued) = self.queued.pop_front() {
+                if !queued.body.group_event_packet_current(now){return Err(ChannelError::Closed);}
                 let sequence = self.next_tx;
                 let distance = sequence.checked_sub(self.last_data_tx.checked_add(1).ok_or(ChannelError::Window)?).ok_or(ChannelError::Protocol)?;
                 if distance >= HISTORY { return Err(ChannelError::Window); }
@@ -223,8 +234,10 @@ impl ChannelCore {
                 let mut body = Vec::with_capacity(queued.body.expose_to_transport().len() + prefix);
                 if gap == 31 { body.extend_from_slice(&(self.last_data_tx as u16).to_be_bytes()); }
                 body.extend_from_slice(queued.body.expose_to_transport());
-                let body = TransportBytes::from_bytes(body);
-                let packet = self.frame(PacketKind::Data, gap, body.expose_to_transport(), Some(sequence))?;
+                let mut body = TransportBytes::from_bytes(body);
+                let event=queued.body.group_event_retention();if let Some(event)=&event{body.retain_group_event_packet(event.clone());}
+                let mut packet = self.frame(PacketKind::Data, gap, body.expose_to_transport(), Some(sequence))?;
+                if let Some(event)=event{packet.retain_group_event_packet(event);}
                 self.roots.insert(sequence, SentRoot { kind: PacketKind::Data, gap, body: Some(body), deadline: queued.deadline,
                     sent: Some(now), retries: 1, acknowledged: false }); self.last_data_tx = sequence;
                 return Ok(Some(packet));

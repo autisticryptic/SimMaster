@@ -62,12 +62,16 @@ impl CommonPath{
     /// Caller supplies only the original RPC payload; this never parses or
     ///changes its call ID, id/domain/token metadata or ownership.
     pub async fn send_call(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,kind:CallKind,payload:&[u8],deadline:Instant)->Result<bool,CommonIoError>{
+        self.send_call_retained(owner,scope,kind,payload,deadline,None).await
+    }
+    async fn send_call_retained(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,kind:CallKind,payload:&[u8],deadline:Instant,event:Option<Arc<super::group_event_packets::GroupEventPackets>>)->Result<bool,CommonIoError>{
         if !self.original(owner,scope){return Ok(false);}
         let mut cancelled=CancelGuard{scope:self.scope.clone(),armed:true};
         let result=async{
             if !matches!(kind,CallKind::Request|CallKind::Reply){return Err(CommonIoError::Configuration);}
             self.tick(deadline)?;
-            let packets=common_packets::encode(kind,payload,NATIVE_FRAGMENT_THRESHOLD,self.compress_above)?;
+            let mut packets=common_packets::encode(kind,payload,NATIVE_FRAGMENT_THRESHOLD,self.compress_above)?;
+            if let Some(event)=event{if !event.current(Instant::now()){return Err(CommonIoError::Scope);}for packet in &mut packets{packet.retain_group_event_packet(event.clone());}}
             self.tick(deadline)?;let end=self.bound(deadline);
             if !self.stream.send_records(owner,scope,&packets,end).await?{return Err(CommonIoError::Scope);}
             self.tick(deadline)?;Ok(true)
@@ -87,7 +91,16 @@ impl CommonPath{
                 if decoded.is_some(){if index+1!=packets.len(){return Err(CommonIoError::Configuration);}message=decoded;}
             }
             let message=message.ok_or(CommonIoError::Configuration)?;
-            self.send_call(owner,scope,message.kind,message.payload.expose_to_transport(),deadline).await
+            // The actual original packet owners survive decoding/encryption.
+            // Recheck their receipt brands before EVERY poll of the same
+            // lower send future; no new future/deadline is created on wake.
+            let event=packets.first().and_then(TransportBytes::group_event_retention);
+            let mut sending=Box::pin(self.send_call_retained(owner,scope,message.kind,message.payload.expose_to_transport(),deadline,event));
+            std::future::poll_fn(|cx|{
+                let now=Instant::now();
+                if packets.iter().any(|p|!p.group_event_packet_current(now)){return std::task::Poll::Ready(Err(CommonIoError::Scope));}
+                std::future::Future::poll(sending.as_mut(),cx)
+            }).await
         }.await;
         if result.is_err(){self.close();}result
     }

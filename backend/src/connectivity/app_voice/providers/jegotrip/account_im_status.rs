@@ -29,6 +29,7 @@ pub(in super::super) fn delivery<'a>(run:&'a ManagedRun,phase:Phase,state:&'a mu
         if phase==Phase::HostingPending{
             let bytes=state.early_bytes.checked_add(delivery.bytes()).ok_or(FULL)?;
             if state.early.len()+state.early_status.len()>=MAX_EARLY||bytes>MAX_BYTES{return Err(FULL);}
+            if state.early.len()+state.early_status.len()+state.early_group_events.len()>=MAX_EARLY{return Err(FULL);}
             state.early_status.push_back(delivery);state.early_bytes=bytes;return Ok(());
         }
         if phase!=Phase::Hosted{return complete(run,&delivery,None).await;}

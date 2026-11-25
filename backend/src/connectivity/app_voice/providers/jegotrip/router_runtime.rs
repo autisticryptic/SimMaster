@@ -166,6 +166,10 @@ impl RouterPath {
     /// RPC/business request or renew the caller's absolute deadline.
     pub(super) async fn send_datagram(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,lease:&PortLease,
         peer:&super::router_peer::PeerBinding,tag:u32,priority:u8,payload:&[u8],deadline:Instant)->Result<bool,RouterIoError>{
+        self.send_datagram_retained(owner,scope,lease,peer,tag,priority,payload,deadline,None).await
+    }
+    pub(super) async fn send_datagram_retained(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,lease:&PortLease,
+        peer:&super::router_peer::PeerBinding,tag:u32,priority:u8,payload:&[u8],deadline:Instant,event:Option<std::sync::Arc<super::group_event_packets::GroupEventPackets>>)->Result<bool,RouterIoError>{
         if !self.original(owner,scope){return Ok(false);}
         if priority>3||payload.is_empty(){return Err(RouterIoError::Configuration);}
         let mut cancelled=CancelGuard{scope:self.scope.clone(),armed:true};
@@ -174,7 +178,7 @@ impl RouterPath {
                 let now=Instant::now();if now>=deadline{return Err(RouterIoError::Timeout);}
                 let timing=self.timing(now)?;
                 match self.tracker.prepare_datagram(owner,scope,lease,peer,tag,priority,payload,timing,now) {
-                    Ok(Some(data))=>return self.send(owner,scope,data.packets_for(owner,scope).ok_or(RouterIoError::Scope)?,deadline).await,
+                    Ok(Some(data))=>return self.send_event_retained(owner,scope,data.packets_for(owner,scope).ok_or(RouterIoError::Scope)?,deadline,event.as_ref()).await,
                     Ok(None)=>return Err(RouterIoError::Scope),
                     Err(RouterConnectError::Pending)=>{if !self.drive_routing(owner,scope,deadline).await?{return Err(RouterIoError::Scope);}},
                     Err(error)=>return Err(error.into()),
@@ -305,6 +309,9 @@ impl RouterPath {
         &self.owner==owner && self.scope.matches(scope) && self.scope.is_open() && self.io.is_some()
     }
     async fn write_wire(&mut self,wire:&[OwnedWireFrames],deadline:Instant)->Result<(),RouterIoError> {
+        self.write_event_wire(wire,deadline,None).await
+    }
+    async fn write_event_wire(&mut self,wire:&[OwnedWireFrames],deadline:Instant,event:Option<&std::sync::Arc<super::group_event_packets::GroupEventPackets>>)->Result<(),RouterIoError>{
         let now=Instant::now();self.engine.tick(&self.owner,&self.scope,now)?;
         let mut end=deadline.min(now.checked_add(self.io_timeout).ok_or(RouterIoError::Configuration)?);
         for original in self.engine.next_deadline().into_iter().chain(self.tracker.next_deadline()).chain(self.ports.next_deadline()){
@@ -316,11 +323,11 @@ impl RouterPath {
             for output in wire {for frame in output.frames_for(owner,&scope).ok_or(RouterIoError::Scope)? {
                 let bytes=frame.expose_to_transport();let mut offset=0;
                 while offset<bytes.len(){
-                    let n=poll_before(&scope,io.write(&bytes[offset..]),end).await?.map_err(|_|RouterIoError::Io)?;
+                    let n=super::group_event_packets::poll_original_write(poll_before(&scope,io.write(&bytes[offset..]),end),event).await?.map_err(|_|RouterIoError::Io)?;
                     if n==0 {return Err(RouterIoError::Io);}offset+=n;
                 }
             }}
-            poll_before(&scope,io.flush(),end).await?.map_err(|_|RouterIoError::Io)?;
+            super::group_event_packets::poll_original_write(poll_before(&scope,io.flush(),end),event).await?.map_err(|_|RouterIoError::Io)?;
             if Instant::now()>=end {return Err(RouterIoError::Timeout);}Ok(())
         };
         tokio::select!{biased;_=scope.closed()=>Err(RouterIoError::Scope),
@@ -380,11 +387,14 @@ impl RouterPath {
     }
     pub(super) async fn send(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,packets:&[TransportBytes],deadline:Instant)
         ->Result<bool,RouterIoError> {
+        self.send_event_retained(owner,scope,packets,deadline,None).await
+    }
+    async fn send_event_retained(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,packets:&[TransportBytes],deadline:Instant,event:Option<&std::sync::Arc<super::group_event_packets::GroupEventPackets>>)->Result<bool,RouterIoError>{
         if !self.original(owner,scope){return Ok(false);}
         let mut cancelled=CancelGuard{scope:self.scope.clone(),armed:true};
         let result=async {
             let wire=self.engine.encrypt_packets(owner,scope,packets,Instant::now())?.ok_or(RouterIoError::Scope)?;
-            self.write_wire(&wire,deadline).await
+            self.write_event_wire(&wire,deadline,event).await
         }.await;
         if result.is_ok(){cancelled.armed=false;}else{self.close();}result.map(|()|true)
     }

@@ -13,6 +13,8 @@ mod user_reads;
 mod sends;
 #[path="relation_io_tests.rs"]
 mod relations;
+#[path="group_event_io_tests.rs"]
+mod group_events;
 #[path="im_info_runtime_io_tests.rs"]
 mod info;
 #[path="group_directory_io_tests.rs"]

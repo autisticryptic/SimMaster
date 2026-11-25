@@ -37,6 +37,8 @@ use im_sends::{ImSendWork,ImSendPending};
 mod relations;
 use relations::{RelationWork,RelationPending};
 pub(super) use relations::RelationActorState;
+#[path="group_event_actor.rs"]
+mod group_event_commands;
 #[path="user_entry_actor.rs"]
 mod user_entry;
 #[path="client_user_entry_actor.rs"]
@@ -170,6 +172,8 @@ enum Operation {
     CompleteInvite(super::native_invite_notifications::InviteReplyTicket, bool),
     CompleteIm(Box<(super::im_delivery::ImReplyTicket,Option<super::im_inbox::CommittedIm>)>),
     CompleteImStatus(Box<(super::im_status_delivery::ImStatusTicket,Option<super::im_inbox::CommittedImStatus>)>),
+    ArmRelationEvents(super::group_events::NativeRelationEventsConfig),
+    CompleteGroupEvent(Box<(super::group_event_delivery::GroupEventTicket,Option<super::group_event_inbox::CommittedGroupEvent>)>),
     ImRead(Box<ImReadWork>),
     WriteReceived(Box<ReceivedWork>),
     GetImBinding(oneshot::Sender<Option<Arc<super::im_delivery::ImBinding>>>),
@@ -198,6 +202,7 @@ impl Operation {
                     + g.metadata.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>()),
             Self::ConfigureClientEx | Self::CompleteBatch(_, _) | Self::CompleteDirect(_, _) | Self::CompleteOfflineHint(_, _) | Self::CompleteInvite(_, _) | Self::CompleteIm(_) | Self::CompleteImStatus(_) => 0,
             Self::ConfigureCalls(binding)=>binding.object.len()+binding.domain.len(),
+            Self::ArmRelationEvents(_)|Self::CompleteGroupEvent(_)=>0,
             Self::ConfigureNativeReceivers(_) => 0,
             Self::ArmNativeReceivers(setup) => setup.retained_bytes(),
             Self::ImRead(work)=>work.query.retained_bytes(),
@@ -801,10 +806,11 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if self.unhosting_pending.is_some() && matches!(&command.operation,Operation::CompleteImStatus(data) if data.1.is_some()){
             let _=command.completion.send(Err(RuntimeError::Closed));return Ok(());
         }
-        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_) | Operation::CompleteImStatus(_)) {
+        if self.unhosting_pending.is_some()&&matches!(&command.operation,Operation::CompleteGroupEvent(data)if data.1.is_some()){let _=command.completion.send(Err(RuntimeError::Closed));return Ok(());}
+        if self.logout_pending.is_some() || self.unhosting_pending.is_some() && !matches!(&command.operation, Operation::CompleteGroupEvent(_)|Operation::Swap(_, None) | Operation::CompleteBatch(_, _) | Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_) | Operation::CompleteImStatus(_)) {
             let _ = command.completion.send(Err(RuntimeError::Closed)); return Ok(());
         }
-        if !matches!(&command.operation, Operation::ArmClientEx(_) | Operation::ArmNativeReceivers(_)) && self.common.is_none() && self.tls.as_ref().is_none_or(|tls|tls.phase()!=TlsPhase::Verified) {
+        if !matches!(&command.operation, Operation::ArmClientEx(_) | Operation::ArmNativeReceivers(_) | Operation::ArmRelationEvents(_)) && self.common.is_none() && self.tls.as_ref().is_none_or(|tls|tls.phase()!=TlsPhase::Verified) {
             let _ = command.completion.send(Err(RuntimeError::Tls(TlsError::NotReady))); return Ok(());
         }
         let mut invite_claims = match &command.operation { Operation::CompleteInvite(ticket, true) => {
@@ -818,6 +824,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             im_gates.push(proof.gate());let end=data.0.completion_deadline();invite_deadline=Some(invite_deadline.map_or(end,|original|original.min(end)));
         }}
         if let Operation::CompleteImStatus(data)=&command.operation{if let Some(proof)=&data.1{
+            if !proof.authorizes(&data.0,now){let _=command.completion.send(Err(RuntimeError::Scope));return Ok(());}
+            im_gates.push(proof.gate());let end=data.0.deadline();invite_deadline=Some(invite_deadline.map_or(end,|original|original.min(end)));
+        }}
+        if let Operation::CompleteGroupEvent(data)=&command.operation{if let Some(proof)=&data.1{
             if !proof.authorizes(&data.0,now){let _=command.completion.send(Err(RuntimeError::Scope));return Ok(());}
             im_gates.push(proof.gate());let end=data.0.deadline();invite_deadline=Some(invite_deadline.map_or(end,|original|original.min(end)));
         }}
@@ -843,11 +853,17 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _) | Operation::ImRead(_) | Operation::WriteReceived(_) | Operation::UserMarkRead(_) | Operation::ImSend(_) | Operation::ClientUserEntry(_)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
-        let is_response = matches!(&command.operation, Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_) | Operation::CompleteImStatus(_));
+        let is_response = matches!(&command.operation, Operation::CompleteGroupEvent(_)|Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_) | Operation::CompleteImStatus(_));
         let is_logout = matches!(&command.operation, Operation::Logout(_));
         let mut unhosting_sequence = None;let mut call_wait=None;let mut im_wait=None;let mut received_wait=None;let mut user_wait=None;let mut send_wait=None;let mut relation_wait=None;let mut client_wait=None;
         let elapsed_ms = self.elapsed_ms(now);
         let prepared = match command.operation {
+            Operation::ArmRelationEvents(config)=>{let result=self.backend.arm_relation_events(config).map_err(|_|RuntimeError::InvalidConfiguration);if command.completion.send(result.map(|()|RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),None))).is_err(){return Err(RuntimeError::Cancelled);}return Ok(());}
+            Operation::CompleteGroupEvent(data)=>{match self.backend.complete_group_event(&data.0,data.1.as_ref()){
+                Ok(Some(super::offline_backend::CallCompletion::Direct(p)))=>Ok(p),
+                Ok(Some(super::offline_backend::CallCompletion::BatchQueued))=>{if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),None))).is_err(){return Err(RuntimeError::Cancelled);}return Ok(());},
+                _=>{let _=command.completion.send(Err(RuntimeError::Protocol));return Ok(());}
+            }}
             Operation::Configure(epoch, incoming) => {
                 let result = self.backend.configure(epoch, incoming.as_ref().map(Binding::borrowed)).map_err(|_| RuntimeError::Protocol);
                 let receipt = result.map(|()| RuntimeReceipt::new(self.owner.clone(), self.scope.clone(), None));

@@ -20,6 +20,9 @@ use super::{
     session::{AttemptOwner, GatewayRegistration},
 };
 use std::{collections::BTreeMap, fmt};
+#[path="group_event_backend.rs"]
+mod relation_events;
+use relation_events::GroupEventState;
 
 pub struct ScheduledIncomingMessage { ticket: ServerRequestTicket, message: IncomingMessage }
 
@@ -48,6 +51,7 @@ pub enum OfflineEvent {
     InviteNotification(Box<super::native_invite_notifications::IncomingInviteNotification>),
     Im(Box<super::im_delivery::IncomingImDelivery>),
     ImStatus(Box<super::im_status_delivery::IncomingImStatus>),
+    GroupEvent(Box<super::group_event_delivery::IncomingGroupEvent>),
     CallOperation(OwnedCallOperationReply),
     Outgoing(OwnedCallPackets),
     Control(super::transport_packets::CallKind),
@@ -79,6 +83,7 @@ pub struct OfflineBackend {
     swaps: BTreeMap<i32, u64>,
     client_actor:super::transport_actor::ClientReadState,
     relation_actor:Box<super::transport_actor::RelationActorState>,
+    group_events:Box<GroupEventState>,
 }
 
 impl fmt::Debug for OfflineBackend {
@@ -92,7 +97,7 @@ impl OfflineBackend {
     pub fn new(owner: AttemptOwner) -> Self {
         let mut protocol = ArcProtocol::new(owner);
         let tracker = protocol.take_hosting_tracker().expect("fresh ARC tracker");
-        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,client_ex:None,im_binding:None,im_pending:BTreeMap::new(),im_completed:BTreeMap::new(),status_pending:BTreeMap::new(),status_completed:BTreeMap::new(),call_pending:BTreeMap::new(),invite_pending:BTreeMap::new(),invite_completed:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new(),client_actor:super::transport_actor::ClientReadState::default(),relation_actor:Box::default() }
+        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,client_ex:None,im_binding:None,im_pending:BTreeMap::new(),im_completed:BTreeMap::new(),status_pending:BTreeMap::new(),status_completed:BTreeMap::new(),call_pending:BTreeMap::new(),invite_pending:BTreeMap::new(),invite_completed:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new(),client_actor:super::transport_actor::ClientReadState::default(),relation_actor:Box::default(),group_events:Box::default() }
     }
     pub fn phase(&self) -> ArcPhase { self.protocol.phase() }
     pub(super) fn is_pending(&self, id: i32) -> bool { self.protocol.is_pending(id) }
@@ -134,7 +139,7 @@ impl OfflineBackend {
     }
     pub fn close(&mut self) {
         self.protocol.close(); if let Some(s) = &mut self.scheduler { s.close(); }
-        self.tracker.retire_all();self.client_actor.clear();self.relation_actor.clear();
+        self.tracker.retire_all();self.client_actor.clear();self.relation_actor.clear();self.group_events.clear();
         self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.invite_pending.clear();self.invite_completed.clear();self.call_acks.clear();self.offline_hints.clear();
         self.swaps.clear();self.dispatcher=None;self.im_binding=None;self.im_pending.clear();self.im_completed.clear();self.status_pending.clear();self.status_completed.clear();
     }
@@ -147,7 +152,7 @@ impl OfflineBackend {
     pub fn prepare_login(&mut self, inputs: ArcLoginInputs<'_>, routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_login(inputs, routing) }
     pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
-        let packets=self.protocol.prepare_logout(routing)?;self.status_pending.clear();self.status_completed.clear();self.im_binding=None;self.im_pending.clear();self.im_completed.clear();self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.invite_pending.clear();self.invite_completed.clear();self.call_acks.clear();self.offline_hints.clear();Ok(packets)
+        let packets=self.protocol.prepare_logout(routing)?;self.group_events.clear();self.status_pending.clear();self.status_completed.clear();self.im_binding=None;self.im_pending.clear();self.im_completed.clear();self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.invite_pending.clear();self.invite_completed.clear();self.call_acks.clear();self.offline_hints.clear();Ok(packets)
     }
     pub fn prepare_bootstrap(&mut self, key: &[u8], routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_bootstrap(key, routing) }
@@ -222,6 +227,7 @@ impl OfflineBackend {
         self.call_dispatcher = Some(self.protocol.native_call_dispatcher()?);
         self.client_ex = self.protocol.captured_client_ex();
         self.im_binding = self.protocol.captured_im_binding();
+        self.group_events.binding=self.protocol.captured_relation_event_binding();
         self.scheduler = Some(self.protocol.take_batch_scheduler(incarnation)?);
         Ok(())
     }
@@ -261,9 +267,10 @@ impl OfflineBackend {
         (claims, deadline)
     }
     pub(super) fn im_write_guard(&self)->(Vec<std::sync::Arc<super::im_inbox::ImReceiptGate>>,Option<std::time::Instant>){
-        (self.im_completed.values().map(|(_,proof)|proof.gate()).chain(self.status_completed.values().map(|(_,proof)|proof.gate())).collect(),self.im_completed.values().map(|(ticket,_)|ticket.completion_deadline()).chain(self.status_completed.values().map(|(ticket,_)|ticket.deadline())).min())
+        (self.im_completed.values().map(|(_,proof)|proof.gate()).chain(self.status_completed.values().map(|(_,proof)|proof.gate())).chain(self.group_events.completed.values().map(|(_,proof)|proof.gate())).collect(),self.im_completed.values().map(|(ticket,_)|ticket.completion_deadline()).chain(self.status_completed.values().map(|(ticket,_)|ticket.deadline())).chain(self.group_events.completed.values().map(|(ticket,_)|ticket.deadline())).min())
     }
     pub fn prepare_swap(&mut self, now_ms: u64, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
+        if self.group_events.completed.values().any(|(ticket,proof)|!proof.authorizes(ticket,std::time::Instant::now())){self.close();return Err(CodecError::InvalidField.into());}
         if self.status_completed.values().any(|(ticket,proof)|!proof.authorizes(ticket,std::time::Instant::now())){
             self.close();return Err(CodecError::InvalidField.into());
         }
@@ -276,12 +283,13 @@ impl OfflineBackend {
         if self.invite_completed.values().any(|ticket| !ticket.positive_is_current()) {
             self.close(); return Err(CodecError::InvalidField.into());
         }
+        let event_packets=if self.group_events.completed.is_empty(){None}else{Some(super::group_event_packets::GroupEventPackets::capture(&self.connection_scope(),self.group_events.completed.values().map(|(ticket,proof)|(ticket,Some(proof))))?)};
         let Some(scheduler) = self.scheduler.as_mut() else { return Err(CodecError::InvalidField.into()); };
         let batch = match scheduler.prepare(now_ms) {
             Ok(batch) => batch, Err(error) => { self.close(); return Err(error.into()); }
         };
         let result_sequences=batch.payload().results.keys().copied().collect::<Vec<_>>();
-        let packets = match self.protocol.prepare_scheduled_swap(&batch, routing) {
+        let mut packets = match self.protocol.prepare_scheduled_swap(&batch, routing) {
             Ok(packets) => packets,
             Err(ProtocolError::Batch(super::batch_scheduler::BatchError::Backpressure)) if !batch.is_encoded()&&!batch.client_holders().is_empty()=>{
                 // Original shared-budget refusal occurred before ARC encoding.
@@ -292,6 +300,7 @@ impl OfflineBackend {
             }
             Err(error) => { self.close(); return Err(error); }
         };
+        if let Some(retained)=event_packets{for packet in &mut packets.packets{packet.retain_group_event_packet(retained.clone());}}
         if let Err(error) = self.scheduler.as_mut().ok_or(CodecError::InvalidField)?.commit_submission(batch, now_ms) {
             self.close(); return Err(error.into());
         }
@@ -326,6 +335,7 @@ impl OfflineBackend {
         let invite_pending = &mut self.invite_pending;
         let invite_completed = &mut self.invite_completed;
         let status_pending=&mut self.status_pending;let status_completed=&mut self.status_completed;
+        let group_events=&mut self.group_events;
         let im_binding=&self.im_binding;let im_pending=&mut self.im_pending;let im_completed=&mut self.im_completed;
         let result = self.protocol.on_plaintext_packet(owner, scope, packet, |event| {
             match event {
@@ -350,7 +360,7 @@ impl OfflineBackend {
                             };
                             if let Some(notice)=action.im{
                                 let key=(incoming.ticket().peer_incarnation(),incoming.ticket().sequence());
-                                if im_pending.len()+status_pending.len()>=super::rpc_stream::MAX_MAP_ENTRIES||im_pending.contains_key(&key){processing_error=Some(CodecError::TooLarge.into());return;}
+                                if im_pending.len()+status_pending.len()+group_events.pending.len()>=super::rpc_stream::MAX_MAP_ENTRIES||im_pending.contains_key(&key){processing_error=Some(CodecError::TooLarge.into());return;}
                                 let delivery=match super::im_delivery::IncomingImDelivery::batch(*notice,incoming.into_ticket()){
                                     Ok(delivery)=>delivery,Err(error)=>{processing_error=Some(error.into());return;}
                                 };
@@ -418,11 +428,20 @@ impl OfflineBackend {
                             processing_error = Some(super::transport_packets::TransportError::UnsupportedKind.into());
                             return;
                         }
+                        if let Some(binding)=&group_events.binding{
+                            let notice=match super::group_event_delivery::batch(binding,&incoming){Ok(n)=>n,Err(e)=>{processing_error=Some(e.into());return;}};
+                            if let Some(notice)=notice{
+                                let key=(incoming.ticket().peer_incarnation(),incoming.ticket().sequence());
+                                if im_pending.len()+status_pending.len()+group_events.pending.len()>=super::rpc_stream::MAX_MAP_ENTRIES||group_events.pending.contains_key(&key){processing_error=Some(CodecError::TooLarge.into());return;}
+                                let delivery=match super::group_event_delivery::IncomingGroupEvent::batch(notice,incoming.into_ticket()){Ok(d)=>d,Err(e)=>{processing_error=Some(e.into());return;}};
+                                group_events.pending.insert(key,(*delivery.ticket().fingerprint(),delivery.ticket().deadline()));events.push(OfflineEvent::GroupEvent(Box::new(delivery)));continue;
+                            }
+                        }
                         if let Some(binding)=im_binding{
                             let notice=match super::im_delivery::batch_message(binding,&incoming){Ok(notice)=>notice,Err(error)=>{processing_error=Some(error.into());return;}};
                             if let Some(notice)=notice{
                                 let key=(incoming.ticket().peer_incarnation(),incoming.ticket().sequence());
-                                if im_pending.len()+status_pending.len()>=super::rpc_stream::MAX_MAP_ENTRIES||im_pending.contains_key(&key){processing_error=Some(CodecError::TooLarge.into());return;}
+                                if im_pending.len()+status_pending.len()+group_events.pending.len()>=super::rpc_stream::MAX_MAP_ENTRIES||im_pending.contains_key(&key){processing_error=Some(CodecError::TooLarge.into());return;}
                                 let delivery=match super::im_delivery::IncomingImDelivery::batch(notice,incoming.into_ticket()){
                                     Ok(delivery)=>delivery,Err(error)=>{processing_error=Some(error.into());return;}
                                 };
@@ -432,7 +451,7 @@ impl OfflineBackend {
                             let notice=match super::im_status_delivery::batch(binding,&incoming){Ok(notice)=>notice,Err(error)=>{processing_error=Some(error.into());return;}};
                             if let Some(notice)=notice{
                                 let key=(incoming.ticket().peer_incarnation(),incoming.ticket().sequence());
-                                if status_pending.len()+im_pending.len()>=super::rpc_stream::MAX_MAP_ENTRIES||status_pending.contains_key(&key){processing_error=Some(CodecError::TooLarge.into());return;}
+                                if status_pending.len()+im_pending.len()+group_events.pending.len()>=super::rpc_stream::MAX_MAP_ENTRIES||status_pending.contains_key(&key){processing_error=Some(CodecError::TooLarge.into());return;}
                                 let delivery=match super::im_status_delivery::IncomingImStatus::batch(notice,incoming.into_ticket()){
                                     Ok(delivery)=>delivery,Err(error)=>{processing_error=Some(error.into());return;}
                                 };
@@ -455,7 +474,7 @@ impl OfflineBackend {
                         }
                     }
                     if let Some(retirement) = retirement {
-                        for sequence in retirement.acknowledged() { invite_completed.remove(&(retirement.peer_incarnation(), *sequence)); im_completed.remove(&(retirement.peer_incarnation(),*sequence)); status_completed.remove(&(retirement.peer_incarnation(),*sequence)); }
+                        for sequence in retirement.acknowledged() { invite_completed.remove(&(retirement.peer_incarnation(), *sequence)); im_completed.remove(&(retirement.peer_incarnation(),*sequence)); status_completed.remove(&(retirement.peer_incarnation(),*sequence)); group_events.completed.remove(&(retirement.peer_incarnation(),*sequence)); }
                         events.push(OfflineEvent::BatchRetirement(retirement));
                     }
                 }
@@ -470,6 +489,7 @@ impl OfflineBackend {
                 ProtocolEvent::InviteNotification(invite)=>events.push(OfflineEvent::InviteNotification(invite)),
                 ProtocolEvent::Im(delivery)=>events.push(OfflineEvent::Im(delivery)),
                 ProtocolEvent::ImStatus(delivery)=>events.push(OfflineEvent::ImStatus(delivery)),
+                ProtocolEvent::GroupEvent(delivery)=>events.push(OfflineEvent::GroupEvent(delivery)),
                 ProtocolEvent::ClientEx { reply, notice } => {
                     events.push(OfflineEvent::Outgoing(reply));
                     if let Some(notice) = notice { events.push(OfflineEvent::ClientEx(notice)); }
@@ -492,6 +512,7 @@ impl OfflineBackend {
     }
 
     pub fn complete_message(&mut self, ticket: &ServerRequestTicket, accepted: bool) -> Result<bool, ProtocolError> {
+        if self.group_events.pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())){return Err(CodecError::InvalidField.into());}
         if self.status_pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())){return Err(CodecError::InvalidField.into());}
         if self.call_pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())) || self.offline_hints.contains(&(ticket.peer_incarnation(),ticket.sequence())) || self.invite_pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())) || self.im_pending.contains_key(&(ticket.peer_incarnation(),ticket.sequence())) {return Err(CodecError::InvalidField.into());}
         let bytes = encode_online_message_result(accepted)?;
@@ -533,7 +554,7 @@ impl OfflineBackend {
             super::im_delivery::ImReplySource::Batch(inner)=>{
                 let key=(inner.peer_incarnation(),inner.sequence());
                 if self.im_pending.get(&key)!=Some(&(*ticket.fingerprint(),ticket.deadline())){return Ok(None);}
-                if proof.is_some()&&self.im_completed.len()+self.status_completed.len()>=super::rpc_stream::MAX_MAP_ENTRIES{return Err(CodecError::TooLarge.into());}
+                if proof.is_some()&&self.im_completed.len()+self.status_completed.len()+self.group_events.completed.len()>=super::rpc_stream::MAX_MAP_ENTRIES{return Err(CodecError::TooLarge.into());}
                 let result=encode_online_message_result(proof.is_some())?;
                 if self.scheduler.as_mut().ok_or(CodecError::InvalidField)?.complete_server_request(inner,0,result.expose_to_transport())?{
                     self.im_pending.remove(&key);if let Some(proof)=proof{self.im_completed.insert(key,(ticket.captured_copy(),proof.captured_copy()));}
@@ -552,7 +573,7 @@ impl OfflineBackend {
             super::im_delivery::ImReplySource::Batch(inner)=>{
                 let key=(inner.peer_incarnation(),inner.sequence());
                 if self.status_pending.get(&key)!=Some(&(*ticket.fingerprint(),ticket.deadline())){return Ok(None);}
-                if proof.is_some()&&self.status_completed.len()+self.im_completed.len()>=super::rpc_stream::MAX_MAP_ENTRIES{return Err(CodecError::TooLarge.into());}
+                if proof.is_some()&&self.status_completed.len()+self.im_completed.len()+self.group_events.completed.len()>=super::rpc_stream::MAX_MAP_ENTRIES{return Err(CodecError::TooLarge.into());}
                 let result=encode_online_message_result(proof.is_some())?;
                 if self.scheduler.as_mut().ok_or(CodecError::InvalidField)?.complete_server_request(inner,0,result.expose_to_transport())?{
                     self.status_pending.remove(&key);if let Some(proof)=proof{self.status_completed.insert(key,(ticket.captured_copy(),proof.captured_copy()));}

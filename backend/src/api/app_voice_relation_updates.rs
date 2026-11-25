@@ -53,6 +53,9 @@ pub(super) async fn update_relations(State(manager):State<Arc<AccountManager>>,P
     drop(request);drop(scratch);
     match prepared{Ok(p)=>success(StatusCode::OK,manager.finish_relation_update(p).await),Err(e)=>failure(e)}
 }
+pub(super) async fn event_history(State(manager):State<Arc<AccountManager>>,Path(line):Path<String>,query:Result<Query<InboxQuery>,QueryRejection>)->Response{
+    let Ok(Query(query))=query else{return failure("app_account_relation_request_invalid");};success(StatusCode::OK,manager.relation_event_history(&line,query.limit))
+}
 pub(super) async fn intent_history(State(manager):State<Arc<AccountManager>>,Path(line):Path<String>,query:Result<Query<InboxQuery>,QueryRejection>)->Response{
     let Ok(Query(query))=query else{return failure("app_account_relation_request_invalid");};success(StatusCode::OK,manager.relation_intent_history(&line,query.limit))
 }

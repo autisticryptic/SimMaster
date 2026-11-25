@@ -10,7 +10,7 @@ use super::super::{group_directory_data::Relation,group_relation_updates::Remova
 pub(super) fn load_original_account(c:&rusqlite::Connection,line:&str)->Result<Option<(StoredAccount,Option<Arc<RelationConfiguration>>)>,&'static str>{
     let tx=rusqlite::Transaction::new_unchecked(c,rusqlite::TransactionBehavior::Deferred).map_err(|_|"app_account_relation_storage_failed")?;
     let account=account_store::load(&tx,line)?;
-    let configuration=match &account{Some(stored)if stored.config.profile.relation_updates.is_some()=>Some(Arc::new(RelationConfiguration::capture(&tx,line,stored.metadata.revision,None)?)),_=>None};
+    let configuration=match &account{Some(stored)if (stored.config.profile.relation_updates.is_some()||stored.config.profile.relation_events.is_some())=>Some(Arc::new(RelationConfiguration::capture(&tx,line,stored.metadata.revision,None)?)),_=>None};
     tx.commit().map_err(|_|"app_account_relation_storage_failed")?;Ok(account.map(|a|(a,configuration)))
 }
 pub(crate) struct RelationHttpScratch(Arc<super::super::native_rpc_budget::NativeRpcReservation>);
@@ -74,6 +74,7 @@ impl AccountManager{
     pub(crate) async fn relation_controller_pause_for_test(&self,line:&str,ready:tokio::sync::oneshot::Sender<()>,release:tokio::sync::oneshot::Receiver<()>)->Result<(),&'static str>{let slot=self.slot(line)?;let run=lock(&slot.run).clone().ok_or("fixture original relation run")?;let _controller=run.controller.lock().await;ready.send(()).map_err(|_|"fixture controller ready")?;release.await.map_err(|_|"fixture controller release")}
     #[cfg(test)]
     pub(crate) fn relation_retire_parent_for_test(&self,line:&str)->Result<(),&'static str>{let slot=self.slot(line)?;let run=lock(&slot.run).clone().ok_or("fixture original relation run")?;run.im_gate.retire();Ok(())}
+    pub(crate) fn relation_event_history(&self,line:&str,limit:usize)->Result<Vec<super::super::group_event_inbox::GroupEventView>,&'static str>{self.database.with_conn(|c|super::super::group_event_inbox::history(c,line,limit))}
     pub(crate) fn relation_intent_history(&self,line:&str,limit:usize)->Result<Vec<RelationIntentView>,&'static str>{self.database.with_conn(|c|super::super::relation_journal::intent_history(c,line,limit))}
     pub(crate) fn relation_write_history(&self,line:&str,limit:usize)->Result<Vec<RelationWriteView>,&'static str>{self.database.with_conn(|c|super::super::relation_journal::history(c,line,limit))}
 }

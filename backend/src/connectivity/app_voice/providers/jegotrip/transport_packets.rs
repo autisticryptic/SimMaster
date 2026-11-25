@@ -47,12 +47,17 @@ impl TransportError {
 // Typed lifetime holders only, never conversions between READ and WRITE grants.
 #[allow(dead_code)]
 enum PacketRetention{Client(std::sync::Arc<super::client_packet_retention::ClientPacketRetention>),Relation(std::sync::Arc<super::rpc_relation_update::RelationRpcRequest>)}
-pub struct TransportBytes(Vec<u8>,Option<PacketRetention>);
+pub struct TransportBytes(Vec<u8>,Option<PacketRetention>,Option<std::sync::Arc<super::group_event_packets::GroupEventPackets>>);
 
 impl TransportBytes {
-    pub(super) fn from_bytes(bytes: Vec<u8>) -> Self { Self(bytes,None) }
+    pub(super) fn from_bytes(bytes: Vec<u8>) -> Self { Self(bytes,None,None) }
     pub(super) fn retain_client_packet(&mut self,guard:std::sync::Arc<super::client_packet_retention::ClientPacketRetention>){let guard=PacketRetention::Client(guard);self.1=Some(guard);}
     pub(super) fn retain_relation_packet(&mut self,guard:std::sync::Arc<super::rpc_relation_update::RelationRpcRequest>){let guard=PacketRetention::Relation(guard);self.1=Some(guard);}
+    // Independent slot: an event response in a mixed Client batch must not
+    // replace the original READ packet holder or borrow its authority.
+    pub(super) fn retain_group_event_packet(&mut self,guard:std::sync::Arc<super::group_event_packets::GroupEventPackets>){self.2=Some(guard);}
+    pub(super) fn group_event_packet_current(&self,now:std::time::Instant)->bool{self.2.as_ref().is_none_or(|guard|guard.current(now))}
+    pub(super) fn group_event_retention(&self)->Option<std::sync::Arc<super::group_event_packets::GroupEventPackets>>{self.2.clone()}
     pub fn expose_to_transport(&self) -> &[u8] { &self.0 }
 }
 
@@ -122,7 +127,7 @@ pub fn encode_call_packets(kind: CallKind, payload: &[u8], threshold: usize)
         let mut bytes = Vec::with_capacity(payload.len() + 1);
         bytes.push(kind as u8);
         bytes.extend_from_slice(payload);
-        return Ok(vec![TransportBytes(bytes,None)]);
+        return Ok(vec![TransportBytes(bytes,None,None)]);
     }
     let mut full = Zeroizing::new(Vec::with_capacity(payload.len() + 4));
     full.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -138,7 +143,7 @@ pub fn encode_call_packets(kind: CallKind, payload: &[u8], threshold: usize)
         let mut bytes = Vec::with_capacity(length + 1);
         bytes.push(if first { kind as u8 | FRAGMENTED } else { CONTINUATION });
         bytes.extend_from_slice(chunk);
-        packets.push(TransportBytes(bytes,None));
+        packets.push(TransportBytes(bytes,None,None));
         remaining = rest;
         first = false;
     }
@@ -153,7 +158,7 @@ pub fn encode_tls_carrier(tls_bytes: &[u8]) -> Result<TransportBytes, TransportE
     let mut bytes = Vec::with_capacity(tls_bytes.len() + 3);
     bytes.extend_from_slice(&[0xff, 0xff, DATA_KEY_TLS]);
     bytes.extend_from_slice(tls_bytes);
-    Ok(TransportBytes(bytes,None))
+    Ok(TransportBytes(bytes,None,None))
 }
 
 /// Mode3 accepts exact FF FF 06. FF FF FF is the escaped NetStream route, not
@@ -204,13 +209,13 @@ impl CallAssembler {
             partial.bytes.extend_from_slice(body);
             if partial.bytes.len() != partial.expected { return Ok(None); }
             let mut partial = self.partial.take().ok_or(TransportError::InvalidFragment)?;
-            return Ok(Some(CallMessage { kind: partial.kind, payload: TransportBytes(std::mem::take(&mut partial.bytes),None) }));
+            return Ok(Some(CallMessage { kind: partial.kind, payload: TransportBytes(std::mem::take(&mut partial.bytes),None,None) }));
         }
         if self.partial.is_some() { return Err(TransportError::InvalidFragment); }
         let kind = CallKind::from_byte(header & 0x0f)?;
         if header & FRAGMENTED == 0 {
             kind.validate_payload(body)?;
-            return Ok(Some(CallMessage { kind, payload: TransportBytes(body.to_vec(),None) }));
+            return Ok(Some(CallMessage { kind, payload: TransportBytes(body.to_vec(),None,None) }));
         }
         if !matches!(kind, CallKind::Request | CallKind::Reply) { return Err(TransportError::InvalidFragment); }
         let prefix = body.get(..4).ok_or(TransportError::Truncated)?;

@@ -47,11 +47,13 @@ impl PreparedChannel {
         now: Instant, caller_end: Instant) -> Result<Option<(&[u8], Instant)>, SessionError> {
         if !self.brand.for_session(owner, scope, session) { return Ok(None); }
         if now < self.prepared_at { return Err(SessionError::Channel(ChannelError::ClockRollback)); }
+        if !self.wire.group_event_packet_current(now){return Err(SessionError::Scope);}
         let end = self.hard_end.map_or(caller_end, |hard| hard.min(caller_end));
         if now >= end { return Err(SessionError::Channel(ChannelError::Timeout)); }
         Ok(Some((self.wire.expose_to_transport(), end)))
     }
 }
+impl PreparedChannel{pub(super) fn group_event_retention(&self)->Option<Arc<super::group_event_packets::GroupEventPackets>>{self.wire.group_event_retention()}}
 impl fmt::Debug for PreparedChannel { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("PreparedChannel(<redacted>)") } }
 
 pub(super) struct ChannelSession {
@@ -107,10 +109,14 @@ impl ChannelSession {
     }
     pub fn queue_record(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope, plain: &[u8], deadline: Instant, now: Instant)
         -> Result<bool, SessionError> {
+        self.queue_record_retained(owner,scope,plain,deadline,now,None)
+    }
+    pub(super) fn queue_record_retained(&mut self,owner:&AttemptOwner,scope:&RpcConnectionScope,plain:&[u8],deadline:Instant,now:Instant,event:Option<Arc<super::group_event_packets::GroupEventPackets>>)->Result<bool,SessionError>{
         if !self.original(owner, scope) { return Ok(false); }
         let result = (|| {
+            if event.as_ref().is_some_and(|e|!e.current(now)){return Err(SessionError::Scope);}
             let mut sender = self.sender.clone(); let encoded = sender.encode(plain)?;
-            self.core.queue_record(encoded.expose_to_transport(), deadline, now)?;
+            self.core.queue_record_retained(encoded.expose_to_transport(), deadline, now, event)?;
             self.sender = sender; Ok(true)
         })();
         if result.is_err() { self.close(); } result
@@ -119,7 +125,8 @@ impl ChannelSession {
         if !self.original(owner, scope) { return Ok(None); }
         let result = (|| {
             let Some(packet) = self.core.next_packet(now)? else { return Ok(None); };
-            Ok(Some(PreparedChannel { brand: self.brand()?, wire: escape_channel(packet.expose_to_transport())?,
+            let mut wire=escape_channel(packet.expose_to_transport())?;if let Some(event)=packet.group_event_retention(){wire.retain_group_event_packet(event);}
+            Ok(Some(PreparedChannel { brand: self.brand()?, wire,
                 hard_end: self.core.hard_deadline(), prepared_at: now }))
         })();
         if result.is_err() { self.close(); } result

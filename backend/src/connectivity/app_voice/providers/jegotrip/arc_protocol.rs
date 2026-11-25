@@ -54,6 +54,7 @@ pub enum ProtocolEvent<'a> {
     InviteNotification(Box<super::native_invite_notifications::IncomingInviteNotification>),
     Im(Box<super::im_delivery::IncomingImDelivery>),
     ImStatus(Box<super::im_status_delivery::IncomingImStatus>),
+    GroupEvent(Box<super::group_event_delivery::IncomingGroupEvent>),
     OfflineHint(super::rpc_offline::IncomingOfflineHint),
     ClientEx { reply: OwnedCallPackets, notice: Option<super::rpc_client_ex::OwnedClientExNotice> },
     OutgoingReply(OwnedCallPackets),
@@ -97,7 +98,7 @@ impl fmt::Debug for IncomingProtocolMessage {
 
 #[derive(Clone,Copy)]
 enum DirectResponse{Message,OfflineHint,Call{kind:CallNoticeKind,native_id:NativeCallId},
-    Invite{notification_id:u64,fingerprint:[u8;32],deadline:Instant},Im{fingerprint:[u8;32],deadline:Instant},ImStatus{fingerprint:[u8;32],deadline:Instant}}
+    Invite{notification_id:u64,fingerprint:[u8;32],deadline:Instant},Im{fingerprint:[u8;32],deadline:Instant},ImStatus{fingerprint:[u8;32],deadline:Instant},GroupEvent{fingerprint:[u8;32],deadline:Instant}}
 struct PendingDirect { magic: Vec<u8>, response:DirectResponse }
 
 /// Private protocol replay boundary, NOT a server ACK, channel or new owner.
@@ -121,6 +122,8 @@ pub struct ArcProtocol {
     client_ex_registration: Option<super::rpc_client_ex::ClientExRegistration>,
     native_receivers: Option<std::sync::Arc<super::native_receiver::NativeReceiverSetup>>,
     im_binding: Option<std::sync::Arc<super::im_delivery::ImBinding>>,
+    relation_events_policy:Option<super::group_events::NativeRelationEventsConfig>,
+    relation_events:Option<std::sync::Arc<super::group_event_delivery::RelationEventBinding>>,
     direct_pending: BTreeMap<i32, PendingDirect>, direct_seen: DirectHistory, direct_last_id: i32,
 }
 
@@ -130,7 +133,7 @@ impl fmt::Debug for ArcProtocol {
 
 impl ArcProtocol {
     pub fn new(owner: AttemptOwner) -> Self {
-        Self { rpc: ArcRpcSession::new(owner), assembler: CallAssembler::default(), incoming: None, call_incoming:None, client_ex: None, client_ex_registration: None, native_receivers: None, im_binding: None,
+        Self { rpc: ArcRpcSession::new(owner), assembler: CallAssembler::default(), incoming: None, call_incoming:None, client_ex: None, client_ex_registration: None, native_receivers: None, im_binding: None,relation_events_policy:None,relation_events:None,
             direct_pending: BTreeMap::new(), direct_seen: DirectHistory::new(Instant::now()), direct_last_id: 0 }
     }
 
@@ -152,7 +155,7 @@ impl ArcProtocol {
         if self.rpc.phase() == ArcPhase::Closed { self.assembler.close(); }
     }
     pub fn close(&mut self) {
-        self.native_receivers = None; self.im_binding = None;
+        self.native_receivers = None; self.im_binding = None;self.relation_events=None;self.relation_events_policy=None;
         self.rpc.close(); self.assembler.close(); self.incoming = None; self.call_incoming=None; self.client_ex=None; self.client_ex_registration=None; self.direct_pending.clear(); self.direct_seen.clear();
     }
 
@@ -180,6 +183,14 @@ impl ArcProtocol {
         }
         self.native_receivers = Some(setup); Ok(())
     }
+    pub(super) fn arm_relation_events(&mut self,config:super::group_events::NativeRelationEventsConfig)->Result<(),ProtocolError>{
+        config.validate().map_err(|_|CodecError::InvalidField)?;
+        if !self.rpc.can_arm_native_receivers()||self.relation_events_policy.is_some()||self.native_receivers.as_ref().is_none_or(|s|!s.client_ex||s.policy.im_messages().is_none()){return Err(CodecError::InvalidField.into());}
+        self.relation_events_policy=Some(config);Ok(())
+    }
+    pub(super) fn captured_relation_event_binding(&self)->Option<std::sync::Arc<super::group_event_delivery::RelationEventBinding>>{
+        (self.phase()==ArcPhase::Authenticated).then(||self.relation_events.clone()).flatten()
+    }
     pub(super) fn native_setup(&self) -> Option<std::sync::Arc<super::native_receiver::NativeReceiverSetup>> {
         self.rpc.native_receiver_scope().then(|| self.native_receivers.clone()).flatten()
     }
@@ -196,6 +207,7 @@ impl ArcProtocol {
         self.incoming = Some(self.rpc.incoming_native_dispatcher(setup.policy.clone())?);
         self.call_incoming = Some(self.rpc.native_call_dispatcher(setup.policy.clone())?);
         self.im_binding = self.rpc.native_im_binding(setup.policy.clone())?;
+        if let Some(config)=self.relation_events_policy{let im=self.im_binding.as_ref().cloned().ok_or(CodecError::InvalidField)?;self.relation_events=Some(super::group_event_delivery::RelationEventBinding::original(im,self.rpc.relation_identity()?,config)?);}
         if setup.client_ex { self.client_ex = Some(self.rpc.native_client_ex_dispatcher(setup.policy.clone())?.with_im(self.im_binding.clone())?); }
         if setup.native_call_control { self.rpc.configure_native_call_control()?; }
         else if let Some(routing) = setup.control() { self.rpc.configure_call_control(&routing)?; }
@@ -454,6 +466,12 @@ impl ArcProtocol {
             }
             return Ok(true);
         }
+        if let Some(binding)=&self.relation_events{if let Some(notice)=super::group_event_delivery::direct(binding,owner,scope,&request)?{
+            let ticket=DirectReplyTicket{owner:self.rpc.owner().clone(),connection:self.rpc.connection_scope(),call_id:request.call_id};
+            let event=super::group_event_delivery::IncomingGroupEvent::direct(notice,ticket)?;
+            self.direct_last_id=request.call_id;self.direct_pending.insert(request.call_id,PendingDirect{magic:magic.to_vec(),response:DirectResponse::GroupEvent{fingerprint:*event.ticket().fingerprint(),deadline:event.ticket().deadline()}});
+            deliver(ProtocolEvent::GroupEvent(Box::new(event)));return Ok(true);
+        }}
         if let Some(binding)=&self.im_binding {
             if let Some(notice)=super::im_delivery::direct_message(binding,owner,scope,&request)? {
                 let incoming=self.capture_im(notice,request.call_id,magic)?;
@@ -502,6 +520,18 @@ impl ArcProtocol {
         Ok(Some(OwnedCallPackets::uncharged(inner.call_id,packets)))
     }
 
+    pub(super) fn complete_group_event(&mut self,ticket:&super::group_event_delivery::GroupEventTicket,proof:Option<&super::group_event_inbox::CommittedGroupEvent>)->Result<Option<OwnedCallPackets>,ProtocolError>{
+        let scope=self.rpc.connection_scope();if self.phase()!=ArcPhase::Authenticated||!ticket.matches(self.rpc.owner(),&scope){return Ok(None);}
+        let super::im_delivery::ImReplySource::Direct(inner)=ticket.source()else{return Err(CodecError::InvalidField.into());};
+        let id=inner.request_id();let Some(pending)=self.direct_pending.get(&id)else{return Ok(None);};
+        let DirectResponse::GroupEvent{fingerprint,deadline}=pending.response else{return Err(CodecError::InvalidField.into());};
+        if &fingerprint!=ticket.fingerprint()||deadline!=ticket.deadline()||proof.is_some_and(|p|!p.authorizes(ticket,Instant::now())){return Err(CodecError::InvalidField.into());}
+        let retained=super::group_event_packets::GroupEventPackets::capture(&scope,std::iter::once((ticket,proof)))?;
+        let reply=super::group_event_packets::direct_reply(id,proof.is_some())?;
+        let mut packets=encode_call_packets(CallKind::Reply,reply.expose_to_transport(),TLS_FRAGMENT_THRESHOLD)?;
+        for packet in &mut packets{packet.retain_group_event_packet(retained.clone());}
+        let pending=self.direct_pending.remove(&id).ok_or(CodecError::InvalidField)?;self.record_direct(id,pending.magic);Ok(Some(OwnedCallPackets::uncharged(id,packets)))
+    }
     fn capture_im_status(&mut self,notice:super::im_status_delivery::ImStatusNotice,id:i32,magic:&[u8])->Result<super::im_status_delivery::IncomingImStatus,ProtocolError>{
         let ticket=DirectReplyTicket{owner:self.rpc.owner().clone(),connection:self.rpc.connection_scope(),call_id:id};
         let incoming=super::im_status_delivery::IncomingImStatus::direct(notice,ticket)?;

@@ -9,6 +9,8 @@ mod retention;
 mod synchronization;
 #[path="im_status_account_tests.rs"]
 mod status_consumer;
+#[path="group_event_account_tests.rs"]
+mod group_events;
 #[path="im_received_account_tests.rs"]
 mod received_writes;
 #[path="im_user_read_account_tests.rs"]

@@ -90,7 +90,7 @@ impl NetstreamPath{
             self.router.try_drive_routing(&self.owner,&self.scope,read_end).await?;self.ingest_pending()?;
             let Some(packet)=self.session.next_packet(&self.owner,&self.scope,Instant::now())? else{return Ok(());};
             let (bytes,write_end)=packet.for_io(&self.owner,&self.scope,&self.session,Instant::now(),deadline)?.ok_or(NetstreamError::Scope)?;
-            if !self.router.send_datagram(&self.owner,&self.scope,self.session.lease(),self.session.peer(),0,0,bytes,write_end).await?{
+            if !self.router.send_datagram_retained(&self.owner,&self.scope,self.session.lease(),self.session.peer(),0,0,bytes,write_end,packet.group_event_retention()).await?{
                 return Err(NetstreamError::Scope);
             }
             tokio::task::yield_now().await;
@@ -130,7 +130,7 @@ impl NetstreamPath{
             // No await between queue admissions. A later failure closes all
             //staged fragments BEFORE any of this call's packets are written.
             for record in records{
-                if !self.session.queue_record(owner,scope,record.expose_to_transport(),record_end,now)?{return Err(NetstreamError::Scope);}
+                if !self.session.queue_record_retained(owner,scope,record.expose_to_transport(),record_end,now,record.group_event_retention())?{return Err(NetstreamError::Scope);}
             }
             while self.session.has_queued(owner,scope){self.flush(deadline).await?;}
             self.ingest_pending()?;Ok(true)
