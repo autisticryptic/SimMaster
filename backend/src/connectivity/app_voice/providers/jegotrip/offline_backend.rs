@@ -283,7 +283,7 @@ impl OfflineBackend {
         if self.invite_completed.values().any(|ticket| !ticket.positive_is_current()) {
             self.close(); return Err(CodecError::InvalidField.into());
         }
-        let event_packets=if self.group_events.completed.is_empty(){None}else{Some(super::group_event_packets::GroupEventPackets::capture(&self.connection_scope(),self.group_events.completed.values().map(|(ticket,proof)|(ticket,Some(proof))))?)};
+        let event_packets=super::group_event_packets::GroupEventPackets::capture_with_org(&self.connection_scope(),self.group_events.completed.values().map(|(ticket,proof)|(ticket,Some(proof))),self.im_completed.values().map(|(ticket,proof)|(ticket,proof)))?;
         let Some(scheduler) = self.scheduler.as_mut() else { return Err(CodecError::InvalidField.into()); };
         let batch = match scheduler.prepare(now_ms) {
             Ok(batch) => batch, Err(error) => { self.close(); return Err(error.into()); }

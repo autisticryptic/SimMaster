@@ -78,6 +78,7 @@ pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
     outbox::initialize_schema(conn)?;
     super::relation_journal::initialize_schema(conn)?;
     super::group_event_inbox::initialize_schema(conn)?;
+    super::org_relation_inbox::initialize_schema(conn)?;
     read_status::initialize_schema(conn)
 }
 
@@ -90,26 +91,36 @@ impl ImReceiptGate{
 }
 impl fmt::Debug for ImReceiptGate{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ImReceiptGate(<redacted>)")}}
 
-pub(super) struct ImInboxScope{run:Arc<RunToken>,binding:Arc<ImBinding>,gate:Arc<ImReceiptGate>}
+pub(super) struct ImInboxScope{run:Arc<RunToken>,binding:Arc<ImBinding>,gate:Arc<ImReceiptGate>,org:Option<Arc<super::org_relation_inbox::OrgContext>>}
 impl fmt::Debug for ImInboxScope{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ImInboxScope(<redacted>)")}}
 impl ImInboxScope{
     pub(super) fn original(run:Arc<RunToken>,binding:Arc<ImBinding>,gate:Arc<ImReceiptGate>)->Result<Self,&'static str>{
         if binding.owner().line_id()!=run.line_id()||!binding.matches(binding.owner(),&binding.scope())||!gate.live(){return Err(SCOPE);}
-        Ok(Self{run,binding,gate})
+        Ok(Self{run,binding,gate,org:None})
+    }
+    pub(super) fn with_org_context(mut self,org:Option<Arc<super::org_relation_inbox::OrgContext>>)->Result<Self,&'static str>{
+        if org.as_ref().is_some_and(|c|!c.matches(&self.run,&self.binding,&self.gate)){return Err(SCOPE);}self.org=org;Ok(self)
     }
     fn validate(&self,conn:&Connection)->Result<(),&'static str>{
         if account_store::metadata(conn,self.run.line_id())?.is_none_or(|row|row.revision!=self.run.revision())
             ||!account_runs::runtime_matches(conn,&self.run)?{return Err(SCOPE);}
-        account_runs::require_live(conn,self.run.line_id(),self.run.revision(),self.run.nonce())
+        account_runs::require_live(conn,self.run.line_id(),self.run.revision(),self.run.nonce())?;
+        if let Some(org)=&self.org{org.validate(conn)?;}Ok(())
     }
+    fn database_matches(&self,db:&Database)->bool{self.org.as_ref().is_none_or(|org|org.owns_database(db))}
     fn matches(&self,delivery:&IncomingImDelivery)->bool{
         self.gate.live()&&delivery.matches(self.binding.owner(),&self.binding.scope())
             &&delivery.notice().binding().identity()==self.binding.identity()
             &&delivery.notice().binding().receipt_epoch()==self.binding.receipt_epoch()
     }
     fn permit(&self,key:&Arc<ImKey>,fingerprint:[u8;32],id:i64)->CommittedIm{
-        CommittedIm{owner:self.binding.owner().clone(),scope:self.binding.scope(),identity:*self.binding.identity(),receipt_epoch:Zeroizing::new(self.binding.receipt_epoch().to_owned()),key:key.clone(),fingerprint,id,gate:self.gate.clone()}
+        CommittedIm{owner:self.binding.owner().clone(),scope:self.binding.scope(),identity:*self.binding.identity(),receipt_epoch:Zeroizing::new(self.binding.receipt_epoch().to_owned()),key:key.clone(),fingerprint,id,gate:self.gate.clone(),org:None}
     }
+    fn org_permit(&self,key:&Arc<ImKey>,fingerprint:[u8;32],id:i64,record:Option<Arc<super::org_relation_inbox::OrgRecord>>)->Result<CommittedIm,&'static str>{
+        let mut proof=self.permit(key,fingerprint,id);proof.org=Some(self.org.as_ref().ok_or(SCOPE)?.receipt(key.clone(),fingerprint,id,record)?);Ok(proof)
+    }
+    fn org_lookup(&self,c:&Connection,key:&Arc<ImKey>)->Result<Option<(i64,[u8;32])>,&'static str>{self.org.as_ref().map(|org|org.lookup(c,key)).transpose().map(Option::flatten)}
+    fn org_saved(&self,c:&Connection,key:&Arc<ImKey>)->Result<Option<(i64,[u8;32])>,&'static str>{self.org.as_ref().map(|org|org.saved(c,key)).transpose().map(Option::flatten)}
     /// Only a freshly parsed current Info body with its already checked
     /// canonical fingerprint reaches this update. An old SQL row or a new
     /// notification cannot establish consumption in another physical login.
@@ -118,14 +129,21 @@ impl ImInboxScope{
         let old:Option<String>=conn.query_row("SELECT info_epoch FROM app_voice_im_messages WHERE id=?1 AND line_id=?2 AND revision=?3 AND identity_key=?4 AND body_kind='info'",
             params![id,self.run.line_id(),self.run.revision()as i64,self.binding.identity().as_slice()],|row|row.get(0)).map_err(|_|STORAGE)?;
         if old.is_none(){let bytes:i64=conn.query_row("SELECT COALESCE(SUM(length(body)+length(CAST(text AS BLOB))+length(sender)+COALESCE(length(info_type),0)+COALESCE(length(CAST(info_epoch AS BLOB)),0)),0) FROM app_voice_im_messages",[],|row|row.get(0)).map_err(|_|STORAGE)?;
-            if bytes.checked_add(self.binding.receipt_epoch().len()as i64).is_none_or(|n|n>MAX_TOTAL_BYTES){return Err(FULL);}}
+            let(_,_,control_bytes)=super::org_relation_inbox::usage(conn,self.run.line_id())?;
+            if bytes.checked_add(self.binding.receipt_epoch().len()as i64).and_then(|n|n.checked_add(control_bytes)).is_none_or(|n|n>MAX_TOTAL_BYTES){return Err(FULL);}}
         let changed=conn.execute("UPDATE app_voice_im_messages SET info_epoch=?5 WHERE id=?1 AND line_id=?2 AND revision=?3 AND identity_key=?4 AND body_kind='info'",
             params![id,self.run.line_id(),self.run.revision()as i64,self.binding.identity().as_slice(),self.binding.receipt_epoch()]).map_err(|_|STORAGE)?;
         if changed!=1{return Err(SCOPE);}Ok(())
     }
     pub(super) fn commit(&self,db:&Database,delivery:&IncomingImDelivery)->Result<Option<CommittedIm>,&'static str>{
-        if !self.matches(delivery)||delivery.notice().notification_id().is_some(){return Err(SCOPE);}
+        if !self.database_matches(db)||!self.matches(delivery)||delivery.notice().notification_id().is_some(){return Err(SCOPE);}
         let notice=delivery.notice();let Some(message)=notice.message().map_err(|_|INVALID)? else{return Err(INVALID);};
+        if message.kind==super::org_relation_sync::KIND{
+            let Some(record)=super::org_relation_inbox::OrgRecord::capture(self.binding.clone(),delivery.notice().key().box_id(),&message)?else{return Ok(None);};
+            let org=self.org.as_ref().ok_or(SCOPE)?;if !org.owns_database(db){return Err(SCOPE);}
+            let(id,event)=db.with_conn(|c|{let tx=Transaction::new_unchecked(c,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;self.validate(&tx)?;let value=org.insert(&tx,&record)?;self.validate(&tx)?;if !self.matches(delivery)||Instant::now()>=delivery.ticket().deadline(){return Err(SCOPE);}tx.commit().map_err(|_|STORAGE)?;Ok(value)})?;
+            if let Some(event)=event{db.publish_committed_app_event(event);}return self.org_permit(&record.key,record.fingerprint,id,Some(record.clone())).map(Some);
+        }
         let Some(text)=ImContent::capture(&self.binding,&message)? else{return Ok(None);};
         let key=notice.key();let raw=notice.raw().ok_or(INVALID)?;let fingerprint=*notice.message_fingerprint().ok_or(INVALID)?;
         let info_epoch=if text.body_kind()=="info"{Some(self.binding.receipt_epoch())}else{None};
@@ -136,6 +154,7 @@ impl ImInboxScope{
         // owning actor still require the same live scope/deadline to reply.
         let(id,event)=db.with_conn(|conn|{
             let tx=Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;self.validate(&tx)?;
+            if super::org_relation_inbox::contains_saved(&tx,&self.run,&self.binding,key)?{return Err("app_account_im_message_conflict");}
             let existing:Option<(i64,Vec<u8>)>=tx.query_row("SELECT id,fingerprint FROM app_voice_im_messages WHERE line_id=?1 AND revision=?2 AND identity_key=?3 AND box_id=?4 AND message_index=?5",
                 params![self.run.line_id(),self.run.revision()as i64,self.binding.identity().as_slice(),key.box_id().bytes(),key.index()],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(|_|STORAGE)?;
             if let Some((id,saved))=existing{
@@ -144,6 +163,8 @@ impl ImInboxScope{
                 tx.commit().map_err(|_|STORAGE)?;return Ok((id,None));
             }
             let(local,total,bytes):(i64,i64,i64)=tx.query_row("SELECT COALESCE(SUM(line_id=?1),0),COUNT(*),COALESCE(SUM(length(body)+length(CAST(text AS BLOB))+length(sender)+COALESCE(length(info_type),0)+COALESCE(length(CAST(info_epoch AS BLOB)),0)),0) FROM app_voice_im_messages",[self.run.line_id()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|_|STORAGE)?;
+            let(control_local,control_total,control_bytes)=super::org_relation_inbox::usage(&tx,self.run.line_id())?;
+            if control_local.checked_add(local).is_none_or(|n|n>=MAX_PER_ACCOUNT)||control_total.checked_add(total).is_none_or(|n|n>=MAX_TOTAL)||bytes.checked_add(control_bytes).and_then(|n|n.checked_add(size as i64)).is_none_or(|n|n>MAX_TOTAL_BYTES){return Err(FULL);}
             if local>=MAX_PER_ACCOUNT||total>=MAX_TOTAL||bytes.checked_add(size as i64).is_none_or(|n|n>MAX_TOTAL_BYTES){return Err(FULL);}
             let kind=match key.box_id().kind(){super::im_data::BoxKind::P2P=>"p2p",super::im_data::BoxKind::Org=>"org"};let now=chrono::Utc::now().to_rfc3339();
             tx.execute("INSERT INTO app_voice_im_messages(line_id,revision,identity_key,box_id,box_kind,message_index,fingerprint,original_time,body,text,sender,attachment_count,created_at,body_kind,info_type,system_info,info_epoch) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
@@ -159,7 +180,7 @@ impl ImInboxScope{
     /// message in the SAME native UID/selector/config context. A deleted row
     /// stays a private receipt tombstone: no content/event is recreated.
     pub(super) fn lookup(&self,db:&Database,delivery:&IncomingImDelivery)->Result<Option<CommittedIm>,&'static str>{
-        if !self.matches(delivery)||delivery.notice().notification_id().is_none(){return Err(SCOPE);}
+        if !self.database_matches(db)||!self.matches(delivery)||delivery.notice().notification_id().is_none(){return Err(SCOPE);}
         let key=delivery.notice().key();
         let row:Option<(i64,Vec<u8>)>=db.with_conn(|conn|{
             let tx=Transaction::new_unchecked(conn,TransactionBehavior::Deferred).map_err(|_|STORAGE)?;self.validate(&tx)?;
@@ -167,20 +188,24 @@ impl ImInboxScope{
                 params![self.run.line_id(),self.run.revision()as i64,self.binding.identity().as_slice(),key.box_id().bytes(),key.index(),i64::from(self.binding.receives_info()),self.binding.receipt_epoch()],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(|_|STORAGE)?;
             tx.commit().map_err(|_|STORAGE)?;Ok(row)
         })?;
-        row.map(|(id,fingerprint)|{let fingerprint:[u8;32]=fingerprint.try_into().map_err(|_|STORAGE)?;Ok(self.permit(key,fingerprint,id))}).transpose()
+        if let Some((id,fingerprint))=row{let fingerprint:[u8;32]=fingerprint.try_into().map_err(|_|STORAGE)?;return Ok(Some(self.permit(key,fingerprint,id)));}
+        let control=db.with_conn(|c|{self.validate(c)?;self.org_lookup(c,key)})?;
+        control.map(|(id,fingerprint)|self.org_permit(key,fingerprint,id,None)).transpose()
     }
 }
 
-pub struct CommittedIm{owner:AttemptOwner,scope:RpcConnectionScope,identity:[u8;32],receipt_epoch:Zeroizing<String>,key:Arc<ImKey>,fingerprint:[u8;32],id:i64,gate:Arc<ImReceiptGate>}
+pub struct CommittedIm{owner:AttemptOwner,scope:RpcConnectionScope,identity:[u8;32],receipt_epoch:Zeroizing<String>,key:Arc<ImKey>,fingerprint:[u8;32],id:i64,gate:Arc<ImReceiptGate>,org:Option<Arc<super::org_relation_inbox::OrgReceipt>>}
 impl fmt::Debug for CommittedIm{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("CommittedIm(<redacted>)")}}
 impl CommittedIm{
     pub(super) fn authorizes(&self,ticket:&ImReplyTicket,now:Instant)->bool{
         self.gate.live()&&self.id>0&&ticket.matches(&self.owner,&self.scope)&&ticket.binding().identity()==&self.identity&&ticket.binding().receipt_epoch()==self.receipt_epoch.as_str()&&ticket.key().digest()==self.key.digest()
-            &&(!ticket.is_message()||ticket.fingerprint()==&self.fingerprint)&&now<ticket.completion_deadline()
+            &&(!ticket.is_message()||ticket.fingerprint()==&self.fingerprint)&&now<ticket.completion_deadline()&&self.org.as_ref().is_none_or(|p|p.authorizes(ticket,now))
     }
     pub(super) fn gate(&self)->Arc<ImReceiptGate>{self.gate.clone()}
     pub(super) fn key_digest(&self)->&[u8;32]{self.key.digest()}
-    pub(super) fn captured_copy(&self)->Self{Self{owner:self.owner.clone(),scope:self.scope.clone(),identity:self.identity,receipt_epoch:self.receipt_epoch.clone(),key:self.key.clone(),fingerprint:self.fingerprint,id:self.id,gate:self.gate.clone()}}
+    pub(super) fn captured_copy(&self)->Self{Self{owner:self.owner.clone(),scope:self.scope.clone(),identity:self.identity,receipt_epoch:self.receipt_epoch.clone(),key:self.key.clone(),fingerprint:self.fingerprint,id:self.id,gate:self.gate.clone(),org:self.org.clone()}}
+    pub(super) fn org_receipt(&self)->bool{self.org.is_some()}
+    pub(super) fn original_org_record(&self,c:&Connection)->Result<bool,&'static str>{self.org.as_ref().map_or(Ok(false),|p|p.matches_record(c))}
 }
 #[derive(Serialize)]
 pub struct ImMessageView{

@@ -26,6 +26,8 @@ mod directory;
 mod relations;
 #[path="group_event_protocol_tests.rs"]
 mod group_events;
+#[path="org_relation_protocol_tests.rs"]
+mod org_relations;
 struct Fixture{owner:AttemptOwner,scope:RpcConnectionScope,backend:OfflineBackend,temp:TempDatabase,run:Arc<account_runs::RunToken>,gate:Arc<ImReceiptGate>}
 impl Fixture{
     fn new(enabled:bool)->Self{Self::with_info(enabled,false)}

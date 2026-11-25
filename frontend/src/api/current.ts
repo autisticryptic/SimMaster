@@ -1167,6 +1167,9 @@ class SimAdminCurrentAPI {
   async getAppRelationEvents(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/relation-events?limit=128`, { method: 'GET', cache: 'no-store', timeoutMs: 10000, skipAuthRedirect: true })
   }
+  async getAppOrgRelationEvents(lineId: string) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/org-relation-events?limit=128`, { method: 'GET', cache: 'no-store', timeoutMs: 10000, skipAuthRedirect: true })
+  }
   async getAppImMessages(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-messages?limit=16`, { cache: 'no-store', timeoutMs: 10000 })
   }

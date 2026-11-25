@@ -12,6 +12,7 @@ import AppUserEntryPane from './AppUserEntryPane'
 import AppNativeDirectoryPane from './AppNativeDirectoryPane'
 import AppRelationHistoryPane from './AppRelationHistoryPane'
 import AppRelationEventsPane from './AppRelationEventsPane'
+import AppOrgRelationEventsPane from './AppOrgRelationEventsPane'
 import AppRelationWritePane from './AppRelationWritePane'
 import JegotripConfigurationDialog from './JegotripConfigurationDialog'
 import { appBusinessLabel, appLoginError, appLoginPhase } from '../../policies/appLogin'
@@ -102,6 +103,7 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
                 <AppNativeDirectoryPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.directory_queries_supported === true} />
                 <AppRelationHistoryPane lineId={account.line_id} revision={account.revision} />
                 <AppRelationEventsPane lineId={account.line_id} revision={account.revision} />
+                <AppOrgRelationEventsPane lineId={account.line_id} revision={account.revision} />
                 <AppRelationWritePane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.relation_updates_supported === true} />
                 <AppUserEntryPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.user_entry_supported === true || account.user_entry_uid_local_supported === true} localOnly={account.user_entry_supported !== true} />
                 <AppImReceiptsPane lineId={account.line_id} />

@@ -32,9 +32,9 @@ impl fmt::Debug for AssociationAdmission{fn fmt(&self,f:&mut fmt::Formatter<'_>)
 struct Row{identity:Vec<u8>,key:Vec<u8>,notice:Vec<u8>,outcome:i64,message_id:Option<i64>,message_fingerprint:Option<Vec<u8>>}
 impl ImInboxScope{
     pub(in super::super) fn open_association(&self,db:&Database,delivery:&IncomingImDelivery)->Result<AssociationAdmission,&'static str>{
-        if !self.matches(delivery){return Err(SCOPE);}
+        if !self.database_matches(db)||!self.matches(delivery){return Err(SCOPE);}
         let id=delivery.notice().notification_id().ok_or(SCOPE)?.to_be_bytes();let ticket=delivery.ticket();let key=ticket.key();let fingerprint=ticket.fingerprint();
-        let existing:Option<(i64,[u8;32])>=db.with_conn(|conn|{
+        let existing:Option<(i64,[u8;32],bool)>=db.with_conn(|conn|{
             let tx=Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;self.validate(&tx)?;
             let row:Option<Row>=tx.query_row("SELECT identity_key,key_fingerprint,notice_fingerprint,outcome,message_id,message_fingerprint FROM app_voice_im_notifications WHERE line_id=?1 AND run_nonce=?2 AND scope_epoch=?3 AND notification_id=?4 AND revision=?5",
                 params![self.run.line_id(),self.run.nonce(),self.binding.receipt_epoch(),id.as_slice(),self.run.revision()as i64],|r|Ok(Row{identity:r.get(0)?,key:r.get(1)?,notice:r.get(2)?,outcome:r.get(3)?,message_id:r.get(4)?,message_fingerprint:r.get(5)?})).optional().map_err(|_|STORAGE)?;
@@ -44,14 +44,15 @@ impl ImInboxScope{
                     // Pending survived an interrupted admission, not its
                     // original in-memory first-deadline capability. Keep NACK.
                     if row.outcome==PENDING{tx.execute("UPDATE app_voice_im_notifications SET outcome=1 WHERE line_id=?1 AND run_nonce=?2 AND scope_epoch=?3 AND notification_id=?4 AND outcome=0",params![self.run.line_id(),self.run.nonce(),self.binding.receipt_epoch(),id.as_slice()]).map_err(|_|STORAGE)?;}
-                    tx.commit().map_err(|_|STORAGE)?;return Ok(Some((0,[0;32])));
+                    tx.commit().map_err(|_|STORAGE)?;return Ok(Some((0,[0;32],false)));
                 }
                 let message_id=row.message_id.ok_or(STORAGE)?;let saved: [u8;32]=row.message_fingerprint.ok_or(STORAGE)?.try_into().map_err(|_|STORAGE)?;
                 // RowID or a stored boolean cannot redeem changed/deleted-and-
                 // reinserted history. A normal text deletion keeps its hash.
                 let same:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_im_messages WHERE id=?1 AND line_id=?2 AND revision=?3 AND identity_key=?4 AND box_id=?5 AND message_index=?6 AND fingerprint=?7)",
                     params![message_id,self.run.line_id(),self.run.revision()as i64,self.binding.identity().as_slice(),key.box_id().bytes(),key.index(),saved.as_slice()],|r|r.get(0)).map_err(|_|STORAGE)?;
-                tx.commit().map_err(|_|STORAGE)?;return Ok(Some(if same{(message_id,saved)}else{(0,[0;32])}));
+                let org_same=if same{false}else{self.org_lookup(&tx,key)?.is_some_and(|(id,h)|id==message_id&&h==saved)};
+                tx.commit().map_err(|_|STORAGE)?;return Ok(Some(if same||org_same{(message_id,saved,org_same)}else{(0,[0;32],false)}));
             }
             let(local,total):(i64,i64)=tx.query_row("SELECT COALESCE(SUM(line_id=?1),0),COUNT(*) FROM app_voice_im_notifications",[self.run.line_id()],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|STORAGE)?;
             if local>=MAX_ASSOC_PER_ACCOUNT||total>=MAX_ASSOC_TOTAL{return Err(FULL_ASSOC);}
@@ -61,19 +62,20 @@ impl ImInboxScope{
         })?;
         Ok(match existing{
             None=>AssociationAdmission::Fresh(ImPendingAssociation{ticket:ticket.captured_copy(),notification_id:id}),
-            Some((id,hash))=>AssociationAdmission::Replay((id>0).then(||self.permit(key,hash,id))),
+            Some((id,hash,true))=>AssociationAdmission::Replay(Some(self.org_permit(key,hash,id,None)?)),
+            Some((id,hash,false))=>AssociationAdmission::Replay((id>0).then(||self.permit(key,hash,id))),
         })
     }
     pub(in super::super) fn finish_association(&self,db:&Database,pending:&ImPendingAssociation,proof:Option<&CommittedIm>)->Result<Option<CommittedIm>,&'static str>{
         let ticket=&pending.ticket;
-        if !self.gate.live()||!ticket.matches(self.binding.owner(),&self.binding.scope())||ticket.binding().receipt_epoch()!=self.binding.receipt_epoch(){return Err(SCOPE);}
+        if !self.database_matches(db)||!self.gate.live()||!ticket.matches(self.binding.owner(),&self.binding.scope())||ticket.binding().receipt_epoch()!=self.binding.receipt_epoch(){return Err(SCOPE);}
         let accepted=proof.is_some_and(|p|p.authorizes(ticket,Instant::now()));
         let result=db.with_conn(|conn|{
             let tx=Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;self.validate(&tx)?;
             let (state,id,hash)=if let Some(proof)=proof.filter(|_|accepted){
                 let same:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_im_messages WHERE id=?1 AND line_id=?2 AND revision=?3 AND identity_key=?4 AND box_id=?5 AND message_index=?6 AND fingerprint=?7)",
                     params![proof.id,self.run.line_id(),self.run.revision()as i64,self.binding.identity().as_slice(),ticket.key().box_id().bytes(),ticket.key().index(),proof.fingerprint.as_slice()],|r|r.get(0)).map_err(|_|STORAGE)?;
-                if !same{return Err("app_account_im_notification_conflict");}(CONSUMED,Some(proof.id),Some(proof.fingerprint.as_slice()))
+                if !(if proof.org_receipt(){proof.original_org_record(&tx)?}else{same}){return Err("app_account_im_notification_conflict");}(CONSUMED,Some(proof.id),Some(proof.fingerprint.as_slice()))
             }else{(NEGATIVE,None,None)};
             let changed=tx.execute("UPDATE app_voice_im_notifications SET outcome=?1,message_id=?2,message_fingerprint=?3 WHERE line_id=?4 AND revision=?5 AND run_nonce=?6 AND scope_epoch=?7 AND notification_id=?8 AND identity_key=?9 AND key_fingerprint=?10 AND notice_fingerprint=?11 AND outcome=0",
                 params![state,id,hash,self.run.line_id(),self.run.revision()as i64,self.run.nonce(),self.binding.receipt_epoch(),pending.notification_id.as_slice(),self.binding.identity().as_slice(),ticket.key().digest().as_slice(),ticket.fingerprint().as_slice()]).map_err(|_|STORAGE)?;

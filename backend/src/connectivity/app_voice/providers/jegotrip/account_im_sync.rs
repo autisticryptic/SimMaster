@@ -92,7 +92,7 @@ impl State{
                 Err(code)=>Err(code),
             }
         }else{
-            if self.cursor.is_none(){self.cursor=Some(CursorSession::from_refresh(run.run_token.clone(),run.im_gate.clone(),&reply)?);}
+            if self.cursor.is_none(){self.cursor=Some(CursorSession::from_refresh(run.run_token.clone(),run.im_gate.clone(),&reply)?.with_org_context(super::im::org_context(run,reply.request().binding())?)?);}
             let cursor=self.cursor.as_mut().ok_or("app_account_im_cursor_invalid")?;
             match cursor.observe_refresh(&run.database,&reply){
                 Ok(_)=>{if !cursor.initial(){self.fail(run,"app_account_im_status_baseline_missing");}},

@@ -514,8 +514,10 @@ impl ArcProtocol {
         let Some(pending)=self.direct_pending.get(&inner.call_id)else{return Ok(None);};
         let DirectResponse::Im{fingerprint,deadline}=pending.response else{return Err(CodecError::InvalidField.into());};
         if &fingerprint!=ticket.fingerprint()||deadline!=ticket.deadline()||proof.is_some_and(|proof|!proof.authorizes(ticket,Instant::now())){return Err(CodecError::InvalidField.into());}
-        let result=encode_online_message_result(proof.is_some())?;let reply=encode_reply(inner.call_id,0,result.expose_to_transport())?;
-        let packets=encode_call_packets(CallKind::Reply,reply.expose_to_transport(),TLS_FRAGMENT_THRESHOLD)?;
+        let retained=super::group_event_packets::GroupEventPackets::capture_with_org(&scope,std::iter::empty(),proof.into_iter().map(|p|(ticket,p)))?;
+        let reply=if retained.is_some(){super::group_event_packets::direct_reply(inner.call_id,true)?}else{let result=encode_online_message_result(proof.is_some())?;encode_reply(inner.call_id,0,result.expose_to_transport())?};
+        let mut packets=encode_call_packets(CallKind::Reply,reply.expose_to_transport(),TLS_FRAGMENT_THRESHOLD)?;
+        if let Some(retained)=retained{for packet in &mut packets{packet.retain_group_event_packet(retained.clone());}}
         let pending=self.direct_pending.remove(&inner.call_id).ok_or(CodecError::InvalidField)?;self.record_direct(inner.call_id,pending.magic);
         Ok(Some(OwnedCallPackets::uncharged(inner.call_id,packets)))
     }

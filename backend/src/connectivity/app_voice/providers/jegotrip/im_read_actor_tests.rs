@@ -15,6 +15,8 @@ mod sends;
 mod relations;
 #[path="group_event_io_tests.rs"]
 mod group_events;
+#[path="org_relation_io_tests.rs"]
+mod org_relations;
 #[path="im_info_runtime_io_tests.rs"]
 mod info;
 #[path="group_directory_io_tests.rs"]

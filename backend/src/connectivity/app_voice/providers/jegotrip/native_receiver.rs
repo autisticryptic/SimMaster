@@ -44,7 +44,7 @@ impl fmt::Debug for DirectDomainConfig {
 
 pub(super) struct NativeReceiverPolicy { mode: DomainMode, domains: Vec<Vec<u8>>, retained: usize,
     invite_notifications: Option<super::native_invite_notifications::NativeInviteConfig>,
-    im_messages: Option<super::im_delivery::NativeImConfig> }
+    im_messages: Option<super::im_delivery::NativeImConfig>,org_relation_sync:bool }
 impl Drop for NativeReceiverPolicy { fn drop(&mut self) { self.domains.zeroize(); } }
 impl fmt::Debug for NativeReceiverPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("NativeReceiverPolicy(<redacted>)") }
@@ -67,11 +67,16 @@ impl NativeReceiverPolicy {
         if let Some(invites) = config.invite_notifications { invites.timeout()?; retained = retained.checked_add(8).ok_or(CodecError::TooLarge)?; }
         if let Some(im) = config.im_messages { im.timeout()?; retained = retained.checked_add(8).ok_or(CodecError::TooLarge)?; }
         if retained > MAX_STREAM_BYTES { return Err(CodecError::TooLarge); }
-        Ok(Arc::new(Self { mode, domains: values.to_vec(), retained, invite_notifications: config.invite_notifications, im_messages: config.im_messages }))
+        Ok(Arc::new(Self { mode, domains: values.to_vec(), retained, invite_notifications: config.invite_notifications, im_messages: config.im_messages,org_relation_sync:false }))
     }
     pub(super) fn invite_notifications(&self) -> Option<super::native_invite_notifications::NativeInviteConfig> { self.invite_notifications }
     pub(super) fn im_messages(&self) -> Option<super::im_delivery::NativeImConfig> { self.im_messages }
     pub(super) fn retained_bytes(&self) -> usize { self.retained }
+    pub(super) fn with_org_relation_sync(&self,config:super::org_relation_sync::NativeOrgRelationSyncConfig)->Result<Arc<Self>,CodecError>{
+        config.validate().map_err(|_|CodecError::InvalidField)?;if self.org_relation_sync||self.im_messages.is_none(){return Err(CodecError::InvalidField);}
+        Ok(Arc::new(Self{mode:self.mode,domains:self.domains.clone(),retained:self.retained,invite_notifications:self.invite_notifications,im_messages:self.im_messages,org_relation_sync:true}))
+    }
+    pub(super) fn org_relation_sync(&self)->bool{self.org_relation_sync}
     /// The caller must first check its private original-scope request brand.
     /// No raw HTTP/notification payload or bare decoder can mint that brand.
     pub(super) fn validate(&self, object: ReceiverObject, metadata: &[RpcProperty<'_>], transport: ReceiverTransport) -> Result<(), CodecError> {

@@ -312,6 +312,11 @@ impl RuntimeProfile {
         if self.relation_updates.is_some()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}
         add_bytes(&mut self.byte_length,std::mem::size_of_val(&config))?;self.relation_updates=Some(config);Ok(self)
     }
+    pub(super) fn with_org_relation_sync(mut self,config:Option<super::org_relation_sync::NativeOrgRelationSyncConfig>)->Result<Self,ProfileError>{
+        let Some(config)=config else{return Ok(self);};if self.common.is_none()||!self.client_ex{return Err(ProfileError::InvalidConfiguration);}
+        let native=self.native_receivers.as_ref().ok_or(ProfileError::InvalidConfiguration)?;let installed=native.with_org_relation_sync(config).map_err(|_|ProfileError::InvalidConfiguration)?;
+        add_bytes(&mut self.byte_length,std::mem::size_of_val(&config))?;self.native_receivers=Some(installed);Ok(self)
+    }
     pub(super) fn with_relation_events(mut self,config:Option<super::group_events::NativeRelationEventsConfig>)->Result<Self,ProfileError>{
         let Some(config)=config else{return Ok(self);};config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;
         if self.relation_events.is_some()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}

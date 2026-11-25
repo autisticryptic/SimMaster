@@ -120,6 +120,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/relation-writes",get(relation_updates::relation_history).post(relation_updates::update_relations))
         .route("/api/non-3gpp/accounts/{line_id}/relation-intents",get(relation_updates::intent_history))
         .route("/api/non-3gpp/accounts/{line_id}/relation-events",get(relation_updates::event_history))
+        .route("/api/non-3gpp/accounts/{line_id}/org-relation-events",get(relation_updates::org_event_history))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}/mark-read",post(mark_im_user_read))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}/mark-read/recipient",post(mark_im_user_read_recipient))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}", delete(delete_im_message))
@@ -192,7 +193,10 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_relation_storage_failed" | "app_account_relation_event_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_account_relation_event_scope_invalid" => StatusCode::BAD_REQUEST,
         "app_account_relation_event_conflict" => StatusCode::CONFLICT,
-        "app_account_relation_event_full" => StatusCode::TOO_MANY_REQUESTS,
+        "app_account_relation_event_full" | "app_account_org_relation_full" => StatusCode::TOO_MANY_REQUESTS,
+        "app_account_org_relation_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
+        "app_account_org_relation_scope_invalid" | "app_account_org_relation_invalid" => StatusCode::BAD_REQUEST,
+        "app_account_org_relation_conflict" => StatusCode::CONFLICT,
         "app_account_directory_request_invalid" => StatusCode::BAD_REQUEST,
         "app_account_directory_consent_required" | "app_account_directory_not_installed" => StatusCode::FORBIDDEN,
         "app_account_directory_capacity" => StatusCode::TOO_MANY_REQUESTS,

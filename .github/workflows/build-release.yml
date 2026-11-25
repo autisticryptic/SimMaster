@@ -438,6 +438,7 @@ jobs:
             connectivity::app_voice::providers::jegotrip::connect_failure_detail::tests \
             connectivity::app_voice::providers::jegotrip::group_relation_updates::tests \
             connectivity::app_voice::providers::jegotrip::group_events::tests \
+            connectivity::app_voice::providers::jegotrip::org_relation_sync::tests \
             connectivity::app_voice::providers::jegotrip::relation_update_policy::tests \
             connectivity::app_voice::providers::jegotrip::transport_actor::tests \
             connectivity::app_voice::providers::jegotrip::transport_actor::native::tests \

@@ -82,6 +82,7 @@ impl<'a> ImMessage<'a>{
     pub(super) fn encode(&self)->Result<RpcBytes,CodecError>{
         let mut writer=Writer::new();self.write(&mut writer)?;Ok(writer.finish())
     }
+    pub(super) fn encode_measured(&self,capacity:usize)->Result<RpcBytes,CodecError>{let mut writer=Writer::measured(capacity)?;self.write(&mut writer)?;Ok(writer.finish())}
     fn write(&self,writer:&mut Writer)->Result<(),CodecError>{
         validate_properties(&self.attachments)?;validate_properties(&self.parameters)?;
         writer.i64(self.index)?;writer.i64(self.time)?;writer.bytes(self.sender_uid)?;

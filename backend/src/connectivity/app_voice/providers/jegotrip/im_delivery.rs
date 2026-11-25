@@ -75,24 +75,28 @@ impl ImKey{
 }
 
 pub(super) enum ImPayload{Message{raw:Zeroizing<Vec<u8>>,fingerprint:[u8;32]},Notification{notification_id:u64}}
-pub(super) struct ImNotice{binding:Arc<ImBinding>,key:Arc<ImKey>,payload:ImPayload,deadline:Instant}
+pub(super) struct ImNotice{binding:Arc<ImBinding>,key:Arc<ImKey>,payload:ImPayload,deadline:Instant,_org_budget:Option<Arc<super::native_rpc_budget::NativeRpcReservation>>}
 impl fmt::Debug for ImNotice{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ImNotice(<redacted>)")}}
 impl ImNotice{
     pub(super) fn more(binding:Arc<ImBinding>,kind:&[u8],properties:&[RpcProperty<'_>],body:&[u8],now:Instant)->Result<Option<Self>,CodecError>{
         if !binding.matches(binding.owner(),&binding.scope()){return Ok(None);}
         if body.len()>MAX_FIELD_BYTES{return Err(CodecError::TooLarge);}
+        let org_budget=if binding.policy().org_relation_sync()&&kind==im_data::MORE_MESSAGE_KIND{
+            let headers=super::org_relation_sync::message_scratch(body)?;let peak=body.len().checked_mul(2).and_then(|n|n.checked_add(headers+std::mem::size_of::<Self>()+256)).ok_or(CodecError::TooLarge)?;
+            Some(binding.scope().reserve_native_rpc(peak)?)
+        }else{None};
         let Some(decoded)=im_data::decode_more_message(kind,properties,body)? else{return Ok(None);};
         let key=ImKey::capture(&binding,decoded.box_id,decoded.message.index);
-        let canonical=decoded.message.encode()?;let raw=Zeroizing::new(canonical.expose_to_transport().to_vec());
+        let canonical=if org_budget.is_some(){decoded.message.encode_measured(body.len())?}else{decoded.message.encode()?};let raw=Zeroizing::new(canonical.expose_to_transport().to_vec());
         let fingerprint=key.message_fingerprint(&raw);
         let deadline=now.checked_add(binding.config.timeout()?).ok_or(CodecError::InvalidField)?;
-        Ok(Some(Self{binding,key,payload:ImPayload::Message{raw,fingerprint},deadline}))
+        Ok(Some(Self{binding,key,payload:ImPayload::Message{raw,fingerprint},deadline,_org_budget:org_budget}))
     }
     pub(super) fn notification(binding:Arc<ImBinding>,notification_id:u64,properties:&[RpcProperty<'_>],now:Instant)->Result<Self,CodecError>{
         if !binding.matches(binding.owner(),&binding.scope())||notification_id==0||notification_id==i64::MAX as u64{return Err(CodecError::InvalidField);}
         let decoded=MessageKey::notification(properties)?;let key=ImKey::capture(&binding,decoded.box_id,decoded.index);
         let deadline=now.checked_add(binding.config.timeout()?).ok_or(CodecError::InvalidField)?;
-        Ok(Self{binding,key,payload:ImPayload::Notification{notification_id},deadline})
+        Ok(Self{binding,key,payload:ImPayload::Notification{notification_id},deadline,_org_budget:None})
     }
     pub(super) fn binding(&self)->&Arc<ImBinding>{&self.binding}
     pub(super) fn key(&self)->&Arc<ImKey>{&self.key}
