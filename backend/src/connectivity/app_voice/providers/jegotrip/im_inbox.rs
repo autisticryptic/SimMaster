@@ -78,7 +78,6 @@ pub(super) fn initialize_schema(conn:&Connection)->Result<(),&'static str>{
     outbox::initialize_schema(conn)?;
     super::relation_journal::initialize_schema(conn)?;
     super::group_event_inbox::initialize_schema(conn)?;
-    super::org_relation_inbox::initialize_schema(conn)?;
     read_status::initialize_schema(conn)
 }
 

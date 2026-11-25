@@ -3,6 +3,7 @@ use super::*;
 use n::{org_relation_sync::{self,NativeOrgRelationSyncConfig},org_relation_inbox::OrgContext,relation_journal::RelationConfiguration};
 fn fixture(enabled:bool)->Fixture{let mut f=Fixture::new(true);reconnect(&mut f,enabled);f}
 fn reconnect(f:&mut Fixture,enabled:bool){
+    f.temp.database.with_conn(|c|n::org_relation_inbox::initialize_schema(c)).unwrap();
     f.backend.close();let mut b=OfflineBackend::new(f.owner.clone());b.claim_common_transport().unwrap();b.bind_common_identity(b"AccountEntry").unwrap();let cfg=NativeReceiverConfig{direct_domains:None,invite_notifications:None,im_messages:Some(NativeImConfig{notification_timeout_ms:30000,receive_info:false,directory_queries:false})};
     let p=NativeReceiverPolicy::capture(&cfg).unwrap();let p=if enabled{p.with_org_relation_sync(NativeOrgRelationSyncConfig{receive:true}).unwrap()}else{p};b.arm_native_receivers(NativeReceiverSetup::capture(p,true,None).unwrap()).unwrap();f.scope=b.connection_scope();let login=b.prepare_login(login(),&[]).unwrap();b.on_plaintext_packet(&f.owner,&f.scope,&reply_packet(login.call_id,&login_result()),0).unwrap();b.configure_native_receivers(7).unwrap();f.backend=b;
 }

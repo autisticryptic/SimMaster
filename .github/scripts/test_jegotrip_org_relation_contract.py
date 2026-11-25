@@ -4,6 +4,11 @@ import unittest
 ROOT=Path(__file__).resolve().parents[2];P=ROOT/'backend/src/connectivity/app_voice/providers/jegotrip'
 def src(n):return(P/n).read_text(encoding='utf-8')
 class OrgRelationContracts(unittest.TestCase):
+ def test_org_schema_is_created_only_by_explicit_account_optin_not_unrelated_database_start(self):
+  self.assertNotIn('org_relation_inbox::initialize_schema',src('im_inbox.rs'))
+  s=src('account_store.rs');self.assertEqual(s.count('if config.profile.org_relation_sync.is_some(){super::org_relation_inbox::initialize_schema(&tx)?;}'),2)
+  s=src('org_relation_inbox.rs');self.assertIn('if !installed(c)?{return Ok((0,0,0));}',s);self.assertIn('if !installed(c)?{return Ok(Vec::new());}',s)
+  self.assertIn('without_control_tables',src('org_relation_sync_tests.rs'));self.assertIn('install_control_tables_atomically',src('org_relation_sync_tests.rs'))
  def test_system_record_is_not_group_update_map_chat_json_or_local_notification(self):
   s=src('org_relation_sync.rs')
   for v in ['KIND:&[u8]=b"System.OrgRelSync"','SYSTEM_BOX:&[u8]=b"P2P/0_1"','message.parameters','b"UpdateRel"','let flags=r.u32()?','first=r.bytes()?','second=r.bytes()?','properties=r.properties()?']:self.assertIn(v,s)
