@@ -205,6 +205,9 @@ pub struct ProfileConfig {
     pub org_relation_sync:Option<super::org_relation_sync::NativeOrgRelationSyncConfig>,
     #[serde(default)]
     pub relation_roster:Option<super::relation_roster::NativeRelationRosterConfig>,
+    /// Explicit UID relationship inspection, independent of directory/WRITE.
+    #[serde(default)]
+    pub buddy_relation_check:Option<super::buddy_relation_check::NativeBuddyRelationCheckConfig>,
     pub connect_timeout_ms: u64,
     pub handshake_timeout_ms: u64,
     pub partial_timeout_ms: u64,
@@ -352,6 +355,7 @@ impl AccountConfig {
             .and_then(|profile|profile.with_im_read_status(p.im_read_status.as_ref()).map_err(|_|INVALID))
             .and_then(|profile|profile.with_im_send(p.im_send.as_ref()).map_err(|_|INVALID))
             .and_then(|profile|profile.with_relation_updates(p.relation_updates).map_err(|_|INVALID))
+            .and_then(|profile|profile.with_buddy_relation_check(p.buddy_relation_check).map_err(|_|INVALID))
             .and_then(|profile|profile.with_relation_events(p.relation_events).map_err(|_|INVALID))
             .and_then(|profile|profile.with_org_relation_sync(p.org_relation_sync).map_err(|_|INVALID))
             .and_then(|profile|profile.with_relation_roster(p.relation_roster).map_err(|_|INVALID))
@@ -600,6 +604,8 @@ pub(super) struct PrivateProfileRef<'a> {
     org_relation_sync:Option<super::org_relation_sync::NativeOrgRelationSyncConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     relation_roster:Option<super::relation_roster::NativeRelationRosterConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    buddy_relation_check:Option<super::buddy_relation_check::NativeBuddyRelationCheckConfig>,
     connect_timeout_ms: u64, handshake_timeout_ms: u64, partial_timeout_ms: u64,
     io_timeout_ms: u64, rpc_timeout_ms: u64,
 }
@@ -645,7 +651,7 @@ impl<'a> PrivateConfigRef<'a> {
                 bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
                 call_incoming:p.call_incoming.as_ref().map(|binding|PrivateCallIncomingRef{object_id:&binding.object_id,domain:&binding.domain}),
                 call_control:p.call_control.as_ref().map(|properties|PrivateProperties(properties)),
-                native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),im_send:p.im_send.as_ref(),relation_updates:p.relation_updates,relation_events:p.relation_events,org_relation_sync:p.org_relation_sync,relation_roster:p.relation_roster,
+                native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),im_send:p.im_send.as_ref(),relation_updates:p.relation_updates,relation_events:p.relation_events,org_relation_sync:p.org_relation_sync,relation_roster:p.relation_roster,buddy_relation_check:p.buddy_relation_check,
                 connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
                 partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
             },
@@ -683,7 +689,7 @@ pub(super) fn private_profile_ref(p: &ProfileConfig) -> PrivateProfileRef<'_> {
         bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
         call_incoming: p.call_incoming.as_ref().map(|b| PrivateCallIncomingRef { object_id: &b.object_id, domain: &b.domain }),
         call_control: p.call_control.as_deref().map(private_properties),
-        native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),im_send:p.im_send.as_ref(),relation_updates:p.relation_updates,relation_events:p.relation_events,org_relation_sync:p.org_relation_sync,relation_roster:p.relation_roster,
+        native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),im_send:p.im_send.as_ref(),relation_updates:p.relation_updates,relation_events:p.relation_events,org_relation_sync:p.org_relation_sync,relation_roster:p.relation_roster,buddy_relation_check:p.buddy_relation_check,
         connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
         partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
     }

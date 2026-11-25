@@ -47,6 +47,7 @@ pub(crate) mod im_info;
 pub(crate) mod im_content;
 pub(crate) mod group_directory_data;
 pub(crate) mod group_relation_updates;
+pub(crate) mod buddy_relation_check;
 pub(crate) mod group_events;
 mod group_event_delivery;
 pub(crate) mod group_event_inbox;

@@ -21,6 +21,8 @@ mod org_relations;
 mod info;
 #[path="group_directory_io_tests.rs"]
 mod directory;
+#[path="buddy_relation_check_io_tests.rs"]
+mod buddy_check;
 async fn bounded<F:std::future::Future>(f:F)->F::Output{tokio::time::timeout(Duration::from_secs(12),f).await.expect("original IM IO fixture budget")}
 fn refresh()->Arc<ImQuery>{Arc::new(ImQuery::refresh(&[],-1).unwrap())}
 fn config(enabled:bool)->NativeReceiverConfig{NativeReceiverConfig{direct_domains:None,invite_notifications:None,im_messages:enabled.then_some(NativeImConfig{notification_timeout_ms:3000,receive_info:false,directory_queries:false})}}

@@ -7,6 +7,9 @@ use std::{sync::Arc,time::Duration};
 use tokio::{net::TcpListener,sync::oneshot};
 use tokio_rustls::rustls::ServerConfig;
 fn reply(id:i32,stream:&[u8])->Vec<u8>{let raw=encode_reply(id,0,stream).unwrap();let mut p=vec![1];p.extend_from_slice(raw.expose_to_transport());p}
+#[path="buddy_check_http_peer.rs"]
+mod buddy_check;
+pub(crate) use buddy_check::serve_buddy_check;
 #[derive(Default)]struct SdkWrites{hosting:Option<i32>,unhosting:Option<i32>}
 async fn swap(peer:&mut CommonPeer,p:&[u8],wanted:Option<&[u8]>,known:&mut SdkWrites)->bool{
     assert_eq!(p[0],0);let request=decode_request(&p[1..]).unwrap();assert_eq!(request.method,rpc_batch::SWAP_CALLS_METHOD.as_bytes(),"HTTP relation operation never becomes an unrelated RPC or nested relation resend");

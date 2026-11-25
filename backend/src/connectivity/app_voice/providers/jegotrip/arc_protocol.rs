@@ -299,7 +299,8 @@ impl ArcProtocol {
     }
 
     pub(super) fn prepare_im_read(&mut self,query:std::sync::Arc<super::rpc_im::ImQuery>,gate:std::sync::Arc<super::im_inbox::ImReceiptGate>,deadline:Instant)->Result<OwnedCallPackets,ProtocolError>{
-        let binding=self.im_binding.as_ref().ok_or(CodecError::InvalidField)?.clone();let(id,bytes)=self.rpc.prepare_im_read(binding,query,gate,deadline)?;self.packets(id,bytes.expose_to_transport())
+        let binding=self.im_binding.as_ref().ok_or(CodecError::InvalidField)?.clone();let(id,bytes)=self.rpc.prepare_im_read(binding,query,gate,deadline)?;let mut packets=self.packets(id,bytes.expose_to_transport())?;
+        if let Some(original)=self.rpc.pending_buddy_check(id){let guard=super::group_event_packets::GroupEventPackets::capture_buddy_check(&self.rpc.connection_scope(),original.clone())?;for packet in &mut packets.packets{packet.retain_buddy_check_packet(original.clone());packet.retain_group_event_packet(guard.clone());}}Ok(packets)
     }
     pub(super) fn take_im_replies(&mut self)->Vec<super::rpc_im::OwnedImReply>{self.rpc.take_im_replies()}
     pub(super) fn retire_im_read(&mut self,id:i32){self.rpc.retire_im_read(id);}

@@ -312,6 +312,11 @@ impl RuntimeProfile {
         if self.relation_updates.is_some()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}
         add_bytes(&mut self.byte_length,std::mem::size_of_val(&config))?;self.relation_updates=Some(config);Ok(self)
     }
+    pub(super) fn with_buddy_relation_check(mut self,config:Option<super::buddy_relation_check::NativeBuddyRelationCheckConfig>)->Result<Self,ProfileError>{
+        let Some(config)=config else{return Ok(self);};if self.common.is_none()||!self.client_ex{return Err(ProfileError::InvalidConfiguration);}
+        let native=self.native_receivers.as_ref().ok_or(ProfileError::InvalidConfiguration)?;let installed=native.with_buddy_relation_check(config).map_err(|_|ProfileError::InvalidConfiguration)?;
+        add_bytes(&mut self.byte_length,std::mem::size_of_val(&config))?;self.native_receivers=Some(installed);Ok(self)
+    }
     pub(super) fn with_relation_roster(mut self,config:Option<super::relation_roster::NativeRelationRosterConfig>)->Result<Self,ProfileError>{
         let Some(config)=config else{return Ok(self);};if self.common.is_none()||!self.client_ex||self.relation_events.is_none(){return Err(ProfileError::InvalidConfiguration);}
         let native=self.native_receivers.as_ref().ok_or(ProfileError::InvalidConfiguration)?;if !native.org_relation_sync(){return Err(ProfileError::InvalidConfiguration);}let installed=native.with_relation_roster(config).map_err(|_|ProfileError::InvalidConfiguration)?;add_bytes(&mut self.byte_length,std::mem::size_of_val(&config))?;self.native_receivers=Some(installed);Ok(self)
@@ -756,6 +761,20 @@ impl NativeHostingBackend {
     pub(super) fn relation_roster_enabled(&self)->bool{self.directory_queries_enabled()&&self.profile.native_receivers.as_ref().is_some_and(|p|p.relation_roster())}
     pub(super) async fn roster_binding(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->Result<Arc<super::im_delivery::ImBinding>,RuntimeError>{
         if !self.relation_roster_enabled(){return Err(RuntimeError::InvalidConfiguration);}let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;attempt.commands(owner,scope)?.original_im_binding(owner,scope).await
+    }
+    pub(super) fn buddy_relation_check_enabled(&self)->bool{self.im_messages_enabled()&&self.profile.native_receivers.as_ref().is_some_and(|p|p.buddy_relation_check())}
+    pub(super) fn reserve_buddy_relation_check(&self,uid:&[u8],deadline:Instant)->Result<(AttemptOwner,RpcConnectionScope,Arc<super::rpc_im::ImQuery>),RuntimeError>{
+        if !self.buddy_relation_check_enabled(){return Err(RuntimeError::InvalidConfiguration);}super::buddy_relation_check::validate_uid(uid).map_err(|_|RuntimeError::InvalidConfiguration)?;
+        let attempt=lock(&self.state).slot.clone().ok_or(RuntimeError::Scope)?;let state=lock(&attempt.state);
+        if !state.configured||state.retired||state.logout_started||state.unregister_started||!attempt.scope.is_open()||attempt.scope.session_revoked(){return Err(RuntimeError::Scope);}
+        let input=attempt.scope.reserve_native_rpc(super::buddy_relation_check::input_size(uid).map_err(|_|RuntimeError::InvalidConfiguration)?).map_err(|_|RuntimeError::Backpressure)?;
+        let query=super::rpc_im::ImQuery::buddy_check(uid,input,deadline).map_err(|_|RuntimeError::InvalidConfiguration)?;
+        Ok((attempt.owner.clone(),attempt.scope.clone(),Arc::new(query)))
+    }
+    pub(super) async fn check_buddy_relation(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,query:Arc<super::rpc_im::ImQuery>,gate:Arc<super::im_inbox::ImReceiptGate>)->Result<super::rpc_im::OwnedImReply,RuntimeError>{
+        if !query.buddy_check_query()||!self.buddy_relation_check_enabled(){return Err(RuntimeError::InvalidConfiguration);}let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;
+        {let state=lock(&attempt.state);if !state.configured||state.retired||state.logout_started||state.unregister_started{return Err(RuntimeError::Closed);}}
+        attempt.commands(owner,scope)?.read_im(owner,scope,query,gate).await
     }
     pub(super) fn directory_queries_enabled(&self)->bool{self.im_messages_enabled()&&self.profile.native_receivers.as_ref().and_then(|p|p.im_messages()).is_some_and(|config|config.directory_queries)}
     pub(super) fn directory_query_timeout(&self)->std::time::Duration{self.profile.native_receivers.as_ref().and_then(|p|p.im_messages()).and_then(|config|config.timeout().ok()).unwrap_or(std::time::Duration::ZERO)}

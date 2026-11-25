@@ -11,6 +11,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::rustls::ServerConfig;
 #[path="relation_roster_account_tests.rs"]
 mod roster;
+#[path="buddy_relation_check_account_tests.rs"]
+mod buddy_check;
 
 // Observe the ACTUAL stored-profile backend, not a fabricated controller/run.
 // This is the same construction as AccountManager's explicit native factory.

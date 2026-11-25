@@ -80,6 +80,10 @@ pub enum DirectoryReadOperation{Relations,Properties}
 #[serde(deny_unknown_fields)]
 pub struct DirectoryReadRequest{expected_revision:u64,operation:DirectoryReadOperation,group_id:Option<String>,since:String,consent:bool}
 impl Drop for DirectoryReadRequest{fn drop(&mut self){if let Some(id)=&mut self.group_id{zeroize::Zeroize::zeroize(id);}zeroize::Zeroize::zeroize(&mut self.since);}}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuddyRelationCheckRequest{expected_revision:u64,target_uid:String,consent:bool}
+impl Drop for BuddyRelationCheckRequest{fn drop(&mut self){zeroize::Zeroize::zeroize(&mut self.target_uid);}}
 fn default_inbox_limit() -> usize { 50 }
 
 /// Merged into main's protected routes BEFORE its existing auth middleware.
@@ -117,6 +121,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/im-user-reads/{receipt_id}/reconcile",post(reconcile_im_user_read))
         .route("/api/non-3gpp/accounts/{line_id}/user-entry/lookup",post(lookup_user_entry))
         .route("/api/non-3gpp/accounts/{line_id}/native-directory/read",post(read_native_directory))
+        .route("/api/non-3gpp/accounts/{line_id}/buddy-relation/check",post(check_buddy_relation))
         .route("/api/non-3gpp/accounts/{line_id}/relation-writes",get(relation_updates::relation_history).post(relation_updates::update_relations))
         .route("/api/non-3gpp/accounts/{line_id}/relation-intents",get(relation_updates::intent_history))
         .route("/api/non-3gpp/accounts/{line_id}/relation-events",get(relation_updates::event_history))
@@ -188,6 +193,8 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_user_entry_scope_invalid" | "app_account_user_entry_reference_unsupported" | "app_account_user_entry_transport_failed"
             | "app_account_user_entry_timeout" | "app_account_user_entry_reply_invalid" => StatusCode::SERVICE_UNAVAILABLE,
         "app_account_user_entry_ambiguous" | "app_account_user_entry_realm_mismatch" => StatusCode::CONFLICT,
+        "app_account_buddy_check_consent_required" | "app_account_buddy_check_not_installed" => StatusCode::FORBIDDEN,
+        "app_account_buddy_check_request_invalid" => StatusCode::BAD_REQUEST,
         "app_account_relation_consent_required" | "app_account_relation_not_installed" => StatusCode::FORBIDDEN,
         "app_account_relation_uncertain" | "app_account_relation_nonce_conflict" | "app_account_relation_preparing" | "app_account_relation_nonce_retired" | "app_account_relation_legacy_intent" => StatusCode::CONFLICT,
         "app_account_relation_capacity" | "app_account_relation_full" => StatusCode::TOO_MANY_REQUESTS,
@@ -340,6 +347,11 @@ pub async fn get_notifications(State(manager):State<Arc<AccountManager>>,Path(li
     success(StatusCode::OK,manager.notification_status(&line_id,request.limit))
 }
 
+pub async fn check_buddy_relation(State(manager):State<Arc<AccountManager>>,Path(line):Path<String>,request:Result<Json<BuddyRelationCheckRequest>,JsonRejection>)->Response{
+    let Ok(Json(request))=request else{return failure("app_account_buddy_check_request_invalid");};
+    let prepared=manager.prepare_buddy_relation_check(&line,request.expected_revision,&request.target_uid,request.consent);drop(request);
+    match prepared{Ok(p)=>success(StatusCode::OK,manager.finish_buddy_relation_check(p).await),Err(e)=>failure(e)}
+}
 pub async fn read_native_directory(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Json<DirectoryReadRequest>,JsonRejection>)->Response{
     let Ok(Json(request))=request else{return failure("app_account_directory_request_invalid");};
     if request.since.is_empty()||request.since.len()>20||request.group_id.as_ref().is_some_and(|id|id.len()>508){return failure("app_account_directory_request_invalid");}

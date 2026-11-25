@@ -1060,7 +1060,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             Err(_) => { let _ = command.completion.send(Err(RuntimeError::Protocol)); return Ok(()); }
         };
         if let Some(work)=&im_wait{
-            if !work.interest.begin_write(&work.gate){self.backend.retire_im_read(packets.call_id);let _=command.completion.send(Err(RuntimeError::Cancelled));return Ok(());}
+            if !work.query.buddy_context_current(&self.owner,&self.scope,&work.gate)||!work.interest.begin_write(&work.gate){self.backend.retire_im_read(packets.call_id);let _=command.completion.send(Err(RuntimeError::Cancelled));return Ok(());}
             im_gates.push(work.gate.clone());
         }
         let read_interest=im_wait.as_ref().map(|work|work.interest.clone());

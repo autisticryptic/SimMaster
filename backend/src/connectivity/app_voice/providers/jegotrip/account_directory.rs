@@ -6,6 +6,9 @@ use serde::Serialize;
 #[path="account_relation_roster.rs"]
 mod roster;
 pub use roster::PreparedRosterRead;
+#[path="account_buddy_relation_check.rs"]
+mod buddy_check;
+pub use buddy_check::{PreparedBuddyRelationCheck,BuddyRelationCheckView};
 #[derive(Serialize)]
 pub struct DirectoryReadView{
     pub operation:&'static str,pub target_kind:&'static str,pub accepted:bool,

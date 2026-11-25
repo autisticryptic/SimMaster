@@ -30,6 +30,8 @@ mod group_events;
 mod org_relations;
 #[path="relation_roster_tests.rs"]
 mod roster;
+#[path="buddy_relation_check_tests.rs"]
+mod buddy_check;
 struct Fixture{owner:AttemptOwner,scope:RpcConnectionScope,backend:OfflineBackend,temp:TempDatabase,run:Arc<account_runs::RunToken>,gate:Arc<ImReceiptGate>}
 impl Fixture{
     fn new(enabled:bool)->Self{Self::with_info(enabled,false)}

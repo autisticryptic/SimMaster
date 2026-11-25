@@ -2,7 +2,7 @@
 //! outbound relation WRITE holders. Mixed batches retain BOTH typed owners.
 use super::{group_event_delivery::GroupEventTicket,group_event_inbox::CommittedGroupEvent,native_rpc_budget::NativeRpcReservation,rpc_pending::RpcConnectionScope,rpc_stream::{CodecError,Writer,RpcBytes,MAX_MAP_ENTRIES}};
 use std::{fmt,sync::Arc,time::Instant};
-pub(super) struct GroupEventPackets{entries:Vec<(GroupEventTicket,Option<CommittedGroupEvent>)>,org:Vec<(super::im_delivery::ImReplyTicket,super::im_inbox::CommittedIm)>,_budget:Arc<NativeRpcReservation>,_org_budget:Option<Arc<NativeRpcReservation>>}
+pub(super) struct GroupEventPackets{entries:Vec<(GroupEventTicket,Option<CommittedGroupEvent>)>,org:Vec<(super::im_delivery::ImReplyTicket,super::im_inbox::CommittedIm)>,_budget:Arc<NativeRpcReservation>,_org_budget:Option<Arc<NativeRpcReservation>>,buddy_check:Option<Arc<super::rpc_im::ImRequest>>}
 impl fmt::Debug for GroupEventPackets{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("GroupEventPackets(<redacted>)")}}
 impl GroupEventPackets{
     /// Charge header copies BEFORE allocating the retained ticket list. The
@@ -15,17 +15,23 @@ impl GroupEventPackets{
             if !ticket.matches(ticket.notice().binding().im().owner(),scope)||proof.is_some_and(|p|!p.authorizes(ticket,Instant::now())){return Err(CodecError::InvalidField);}
             captured.push((ticket.captured_copy(),proof.map(CommittedGroupEvent::captured_copy)));
         }
-        Ok(Arc::new(Self{entries:captured,org:Vec::new(),_budget:budget,_org_budget:None}))
+        Ok(Arc::new(Self{entries:captured,org:Vec::new(),_budget:budget,_org_budget:None,buddy_check:None}))
     }
     pub(super) fn capture_with_org<'a>(scope:&RpcConnectionScope,group:impl ExactSizeIterator<Item=(&'a GroupEventTicket,Option<&'a CommittedGroupEvent>)>,im:impl Iterator<Item=(&'a super::im_delivery::ImReplyTicket,&'a super::im_inbox::CommittedIm)>+Clone)->Result<Option<Arc<Self>>,CodecError>{
         let count=im.clone().filter(|(_,p)|p.org_receipt()).count();if group.len()==0&&count==0{return Ok(None);}if group.len()+count>MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
-        let mut value=if group.len()>0{Self::capture(scope,group)?}else{Arc::new(Self{entries:Vec::new(),org:Vec::new(),_budget:scope.reserve_native_rpc(std::mem::size_of::<Self>()+128)?,_org_budget:None})};
+        let mut value=if group.len()>0{Self::capture(scope,group)?}else{Arc::new(Self{entries:Vec::new(),org:Vec::new(),_budget:scope.reserve_native_rpc(std::mem::size_of::<Self>()+128)?,_org_budget:None,buddy_check:None})};
         if count>0{let bytes=count.checked_mul(std::mem::size_of::<(super::im_delivery::ImReplyTicket,super::im_inbox::CommittedIm)>()).and_then(|n|n.checked_add(128)).ok_or(CodecError::TooLarge)?;let budget=scope.reserve_native_rpc(bytes)?;
             let own=Arc::get_mut(&mut value).ok_or(CodecError::InvalidField)?;own.org=Vec::with_capacity(count);own._org_budget=Some(budget);
             for(t,p)in im.filter(|(_,p)|p.org_receipt()){if !t.matches(t.binding().owner(),scope)||!p.authorizes(t,Instant::now()){return Err(CodecError::InvalidField);}own.org.push((t.captured_copy(),p.captured_copy()));}
         }Ok(Some(value))
     }
-    pub(super) fn current(&self,now:Instant)->bool{self.org.iter().all(|(t,p)|p.authorizes(t,now))&&self.entries.iter().all(|(ticket,proof)|{
+    /// Shared actual-packet guard lane; Buddy queries carry no event proof and
+    /// cannot complete any incoming receipt. This reuses only physical lifetime.
+    pub(super) fn capture_buddy_check(scope:&RpcConnectionScope,request:Arc<super::rpc_im::ImRequest>)->Result<Arc<Self>,CodecError>{
+        if !request.query().buddy_check_query()||!request.matches(request.binding().owner(),scope){return Err(CodecError::InvalidField);}
+        let budget=scope.reserve_native_rpc(std::mem::size_of::<Self>()+128)?;Ok(Arc::new(Self{entries:Vec::new(),org:Vec::new(),_budget:budget,_org_budget:None,buddy_check:Some(request)}))
+    }
+    pub(super) fn current(&self,now:Instant)->bool{self.buddy_check.as_ref().is_none_or(|r|r.active())&&self.org.iter().all(|(t,p)|p.authorizes(t,now))&&self.entries.iter().all(|(ticket,proof)|{
         let im=ticket.notice().binding().im();ticket.matches(im.owner(),&im.scope())&&proof.as_ref().is_none_or(|p|p.authorizes(ticket,now))
     })}
 }

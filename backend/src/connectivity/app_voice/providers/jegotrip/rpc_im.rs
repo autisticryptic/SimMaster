@@ -7,13 +7,14 @@ use std::{fmt,sync::Arc,time::Instant};
 use zeroize::Zeroizing;
 pub(super) const GROUP_OBJECT:&[u8]=b"#Group";
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(super) enum ImOperation{Refresh,Receive,SetReceived,Relations,GroupProperties}
+pub(super) enum ImOperation{Refresh,Receive,SetReceived,Relations,GroupProperties,BuddyCheck}
 pub(super) enum ImQuery{
     Refresh{labels:Vec<Zeroizing<Vec<u8>>>,since:i64},
     Receive{box_id:Zeroizing<Vec<u8>>,start:i64,count:u32},
     SetReceived{box_id:Zeroizing<Vec<u8>>,index:i64},
     Relations{group:Option<Zeroizing<Vec<u8>>>,since:i64,input:Option<Arc<super::native_rpc_budget::NativeRpcReservation>>,deadline:Option<Instant>},
     GroupProperties{group:Zeroizing<Vec<u8>>,input:Option<Arc<super::native_rpc_budget::NativeRpcReservation>>,deadline:Option<Instant>},
+    BuddyCheck{uid:Zeroizing<Vec<u8>>,input:Arc<super::native_rpc_budget::NativeRpcReservation>,deadline:Instant,context:Option<Arc<super::buddy_relation_check::CheckContext>>},
 }
 impl fmt::Debug for ImQuery{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ImQuery(<redacted>)")}}
 impl ImQuery{
@@ -42,19 +43,26 @@ impl ImQuery{
         if Instant::now()>=original{return Err(CodecError::InvalidField);}
         match &mut self{Self::Relations{deadline,..}|Self::GroupProperties{deadline,..}if deadline.is_none()=>*deadline=Some(original),_=>return Err(CodecError::InvalidField)}Ok(self)
     }
-    pub(super) fn clipped_deadline(&self,limit:Instant)->Instant{match self{Self::Relations{deadline:Some(original),..}|Self::GroupProperties{deadline:Some(original),..}=>limit.min(*original),_=>limit}}
-    pub(super) fn directory_input_matches(&self,scope:&RpcConnectionScope)->bool{match self{Self::Relations{input,..}|Self::GroupProperties{input,..}=>input.as_ref().is_none_or(|budget|budget.belongs_to(scope)),_=>true}}
+    pub(super) fn buddy_check(uid:&[u8],input:Arc<super::native_rpc_budget::NativeRpcReservation>,deadline:Instant)->Result<Self,CodecError>{
+        super::buddy_relation_check::validate_uid(uid)?;if Instant::now()>=deadline{return Err(CodecError::InvalidField);}Ok(Self::BuddyCheck{uid:Zeroizing::new(uid.to_vec()),input,deadline,context:None})
+    }
+    pub(super) fn bind_buddy_context(self:Arc<Self>,context:Arc<super::buddy_relation_check::CheckContext>)->Result<Arc<Self>,CodecError>{let mut query=Arc::try_unwrap(self).map_err(|_|CodecError::InvalidField)?;match &mut query{Self::BuddyCheck{context:slot,..}if slot.is_none()=>*slot=Some(context),_=>return Err(CodecError::InvalidField)}Ok(Arc::new(query))}
+    pub(super) fn buddy_context_current(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,gate:&Arc<ImReceiptGate>)->bool{match self{Self::BuddyCheck{context,deadline,..}=>context.as_ref().is_some_and(|c|c.binds(owner,scope,gate,*deadline)),_=>true}}
+    pub(super) fn buddy_check_query(&self)->bool{matches!(self,Self::BuddyCheck{..})}
+    pub(super) fn clipped_deadline(&self,limit:Instant)->Instant{match self{Self::Relations{deadline:Some(original),..}|Self::GroupProperties{deadline:Some(original),..}|Self::BuddyCheck{deadline:original,..}=>limit.min(*original),_=>limit}}
+    pub(super) fn directory_input_matches(&self,scope:&RpcConnectionScope)->bool{match self{Self::Relations{input,..}|Self::GroupProperties{input,..}=>input.as_ref().is_none_or(|budget|budget.belongs_to(scope)),Self::BuddyCheck{input,..}=>input.belongs_to(scope),_=>true}}
     pub(super) fn directory_query(&self)->bool{matches!(self,Self::Relations{..}|Self::GroupProperties{..})}
-    pub(super) fn operation(&self)->ImOperation{match self{Self::Refresh{..}=>ImOperation::Refresh,Self::Receive{..}=>ImOperation::Receive,Self::SetReceived{..}=>ImOperation::SetReceived,Self::Relations{..}=>ImOperation::Relations,Self::GroupProperties{..}=>ImOperation::GroupProperties}}
-    pub(super) fn method(&self)->&'static str{match self{Self::Refresh{..}=>im_status::REFRESH_METHOD,Self::Receive{..}=>im_data::RECV_METHOD,Self::SetReceived{..}=>im_data::SET_READ_METHOD,Self::Relations{..}=>directory::RELATIONS_METHOD,Self::GroupProperties{..}=>directory::PROPERTIES_METHOD}}
+    pub(super) fn operation(&self)->ImOperation{match self{Self::Refresh{..}=>ImOperation::Refresh,Self::Receive{..}=>ImOperation::Receive,Self::SetReceived{..}=>ImOperation::SetReceived,Self::Relations{..}=>ImOperation::Relations,Self::GroupProperties{..}=>ImOperation::GroupProperties,Self::BuddyCheck{..}=>ImOperation::BuddyCheck}}
+    pub(super) fn method(&self)->&'static str{match self{Self::Refresh{..}=>im_status::REFRESH_METHOD,Self::Receive{..}=>im_data::RECV_METHOD,Self::SetReceived{..}=>im_data::SET_READ_METHOD,Self::Relations{..}=>directory::RELATIONS_METHOD,Self::GroupProperties{..}=>directory::PROPERTIES_METHOD,Self::BuddyCheck{..}=>super::buddy_relation_check::METHOD}}
     pub(super) fn arguments(&self,current_uid:&[u8])->Result<RpcBytes,CodecError>{match self{
         Self::Refresh{labels,since}=>{let labels=labels.iter().map(|l|im_status::StatusLabel::parse(l)).collect::<Result<Vec<_>,_>>()?;im_status::encode_refresh(current_uid,&labels,*since)},
         Self::Receive{box_id,start,count}=>im_data::encode_gap_recv(ImBox::parse(box_id)?,*start,*count),
         Self::SetReceived{box_id,index}=>im_data::encode_set_read(ImBox::parse(box_id)?,*index),
         Self::Relations{group,since,..}=>directory::encode_relations(group.as_ref().map_or(current_uid,|id|id.as_slice()),*since),
         Self::GroupProperties{group,..}=>directory::encode_properties(directory::GroupId::parse(group)?),
+        Self::BuddyCheck{uid,..}=>super::buddy_relation_check::encode(uid),
     }}
-    pub(super) fn retained_bytes(&self)->usize{match self{Self::Refresh{labels,..}=>labels.iter().map(|l|l.len()+4).sum::<usize>()+16,Self::Receive{box_id,..}|Self::SetReceived{box_id,..}=>box_id.len()+24,Self::Relations{group,..}=>group.as_ref().map_or(0,|id|id.len())+24,Self::GroupProperties{group,..}=>group.len()+24}}
+    pub(super) fn retained_bytes(&self)->usize{match self{Self::Refresh{labels,..}=>labels.iter().map(|l|l.len()+4).sum::<usize>()+16,Self::Receive{box_id,..}|Self::SetReceived{box_id,..}=>box_id.len()+24,Self::Relations{group,..}=>group.as_ref().map_or(0,|id|id.len())+24,Self::GroupProperties{group,..}=>group.len()+24,Self::BuddyCheck{uid,..}=>uid.len()+64}}
 }
 /// A cancellation gate belongs to the parent account run, while binding is the
 /// one authenticated original native receiver. It is never serialized.
@@ -63,10 +71,11 @@ impl fmt::Debug for ImRequest{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Resu
 impl ImRequest{
     pub(super) fn original(binding:Arc<ImBinding>,query:Arc<ImQuery>,gate:Arc<ImReceiptGate>,deadline:Instant,call_id:i32,budget:Arc<super::native_rpc_budget::NativeRpcReservation>)->Result<Arc<Self>,CodecError>{
         let deadline=query.clipped_deadline(deadline);
+        if query.buddy_check_query()&&(!binding.policy().buddy_relation_check()||!query.buddy_context_current(binding.owner(),&binding.scope(),&gate)){return Err(CodecError::InvalidField);}
         if call_id<=0||Instant::now()>=deadline||!gate.live()||!binding.matches(binding.owner(),&binding.scope())||query.directory_query()&&!binding.directory_queries()||!query.directory_input_matches(&binding.scope())||!budget.belongs_to(&binding.scope()){return Err(CodecError::InvalidField);}
         Ok(Arc::new(Self{binding,query,gate,deadline,call_id,budget}))
     }
-    pub(super) fn active(&self)->bool{self.gate.live()&&Instant::now()<self.deadline&&self.binding.matches(self.binding.owner(),&self.binding.scope())}
+    pub(super) fn active(&self)->bool{self.gate.live()&&Instant::now()<self.deadline&&self.binding.matches(self.binding.owner(),&self.binding.scope())&&self.query.buddy_context_current(self.binding.owner(),&self.binding.scope(),&self.gate)}
     pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{self.active()&&self.binding.matches(owner,scope)}
     pub(super) fn call_id(&self)->i32{self.call_id}
     pub(super) fn deadline(&self)->Instant{self.deadline}
@@ -87,10 +96,11 @@ impl ImRequest{
             ImQuery::SetReceived{..}=>im_data::decode_set_read_result(code,bytes).map(ImReplyData::SetReceived),
             ImQuery::Relations{..}=>directory::decode_relations_scoped(&self.binding.scope(),code,bytes).map(ImReplyData::Relations),
             ImQuery::GroupProperties{..}=>directory::decode_properties_scoped(&self.binding.scope(),code,bytes).map(ImReplyData::GroupProperties),
+            ImQuery::BuddyCheck{..}=>super::buddy_relation_check::decode(&self.binding.scope(),code,bytes).map(ImReplyData::BuddyCheck),
         }
     }
 }
-pub(super) enum ImReplyData<'a>{Refresh(im_status::RefreshResult<'a>),Receive(im_data::RecvResult<'a>),SetReceived(im_data::SetReadResult<'a>),Relations(directory::RelationsResult<'a>),GroupProperties(directory::PropertiesResult<'a>)}
+pub(super) enum ImReplyData<'a>{Refresh(im_status::RefreshResult<'a>),Receive(im_data::RecvResult<'a>),SetReceived(im_data::SetReadResult<'a>),Relations(directory::RelationsResult<'a>),GroupProperties(directory::PropertiesResult<'a>),BuddyCheck(super::buddy_relation_check::CheckResult<'a>)}
 impl fmt::Debug for ImReplyData<'_>{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("ImReplyData(<redacted>)")}}
 pub struct OwnedImReply{request:Arc<ImRequest>,code:u32,bytes:Zeroizing<Vec<u8>>}
 impl fmt::Debug for OwnedImReply{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("OwnedImReply(<redacted>)")}}
