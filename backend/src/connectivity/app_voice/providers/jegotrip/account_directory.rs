@@ -3,6 +3,9 @@
 use super::*;
 use super::super::{rpc_im::{ImQuery,ImReplyData},transport_actor::RuntimeError};
 use serde::Serialize;
+#[path="account_relation_roster.rs"]
+mod roster;
+pub use roster::PreparedRosterRead;
 #[derive(Serialize)]
 pub struct DirectoryReadView{
     pub operation:&'static str,pub target_kind:&'static str,pub accepted:bool,

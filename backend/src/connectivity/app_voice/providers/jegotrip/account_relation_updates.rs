@@ -10,7 +10,7 @@ use super::super::{group_directory_data::Relation,group_relation_updates::Remova
 pub(super) fn load_original_account(c:&rusqlite::Connection,line:&str)->Result<Option<(StoredAccount,Option<Arc<RelationConfiguration>>)>,&'static str>{
     let tx=rusqlite::Transaction::new_unchecked(c,rusqlite::TransactionBehavior::Deferred).map_err(|_|"app_account_relation_storage_failed")?;
     let account=account_store::load(&tx,line)?;
-    let configuration=match &account{Some(stored)if (stored.config.profile.relation_updates.is_some()||stored.config.profile.relation_events.is_some()||stored.config.profile.org_relation_sync.is_some())=>Some(Arc::new(RelationConfiguration::capture(&tx,line,stored.metadata.revision,None)?)),_=>None};
+    let configuration=match &account{Some(stored)if (stored.config.profile.relation_updates.is_some()||stored.config.profile.relation_events.is_some()||stored.config.profile.org_relation_sync.is_some()||stored.config.profile.relation_roster.is_some())=>Some(Arc::new(RelationConfiguration::capture(&tx,line,stored.metadata.revision,None)?)),_=>None};
     tx.commit().map_err(|_|"app_account_relation_storage_failed")?;Ok(account.map(|a|(a,configuration)))
 }
 pub(crate) struct RelationHttpScratch(Arc<super::super::native_rpc_budget::NativeRpcReservation>);

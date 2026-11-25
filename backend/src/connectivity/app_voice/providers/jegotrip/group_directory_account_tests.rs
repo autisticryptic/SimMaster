@@ -9,6 +9,8 @@ use n::{account_runtime::{AccountBackendFactory, DirectoryReadView, PreparedDire
 use std::{sync::{Arc, Mutex}, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::rustls::ServerConfig;
+#[path="relation_roster_account_tests.rs"]
+mod roster;
 
 // Observe the ACTUAL stored-profile backend, not a fabricated controller/run.
 // This is the same construction as AccountManager's explicit native factory.

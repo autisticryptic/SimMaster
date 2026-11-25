@@ -28,6 +28,8 @@ mod relations;
 mod group_events;
 #[path="org_relation_protocol_tests.rs"]
 mod org_relations;
+#[path="relation_roster_tests.rs"]
+mod roster;
 struct Fixture{owner:AttemptOwner,scope:RpcConnectionScope,backend:OfflineBackend,temp:TempDatabase,run:Arc<account_runs::RunToken>,gate:Arc<ImReceiptGate>}
 impl Fixture{
     fn new(enabled:bool)->Self{Self::with_info(enabled,false)}

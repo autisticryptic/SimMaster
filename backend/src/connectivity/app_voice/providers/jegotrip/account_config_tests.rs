@@ -89,7 +89,7 @@ fn fixture(root: &str) -> AccountConfig {
         client_ex: false,
         native_receivers: None,
         bootstrap_via_router: None,
-        call_incoming:None,call_control:None,native_call_control:false,account_alive:None,im_sync:None,im_receipts:None,im_user_read:None,im_read_status:None,im_send:None,relation_updates:None,relation_events:None,org_relation_sync:None,
+        call_incoming:None,call_control:None,native_call_control:false,account_alive:None,im_sync:None,im_receipts:None,im_user_read:None,im_read_status:None,im_send:None,relation_updates:None,relation_events:None,org_relation_sync:None,relation_roster:None,
         connect_timeout_ms: 1000, handshake_timeout_ms: 3000, partial_timeout_ms: 300,
         io_timeout_ms: 2000, rpc_timeout_ms: 2000,
     } }

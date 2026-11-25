@@ -121,6 +121,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/relation-intents",get(relation_updates::intent_history))
         .route("/api/non-3gpp/accounts/{line_id}/relation-events",get(relation_updates::event_history))
         .route("/api/non-3gpp/accounts/{line_id}/org-relation-events",get(relation_updates::org_event_history))
+        .route("/api/non-3gpp/accounts/{line_id}/relation-roster",get(relation_roster_history))
+        .route("/api/non-3gpp/accounts/{line_id}/relation-roster/read",post(read_relation_roster))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}/mark-read",post(mark_im_user_read))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}/mark-read/recipient",post(mark_im_user_read_recipient))
         .route("/api/non-3gpp/accounts/{line_id}/im-messages/{message_id}", delete(delete_im_message))
@@ -197,6 +199,10 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_org_relation_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
         "app_account_org_relation_scope_invalid" | "app_account_org_relation_invalid" => StatusCode::BAD_REQUEST,
         "app_account_org_relation_conflict" => StatusCode::CONFLICT,
+        "app_account_relation_roster_storage_failed" => StatusCode::INTERNAL_SERVER_ERROR,
+        "app_account_relation_roster_scope_invalid" | "app_account_relation_roster_conflict" => StatusCode::CONFLICT,
+        "app_account_relation_roster_capacity" => StatusCode::TOO_MANY_REQUESTS,
+        "app_account_relation_roster_not_installed" => StatusCode::FORBIDDEN,
         "app_account_directory_request_invalid" => StatusCode::BAD_REQUEST,
         "app_account_directory_consent_required" | "app_account_directory_not_installed" => StatusCode::FORBIDDEN,
         "app_account_directory_capacity" => StatusCode::TOO_MANY_REQUESTS,
@@ -345,6 +351,16 @@ pub async fn read_native_directory(State(manager):State<Arc<AccountManager>>,Pat
     drop(request);
     let prepared=match prepared{Ok(value)=>value,Err(code)=>return failure(code)};
     success(StatusCode::OK,manager.finish_native_directory(prepared).await)
+}
+pub async fn read_relation_roster(State(manager):State<Arc<AccountManager>>,Path(line):Path<String>,request:Result<Json<DirectoryReadRequest>,JsonRejection>)->Response{
+    let Ok(Json(request))=request else{return failure("app_account_directory_request_invalid");};
+    if !matches!(request.operation,DirectoryReadOperation::Relations)||request.since.is_empty()||request.since.len()>20{return failure("app_account_directory_request_invalid");}
+    let Ok(since)=request.since.parse::<i64>()else{return failure("app_account_directory_request_invalid");};if since< -1||since.to_string()!=request.since{return failure("app_account_directory_request_invalid");}
+    let prepared=manager.prepare_relation_roster(&line,request.expected_revision,request.group_id.as_deref(),since,request.consent);drop(request);
+    match prepared{Ok(p)=>success(StatusCode::OK,manager.finish_relation_roster(p).await),Err(code)=>failure(code)}
+}
+pub async fn relation_roster_history(State(manager):State<Arc<AccountManager>>,Path(line):Path<String>,query:Result<Query<InboxQuery>,QueryRejection>)->Response{
+    let Ok(Query(query))=query else{return failure("app_account_directory_request_invalid");};success(StatusCode::OK,manager.relation_roster_history(&line,query.limit))
 }
 pub async fn get_im_messages(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Query<InboxQuery>,QueryRejection>)->Response{
     let Ok(Query(request))=request else{return failure("app_account_request_invalid");};

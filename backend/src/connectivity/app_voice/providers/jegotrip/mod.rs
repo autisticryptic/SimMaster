@@ -53,6 +53,7 @@ pub(crate) mod group_event_inbox;
 mod group_event_packets;
 pub(crate) mod org_relation_sync;
 pub(crate) mod org_relation_inbox;
+pub(crate) mod relation_roster;
 pub(crate) mod relation_update_policy;
 pub(crate) mod relation_journal;
 #[cfg(test)]

@@ -172,6 +172,7 @@ pub fn create(conn: &Connection, id: &str, config: &AccountConfig, now: u64)
         params![id, private.as_slice(), &time],
     ).map_err(|_| STORAGE)?;
     if config.profile.org_relation_sync.is_some(){super::org_relation_inbox::initialize_schema(&tx)?;}
+    if config.profile.relation_roster.is_some(){super::relation_roster::initialize_schema(&tx)?;}
     let metadata = AccountMetadata { line_id: id.to_owned(), provider_id: PROVIDER.to_owned(), revision: 1,
         created_at: time.clone(), updated_at: time };
     tx.commit().map_err(|_| STORAGE)?;
@@ -196,6 +197,7 @@ pub fn replace(conn: &Connection, id: &str, expected_revision: u64, config: &Acc
     ).map_err(|_| STORAGE)?;
     if changed != 1 { return Err(CONFLICT); }
     if config.profile.org_relation_sync.is_some(){super::org_relation_inbox::initialize_schema(&tx)?;}
+    if config.profile.relation_roster.is_some(){super::relation_roster::initialize_schema(&tx)?;}
     let metadata = metadata(&tx, id)?.ok_or(STORAGE)?;
     tx.commit().map_err(|_| STORAGE)?;
     Ok(metadata)

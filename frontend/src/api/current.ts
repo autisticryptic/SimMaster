@@ -413,6 +413,7 @@ export interface AppAccountView {
   im_read_status_recipient_supported?: boolean
   relation_updates_supported?: boolean
   relation_events_supported?: boolean
+  relation_roster_supported?: boolean
   im_send_supported?: boolean
   im_reconciliation_supported?: boolean
   directory_queries_supported?: boolean
@@ -1169,6 +1170,12 @@ class SimAdminCurrentAPI {
   }
   async getAppOrgRelationEvents(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/org-relation-events?limit=128`, { method: 'GET', cache: 'no-store', timeoutMs: 10000, skipAuthRedirect: true })
+  }
+  async getAppRelationRosters(lineId: string) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/relation-roster?limit=128`, { method: 'GET', cache: 'no-store', timeoutMs: 10000, skipAuthRedirect: true })
+  }
+  async readAppRelationRoster(lineId: string, body: { expected_revision: number; operation: 'relations'; group_id: string | null; since: string; consent: boolean }) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/relation-roster/read`, { method: 'POST', body: JSON.stringify(body), cache: 'no-store', timeoutMs: 10000, skipAuthRedirect: true })
   }
   async getAppImMessages(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/im-messages?limit=16`, { cache: 'no-store', timeoutMs: 10000 })

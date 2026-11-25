@@ -81,6 +81,7 @@ pub(super) fn commit(db:&Arc<Database>,run:Arc<RunToken>,delivery:&IncomingGroup
         let id=tx.last_insert_rowid();tx.execute("INSERT INTO app_voice_relation_event_heads(line_id,revision,identity_key,receipt_epoch,target_hash,observed_time,target_time,gap) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(line_id,revision,identity_key,receipt_epoch,target_hash) DO UPDATE SET observed_time=excluded.observed_time,target_time=excluded.target_time,gap=excluded.gap",params![run.line_id(),run.revision()as i64,binding.identity().as_slice(),binding.receipt_epoch(),target_hash.as_slice(),current,target,gap]).map_err(|_|STORAGE)?;
         let payload=serde_json::json!({"relation_event_id":id,"source":"original_group_update","target_kind":notice.target().name(),"updates":updates,"removals":removals,"base_time":notice.base_time().to_string(),"update_time":notice.update_time().to_string(),"continuity":continuity,"full_roster_verified":false}).to_string();
         let event=insert_app_event_for_conn(&tx,"app_voice.relation_event_observed",Some(run.line_id()),Some("app_voice"),&payload,&at).map_err(|_|STORAGE)?;
+        super::relation_roster::observe(&tx,&run,binding,if notice.target()==super::group_events::RelationEventTarget::Group{Some(notice.identifier())}else{None},Some(notice.base_time()),Some(notice.update_time()),&data.relations)?;
         validate(&tx,&run,delivery,&gate,configuration)?;tx.commit().map_err(|_|STORAGE)?;Ok((id,Some(event)))
     })?;
     if let Some(event)=event{db.publish_committed_app_event(event);}

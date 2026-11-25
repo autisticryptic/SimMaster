@@ -312,6 +312,10 @@ impl RuntimeProfile {
         if self.relation_updates.is_some()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}
         add_bytes(&mut self.byte_length,std::mem::size_of_val(&config))?;self.relation_updates=Some(config);Ok(self)
     }
+    pub(super) fn with_relation_roster(mut self,config:Option<super::relation_roster::NativeRelationRosterConfig>)->Result<Self,ProfileError>{
+        let Some(config)=config else{return Ok(self);};if self.common.is_none()||!self.client_ex||self.relation_events.is_none(){return Err(ProfileError::InvalidConfiguration);}
+        let native=self.native_receivers.as_ref().ok_or(ProfileError::InvalidConfiguration)?;if !native.org_relation_sync(){return Err(ProfileError::InvalidConfiguration);}let installed=native.with_relation_roster(config).map_err(|_|ProfileError::InvalidConfiguration)?;add_bytes(&mut self.byte_length,std::mem::size_of_val(&config))?;self.native_receivers=Some(installed);Ok(self)
+    }
     pub(super) fn with_org_relation_sync(mut self,config:Option<super::org_relation_sync::NativeOrgRelationSyncConfig>)->Result<Self,ProfileError>{
         let Some(config)=config else{return Ok(self);};if self.common.is_none()||!self.client_ex{return Err(ProfileError::InvalidConfiguration);}
         let native=self.native_receivers.as_ref().ok_or(ProfileError::InvalidConfiguration)?;let installed=native.with_org_relation_sync(config).map_err(|_|ProfileError::InvalidConfiguration)?;
@@ -749,6 +753,10 @@ impl NativeHostingBackend {
         self.profile.client_ex&&self.profile.native_receivers.as_ref().is_some_and(|policy|policy.im_messages().is_some())
     }
     pub(super) fn im_sync_enabled(&self)->bool{self.profile.im_sync.is_some()&&self.im_messages_enabled()}
+    pub(super) fn relation_roster_enabled(&self)->bool{self.directory_queries_enabled()&&self.profile.native_receivers.as_ref().is_some_and(|p|p.relation_roster())}
+    pub(super) async fn roster_binding(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->Result<Arc<super::im_delivery::ImBinding>,RuntimeError>{
+        if !self.relation_roster_enabled(){return Err(RuntimeError::InvalidConfiguration);}let attempt=self.original(owner).map_err(|_|RuntimeError::Scope)?;attempt.commands(owner,scope)?.original_im_binding(owner,scope).await
+    }
     pub(super) fn directory_queries_enabled(&self)->bool{self.im_messages_enabled()&&self.profile.native_receivers.as_ref().and_then(|p|p.im_messages()).is_some_and(|config|config.directory_queries)}
     pub(super) fn directory_query_timeout(&self)->std::time::Duration{self.profile.native_receivers.as_ref().and_then(|p|p.im_messages()).and_then(|config|config.timeout().ok()).unwrap_or(std::time::Duration::ZERO)}
     pub(super) fn reserve_directory_query(&self,group:Option<&[u8]>,since:i64,properties:bool,deadline:Instant)->Result<(AttemptOwner,RpcConnectionScope,Arc<super::rpc_im::ImQuery>),RuntimeError>{
