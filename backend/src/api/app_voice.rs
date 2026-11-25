@@ -360,7 +360,11 @@ pub async fn read_relation_roster(State(manager):State<Arc<AccountManager>>,Path
     match prepared{Ok(p)=>success(StatusCode::OK,manager.finish_relation_roster(p).await),Err(code)=>failure(code)}
 }
 pub async fn relation_roster_history(State(manager):State<Arc<AccountManager>>,Path(line):Path<String>,query:Result<Query<InboxQuery>,QueryRejection>)->Response{
-    let Ok(Query(query))=query else{return failure("app_account_directory_request_invalid");};success(StatusCode::OK,manager.relation_roster_history(&line,query.limit))
+    let Ok(Query(query))=query else{return failure("app_account_directory_request_invalid");};
+    // Reject malformed bounds before account lookup; a bad query is not an
+    // account scope conflict, including when the account does not exist.
+    if !(1..=128).contains(&query.limit){return failure("app_account_directory_request_invalid");}
+    success(StatusCode::OK,manager.relation_roster_history(&line,query.limit))
 }
 pub async fn get_im_messages(State(manager):State<Arc<AccountManager>>,Path(line_id):Path<String>,request:Result<Query<InboxQuery>,QueryRejection>)->Response{
     let Ok(Query(request))=request else{return failure("app_account_request_invalid");};

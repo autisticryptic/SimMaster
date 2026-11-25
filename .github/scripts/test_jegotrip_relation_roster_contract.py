@@ -8,6 +8,13 @@ class RosterContracts(unittest.TestCase):
   s=src('relation_roster_tests.rs');block=s[s.index('fn roster_history_and_debug_never_export'):]
   self.assertIn('Some(b"711111111-822222222")',block);self.assertIn('for private in ["711111111-822222222"',block);self.assertIn('assert!(!s.contains(private))',block)
   self.assertIn('1-2','2026-11-25T23:00:00Z');self.assertNotIn('711111111-822222222','2026-11-25T23:00:00Z')
+ def test_roster_history_rejects_bad_limit_before_account_scope_without_changing_http_assertions(self):
+  s=(ROOT/'backend/src/api/app_voice.rs').read_text(encoding='utf-8');block=s[s.index('pub async fn relation_roster_history('):s.index('pub async fn get_im_messages(')]
+  guard='if !(1..=128).contains(&query.limit){return failure("app_account_directory_request_invalid");}'
+  self.assertIn(guard,block);self.assertLess(block.index(guard),block.index('manager.relation_roster_history('))
+  tests=(ROOT/'backend/src/api/app_voice_roster_http_tests.rs').read_text(encoding='utf-8')
+  self.assertIn('for suffix in ["?limit=0","?limit=129","?limit=1&token=private","?limit=1&clear_gap=true"]',tests)
+  self.assertIn('assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);',tests)
  def test_roster_policy_requires_independent_directory_and_both_event_consumer_installations(self):
   s=src('runtime_backend.rs');self.assertIn('with_relation_roster',s);self.assertIn('self.relation_events.is_none()',s);self.assertIn('if !native.org_relation_sync()',s)
   s=src('native_receiver.rs');self.assertIn('relation_roster:false',s);self.assertIn('self.im_messages.is_none_or(|im|!im.directory_queries)',s)
