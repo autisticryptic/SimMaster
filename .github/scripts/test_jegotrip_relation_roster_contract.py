@@ -29,6 +29,8 @@ class RosterContracts(unittest.TestCase):
   self.assertLess(block.index('DELETE FROM app_voice_relation_roster_members'),block.index('for m in self.values.iter().filter(|m|!m.remove)'))
   self.assertIn('local>=1024||total>=4096',block);self.assertIn('n>16*1024*1024',block)
   for name in ['roster_net_neutral_partial_at_local_and_global_capacity','roster_net_neutral_type20_event_at_capacity','roster_capacity_replacement_deletes_roll_back']:self.assertIn(name,src('relation_roster_tests.rs'))
+ def test_directory_summary_drops_decoded_scratch_before_original_reply(self):
+  s=src('account_directory.rs');self.assertIn('let view=match(reply.request().query(),reply.result()',s);self.assertIn('};view',s)
  def test_roster_policy_requires_independent_directory_and_both_event_consumer_installations(self):
   s=src('runtime_backend.rs');self.assertIn('with_relation_roster',s);self.assertIn('self.relation_events.is_none()',s);self.assertIn('if !native.org_relation_sync()',s)
   s=src('native_receiver.rs');self.assertIn('relation_roster:false',s);self.assertIn('self.im_messages.is_none_or(|im|!im.directory_queries)',s)

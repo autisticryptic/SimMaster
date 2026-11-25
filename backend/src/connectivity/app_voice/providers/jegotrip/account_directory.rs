@@ -52,11 +52,12 @@ impl AccountManager{
         let reply=tokio::select!{biased;_ = run.im_gate.retired()=>return Err("app_account_directory_scope_invalid"),_ = scope.session_ended()=>return Err("app_account_directory_scope_invalid"),result=tokio::time::timeout_at(deadline.into(),operation)=>result.map_err(|_|"app_account_directory_timeout")?.map_err(error)?};
         run.configuration_current()?;live_run(&run)?;
         if !run.accepting.load(Ordering::SeqCst)||run.stopping.load(Ordering::SeqCst)||run.finalized.load(Ordering::SeqCst)||!run.im_gate.live()||!reply.matches(&owner,&scope)||!Arc::ptr_eq(reply.request().query_arc(),&query)||!Arc::ptr_eq(&reply.request().gate(),&run.im_gate){return Err("app_account_directory_scope_invalid");}
-        match(reply.request().query(),reply.result().map_err(|_|"app_account_directory_reply_invalid")?){
+        // Finish decoding and drop its scoped scratch before the owned reply.
+        let view=match(reply.request().query(),reply.result().map_err(|_|"app_account_directory_reply_invalid")?){
             (ImQuery::Relations{group,..},ImReplyData::Relations(value))=>Ok(DirectoryReadView{operation:"relations",target_kind:if group.is_some(){"group"}else{"current_user"},accepted:value.accepted,reported:Some(value.reported),original_time:Some(value.time.to_string()),first_relations:value.first.len(),second_relations:value.second.len(),names:value.names.len(),properties:0}),
             (ImQuery::GroupProperties{..},ImReplyData::GroupProperties(value))=>Ok(DirectoryReadView{operation:"properties",target_kind:"group",accepted:value.accepted,reported:None,original_time:None,first_relations:0,second_relations:0,names:0,properties:value.properties.len()}),
             _=>Err("app_account_directory_reply_invalid"),
-        }
+        };view
     }
     pub async fn read_native_directory(&self,line:&str,revision:u64,group:Option<&str>,since:i64,properties:bool,consent:bool)->Result<DirectoryReadView,&'static str>{
         let prepared=self.prepare_native_directory(line,revision,group,since,properties,consent)?;self.finish_native_directory(prepared).await
