@@ -50,8 +50,13 @@ impl Changes{
   for label in removed{values.push(Member{key:label_hash(label),bytes:Zeroizing::new(Vec::new()),remove:true});}Ok(Self{values,_budget:budget})
  }
  fn apply(&self,c:&Connection,id:i64)->Result<(),&'static str>{
-  for m in &self.values{if m.remove{c.execute("DELETE FROM app_voice_relation_roster_members WHERE roster_id=?1 AND label_key=?2",params![id,m.key.as_slice()]).map_err(|_|STORAGE)?;}else{let old:i64=c.query_row("SELECT COALESCE(SUM(length(relation)),0) FROM app_voice_relation_roster_members WHERE roster_id=?1 AND label_key=?2",params![id,m.key.as_slice()],|r|r.get(0)).map_err(|_|STORAGE)?;let(local,total,bytes):(i64,i64,i64)=c.query_row("SELECT COALESCE(SUM(roster_id=?1),0),COUNT(*),COALESCE(SUM(length(relation)),0) FROM app_voice_relation_roster_members",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|STORAGE)?;
-    if old==0&&(local>=1024||total>=4096)||bytes.checked_sub(old).and_then(|n|n.checked_add(m.bytes.len()as i64)).is_none_or(|n|n>16*1024*1024){return Err(CAPACITY);}c.execute("INSERT INTO app_voice_relation_roster_members(roster_id,label_key,relation) VALUES(?1,?2,?3) ON CONFLICT(roster_id,label_key) DO UPDATE SET relation=excluded.relation",params![id,m.key.as_slice(),m.bytes.as_slice()]).map_err(|_|STORAGE)?;}}
+  // Callers hold the original event/read transaction. Keys are unique across
+  // all buckets. Remove the touched old values first, including replacements,
+  // so capacity reflects the final delta rather than arbitrary wire ordering.
+  // Any later error rolls back these deletes together with the head/event.
+  for m in &self.values{c.execute("DELETE FROM app_voice_relation_roster_members WHERE roster_id=?1 AND label_key=?2",params![id,m.key.as_slice()]).map_err(|_|STORAGE)?;}
+  for m in self.values.iter().filter(|m|!m.remove){let(local,total,bytes):(i64,i64,i64)=c.query_row("SELECT COALESCE(SUM(roster_id=?1),0),COUNT(*),COALESCE(SUM(length(relation)),0) FROM app_voice_relation_roster_members",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|STORAGE)?;
+    if local>=1024||total>=4096||bytes.checked_add(m.bytes.len()as i64).is_none_or(|n|n>16*1024*1024){return Err(CAPACITY);}c.execute("INSERT INTO app_voice_relation_roster_members(roster_id,label_key,relation) VALUES(?1,?2,?3)",params![id,m.key.as_slice(),m.bytes.as_slice()]).map_err(|_|STORAGE)?;}
   Ok(())
  }
 }

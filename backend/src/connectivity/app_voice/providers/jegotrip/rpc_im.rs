@@ -85,8 +85,8 @@ impl ImRequest{
                 Ok(ImReplyData::Receive(result))
             },
             ImQuery::SetReceived{..}=>im_data::decode_set_read_result(code,bytes).map(ImReplyData::SetReceived),
-            ImQuery::Relations{..}=>directory::decode_relations(code,bytes).map(ImReplyData::Relations),
-            ImQuery::GroupProperties{..}=>directory::decode_properties(code,bytes).map(ImReplyData::GroupProperties),
+            ImQuery::Relations{..}=>directory::decode_relations_scoped(&self.binding.scope(),code,bytes).map(ImReplyData::Relations),
+            ImQuery::GroupProperties{..}=>directory::decode_properties_scoped(&self.binding.scope(),code,bytes).map(ImReplyData::GroupProperties),
         }
     }
 }

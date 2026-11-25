@@ -3,7 +3,8 @@
 //! getPropsPrefixs(group identifier, the original one-entry empty-prefix set).
 //! Relation record labels/flags/strings/properties are opaque, not routes or UIDs.
 use super::rpc_stream::{read_footer,CodecError,Reader,RpcBytes,RpcFooter,RpcProperty,Writer,MAX_FIELD_BYTES,MAX_MAP_ENTRIES};
-use std::fmt;
+use std::{fmt,sync::Arc};
+use super::{native_rpc_budget::NativeRpcReservation,rpc_pending::RpcConnectionScope};
 pub(super) const RELATIONS_METHOD:&str="getRelations2.GroupServer.Group";
 pub(super) const PROPERTIES_METHOD:&str="getPropsPrefixs.GroupServer.Group";
 #[derive(Clone,Copy)]
@@ -40,8 +41,11 @@ fn relations<'a>(r:&mut Reader<'a>)->Result<Vec<Relation<'a>>,CodecError>{
         values.push(Relation{label,flags:r.u32()?,first:r.bytes()?,second:r.bytes()?,properties:r.properties()?});}
     Ok(values)
 }
-pub(super) struct RelationsResult<'a>{pub(super) accepted:bool,pub(super) reported:bool,pub(super) first:Vec<Relation<'a>>,pub(super) second:Vec<Relation<'a>>,pub(super) names:Vec<&'a[u8]>,pub(super) time:i64,pub(super) footer:RpcFooter<'a>}
+pub(super) struct RelationsResult<'a>{pub(super) accepted:bool,pub(super) reported:bool,pub(super) first:Vec<Relation<'a>>,pub(super) second:Vec<Relation<'a>>,pub(super) names:Vec<&'a[u8]>,pub(super) time:i64,pub(super) footer:RpcFooter<'a>,_decode_budget:Option<Arc<NativeRpcReservation>>}
 impl fmt::Debug for RelationsResult<'_>{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("OriginalRelationsResult(<redacted>)")}}
+// The last field releases only after every decoded vector. Drop also prevents
+// moving a vector out while silently discarding its original-scope reservation.
+impl Drop for RelationsResult<'_>{fn drop(&mut self){}}
 pub(super) fn decode_relations(code:u32,bytes:&[u8])->Result<RelationsResult<'_>,CodecError>{
     if code!=0{return Err(CodecError::RemoteFailure);}
     // 405C34 consumes bool, bool, two relation maps, STRING set, signed64 time,
@@ -49,14 +53,37 @@ pub(super) fn decode_relations(code:u32,bytes:&[u8])->Result<RelationsResult<'_>
     let mut r=Reader::new(bytes)?;let accepted=r.boolean()?;let reported=r.boolean()?;let first=relations(&mut r)?;let second=relations(&mut r)?;
     let count=r.count(4)?;let mut names=Vec::with_capacity(count);for _ in 0..count{let name=r.bytes()?;if names.contains(&name){return Err(CodecError::DuplicateKey);}names.push(name);}
     let time=r.i64()?;let footer=read_footer(&mut r)?;r.finish()?;
-    Ok(RelationsResult{accepted:accepted&&footer.reason.is_empty(),reported,first,second,names,time,footer})
+    Ok(RelationsResult{accepted:accepted&&footer.reason.is_empty(),reported,first,second,names,time,footer,_decode_budget:None})
 }
-pub(super) struct PropertiesResult<'a>{pub(super) accepted:bool,pub(super) properties:Vec<RpcProperty<'a>>,pub(super) footer:RpcFooter<'a>}
+pub(super) struct PropertiesResult<'a>{pub(super) accepted:bool,pub(super) properties:Vec<RpcProperty<'a>>,pub(super) footer:RpcFooter<'a>,_decode_budget:Option<Arc<NativeRpcReservation>>}
 impl fmt::Debug for PropertiesResult<'_>{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("OriginalGroupPropertiesResult(<redacted>)")}}
+impl Drop for PropertiesResult<'_>{fn drop(&mut self){}}
 pub(super) fn decode_properties(code:u32,bytes:&[u8])->Result<PropertiesResult<'_>,CodecError>{
     if code!=0{return Err(CodecError::RemoteFailure);}
     let mut r=Reader::new(bytes)?;let accepted=r.boolean()?;let properties=r.properties()?;let footer=read_footer(&mut r)?;r.finish()?;
-    Ok(PropertiesResult{accepted:accepted&&footer.reason.is_empty(),properties,footer})
+    Ok(PropertiesResult{accepted:accepted&&footer.reason.is_empty(),properties,footer,_decode_budget:None})
+}
+// This pass only borrows stream slices. Duplicate validation remains in the
+// original decoder, after the full allocation reservation. Include ignored
+// maps, all nested property vectors, names and optional footer properties.
+fn add_headers(size:&mut usize,count:usize,width:usize)->Result<(),CodecError>{*size=size.checked_add(count.checked_mul(width).ok_or(CodecError::TooLarge)?).ok_or(CodecError::TooLarge)?;Ok(())}
+fn measure_properties(r:&mut Reader<'_>,size:&mut usize)->Result<(),CodecError>{let count=r.count(8)?;add_headers(size,count,std::mem::size_of::<RpcProperty<'_>>())?;for _ in 0..count{r.bytes()?;r.bytes()?;}Ok(())}
+fn measure_footer(r:&mut Reader<'_>,size:&mut usize)->Result<(),CodecError>{r.bytes()?;if !r.is_empty(){measure_properties(r,size)?;}Ok(())}
+pub(super) fn relations_decode_size(code:u32,bytes:&[u8])->Result<usize,CodecError>{
+    if code!=0{return Err(CodecError::RemoteFailure);}let mut r=Reader::new(bytes)?;let mut size=128usize;r.boolean()?;r.boolean()?;
+    for _ in 0..2{let count=r.count(20)?;add_headers(&mut size,count,std::mem::size_of::<Relation<'_>>())?;for _ in 0..count{r.bytes()?;r.u32()?;r.bytes()?;r.bytes()?;measure_properties(&mut r,&mut size)?;}}
+    let count=r.count(4)?;add_headers(&mut size,count,std::mem::size_of::<&[u8]>())?;for _ in 0..count{r.bytes()?;}r.i64()?;measure_footer(&mut r,&mut size)?;r.finish()?;Ok(size)
+}
+pub(super) fn properties_decode_size(code:u32,bytes:&[u8])->Result<usize,CodecError>{
+    if code!=0{return Err(CodecError::RemoteFailure);}let mut r=Reader::new(bytes)?;let mut size=128usize;r.boolean()?;measure_properties(&mut r,&mut size)?;measure_footer(&mut r,&mut size)?;r.finish()?;Ok(size)
+}
+pub(super) fn decode_relations_scoped<'a>(scope:&RpcConnectionScope,code:u32,bytes:&'a[u8])->Result<RelationsResult<'a>,CodecError>{
+    let budget=scope.reserve_native_rpc(relations_decode_size(code,bytes)?)?;
+    let mut value=decode_relations(code,bytes)?;value._decode_budget=Some(budget);Ok(value)
+}
+pub(super) fn decode_properties_scoped<'a>(scope:&RpcConnectionScope,code:u32,bytes:&'a[u8])->Result<PropertiesResult<'a>,CodecError>{
+    let budget=scope.reserve_native_rpc(properties_decode_size(code,bytes)?)?;
+    let mut value=decode_properties(code,bytes)?;value._decode_budget=Some(budget);Ok(value)
 }
 /// Bound result summaries only; no raw property value or reference may become a
 /// view/model field, SDK authorization, receipt or Unknown WRITE resolution.

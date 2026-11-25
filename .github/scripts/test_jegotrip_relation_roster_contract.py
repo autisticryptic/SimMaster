@@ -15,6 +15,20 @@ class RosterContracts(unittest.TestCase):
   tests=(ROOT/'backend/src/api/app_voice_roster_http_tests.rs').read_text(encoding='utf-8')
   self.assertIn('for suffix in ["?limit=0","?limit=129","?limit=1&token=private","?limit=1&clear_gap=true"]',tests)
   self.assertIn('assert_eq!(status,StatusCode::BAD_REQUEST);no_store(&headers);no_secrets(&body);',tests)
+ def test_directory_decoding_borrows_and_charges_both_maps_names_and_footer_before_allocations(self):
+  s=src('group_directory_data.rs');block=s[s.index('fn add_headers('):s.index('pub(super) fn decode_relations_scoped')]
+  for bad in ['Vec::','vec![','.collect(','.to_vec()']:self.assertNotIn(bad,block)
+  self.assertIn('for _ in 0..2',block);self.assertIn('measure_properties(r,size)',block);self.assertIn('std::mem::size_of::<Relation',block);self.assertIn('std::mem::size_of::<&[u8]>()',block)
+  for kind in ['relations','properties']:
+   block=s.split('pub(super) fn decode_'+kind+'_scoped',1)[1].split('\n}',1)[0]
+   self.assertLess(block.index('scope.reserve_native_rpc('),block.index('let mut value=decode_'+kind+'('));self.assertIn('value._decode_budget=Some(budget)',block)
+   self.assertIn('directory::decode_'+kind+'_scoped(&self.binding.scope(),code,bytes)',src('rpc_im.rs'))
+  self.assertIn('impl Drop for RelationsResult',s);self.assertIn('impl Drop for PropertiesResult',s)
+ def test_roster_capacity_uses_transactional_final_delta_without_weakening_original_caps(self):
+  s=src('relation_roster.rs');block=s.split(' fn apply(',1)[1].split('/// Binds',1)[0]
+  self.assertLess(block.index('DELETE FROM app_voice_relation_roster_members'),block.index('for m in self.values.iter().filter(|m|!m.remove)'))
+  self.assertIn('local>=1024||total>=4096',block);self.assertIn('n>16*1024*1024',block)
+  for name in ['roster_net_neutral_partial_at_local_and_global_capacity','roster_net_neutral_type20_event_at_capacity','roster_capacity_replacement_deletes_roll_back']:self.assertIn(name,src('relation_roster_tests.rs'))
  def test_roster_policy_requires_independent_directory_and_both_event_consumer_installations(self):
   s=src('runtime_backend.rs');self.assertIn('with_relation_roster',s);self.assertIn('self.relation_events.is_none()',s);self.assertIn('if !native.org_relation_sync()',s)
   s=src('native_receiver.rs');self.assertIn('relation_roster:false',s);self.assertIn('self.im_messages.is_none_or(|im|!im.directory_queries)',s)
