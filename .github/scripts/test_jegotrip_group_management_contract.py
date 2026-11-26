@@ -6,6 +6,8 @@ def src(n):return(P/n).read_text(encoding='utf-8')
 class GroupManagementContracts(unittest.TestCase):
  def test_new_browser_fixture_exports_component_without_weakening_zero_warning_gate(self):
   self.assertIn('export default function Fixture()',(R/'frontend/e2e/fixtures/group-management.tsx').read_text(encoding='utf-8'));self.assertIn('eslint . --max-warnings 0',(R/'frontend/package.json').read_text(encoding='utf-8'))
+ def test_management_private_group_fixture_does_not_alias_calendar_timestamp(self):
+  s=src('group_management_tests.rs');self.assertIn('capture_management(&f.scope,b"711111111-822222222",op,fields,nonce,gpolicy())',s);self.assertIn('for secret in ["private-group-name","711111111-822222222"',s);self.assertIn('assert!(!body.contains(secret))',s);self.assertNotIn('711111111-822222222','2026-11-26T13:00:00Z')
  def test_original_methods_and_mapping_literals_are_not_membership_or_read_aliases(self):
   s=src('group_management.rs')
   for x in ['setProps.GroupServer.Group','disbandOrganize.GroupServer.Group','Group.Org.Name','Group.Org.Type','Group.Org.Notify','Group.Org.JoinAuth','Group.Org.PropsControl','DiscussionGroup','LargeGroup','LargeRoom']:self.assertIn(x,s)
