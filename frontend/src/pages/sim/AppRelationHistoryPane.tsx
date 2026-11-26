@@ -34,7 +34,7 @@ export default function AppRelationHistoryPane({ lineId, revision }: { lineId: s
     {rows?.length === 0 && <Typography variant="caption">本次未返回既有修改记录；不是先前写入未发生或当前 WRITE 可用的证明。</Typography>}
     {rows?.map((row) => <Stack key={row.id} spacing={0.25}>
       <Typography variant="caption">记录 #{row.id} · {row.targetKind === 'buddy' ? 'Buddy 关系' : 'Group 关系'} · {relationHistoryLabel(row.state)}</Typography>
-      <Typography variant="caption">新增 {row.additions} 项 · 更新 {row.updates} 项 · 删除 {row.removals} 项</Typography>
+      {row.management ? <Typography variant="caption">群组管理 {row.management.operation} · 属性 {row.management.properties} 项（不是成员计数）</Typography> : <Typography variant="caption">新增 {row.additions} 项 · 更新 {row.updates} 项 · 删除 {row.removals} 项</Typography>}
       {row.baseTime !== null && <Typography variant="caption">原 BaseTime {row.baseTime} · UpdateTime {row.updateTime}（signed64 原值，不推断墙上时钟或在线状态）</Typography>}
     </Stack>)}
     <Typography variant="caption" color="text.secondary">此视图没有关系写入按钮；完整修改交互与原服务端关系事件尚待独立验收。</Typography>

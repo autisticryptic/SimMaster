@@ -13,6 +13,13 @@ impl NativeRelationUpdateConfig{
         (adds>0||updates>0||removes>0)&&(adds==0||self.additions)&&(updates==0||self.updates)&&(removes==0||self.removals)
     }
 }
+/// Either permission family, never a conversion between them. Runtime selects
+/// it from the frozen original profile; legacy call sites remain unchanged.
+#[derive(Clone,Copy)]
+pub(super) enum RelationWriteGrant{Members(NativeRelationUpdateConfig),Management(super::group_management::NativeGroupManagementConfig)}
+impl From<NativeRelationUpdateConfig> for RelationWriteGrant{fn from(p:NativeRelationUpdateConfig)->Self{Self::Members(p)}}
+impl From<super::group_management::NativeGroupManagementConfig> for RelationWriteGrant{fn from(p:super::group_management::NativeGroupManagementConfig)->Self{Self::Management(p)}}
+impl RelationWriteGrant{pub(super) fn admits(self,counts:[usize;3],op:Option<super::group_management_store::Descriptor>)->bool{match(self,op){(Self::Members(p),None)=>p.admits(counts[0],counts[1],counts[2]),(Self::Management(p),Some(d))=>counts==[0;3]&&p.admits(d.operation),_=>false}}}
 #[cfg(test)]
 #[path="relation_update_policy_tests.rs"]
 mod tests;

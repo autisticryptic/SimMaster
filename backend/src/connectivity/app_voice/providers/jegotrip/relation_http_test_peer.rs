@@ -10,6 +10,9 @@ fn reply(id:i32,stream:&[u8])->Vec<u8>{let raw=encode_reply(id,0,stream).unwrap(
 #[path="buddy_check_http_peer.rs"]
 mod buddy_check;
 pub(crate) use buddy_check::serve_buddy_check;
+#[path="group_management_http_peer.rs"]
+mod management;
+pub(crate) use management::serve_group_management;
 #[derive(Default)]struct SdkWrites{hosting:Option<i32>,unhosting:Option<i32>}
 async fn swap(peer:&mut CommonPeer,p:&[u8],wanted:Option<&[u8]>,known:&mut SdkWrites)->bool{
     assert_eq!(p[0],0);let request=decode_request(&p[1..]).unwrap();assert_eq!(request.method,rpc_batch::SWAP_CALLS_METHOD.as_bytes(),"HTTP relation operation never becomes an unrelated RPC or nested relation resend");

@@ -198,6 +198,8 @@ pub struct ProfileConfig {
     /// Independent relation-changing rights; absent preserves every legacy field.
     #[serde(default)]
     pub relation_updates:Option<super::relation_update_policy::NativeRelationUpdateConfig>,
+    #[serde(default)]
+    pub group_management:Option<super::group_management::NativeGroupManagementConfig>,
     /// Independent incoming Group event opt-in, never a relation WRITE grant.
     #[serde(default)]
     pub relation_events:Option<super::group_events::NativeRelationEventsConfig>,
@@ -355,6 +357,7 @@ impl AccountConfig {
             .and_then(|profile|profile.with_im_read_status(p.im_read_status.as_ref()).map_err(|_|INVALID))
             .and_then(|profile|profile.with_im_send(p.im_send.as_ref()).map_err(|_|INVALID))
             .and_then(|profile|profile.with_relation_updates(p.relation_updates).map_err(|_|INVALID))
+            .and_then(|profile|profile.with_group_management(p.group_management).map_err(|_|INVALID))
             .and_then(|profile|profile.with_buddy_relation_check(p.buddy_relation_check).map_err(|_|INVALID))
             .and_then(|profile|profile.with_relation_events(p.relation_events).map_err(|_|INVALID))
             .and_then(|profile|profile.with_org_relation_sync(p.org_relation_sync).map_err(|_|INVALID))
@@ -599,6 +602,8 @@ pub(super) struct PrivateProfileRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     relation_updates:Option<super::relation_update_policy::NativeRelationUpdateConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    group_management:Option<super::group_management::NativeGroupManagementConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     relation_events:Option<super::group_events::NativeRelationEventsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     org_relation_sync:Option<super::org_relation_sync::NativeOrgRelationSyncConfig>,
@@ -651,7 +656,7 @@ impl<'a> PrivateConfigRef<'a> {
                 bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
                 call_incoming:p.call_incoming.as_ref().map(|binding|PrivateCallIncomingRef{object_id:&binding.object_id,domain:&binding.domain}),
                 call_control:p.call_control.as_ref().map(|properties|PrivateProperties(properties)),
-                native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),im_send:p.im_send.as_ref(),relation_updates:p.relation_updates,relation_events:p.relation_events,org_relation_sync:p.org_relation_sync,relation_roster:p.relation_roster,buddy_relation_check:p.buddy_relation_check,
+                native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),im_send:p.im_send.as_ref(),relation_updates:p.relation_updates,group_management:p.group_management,relation_events:p.relation_events,org_relation_sync:p.org_relation_sync,relation_roster:p.relation_roster,buddy_relation_check:p.buddy_relation_check,
                 connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
                 partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
             },
@@ -689,7 +694,7 @@ pub(super) fn private_profile_ref(p: &ProfileConfig) -> PrivateProfileRef<'_> {
         bootstrap_via_router: private_router_bootstrap(&p.bootstrap_via_router),
         call_incoming: p.call_incoming.as_ref().map(|b| PrivateCallIncomingRef { object_id: &b.object_id, domain: &b.domain }),
         call_control: p.call_control.as_deref().map(private_properties),
-        native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),im_send:p.im_send.as_ref(),relation_updates:p.relation_updates,relation_events:p.relation_events,org_relation_sync:p.org_relation_sync,relation_roster:p.relation_roster,buddy_relation_check:p.buddy_relation_check,
+        native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),im_send:p.im_send.as_ref(),relation_updates:p.relation_updates,group_management:p.group_management,relation_events:p.relation_events,org_relation_sync:p.org_relation_sync,relation_roster:p.relation_roster,buddy_relation_check:p.buddy_relation_check,
         connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
         partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
     }

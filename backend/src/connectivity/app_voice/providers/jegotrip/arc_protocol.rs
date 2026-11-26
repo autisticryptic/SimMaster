@@ -238,7 +238,8 @@ impl ArcProtocol {
     pub(super) fn prepare_relation_update(&mut self,permit:std::sync::Arc<super::relation_journal::RelationPermit>,deadline:std::time::Instant)->Result<OwnedCallPackets,ProtocolError>{
         let binding=self.im_binding.clone().ok_or(CodecError::InvalidField)?;let(id,bytes)=self.rpc.prepare_relation_update(binding,permit,deadline)?;
         let original=self.rpc.pending_relation_update(id).ok_or(CodecError::InvalidField)?;let mut packets=self.packets(id,bytes.expose_to_transport())?;
-        for packet in &mut packets.packets{packet.retain_relation_packet(original.clone());}Ok(packets)
+        let guard=if original.permit().management_operation().is_some(){Some(super::group_event_packets::GroupEventPackets::capture_management(&self.rpc.connection_scope(),original.clone())?)}else{None};
+        for packet in &mut packets.packets{packet.retain_relation_packet(original.clone());if let Some(guard)=&guard{packet.retain_group_event_packet(guard.clone());}}Ok(packets)
     }
     pub(super) fn take_relation_replies(&mut self)->Vec<super::rpc_relation_update::OwnedRelationReply>{self.rpc.take_relation_replies()}
     pub(super) fn retire_relation_update(&mut self,id:i32){self.rpc.retire_relation_update(id);}

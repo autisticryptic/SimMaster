@@ -2,6 +2,8 @@
 //! Fresh local database and loopback peer only; no SO/device/real business API.
 #[path="relation_intent_account_tests.rs"]
 mod admission;
+#[path="group_management_account_tests.rs"]
+mod management;
 use super::*;
 use n::{group_directory_data::Relation,group_relation_updates::Removal,
     relation_update_policy::NativeRelationUpdateConfig as Policy,account_runtime::PreparedRelationUpdate};

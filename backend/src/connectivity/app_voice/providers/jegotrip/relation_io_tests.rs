@@ -1,6 +1,8 @@
 //! Actions-only original Router/TCP/TLS/Common relation WRITE and physical Join.
 //! No original SO/SDK, device, Provider API, live target or detached protocol peer.
 use super::*;
+#[path="group_management_io_tests.rs"]
+mod management;
 use n::{account_test_support::TempDatabase,group_directory_data::Relation,
     group_relation_updates::Removal,relation_journal::{RelationAction,RelationMessage,RelationPermit,PreparedRelation},
     relation_update_policy::NativeRelationUpdateConfig as Policy};

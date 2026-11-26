@@ -10,7 +10,7 @@ use super::super::{group_directory_data::Relation,group_relation_updates::Remova
 pub(super) fn load_original_account(c:&rusqlite::Connection,line:&str)->Result<Option<(StoredAccount,Option<Arc<RelationConfiguration>>)>,&'static str>{
     let tx=rusqlite::Transaction::new_unchecked(c,rusqlite::TransactionBehavior::Deferred).map_err(|_|"app_account_relation_storage_failed")?;
     let account=account_store::load(&tx,line)?;
-    let configuration=match &account{Some(stored)if (stored.config.profile.relation_updates.is_some()||stored.config.profile.relation_events.is_some()||stored.config.profile.org_relation_sync.is_some()||stored.config.profile.relation_roster.is_some()||stored.config.profile.buddy_relation_check.is_some())=>Some(Arc::new(RelationConfiguration::capture(&tx,line,stored.metadata.revision,None)?)),_=>None};
+    let configuration=match &account{Some(stored)if (stored.config.profile.relation_updates.is_some()||stored.config.profile.group_management.is_some()||stored.config.profile.relation_events.is_some()||stored.config.profile.org_relation_sync.is_some()||stored.config.profile.relation_roster.is_some()||stored.config.profile.buddy_relation_check.is_some())=>Some(Arc::new(RelationConfiguration::capture(&tx,line,stored.metadata.revision,None)?)),_=>None};
     tx.commit().map_err(|_|"app_account_relation_storage_failed")?;Ok(account.map(|a|(a,configuration)))
 }
 pub(crate) struct RelationHttpScratch(Arc<super::super::native_rpc_budget::NativeRpcReservation>);
@@ -22,6 +22,20 @@ fn live_run(run:&ManagedRun)->Result<(),&'static str>{
     run.database.with_conn(|c|{if !super::super::account_runs::runtime_matches(c,&run.run_token)?{return Err("app_account_relation_scope_invalid");}super::super::account_runs::require_live(c,run.run_token.line_id(),run.run_token.revision(),run.run_token.nonce())})
 }
 impl AccountManager{
+    pub(crate) fn reserve_group_management_http_scratch(&self,line:&str,revision:u64,bytes:usize,consent:bool,write_consent:bool)->Result<RelationHttpScratch,&'static str>{
+        if !consent||!write_consent{return Err("app_account_relation_consent_required");}self.check_revision(line,revision)?;let slot=self.slot(line)?;let run=lock(&slot.run).clone().ok_or("app_account_relation_scope_invalid")?;
+        if !run.accepting.load(Ordering::SeqCst)||run.stopping.load(Ordering::SeqCst)||run.finalized.load(Ordering::SeqCst)||!run.im_gate.live(){return Err("app_account_relation_scope_invalid");}run.configuration_current()?;live_run(&run)?;
+        let(scope,budget)=run.backend.reserve_management_scratch(bytes)?;let cfg=run.relation_configuration.as_ref().ok_or("app_account_group_management_not_installed")?;run.database.with_conn(|c|cfg.require_current(c,line,revision,&scope))?;Ok(RelationHttpScratch(budget))
+    }
+    pub(crate) fn prepare_group_management(&self,line:&str,revision:u64,group:&[u8],op:super::super::group_management::GroupWriteOperation,properties:&[super::super::group_management::PublicProperty<'_>],nonce:&str,consent:bool,write_consent:bool,destructive_consent:bool)->Result<PreparedRelationUpdate,&'static str>{
+        if !consent||!write_consent||op==super::super::group_management::GroupWriteOperation::Disband&&!destructive_consent{return Err("app_account_relation_consent_required");}
+        self.check_revision(line,revision)?;let slot=self.slot(line)?;let run=lock(&slot.run).clone().ok_or("app_account_relation_scope_invalid")?;
+        if !run.accepting.load(Ordering::SeqCst)||run.stopping.load(Ordering::SeqCst)||run.finalized.load(Ordering::SeqCst)||!run.im_gate.live()||!run.backend.group_management_enabled(){return Err("app_account_group_management_not_installed");}
+        run.configuration_current()?;live_run(&run)?;let deadline=Instant::now().checked_add(run.backend.relation_update_timeout()).ok_or("app_account_relation_timeout")?;
+        let(owner,scope,message)=run.backend.reserve_management_message(group,op,properties,nonce)?;let configuration=run.relation_configuration.as_ref().cloned().ok_or("app_account_group_management_not_installed")?;run.database.with_conn(|c|configuration.require_current(c,line,revision,&scope))?;let message=Arc::new(message);
+        let admission=RelationIntent::capture(run.database.clone(),run.run_token.clone(),owner.clone(),scope.clone(),message.clone(),configuration.clone(),run.im_gate.clone(),deadline)?;let interest=match &admission{IntentAdmission::Fresh(i)=>Some(RelationIntentWait::original(i.clone())),IntentAdmission::Replay(_)=>None};
+        Ok(PreparedRelationUpdate{run,owner,scope,message,deadline,configuration,admission,_interest:interest})
+    }
     /// Accounting only, before HTTP creates borrowed Relation/property vectors.
     /// The actual immutable input/current identity/nonce admission is separate.
     pub(crate) fn reserve_relation_http_scratch(&self,line:&str,revision:u64,bytes:usize,consent:bool,write_consent:bool)->Result<RelationHttpScratch,&'static str>{

@@ -31,10 +31,10 @@ impl RelationIntent{
         let body_hash=message.fingerprint();let claim=Zeroizing::new(super::super::account_runtime::local_nonce().map_err(|_|"app_account_relation_entropy_failed")?);
         let(id,replay)=database.with_conn(|c|{
             let tx=Transaction::new_unchecked(c,TransactionBehavior::Immediate).map_err(|_|STORAGE)?;
-            validate_original(&tx,&run,&scope,&parent,&configuration,deadline)?;
+            validate_original(&tx,&run,&scope,&parent,&configuration,deadline)?;management::validate_shared(&tx,run.line_id())?;
             let old:Option<(i64,Vec<u8>,i64,Option<i64>)>=tx.query_row("SELECT id,body_hash,state,write_id FROM app_voice_relation_intents WHERE line_id=?1 AND user_nonce=?2",params![run.line_id(),message.nonce.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|_|STORAGE)?;
-            if let Some((_id,body,state,write))=old{
-                if body.as_slice()!=body_hash.as_slice(){return Err("app_account_relation_nonce_conflict");}
+            if let Some((old_id,body,state,write))=old{
+                if body.as_slice()!=body_hash.as_slice(){return Err("app_account_relation_nonce_conflict");}management::require(&tx,run.line_id(),message.nonce.as_str(),message.management,Some(old_id),write)?;
                 match(state,write){
                     (0,None)=>return Err("app_account_relation_preparing"),
                     (2,None)=>return Err("app_account_relation_nonce_retired"),
@@ -53,7 +53,7 @@ impl RelationIntent{
             let(local,total):(i64,i64)=tx.query_row("SELECT COALESCE(SUM(line_id=?1),0),COUNT(*) FROM app_voice_relation_intents",[run.line_id()],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|STORAGE)?;
             if local>=128||total>=4096{return Err("app_account_relation_full");}
             tx.execute("INSERT INTO app_voice_relation_intents(line_id,revision,user_nonce,body_hash,run_nonce,claim_nonce,configuration_hash,target_kind,additions,updates,removals,state,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12)",params![run.line_id(),run.revision() as i64,message.nonce.as_str(),body_hash.as_slice(),run.nonce(),claim.as_str(),configuration.0.as_slice(),message.target_kind(),message.counts[0] as i64,message.counts[1] as i64,message.counts[2] as i64,chrono::Utc::now().to_rfc3339()]).map_err(|_|STORAGE)?;
-            let id=tx.last_insert_rowid();validate_original(&tx,&run,&scope,&parent,&configuration,deadline)?;tx.commit().map_err(|_|STORAGE)?;Ok((id,false))
+            let id=tx.last_insert_rowid();management::capture(&tx,run.line_id(),message.nonce.as_str(),message.management,Some(id),None)?;validate_original(&tx,&run,&scope,&parent,&configuration,deadline)?;tx.commit().map_err(|_|STORAGE)?;Ok((id,false))
         })?;
         if replay{return Ok(IntentAdmission::Replay(id));}
         let intent=Arc::new(Self{database,run,owner,scope,message,configuration,parent,gate:ImReceiptGate::fresh(),claim,body_hash,id,deadline,phase:AtomicU8::new(PREPARING),transition:Mutex::new(Weak::new())});
@@ -62,15 +62,15 @@ impl RelationIntent{
     fn live(&self)->bool{self.scope.is_open()&&!self.scope.session_revoked()&&self.parent.live()&&self.gate.live()&&Instant::now()<self.deadline}
     fn fixed(&self,c:&Connection,state:i64,write:Option<i64>)->Result<(),&'static str>{
         let yes:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_relation_intents WHERE id=?1 AND line_id=?2 AND revision=?3 AND user_nonce=?4 AND body_hash=?5 AND run_nonce=?6 AND claim_nonce=?7 AND configuration_hash=?8 AND state=?9 AND write_id IS ?10)",params![self.id,self.run.line_id(),self.run.revision() as i64,self.message.nonce.as_str(),self.body_hash.as_slice(),self.run.nonce(),self.claim.as_str(),self.configuration.0.as_slice(),state,write],|r|r.get(0)).map_err(|_|STORAGE)?;
-        if !yes{return Err(SCOPE);}Ok(())
+        if !yes{return Err(SCOPE);}management::require(c,self.run.line_id(),self.message.nonce.as_str(),self.message.management,Some(self.id),write)
     }
     pub(in super::super) fn gate(&self)->Arc<ImReceiptGate>{self.gate.clone()}
     pub(in super::super) fn binds(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,message:&Arc<RelationMessage>)->bool{self.live()&&&self.owner==owner&&self.scope.matches(scope)&&Arc::ptr_eq(&self.message,message)&&self.message.budget.belongs_to(scope)}
     pub(in super::super) fn belongs_to(&self,database:&Arc<Database>,run:&Arc<RunToken>,configuration:&Arc<RelationConfiguration>,parent:&Arc<ImReceiptGate>,owner:&AttemptOwner,scope:&RpcConnectionScope,message:&Arc<RelationMessage>,deadline:Instant)->bool{
         self.binds(owner,scope,message)&&Arc::ptr_eq(database,&self.database)&&Arc::ptr_eq(run,&self.run)&&Arc::ptr_eq(configuration,&self.configuration)&&Arc::ptr_eq(parent,&self.parent)&&deadline==self.deadline
     }
-    pub(in super::super) fn bind(self:&Arc<Self>,binding:Arc<ImBinding>,identity:Arc<RelationIdentity>,policy:Policy)->Result<PreparedRelation,&'static str>{
-        let mut slot=lock(&self.transition);
+    pub(in super::super) fn bind(self:&Arc<Self>,binding:Arc<ImBinding>,identity:Arc<RelationIdentity>,policy:impl Into<RelationWriteGrant>)->Result<PreparedRelation,&'static str>{
+        let policy=policy.into();let mut slot=lock(&self.transition);
         if self.phase.load(Ordering::SeqCst)!=PREPARING||!self.live()||binding.owner()!=&self.owner||!binding.scope().matches(&self.scope){return Err(SCOPE);}
         let result=RelationAction::original_captured(self.database.clone(),self.run.clone(),binding,identity,self.parent.clone(),self.message.clone(),self.deadline,policy,self.configuration.clone(),Some(self.clone()))?;
         let PreparedRelation::Fresh(action)=&result else{return Err(SCOPE);};
@@ -106,15 +106,17 @@ pub(in super::super) struct RelationIntentWait(Arc<RelationIntent>);
 impl RelationIntentWait{pub(in super::super) fn original(intent:Arc<RelationIntent>)->Self{Self(intent)}}
 impl Drop for RelationIntentWait{fn drop(&mut self){self.0.cancel();}}
 #[derive(Serialize)]
-pub(crate) struct RelationIntentView{pub id:i64,pub nonce_tag:String,pub state:&'static str,pub write_id:Option<i64>,pub target_kind:&'static str,pub additions:usize,pub updates:usize,pub removals:usize,pub updated_at:String}
+pub(crate) struct RelationIntentView{pub id:i64,pub nonce_tag:String,pub state:&'static str,pub write_id:Option<i64>,pub target_kind:&'static str,pub additions:usize,pub updates:usize,pub removals:usize,pub updated_at:String,#[serde(skip_serializing_if="Option::is_none")]pub management:Option<GroupManagementView>}
 impl fmt::Debug for RelationIntentView{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RelationIntentView(<redacted>)")}}
 pub(in super::super) fn history(c:&Connection,line:&str,limit:usize)->Result<Vec<RelationIntentView>,&'static str>{
     if !(1..=128).contains(&limit)||account_store::metadata(c,line)?.is_none(){return Err(INVALID);}
     let mut statement=c.prepare("SELECT id,user_nonce,state,write_id,target_kind,additions,updates,removals,updated_at FROM app_voice_relation_intents WHERE line_id=?1 ORDER BY id DESC LIMIT ?2").map_err(|_|STORAGE)?;
     let rows=statement.query_map(params![line,limit as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,Option<i64>>(3)?,r.get::<_,String>(4)?,r.get::<_,usize>(5)?,r.get::<_,usize>(6)?,r.get::<_,usize>(7)?,r.get::<_,String>(8)?))).map_err(|_|STORAGE)?;
     rows.map(|row|{let(id,nonce,state,write,kind,adds,updates,removes,at)=row.map_err(|_|STORAGE)?;let nonce=Zeroizing::new(nonce);
-        if id<=0||nonce.len()!=32||!nonce.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||at.len()>64||chrono::DateTime::parse_from_rfc3339(&at).is_err()||[adds,updates,removes].iter().any(|n|*n>128)||adds+updates+removes==0||!matches!((state,write),(0,None)|(2,None)|(1,Some(1..=i64::MAX))){return Err(STORAGE);}
+        if [adds,updates,removes].iter().any(|n|*n>128){return Err(STORAGE);}
+        let descriptor=if adds+updates+removes==0{management::get(c,line,nonce.as_str(),Some(id),write)?}else{None};if descriptor.is_some_and(|_|kind!="group"||adds+updates+removes!=0){return Err(STORAGE);}
+        if id<=0||nonce.len()!=32||!nonce.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||at.len()>64||chrono::DateTime::parse_from_rfc3339(&at).is_err()||[adds,updates,removes].iter().any(|n|*n>128)||descriptor.is_none()&&adds+updates+removes==0||!matches!((state,write),(0,None)|(2,None)|(1,Some(1..=i64::MAX))){return Err(STORAGE);}
         let tag=hash(&[b"original-relation-intent-ui-nonce-v1",nonce.as_bytes()]).iter().map(|b|format!("{b:02x}")).collect();
-        Ok(RelationIntentView{id,nonce_tag:tag,state:match state{0=>"preparing",1=>"bound",2=>"not_sent",_=>return Err(STORAGE)},write_id:write,target_kind:match kind.as_str(){"buddy"=>"buddy","group"=>"group",_=>return Err(STORAGE)},additions:adds,updates,removals:removes,updated_at:at})
+        Ok(RelationIntentView{id,nonce_tag:tag,state:match state{0=>"preparing",1=>"bound",2=>"not_sent",_=>return Err(STORAGE)},write_id:write,target_kind:match kind.as_str(){"buddy"=>"buddy","group"=>"group",_=>return Err(STORAGE)},additions:adds,updates,removals:removes,updated_at:at,management:descriptor.map(|d|GroupManagementView{operation:d.operation.name(),properties:d.properties})})
     }).collect()
 }

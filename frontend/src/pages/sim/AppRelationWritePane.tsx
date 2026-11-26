@@ -78,8 +78,8 @@ function RelationEditor({ lineId, revision, hosted, installed }: RelationWritePr
     <FormControlLabel control={<Checkbox checked={form.consent} disabled={disabled || !ready} onChange={(event) => setInput({ ...form, consent: event.target.checked })} />} label="确认当前账号、原目标和本次不可变关系内容" />
     <FormControlLabel control={<Checkbox checked={form.writeConsent} disabled={disabled || !ready} onChange={(event) => setInput({ ...form, writeConsent: event.target.checked })} />} label="明确授权本次关系 WRITE，接受业务影响且不重放未知结果" />
     <Button size="small" disabled={disabled || !ready || !body} onClick={() => { void run(true) }}>明确执行本次关系修改</Button>
-    {selected?.snapshot?.intents.slice(0, 16).map((row) => <Typography key={`intent-${row.id}`} variant="caption">准备 #{row.id} · {row.state === 'preparing' ? '准备未决（不授 WRITE）' : row.state === 'bound' ? '已关联原写入记录' : '准备未写出'} · 新增 {row.additions} / 更新 {row.updates} / 删除 {row.removals}</Typography>)}
-    {selected?.snapshot?.writes.slice(0, 16).map((row) => <Typography key={`write-${row.id}`} variant="caption">结果 #{row.id} · {relationHistoryLabel(row.state)}{row.baseTime !== null ? ` · BaseTime ${row.baseTime} · UpdateTime ${row.updateTime}` : ''}</Typography>)}
+    {selected?.snapshot?.intents.slice(0, 16).map((row) => <Typography key={`intent-${row.id}`} variant="caption">准备 #{row.id} · {row.state === 'preparing' ? '准备未决（不授 WRITE）' : row.state === 'bound' ? '已关联原写入记录' : '准备未写出'}{row.management ? ` · 群组管理 ${row.management.operation} · 属性 ${row.management.properties}` : ` · 新增 ${row.additions} / 更新 ${row.updates} / 删除 ${row.removals}`}</Typography>)}
+    {selected?.snapshot?.writes.slice(0, 16).map((row) => <Typography key={`write-${row.id}`} variant="caption">结果 #{row.id} · {relationHistoryLabel(row.state)}{row.management ? ` · 群组管理 ${row.management.operation}` : ''}{row.baseTime !== null ? ` · BaseTime ${row.baseTime} · UpdateTime ${row.updateTime}` : ''}</Typography>)}
     <Typography variant="caption" color="text.secondary">即使其他标签页、配置切换或重载，未决标记仍保留；没有强制清除、自动重试或重新登录按钮。</Typography>
   </Stack>
 }

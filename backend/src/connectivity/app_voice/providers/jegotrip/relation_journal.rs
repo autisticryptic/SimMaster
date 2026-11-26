@@ -3,7 +3,7 @@
 use super::{account_runs::{self,RunToken},account_store,arc_session::RelationIdentity,
     group_directory_data::{GroupId,Relation},group_relation_updates::{self,Removal},
     im_delivery::ImBinding,im_inbox::ImReceiptGate,native_rpc_budget::NativeRpcReservation,
-    relation_update_policy::NativeRelationUpdateConfig as Policy,rpc_pending::RpcConnectionScope,
+    relation_update_policy::{NativeRelationUpdateConfig as Policy,RelationWriteGrant},group_management_store as management,rpc_pending::RpcConnectionScope,
     rpc_stream::MAX_STREAM_BYTES,session::AttemptOwner};
 use crate::platform::db::Database;
 use rusqlite::{params,Connection,OptionalExtension,Transaction,TransactionBehavior};
@@ -57,11 +57,11 @@ pub(super) fn initialize_schema(c:&Connection)->Result<(),&'static str>{
 pub(super) fn delete_account(c:&Connection,line:&str)->Result<(),&'static str>{
     if account_store::metadata(c,line)?.is_some(){return Err(SCOPE);}
     let exists:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_voice_relation_writes')",[],|r|r.get(0)).map_err(|_|STORAGE)?;
-    if exists{c.execute("DELETE FROM app_voice_relation_writes WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;}intents::delete_account(c,line)
+    if exists{c.execute("DELETE FROM app_voice_relation_writes WHERE line_id=?1",[line]).map_err(|_|STORAGE)?;}intents::delete_account(c,line)?;management::delete_account(c,line)
 }
 /// Immutable maps captured synchronously under the original input reservation.
 /// For Buddy, the real identifier is taken later ONLY from RelationIdentity.
-pub(crate) struct RelationMessage{group:Option<Zeroizing<Vec<u8>>>,maps:Zeroizing<Vec<u8>>,nonce:Zeroizing<String>,counts:[usize;3],budget:Arc<NativeRpcReservation>}
+pub(crate) struct RelationMessage{group:Option<Zeroizing<Vec<u8>>>,maps:Zeroizing<Vec<u8>>,nonce:Zeroizing<String>,counts:[usize;3],budget:Arc<NativeRpcReservation>,management:Option<management::Descriptor>}
 impl fmt::Debug for RelationMessage{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RelationMessage(<redacted>)")}}
 impl RelationMessage{
     pub(super) fn capture(scope:&RpcConnectionScope,group:Option<&[u8]>,adds:&[Relation<'_>],updates:&[Relation<'_>],removes:&[Removal<'_>],nonce:&str,policy:Policy)->Result<Self,&'static str>{
@@ -77,11 +77,18 @@ impl RelationMessage{
         let budget=scope.reserve_native_rpc(peak).map_err(|_|"app_account_relation_capacity")?;
         let bytes=group_relation_updates::encode_updates(shape_id,adds,updates,removes).map_err(|_|INVALID)?;
         let start=5+4+shape_id.len();let maps=Zeroizing::new(bytes.expose_to_transport()[start..].to_vec());
-        Ok(Self{group:group.map(|g|Zeroizing::new(g.to_vec())),maps,nonce:Zeroizing::new(nonce.to_owned()),counts:[adds.len(),updates.len(),removes.len()],budget})
+        Ok(Self{group:group.map(|g|Zeroizing::new(g.to_vec())),maps,nonce:Zeroizing::new(nonce.to_owned()),counts:[adds.len(),updates.len(),removes.len()],budget,management:None})
     }
-    fn fingerprint(&self)->[u8;32]{hash(&[b"original-relation-body-v1",&[u8::from(self.group.is_some())],self.group.as_deref().map_or(b"".as_slice(),|g|g.as_slice()),&self.maps])}
+    pub(super) fn capture_management(scope:&RpcConnectionScope,group:&[u8],operation:super::group_management::GroupWriteOperation,properties:&[super::group_management::PublicProperty<'_>],nonce:&str,policy:super::group_management::NativeGroupManagementConfig)->Result<Self,&'static str>{
+        policy.validate()?;if !policy.admits(operation){return Err("app_account_group_management_not_installed");}if nonce.len()!=32||!nonce.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)){return Err(INVALID);}
+        let size=super::group_management::size(group,operation,properties).map_err(|_|"app_account_group_management_invalid")?;let budget=scope.reserve_native_rpc(size*2+group.len()+nonce.len()+std::mem::size_of::<Self>()+std::mem::size_of::<RelationAction>()+std::mem::size_of::<RelationConfiguration>()+std::mem::size_of::<RelationIntent>()+properties.len()*(std::mem::size_of::<super::rpc_stream::RpcProperty<'_>>()+std::mem::size_of::<&super::rpc_stream::RpcProperty<'_>>())+256).map_err(|_|"app_account_relation_capacity")?;
+        let wire=super::group_management::encode(group,operation,properties).map_err(|_|"app_account_group_management_invalid")?;let maps=Zeroizing::new(wire.expose_to_transport()[9+group.len()..].to_vec());
+        Ok(Self{group:Some(Zeroizing::new(group.to_vec())),maps,nonce:Zeroizing::new(nonce.to_owned()),counts:[0;3],budget,management:Some(management::Descriptor{operation,properties:properties.len()})})
+    }
+    fn fingerprint(&self)->[u8;32]{if let Some(d)=self.management{return hash(&[b"original-group-management-body-v1",d.operation.name().as_bytes(),self.group.as_deref().map_or(b"".as_slice(),|g|g.as_slice()),&self.maps]);}hash(&[b"original-relation-body-v1",&[u8::from(self.group.is_some())],self.group.as_deref().map_or(b"".as_slice(),|g|g.as_slice()),&self.maps])}
+    pub(super) fn management_operation(&self)->Option<super::group_management::GroupWriteOperation>{self.management.map(|d|d.operation)}
     fn target_kind(&self)->&'static str{if self.group.is_some(){"group"}else{"buddy"}}
-    fn matches(&self,scope:&RpcConnectionScope,policy:Policy)->bool{self.budget.belongs_to(scope)&&policy.admits(self.counts[0],self.counts[1],self.counts[2])}
+    fn matches(&self,scope:&RpcConnectionScope,policy:RelationWriteGrant)->bool{self.budget.belongs_to(scope)&&policy.admits(self.counts,self.management)}
     fn arguments_size(&self,uid:&[u8])->Result<usize,&'static str>{let id=self.group.as_deref().map_or(uid,|g|g.as_slice());let size=9usize.checked_add(id.len()).and_then(|n|n.checked_add(self.maps.len())).ok_or("app_account_relation_capacity")?;if size>MAX_STREAM_BYTES{return Err("app_account_relation_capacity");}Ok(size)}
     fn arguments(&self,uid:&[u8])->Result<Zeroizing<Vec<u8>>,&'static str>{
         let id=self.group.as_deref().map_or(uid,|g|g.as_slice());if id.is_empty()||id.len()>super::rpc_stream::MAX_FIELD_BYTES{return Err(SCOPE);}
@@ -100,9 +107,9 @@ impl RelationAction{
     }
     #[cfg(test)]
     pub(super) fn original_with_configuration(database:Arc<Database>,run:Arc<RunToken>,binding:Arc<ImBinding>,identity:Arc<RelationIdentity>,parent:Arc<ImReceiptGate>,message:RelationMessage,deadline:Instant,policy:Policy,configuration:Arc<RelationConfiguration>)->Result<PreparedRelation,&'static str>{
-        Self::original_captured(database,run,binding,identity,parent,Arc::new(message),deadline,policy,configuration,None)
+        Self::original_captured(database,run,binding,identity,parent,Arc::new(message),deadline,policy.into(),configuration,None)
     }
-    fn original_captured(database:Arc<Database>,run:Arc<RunToken>,binding:Arc<ImBinding>,identity:Arc<RelationIdentity>,parent:Arc<ImReceiptGate>,message:Arc<RelationMessage>,deadline:Instant,policy:Policy,configuration:Arc<RelationConfiguration>,intent:Option<Arc<RelationIntent>>)->Result<PreparedRelation,&'static str>{
+    fn original_captured(database:Arc<Database>,run:Arc<RunToken>,binding:Arc<ImBinding>,identity:Arc<RelationIdentity>,parent:Arc<ImReceiptGate>,message:Arc<RelationMessage>,deadline:Instant,policy:RelationWriteGrant,configuration:Arc<RelationConfiguration>,intent:Option<Arc<RelationIntent>>)->Result<PreparedRelation,&'static str>{
         if !identity.authenticates(&binding)||!message.matches(&binding.scope(),policy)||!parent.live()||Instant::now()>=deadline||run.line_id()!=binding.owner().line_id()||intent.as_ref().is_some_and(|i|!i.binds(binding.owner(),&binding.scope(),&message)){return Err(SCOPE);}
         let uid=identity.uid_for(binding.owner(),&binding.scope()).ok_or(SCOPE)?;
         let intent_hash=hash(&[b"original-relation-intent-v1",binding.identity(),uid,&message.fingerprint()]);
@@ -115,7 +122,7 @@ impl RelationAction{
             let unknown:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_relation_writes WHERE line_id=?1 AND state=0)",[action.run.line_id()],|r|r.get(0)).map_err(|_|STORAGE)?;if unknown{return Err(UNKNOWN);}
             let(local,total):(i64,i64)=tx.query_row("SELECT COALESCE(SUM(line_id=?1),0),COUNT(*) FROM app_voice_relation_writes",[action.run.line_id()],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|STORAGE)?;if local>=128||total>=4096{return Err("app_account_relation_full");}
             tx.execute("INSERT INTO app_voice_relation_writes(line_id,revision,user_nonce,intent_hash,identity_key,run_nonce,scope_epoch,target_kind,additions,updates,removals,state,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12)",params![action.run.line_id(),action.run.revision() as i64,action.message.nonce.as_str(),action.intent_hash.as_slice(),action.binding.identity().as_slice(),action.run.nonce(),action.binding.receipt_epoch(),action.message.target_kind(),action.message.counts[0] as i64,action.message.counts[1] as i64,action.message.counts[2] as i64,chrono::Utc::now().to_rfc3339()]).map_err(|_|STORAGE)?;
-            let id=tx.last_insert_rowid();if let Some(intent)=&action.intent{intent.commit_binding(&tx,id)?;}action.validate(&tx)?;tx.commit().map_err(|_|STORAGE)?;Ok((id,false))
+            let id=tx.last_insert_rowid();management::capture(&tx,action.run.line_id(),action.message.nonce.as_str(),action.message.management,None,Some(id))?;if let Some(intent)=&action.intent{intent.commit_binding(&tx,id)?;}action.validate(&tx)?;tx.commit().map_err(|_|STORAGE)?;Ok((id,false))
         })?;
         if replay{return Ok(PreparedRelation::Replay(action.database.with_conn(|c|view(c,id))?));}
         action.row.store(id,Ordering::SeqCst);Ok(PreparedRelation::Fresh(action))
@@ -131,8 +138,8 @@ impl RelationAction{
     pub(super) fn scope(&self)->RpcConnectionScope{self.binding.scope()}
     pub(super) fn gate(&self)->Arc<ImReceiptGate>{self.gate.clone()}
     pub(super) fn deadline(&self)->Instant{self.deadline}
-    pub(super) fn permit(self:&Arc<Self>,policy:Policy)->Result<Arc<RelationPermit>,&'static str>{
-        let mut slot=lock(&self.permit);if slot.cancelled||slot.permit.upgrade().is_some()||!self.live()||!self.message.matches(&self.scope(),policy){return Err(SCOPE);}
+    pub(super) fn permit(self:&Arc<Self>,policy:impl Into<RelationWriteGrant>)->Result<Arc<RelationPermit>,&'static str>{
+        let policy=policy.into();let mut slot=lock(&self.permit);if slot.cancelled||slot.permit.upgrade().is_some()||!self.live()||!self.message.matches(&self.scope(),policy){return Err(SCOPE);}
         let uid=self.identity.uid_for(self.owner(),&self.scope()).ok_or(SCOPE)?;let size=self.message.arguments_size(uid)?;
         let budget=self.scope().reserve_native_rpc(size.checked_add(std::mem::size_of::<RelationPermit>()+64).ok_or("app_account_relation_capacity")?).map_err(|_|"app_account_relation_capacity")?;
         let arguments=self.message.arguments(uid)?;let arguments_hash=hash(&[b"original-relation-args-v1",&arguments]);let row=self.row.load(Ordering::SeqCst);
@@ -156,6 +163,7 @@ impl fmt::Debug for RelationPermit{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt:
 impl RelationPermit{
     pub(super) fn binding(&self)->&Arc<ImBinding>{&self.action.binding}
     pub(super) fn arguments(&self)->&[u8]{&self.arguments}
+    pub(super) fn management_operation(&self)->Option<super::group_management::GroupWriteOperation>{self.action.message.management_operation()}
     pub(super) fn deadline(&self)->Instant{self.action.deadline}
     pub(super) fn gate(&self)->Arc<ImReceiptGate>{self.action.gate()}
     pub(super) fn parent_gate(&self)->Arc<ImReceiptGate>{self.action.parent.clone()}
@@ -163,7 +171,7 @@ impl RelationPermit{
     pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{self.action.live()&&self.binding().matches(owner,scope)&&self.budget.belongs_to(scope)&&self.phase.load(Ordering::SeqCst)<RESOLVED}
     pub(super) fn retained_bytes(&self)->usize{self.arguments.len()+self.action.message.maps.len()+256}
     fn fixed(&self,c:&Connection)->Result<(),&'static str>{
-        let yes:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_relation_writes WHERE id=?1 AND line_id=?2 AND revision=?3 AND identity_key=?4 AND user_nonce=?5 AND intent_hash=?6 AND arguments_hash=?7 AND run_nonce=?8 AND scope_epoch=?9)",params![self.action.row.load(Ordering::SeqCst),self.action.run.line_id(),self.action.run.revision() as i64,self.binding().identity().as_slice(),self.action.message.nonce.as_str(),self.action.intent_hash.as_slice(),self.arguments_hash.as_slice(),self.action.run.nonce(),self.binding().receipt_epoch()],|r|r.get(0)).map_err(|_|STORAGE)?;if !yes{return Err(SCOPE);}Ok(())
+        let yes:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_relation_writes WHERE id=?1 AND line_id=?2 AND revision=?3 AND identity_key=?4 AND user_nonce=?5 AND intent_hash=?6 AND arguments_hash=?7 AND run_nonce=?8 AND scope_epoch=?9)",params![self.action.row.load(Ordering::SeqCst),self.action.run.line_id(),self.action.run.revision() as i64,self.binding().identity().as_slice(),self.action.message.nonce.as_str(),self.action.intent_hash.as_slice(),self.arguments_hash.as_slice(),self.action.run.nonce(),self.binding().receipt_epoch()],|r|r.get(0)).map_err(|_|STORAGE)?;if !yes{return Err(SCOPE);}management::require(c,self.action.run.line_id(),self.action.message.nonce.as_str(),self.action.message.management,None,Some(self.action.row.load(Ordering::SeqCst)))
     }
     pub(super) fn arm(&self,id:i32,deadline:Instant)->Result<(),&'static str>{
         let _transition=lock(&self.transition);let end=deadline.min(self.deadline());let mut request=lock(&self.request);if id<=0||request.is_some()||self.phase.load(Ordering::SeqCst)!=QUEUED||!self.action.live()||Instant::now()>=end{return Err(SCOPE);}
@@ -172,6 +180,10 @@ impl RelationPermit{
         })?;*request=Some(Request{id,deadline:end});Ok(())
     }
     pub(super) fn current(&self,id:i32)->bool{self.action.live()&&lock(&self.request).as_ref().is_some_and(|r|r.id==id&&Instant::now()<r.deadline)}
+    pub(super) fn packet_current(&self,id:i32)->bool{
+        if self.management_operation().is_none()||!self.current(id)||self.phase.load(Ordering::SeqCst)>=RESOLVED{return false;}
+        self.action.database.with_conn(|c|{self.action.validate(c)?;self.fixed(c)}).is_ok()&&self.current(id)&&self.phase.load(Ordering::SeqCst)<RESOLVED
+    }
     pub(super) fn begin_write(&self,id:i32)->bool{
         let _transition=lock(&self.transition);
         if !self.current(id)||self.phase.load(Ordering::SeqCst)!=QUEUED{return false;}
@@ -187,7 +199,7 @@ impl RelationPermit{
             let n=tx.execute("UPDATE app_voice_relation_writes SET state=?4,result_code=?5,base_time=?6,update_time=?7,updated_at=?8 WHERE id=?1 AND user_nonce=?2 AND request_id=?3 AND state=0",params![self.action.row.load(Ordering::SeqCst),self.action.message.nonce.as_str(),id,if reply.accepted(){1}else{2},i64::from(reply.code()),reply.base_time(),reply.update_time(),chrono::Utc::now().to_rfc3339()]).map_err(|_|STORAGE)?;
             if n!=1||!self.current(id)||self.phase.load(Ordering::SeqCst)!=SUBMITTED{return Err(UNKNOWN);}let data=view(&tx,self.action.row.load(Ordering::SeqCst))?;
             let payload=serde_json::json!({"relation_write_id":data.id,"target_kind":data.target_kind,"state":data.state,"additions":data.additions,"updates":data.updates,"removals":data.removals,"base_time":data.base_time,"update_time":data.update_time}).to_string();
-            let event=crate::platform::db::insert_app_event_for_conn(&tx,"app_voice.relations_updated",Some(self.action.run.line_id()),Some("app_voice"),&payload,&data.updated_at).map_err(|_|STORAGE)?;
+            let event=if let Some(management)=&data.management{let payload=serde_json::json!({"relation_write_id":data.id,"state":data.state,"operation":management.operation,"properties":management.properties,"base_time":data.base_time,"update_time":data.update_time}).to_string();crate::platform::db::insert_app_event_for_conn(&tx,"app_voice.group_management_updated",Some(self.action.run.line_id()),Some("app_voice"),&payload,&data.updated_at)}else{crate::platform::db::insert_app_event_for_conn(&tx,"app_voice.relations_updated",Some(self.action.run.line_id()),Some("app_voice"),&payload,&data.updated_at)}.map_err(|_|STORAGE)?;
             if !self.current(id){return Err(UNKNOWN);}tx.commit().map_err(|_|STORAGE)?;self.phase.store(RESOLVED,Ordering::SeqCst);Ok((data,event))
         })?;
         self.action.database.publish_committed_app_event(event);Ok(data)
@@ -200,12 +212,16 @@ impl RelationPermit{
     pub(super) async fn cancelled(&self){loop{let n=self.changed.notified();tokio::pin!(n);n.as_mut().enable();if self.retired(){return;}n.await;}}
 }
 impl Drop for RelationPermit{fn drop(&mut self){self.cancel();}}
-#[derive(Serialize)]pub struct RelationWriteView{pub id:i64,pub nonce_tag:String,pub target_kind:&'static str,pub state:&'static str,pub additions:usize,pub updates:usize,pub removals:usize,pub base_time:Option<String>,pub update_time:Option<String>,pub updated_at:String}
+#[derive(Serialize)]pub struct RelationWriteView{pub id:i64,pub nonce_tag:String,pub target_kind:&'static str,pub state:&'static str,pub additions:usize,pub updates:usize,pub removals:usize,pub base_time:Option<String>,pub update_time:Option<String>,pub updated_at:String,#[serde(skip_serializing_if="Option::is_none")]pub management:Option<GroupManagementView>}
+#[derive(Serialize)]pub struct GroupManagementView{pub operation:&'static str,pub properties:usize}
 impl fmt::Debug for RelationWriteView{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RelationWriteView(<redacted>)")}}
 fn view(c:&Connection,id:i64)->Result<RelationWriteView,&'static str>{
     c.query_row("SELECT target_kind,state,additions,updates,removals,base_time,update_time,updated_at,user_nonce FROM app_voice_relation_writes WHERE id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,usize>(2)?,r.get::<_,usize>(3)?,r.get::<_,usize>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?))).map_err(|_|STORAGE).and_then(|(kind,state,adds,updates,removes,base,update,at,nonce)|{
-        let nonce=Zeroizing::new(nonce);if id<=0||nonce.len()!=32||!nonce.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||at.len()>64||chrono::DateTime::parse_from_rfc3339(&at).is_err()||[adds,updates,removes].iter().any(|n|*n>128)||adds+updates+removes==0||base.is_some()!=update.is_some()||matches!(state,0|3)&&base.is_some()||matches!(state,1|2)&&base.is_none(){return Err(STORAGE);}let tag=hash(&[b"original-relation-ui-nonce-v1",nonce.as_bytes()]).iter().map(|b|format!("{b:02x}")).collect();
-        Ok(RelationWriteView{id,nonce_tag:tag,target_kind:match kind.as_str(){"buddy"=>"buddy","group"=>"group",_=>return Err(STORAGE)},state:match state{0=>"uncertain",1=>"confirmed",2=>"rejected",3=>"not_sent",_=>return Err(STORAGE)},additions:adds,updates,removals:removes,base_time:base.map(|v|v.to_string()),update_time:update.map(|v|v.to_string()),updated_at:at})
+        let nonce=Zeroizing::new(nonce);if [adds,updates,removes].iter().any(|n|*n>128){return Err(STORAGE);}
+        let descriptor=if adds+updates+removes==0{let line:String=c.query_row("SELECT line_id FROM app_voice_relation_writes WHERE id=?1",[id],|r|r.get(0)).map_err(|_|STORAGE)?;management::get(c,&line,nonce.as_str(),None,Some(id))?}else{None};
+        if descriptor.is_some_and(|d|kind!="group"||adds+updates+removes!=0||match d.operation{super::group_management::GroupWriteOperation::SetProperties=>base.is_some()||update.is_some(),super::group_management::GroupWriteOperation::Disband=>matches!(state,1|2)&&base.is_none()}){return Err(STORAGE);}
+        if id<=0||nonce.len()!=32||!nonce.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||at.len()>64||chrono::DateTime::parse_from_rfc3339(&at).is_err()||[adds,updates,removes].iter().any(|n|*n>128)||descriptor.is_none()&&adds+updates+removes==0||base.is_some()!=update.is_some()||matches!(state,0|3)&&base.is_some()||descriptor.is_none()&&matches!(state,1|2)&&base.is_none(){return Err(STORAGE);}let tag=hash(&[b"original-relation-ui-nonce-v1",nonce.as_bytes()]).iter().map(|b|format!("{b:02x}")).collect();
+        Ok(RelationWriteView{id,nonce_tag:tag,target_kind:match kind.as_str(){"buddy"=>"buddy","group"=>"group",_=>return Err(STORAGE)},state:match state{0=>"uncertain",1=>"confirmed",2=>"rejected",3=>"not_sent",_=>return Err(STORAGE)},additions:adds,updates,removals:removes,base_time:base.map(|v|v.to_string()),update_time:update.map(|v|v.to_string()),updated_at:at,management:descriptor.map(|d|GroupManagementView{operation:d.operation.name(),properties:d.properties})})
     })
 }
 pub(super) fn historical_view(c:&Connection,line:&str,id:i64)->Result<RelationWriteView,&'static str>{

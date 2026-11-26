@@ -1,13 +1,13 @@
 // Explicit relation WRITE inputs and conservative outcome correlation only.
 // No cached directory/UID/SDK flag/history row can create a native permit.
 import { directoryGroupId } from './nativeDirectory.ts'
-import { relationHistoryRows, type RelationHistoryRow } from './relationHistory.ts'
+import { relationHistoryRows, managementSummary, type GroupManagementSummary, type RelationHistoryRow } from './relationHistory.ts'
 export interface RelationDraft { target: 'buddy' | 'group'; groupId: string; additions: string; updates: string; removals: string }
 export interface RelationChangeBody { label: string; relation_type: number; first: string; second: string; properties: { key: number[]; value: number[] }[] }
 export interface RelationWriteBody { expected_revision: number; nonce: string; group_id: string | null; additions: RelationChangeBody[]; updates: RelationChangeBody[]; removals: { label: string; flag: boolean }[]; consent: true; write_consent: true }
-export interface RelationIntentRow { id: number; nonceTag: string; state: 'preparing' | 'bound' | 'not_sent'; writeId: number | null; targetKind: 'buddy' | 'group'; additions: number; updates: number; removals: number }
+export interface RelationIntentRow { management?: GroupManagementSummary; id: number; nonceTag: string; state: 'preparing' | 'bound' | 'not_sent'; writeId: number | null; targetKind: 'buddy' | 'group'; additions: number; updates: number; removals: number }
 export interface RelationSnapshot { intents: RelationIntentRow[]; writes: RelationHistoryRow[] }
-export interface RelationLocalMarker { version: 1; intentTag: string; writeTag: string; revision: number; afterIntent: number; afterWrite: number; target: 'buddy' | 'group'; additions: number; updates: number; removals: number }
+export interface RelationLocalMarker { management?: GroupManagementSummary; version: 1; intentTag: string; writeTag: string; revision: number; afterIntent: number; afterWrite: number; target: 'buddy' | 'group'; additions: number; updates: number; removals: number }
 const own = (v: object, k: string): unknown => Object.prototype.hasOwnProperty.call(v, k) ? (v as Record<string, unknown>)[k] : undefined
 function object(v: unknown): v is Record<string, unknown> { return v !== null && typeof v === 'object' && !Array.isArray(v) }
 function keys(v: Record<string, unknown>, allowed: string[], required: string[]): boolean { return Object.keys(v).every((k) => allowed.includes(k)) && required.every((k) => Object.prototype.hasOwnProperty.call(v, k)) && allowed.every((k) => !(k in v) || Object.prototype.hasOwnProperty.call(v, k)) }
@@ -76,16 +76,17 @@ export function relationIntentRows(value: unknown): RelationIntentRow[] | null {
   const result: RelationIntentRow[] = []; const ids = new Set<number>(); const tags = new Set<string>(); const writes = new Set<number>()
   for (const raw of value) {
     const fields = ['id', 'nonce_tag', 'state', 'write_id', 'target_kind', 'additions', 'updates', 'removals', 'updated_at']
-    if (!object(raw) || !keys(raw, fields, fields)) return null
+    if (!object(raw) || !keys(raw, [...fields, 'management'], fields)) return null
+    const management = own(raw, 'management') === undefined ? undefined : managementSummary(own(raw, 'management')); if (management === null) return null
     const id = own(raw, 'id'); const nonceTag = own(raw, 'nonce_tag'); const state = own(raw, 'state'); const writeId = own(raw, 'write_id'); const targetKind = own(raw, 'target_kind'); const additions = own(raw, 'additions'); const updates = own(raw, 'updates'); const removals = own(raw, 'removals'); const at = own(raw, 'updated_at')
-    if (!safeId(id) || ids.has(id) || !tag(nonceTag) || tags.has(nonceTag) || state !== 'preparing' && state !== 'bound' && state !== 'not_sent' || targetKind !== 'buddy' && targetKind !== 'group' || !counter(additions) || !counter(updates) || !counter(removals) || additions + updates + removals === 0 || typeof at !== 'string' || at.length > 64 || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.[0-9]{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(at)) return null
+    if (!safeId(id) || ids.has(id) || !tag(nonceTag) || tags.has(nonceTag) || state !== 'preparing' && state !== 'bound' && state !== 'not_sent' || targetKind !== 'buddy' && targetKind !== 'group' || !counter(additions) || !counter(updates) || !counter(removals) || (management ? targetKind !== 'group' || additions + updates + removals !== 0 : additions + updates + removals === 0) || typeof at !== 'string' || at.length > 64 || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.[0-9]{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(at)) return null
     let capturedWrite: number | null = null
     if (state === 'bound') { if (!safeId(writeId) || writes.has(writeId)) return null; writes.add(writeId); capturedWrite = writeId } else if (writeId !== null) return null
-    ids.add(id); tags.add(nonceTag); result.push({ id, nonceTag, state, writeId: capturedWrite, targetKind, additions, updates, removals })
+    ids.add(id); tags.add(nonceTag); result.push({ id, nonceTag, state, writeId: capturedWrite, targetKind, additions, updates, removals, ...(management ? { management } : {}) })
   }
   return result
 }
-function sameShape(a: { targetKind: string; additions: number; updates: number; removals: number }, b: { targetKind: string; additions: number; updates: number; removals: number }): boolean { return a.targetKind === b.targetKind && a.additions === b.additions && a.updates === b.updates && a.removals === b.removals }
+function sameShape(a: { targetKind: string; additions: number; updates: number; removals: number; management?: GroupManagementSummary }, b: { targetKind: string; additions: number; updates: number; removals: number; management?: GroupManagementSummary }): boolean { return a.targetKind === b.targetKind && a.additions === b.additions && a.updates === b.updates && a.removals === b.removals && a.management?.operation === b.management?.operation && a.management?.properties === b.management?.properties }
 export function relationSnapshot(intents: unknown, writes: unknown): RelationSnapshot | null {
   const prepared = relationIntentRows(intents); const results = relationHistoryRows(writes); if (!prepared || !results) return null
   for (const row of prepared) { if (row.state !== 'bound') continue; const result = results.find((item) => item.id === row.writeId); if (!result || !sameShape(row, result)) return null }
@@ -94,15 +95,16 @@ export function relationSnapshot(intents: unknown, writes: unknown): RelationSna
 export function relationSnapshotClear(value: RelationSnapshot): boolean { return !value.intents.some((row) => row.state === 'preparing') && !value.writes.some((row) => row.state === 'uncertain') }
 export function relationMarker(value: unknown): RelationLocalMarker | null {
   const fields = ['version', 'intentTag', 'writeTag', 'revision', 'afterIntent', 'afterWrite', 'target', 'additions', 'updates', 'removals']
-  if (!object(value) || !keys(value, fields, fields)) return null
+  if (!object(value) || !keys(value, [...fields, 'management'], fields)) return null
+  const management = own(value, 'management') === undefined ? undefined : managementSummary(own(value, 'management')); if (management === null) return null
   const version = own(value, 'version'); const intentTag = own(value, 'intentTag'); const writeTag = own(value, 'writeTag'); const revision = own(value, 'revision'); const afterIntent = own(value, 'afterIntent'); const afterWrite = own(value, 'afterWrite'); const target = own(value, 'target'); const additions = own(value, 'additions'); const updates = own(value, 'updates'); const removals = own(value, 'removals')
-  if (version !== 1 || !tag(intentTag) || !tag(writeTag) || !safeId(revision) || typeof afterIntent !== 'number' || !Number.isSafeInteger(afterIntent) || afterIntent < 0 || typeof afterWrite !== 'number' || !Number.isSafeInteger(afterWrite) || afterWrite < 0 || target !== 'buddy' && target !== 'group' || !counter(additions) || !counter(updates) || !counter(removals) || additions + updates + removals === 0) return null
-  return { version, intentTag, writeTag, revision, afterIntent, afterWrite, target, additions, updates, removals }
+  if (version !== 1 || !tag(intentTag) || !tag(writeTag) || !safeId(revision) || typeof afterIntent !== 'number' || !Number.isSafeInteger(afterIntent) || afterIntent < 0 || typeof afterWrite !== 'number' || !Number.isSafeInteger(afterWrite) || afterWrite < 0 || target !== 'buddy' && target !== 'group' || !counter(additions) || !counter(updates) || !counter(removals) || (management ? target !== 'group' || additions + updates + removals !== 0 : additions + updates + removals === 0)) return null
+  return { version, intentTag, writeTag, revision, afterIntent, afterWrite, target, additions, updates, removals, ...(management ? { management } : {}) }
 }
 export function relationMarkerResolved(marker: RelationLocalMarker, snapshot: RelationSnapshot): boolean {
   if (!relationSnapshotClear(snapshot)) return false
   const intent = snapshot.intents.find((row) => row.nonceTag === marker.intentTag && row.id > marker.afterIntent)
-  const expected = { targetKind: marker.target, additions: marker.additions, updates: marker.updates, removals: marker.removals }
+  const expected = { targetKind: marker.target, additions: marker.additions, updates: marker.updates, removals: marker.removals, ...(marker.management ? { management: marker.management } : {}) }
   if (!intent || !sameShape(intent, expected)) return false
   if (intent.state === 'not_sent') return intent.writeId === null
   if (intent.state !== 'bound') return false

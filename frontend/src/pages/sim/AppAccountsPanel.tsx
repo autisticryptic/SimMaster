@@ -16,6 +16,7 @@ import AppOrgRelationEventsPane from './AppOrgRelationEventsPane'
 import AppRelationRosterPane from './AppRelationRosterPane'
 import AppBuddyRelationCheckPane from './AppBuddyRelationCheckPane'
 import AppRelationWritePane from './AppRelationWritePane'
+import AppGroupManagementPane from './AppGroupManagementPane'
 import JegotripConfigurationDialog from './JegotripConfigurationDialog'
 import { appBusinessLabel, appLoginError, appLoginPhase } from '../../policies/appLogin'
 
@@ -108,6 +109,7 @@ export default function AppAccountsPanel({ onLogin, refreshKey = 0 }: { onLogin:
                 <AppOrgRelationEventsPane lineId={account.line_id} revision={account.revision} />
                 <AppBuddyRelationCheckPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.buddy_relation_check_supported === true} />
                 <AppRelationRosterPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.relation_roster_supported === true} />
+                <AppGroupManagementPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.group_management_supported === true} />
                 <AppRelationWritePane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.relation_updates_supported === true} />
                 <AppUserEntryPane lineId={account.line_id} revision={account.revision} hosted={account.phase === 'hosted'} installed={account.user_entry_supported === true || account.user_entry_uid_local_supported === true} localOnly={account.user_entry_supported !== true} />
                 <AppImReceiptsPane lineId={account.line_id} />
