@@ -75,7 +75,7 @@ impl ImRequest{
         if call_id<=0||Instant::now()>=deadline||!gate.live()||!binding.matches(binding.owner(),&binding.scope())||query.directory_query()&&!binding.directory_queries()||!query.directory_input_matches(&binding.scope())||!budget.belongs_to(&binding.scope()){return Err(CodecError::InvalidField);}
         Ok(Arc::new(Self{binding,query,gate,deadline,call_id,budget}))
     }
-    pub(super) fn active(&self)->bool{self.gate.live()&&Instant::now()<self.deadline&&self.binding.matches(self.binding.owner(),&self.binding.scope())&&self.query.buddy_context_current(self.binding.owner(),&self.binding.scope(),&self.gate)}
+    pub(super) fn active(&self)->bool{self.gate.live()&&Instant::now()<self.deadline&&self.binding.matches(self.binding.owner(),&self.binding.scope())&&self.query.buddy_context_current(self.binding.owner(),&self.binding.scope(),&self.gate)&&(!self.query.buddy_check_query()||self.gate.live()&&Instant::now()<self.deadline&&self.binding.matches(self.binding.owner(),&self.binding.scope()))}
     pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{self.active()&&self.binding.matches(owner,scope)}
     pub(super) fn call_id(&self)->i32{self.call_id}
     pub(super) fn deadline(&self)->Instant{self.deadline}

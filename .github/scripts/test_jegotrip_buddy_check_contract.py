@@ -10,6 +10,9 @@ class BuddyCheckContracts(unittest.TestCase):
   s=src('arc_session.rs');self.assertIn('if self.phase()!=ArcPhase::Authenticated||!request.matches(owner,connection){return Ok(None);}',s)
   t=src('buddy_relation_check_tests.rs').split('fn buddy_check_same_revision_configuration_change',1)[1].split('#[test]',1)[0]
   self.assertIn('unwrap().is_empty()',t);self.assertIn('assert!(f.scope.is_open())',t);self.assertIn('take_im_replies().is_empty()',t)
+ def test_sql_wait_does_not_extend_shorter_actual_rpc_deadline(self):
+  s=src('rpc_im.rs').split('fn active(&self)',1)[1].split('fn matches(',1)[0];self.assertIn('buddy_context_current',s);self.assertGreater(s.rindex('Instant::now()<self.deadline'),s.index('buddy_context_current'))
+  t=src('buddy_relation_check_tests.rs');self.assertIn('buddy_check_packet_rechecks_shorter_actual_rpc_deadline_after_sql_lock_wait',t);self.assertIn('buddy_check_channel_retry_retains_original_holder_and_wait_drop_blocks_retransmit',t)
  def test_policy_is_independent_and_absent_preserves_legacy_serialization(self):
   s=src('account_config.rs');self.assertIn('pub buddy_relation_check:Option<',s);self.assertIn('with_buddy_relation_check(p.buddy_relation_check)',s)
   s=src('native_receiver.rs');self.assertIn('buddy_relation_check:false',s);self.assertIn('if self.buddy_relation_check||self.im_messages.is_none()',s)
