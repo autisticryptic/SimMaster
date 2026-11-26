@@ -4,6 +4,8 @@ import unittest
 R=Path(__file__).resolve().parents[2];P=R/'backend/src/connectivity/app_voice/providers/jegotrip'
 def src(n):return(P/n).read_text(encoding='utf-8')
 class GroupManagementContracts(unittest.TestCase):
+ def test_new_browser_fixture_exports_component_without_weakening_zero_warning_gate(self):
+  self.assertIn('export default function Fixture()',(R/'frontend/e2e/fixtures/group-management.tsx').read_text(encoding='utf-8'));self.assertIn('eslint . --max-warnings 0',(R/'frontend/package.json').read_text(encoding='utf-8'))
  def test_original_methods_and_mapping_literals_are_not_membership_or_read_aliases(self):
   s=src('group_management.rs')
   for x in ['setProps.GroupServer.Group','disbandOrganize.GroupServer.Group','Group.Org.Name','Group.Org.Type','Group.Org.Notify','Group.Org.JoinAuth','Group.Org.PropsControl','DiscussionGroup','LargeGroup','LargeRoom']:self.assertIn(x,s)
