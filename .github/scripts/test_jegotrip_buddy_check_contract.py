@@ -4,6 +4,8 @@ import unittest
 R=Path(__file__).resolve().parents[2];P=R/'backend/src/connectivity/app_voice/providers/jegotrip'
 def src(n):return(P/n).read_text(encoding='utf-8')
 class BuddyCheckContracts(unittest.TestCase):
+ def test_new_node_test_promises_are_explicit_without_changing_titles_or_assertions(self):
+  s=(R/'frontend/tests/buddyRelationCheck.test.ts').read_text(encoding='utf-8');self.assertEqual(s.count('\nvoid test('),5);self.assertNotIn('\ntest(',s)
  def test_policy_is_independent_and_absent_preserves_legacy_serialization(self):
   s=src('account_config.rs');self.assertIn('pub buddy_relation_check:Option<',s);self.assertIn('with_buddy_relation_check(p.buddy_relation_check)',s)
   s=src('native_receiver.rs');self.assertIn('buddy_relation_check:false',s);self.assertIn('if self.buddy_relation_check||self.im_messages.is_none()',s)
