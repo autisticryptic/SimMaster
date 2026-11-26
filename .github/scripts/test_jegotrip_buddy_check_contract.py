@@ -6,6 +6,10 @@ def src(n):return(P/n).read_text(encoding='utf-8')
 class BuddyCheckContracts(unittest.TestCase):
  def test_new_node_test_promises_are_explicit_without_changing_titles_or_assertions(self):
   s=(R/'frontend/tests/buddyRelationCheck.test.ts').read_text(encoding='utf-8');self.assertEqual(s.count('\nvoid test('),5);self.assertNotIn('\ntest(',s)
+ def test_stale_check_reply_preserves_original_read_discard_and_healthy_logout_contract(self):
+  s=src('arc_session.rs');self.assertIn('if self.phase()!=ArcPhase::Authenticated||!request.matches(owner,connection){return Ok(None);}',s)
+  t=src('buddy_relation_check_tests.rs').split('fn buddy_check_same_revision_configuration_change',1)[1].split('#[test]',1)[0]
+  self.assertIn('unwrap().is_empty()',t);self.assertIn('assert!(f.scope.is_open())',t);self.assertIn('take_im_replies().is_empty()',t)
  def test_policy_is_independent_and_absent_preserves_legacy_serialization(self):
   s=src('account_config.rs');self.assertIn('pub buddy_relation_check:Option<',s);self.assertIn('with_buddy_relation_check(p.buddy_relation_check)',s)
   s=src('native_receiver.rs');self.assertIn('buddy_relation_check:false',s);self.assertIn('if self.buddy_relation_check||self.im_messages.is_none()',s)
