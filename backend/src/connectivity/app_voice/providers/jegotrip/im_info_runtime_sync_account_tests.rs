@@ -1,6 +1,68 @@
 //! Actions-only original Hosted consumer: Info recv, ordering, SQL and joins.
 use super::*;
 use super::super::info::{BODY,info_packet,no_write_markers,private_view};
+// Only this module's stop/late-Info case calls hosting_call directly. Normal
+// login_host and finish_account keep their original immediate-result peers.
+// A peer write does not prove the actor processed its epoch ACK. Return the
+// status-3 result only on a later empty poll from the acknowledged epoch.
+async fn hosting_call(peer: &mut CommonPeer) -> (Vec<u8>, Vec<u8>) {
+    Box::pin(unhost_after_epoch_ack(peer)).await
+}
+fn stop_poll(packet: &[u8]) -> (n::rpc_envelope::RpcRequest<'_>, n::rpc_batch::BatchPayload<'_>) {
+    assert_eq!(packet.first(), Some(&0));
+    let request = decode_request(&packet[1..]).unwrap();
+    assert_eq!(request.method, n::rpc_batch::SWAP_CALLS_METHOD.as_bytes());
+    let mut args = Reader::versioned(request.arguments).unwrap();
+    assert_eq!(args.bytes().unwrap(), b"fixture-user");
+    assert_eq!(args.bytes().unwrap(), b"fixture-original-selector");
+    let batch = n::rpc_batch::read_payload(&mut args).unwrap();
+    args.finish().unwrap();
+    assert!(batch.results.is_empty(), "no Info completion during stop");
+    (request, batch)
+}
+fn retained_status(original: &n::rpc_envelope::RpcRequest<'_>, next: &n::rpc_envelope::RpcRequest<'_>) -> bool {
+    // Only the outer id changes. Equality includes the epoch words and every
+    // byte of the nested sequence, route, arguments, and both maps.
+    next.call_id > original.call_id && next.method == original.method
+        && next.metadata == original.metadata && next.arguments == original.arguments
+}
+async fn unhost_after_epoch_ack(peer: &mut CommonPeer) -> (Vec<u8>, Vec<u8>) {
+    let first = loop {
+        let packet = peer.next().await.unwrap();
+        let (request, batch) = stop_poll(&packet);
+        if !batch.requests.is_empty() { drop((request, batch)); break packet; }
+        peer.send(&[reply(request.call_id, &n::runtime_backend::tests::swap_result(None, true, batch.fields))]).await;
+    };
+    let (original, batch) = stop_poll(&first);
+    assert_eq!(batch.requests.len(), 1);
+    let (&sequence, nested) = batch.requests.first_key_value().unwrap();
+    assert!(sequence > 0 && batch.fields[2] == 1);
+    assert_eq!(nested.method, n::rpc_arguments::UPDATE_STATUS_METHOD.as_bytes());
+    assert_eq!(nested.metadata.iter().find(|p| p.key == b"id").unwrap().value, n::rpc_arguments::DEFAULT_GATEWAY_OBJECT.as_bytes());
+    let mut args = Reader::versioned(nested.arguments).unwrap();
+    let uri = args.bytes().unwrap().to_vec();
+    let flag = args.properties().unwrap().iter().find(|p| p.key == b"SipFlag").unwrap().value.to_vec();
+    args.finish().unwrap();
+    assert_eq!(flag, b"3");
+    peer.send(&[reply(original.call_id, &n::runtime_backend::tests::swap_result(None, true, batch.fields))]).await;
+    let mut last = original.call_id;
+    loop {
+        let packet = peer.next().await.unwrap();
+        let (next, poll) = stop_poll(&packet);
+        assert!(next.call_id > last && next.metadata == original.metadata);
+        last = next.call_id;
+        if !poll.requests.is_empty() {
+            assert!(retained_status(&original, &next), "new work is not a retained unregister");
+            peer.send(&[reply(last, &n::runtime_backend::tests::swap_result(None, true, poll.fields))]).await;
+            continue;
+        }
+        assert_eq!(poll.fields[..3], [batch.fields[0], batch.fields[1], 0]);
+        peer.send(&[reply(last, &n::runtime_backend::tests::swap_result(Some(sequence), true, poll.fields))]).await;
+        return (uri, flag);
+    }
+}
+#[path="im_info_stop_poll_fixture_tests.rs"]
+mod poll_fence;
 fn info_config(root:&str,port:u16,timeout:u64)->AccountConfig{let mut c=config(root,port,timeout);c.profile.native_receivers.as_mut().unwrap().im_messages.as_mut().unwrap().receive_info=true;c}
 fn mixed_records(rows:&[(i64,&[u8],&[u8])])->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.u32(rows.len()as u32).unwrap();for(index,kind,body)in rows{w.i64(*index).unwrap();w.i64(1234567890123).unwrap();w.bytes(b"fixture-private-uid").unwrap();w.bytes(kind).unwrap();w.bytes(body).unwrap();w.properties(&[RpcProperty{key:b"../never-written",value:b"attachment-bytes"}]).unwrap();w.properties(&[]).unwrap();}w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}
 async fn mixed(mode:u8){

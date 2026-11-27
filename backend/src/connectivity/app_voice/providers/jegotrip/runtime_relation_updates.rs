@@ -44,6 +44,21 @@ impl NativeHostingBackend{
     }
     pub(in super::super) fn group_management_enabled(&self)->bool{self.profile.group_management.is_some()&&self.im_messages_enabled()}
     pub(in super::super) fn relation_update_timeout(&self)->Duration{self.profile.rpc_timeout}
+    // Fixture-only: take the very same admission mutex as both poll producers.
+    // Any poll submitted before this returns precedes the fixture's next direct
+    // call on this actor. Do not hold the mutex while the peer waits for EOF.
+    #[cfg(test)]
+    pub(in super::super) async fn pause_create_fixture_polls(&self, owner: &AttemptOwner, scope: &RpcConnectionScope) -> Result<(), RuntimeError> {
+        let attempt = self.original(owner).map_err(|_| RuntimeError::Scope)?;
+        let _admission = attempt.poll_work.lock().await;
+        let mut state = lock(&attempt.state);
+        if !attempt.scope.matches(scope) || !scope.is_open() || scope.session_revoked()
+            || !state.configured || state.retired || state.logout_started || state.unregister_started {
+            return Err(RuntimeError::Scope);
+        }
+        state.polls_paused = true;
+        Ok(())
+    }
     #[cfg(test)]
     pub(in super::super) fn relation_resources_for_test(&self)->Option<(usize,usize)>{lock(&self.state).slot.as_ref().map(|a|a.scope.native_rpc_resources())}
     pub(in super::super) fn reserve_relation_http_scratch(&self,bytes:usize)->Result<(RpcConnectionScope,Arc<super::super::native_rpc_budget::NativeRpcReservation>),&'static str>{

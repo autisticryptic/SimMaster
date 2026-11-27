@@ -6,6 +6,12 @@ use crate::connectivity::app_voice::providers::jegotrip as n;
 pub(crate) struct GroupCreateView{pub write:RelationWriteView,pub properties_read:n::group_create_read::PropertiesReadView}
 impl std::fmt::Debug for GroupCreateView{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str("GroupCreateView(<redacted>)")}}
 pub(crate) struct PreparedGroupCreate{write:PreparedRelationUpdate,read_properties:bool}
+#[cfg(test)]
+impl PreparedGroupCreate {
+    pub(crate) async fn pause_polls_before_fault(&self) {
+        self.write.run.backend.pause_create_fixture_polls(&self.write.owner, &self.write.scope).await.unwrap();
+    }
+}
 impl std::fmt::Debug for PreparedGroupCreate{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str("PreparedGroupCreate(<redacted>)")}}
 impl AccountManager{
  pub(crate) fn reserve_group_create_http_scratch(&self,line:&str,revision:u64,bytes:usize,consent:bool,write_consent:bool)->Result<RelationHttpScratch,&'static str>{

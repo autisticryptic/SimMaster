@@ -10,6 +10,27 @@ class OwnerOnlyContract(unittest.TestCase):
     def test_new_common_fixture_disables_only_unused_inner_sni_and_preserves_router_checks(self):
         s=src('group_owner_only_test_support.rs');self.assertIn('p["authority"]=serde_json::json!("");p["enable_sni"]=serde_json::json!(false);',s)
         self.assertIn('"authority":"127.0.0.1","root_der_base64":root',s);self.assertIn('!p.authority.expose_to_backend().is_empty()||p.enable_sni||self.bootstrap.is_some()',src('account_config.rs'))
+    def test_fault_injection_pauses_only_original_poll_admission_before_create(self):
+        fixture = src('group_create_account_tests.rs')
+        self.assertLess(fixture.index('bounded(p.pause_polls_before_fault())'), fixture.index('manager.finish_group_create(p)'))
+        self.assertIn('if read_mode==2{bounded(p.pause_polls_before_fault()).await;}', fixture)
+        self.assertIn('while let Some(raw)=p.next_input_only().await{assert!(matches!(raw.as_slice(),[2]|[14]|[4]));}', fixture)
+        self.assertIn('#[cfg(test)]\nimpl PreparedGroupCreate', src('account_group_create.rs'))
+        impl = src('runtime_relation_updates.rs').split('fn pause_create_fixture_polls(', 1)[1].split('fn relation_resources_for_test', 1)[0]
+        self.assertLess(impl.index('attempt.poll_work.lock().await'), impl.index('state.polls_paused = true'))
+        self.assertIn('attempt.scope.matches(scope)', impl)
+        self.assertNotIn('commands.', impl)
+
+    def test_info_stop_fixture_separates_epoch_ack_from_semantic_result(self):
+        fixture = src('im_info_runtime_sync_account_tests.rs')
+        self.assertIn('#[path="im_info_stop_poll_fixture_tests.rs"]\nmod poll_fence;', fixture)
+        s = fixture.split('async fn unhost_after_epoch_ack(', 1)[1].split('#[path=', 1)[0]
+        self.assertLess(s.index('swap_result(None, true, batch.fields)', s.index('assert_eq!(flag, b"3")')), s.index('retained_status(&original, &next)'))
+        self.assertLess(s.index('assert_eq!(poll.fields[..3]'), s.index('swap_result(Some(sequence), true, poll.fields)'))
+        self.assertEqual(s.count('Some(sequence)'), 1)
+        self.assertIn('assert!(p.requests.is_empty(),"no extra hosting/business write")', src('im_sync_account_tests.rs'))
+        self.assertNotIn('sleep(', s)
+
     def test_opt_in_requires_existing_create_native_bootstrap_and_derived_uri(self):
         body=src('runtime_backend.rs').split('fn with_group_owner_only(',1)[1].split('fn with_group_management',1)[0]
         for word in ['let Some(config)=config else{return Ok(self);}','!config.from_session','self.group_creation.is_none()','self.common_bootstrap.is_none()','self.gateway_uri.is_some()']:self.assertIn(word,body)
