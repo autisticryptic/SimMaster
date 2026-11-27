@@ -7,6 +7,9 @@ R=Path(__file__).resolve().parents[2];P=R/'backend/src/connectivity/app_voice/pr
 def src(name):return (P/name).read_text(encoding='utf-8')
 
 class OwnerOnlyContract(unittest.TestCase):
+    def test_new_common_fixture_disables_only_unused_inner_sni_and_preserves_router_checks(self):
+        s=src('group_owner_only_test_support.rs');self.assertIn('p["authority"]=serde_json::json!("");p["enable_sni"]=serde_json::json!(false);',s)
+        self.assertIn('"authority":"127.0.0.1","root_der_base64":root',s);self.assertIn('!p.authority.expose_to_backend().is_empty()||p.enable_sni||self.bootstrap.is_some()',src('account_config.rs'))
     def test_opt_in_requires_existing_create_native_bootstrap_and_derived_uri(self):
         body=src('runtime_backend.rs').split('fn with_group_owner_only(',1)[1].split('fn with_group_management',1)[0]
         for word in ['let Some(config)=config else{return Ok(self);}','!config.from_session','self.group_creation.is_none()','self.common_bootstrap.is_none()','self.gateway_uri.is_some()']:self.assertIn(word,body)
