@@ -1,4 +1,6 @@
 //! Actions-only explicit-owner create protocol, shared journal and READ brands.
+#[path="group_owner_only_tests.rs"]
+mod owner_only;
 use super::*;
 use n::{group_create::{self as create,NativeGroupCreateConfig as CPolicy},group_management::{PublicProperty,PropertyValue},group_create_store,relation_journal::{RelationIntent,IntentAdmission,RelationConfiguration},rpc_im::ImQuery};
 const GROUP:&[u8]=b"811111111-922222222";

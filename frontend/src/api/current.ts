@@ -415,6 +415,7 @@ export interface AppAccountView {
   group_management_supported?: boolean
   group_creation_supported?: boolean
   group_creation_properties_supported?: boolean
+  group_owner_only_supported?: boolean
   relation_events_supported?: boolean
   relation_roster_supported?: boolean
   buddy_relation_check_supported?: boolean
@@ -1165,6 +1166,9 @@ class SimAdminCurrentAPI {
   }
   async getAppRelationIntents(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/relation-intents?limit=128`, { cache: 'no-store', timeoutMs: 10000 })
+  }
+  async createOwnerOnlyGroup(lineId: string, body: import('../policies/groupOwnerOnly').OwnerOnlyBody) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/groups/create/owner-only`, { method: 'POST', body: JSON.stringify(body), cache: 'no-store', timeoutMs: 10000, skipAuthRedirect: true })
   }
   async createAppGroup(lineId: string, body: import('../policies/groupCreate').GroupCreateBody) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/groups/create`, { method: 'POST', body: JSON.stringify(body), cache: 'no-store', timeoutMs: 10000, skipAuthRedirect: true })

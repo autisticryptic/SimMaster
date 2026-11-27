@@ -23,6 +23,8 @@ mod relation_updates;
 mod group_management;
 #[path="app_voice_group_create.rs"]
 mod group_creation;
+#[path="app_voice_group_owner_only.rs"]
+mod group_owner_only;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateAccountRequest { provider_id: String, config: AccountConfig }
@@ -129,6 +131,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/relation-writes",get(relation_updates::relation_history).post(relation_updates::update_relations))
         .route("/api/non-3gpp/accounts/{line_id}/group-management",post(group_management::write_group))
         .route("/api/non-3gpp/accounts/{line_id}/groups/create",post(group_creation::create_group))
+        .route("/api/non-3gpp/accounts/{line_id}/groups/create/owner-only",post(group_owner_only::create))
         .route("/api/non-3gpp/accounts/{line_id}/relation-intents",get(relation_updates::intent_history))
         .route("/api/non-3gpp/accounts/{line_id}/relation-events",get(relation_updates::event_history))
         .route("/api/non-3gpp/accounts/{line_id}/org-relation-events",get(relation_updates::org_event_history))
@@ -202,7 +205,7 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_buddy_check_consent_required" | "app_account_buddy_check_not_installed" => StatusCode::FORBIDDEN,
         "app_account_buddy_check_request_invalid" => StatusCode::BAD_REQUEST,
         "app_account_group_create_invalid" => StatusCode::BAD_REQUEST,
-        "app_account_group_create_not_installed" => StatusCode::FORBIDDEN,
+        "app_account_group_create_not_installed" | "app_account_group_owner_only_not_installed" => StatusCode::FORBIDDEN,
         "app_account_group_create_owner_mismatch" => StatusCode::CONFLICT,
         "app_account_group_management_invalid" => StatusCode::BAD_REQUEST,
         "app_account_group_management_not_installed" => StatusCode::FORBIDDEN,

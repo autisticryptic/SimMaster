@@ -1,4 +1,6 @@
 //! Actions-only real create/property-READ ciphertext, cancellation and FD Join.
+#[path="group_owner_only_io_tests.rs"]
+mod owner_only;
 use super::*;
 use n::{group_create::NativeGroupCreateConfig as CPolicy,relation_journal::{RelationIntent,IntentAdmission,RelationConfiguration},group_create_store};
 const GROUP:&[u8]=b"811111111-922222222";

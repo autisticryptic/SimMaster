@@ -6,7 +6,7 @@ impl ArcRpcSession{
         if !self.native_receiver_scope()||!binding.matches(&self.owner,&self.connection)||!Arc::ptr_eq(&binding,permit.binding())||!permit.matches(&self.owner,&self.connection)||std::time::Instant::now()>=deadline.min(permit.deadline()){return Err(CodecError::InvalidField);}
         if self.pending.len()>=MAX_MAP_ENTRIES||self.im_reply_count()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
         let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
-        if !binding.authenticates(&auth.user_id,&auth.selected_session_id){return Err(CodecError::InvalidField);}
+        if !binding.authenticates(&auth.user_id,&auth.selected_session_id)||!permit.matches_session_uri(self.login_uri.as_ref().map(|v|v.as_slice())){return Err(CodecError::InvalidField);}
         let id=self.next_id.ok_or(CodecError::InvalidCallId)?;
         let(request,bytes)=rpc_relation_update::encode_original(permit,id,&self.owner,&self.connection,&auth.token,deadline)?;
         self.next_id=id.checked_add(1);self.relation_requests.insert(id,request);

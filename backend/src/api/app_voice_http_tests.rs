@@ -56,6 +56,7 @@ mod app_voice_accounts {
     include!("app_voice_buddy_check_http_tests.rs");
     include!("app_voice_group_management_http_tests.rs");
     include!("app_voice_group_create_http_tests.rs");
+    include!("app_voice_group_owner_only_http_tests.rs");
 
     #[tokio::test]
     async fn push_status_is_authenticated_read_only_and_reports_unconfigured_receivers_without_secret_export() {

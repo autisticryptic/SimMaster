@@ -1,0 +1,47 @@
+//! Actions-only fixtures. All keys, IDs, databases and peers are synthetic.
+use super::{account_test_support, arc_session::{ArcReply,ArcRpcSession}, common_runtime::tests::CommonPeer,
+    rpc_envelope::{encode_reply,decode_request}, rpc_stream::{Reader,Writer,RpcProperty},rpc_batch,rpc_arguments,
+    router_connector::RouterPolicy,rpc_pending::RpcConnectionScope,session::AttemptOwner,user_entry_local::UserEntryLocalReference};
+use crate::platform::db::Database;
+use std::{sync::Arc,time::Duration};
+use tokio::{net::TcpListener,sync::oneshot};
+use tokio_rustls::rustls::ServerConfig;
+pub(crate) const UID:&[u8]=b"711111111_822222222";
+pub(crate) const GROUP:&[u8]=b"811111111-922222222";
+const URI:&[u8]=b"[username:fixture-account@account-domain.invalid]";
+pub(crate) fn account_json(root:&str,port:u16)->serde_json::Value {
+    let mut c=account_test_support::config_json(root);c["credentials"]["sdk"]["server_address"]=serde_json::json!("BootEntry:sarc -h 42.7 -p 98;");let p=&mut c["profile"];
+    p["route"]=serde_json::json!({"router_common":{"reference":format!("Router:tls -h 127.0.0.1 -p {port} -ri 12001;"),"anchors":[{"router_id":12001,"host":"127.0.0.1","port":port,"authority":"127.0.0.1","root_der_base64":root,"enable_sni":false}],"access":[],"endpoint_index":0,"resolved_host_index":0,"startup_timeout_ms":5000,"attempt_timeout_ms":8000,"compress_above":null}});
+    for key in ["domain_name","domain_id","application_id","device_info_cc","incoming"]{p[key]=serde_json::Value::Null;}
+    p["authority"]=serde_json::json!("");p["gateway_uri"]=serde_json::json!("");p["gateway_metadata"]=serde_json::json!([]);p["bootstrap_via_router"]=serde_json::json!({"routing":[],"handoff_timeout_ms":10000});p["client_ex"]=serde_json::json!(true);p["native_receivers"]=serde_json::json!({"im_messages":{"notification_timeout_ms":3000}});
+    p["group_creation"]=serde_json::json!({"create":true,"read_properties":true});p["group_owner_only"]=serde_json::json!({"from_session":true});c
+}
+fn bootstrap(user_entry:&[u8])->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.properties(&[RpcProperty{key:b"DomainName",value:b"account-domain.invalid"},RpcProperty{key:b"DomainId",value:b"fixture-domain"},RpcProperty{key:b"AppId",value:b"fixture-app"},RpcProperty{key:b"CC",value:b"fixture-cc"}]).unwrap();w.bytes(b"DestEntry:sarc -h 42.7 -p 98;").unwrap();w.bytes(b"").unwrap();w.bytes(user_entry).unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}
+pub(super) fn reference(who:&AttemptOwner,scope:&RpcConnectionScope,router:&RouterPolicy)->Arc<UserEntryLocalReference>{
+    let mut boot=ArcRpcSession::new(who.clone());let src=boot.connection_scope();let(id,_)=boot.prepare_bootstrap(b"fixture-key",&[]).unwrap();let wire=encode_reply(id,0,&bootstrap(b"UserEntry")).unwrap();let Some(ArcReply::Bootstrap(result))=boot.on_reply(who,&src,wire.expose_to_transport()).unwrap()else{panic!("original bootstrap")};let r=UserEntryLocalReference::from_bootstrap(&result,who,&src,scope,router,None).unwrap().unwrap();boot.close();r
+}
+pub(crate) fn login_result()->Vec<u8>{let mut w=Writer::new();w.boolean(true).unwrap();w.bytes(UID).unwrap();w.bytes(b"fixture-auth").unwrap();w.properties(&[RpcProperty{key:b"mainAccount",value:b"not-the-owner-first"}]).unwrap();w.bytes(b"").unwrap();w.finish().expose_to_transport().to_vec()}
+fn reply(id:i32,stream:&[u8])->Vec<u8>{let e=encode_reply(id,0,stream).unwrap();let mut p=vec![1];p.extend_from_slice(e.expose_to_transport());p}
+#[derive(Clone,Copy,PartialEq,Eq)]pub(crate) enum Flow{ConfirmRead,ConfirmOnly,Reject,NoReference,NoWrite}
+async fn swap(peer:&mut CommonPeer,p:&[u8],phase:Option<&[u8]>,known:&mut[Option<i32>;2])->bool{
+    let req=decode_request(&p[1..]).unwrap();assert_eq!(req.method,rpc_batch::SWAP_CALLS_METHOD.as_bytes());let mut r=Reader::versioned(req.arguments).unwrap();assert_eq!(r.bytes().unwrap(),UID);assert_eq!(r.bytes().unwrap(),b"fixture-original-selector");let data=rpc_batch::read_payload(&mut r).unwrap();let mut seq=None;let mut found=false;
+    for(id,nested)in &data.requests{assert_eq!(nested.method,rpc_arguments::UPDATE_STATUS_METHOD.as_bytes());assert!(nested.metadata.iter().any(|p|p.key==b"id"&&p.value==rpc_arguments::DEFAULT_GATEWAY_OBJECT.as_bytes()));let mut args=Reader::versioned(nested.arguments).unwrap();assert_eq!(args.bytes().unwrap(),URI);let fields=args.properties().unwrap();let flag=fields.iter().find(|p|p.key==b"SipFlag").unwrap().value;let slot=match flag{b"4"=>0,b"3"=>1,_=>panic!("unexpected nested business")};if let Some(previous)=known[slot]{assert_eq!(previous,*id);}else{assert_eq!(Some(flag),phase);known[slot]=Some(*id);}found|=Some(flag)==phase;seq=Some(*id);}
+    peer.send(&[reply(req.call_id,&super::runtime_backend::tests::swap_result(seq,true,data.fields))]).await;found
+}
+async fn group_call(p:&mut CommonPeer,known:&mut[Option<i32>;2],method:&[u8])->Vec<u8>{loop{let raw=p.next().await.unwrap();assert_eq!(raw[0],0);let req=decode_request(&raw[1..]).unwrap();if req.method==rpc_batch::SWAP_CALLS_METHOD.as_bytes(){assert!(!swap(p,&raw,None,known).await);continue;}assert_eq!(req.method,method);assert_eq!(req.metadata.len(),2);assert!(req.metadata.iter().any(|f|f.key==b"id"&&f.value==b"#Group"));assert!(req.metadata.iter().any(|f|f.key==b"token"&&f.value==b"fixture-auth"));return raw;}}
+pub(crate) async fn serve(listener:TcpListener,server:Arc<ServerConfig>,db:Arc<Database>,line:String,flow:Flow,mut finish:oneshot::Receiver<()>) {
+    tokio::time::timeout(Duration::from_secs(12),Box::pin(async move{
+        // Both connections use the same original physical Router. Retain a
+        // nonblocking listener to prove no third (resolver) connection arrived.
+        let raw=listener.into_std().unwrap();let boot=TcpListener::from_std(raw.try_clone().unwrap()).unwrap();let sdk=TcpListener::from_std(raw.try_clone().unwrap()).unwrap();
+        let mut source=CommonPeer::open(boot,server.clone()).await;let p=source.next().await.unwrap();let r=decode_request(&p[1..]).unwrap();assert_eq!(r.method,b"getAppConfigs.AccountEntry.Account");let reference=if flow==Flow::NoReference{b"".as_slice()}else{b"UserEntry".as_slice()};source.send(&[reply(r.call_id,&bootstrap(reference))]).await;
+        let main=async move{let mut peer=CommonPeer::open(sdk,server).await;let p=peer.next().await.unwrap();let req=decode_request(&p[1..]).unwrap();assert_eq!(req.method,b"loginSession.AccountEntry.Account");let mut a=Reader::versioned(req.arguments).unwrap();assert_eq!(a.bytes().unwrap(),URI);peer.send(&[reply(req.call_id,&login_result())]).await;
+            let mut known=[None,None];loop{let p=peer.next().await.unwrap();if swap(&mut peer,&p,Some(b"4"),&mut known).await{break;}}
+            if !matches!(flow,Flow::NoReference|Flow::NoWrite){let p=group_call(&mut peer,&mut known,b"createOrganize.GroupServer.Group").await;let req=decode_request(&p[1..]).unwrap();let mut a=Reader::versioned(req.arguments).unwrap();assert_eq!(a.u32().unwrap(),1);assert_eq!(a.bytes().unwrap(),UID);assert_eq!(a.u32().unwrap(),0);assert_eq!(a.bytes().unwrap(),b"fixture-account");assert_eq!(a.bytes().unwrap(),b"");assert!(a.properties().unwrap().is_empty());let props=a.properties().unwrap();assert_eq!(props.len(),2);assert!(props.iter().any(|p|p.key==b"Group.Org.Name"&&p.value==b"private-single-group"));a.finish().unwrap();
+                let state=||db.with_conn(|c|c.query_row("SELECT w.state,d.initial_members,d.owner_only,d.owner_only_hash=d.body_hash FROM app_voice_relation_writes w JOIN app_voice_group_creations d ON d.write_id=w.id WHERE w.line_id=?1 AND w.request_id=?2",rusqlite::params![line,req.call_id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?))).map_err(|_|"fixture")).unwrap();assert_eq!(state(),(0,1,1,1));let mut w=Writer::new();w.boolean(flow!=Flow::Reject).unwrap();w.bytes(GROUP).unwrap();w.u32(0).unwrap();w.bytes(b"private-result").unwrap();w.bytes(b"").unwrap();w.properties(&[]).unwrap();w.i64(-7).unwrap();w.i64(12).unwrap();w.bytes(b"").unwrap();peer.send(&[reply(req.call_id,w.finish().expose_to_transport())]).await;
+                if flow==Flow::ConfirmRead{let p=group_call(&mut peer,&mut known,b"getPropsPrefixs.GroupServer.Group").await;let read=decode_request(&p[1..]).unwrap();assert_ne!(read.call_id,req.call_id);let mut a=Reader::versioned(read.arguments).unwrap();assert_eq!(a.bytes().unwrap(),GROUP);assert_eq!(a.u32().unwrap(),1);assert_eq!(a.bytes().unwrap(),b"");a.finish().unwrap();assert_eq!(state(),(1,1,1,1));let mut w=Writer::new();w.boolean(true).unwrap();w.properties(&[]).unwrap();w.bytes(b"").unwrap();peer.send(&[reply(read.call_id,w.finish().expose_to_transport())]).await;}
+            }
+            loop{tokio::select!{biased;r=&mut finish=>{r.unwrap();break;},p=peer.next()=>assert!(!swap(&mut peer,&p.unwrap(),None,&mut known).await)}}loop{let p=peer.next().await.unwrap();if swap(&mut peer,&p,Some(b"3"),&mut known).await{break;}}loop{let p=peer.next().await.unwrap();let r=decode_request(&p[1..]).unwrap();if r.method==b"logoutSession.AccountEntry.Account"{peer.send(&[reply(r.call_id,&[0,1,0,0,0,0])]).await;break;}assert!(!swap(&mut peer,&p,None,&mut known).await);}while let Some(p)=peer.next_input_only().await{assert!(matches!(p.as_slice(),[2]|[14]|[4]));}
+        };tokio::join!(Box::pin(source.no_more_common()),Box::pin(main));assert_eq!(raw.accept().unwrap_err().kind(),std::io::ErrorKind::WouldBlock);
+    })).await.expect("original Actions-only owner group peer deadline");
+}

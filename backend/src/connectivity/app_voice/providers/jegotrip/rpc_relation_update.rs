@@ -30,7 +30,7 @@ impl fmt::Debug for OwnedRelationReply{fn fmt(&self,f:&mut fmt::Formatter<'_>)->
 impl OwnedRelationReply{
     pub(super) fn original(request:Arc<RelationRpcRequest>,owner:&AttemptOwner,scope:&RpcConnectionScope,code:u32,bytes:&[u8])->Result<Self,CodecError>{
         if !request.matches(owner,scope)||Instant::now()>=request.permit.deadline(){return Err(CodecError::InvalidField);}
-        let created=if request.permit.management_operation()==Some(super::group_management::GroupWriteOperation::Create){Some(super::group_create::decode(scope,code,bytes)?)}else{None};
+        let created=if request.permit.management_operation().is_some_and(|op|op.is_create()){Some(super::group_create::decode(scope,code,bytes)?)}else{None};
         let(accepted,base_time,update_time)=if let Some(data)=&created{(data.accepted,Some(data.base),Some(data.update))}else if let Some(op)=request.permit.management_operation(){let data=super::group_management::decode(scope,op,code,bytes)?;(data.accepted,data.base,data.update)}else{let data=group_relation_updates::decode_updates(code,bytes)?;(data.accepted,Some(data.base_time),Some(data.update_time))};
         request.budget.retain_reply(bytes.len().checked_add(96).ok_or(CodecError::TooLarge)?)?;
         Ok(Self{request,code,accepted,base_time,update_time,raw:Zeroizing::new(bytes.to_vec()),created})

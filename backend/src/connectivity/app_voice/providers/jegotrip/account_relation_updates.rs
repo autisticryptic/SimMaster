@@ -81,7 +81,7 @@ impl AccountManager{
         run.database.with_conn(|c|configuration.require_current(c,run.run_token.line_id(),run.run_token.revision(),&scope))?;
         if controller.phase()!=Phase::Hosted||controller.resource_owner().as_ref()!=Some(&owner)||!run.backend.original_scope(&owner).is_some_and(|s|s.matches(&scope))||!run.accepting.load(Ordering::SeqCst)||run.stopping.load(Ordering::SeqCst)||run.finalized.load(Ordering::SeqCst)||!run.im_gate.live(){return Err("app_account_relation_scope_invalid");}
         drop(controller);
-        let creation=message.management_operation()==Some(super::super::group_management::GroupWriteOperation::Create);
+        let creation=message.management_operation().is_some_and(|op|op.is_create());
         let result=Box::pin(run.backend.update_relations(run.database.clone(),run.run_token.clone(),run.im_gate.clone(),owner,scope,message,deadline,configuration,intent)).await?;
         // A fresh create result has already committed on the original run. A
         // change after commit can veto its separate READ, not erase that WRITE.

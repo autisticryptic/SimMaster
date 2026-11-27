@@ -27,11 +27,11 @@ export function captureGroupCreateBody(value: unknown): GroupCreateBody | null {
   for (const raw of v.members) { if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null; const m = raw as Record<string, unknown>; const keys = ['uid', 'relation_type', 'first', 'second', 'properties']; if (Reflect.ownKeys(m).length !== keys.length || !keys.every((k) => Object.hasOwn(m, k))) return null; members.push({ label: m.uid, relation_type: m.relation_type, first: m.first, second: m.second, properties: m.properties }) }
   try { return groupCreateBody(v.expected_revision, v.nonce, v.name, v.group_type, v.expected_owner_uid, JSON.stringify(members), JSON.stringify(v.properties), v.consent === true, v.write_consent === true, v.properties_read_consent) } catch { return null }
 }
-export function groupCreateOutcome(value: unknown): GroupCreateOutcome | null {
+export function groupCreateOutcome(value: unknown, operation: 'create' | 'create_owner_only' = 'create'): GroupCreateOutcome | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const v = value as Record<string, unknown>; const keys = Reflect.ownKeys(v)
   if (keys.length !== 2 || !keys.includes('write') || !keys.includes('properties_read')) return null
-  const write = relationHistoryRows([v.write])?.[0]; if (!write || write.management?.operation !== 'create') return null
+  const write = relationHistoryRows([v.write])?.[0]; if (!write || write.management?.operation !== operation) return null
   if (!v.properties_read || typeof v.properties_read !== 'object' || Array.isArray(v.properties_read)) return null
   const r = v.properties_read as Record<string, unknown>; const rk = Reflect.ownKeys(r); if (rk.length !== 3 || !['state', 'accepted', 'properties'].every((k) => rk.includes(k))) return null
   const state = r.state; if (state !== 'not_requested' && state !== 'not_attempted' && state !== 'unverified' && state !== 'observed' && state !== 'rejected') return null

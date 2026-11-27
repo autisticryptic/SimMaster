@@ -49,6 +49,7 @@ pub(crate) mod group_directory_data;
 pub(crate) mod group_relation_updates;
 pub(crate) mod group_management;
 pub(crate) mod group_create;
+pub(crate) mod group_owner_only;
 pub(super) mod group_create_store;
 pub(super) mod group_create_read;
 pub(super) mod group_management_store;
@@ -62,6 +63,8 @@ pub(crate) mod org_relation_inbox;
 pub(crate) mod relation_roster;
 pub(crate) mod relation_update_policy;
 pub(crate) mod relation_journal;
+#[cfg(test)]
+pub(crate) mod group_owner_only_test_support;
 #[cfg(test)]
 pub(crate) mod relation_http_test_peer;
 mod rpc_relation_update;

@@ -1,4 +1,6 @@
 //! Actions-only actual AccountManager/create and separately authorized READ.
+#[path="group_owner_only_account_tests.rs"]
+mod owner_only;
 use super::*;
 use n::group_create::NativeGroupCreateConfig as CPolicy;
 const GROUP:&[u8]=b"811111111-922222222";

@@ -18,7 +18,7 @@ pub(super) fn validate_shared(c:&Connection,line:&str)->Result<(),&'static str>{
  if bad{Err(STORAGE)}else{Ok(())}
 }
 pub(super) fn capture(c:&Connection,line:&str,nonce:&str,d:Option<Descriptor>,intent:Option<i64>,write:Option<i64>)->Result<(),&'static str>{
- let Some(d)=d else{return Ok(());};if d.operation==GroupWriteOperation::Create{return super::group_create_store::bind(c,line,nonce,d,intent,write);}if !installed(c)?{return Err("app_account_group_management_not_installed");}
+ let Some(d)=d else{return Ok(());};if d.operation.is_create(){return super::group_create_store::bind(c,line,nonce,d,intent,write);}if !installed(c)?{return Err("app_account_group_management_not_installed");}
  c.execute("INSERT INTO app_voice_group_write_operations(line_id,user_nonce,operation,properties,intent_id,write_id) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(line_id,user_nonce) DO NOTHING",params![line,nonce,d.operation.name(),d.properties as i64,intent,write]).map_err(|_|STORAGE)?;
  let row:Option<(String,i64,Option<i64>,Option<i64>)>=c.query_row("SELECT operation,properties,intent_id,write_id FROM app_voice_group_write_operations WHERE line_id=?1 AND user_nonce=?2",params![line,nonce],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|_|STORAGE)?;
  let Some((op,count,old_intent,old_write))=row else{return Err(STORAGE);};if op!=d.operation.name()||count!=d.properties as i64||intent.is_some()&&old_intent!=intent||old_write.is_some()&&write.is_some()&&old_write!=write{return Err(STORAGE);}
@@ -27,7 +27,7 @@ pub(super) fn capture(c:&Connection,line:&str,nonce:&str,d:Option<Descriptor>,in
 pub(super) fn get(c:&Connection,line:&str,nonce:&str,intent:Option<i64>,write:Option<i64>)->Result<Option<Descriptor>,&'static str>{
  if !installed(c)?{return super::group_create_store::get(c,line,nonce,intent,write);}let row:Option<(Option<String>,i64,Option<i64>,Option<i64>)>=c.query_row("SELECT CASE WHEN operation IN('set_properties','disband') THEN operation ELSE NULL END,properties,intent_id,write_id FROM app_voice_group_write_operations WHERE line_id=?1 AND user_nonce=?2",params![line,nonce],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|_|STORAGE)?;
  if row.is_none(){return super::group_create_store::get(c,line,nonce,intent,write);}
- row.map(|(op,n,i,w)|{let operation=GroupWriteOperation::parse(op.as_deref().ok_or(STORAGE)?)?;if !(0..=128).contains(&n)||intent.is_some()&&intent!=i||write.is_some()&&write!=w||match operation{GroupWriteOperation::SetProperties=>n==0,GroupWriteOperation::Disband=>n!=0,GroupWriteOperation::Create=>true}{return Err(STORAGE);}Ok(Descriptor{operation,properties:n as usize})}).transpose()
+ row.map(|(op,n,i,w)|{let operation=GroupWriteOperation::parse(op.as_deref().ok_or(STORAGE)?)?;if !(0..=128).contains(&n)||intent.is_some()&&intent!=i||write.is_some()&&write!=w||match operation{GroupWriteOperation::SetProperties=>n==0,GroupWriteOperation::Disband=>n!=0,GroupWriteOperation::Create|GroupWriteOperation::CreateOwnerOnly=>true}{return Err(STORAGE);}Ok(Descriptor{operation,properties:n as usize})}).transpose()
 }
 pub(super) fn require(c:&Connection,line:&str,nonce:&str,d:Option<Descriptor>,intent:Option<i64>,write:Option<i64>)->Result<(),&'static str>{
  // Legacy membership messages never change method from a descriptor. Preserve

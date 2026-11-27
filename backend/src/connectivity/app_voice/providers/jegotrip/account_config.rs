@@ -202,6 +202,8 @@ pub struct ProfileConfig {
     pub group_management:Option<super::group_management::NativeGroupManagementConfig>,
     #[serde(default)]
     pub group_creation:Option<super::group_create::NativeGroupCreateConfig>,
+    #[serde(default)]
+    pub group_owner_only:Option<super::group_owner_only::GroupOwnerOnlyConfig>,
     /// Independent incoming Group event opt-in, never a relation WRITE grant.
     #[serde(default)]
     pub relation_events:Option<super::group_events::NativeRelationEventsConfig>,
@@ -361,6 +363,7 @@ impl AccountConfig {
             .and_then(|profile|profile.with_relation_updates(p.relation_updates).map_err(|_|INVALID))
             .and_then(|profile|profile.with_group_management(p.group_management).map_err(|_|INVALID))
             .and_then(|profile|profile.with_group_creation(p.group_creation).map_err(|_|INVALID))
+            .and_then(|profile|profile.with_group_owner_only(p.group_owner_only).map_err(|_|INVALID))
             .and_then(|profile|profile.with_buddy_relation_check(p.buddy_relation_check).map_err(|_|INVALID))
             .and_then(|profile|profile.with_relation_events(p.relation_events).map_err(|_|INVALID))
             .and_then(|profile|profile.with_org_relation_sync(p.org_relation_sync).map_err(|_|INVALID))
@@ -609,6 +612,8 @@ pub(super) struct PrivateProfileRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     group_creation:Option<super::group_create::NativeGroupCreateConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    group_owner_only:Option<super::group_owner_only::GroupOwnerOnlyConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     relation_events:Option<super::group_events::NativeRelationEventsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     org_relation_sync:Option<super::org_relation_sync::NativeOrgRelationSyncConfig>,
@@ -662,6 +667,7 @@ impl<'a> PrivateConfigRef<'a> {
                 call_incoming:p.call_incoming.as_ref().map(|binding|PrivateCallIncomingRef{object_id:&binding.object_id,domain:&binding.domain}),
                 call_control:p.call_control.as_ref().map(|properties|PrivateProperties(properties)),
                 native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),im_send:p.im_send.as_ref(),relation_updates:p.relation_updates,group_management:p.group_management,group_creation:p.group_creation,relation_events:p.relation_events,org_relation_sync:p.org_relation_sync,relation_roster:p.relation_roster,buddy_relation_check:p.buddy_relation_check,
+                group_owner_only:p.group_owner_only,
                 connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
                 partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
             },
@@ -700,6 +706,7 @@ pub(super) fn private_profile_ref(p: &ProfileConfig) -> PrivateProfileRef<'_> {
         call_incoming: p.call_incoming.as_ref().map(|b| PrivateCallIncomingRef { object_id: &b.object_id, domain: &b.domain }),
         call_control: p.call_control.as_deref().map(private_properties),
         native_call_control:p.native_call_control,account_alive:p.account_alive.as_ref(),im_sync:p.im_sync.as_ref(),im_receipts:p.im_receipts.as_ref(),im_user_read:p.im_user_read.as_ref(),im_read_status:p.im_read_status.as_ref(),im_send:p.im_send.as_ref(),relation_updates:p.relation_updates,group_management:p.group_management,group_creation:p.group_creation,relation_events:p.relation_events,org_relation_sync:p.org_relation_sync,relation_roster:p.relation_roster,buddy_relation_check:p.buddy_relation_check,
+        group_owner_only:p.group_owner_only,
         connect_timeout_ms: p.connect_timeout_ms, handshake_timeout_ms: p.handshake_timeout_ms,
         partial_timeout_ms: p.partial_timeout_ms, io_timeout_ms: p.io_timeout_ms, rpc_timeout_ms: p.rpc_timeout_ms,
     }

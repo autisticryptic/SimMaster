@@ -16,11 +16,11 @@ impl NativeRelationUpdateConfig{
 /// Either permission family, never a conversion between them. Runtime selects
 /// it from the frozen original profile; legacy call sites remain unchanged.
 #[derive(Clone,Copy)]
-pub(super) enum RelationWriteGrant{Members(NativeRelationUpdateConfig),Management(super::group_management::NativeGroupManagementConfig),Creation(super::group_create::NativeGroupCreateConfig)}
+pub(super) enum RelationWriteGrant{Members(NativeRelationUpdateConfig),Management(super::group_management::NativeGroupManagementConfig),Creation(super::group_create::NativeGroupCreateConfig),OwnerOnly(super::group_create::NativeGroupCreateConfig)}
 impl From<NativeRelationUpdateConfig> for RelationWriteGrant{fn from(p:NativeRelationUpdateConfig)->Self{Self::Members(p)}}
 impl From<super::group_management::NativeGroupManagementConfig> for RelationWriteGrant{fn from(p:super::group_management::NativeGroupManagementConfig)->Self{Self::Management(p)}}
 impl From<super::group_create::NativeGroupCreateConfig> for RelationWriteGrant{fn from(p:super::group_create::NativeGroupCreateConfig)->Self{Self::Creation(p)}}
-impl RelationWriteGrant{pub(super) fn admits(self,counts:[usize;3],op:Option<super::group_management_store::Descriptor>)->bool{match(self,op){(Self::Members(p),None)=>p.admits(counts[0],counts[1],counts[2]),(Self::Management(p),Some(d))=>counts==[0;3]&&p.admits(d.operation),(Self::Creation(p),Some(d))=>counts==[0;3]&&d.operation==super::group_management::GroupWriteOperation::Create&&p.create,_=>false}}}
+impl RelationWriteGrant{pub(super) fn admits(self,counts:[usize;3],op:Option<super::group_management_store::Descriptor>)->bool{match(self,op){(Self::Members(p),None)=>p.admits(counts[0],counts[1],counts[2]),(Self::Management(p),Some(d))=>counts==[0;3]&&p.admits(d.operation),(Self::Creation(p),Some(d))=>counts==[0;3]&&d.operation==super::group_management::GroupWriteOperation::Create&&p.create,(Self::OwnerOnly(p),Some(d))=>counts==[0;3]&&d.operation==super::group_management::GroupWriteOperation::CreateOwnerOnly&&p.create,_=>false}}}
 #[cfg(test)]
 #[path="relation_update_policy_tests.rs"]
 mod tests;
