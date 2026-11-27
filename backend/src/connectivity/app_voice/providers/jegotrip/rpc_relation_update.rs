@@ -25,15 +25,17 @@ pub(super) fn encode_original(permit:Arc<RelationPermit>,id:i32,owner:&AttemptOw
     permit.arm(id,deadline).map_err(|_|CodecError::InvalidField)?;
     Ok((Arc::new(RelationRpcRequest{permit,id,budget}),bytes))
 }
-pub(super) struct OwnedRelationReply{request:Arc<RelationRpcRequest>,code:u32,accepted:bool,base_time:Option<i64>,update_time:Option<i64>,raw:Zeroizing<Vec<u8>>}
+pub(super) struct OwnedRelationReply{request:Arc<RelationRpcRequest>,code:u32,accepted:bool,base_time:Option<i64>,update_time:Option<i64>,raw:Zeroizing<Vec<u8>>,created:Option<Arc<super::group_create::CreatedReply>>}
 impl fmt::Debug for OwnedRelationReply{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("OwnedRelationReply(<redacted>)")}}
 impl OwnedRelationReply{
     pub(super) fn original(request:Arc<RelationRpcRequest>,owner:&AttemptOwner,scope:&RpcConnectionScope,code:u32,bytes:&[u8])->Result<Self,CodecError>{
         if !request.matches(owner,scope)||Instant::now()>=request.permit.deadline(){return Err(CodecError::InvalidField);}
-        let(accepted,base_time,update_time)=if let Some(op)=request.permit.management_operation(){let data=super::group_management::decode(scope,op,code,bytes)?;(data.accepted,data.base,data.update)}else{let data=group_relation_updates::decode_updates(code,bytes)?;(data.accepted,Some(data.base_time),Some(data.update_time))};
+        let created=if request.permit.management_operation()==Some(super::group_management::GroupWriteOperation::Create){Some(super::group_create::decode(scope,code,bytes)?)}else{None};
+        let(accepted,base_time,update_time)=if let Some(data)=&created{(data.accepted,Some(data.base),Some(data.update))}else if let Some(op)=request.permit.management_operation(){let data=super::group_management::decode(scope,op,code,bytes)?;(data.accepted,data.base,data.update)}else{let data=group_relation_updates::decode_updates(code,bytes)?;(data.accepted,Some(data.base_time),Some(data.update_time))};
         request.budget.retain_reply(bytes.len().checked_add(96).ok_or(CodecError::TooLarge)?)?;
-        Ok(Self{request,code,accepted,base_time,update_time,raw:Zeroizing::new(bytes.to_vec())})
+        Ok(Self{request,code,accepted,base_time,update_time,raw:Zeroizing::new(bytes.to_vec()),created})
     }
+    pub(super) fn created(&self)->Option<&Arc<super::group_create::CreatedReply>>{self.created.as_ref()}
     pub(super) fn request(&self)->&Arc<RelationRpcRequest>{&self.request}
     pub(super) fn belongs_to(&self,permit:&RelationPermit)->bool{std::ptr::eq(Arc::as_ptr(&self.request.permit),permit)}
     pub(super) fn matches(&self,owner:&AttemptOwner,scope:&RpcConnectionScope)->bool{self.request.matches(owner,scope)}
@@ -41,5 +43,5 @@ impl OwnedRelationReply{
     pub(super) fn accepted(&self)->bool{self.accepted}
     pub(super) fn base_time(&self)->Option<i64>{self.base_time}
     pub(super) fn update_time(&self)->Option<i64>{self.update_time}
-    pub(super) fn retained_bytes(&self)->usize{self.raw.len()+96}
+    pub(super) fn retained_bytes(&self)->usize{self.raw.len()+96+self.created.as_ref().map_or(0,|r|r.group.len()+128)}
 }

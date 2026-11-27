@@ -318,7 +318,9 @@ impl ArcRpcSession {
         if !self.native_receiver_scope()||!binding.matches(&self.owner,&self.connection)||!gate.live()||std::time::Instant::now()>=deadline
             ||query.operation()==super::rpc_im::ImOperation::SetReceived||query.directory_query()&&!binding.directory_queries()||!query.directory_input_matches(&self.connection){return Err(CodecError::InvalidField);}
         if query.buddy_check_query()&&(!binding.policy().buddy_relation_check()||!query.buddy_context_current(&self.owner,&self.connection,&gate)){return Err(CodecError::InvalidField);}
+        if query.created_properties_query()&&(!binding.policy().creation_properties()||!query.created_context_current(&self.owner,&self.connection,&gate)){return Err(CodecError::InvalidField);}
         if self.pending.len()>=MAX_MAP_ENTRIES||self.im_reply_count()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
+        if query.created_properties_query(){return self.prepare_created_properties_read(binding,query,gate,deadline);}
         if query.buddy_check_query(){return self.prepare_buddy_check_read(binding,query,gate,deadline);}
         let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;
         if !binding.authenticates(&auth.user_id,&auth.selected_session_id){return Err(CodecError::InvalidField);}
@@ -344,6 +346,15 @@ impl ArcRpcSession {
         let request=super::rpc_im::ImRequest::original(binding,query,gate,deadline,id,budget)?;
         self.next_id=id.checked_add(1);self.pending.insert(id,PendingRpc{kind:PendingKind::ImRead,selected_session_id:None,scheduler:None,call:None,im:Some(request),received:None,user_read:None,send:None});Ok((id,bytes))
     }
+    fn prepare_created_properties_read(&mut self,binding:Arc<super::im_delivery::ImBinding>,query:Arc<super::rpc_im::ImQuery>,gate:Arc<super::im_inbox::ImReceiptGate>,deadline:std::time::Instant)->Result<(i32,RpcBytes),CodecError>{
+        let super::rpc_im::ImQuery::CreatedProperties{receipt,..}=query.as_ref()else{return Err(CodecError::InvalidField);};
+        let auth=self.authentication.as_ref().ok_or(CodecError::InvalidField)?;if !binding.authenticates(&auth.user_id,&auth.selected_session_id){return Err(CodecError::InvalidField);}
+        let id=self.next_id.ok_or(CodecError::InvalidCallId)?;let method=query.method().as_bytes();let arguments_size=17+receipt.group().len();let size=1usize+4+4+(4+2+4+6)+(4+5+4+auth.token.len())+4+method.len()+4+arguments_size;
+        let budget=self.connection.reserve_native_rpc(size.checked_mul(3).and_then(|n|n.checked_add(arguments_size+query.retained_bytes()+512)).ok_or(CodecError::TooLarge)?)?;
+        let arguments=query.arguments(&auth.user_id)?;let mut w=super::rpc_stream::Writer::measured(size)?;w.i32(id)?;w.properties(&[RpcProperty{key:b"id",value:super::rpc_im::GROUP_OBJECT},RpcProperty{key:b"token",value:&auth.token}])?;w.bytes(method)?;w.bytes(arguments.expose_to_transport())?;let bytes=w.finish();let request=super::rpc_im::ImRequest::original(binding,query,gate,deadline,id,budget)?;
+        self.next_id=id.checked_add(1);self.pending.insert(id,PendingRpc{kind:PendingKind::ImRead,selected_session_id:None,scheduler:None,call:None,im:Some(request),received:None,user_read:None,send:None});Ok((id,bytes))
+    }
+    pub(super) fn pending_created_properties(&self,id:i32)->Option<Arc<super::rpc_im::ImRequest>>{self.pending.get(&id).and_then(|p|p.im.as_ref()).filter(|r|r.query().created_properties_query()).cloned()}
     pub(super) fn pending_buddy_check(&self,id:i32)->Option<Arc<super::rpc_im::ImRequest>>{self.pending.get(&id).and_then(|p|p.im.as_ref()).filter(|r|r.query().buddy_check_query()).cloned()}
     pub(super) fn take_im_replies(&mut self)->Vec<super::rpc_im::OwnedImReply>{std::mem::take(&mut self.im_replies)}
     pub(super) fn retire_im_read(&mut self,id:i32){

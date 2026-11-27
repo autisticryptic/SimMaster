@@ -2,11 +2,12 @@ import { directoryGroupId } from './nativeDirectory.ts'
 export interface GroupManagementBody { expected_revision: number; group_id: string; operation: 'set_properties' | 'disband'; nonce: string; properties: { key: string; value: string | number }[]; consent: true; write_consent: true; destructive_consent: boolean }
 const aliases: Record<string, string> = { Name: 'Group.Org.Name', Type: 'Group.Org.Type', UpdateMethod: 'Group.Org.Notify', Permission: 'Group.Org.JoinAuth', PropertyControl: 'Group.Org.PropsControl' }
 const limits: Record<string, number> = { Type: 4, UpdateMethod: 2, Permission: 3, PropertyControl: 2 }
-export function groupManagementBody(revision: number, group: string, operation: string, nonce: string, json: string, consent: boolean, writeConsent: boolean, destructive: boolean): GroupManagementBody | null {
-  if (!Number.isSafeInteger(revision) || revision < 1 || !directoryGroupId(group) || (operation !== 'set_properties' && operation !== 'disband') || /^[0-9a-f]{32}$/.exec(nonce)?.[0] !== nonce || !consent || !writeConsent || operation === 'disband' && !destructive || json.length > 262144) return null
+// Shared property-list validation, not an operation, group identifier, or WRITE grant.
+export function groupPropertyList(json: string, min: number, max: number, initialBytes: number): GroupManagementBody['properties'] | null {
+  if (json.length > 262144) return null
   let raw: unknown; try { raw = JSON.parse(json) } catch { return null }
-  if (!Array.isArray(raw) || raw.length > 128 || (operation === 'disband' ? raw.length !== 0 : raw.length === 0)) return null
-  const props: GroupManagementBody['properties'] = []; const keys = new Set<string>(); const enc = new TextEncoder(); let size = 13 + enc.encode(group).length
+  if (!Array.isArray(raw) || raw.length < min || raw.length > max) return null
+  const props: GroupManagementBody['properties'] = []; const keys = new Set<string>(); const enc = new TextEncoder(); let size = initialBytes
   for (const row of raw) {
     if (!row || typeof row !== 'object' || Array.isArray(row) || Reflect.ownKeys(row).length !== 2 || !Object.hasOwn(row, 'key') || !Object.hasOwn(row, 'value')) return null
     const r = row as Record<string, unknown>; if (typeof r.key !== 'string' || !r.key || r.key.includes('\0') || enc.encode(r.key).length > 65536) return null
@@ -15,7 +16,12 @@ export function groupManagementBody(revision: number, group: string, operation: 
     if (typeof r.value !== 'number' && typeof r.value !== 'string') return null
     keys.add(key); size += 8 + enc.encode(key).length + (numeric ? 15 : enc.encode(String(r.value)).length); props.push({ key: r.key, value: r.value })
   }
-  if (size > 65536) return null
+  return size > 65536 ? null : props
+}
+export function groupManagementBody(revision: number, group: string, operation: string, nonce: string, json: string, consent: boolean, writeConsent: boolean, destructive: boolean): GroupManagementBody | null {
+  if (!Number.isSafeInteger(revision) || revision < 1 || !directoryGroupId(group) || (operation !== 'set_properties' && operation !== 'disband') || /^[0-9a-f]{32}$/.exec(nonce)?.[0] !== nonce || !consent || !writeConsent || operation === 'disband' && !destructive) return null
+  const enc = new TextEncoder(); const props = groupPropertyList(json, operation === 'disband' ? 0 : 1, operation === 'disband' ? 0 : 128, 13 + enc.encode(group).length)
+  if (!props) return null
   const body: GroupManagementBody = { expected_revision: revision, group_id: group, operation, nonce, properties: props, consent: true, write_consent: true, destructive_consent: destructive }
   return enc.encode(JSON.stringify(body)).length <= 262144 ? body : null
 }

@@ -38,7 +38,7 @@ mod directory;
 pub use directory::{DirectoryReadView,PreparedDirectoryRead,PreparedRosterRead,PreparedBuddyRelationCheck,BuddyRelationCheckView};
 #[path="account_relation_updates.rs"]
 mod relations;
-pub(crate) use relations::PreparedRelationUpdate;
+pub(crate) use relations::{PreparedRelationUpdate,PreparedGroupCreate,GroupCreateView};
 
 pub trait AccountBackendFactory: Send + Sync {
     /// Construction only. Network work remains inside the original-owned
@@ -103,6 +103,10 @@ pub struct AccountView {
     #[serde(skip_serializing_if="Option::is_none")]
     pub group_management_supported:Option<bool>,
     #[serde(skip_serializing_if="Option::is_none")]
+    pub group_creation_supported:Option<bool>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub group_creation_properties_supported:Option<bool>,
+    #[serde(skip_serializing_if="Option::is_none")]
     pub buddy_relation_check_supported:Option<bool>,
     #[serde(skip_serializing_if="Option::is_none")]
     pub relation_events_supported:Option<bool>,
@@ -140,7 +144,7 @@ fn view(metadata: AccountMetadata, phase: Phase, cleanup: bool, error: Option<&'
         // A hosted SDK acknowledgement is not verified SMS/call/media support.
         incoming_call_ready: false, incoming_message_ready: false, outbound_authorized: false,
         provider_availability: "unsupported", manual_start_required: true, cleanup_on_disconnect: None, cleanup_error: None,
-        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, account_alive_state:None, startup_failure:None, startup_tls_detail:None, startup_connect_detail:None, relation_updates_supported:None,group_management_supported:None,buddy_relation_check_supported:None,relation_events_supported:None,relation_roster_supported:None, im_user_read_supported:None, im_user_read_recipient_supported:None, im_read_status_supported:None, im_read_status_recipient_supported:None, im_send_supported:None, im_reconciliation_supported:None, directory_queries_supported:None, user_entry_supported:None, user_entry_uid_local_supported:None, last_error: error }
+        reconnect_attempt: None, reconnect_state: None, reconnect_error: None, account_alive_state:None, startup_failure:None, startup_tls_detail:None, startup_connect_detail:None, relation_updates_supported:None,group_management_supported:None,group_creation_supported:None,group_creation_properties_supported:None,buddy_relation_check_supported:None,relation_events_supported:None,relation_roster_supported:None, im_user_read_supported:None, im_user_read_recipient_supported:None, im_read_status_supported:None, im_read_status_recipient_supported:None, im_send_supported:None, im_reconciliation_supported:None, directory_queries_supported:None, user_entry_supported:None, user_entry_uid_local_supported:None, last_error: error }
 }
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
@@ -455,6 +459,8 @@ impl AccountManager {
             snapshot.startup_connect_detail=run.backend.startup_connect_detail_observation(&owner);
             snapshot.relation_updates_supported=Some(run.backend.relation_updates_enabled());
             snapshot.group_management_supported=Some(run.backend.group_management_enabled());
+            snapshot.group_creation_supported=Some(run.backend.group_creation_enabled());
+            snapshot.group_creation_properties_supported=Some(run.backend.group_creation_properties_enabled());
             snapshot.buddy_relation_check_supported=Some(run.backend.buddy_relation_check_enabled());
             snapshot.relation_events_supported=Some(run.backend.relation_events_enabled());
             snapshot.relation_roster_supported=Some(run.backend.relation_roster_enabled());

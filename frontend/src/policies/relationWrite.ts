@@ -17,12 +17,12 @@ function tag(v: unknown): v is string { return typeof v === 'string' && /^[0-9a-
 function utf8(v: unknown): v is string { return typeof v === 'string' && new TextDecoder('utf-8', { fatal: true }).decode(new TextEncoder().encode(v)) === v && new TextEncoder().encode(v).length <= 65536 }
 function bytes(v: unknown): v is number[] { return Array.isArray(v) && v.length <= 65536 && v.every((n: unknown) => typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= 255) }
 const nativeTypes = [11, 12, 13, 14, 15, 16, 18, 257, 258, 259, 4097]
-function parseChanges(text: string): RelationChangeBody[] | null {
+export function parseChanges(text: string, explicitNames = false): RelationChangeBody[] | null {
   let raw: unknown; try { raw = JSON.parse(text) } catch { return null }
   if (!Array.isArray(raw) || raw.length > 128) return null
   const result: RelationChangeBody[] = []; const seen = new Set<string>()
   for (const entry of raw) {
-    if (!object(entry) || !keys(entry, ['label', 'relation_type', 'first', 'second', 'properties'], ['label', 'relation_type'])) return null
+    if (!object(entry) || !keys(entry, ['label', 'relation_type', 'first', 'second', 'properties'], explicitNames ? ['label', 'relation_type', 'first', 'second'] : ['label', 'relation_type'])) return null
     const label = own(entry, 'label'); const type = own(entry, 'relation_type'); const first = own(entry, 'first') === undefined ? '' : own(entry, 'first'); const second = own(entry, 'second') === undefined ? '' : own(entry, 'second'); const props = own(entry, 'properties') === undefined ? [] : own(entry, 'properties')
     if (!utf8(label) || label.length === 0 || seen.has(label) || typeof type !== 'number' || !nativeTypes.includes(type) || !utf8(first) || !utf8(second) || !Array.isArray(props) || props.length > 128) return null
     const properties: { key: number[]; value: number[] }[] = []; const propertyKeys = new Set<string>()

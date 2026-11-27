@@ -8,11 +8,11 @@ use serde::{Deserialize,Serialize};
 use std::{fmt,sync::Arc};
 #[derive(Clone,Copy,Debug,PartialEq,Eq,Deserialize,Serialize)]
 #[serde(rename_all="snake_case")]
-pub enum GroupWriteOperation{SetProperties,Disband}
+pub enum GroupWriteOperation{SetProperties,Disband,Create}
 impl GroupWriteOperation{
- pub(super) fn name(self)->&'static str{match self{Self::SetProperties=>"set_properties",Self::Disband=>"disband"}}
- pub(super) fn parse(s:&str)->Result<Self,&'static str>{match s{"set_properties"=>Ok(Self::SetProperties),"disband"=>Ok(Self::Disband),_=>Err("app_account_relation_storage_failed")}}
- pub(super) fn method(self)->&'static str{match self{Self::SetProperties=>"setProps.GroupServer.Group",Self::Disband=>"disbandOrganize.GroupServer.Group"}}
+ pub(super) fn name(self)->&'static str{match self{Self::SetProperties=>"set_properties",Self::Disband=>"disband",Self::Create=>"create"}}
+ pub(super) fn parse(s:&str)->Result<Self,&'static str>{match s{"set_properties"=>Ok(Self::SetProperties),"disband"=>Ok(Self::Disband),"create"=>Ok(Self::Create),_=>Err("app_account_relation_storage_failed")}}
+ pub(super) fn method(self)->&'static str{match self{Self::SetProperties=>"setProps.GroupServer.Group",Self::Disband=>"disbandOrganize.GroupServer.Group",Self::Create=>super::group_create::METHOD}}
 }
 #[derive(Clone,Copy,Deserialize,Serialize)]
 #[serde(deny_unknown_fields)]
@@ -20,7 +20,7 @@ pub struct NativeGroupManagementConfig{pub set_properties:bool,pub disband:bool}
 impl fmt::Debug for NativeGroupManagementConfig{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("NativeGroupManagementConfig(<redacted>)")}}
 impl NativeGroupManagementConfig{
  pub(super) fn validate(self)->Result<(),&'static str>{if self.set_properties||self.disband{Ok(())}else{Err("app_account_group_management_invalid")}}
- pub(super) fn admits(self,op:GroupWriteOperation)->bool{match op{GroupWriteOperation::SetProperties=>self.set_properties,GroupWriteOperation::Disband=>self.disband}}
+ pub(super) fn admits(self,op:GroupWriteOperation)->bool{match op{GroupWriteOperation::SetProperties=>self.set_properties,GroupWriteOperation::Disband=>self.disband,GroupWriteOperation::Create=>false}}
 }
 #[derive(Clone,Copy)]pub(crate) enum PropertyValue<'a>{Text(&'a str),Number(u32)}
 pub(crate) struct PublicProperty<'a>{pub key:&'a str,pub value:PropertyValue<'a>}
@@ -38,7 +38,7 @@ pub(crate) fn property<'a>(p:&PublicProperty<'a>)->Result<RpcProperty<'a>,CodecE
  };Ok(RpcProperty{key,value})
 }
 pub(super) fn size(group:&[u8],op:GroupWriteOperation,properties:&[PublicProperty<'_>])->Result<usize,CodecError>{
- GroupId::parse(group)?;if properties.len()>MAX_MAP_ENTRIES||match op{GroupWriteOperation::SetProperties=>properties.is_empty(),GroupWriteOperation::Disband=>!properties.is_empty()}{return Err(CodecError::InvalidField);}
+ GroupId::parse(group)?;if properties.len()>MAX_MAP_ENTRIES||match op{GroupWriteOperation::SetProperties=>properties.is_empty(),GroupWriteOperation::Disband=>!properties.is_empty(),GroupWriteOperation::Create=>true}{return Err(CodecError::InvalidField);}
  let mut size=9+group.len();if op==GroupWriteOperation::SetProperties{size+=4;}
  for(i,p)in properties.iter().enumerate(){let value=property(p)?;for other in &properties[..i]{if property(other)?.key==value.key{return Err(CodecError::DuplicateKey);}}size=size.checked_add(8+value.key.len()+value.value.len()).ok_or(CodecError::TooLarge)?;if size>MAX_FIELD_BYTES{return Err(CodecError::TooLarge);}}
  if size>MAX_STREAM_BYTES{return Err(CodecError::TooLarge);}Ok(size)
@@ -49,7 +49,7 @@ pub(super) fn encode(group:&[u8],op:GroupWriteOperation,properties:&[PublicPrope
 }
 pub(super) struct ManagementResult{pub accepted:bool,pub base:Option<i64>,pub update:Option<i64>,_budget:Arc<NativeRpcReservation>}
 pub(super) fn decode(scope:&RpcConnectionScope,op:GroupWriteOperation,code:u32,bytes:&[u8])->Result<ManagementResult,CodecError>{
- if code!=0{return Err(CodecError::RemoteFailure);}let mut r=Reader::new(bytes)?;r.boolean()?;if op==GroupWriteOperation::Disband{r.i64()?;r.i64()?;}r.bytes()?;let count=if r.is_empty(){0}else{let n=r.count(8)?;for _ in 0..n{r.bytes()?;r.bytes()?;}n};r.finish()?;
+ if op==GroupWriteOperation::Create{return Err(CodecError::InvalidField);}if code!=0{return Err(CodecError::RemoteFailure);}let mut r=Reader::new(bytes)?;r.boolean()?;if op==GroupWriteOperation::Disband{r.i64()?;r.i64()?;}r.bytes()?;let count=if r.is_empty(){0}else{let n=r.count(8)?;for _ in 0..n{r.bytes()?;r.bytes()?;}n};r.finish()?;
  let budget=scope.reserve_native_rpc(128+count*std::mem::size_of::<RpcProperty<'_>>())?;let mut r=Reader::new(bytes)?;let accepted=r.boolean()?;let(base,update)=if op==GroupWriteOperation::Disband{(Some(r.i64()?),Some(r.i64()?))}else{(None,None)};let footer=read_footer(&mut r)?;r.finish()?;
  Ok(ManagementResult{accepted:accepted&&footer.reason.is_empty(),base,update,_budget:budget})
 }

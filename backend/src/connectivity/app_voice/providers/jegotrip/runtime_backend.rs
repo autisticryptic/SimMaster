@@ -235,6 +235,7 @@ pub struct RuntimeProfile {
     im_send:Option<super::im_send_policy::NativeImSendConfig>,
     relation_updates:Option<super::relation_update_policy::NativeRelationUpdateConfig>,
     group_management:Option<super::group_management::NativeGroupManagementConfig>,
+    group_creation:Option<super::group_create::NativeGroupCreateConfig>,
     relation_events:Option<super::group_events::NativeRelationEventsConfig>,
     io_timeout: Duration, rpc_timeout: Duration, bootstrap:Option<BootstrapProfile>, common:Option<CommonProfile>, common_bootstrap:Option<CommonBootstrapProfile>, call_incoming:Option<CallBinding>,call_control:Option<Vec<Property>>,native_call_control:bool,byte_length:usize,
 }
@@ -307,6 +308,12 @@ impl RuntimeProfile {
         add_bytes(&mut self.byte_length,16)?;self.im_sync=Some(*config);Ok(self)
     }
     pub(super) fn with_im_send(mut self,config:Option<&super::im_send_policy::NativeImSendConfig>)->Result<Self,ProfileError>{let Some(config)=config else{return Ok(self);};config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;if self.im_send.is_some()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}add_bytes(&mut self.byte_length,64+config.auth_country_code.as_ref().map_or(0,String::len))?;self.im_send=Some(config.clone());Ok(self)}
+    pub(super) fn with_group_creation(mut self,config:Option<super::group_create::NativeGroupCreateConfig>)->Result<Self,ProfileError>{
+        let Some(config)=config else{return Ok(self);};config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;
+        if self.group_creation.is_some()||self.common.is_none()||!self.client_ex{return Err(ProfileError::InvalidConfiguration);}
+        let native=self.native_receivers.as_ref().ok_or(ProfileError::InvalidConfiguration)?;let installed=native.with_creation_properties(config).map_err(|_|ProfileError::InvalidConfiguration)?;
+        add_bytes(&mut self.byte_length,std::mem::size_of_val(&config))?;self.group_creation=Some(config);self.native_receivers=Some(installed);Ok(self)
+    }
     pub(super) fn with_group_management(mut self,config:Option<super::group_management::NativeGroupManagementConfig>)->Result<Self,ProfileError>{
         let Some(config)=config else{return Ok(self);};config.validate().map_err(|_|ProfileError::InvalidConfiguration)?;
         if self.group_management.is_some()||self.common.is_none()||!self.client_ex||self.native_receivers.as_ref().is_none_or(|p|p.im_messages().is_none()){return Err(ProfileError::InvalidConfiguration);}
@@ -462,7 +469,7 @@ impl RuntimeProfile {
             poll_routing, logout_routing, incoming, offline_reception: false, client_ex: false, reference_decode_key: input.reference_decode_key,
             native_receivers: None,
             handshake_timeout: input.handshake_timeout, partial_timeout: input.partial_timeout,
-            account_alive:None,im_sync:None,im_receipts:None,im_user_read:None,im_read_status:None,im_send:None,relation_updates:None,group_management:None,relation_events:None,io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
+            account_alive:None,im_sync:None,im_receipts:None,im_user_read:None,im_read_status:None,im_send:None,relation_updates:None,group_management:None,group_creation:None,relation_events:None,io_timeout: input.io_timeout, rpc_timeout: input.rpc_timeout, bootstrap, common, common_bootstrap, call_incoming:None,call_control:None,native_call_control:false,byte_length:total,
         })
     }
 }

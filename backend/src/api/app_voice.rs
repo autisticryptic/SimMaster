@@ -21,6 +21,8 @@ const MAX_REQUEST_BYTES: usize = 256 * 1024;
 mod relation_updates;
 #[path="app_voice_group_management.rs"]
 mod group_management;
+#[path="app_voice_group_create.rs"]
+mod group_creation;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateAccountRequest { provider_id: String, config: AccountConfig }
@@ -126,6 +128,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/non-3gpp/accounts/{line_id}/buddy-relation/check",post(check_buddy_relation))
         .route("/api/non-3gpp/accounts/{line_id}/relation-writes",get(relation_updates::relation_history).post(relation_updates::update_relations))
         .route("/api/non-3gpp/accounts/{line_id}/group-management",post(group_management::write_group))
+        .route("/api/non-3gpp/accounts/{line_id}/groups/create",post(group_creation::create_group))
         .route("/api/non-3gpp/accounts/{line_id}/relation-intents",get(relation_updates::intent_history))
         .route("/api/non-3gpp/accounts/{line_id}/relation-events",get(relation_updates::event_history))
         .route("/api/non-3gpp/accounts/{line_id}/org-relation-events",get(relation_updates::org_event_history))
@@ -198,6 +201,9 @@ fn error_status(code: &str) -> StatusCode {
         "app_account_user_entry_ambiguous" | "app_account_user_entry_realm_mismatch" => StatusCode::CONFLICT,
         "app_account_buddy_check_consent_required" | "app_account_buddy_check_not_installed" => StatusCode::FORBIDDEN,
         "app_account_buddy_check_request_invalid" => StatusCode::BAD_REQUEST,
+        "app_account_group_create_invalid" => StatusCode::BAD_REQUEST,
+        "app_account_group_create_not_installed" => StatusCode::FORBIDDEN,
+        "app_account_group_create_owner_mismatch" => StatusCode::CONFLICT,
         "app_account_group_management_invalid" => StatusCode::BAD_REQUEST,
         "app_account_group_management_not_installed" => StatusCode::FORBIDDEN,
         "app_account_relation_consent_required" | "app_account_relation_not_installed" => StatusCode::FORBIDDEN,

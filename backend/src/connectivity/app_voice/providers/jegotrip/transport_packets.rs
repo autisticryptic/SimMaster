@@ -46,7 +46,7 @@ impl TransportError {
 
 // Typed lifetime holders only, never conversions between READ and WRITE grants.
 #[allow(dead_code)]
-enum PacketRetention{Client(std::sync::Arc<super::client_packet_retention::ClientPacketRetention>),Relation(std::sync::Arc<super::rpc_relation_update::RelationRpcRequest>),BuddyCheck(std::sync::Arc<super::rpc_im::ImRequest>)}
+enum PacketRetention{Client(std::sync::Arc<super::client_packet_retention::ClientPacketRetention>),Relation(std::sync::Arc<super::rpc_relation_update::RelationRpcRequest>),BuddyCheck(std::sync::Arc<super::rpc_im::ImRequest>),CreatedProperties(std::sync::Arc<super::rpc_im::ImRequest>)}
 pub struct TransportBytes(Vec<u8>,Option<PacketRetention>,Option<std::sync::Arc<super::group_event_packets::GroupEventPackets>>);
 
 impl TransportBytes {
@@ -54,6 +54,7 @@ impl TransportBytes {
     pub(super) fn retain_client_packet(&mut self,guard:std::sync::Arc<super::client_packet_retention::ClientPacketRetention>){let guard=PacketRetention::Client(guard);self.1=Some(guard);}
     pub(super) fn retain_relation_packet(&mut self,guard:std::sync::Arc<super::rpc_relation_update::RelationRpcRequest>){let guard=PacketRetention::Relation(guard);self.1=Some(guard);}
     pub(super) fn retain_buddy_check_packet(&mut self,guard:std::sync::Arc<super::rpc_im::ImRequest>){self.1=Some(PacketRetention::BuddyCheck(guard));}
+    pub(super) fn retain_created_properties_packet(&mut self,guard:std::sync::Arc<super::rpc_im::ImRequest>){self.1=Some(PacketRetention::CreatedProperties(guard));}
     // Independent slot: an event response in a mixed Client batch must not
     // replace the original READ packet holder or borrow its authority.
     pub(super) fn retain_group_event_packet(&mut self,guard:std::sync::Arc<super::group_event_packets::GroupEventPackets>){self.2=Some(guard);}

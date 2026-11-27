@@ -413,6 +413,8 @@ export interface AppAccountView {
   im_read_status_recipient_supported?: boolean
   relation_updates_supported?: boolean
   group_management_supported?: boolean
+  group_creation_supported?: boolean
+  group_creation_properties_supported?: boolean
   relation_events_supported?: boolean
   relation_roster_supported?: boolean
   buddy_relation_check_supported?: boolean
@@ -1163,6 +1165,9 @@ class SimAdminCurrentAPI {
   }
   async getAppRelationIntents(lineId: string) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/relation-intents?limit=128`, { cache: 'no-store', timeoutMs: 10000 })
+  }
+  async createAppGroup(lineId: string, body: import('../policies/groupCreate').GroupCreateBody) {
+    return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/groups/create`, { method: 'POST', body: JSON.stringify(body), cache: 'no-store', timeoutMs: 10000, skipAuthRedirect: true })
   }
   async writeAppGroupManagement(lineId: string, body: import('../policies/groupManagement').GroupManagementBody) {
     return request<ApiResponse<unknown>>(`/non-3gpp/accounts/${encodeURIComponent(lineId)}/group-management`, { method: 'POST', body: JSON.stringify(body), cache: 'no-store', timeoutMs: 10000, skipAuthRedirect: true })

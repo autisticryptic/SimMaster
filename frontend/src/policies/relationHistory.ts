@@ -1,10 +1,10 @@
 // Persisted relation outcomes are DATA, never current SDK/WRITE permission.
 export type RelationState = 'uncertain' | 'confirmed' | 'rejected' | 'not_sent'
-export interface GroupManagementSummary { operation: 'set_properties' | 'disband'; properties: number }
+export interface GroupManagementSummary { operation: 'set_properties' | 'disband' | 'create'; properties: number }
 export function managementSummary(value: unknown): GroupManagementSummary | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const keys = Reflect.ownKeys(value); const v = value as Record<string, unknown>
-  if (keys.length !== 2 || !keys.includes('operation') || !keys.includes('properties') || v.operation !== 'set_properties' && v.operation !== 'disband' || typeof v.properties !== 'number' || !Number.isSafeInteger(v.properties) || v.properties < 0 || v.properties > 128 || (v.operation === 'set_properties' ? v.properties === 0 : v.properties !== 0)) return null
+  if (keys.length !== 2 || !keys.includes('operation') || !keys.includes('properties') || v.operation !== 'set_properties' && v.operation !== 'disband' && v.operation !== 'create' || typeof v.properties !== 'number' || !Number.isSafeInteger(v.properties) || v.properties < 0 || v.properties > 128 || (v.operation === 'set_properties' ? v.properties === 0 : v.operation === 'create' ? v.properties < 2 : v.properties !== 0)) return null
   return { operation: v.operation, properties: v.properties }
 }
 export interface RelationHistoryRow { management?: GroupManagementSummary; id: number; nonceTag: string; targetKind: 'buddy' | 'group'; state: RelationState; additions: number; updates: number; removals: number; baseTime: string | null; updateTime: string | null }

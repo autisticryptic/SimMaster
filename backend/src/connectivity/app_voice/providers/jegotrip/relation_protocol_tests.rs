@@ -3,6 +3,8 @@
 mod admission;
 #[path="group_management_tests.rs"]
 mod management;
+#[path="group_create_tests.rs"]
+mod creation;
 use super::*;
 use n::{group_directory_data::Relation,group_relation_updates::Removal,relation_update_policy::NativeRelationUpdateConfig as Policy,
     relation_journal::{RelationAction,RelationMessage,RelationPermit,PreparedRelation}};

@@ -34,7 +34,7 @@ impl RelationIntent{
             validate_original(&tx,&run,&scope,&parent,&configuration,deadline)?;management::validate_shared(&tx,run.line_id())?;
             let old:Option<(i64,Vec<u8>,i64,Option<i64>)>=tx.query_row("SELECT id,body_hash,state,write_id FROM app_voice_relation_intents WHERE line_id=?1 AND user_nonce=?2",params![run.line_id(),message.nonce.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|_|STORAGE)?;
             if let Some((old_id,body,state,write))=old{
-                if body.as_slice()!=body_hash.as_slice(){return Err("app_account_relation_nonce_conflict");}management::require(&tx,run.line_id(),message.nonce.as_str(),message.management,Some(old_id),write)?;
+                if body.as_slice()!=body_hash.as_slice(){return Err("app_account_relation_nonce_conflict");}if let Some(input)=&message.creation{super::super::group_create_store::require_input(&tx,run.line_id(),message.nonce.as_str(),old_id,input)?;}management::require(&tx,run.line_id(),message.nonce.as_str(),message.management,Some(old_id),write)?;
                 match(state,write){
                     (0,None)=>return Err("app_account_relation_preparing"),
                     (2,None)=>return Err("app_account_relation_nonce_retired"),
@@ -53,16 +53,18 @@ impl RelationIntent{
             let(local,total):(i64,i64)=tx.query_row("SELECT COALESCE(SUM(line_id=?1),0),COUNT(*) FROM app_voice_relation_intents",[run.line_id()],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|STORAGE)?;
             if local>=128||total>=4096{return Err("app_account_relation_full");}
             tx.execute("INSERT INTO app_voice_relation_intents(line_id,revision,user_nonce,body_hash,run_nonce,claim_nonce,configuration_hash,target_kind,additions,updates,removals,state,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12)",params![run.line_id(),run.revision() as i64,message.nonce.as_str(),body_hash.as_slice(),run.nonce(),claim.as_str(),configuration.0.as_slice(),message.target_kind(),message.counts[0] as i64,message.counts[1] as i64,message.counts[2] as i64,chrono::Utc::now().to_rfc3339()]).map_err(|_|STORAGE)?;
-            let id=tx.last_insert_rowid();management::capture(&tx,run.line_id(),message.nonce.as_str(),message.management,Some(id),None)?;validate_original(&tx,&run,&scope,&parent,&configuration,deadline)?;tx.commit().map_err(|_|STORAGE)?;Ok((id,false))
+            let id=tx.last_insert_rowid();if let Some(input)=&message.creation{super::super::group_create_store::capture_input(&tx,run.line_id(),message.nonce.as_str(),input,id)?;}management::capture(&tx,run.line_id(),message.nonce.as_str(),message.management,Some(id),None)?;validate_original(&tx,&run,&scope,&parent,&configuration,deadline)?;tx.commit().map_err(|_|STORAGE)?;Ok((id,false))
         })?;
         if replay{return Ok(IntentAdmission::Replay(id));}
         let intent=Arc::new(Self{database,run,owner,scope,message,configuration,parent,gate:ImReceiptGate::fresh(),claim,body_hash,id,deadline,phase:AtomicU8::new(PREPARING),transition:Mutex::new(Weak::new())});
         if !intent.live(){intent.cancel();return Err(SCOPE);}Ok(IntentAdmission::Fresh(intent))
     }
     fn live(&self)->bool{self.scope.is_open()&&!self.scope.session_revoked()&&self.parent.live()&&self.gate.live()&&Instant::now()<self.deadline}
-    fn fixed(&self,c:&Connection,state:i64,write:Option<i64>)->Result<(),&'static str>{
+    pub(super) fn fixed(&self,c:&Connection,state:i64,write:Option<i64>)->Result<(),&'static str>{
         let yes:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM app_voice_relation_intents WHERE id=?1 AND line_id=?2 AND revision=?3 AND user_nonce=?4 AND body_hash=?5 AND run_nonce=?6 AND claim_nonce=?7 AND configuration_hash=?8 AND state=?9 AND write_id IS ?10)",params![self.id,self.run.line_id(),self.run.revision() as i64,self.message.nonce.as_str(),self.body_hash.as_slice(),self.run.nonce(),self.claim.as_str(),self.configuration.0.as_slice(),state,write],|r|r.get(0)).map_err(|_|STORAGE)?;
-        if !yes{return Err(SCOPE);}management::require(c,self.run.line_id(),self.message.nonce.as_str(),self.message.management,Some(self.id),write)
+        if !yes{return Err(SCOPE);}
+        if let Some(input)=&self.message.creation{super::super::group_create_store::require_input(c,self.run.line_id(),self.message.nonce.as_str(),self.id,input)?;}
+        management::require(c,self.run.line_id(),self.message.nonce.as_str(),self.message.management,Some(self.id),write)
     }
     pub(in super::super) fn gate(&self)->Arc<ImReceiptGate>{self.gate.clone()}
     pub(in super::super) fn binds(&self,owner:&AttemptOwner,scope:&RpcConnectionScope,message:&Arc<RelationMessage>)->bool{self.live()&&&self.owner==owner&&self.scope.matches(scope)&&Arc::ptr_eq(&self.message,message)&&self.message.budget.belongs_to(scope)}

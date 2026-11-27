@@ -10,9 +10,12 @@ use super::super::{group_directory_data::Relation,group_relation_updates::Remova
 pub(super) fn load_original_account(c:&rusqlite::Connection,line:&str)->Result<Option<(StoredAccount,Option<Arc<RelationConfiguration>>)>,&'static str>{
     let tx=rusqlite::Transaction::new_unchecked(c,rusqlite::TransactionBehavior::Deferred).map_err(|_|"app_account_relation_storage_failed")?;
     let account=account_store::load(&tx,line)?;
-    let configuration=match &account{Some(stored)if (stored.config.profile.relation_updates.is_some()||stored.config.profile.group_management.is_some()||stored.config.profile.relation_events.is_some()||stored.config.profile.org_relation_sync.is_some()||stored.config.profile.relation_roster.is_some()||stored.config.profile.buddy_relation_check.is_some())=>Some(Arc::new(RelationConfiguration::capture(&tx,line,stored.metadata.revision,None)?)),_=>None};
+    let configuration=match &account{Some(stored)if (stored.config.profile.relation_updates.is_some()||stored.config.profile.group_management.is_some()||stored.config.profile.group_creation.is_some()||stored.config.profile.relation_events.is_some()||stored.config.profile.org_relation_sync.is_some()||stored.config.profile.relation_roster.is_some()||stored.config.profile.buddy_relation_check.is_some())=>Some(Arc::new(RelationConfiguration::capture(&tx,line,stored.metadata.revision,None)?)),_=>None};
     tx.commit().map_err(|_|"app_account_relation_storage_failed")?;Ok(account.map(|a|(a,configuration)))
 }
+#[path="account_group_create.rs"]
+mod creation;
+pub(crate) use creation::{PreparedGroupCreate,GroupCreateView};
 pub(crate) struct RelationHttpScratch(Arc<super::super::native_rpc_budget::NativeRpcReservation>);
 impl std::fmt::Debug for RelationHttpScratch{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str("RelationHttpScratch(<redacted>)")}}
 impl RelationHttpScratch{pub(crate) fn matches(&self,prepared:&PreparedRelationUpdate)->bool{self.0.belongs_to(&prepared.scope)}}
@@ -78,7 +81,11 @@ impl AccountManager{
         run.database.with_conn(|c|configuration.require_current(c,run.run_token.line_id(),run.run_token.revision(),&scope))?;
         if controller.phase()!=Phase::Hosted||controller.resource_owner().as_ref()!=Some(&owner)||!run.backend.original_scope(&owner).is_some_and(|s|s.matches(&scope))||!run.accepting.load(Ordering::SeqCst)||run.stopping.load(Ordering::SeqCst)||run.finalized.load(Ordering::SeqCst)||!run.im_gate.live(){return Err("app_account_relation_scope_invalid");}
         drop(controller);
+        let creation=message.management_operation()==Some(super::super::group_management::GroupWriteOperation::Create);
         let result=Box::pin(run.backend.update_relations(run.database.clone(),run.run_token.clone(),run.im_gate.clone(),owner,scope,message,deadline,configuration,intent)).await?;
+        // A fresh create result has already committed on the original run. A
+        // change after commit can veto its separate READ, not erase that WRITE.
+        if creation&&matches!(result.state,"confirmed"|"rejected"){return Ok(result);}
         run.configuration_current()?;live_run(&run)?;
         if !run.accepting.load(Ordering::SeqCst)||run.stopping.load(Ordering::SeqCst)||run.finalized.load(Ordering::SeqCst)||!run.im_gate.live(){return Err("app_account_relation_scope_invalid");}Ok(result)
     }

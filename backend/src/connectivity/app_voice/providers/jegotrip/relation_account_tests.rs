@@ -4,6 +4,8 @@
 mod admission;
 #[path="group_management_account_tests.rs"]
 mod management;
+#[path="group_create_account_tests.rs"]
+mod creation;
 use super::*;
 use n::{group_directory_data::Relation,group_relation_updates::Removal,
     relation_update_policy::NativeRelationUpdateConfig as Policy,account_runtime::PreparedRelationUpdate};
