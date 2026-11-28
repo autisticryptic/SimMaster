@@ -8,12 +8,12 @@ use tokio::sync::oneshot;
 
 const ALIAS:&[u8]=b"private-alias";
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-enum Mode{Good,Empty,False,Bad,Version,DropSubmitted,Timeout,PolicyTimeout,GateRetired,AdmissionDrop,PrefixDrop,PrefixMixed,PrefixTimeout,PrefixClose,RejectedLogin,Unbound,WrongRouter}
+pub(super) enum Mode{Good,Empty,False,Bad,Version,DropSubmitted,Timeout,PolicyTimeout,GateRetired,AdmissionDrop,PrefixDrop,PrefixMixed,PrefixTimeout,PrefixClose,RejectedLogin,Unbound,WrongRouter}
 impl Mode{
     fn held(self)->bool{matches!(self,Self::DropSubmitted|Self::Timeout|Self::PolicyTimeout|Self::GateRetired)}
     fn prefix(self)->bool{matches!(self,Self::PrefixDrop|Self::PrefixMixed|Self::PrefixTimeout|Self::PrefixClose)}
 }
-async fn bounded<F:Future>(future:F)->F::Output{tokio::time::timeout(Duration::from_secs(12),future).await.expect("original alias fixture bound")}
+pub(super) async fn bounded<F:Future>(future:F)->F::Output{tokio::time::timeout(Duration::from_secs(12),future).await.expect("original alias fixture bound")}
 fn aliases(mode:Mode)->Vec<u8>{
     let mut w=Writer::new();w.boolean(mode!=Mode::False).unwrap();let count=usize::from(mode!=Mode::Empty);w.u32(count as u32).unwrap();
     if count==1{w.bytes(b"username").unwrap();w.bytes(ALIAS).unwrap();w.boolean(true).unwrap();}w.bytes(b"").unwrap();
@@ -58,9 +58,9 @@ async fn peer(listener:TcpListener,server:Arc<tokio_rustls::rustls::ServerConfig
         else{let result=host.map(|seq|vec![(seq,0,b"\0\x01\0\0\0\0".as_slice())]).unwrap_or_default();p.send(&[reply(call.call_id,&swap_body(batch.fields,&result,mode!=Mode::PrefixMixed))]).await;}
     }
 }
-struct Fixture{handle:RuntimeHandle,events:mpsc::Receiver<RuntimeEvent>,owner:AttemptOwner,scope:RpcConnectionScope,gate:Arc<ImReceiptGate>,seen:oneshot::Receiver<()>,release:Option<oneshot::Sender<()>>,done:Option<oneshot::Sender<()>>,sdk:Option<tokio::task::JoinHandle<()>>,relay:Option<tokio::task::JoinHandle<()>>,reads:Arc<AtomicUsize>,connections:Arc<AtomicUsize>}
+pub(super) struct Fixture{pub(super) handle:RuntimeHandle,pub(super) events:mpsc::Receiver<RuntimeEvent>,pub(super) owner:AttemptOwner,pub(super) scope:RpcConnectionScope,pub(super) gate:Arc<ImReceiptGate>,pub(super) seen:oneshot::Receiver<()>,pub(super) release:Option<oneshot::Sender<()>>,done:Option<oneshot::Sender<()>>,sdk:Option<tokio::task::JoinHandle<()>>,relay:Option<tokio::task::JoinHandle<()>>,reads:Arc<AtomicUsize>,connections:Arc<AtomicUsize>}
 impl Fixture{
-    async fn open(mode:Mode)->Self{
+    pub(super) async fn open(mode:Mode)->Self{
         let cert=Certificates::generate("IP:127.0.0.1");let front=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let port=front.local_addr().unwrap().port();let boot=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let main=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let ports=[boot.local_addr().unwrap().port(),main.local_addr().unwrap().port()];let server=cert.server_config(&TLS13);let bootserver=server.clone();
         let(done,finished)=oneshot::channel();let connections=Arc::new(AtomicUsize::new(0));let counted=connections.clone();
         let relay=tokio::spawn(async move{let mut joins=Vec::new();for port in ports{let(mut incoming,_)=front.accept().await.unwrap();counted.fetch_add(1,Ordering::SeqCst);let mut target=tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST,port)).await.unwrap();joins.push(tokio::spawn(async move{let _=tokio::io::copy_bidirectional(&mut incoming,&mut target).await;}));}
@@ -80,8 +80,8 @@ impl Fixture{
         let event=bounded(events.recv()).await.unwrap();if mode==Mode::RejectedLogin{assert!(event.terminal_failure(&owner,&scope).is_some());}else{assert!(matches!(&event.events_for(&owner,&scope).unwrap()[0],OfflineEvent::Callback(c)if c.callback==Callback::SdkLogin{success:true}));bounded(command.configure(&owner,&scope,77,None)).await.unwrap();}
         Self{handle,events,owner,scope,gate,seen:seen_rx,release:Some(release),done:Some(done),sdk:Some(sdk),relay:Some(relay),reads,connections}
     }
-    fn action(&self,ms:u64)->Arc<AliasAction>{AliasAction::capture(&self.owner,&self.scope,self.gate.clone(),Instant::now()+Duration::from_millis(ms)).unwrap()}
-    async fn close(mut self,logout:bool){
+    pub(super) fn action(&self,ms:u64)->Arc<AliasAction>{AliasAction::capture(&self.owner,&self.scope,self.gate.clone(),Instant::now()+Duration::from_millis(ms)).unwrap()}
+    pub(super) async fn close(mut self,logout:bool){
         let released=if logout{bounded(self.handle.logout(&self.owner,&self.scope,&[])).await.unwrap()}else{bounded(self.handle.close()).await};assert!(released.io_released());assert!(!self.scope.is_open());
         self.done.take().unwrap().send(()).unwrap();bounded(self.sdk.take().unwrap()).await.unwrap();bounded(self.relay.take().unwrap()).await.unwrap();assert_eq!(self.connections.load(Ordering::SeqCst),2);
     }

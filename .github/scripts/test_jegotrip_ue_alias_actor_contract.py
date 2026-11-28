@@ -45,4 +45,17 @@ class AliasActor(unittest.TestCase):
   q=s('ue_alias_snapshot').split('fn sampled_outcome',1)[1].split('fn outcome',1)[0]
   self.assertEqual(q.count('Instant::now()'),1);self.assertNotIn('is_waiting(',q)
   self.assertIn('if observation.expired(){RuntimeError::Timeout}',s('ue_alias_actor'))
+ def test_invite_fixture_setup_precedes_claim_without_changing_production_deadline(self):
+  t=s('native_invite_liveness_tests');setup=t.split('fn native_context()',1)[1].split('fn receipt(',1)[0]
+  self.assertLess(setup.index('Certificates::generate'),setup.index('super::native_context()'))
+  body=t.split('fn receipt(',1)[1].split('#[test]',1)[0]
+  self.assertIn('native_invite_receipts::consume',body);self.assertNotIn('Certificates::generate',body);self.assertNotIn('TempDatabase::new',body)
+  self.assertNotIn('fixture_consumed',t);self.assertIn('Instant::now() >= self.deadline',s('native_invite_notifications'))
+ def test_only_submitted_alias_result_wait_is_excluded_from_connection_io_expiry(self):
+  q=s('arc_protocol');self.assertIn('self._client_only&&self._alias_sequence.is_some()&&self._client_holders.is_empty()',q)
+  actor=s('transport_actor');self.assertIn('if !packets.alias_only(){self.pending.insert(packets.call_id,rpc_deadline);}',actor)
+  self.assertIn('if !is_response && !packets.alias_only()',actor)
+  self.assertLess(actor.index('let sent ='),actor.index('if let Some(wait)=alias_wait{'))
+  io=s('arc_native_actor');self.assertIn('filter(|(id,_)|!self.im_pending.contains_key(*id)).map(|(_,end)|*end).chain(extra)',io)
+  self.assertIn('chain(self.common.as_ref().and_then(CommonPath::next_deadline))',io)
 if __name__=='__main__':unittest.main()

@@ -1141,7 +1141,10 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             self.backend.client_read_state_mut().client_read_outer.insert(packets.call_id,sequences);
         }
         if let Some(wait)=alias_wait{
-            self.pending.insert(packets.call_id,rpc_deadline);self.retain_alias_pending(wait);
+            // READ-result timeout is independent after full physical submission;
+            // mixed work still owns the existing fatal outer/IO deadline.
+            if !packets.alias_only(){self.pending.insert(packets.call_id,rpc_deadline);}
+            self.retain_alias_pending(wait);
             let _=command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),Some(packets.call_id))));
             self.retire_client_reads(Instant::now());return Ok(());
         }
@@ -1186,7 +1189,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             self.pending.insert(packets.call_id,rpc_deadline);self.backend.relation_actor_state_mut().pending.insert(packets.call_id,RelationPending{permit:work.permit,deadline:rpc_deadline,reply:work.reply});
             if command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),Some(packets.call_id)))).is_err(){self.retire_relation_updates(Instant::now());return Err(RuntimeError::Cancelled);}return Ok(());
         }
-        if !is_response { self.pending.insert(packets.call_id,rpc_deadline); }
+        if !is_response && !packets.alias_only() { self.pending.insert(packets.call_id,rpc_deadline); }
         if let Some((ticket,operation,completion))=call_wait{
             self.call_pending.insert(packets.call_id,CallPending{ticket,operation,deadline:rpc_deadline,completion});
         }

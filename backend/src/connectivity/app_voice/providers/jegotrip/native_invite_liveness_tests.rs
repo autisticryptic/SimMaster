@@ -2,10 +2,22 @@
 use super::*;
 use n::{native_invite_notifications::ConsumerClaim,native_invite_receipts::{self,InviteConsumptionReceipt},account_test_support::{TempDatabase,config},account_runtime::local_nonce};
 use std::time::{Duration,Instant};
+// Prepare slow synthetic RSA/schema/account/history inputs BEFORE a call ticket
+// and its unchanged one-second ConsumerClaim exist. Receipt consumption itself
+// remains the actual SQLite transaction at the original test's call site.
+struct ReceiptSetup{temp:TempDatabase,run:n::account_runs::RunToken,history:n::account_call_history::HistoryTicket}
+std::thread_local!{static RECEIPT_SETUP:std::cell::RefCell<Option<ReceiptSetup>>=const{std::cell::RefCell::new(None)};}
+fn native_context()->(ArcRpcSession,AttemptOwner,RpcConnectionScope,CallDispatcher){
+    RECEIPT_SETUP.with(|slot|{let needed=slot.borrow().is_none();if needed{
+        let temp=TempDatabase::new();let cert=n::tls_engine::tests::Certificates::generate("DNS:fixture.invalid");let line=format!("app-account-{}",local_nonce().unwrap());
+        temp.database.with_conn(|conn|n::account_store::create(conn,&line,&config(&cert.root),100)).unwrap();let run=temp.database.with_conn(|conn|n::account_runs::register_runtime(conn,&line,1,&local_nonce().unwrap())).unwrap();
+        let history=n::account_call_history::insert(&temp.database,&run,&local_nonce().unwrap(),"").unwrap();*slot.borrow_mut()=Some(ReceiptSetup{temp,run,history});
+    }});
+    super::native_context()
+}
 fn receipt(id:u64,fingerprint:[u8;32])->InviteConsumptionReceipt{
-    let temp=TempDatabase::new();let cert=n::tls_engine::tests::Certificates::generate("DNS:fixture.invalid");let line=format!("app-account-{}",local_nonce().unwrap());
-    temp.database.with_conn(|conn|n::account_store::create(conn,&line,&config(&cert.root),100)).unwrap();let run=temp.database.with_conn(|conn|n::account_runs::register_runtime(conn,&line,1,&local_nonce().unwrap())).unwrap();
-    let history=n::account_call_history::insert(&temp.database,&run,&local_nonce().unwrap(),"").unwrap();native_invite_receipts::consume(&temp.database,&run,&history,id,&fingerprint).unwrap()
+    let setup=RECEIPT_SETUP.with(|slot|slot.borrow_mut().take()).expect("fixture prepared before original claim");
+    native_invite_receipts::consume(&setup.temp.database,&setup.run,&setup.history,id,&fingerprint).unwrap()
 }
 #[test]
 fn committed_invite_claim_binds_original_live_call_and_cannot_survive_release(){

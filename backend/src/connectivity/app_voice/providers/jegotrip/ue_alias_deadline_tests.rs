@@ -1,4 +1,6 @@
 //! Deterministic distinction of expiration from pre-deadline retirement.
+#[path="ue_alias_outer_deadline_tests.rs"]
+mod outer;
 use super::*;
 use n::batch_scheduler::AliasOutcome;
 #[test]

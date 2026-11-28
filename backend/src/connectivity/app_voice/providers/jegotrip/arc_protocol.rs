@@ -36,6 +36,9 @@ impl OwnedCallPackets{
     fn uncharged(call_id:i32,packets:Vec<TransportBytes>)->Self{Self{call_id,packets,_send_budget:None,_client_holders:Vec::new(),_client_packet_budget:None,_client_only:false,_has_business_work:true,_alias_sequence:None}}
     pub(super) fn has_business_work(&self)->bool{self._has_business_work}
     pub(super) fn client_only(&self)->bool{self._client_only}
+    /// A fully sent alias-only outer waits under its own READ deadline. Any
+    /// hosting/result WRITE or another Client request keeps existing handling.
+    pub(super) fn alias_only(&self)->bool{self._client_only&&self._alias_sequence.is_some()&&self._client_holders.is_empty()}
     pub(super) fn client_sequences(&self)->Vec<i32>{self._client_holders.iter().map(|request|request.sequence()).chain(self._alias_sequence).collect()}
 }
 
