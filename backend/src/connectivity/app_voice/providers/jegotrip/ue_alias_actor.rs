@@ -63,7 +63,7 @@ impl<I> Actor<I> where I:AsyncRead+AsyncWrite+Unpin+Send+'static{
         let Some(p)=self.backend.client_read_state().alias.as_ref()else{return;};
         if outcome.is_ok()&&p.wait.outcome()!=Some(Ok(())){return;}
         let p=self.backend.client_read_state_mut().alias.take().expect("original alias completion");
-        let result=outcome.and_then(|()|AliasObservation::original(p.wait,p.work.action.clone()).map_err(error));
+        let result=match outcome{Ok(())=>AliasObservation::original(p.wait,p.work.action.clone()).map_err(error),Err(error)=>Err(error)};
         let _=p.work.reply.send(result);self.retire_client_reads(Instant::now());
     }
     pub(super) fn retire_alias_read(&mut self,now:Instant){

@@ -35,4 +35,8 @@ class AliasActor(unittest.TestCase):
   self.assertIn('#[path="ue_alias_actor_io_tests.rs"]\nmod ue_alias;',s('arc_native_actor_tests'))
   for name in ['build-release.yml','beta-validation.yml']:
    w=(R/'.github/workflows'/name).read_text(encoding='utf-8');self.assertIn('connectivity::app_voice::providers::jegotrip::transport_actor::native::tests',w);self.assertNotIn('RUST_MIN_STACK',w)
+ def test_completion_moves_only_wait_not_boxed_pending_sender(self):
+  body=s('ue_alias_actor').split('fn finish_alias_delivery',1)[1].split('fn retire_alias_read',1)[0]
+  self.assertIn('let result=match outcome{Ok(())=>AliasObservation::original(p.wait,p.work.action.clone()).map_err(error),Err(error)=>Err(error)};',body)
+  self.assertIn('p.work.reply.send(result)',body);self.assertNotIn('outcome.and_then(',body)
 if __name__=='__main__':unittest.main()
