@@ -48,6 +48,7 @@ impl PreparedCommonRuntime{
         let host=endpoint.router_host().map_err(|_|failed(RuntimeError::InvalidConfiguration))?;
         if matches!(host,super::super::object_reference::RouterHost::Address(_))&&index!=0{return Err(failed(RuntimeError::InvalidConfiguration));}
         self.backend.as_mut().ok_or_else(||failed(RuntimeError::Closed))?.bind_common_identity(identity).map_err(|_|failed(RuntimeError::InvalidConfiguration))?;
+        self.backend.as_mut().ok_or_else(||failed(RuntimeError::Closed))?.bind_alias_transport(router_policy).map_err(|_|failed(RuntimeError::InvalidConfiguration))?;
         timeouts.startup=timeouts.startup.min(self.attempt_end.duration_since(now));
         let connecting=async{
             let router=RouterPath::open(self.owner.clone(),self.scope.clone(),router_policy,access,timeouts).await.map_err(|error|{

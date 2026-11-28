@@ -17,6 +17,16 @@ impl OfflineBackend {
         self.ue_origin = Some(source);
         Ok(packet)
     }
+    pub(in super::super) fn bind_alias_transport(&mut self,router:&RouterPolicy)->Result<(),ProtocolError>{
+        if self.phase()!=ArcPhase::Initial||self.client_actor.alias_router.is_some(){return Err(CodecError::InvalidField.into());}
+        self.client_actor.alias_router=Some(router.original_identity());Ok(())
+    }
+    pub(in super::super) fn prepare_bound_alias_login(&mut self, binding: super::super::ue_alias_login::AliasLogin,
+        inputs: ArcLoginInputs<'_>, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
+        let owner=self.tracker.batch_owner()?;let scope=self.connection_scope();
+        if self.ue_origin.is_some()||self.client_actor.alias_router.as_ref().is_none_or(|r|!binding.transport_matches(r))||!binding.current(&owner,&scope,&inputs)||!self.protocol.initial_common_object_is(binding.entry()){return Err(CodecError::InvalidField.into());}
+        let packets=self.prepare_login(inputs,routing)?;self.ue_origin=Some(binding.into_origin());Ok(packets)
+    }
     pub(in super::super) fn begin_ue_alias_read(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope, deadline: Instant) -> Result<AliasWait, ProtocolError> {
         let source = self.ue_origin.as_ref().ok_or(CodecError::InvalidField)?;
         if self.phase() != ArcPhase::Authenticated || !source.matches(owner, scope) { return Err(CodecError::InvalidField.into()); }

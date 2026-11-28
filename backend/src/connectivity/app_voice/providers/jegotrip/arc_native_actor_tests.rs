@@ -1,4 +1,6 @@
 //! Actions-only original Router/TLS/Channel/Common -> ARC actor regressions.
+#[path="ue_alias_actor_io_tests.rs"]
+mod ue_alias;
 #[path = "startup_diagnostics_tests.rs"]
 mod startup_diagnostics;
 #[path="im_read_actor_tests.rs"]

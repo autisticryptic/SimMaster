@@ -31,12 +31,12 @@ impl From<CodecError> for ProtocolError { fn from(error: CodecError) -> Self { S
 impl From<TransportError> for ProtocolError { fn from(error: TransportError) -> Self { Self::Transport(error) } }
 impl From<BatchError> for ProtocolError { fn from(error: BatchError) -> Self { Self::Batch(error) } }
 
-pub struct OwnedCallPackets { pub call_id: i32, pub packets: Vec<TransportBytes>, _send_budget:Option<std::sync::Arc<super::rpc_im_send::ImSendRpcRequest>>,_client_holders:Vec<std::sync::Arc<super::user_entry_client::ClientUserEntryRequest>>,_client_packet_budget:Option<std::sync::Arc<super::native_rpc_budget::NativeRpcReservation>>,_client_only:bool,_has_business_work:bool }
+pub struct OwnedCallPackets { pub call_id: i32, pub packets: Vec<TransportBytes>, _send_budget:Option<std::sync::Arc<super::rpc_im_send::ImSendRpcRequest>>,_client_holders:Vec<std::sync::Arc<super::user_entry_client::ClientUserEntryRequest>>,_client_packet_budget:Option<std::sync::Arc<super::native_rpc_budget::NativeRpcReservation>>,_client_only:bool,_has_business_work:bool,_alias_sequence:Option<i32> }
 impl OwnedCallPackets{
-    fn uncharged(call_id:i32,packets:Vec<TransportBytes>)->Self{Self{call_id,packets,_send_budget:None,_client_holders:Vec::new(),_client_packet_budget:None,_client_only:false,_has_business_work:true}}
+    fn uncharged(call_id:i32,packets:Vec<TransportBytes>)->Self{Self{call_id,packets,_send_budget:None,_client_holders:Vec::new(),_client_packet_budget:None,_client_only:false,_has_business_work:true,_alias_sequence:None}}
     pub(super) fn has_business_work(&self)->bool{self._has_business_work}
     pub(super) fn client_only(&self)->bool{self._client_only}
-    pub(super) fn client_sequences(&self)->Vec<i32>{self._client_holders.iter().map(|request|request.sequence()).collect()}
+    pub(super) fn client_sequences(&self)->Vec<i32>{self._client_holders.iter().map(|request|request.sequence()).chain(self._alias_sequence).collect()}
 }
 
 impl fmt::Debug for OwnedCallPackets {
@@ -272,7 +272,7 @@ impl ArcProtocol {
             let actual=super::client_packet_retention::ClientPacketRetention::original(holders.clone(),budget.clone(),batch.alias_holder());
             for packet in &mut packets.packets{packet.retain_client_packet(actual.clone());}
         }
-        packets._client_holders=holders;packets._client_packet_budget=charge;packets._client_only=batch.client_only();packets._has_business_work=batch.has_business_work();Ok(packets)
+        packets._alias_sequence=batch.alias_sequence();packets._client_holders=holders;packets._client_packet_budget=charge;packets._client_only=batch.client_only();packets._has_business_work=batch.has_business_work();Ok(packets)
     }
 
     fn packets(&mut self, id: i32, bytes: &[u8]) -> Result<OwnedCallPackets, ProtocolError> {

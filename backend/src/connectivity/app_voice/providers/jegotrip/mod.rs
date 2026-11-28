@@ -7,6 +7,8 @@
 //! before this provider can be installed as available.
 pub mod batch_scheduler;
 mod ue_alias_data;
+mod ue_alias_action;
+mod ue_alias_login;
 mod batch_retention;
 pub mod arc_protocol;
 mod direct_history;

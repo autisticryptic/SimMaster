@@ -61,7 +61,8 @@ impl AliasOrigin {
 }
 impl fmt::Debug for AliasOrigin { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("AliasOrigin(<redacted>)") } }
 
-pub(in super::super) struct AliasRead { origin: Arc<AliasOrigin>, sequence: i32, deadline: Instant, _charge: Arc<NativeRpcReservation> }
+pub(in super::super) struct AliasRead { origin: Arc<AliasOrigin>, sequence: i32, deadline: Instant,
+    outcome: Mutex<Option<Result<(), CodecError>>>, actor_interest: Mutex<Option<(Arc<ImReceiptGate>,Arc<ImReceiptGate>)>>, _charge: Arc<NativeRpcReservation> }
 impl AliasRead {
     pub(super) fn start(origin: &Arc<AliasOrigin>, sequence: i32, deadline: Instant) -> Result<Arc<Self>, CodecError> {
         let mut s = origin.state();
@@ -70,15 +71,16 @@ impl AliasRead {
             || deadline.saturating_duration_since(now) > std::time::Duration::from_secs(30)
             || s.waiting.upgrade().is_some_and(|old| now < old.deadline) { return Err(CodecError::InvalidField); }
         let charge = origin.scope.reserve_native_rpc(size_of::<Self>() + 4096)?;
-        let read = Arc::new(Self { origin: origin.clone(), sequence, deadline, _charge: charge });
+        let read = Arc::new(Self { origin: origin.clone(), sequence, deadline, outcome: Mutex::new(None), actor_interest: Mutex::new(None), _charge: charge });
         s.waiting = Arc::downgrade(&read);
         s.observed = Weak::new();
         Ok(read)
     }
     pub(super) fn sequence(&self) -> i32 { self.sequence }
     fn is_waiting(&self, s: &State) -> bool {
-        std::ptr::eq(s.waiting.as_ptr(), self) && !s.retired && self.origin.live() && Instant::now() < self.deadline
+        std::ptr::eq(s.waiting.as_ptr(), self) && !s.retired && self.origin.live() && self.actor_current() && Instant::now() < self.deadline
     }
+    fn actor_current(&self)->bool{self.actor_interest.lock().unwrap_or_else(|p|p.into_inner()).as_ref().is_none_or(|(interest,parent)|interest.live()&&parent.live())}
     pub(in super::super) fn pending(&self) -> bool { self.is_waiting(&self.origin.state()) }
     pub(in super::super) fn cancel(&self) {
         let mut s = self.origin.state(); if std::ptr::eq(s.waiting.as_ptr(), self) { s.waiting = Weak::new(); }
@@ -105,22 +107,35 @@ impl StagedAliases {
         let mut s = origin.state();
         if !self.read.is_waiting(&s) { return; }
         s.waiting = Weak::new();
-        if let Ok(rows) = self.rows {
-            s.snapshot = Some(rows);
-            s.observed = Arc::downgrade(&self.read);
-        }
+        let outcome = match self.rows {
+            Ok(rows) => { s.snapshot = Some(rows); s.observed = Arc::downgrade(&self.read); Ok(()) }
+            Err(error) => Err(error),
+        };
+        *self.read.outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(outcome);
     }
 }
 pub(in super::super) struct AliasWait(Arc<AliasRead>);
 impl AliasWait {
     pub(in super::super) fn original(read: Arc<AliasRead>) -> Self { Self(read) }
     pub(in super::super) fn sequence(&self) -> i32 { self.0.sequence }
+    pub(in super::super) fn attach_actor_interest(&self,gate:Arc<ImReceiptGate>,parent:Arc<ImReceiptGate>)->bool{
+        let state=self.0.origin.state();if !self.0.is_waiting(&state)||!gate.live()||!parent.live(){return false;}
+        let mut slot=self.0.actor_interest.lock().unwrap_or_else(|p|p.into_inner());if slot.is_some(){return false;}*slot=Some((gate,parent));true
+    }
+    pub(in super::super) fn outcome(&self) -> Option<Result<(), CodecError>> {
+        let read = &self.0; let s = read.origin.state();
+        if s.retired || !read.origin.live() || !read.actor_current() || Instant::now() >= read.deadline { return Some(Err(CodecError::InvalidField)); }
+        let value = *read.outcome.lock().unwrap_or_else(|p| p.into_inner());
+        if value == Some(Ok(())) && !std::ptr::eq(s.observed.as_ptr(), Arc::as_ptr(read)) { return Some(Err(CodecError::InvalidField)); }
+        if value.is_none() && !read.is_waiting(&s) { return Some(Err(CodecError::InvalidField)); }
+        value
+    }
     /// Read-only DATA from exactly this successful, still-current full reply.
     /// Failure, supersession or even a selective mutation cannot borrow it.
     pub(in super::super) fn observed_pair(&self, owner: &AttemptOwner, scope: &RpcConnectionScope, kind: &[u8], value: &[u8]) -> Option<bool> {
         let read = &self.0; let origin = &read.origin; let s = origin.state();
         if &origin.owner != owner || !origin.scope.matches(scope) || !origin.live() || s.retired
-            || Instant::now() >= read.deadline || !std::ptr::eq(s.observed.as_ptr(), Arc::as_ptr(read))
+            || !read.actor_current() || Instant::now() >= read.deadline || !std::ptr::eq(s.observed.as_ptr(), Arc::as_ptr(read))
             || kind.is_empty() || value.is_empty() { return None; }
         s.snapshot.as_ref().map(|rows| rows.contains(kind, value))
     }

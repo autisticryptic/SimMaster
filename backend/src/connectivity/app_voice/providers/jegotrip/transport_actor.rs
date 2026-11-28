@@ -45,6 +45,9 @@ mod user_entry;
 mod client_user_entry;
 use client_user_entry::{ClientReadWork,ClientReadPending};
 pub(super) use client_user_entry::ClientReadState;
+#[path="ue_alias_actor.rs"]
+mod ue_alias;
+use ue_alias::{AliasLoginWork,AliasReadWork};
 use std::{fmt, future::poll_fn, io, pin::Pin, sync::Arc, task::Poll, time::{Duration, Instant}};
 use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite}, sync::{mpsc, oneshot}, task::JoinHandle};
 use zeroize::{Zeroize, Zeroizing};
@@ -167,6 +170,7 @@ impl Gateway {
 }
 
 enum Operation {
+    AliasLogin(Box<AliasLoginWork>), ReadAliases(Box<AliasReadWork>),
     Login(Login, Vec<Property>), Bootstrap(Zeroizing<Vec<u8>>, Vec<Property>), Configure(u32, Option<Binding>), ArmClientEx(Binding), ConfigureClientEx, ConfigureCalls(CallBinding), Logout(Vec<Property>),
     Swap(Vec<Property>, Option<Gateway>), CompleteBatch(ServerRequestTicket, bool), CompleteDirect(DirectReplyTicket, bool), CompleteCall(CallReplyTicket,bool,Vec<Property>),
     CompleteInvite(super::native_invite_notifications::InviteReplyTicket, bool),
@@ -194,6 +198,7 @@ impl Operation {
             Self::Login(login, routing) => [&login.identity, &login.domain, &login.selector, &login.phone, &login.key,
                 &login.domain_id, &login.application_id, &login.cc].iter().map(|v| v.len()).sum::<usize>()
                 + login.properties.iter().chain(routing).map(|p| p.key.len() + p.value.len()).sum::<usize>(),
+            Self::AliasLogin(work)=>work.bytes(), Self::ReadAliases(work)=>work.bytes(),
             Self::Bootstrap(key, routing) => key.len() + routing.iter().map(|p| p.key.len() + p.value.len()).sum::<usize>(),
             Self::Logout(routing) | Self::GetOffline(_, routing) => routing.iter().map(|p| p.key.len() + p.value.len()).sum(),
             Self::Configure(_, incoming) => incoming.as_ref().map_or(0, |b| b.object.len() + b.domain.len() + b.receiver.len()),
@@ -737,6 +742,7 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
                 if let Some(error) = error { return Err(error); }
             }
         }
+        self.finish_alias_delivery(outcome);
         outcome
     }
     async fn deliver_events(&mut self, events: Vec<OfflineEvent>, unhosting_accepted: &mut bool,call_replies:&mut Vec<OwnedCallOperationReply>) -> Result<(), RuntimeError> {
@@ -831,14 +837,18 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             if !proof.authorizes(&data.0,now){let _=command.completion.send(Err(RuntimeError::Scope));return Ok(());}
             im_gates.push(proof.gate());let end=data.0.deadline();invite_deadline=Some(invite_deadline.map_or(end,|original|original.min(end)));
         }}
-        if matches!(&command.operation, Operation::Swap(_, _) | Operation::ClientUserEntry(_)) {
+        if matches!(&command.operation, Operation::Swap(_, _) | Operation::ClientUserEntry(_) | Operation::ReadAliases(_)) {
             let (gates,deadline)=self.backend.im_write_guard();im_gates.extend(gates);
             if let Some(deadline)=deadline{invite_deadline=Some(invite_deadline.map_or(deadline,|original|original.min(deadline)));}
             let (claims, deadline) = self.backend.invite_write_guard(); invite_claims.extend(claims);
             if let Some(deadline) = deadline { invite_deadline = Some(invite_deadline.map_or(deadline, |original| original.min(deadline))); }
         }
+        if let Operation::ReadAliases(work)=&command.operation {
+            let end=command.admitted.checked_add(self.policy.rpc_timeout.min(Duration::from_secs(30))).ok_or(RuntimeError::Timeout)?.min(work.deadline());
+            if now>=end {if let Operation::ReadAliases(work)=command.operation{work.reject(RuntimeError::Timeout);}let _=command.completion.send(Err(RuntimeError::Timeout));return Ok(());}
+        }
         let native_deadline=if self.common.is_some(){
-            let wait=if matches!(&command.operation,Operation::Login(..)){Duration::from_secs(90)}else{self.policy.rpc_timeout};
+            let wait=if matches!(&command.operation,Operation::Login(..)|Operation::AliasLogin(_)){Duration::from_secs(90)}else{self.policy.rpc_timeout};
             let mut end=command.admitted.checked_add(wait).ok_or(RuntimeError::Timeout)?;
             if self.backend.phase()!=ArcPhase::Authenticated{if let Some(attempt)=self.native_attempt_end{end=end.min(attempt);}}
             if now>=end{let _=command.completion.send(Err(RuntimeError::Timeout));return Err(RuntimeError::Timeout);}Some(end)
@@ -850,14 +860,19 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         // controller waits may clip it, never restart its timeout on admission.
         let native_deadline=match &command.operation{Operation::ImRead(work)=>native_deadline.map(|end|work.query.clipped_deadline(end)),_=>native_deadline};
         if native_deadline.is_some_and(|deadline| now >= deadline) { let _ = command.completion.send(Err(RuntimeError::Timeout)); return Ok(()); }
-        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _) | Operation::ImRead(_) | Operation::WriteReceived(_) | Operation::UserMarkRead(_) | Operation::ImSend(_) | Operation::ClientUserEntry(_)) {
+        if self.pending.len() >= MAX_PENDING_RPC && matches!(&command.operation, Operation::Login(_, _) | Operation::Bootstrap(_, _) | Operation::Swap(_, _) | Operation::Call(_,_,_,_) | Operation::GetOffline(_, _) | Operation::ImRead(_) | Operation::WriteReceived(_) | Operation::UserMarkRead(_) | Operation::ImSend(_) | Operation::ClientUserEntry(_) | Operation::ReadAliases(_) | Operation::AliasLogin(_)) {
             let _ = command.completion.send(Err(RuntimeError::Backpressure)); return Ok(());
         }
         let is_response = matches!(&command.operation, Operation::CompleteGroupEvent(_)|Operation::CompleteDirect(_, _) | Operation::CompleteCall(_,_,_) | Operation::CompleteOfflineHint(_, _) | Operation::CompleteInvite(_, _) | Operation::CompleteIm(_) | Operation::CompleteImStatus(_));
         let is_logout = matches!(&command.operation, Operation::Logout(_));
-        let mut unhosting_sequence = None;let mut call_wait=None;let mut im_wait=None;let mut received_wait=None;let mut user_wait=None;let mut send_wait=None;let mut relation_wait=None;let mut client_wait=None;
+        let mut unhosting_sequence = None;let mut call_wait=None;let mut im_wait=None;let mut received_wait=None;let mut user_wait=None;let mut send_wait=None;let mut relation_wait=None;let mut client_wait=None;let mut alias_wait=None;
         let elapsed_ms = self.elapsed_ms(now);
         let prepared = match command.operation {
+            Operation::AliasLogin(work)=>self.prepare_alias_login(*work),
+            Operation::ReadAliases(work)=>match Box::pin(self.prepare_alias_read(*work,native_deadline,elapsed_ms)).await{
+                Ok((packets,wait))=>{alias_wait=Some(wait);Ok(packets)},
+                Err(error)=>{let _=command.completion.send(Err(error));return Ok(());}
+            },
             Operation::ArmRelationEvents(config)=>{let result=self.backend.arm_relation_events(config).map_err(|_|RuntimeError::InvalidConfiguration);if command.completion.send(result.map(|()|RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),None))).is_err(){return Err(RuntimeError::Cancelled);}return Ok(());}
             Operation::CompleteGroupEvent(data)=>{match self.backend.complete_group_event(&data.0,data.1.as_ref()){
                 Ok(Some(super::offline_backend::CallCompletion::Direct(p)))=>Ok(p),
@@ -1083,11 +1098,12 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         // Keep one heap-owned transport future, not two large inline copies
         // in the new guarded/legacy branches. Standard test stack and all IO
         // deadlines/gates remain unchanged, including when Invite is absent.
-        let read_owned_frame=client_wait.is_some()||packets.client_only();
+        let read_owned_frame=client_wait.is_some()||alias_wait.is_some()||packets.client_only();
         // This actor still owns and Joins the indivisible frame. READ waiter
         // retirement does not abort it; existing mixed WRITE gates still do.
         #[cfg(test)]
         if let Some((_,work))=&client_wait{if let Some(test)=work.query.action().client_io_test(){if test.is_prefix(){self.common.as_mut().ok_or(RuntimeError::Closed)?.gate_client_read_test(test);}}}
+        #[cfg(test)] if let Some(wait)=&alias_wait{self.alias_prefix_test(wait)?;}
         let completion=if read_owned_frame{None}else{Some(&mut command.completion)};
         let mut sending = Box::pin(self.send_packets(&packets.packets,completion,native_deadline));
         let sent = if !invite_claims.is_empty() || !im_gates.is_empty() {
@@ -1120,9 +1136,14 @@ impl<I> Actor<I> where I: AsyncRead + AsyncWrite + Unpin + Send + 'static {
             self.backend.retire_request(packets.call_id); let _ = command.completion.send(Err(error)); return Err(error);
         }
         let rpc_deadline=native_deadline.unwrap_or(Instant::now().checked_add(self.policy.rpc_timeout).ok_or(RuntimeError::Timeout)?);
-        if packets.client_only()||client_wait.is_some()&&!packets.has_business_work(){
+        if packets.client_only()||client_wait.is_some()&&!packets.has_business_work()||alias_wait.is_some()&&!packets.has_business_work(){
             let mut sequences=packets.client_sequences();if let Some((sequence,_))=&client_wait{if !sequences.contains(sequence){sequences.push(*sequence);}}
             self.backend.client_read_state_mut().client_read_outer.insert(packets.call_id,sequences);
+        }
+        if let Some(wait)=alias_wait{
+            self.pending.insert(packets.call_id,rpc_deadline);self.retain_alias_pending(wait);
+            let _=command.completion.send(Ok(RuntimeReceipt::new(self.owner.clone(),self.scope.clone(),Some(packets.call_id))));
+            self.retire_client_reads(Instant::now());return Ok(());
         }
         if let Some((sequence,work))=client_wait{
             self.pending.insert(packets.call_id,rpc_deadline);

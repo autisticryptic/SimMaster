@@ -21,7 +21,9 @@ pub struct RouterPolicy { reference:Zeroizing<String>, targets:Vec<Target>, iden
     #[cfg(test)]test_connect_gate:Option<Arc<super::router_connect_detail_test_gate::RouterConnectTestGate>>,
 }
 pub(super) struct RouterPolicyIdentity(Arc<()>);
-impl RouterPolicyIdentity{pub fn matches(&self,policy:&RouterPolicy)->bool{Arc::ptr_eq(&self.0,&policy.identity)}}
+impl RouterPolicyIdentity{pub fn matches(&self,policy:&RouterPolicy)->bool{Arc::ptr_eq(&self.0,&policy.identity)}
+    pub(super) fn same(&self,other:&Self)->bool{Arc::ptr_eq(&self.0,&other.0)}
+}
 impl fmt::Debug for RouterPolicyIdentity{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("RouterPolicyIdentity(<redacted>)")}}
 impl fmt::Debug for RouterPolicy {fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {f.write_str("RouterPolicy(<redacted>)")} }
 impl RouterPolicy {

@@ -134,7 +134,7 @@ impl ScheduledBatch {
             results: self.bucket.results.iter().map(|(&s, r)| (s, r.borrowed())).collect() }
     }
     pub(super) fn has_business_work(&self)->bool{!self.bucket.results.is_empty()||self.bucket.requests.values().any(|request|request.client.is_none() && request.alias.is_none())}
-    pub(super) fn client_only(&self)->bool{!self.bucket.requests.is_empty()&&self.bucket.results.is_empty()&&self.bucket.requests.values().all(|request|request.client.is_some())}
+    pub(super) fn client_only(&self)->bool{!self.bucket.requests.is_empty()&&self.bucket.results.is_empty()&&self.bucket.requests.values().all(|request|request.client.is_some() || request.alias.is_some())}
     pub(super) fn has_client_reads(&self)->bool{self.bucket.requests.values().any(|request|request.client.is_some() || request.alias.is_some())}
     pub(super) fn client_holders(&self)->Vec<Arc<super::user_entry_client::ClientUserEntryRequest>>{self.bucket.requests.values().filter_map(|request|request.client.clone()).collect()}
     pub(super) fn encoded_argument_bytes(&self,uid:usize,selector:usize)->Result<usize,CodecError>{

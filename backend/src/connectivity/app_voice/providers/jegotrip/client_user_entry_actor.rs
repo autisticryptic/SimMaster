@@ -7,8 +7,8 @@ pub(in super::super) struct ClientReadPending{pub(super) query:Arc<ClientUserEnt
 /// Kept behind OfflineBackend's already owned container so the original Actor
 /// layout, existing standard-stack literals and test definitions stay intact.
 #[derive(Default)]
-pub(in super::super) struct ClientReadState{pub(in super::super) client_read_pending:std::collections::BTreeMap<i32,ClientReadPending>,pub(in super::super) client_read_outer:std::collections::BTreeMap<i32,Vec<i32>>}
-impl ClientReadState{pub(in super::super) fn clear(&mut self){for p in self.client_read_pending.values(){p.query.interest().retire();}self.client_read_pending.clear();self.client_read_outer.clear();}}
+pub(in super::super) struct ClientReadState{pub(in super::super) client_read_pending:std::collections::BTreeMap<i32,ClientReadPending>,pub(in super::super) client_read_outer:std::collections::BTreeMap<i32,Vec<i32>>,pub(in super::super) alias:Option<Box<super::ue_alias::AliasPending>>,pub(in super::super) alias_router:Option<super::super::router_connector::RouterPolicyIdentity>}
+impl ClientReadState{pub(in super::super) fn clear(&mut self){for p in self.client_read_pending.values(){p.query.interest().retire();}self.client_read_pending.clear();self.client_read_outer.clear();self.alias=None;self.alias_router=None;}}
 fn mapped(error:RuntimeError)->UserEntryError{match error{RuntimeError::Timeout=>UserEntryError::Timeout,RuntimeError::Backpressure=>UserEntryError::Capacity,RuntimeError::InvalidConfiguration=>UserEntryError::Configuration,RuntimeError::Io|RuntimeError::Tls(_)=>UserEntryError::Transport,RuntimeError::Protocol=>UserEntryError::Protocol,_=>UserEntryError::Scope}}
 impl RuntimeCommands{
     pub(in super::super) async fn client_user_entry(&self,query:Arc<ClientUserEntryQuery>,routing:&[RpcProperty<'_>])->Result<OwnedUserEntryReply,UserEntryError>{
@@ -28,6 +28,7 @@ impl RuntimeCommands{
 }
 impl<I> Actor<I> where I:AsyncRead+AsyncWrite+Unpin+Send+'static{
     pub(super) fn retire_client_reads(&mut self,now:Instant){
+        self.retire_alias_read(now);
         let retired=self.backend.client_read_state().client_read_pending.iter().filter_map(|(&sequence,p)|{
             if now>=p.query.deadline(){Some((sequence,UserEntryError::Timeout))}
             else if p.reply.is_closed()||!p.query.matches(&self.owner,&self.scope){Some((sequence,UserEntryError::Scope))}else{None}
@@ -36,7 +37,7 @@ impl<I> Actor<I> where I:AsyncRead+AsyncWrite+Unpin+Send+'static{
         // Retire only READ-only outer RPC interest. Mixed frames keep all of
         // their original WRITE/control ACKs, deadlines, epochs and owners.
         let finished=self.backend.client_read_state().client_read_outer.iter().filter_map(|(&outer,sequences)|{
-            (!self.backend.is_pending(outer)||sequences.iter().all(|s|!self.backend.client_read_state().client_read_pending.contains_key(s))).then_some(outer)
+            (!self.backend.is_pending(outer)||sequences.iter().all(|s|!self.backend.client_read_state().client_read_pending.contains_key(s)) && !self.alias_sequences_pending(sequences)).then_some(outer)
         }).collect::<Vec<_>>();
         for outer in finished{self.backend.client_read_state_mut().client_read_outer.remove(&outer);self.backend.retire_request(outer);self.pending.remove(&outer);}
     }

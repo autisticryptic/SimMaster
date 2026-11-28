@@ -3,6 +3,7 @@ use super::*;
 use std::time::Instant;
 
 impl ScheduledBatch {
+    pub(in super::super) fn alias_sequence(&self)->Option<i32>{self.alias_holder().map(|r|r.sequence())}
     pub(in super::super) fn alias_holder(&self) -> Option<Arc<AliasRead>> {
         self.bucket.requests.values().find_map(|r| r.alias.clone())
     }
