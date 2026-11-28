@@ -1,0 +1,3 @@
+89ffd8ade9ca9690bb6864539fb22033c70e233807cf70a837ada8bf73ae7faa  ./frontend-dist.tar.gz
+8c221942c4e84432f34296ff465e5f7c478f8ba820521c30e4066473b914a5cf  ./simadmin-linux-amd64.tar.gz
+9b22f0fe7a78160d03f2ca2d76f2ce04def59670f3377c57b2e34c6a6eecf418  ./simadmin-linux-arm64.tar.gz
