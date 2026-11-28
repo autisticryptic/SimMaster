@@ -114,6 +114,7 @@ impl StagedAliases {
         *self.read.outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(outcome);
     }
 }
+pub(in super::super) enum AliasOutcome { Expired, Live(Option<Result<(), CodecError>>) }
 pub(in super::super) struct AliasWait(Arc<AliasRead>);
 impl AliasWait {
     pub(in super::super) fn original(read: Arc<AliasRead>) -> Self { Self(read) }
@@ -122,13 +123,20 @@ impl AliasWait {
         let state=self.0.origin.state();if !self.0.is_waiting(&state)||!gate.live()||!parent.live(){return false;}
         let mut slot=self.0.actor_interest.lock().unwrap_or_else(|p|p.into_inner());if slot.is_some(){return false;}*slot=Some((gate,parent));true
     }
-    pub(in super::super) fn outcome(&self) -> Option<Result<(), CodecError>> {
+    /// Sample the actual clipped READ deadline under its original state lock.
+    /// Do not compare an earlier actor tick with a later decoder clock: crossing
+    /// the deadline between those two reads is expiration, not cancellation.
+    pub(in super::super) fn sampled_outcome(&self) -> AliasOutcome {
         let read = &self.0; let s = read.origin.state();
-        if s.retired || !read.origin.live() || !read.actor_current() || Instant::now() >= read.deadline { return Some(Err(CodecError::InvalidField)); }
+        if Instant::now() >= read.deadline { return AliasOutcome::Expired; }
+        if s.retired || !read.origin.live() || !read.actor_current() { return AliasOutcome::Live(Some(Err(CodecError::InvalidField))); }
         let value = *read.outcome.lock().unwrap_or_else(|p| p.into_inner());
-        if value == Some(Ok(())) && !std::ptr::eq(s.observed.as_ptr(), Arc::as_ptr(read)) { return Some(Err(CodecError::InvalidField)); }
-        if value.is_none() && !read.is_waiting(&s) { return Some(Err(CodecError::InvalidField)); }
-        value
+        if value == Some(Ok(())) && !std::ptr::eq(s.observed.as_ptr(), Arc::as_ptr(read)) { return AliasOutcome::Live(Some(Err(CodecError::InvalidField))); }
+        if value.is_none() && !std::ptr::eq(s.waiting.as_ptr(), Arc::as_ptr(read)) { return AliasOutcome::Live(Some(Err(CodecError::InvalidField))); }
+        AliasOutcome::Live(value)
+    }
+    pub(in super::super) fn outcome(&self) -> Option<Result<(), CodecError>> {
+        match self.sampled_outcome() { AliasOutcome::Expired => Some(Err(CodecError::InvalidField)), AliasOutcome::Live(value) => value }
     }
     /// Read-only DATA from exactly this successful, still-current full reply.
     /// Failure, supersession or even a selective mutation cannot borrow it.

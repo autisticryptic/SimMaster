@@ -44,5 +44,6 @@ impl AliasObservation{
         if !self.action.matches(owner,scope){return None;}self.wait.observed_pair(owner,scope,kind,value)
     }
     pub(super) fn current(&self)->bool{self.action.live()&&self.wait.outcome()==Some(Ok(()))}
+    pub(super) fn expired(&self)->bool{Instant::now()>=self.action.deadline()||matches!(self.wait.sampled_outcome(),super::batch_scheduler::AliasOutcome::Expired)}
 }
 impl fmt::Debug for AliasObservation{fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str("AliasObservation(<redacted>)")}}

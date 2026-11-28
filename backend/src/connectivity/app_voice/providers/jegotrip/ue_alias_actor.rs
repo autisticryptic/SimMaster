@@ -31,7 +31,7 @@ impl RuntimeCommands{
         let complete=self.enqueue(owner,&scope,Operation::ReadAliases(Box::new(AliasReadWork{action:action.clone(),routing,reply,_charge:charge})))?;
         let operation=async{complete.await.map_err(|_|RuntimeError::Closed)??;result.await.map_err(|_|RuntimeError::Closed)?};
         let observation=tokio::select!{biased;_=action.retired()=>return Err(RuntimeError::Cancelled),r=tokio::time::timeout_at(action.deadline().into(),operation)=>r.map_err(|_|RuntimeError::Timeout)??};
-        if !observation.current(){return Err(RuntimeError::Cancelled);}interest.disarm();Ok(observation)
+        if !observation.current(){return Err(if observation.expired(){RuntimeError::Timeout}else{RuntimeError::Cancelled});}interest.disarm();Ok(observation)
     }
 }
 impl<I> Actor<I> where I:AsyncRead+AsyncWrite+Unpin+Send+'static{
@@ -64,13 +64,18 @@ impl<I> Actor<I> where I:AsyncRead+AsyncWrite+Unpin+Send+'static{
         if outcome.is_ok()&&p.wait.outcome()!=Some(Ok(())){return;}
         let p=self.backend.client_read_state_mut().alias.take().expect("original alias completion");
         let result=match outcome{Ok(())=>AliasObservation::original(p.wait,p.work.action.clone()).map_err(error),Err(error)=>Err(error)};
+        let result=if Instant::now()>=p.deadline{Err(RuntimeError::Timeout)}else{result};
         let _=p.work.reply.send(result);self.retire_client_reads(Instant::now());
     }
-    pub(super) fn retire_alias_read(&mut self,now:Instant){
+    pub(super) fn retire_alias_read(&mut self,_now:Instant){
         let Some(p)=self.backend.client_read_state().alias.as_ref()else{return;};
-        let state=if now>=p.deadline{Some(Err(RuntimeError::Timeout))}
-            else if p.work.reply.is_closed()||!p.work.action.matches(&self.owner,&self.scope){Some(Err(RuntimeError::Cancelled))}
-            else{p.wait.outcome().and_then(|v|v.err().map(|e|Err(error(e))))};
+        let state=match p.wait.sampled_outcome(){
+            super::super::batch_scheduler::AliasOutcome::Expired=>Some(Err(RuntimeError::Timeout)),
+            super::super::batch_scheduler::AliasOutcome::Live(value)=>{
+                if p.work.reply.is_closed()||!p.work.action.matches(&self.owner,&self.scope){Some(Err(RuntimeError::Cancelled))}
+                else{value.and_then(|v|v.err().map(|e|Err(error(e))))}
+            }
+        };
         if let Some(state)=state{let pending=self.backend.client_read_state_mut().alias.take().expect("original alias pending");
             let result=match state{Ok(())=>AliasObservation::original(pending.wait,pending.work.action.clone()).map_err(error),Err(error)=>Err(error)};
             let _=pending.work.reply.send(result);

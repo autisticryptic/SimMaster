@@ -1,4 +1,6 @@
 //! Original ARC + scheduler, with synthetic bootstrap/login and no devices or sockets.
+#[path="ue_alias_deadline_tests.rs"]
+mod deadline;
 use super::*;
 use n::{arc_protocol::OwnedCallPackets, batch_scheduler::AliasWait, rpc_stream::{CodecError, RpcProperty},
     runtime_provision::ProvisionedCommonLogin};

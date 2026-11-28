@@ -39,4 +39,10 @@ class AliasActor(unittest.TestCase):
   body=s('ue_alias_actor').split('fn finish_alias_delivery',1)[1].split('fn retire_alias_read',1)[0]
   self.assertIn('let result=match outcome{Ok(())=>AliasObservation::original(p.wait,p.work.action.clone()).map_err(error),Err(error)=>Err(error)};',body)
   self.assertIn('p.work.reply.send(result)',body);self.assertNotIn('outcome.and_then(',body)
+ def test_expiry_uses_typed_same_read_sample_not_an_earlier_actor_tick(self):
+  a=s('ue_alias_actor').split('fn retire_alias_read',1)[1]
+  self.assertIn('match p.wait.sampled_outcome()',a);self.assertIn('AliasOutcome::Expired=>Some(Err(RuntimeError::Timeout))',a)
+  q=s('ue_alias_snapshot').split('fn sampled_outcome',1)[1].split('fn outcome',1)[0]
+  self.assertEqual(q.count('Instant::now()'),1);self.assertNotIn('is_waiting(',q)
+  self.assertIn('if observation.expired(){RuntimeError::Timeout}',s('ue_alias_actor'))
 if __name__=='__main__':unittest.main()

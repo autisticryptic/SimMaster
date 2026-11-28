@@ -17,7 +17,7 @@ use std::{collections::{BTreeMap, BTreeSet}, fmt, sync::{atomic::{AtomicBool, Or
 
 #[path = "ue_alias_snapshot.rs"]
 mod ue_alias;
-pub(super) use ue_alias::{AliasOrigin, AliasRead, AliasWait, StagedAliases};
+pub(super) use ue_alias::{AliasOrigin, AliasRead, AliasWait, AliasOutcome, StagedAliases};
 #[path = "batch_ue_alias.rs"]
 mod alias_queue;
 
