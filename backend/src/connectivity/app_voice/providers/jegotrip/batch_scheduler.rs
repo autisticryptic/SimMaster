@@ -15,6 +15,12 @@ use super::{
 };
 use std::{collections::{BTreeMap, BTreeSet}, fmt, sync::{atomic::{AtomicBool, Ordering}, Arc}};
 
+#[path = "ue_alias_snapshot.rs"]
+mod ue_alias;
+pub(super) use ue_alias::{AliasOrigin, AliasRead, AliasWait, StagedAliases};
+#[path = "batch_ue_alias.rs"]
+mod alias_queue;
+
 pub const MAX_BATCH_EPOCHS: usize = 32;
 pub const BATCH_RETENTION_MS: u64 = 45_000;
 pub const REQUEST_DEDUP_BITS: usize = 2048;
@@ -58,7 +64,7 @@ impl BatchWords {
 }
 
 #[derive(Clone)]
-struct RequestData { method: Vec<u8>, arguments: Vec<u8>, metadata: Vec<(Vec<u8>, Vec<u8>)>, bytes: usize,client:Option<Arc<super::user_entry_client::ClientUserEntryRequest>> }
+struct RequestData { method: Vec<u8>, arguments: Vec<u8>, metadata: Vec<(Vec<u8>, Vec<u8>)>, bytes: usize,client:Option<Arc<super::user_entry_client::ClientUserEntryRequest>>, alias: Option<Arc<AliasRead>> }
 
 impl RequestData {
     fn measure(request: &BatchRequest<'_>) -> Result<usize, CodecError> {
@@ -78,16 +84,17 @@ impl RequestData {
     fn capture(request: &BatchRequest<'_>) -> Result<Self, CodecError> {
         let bytes = Self::measure(request)?;
         Ok(Self { method: request.method.to_vec(), arguments: request.arguments.to_vec(),
-            metadata: request.metadata.iter().map(|p| (p.key.to_vec(), p.value.to_vec())).collect(), bytes,client:None })
+            metadata: request.metadata.iter().map(|p| (p.key.to_vec(), p.value.to_vec())).collect(), bytes,client:None, alias:None })
     }
     fn captured_client(request:Arc<super::user_entry_client::ClientUserEntryRequest>)->Result<Self,CodecError>{
         let bytes=Self::measure(&request.as_batch_request())?;
         // Share the already charged private request, rather than copying its
         // factory/arguments into working, history and prepared snapshots.
-        Ok(Self{method:Vec::new(),arguments:Vec::new(),metadata:Vec::new(),bytes,client:Some(request)})
+        Ok(Self{method:Vec::new(),arguments:Vec::new(),metadata:Vec::new(),bytes,client:Some(request),alias:None})
     }
     fn borrowed(&self) -> BatchRequest<'_> {
         if let Some(request)=&self.client{return request.as_batch_request();}
+        if let Some(read) = &self.alias { return read.nested(); }
         BatchRequest { method: &self.method, arguments: &self.arguments,
             metadata: self.metadata.iter().map(|(key, value)| super::rpc_stream::RpcProperty { key, value }).collect() }
     }
@@ -126,9 +133,9 @@ impl ScheduledBatch {
             requests: self.bucket.requests.iter().map(|(&s, r)| (s, r.borrowed())).collect(),
             results: self.bucket.results.iter().map(|(&s, r)| (s, r.borrowed())).collect() }
     }
-    pub(super) fn has_business_work(&self)->bool{!self.bucket.results.is_empty()||self.bucket.requests.values().any(|request|request.client.is_none())}
+    pub(super) fn has_business_work(&self)->bool{!self.bucket.results.is_empty()||self.bucket.requests.values().any(|request|request.client.is_none() && request.alias.is_none())}
     pub(super) fn client_only(&self)->bool{!self.bucket.requests.is_empty()&&self.bucket.results.is_empty()&&self.bucket.requests.values().all(|request|request.client.is_some())}
-    pub(super) fn has_client_reads(&self)->bool{self.bucket.requests.values().any(|request|request.client.is_some())}
+    pub(super) fn has_client_reads(&self)->bool{self.bucket.requests.values().any(|request|request.client.is_some() || request.alias.is_some())}
     pub(super) fn client_holders(&self)->Vec<Arc<super::user_entry_client::ClientUserEntryRequest>>{self.bucket.requests.values().filter_map(|request|request.client.clone()).collect()}
     pub(super) fn encoded_argument_bytes(&self,uid:usize,selector:usize)->Result<usize,CodecError>{
         let prefix=45usize.checked_add(uid).and_then(|n|n.checked_add(selector)).ok_or(CodecError::TooLarge)?;
@@ -143,7 +150,7 @@ impl ScheduledBatch {
         let node=16usize.checked_mul(std::mem::size_of::<(i32,BatchRequest<'_>)>()+std::mem::size_of::<(i32,BatchResult<'_>)>()+16).ok_or(CodecError::TooLarge)?;
         let mut total=slots.checked_mul(node).and_then(|n|n.checked_add(256)).ok_or(CodecError::TooLarge)?;
         for request in self.bucket.requests.values(){
-            let properties=if request.client.is_some(){2}else{request.metadata.len()};
+            let properties=if request.client.is_some(){2}else if request.alias.is_some(){1}else{request.metadata.len()};
             total=total.checked_add(properties*(std::mem::size_of::<super::rpc_stream::RpcProperty<'_>>()+2*std::mem::size_of::<usize>())).ok_or(CodecError::TooLarge)?;
         }
         Ok(total)
@@ -231,6 +238,7 @@ pub struct BatchDelivery {
     connection: RpcConnectionScope,
     results: BTreeMap<i32, ResultData>,
     client_results:Vec<super::user_entry_client::ClientUserEntryCompletion>,
+    pub(super) alias_result: Option<Box<ue_alias::StagedAliases>>,
 }
 
 impl BatchDelivery {
@@ -294,6 +302,7 @@ pub struct BatchScheduler {
     client_reads:BTreeSet<i32>,retired_reads:BTreeSet<i32>,
     // Business pending identity survives transport epoch ACK/history removal.
     client_requests:BTreeMap<i32,Arc<super::user_entry_client::ClientUserEntryRequest>>,
+    alias_read: Option<Arc<AliasRead>>,
     last_client_sequence: i32,
     pending_server: BTreeMap<i32, usize>,
     peer_incarnation: Option<u32>,
@@ -318,7 +327,7 @@ impl BatchScheduler {
         if !connection.is_open() { return Err(BatchError::Closed); }
         Ok(Self { owner, connection, identity: Arc::new(()), local_incarnation: incarnation, next_batch: 0,
             next_serial: Some(1), prepared: None, clock_ms: 0, history: BTreeMap::new(), working: Bucket::default(),
-            pending_client: BTreeSet::new(), submitted_client: BTreeSet::new(),client_reads:BTreeSet::new(),retired_reads:BTreeSet::new(),client_requests:BTreeMap::new(),
+            pending_client: BTreeSet::new(), submitted_client: BTreeSet::new(),client_reads:BTreeSet::new(),retired_reads:BTreeSet::new(),client_requests:BTreeMap::new(),alias_read:None,
             last_client_sequence: 0, pending_server: BTreeMap::new(),
             peer_incarnation: None, peer_next: 0, peer_batches: 0, dedup: DedupWindow::default(), retired_through: 0, closed: false })
     }
@@ -331,6 +340,7 @@ impl BatchScheduler {
         self.closed = true; self.connection.close();
         self.history.clear(); self.working = Bucket::default(); self.pending_client.clear(); self.submitted_client.clear();self.client_reads.clear();self.retired_reads.clear();self.client_requests.clear();
         self.pending_server.clear();
+        if let Some(read) = self.alias_read.take() { read.cancel(); }
         self.dedup = DedupWindow::default();
         if let Some((_, active, _)) = self.prepared.take() { active.store(false, Ordering::Release); }
     }
@@ -422,7 +432,7 @@ impl BatchScheduler {
     pub fn prepare(&mut self, now_ms: u64) -> Result<ScheduledBatch, BatchError> {
         self.clock(now_ms)?; self.ensure_retention(now_ms)?;
         if self.prepared.is_some() { return Err(BatchError::Backpressure); }
-        self.expire_client_reads();self.prune_retired_reads();
+        self.expire_ue_alias(); self.expire_client_reads();self.prune_retired_reads();
         let Some(serial) = self.next_serial else { return self.fail(BatchError::Epoch); };
         let mut bucket = self.working.clone();
         let has_work = !bucket.requests.is_empty() || !bucket.results.is_empty();
@@ -554,10 +564,12 @@ impl BatchScheduler {
             requests.push(IncomingBatchRequest { request, ticket: ServerRequestTicket { owner: self.owner.clone(),
                 connection: self.connection.clone(), scheduler: self.identity.clone(), peer_incarnation: words.incarnation, sequence } });
         }
-        let mut results = BTreeMap::new();let mut client_results=Vec::new();
+        let mut results = BTreeMap::new();let mut client_results=Vec::new();let mut alias_result=None;
         for (&sequence, result) in &reply.payload.results {
             if self.pending_client.contains(&sequence) && self.submitted_client.contains(&sequence) {
-                if let Some(request)=self.client_requests.get(&sequence){
+                if let Some(read) = self.alias_read.as_ref().filter(|r| r.sequence() == sequence) {
+                    alias_result = Some(Box::new(read.stage(result.result_code, result.result_stream)));
+                } else if let Some(request)=self.client_requests.get(&sequence){
                     let result=super::user_entry_rpc::OwnedUserEntryReply::from_client(request.clone(),result.result_code,result.result_stream);
                     client_results.push(super::user_entry_client::ClientUserEntryCompletion{request:request.clone(),result});
                 }else{results.insert(sequence, ResultData { code: result.result_code, stream: result.result_stream.to_vec() });}
@@ -565,7 +577,7 @@ impl BatchScheduler {
         }
         // Commit original pending retirement only after all delivery payloads
         // have been copied/validated; no partially retired successful batch.
-        let matched_result_sequences=results.keys().copied().chain(client_results.iter().map(|result|result.request.sequence())).collect::<Vec<_>>();
+        let matched_result_sequences=results.keys().copied().chain(client_results.iter().map(|result|result.request.sequence())).chain(alias_result.iter().map(|r|r.sequence())).collect::<Vec<_>>();
         for sequence in &matched_result_sequences {
             self.submitted_client.remove(sequence); self.pending_client.remove(sequence);self.client_requests.remove(sequence);
         }
@@ -584,7 +596,7 @@ impl BatchScheduler {
                 peer_incarnation: words.incarnation, through: self.retired_through,
                 acknowledged: acknowledged.into_iter().collect() })
         } else { None };
-        Ok(Some(BatchDelivery { requests, matched_result_sequences, retirement, results,client_results,
+        Ok(Some(BatchDelivery { requests, matched_result_sequences, retirement, results,client_results,alias_result,
             owner: self.owner.clone(), connection: self.connection.clone() }))
     }
 

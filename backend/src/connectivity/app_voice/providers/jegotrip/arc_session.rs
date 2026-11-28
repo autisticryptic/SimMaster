@@ -249,6 +249,10 @@ impl ArcRpcSession {
         if !self.common_transport_claimed||self.phase()!=ArcPhase::Initial||!self.pending.is_empty()||self.common_identity.is_some(){return Err(CodecError::InvalidField);}
         validate_bytes(identity,true)?;self.common_identity=Some(identity.to_vec());Ok(())
     }
+    pub(super) fn initial_common_object_is(&self, entry: &[u8]) -> bool {
+        self.common_transport_claimed && self.phase() == ArcPhase::Initial && !self.connection.session_revoked()
+            && self.pending.is_empty() && self.common_identity.as_deref() == Some(entry)
+    }
     /// Original account-level `mainAccount` captured from a matched login reply.
     /// Not a credential and not a routing override.
     pub(super) fn main_account(&self)->Option<&[u8]>{self.main_account.as_deref().map(|value|value.as_slice())}

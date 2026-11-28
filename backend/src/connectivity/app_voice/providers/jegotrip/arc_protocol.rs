@@ -146,6 +146,7 @@ impl ArcProtocol {
     pub fn take_tls_engine(&mut self, route: PacketRoute<'_>, parameters: TlsParameters<'_>, now: std::time::Instant)
         -> Result<TlsEngine, TlsError> { self.rpc.take_tls_engine(route, parameters, now) }
     pub(super) fn claim_common_transport(&mut self)->Result<(),ProtocolError>{Ok(self.rpc.claim_common_transport()?)}
+    pub(super) fn initial_common_object_is(&self, entry: &[u8]) -> bool { self.rpc.initial_common_object_is(entry) }
     pub(super) fn bind_common_identity(&mut self,identity:&[u8])->Result<(),ProtocolError>{Ok(self.rpc.bind_common_identity(identity)?)}
     pub fn take_hosting_tracker(&mut self) -> Result<HostingRpcTracker, ProtocolError> {
         Ok(self.rpc.take_hosting_tracker()?)
@@ -268,7 +269,7 @@ impl ArcProtocol {
         let (id, bytes) = self.rpc.prepare_scheduled_swap(batch, routing)?;
         let mut packets=self.packets(id, bytes.expose_to_transport())?;
         if let Some(budget)=&charge{
-            let actual=super::client_packet_retention::ClientPacketRetention::original(holders.clone(),budget.clone());
+            let actual=super::client_packet_retention::ClientPacketRetention::original(holders.clone(),budget.clone(),batch.alias_holder());
             for packet in &mut packets.packets{packet.retain_client_packet(actual.clone());}
         }
         packets._client_holders=holders;packets._client_packet_budget=charge;packets._client_only=batch.client_only();packets._has_business_work=batch.has_business_work();Ok(packets)

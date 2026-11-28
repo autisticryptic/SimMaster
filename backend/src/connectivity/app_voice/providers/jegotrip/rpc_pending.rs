@@ -138,6 +138,10 @@ pub struct OwnedRpcCallback {
     pub callback: Callback,
 }
 
+/// Only this tracker issues the next sequence after checking all pending families.
+pub(super) struct UeAliasSequence(i32);
+impl UeAliasSequence { pub(super) fn get(self) -> i32 { self.0 } }
+
 pub struct HostingRpcTracker {
     connection: RpcConnectionScope,
     batch_owner: Option<AttemptOwner>,
@@ -146,6 +150,7 @@ pub struct HostingRpcTracker {
     unhosting: Vec<OwnedUnhostingReply>,
     client_reads:BTreeMap<i32,Arc<super::user_entry_client::ClientUserEntryRequest>>,
     client_replies:Vec<super::user_entry_client::ClientUserEntryCompletion>,
+    alias_pending: std::sync::Weak<super::batch_scheduler::AliasRead>,
 }
 
 impl Default for HostingRpcTracker {
@@ -157,11 +162,11 @@ impl HostingRpcTracker {
     /// Native nested hosting requires the original ARC session's one-time tracker.
     pub fn new() -> Self {
         Self { connection: RpcConnectionScope::fresh(), batch_owner: None,
-            next_id: Some(1), pending: BTreeMap::new(), unhosting: Vec::new(),client_reads:BTreeMap::new(),client_replies:Vec::new() }
+            next_id: Some(1), pending: BTreeMap::new(), unhosting: Vec::new(),client_reads:BTreeMap::new(),client_replies:Vec::new(),alias_pending:Default::default() }
     }
 
     pub(super) fn for_arc_session(owner: AttemptOwner, connection: RpcConnectionScope) -> Self {
-        Self { connection, batch_owner: Some(owner), next_id: Some(1), pending: BTreeMap::new(), unhosting: Vec::new(),client_reads:BTreeMap::new(),client_replies:Vec::new() }
+        Self { connection, batch_owner: Some(owner), next_id: Some(1), pending: BTreeMap::new(), unhosting: Vec::new(),client_reads:BTreeMap::new(),client_replies:Vec::new(),alias_pending:Default::default() }
     }
 
     /// Capture this when the authenticated connection installs its receive task.
@@ -171,11 +176,26 @@ impl HostingRpcTracker {
         self.batch_owner.clone().filter(|_| self.connection.is_open()).ok_or(CodecError::InvalidField)
     }
 
+    fn retained_read_count(&self) -> usize {
+        self.client_reads.len() + self.client_replies.len() + usize::from(self.alias_pending.upgrade().is_some_and(|r| r.pending()))
+    }
+    pub(super) fn queue_ue_alias(&mut self, scheduler: &mut super::batch_scheduler::BatchScheduler,
+        origin: &Arc<super::batch_scheduler::AliasOrigin>, deadline: std::time::Instant) -> Result<super::batch_scheduler::AliasWait, super::batch_scheduler::BatchError> {
+        use super::batch_scheduler::{AliasWait, BatchError};
+        let owner = self.batch_owner.as_ref().ok_or(BatchError::Scope)?;
+        if !origin.matches(owner, &self.connection) { return Err(BatchError::Scope); }
+        if self.pending.len() + self.retained_read_count() >= MAX_MAP_ENTRIES { return Err(BatchError::Backpressure); }
+        let sequence = self.next_id.ok_or(BatchError::Epoch)?;
+        let read = scheduler.queue_ue_alias(origin, UeAliasSequence(sequence), deadline)?;
+        self.next_id = sequence.checked_add(1);
+        self.alias_pending = Arc::downgrade(&read);
+        Ok(AliasWait::original(read))
+    }
     pub(super) fn prepare_client_user_entry(&mut self,query:Arc<super::user_entry_client::ClientUserEntryQuery>,auth:Box<super::arc_session::UserEntryAuth>,budget:Arc<super::native_rpc_budget::NativeRpcReservation>)->Result<Arc<super::user_entry_client::ClientUserEntryRequest>,super::user_entry_rpc::UserEntryError>{
         use super::user_entry_rpc::UserEntryError as E;
         let owner=self.batch_owner.as_ref().ok_or(E::Scope)?;
         if !query.matches(owner,&self.connection)||!auth.matches(owner,&self.connection){return Err(E::Scope);}
-        if self.pending.len()+self.client_reads.len()+self.client_replies.len()>=MAX_MAP_ENTRIES{return Err(E::Capacity);}
+        if self.pending.len()+self.retained_read_count()>=MAX_MAP_ENTRIES{return Err(E::Capacity);}
         let sequence=self.next_id.ok_or(E::Capacity)?;
         let request=super::user_entry_client::ClientUserEntryRequest::original(sequence,query,auth,budget)?;
         self.next_id=sequence.checked_add(1);self.client_reads.insert(sequence,request.clone());Ok(request)
@@ -192,7 +212,7 @@ impl HostingRpcTracker {
         -> Result<(i32, RpcBytes), CodecError> {
         if !self.connection.is_open() { self.pending.clear(); return Err(CodecError::InvalidField); }
         if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
-        if self.pending.len()+self.client_reads.len()+self.client_replies.len()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
+        if self.pending.len()+self.retained_read_count()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
         let id = self.next_id.ok_or(CodecError::InvalidCallId)?;
         let operation = match status {
             STATUS_REGISTER => NativeOperation::HostingRegister,
@@ -218,7 +238,7 @@ impl HostingRpcTracker {
         if !self.connection.is_open() { self.pending.clear(); return Err(CodecError::InvalidField); }
         if self.batch_owner.as_ref() != Some(&owner) { return Err(CodecError::InvalidField); }
         if self.pending.len() >= MAX_MAP_ENTRIES { return Err(CodecError::TooLarge); }
-        if self.pending.len()+self.client_reads.len()+self.client_replies.len()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
+        if self.pending.len()+self.retained_read_count()>=MAX_MAP_ENTRIES{return Err(CodecError::TooLarge);}
         let sequence = self.next_id.ok_or(CodecError::InvalidCallId)?;
         let operation = match status {
             STATUS_REGISTER => NativeOperation::HostingRegister,
@@ -302,7 +322,7 @@ impl HostingRpcTracker {
         if !self.connection.is_open() { self.retire_all(); return Vec::new(); }
         std::mem::take(&mut self.unhosting)
     }
-    pub(super) fn retire_all(&mut self) { self.pending.clear(); self.unhosting.clear();self.client_reads.clear();self.client_replies.clear(); }
+    pub(super) fn retire_all(&mut self) { if let Some(read) = self.alias_pending.upgrade() { read.cancel(); } self.alias_pending = Default::default(); self.pending.clear(); self.unhosting.clear();self.client_reads.clear();self.client_replies.clear(); }
 
     /// Retire pending work AND any completion not yet handed to its consumer.
     /// Already borrowed/copied results remain scoped snapshots, not revocable.
@@ -312,6 +332,7 @@ impl HostingRpcTracker {
     }
 
     pub fn retire_owner(&mut self, owner: &AttemptOwner) {
+        if self.batch_owner.as_ref() == Some(owner) { if let Some(read) = self.alias_pending.upgrade() { read.cancel(); } }
         self.pending.retain(|_, request| &request.owner != owner);
         self.unhosting.retain(|reply| &reply.owner != owner);
         self.client_reads.retain(|_,request|request.query().action().owner()!=owner);

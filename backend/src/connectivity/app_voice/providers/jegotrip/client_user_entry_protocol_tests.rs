@@ -1,4 +1,6 @@
 //! Actions-only Client READ protocol/retention regressions, no original SDK execution.
+#[path="ue_alias_protocol_tests.rs"]
+mod ue_alias;
 use super::*;
 use crate::connectivity::app_voice::providers::jegotrip as n;
 use n::{user_entry_action::UserEntryAction,user_entry_client::ClientUserEntryQuery,user_entry_client_target::NewClientTarget,

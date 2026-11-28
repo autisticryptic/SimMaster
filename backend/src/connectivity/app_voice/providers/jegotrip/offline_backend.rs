@@ -23,6 +23,8 @@ use std::{collections::BTreeMap, fmt};
 #[path="group_event_backend.rs"]
 mod relation_events;
 use relation_events::GroupEventState;
+#[path="offline_ue_alias.rs"]
+mod ue_alias;
 
 pub struct ScheduledIncomingMessage { ticket: ServerRequestTicket, message: IncomingMessage }
 
@@ -84,6 +86,7 @@ pub struct OfflineBackend {
     client_actor:super::transport_actor::ClientReadState,
     relation_actor:Box<super::transport_actor::RelationActorState>,
     group_events:Box<GroupEventState>,
+    ue_origin: Option<std::sync::Arc<super::batch_scheduler::AliasOrigin>>,
 }
 
 impl fmt::Debug for OfflineBackend {
@@ -97,7 +100,7 @@ impl OfflineBackend {
     pub fn new(owner: AttemptOwner) -> Self {
         let mut protocol = ArcProtocol::new(owner);
         let tracker = protocol.take_hosting_tracker().expect("fresh ARC tracker");
-        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,client_ex:None,im_binding:None,im_pending:BTreeMap::new(),im_completed:BTreeMap::new(),status_pending:BTreeMap::new(),status_completed:BTreeMap::new(),call_pending:BTreeMap::new(),invite_pending:BTreeMap::new(),invite_completed:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new(),client_actor:super::transport_actor::ClientReadState::default(),relation_actor:Box::default(),group_events:Box::default() }
+        Self { protocol, tracker, scheduler: None, dispatcher: None, call_dispatcher:None,client_ex:None,im_binding:None,im_pending:BTreeMap::new(),im_completed:BTreeMap::new(),status_pending:BTreeMap::new(),status_completed:BTreeMap::new(),call_pending:BTreeMap::new(),invite_pending:BTreeMap::new(),invite_completed:BTreeMap::new(),offline_hints:std::collections::BTreeSet::new(),call_acks:BTreeMap::new(),swaps: BTreeMap::new(),client_actor:super::transport_actor::ClientReadState::default(),relation_actor:Box::default(),group_events:Box::default(),ue_origin:None }
     }
     pub fn phase(&self) -> ArcPhase { self.protocol.phase() }
     pub(super) fn is_pending(&self, id: i32) -> bool { self.protocol.is_pending(id) }
@@ -114,9 +117,11 @@ impl OfflineBackend {
     pub fn on_verified_plaintext(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope,
         plaintext: VerifiedPlaintextPackets, now_ms: u64) -> Result<Vec<OfflineEvent>, ProtocolError> {
         let Some(packets) = plaintext.packets_for(owner, scope) else { return Ok(vec![]); };
-        let mut events = Vec::new();
-        for packet in packets { events.extend(self.on_plaintext_packet(owner, scope, packet.expose_to_transport(), now_ms)?); }
-        Ok(events)
+        self.with_alias_group(owner, scope, |backend, staged| {
+            let mut events = Vec::new();
+            for packet in packets { events.extend(backend.receive_packet(owner, scope, packet.expose_to_transport(), now_ms, staged)?); }
+            Ok(events)
+        })
     }
     pub(super) fn alive_link(&self)->std::sync::Arc<super::alive_session::AliveLink>{self.protocol.alive_link()}
     pub(super) fn claim_common_transport(&mut self)->Result<(),ProtocolError>{self.protocol.claim_common_transport()}
@@ -128,17 +133,19 @@ impl OfflineBackend {
         path:&super::common_runtime::CommonPath,group:&super::common_runtime::ScopedCommonCalls,now_ms:u64)->Result<Vec<OfflineEvent>,ProtocolError>{
         if !self.connection_scope().matches(scope){return Ok(Vec::new());}
         let Some(calls)=path.calls_for(owner,scope,group) else{return Ok(Vec::new());};
-        let mut events=Vec::new();
-        for call in calls{
-            if !matches!(call.kind,super::transport_packets::CallKind::Request|super::transport_packets::CallKind::Reply){self.close();return Err(super::transport_packets::TransportError::UnsupportedKind.into());}
-            let mut packet=zeroize::Zeroizing::new(Vec::with_capacity(call.payload.expose_to_transport().len()+1));
-            packet.push(call.kind as u8);packet.extend_from_slice(call.payload.expose_to_transport());
-            events.extend(self.on_plaintext_packet(owner,scope,&packet,now_ms)?);
-        }
-        Ok(events)
+        self.with_alias_group(owner, scope, |backend, staged| {
+            let mut events = Vec::new();
+            for call in calls {
+                if !matches!(call.kind,super::transport_packets::CallKind::Request|super::transport_packets::CallKind::Reply){backend.close();return Err(super::transport_packets::TransportError::UnsupportedKind.into());}
+                let mut packet=zeroize::Zeroizing::new(Vec::with_capacity(call.payload.expose_to_transport().len()+1));
+                packet.push(call.kind as u8);packet.extend_from_slice(call.payload.expose_to_transport());
+                events.extend(backend.receive_packet(owner,scope,&packet,now_ms,staged)?);
+            }
+            Ok(events)
+        })
     }
     pub fn close(&mut self) {
-        self.protocol.close(); if let Some(s) = &mut self.scheduler { s.close(); }
+        self.protocol.close(); self.retire_ue_origin(); if let Some(s) = &mut self.scheduler { s.close(); }
         self.tracker.retire_all();self.client_actor.clear();self.relation_actor.clear();self.group_events.clear();
         self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.invite_pending.clear();self.invite_completed.clear();self.call_acks.clear();self.offline_hints.clear();
         self.swaps.clear();self.dispatcher=None;self.im_binding=None;self.im_pending.clear();self.im_completed.clear();self.status_pending.clear();self.status_completed.clear();
@@ -152,7 +159,7 @@ impl OfflineBackend {
     pub fn prepare_login(&mut self, inputs: ArcLoginInputs<'_>, routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_login(inputs, routing) }
     pub fn prepare_logout(&mut self, routing: &[RpcProperty<'_>]) -> Result<OwnedCallPackets, ProtocolError> {
-        let packets=self.protocol.prepare_logout(routing)?;self.group_events.clear();self.status_pending.clear();self.status_completed.clear();self.im_binding=None;self.im_pending.clear();self.im_completed.clear();self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.invite_pending.clear();self.invite_completed.clear();self.call_acks.clear();self.offline_hints.clear();Ok(packets)
+        let packets=self.protocol.prepare_logout(routing)?;self.retire_ue_origin();self.group_events.clear();self.status_pending.clear();self.status_completed.clear();self.im_binding=None;self.im_pending.clear();self.im_completed.clear();self.call_dispatcher=None;self.client_ex=None;self.call_pending.clear();self.invite_pending.clear();self.invite_completed.clear();self.call_acks.clear();self.offline_hints.clear();Ok(packets)
     }
     pub fn prepare_bootstrap(&mut self, key: &[u8], routing: &[RpcProperty<'_>])
         -> Result<OwnedCallPackets, ProtocolError> { self.protocol.prepare_bootstrap(key, routing) }
@@ -256,6 +263,7 @@ impl OfflineBackend {
         if let Err(error) = scheduler.queue_hosting(&call, metadata) {
             self.tracker.retire_request(call.sequence); return Err(error.into());
         }
+        if status == super::session::STATUS_UNREGISTER { self.retire_ue_origin(); }
         Ok(call.sequence)
     }
 
@@ -291,7 +299,7 @@ impl OfflineBackend {
         let result_sequences=batch.payload().results.keys().copied().collect::<Vec<_>>();
         let mut packets = match self.protocol.prepare_scheduled_swap(&batch, routing) {
             Ok(packets) => packets,
-            Err(ProtocolError::Batch(super::batch_scheduler::BatchError::Backpressure)) if !batch.is_encoded()&&!batch.client_holders().is_empty()=>{
+            Err(ProtocolError::Batch(super::batch_scheduler::BatchError::Backpressure)) if !batch.is_encoded() && batch.has_client_reads()=>{
                 // Original shared-budget refusal occurred before ARC encoding.
                 // Abandon this unsent snapshot, preserving unrelated WRITE
                 // work/epochs. The READ caller retires only its own interest.
@@ -327,6 +335,10 @@ impl OfflineBackend {
     /// expiry/hosting/readiness, and the inbox consumer decides ticket acceptance.
     pub fn on_plaintext_packet(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope,
         packet: &[u8], now_ms: u64) -> Result<Vec<OfflineEvent>, ProtocolError> {
+        self.with_alias_group(owner, scope, |backend, staged| backend.receive_packet(owner, scope, packet, now_ms, staged))
+    }
+    fn receive_packet(&mut self, owner: &AttemptOwner, scope: &RpcConnectionScope, packet: &[u8], now_ms: u64,
+        aliases: &mut Option<Box<super::batch_scheduler::StagedAliases>>) -> Result<Vec<OfflineEvent>, ProtocolError> {
         let mut events = Vec::new(); let mut processing_error = None;
         let scheduler = &mut self.scheduler; let tracker = &mut self.tracker;
         let dispatcher = &self.dispatcher;let call_dispatcher=&self.call_dispatcher;let call_pending=&mut self.call_pending;let swaps = &mut self.swaps;
@@ -349,6 +361,10 @@ impl OfflineBackend {
                         Err(error) => { processing_error = Some(error.into()); return; }
                     };
                     let retirement = delivery.retirement.take();
+                    if let Some(result) = delivery.alias_result.take() {
+                        if aliases.is_some() { processing_error = Some(CodecError::InvalidField.into()); return; }
+                        *aliases = Some(result);
+                    }
                     for callback in tracker.on_scheduled_delivery(&delivery) { events.push(OfflineEvent::Callback(callback)); }
                     tracker.consume_scheduled_client_results(&mut delivery);
                     for reply in tracker.take_unhosting_replies() { events.push(OfflineEvent::Unhosting(reply)); }
